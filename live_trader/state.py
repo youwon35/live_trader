@@ -149,6 +149,66 @@ DEFAULT_RETRY_POLICY: dict[str, float | bool] = {
     "retry_on_rate_limit": True,
 }
 
+POSITION_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
+    {
+        "symbol": "069500.KS",
+        "asset": "한국주식",
+        "broker_id": "kis",
+        "broker_name": "한국투자증권",
+        "program_qty": 0.0,
+        "broker_qty": None,
+        "program_value": 0.0,
+        "broker_value": None,
+        "currency": "KRW",
+        "tolerance_qty": 0.0,
+    },
+    {
+        "symbol": "BTCUSDT",
+        "asset": "코인",
+        "broker_id": "binance",
+        "broker_name": "Binance",
+        "program_qty": 0.0,
+        "broker_qty": None,
+        "program_value": 0.0,
+        "broker_value": None,
+        "currency": "USDT",
+        "tolerance_qty": 0.000001,
+    },
+    {
+        "symbol": "SPY",
+        "asset": "미국 ETF",
+        "broker_id": "kis",
+        "broker_name": "한국투자증권",
+        "program_qty": 0.0,
+        "broker_qty": None,
+        "program_value": 0.0,
+        "broker_value": None,
+        "currency": "USD",
+        "tolerance_qty": 0.0,
+    },
+)
+
+ACCOUNT_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
+    {
+        "broker_id": "kis",
+        "broker_name": "한국투자증권",
+        "account": "KIS 실계좌",
+        "currency": "KRW/USD",
+        "program_cash": None,
+        "broker_cash": None,
+        "detail": "KIS 잔고/예수금 조회 어댑터가 연결되어야 계좌 대조를 통과합니다.",
+    },
+    {
+        "broker_id": "binance",
+        "broker_name": "Binance",
+        "account": "Binance Spot",
+        "currency": "USDT",
+        "program_cash": None,
+        "broker_cash": None,
+        "detail": "Binance signed account endpoint가 연결되어야 현금성 잔고를 대조합니다.",
+    },
+)
+
 FINAL_ORDER_STATES = {"dry_run", "sent", "filled", "canceled", "retry_exhausted"}
 
 
@@ -171,6 +231,8 @@ STATE: dict[str, Any] = {
     "risk_settings": dict(DEFAULT_RISK_SETTINGS),
     "checklist": {str(item["key"]): False for item in CHECKLIST_ITEMS},
     "retry_policy": dict(DEFAULT_RETRY_POLICY),
+    "reconciliation_last_run": None,
+    "preflight_last_run": None,
     "orders": [],
     "audit": [
         {
@@ -232,12 +294,17 @@ def market_sessions() -> list[dict[str, str]]:
     ]
 
 
-def readiness_checks(strategies: list[dict[str, Any]], brokers: list[dict[str, object]]) -> list[Check]:
+def readiness_checks(
+    strategies: list[dict[str, Any]],
+    brokers: list[dict[str, object]],
+    reconciliation_summary: dict[str, Any],
+) -> list[Check]:
     live_ready_count = sum(1 for strategy in strategies if strategy.get("live_allowed") is True)
     missing_brokers = [broker for broker in brokers if broker["status"] == "missing_credentials"]
     adapter_blocked = [broker for broker in brokers if broker["live_order_adapter_ready"] is not True]
     checklist = checklist_rows()
     checklist_missing = [item for item in checklist if item["required"] and not item["checked"]]
+    reconcile_blocking = int(reconciliation_summary["api_required_count"]) + int(reconciliation_summary["mismatch_count"])
     checks = [
         Check(
             "Dry Run 보호",
@@ -286,15 +353,23 @@ def readiness_checks(strategies: list[dict[str, Any]], brokers: list[dict[str, o
         ),
         Check(
             "포지션 대조",
-            "warn",
-            "실계좌 포지션 대조 API가 연결되면 프로그램 포지션과 브로커 포지션을 비교해야 합니다.",
+            "fail" if reconcile_blocking else "pass",
+            (
+                f"포지션/계좌 대조 차단 {reconcile_blocking}개가 남아 있습니다."
+                if reconcile_blocking
+                else "프로그램 포지션과 브로커 포지션이 대조되었습니다."
+            ),
         ),
     ]
     return checks
 
 
-def risk_checks() -> list[dict[str, str]]:
+def risk_checks(reconciliation_summary: dict[str, Any] | None = None) -> list[dict[str, str]]:
     settings = STATE["risk_settings"]
+    if reconciliation_summary is None:
+        reconciliation_summary = reconciliation_snapshot()["summary"]
+    reconcile_status = str(reconciliation_summary["status"])
+    reconcile_risk_status = "pass" if reconcile_status == "pass" else "fail" if reconcile_status == "fail" else "warn"
     return [
         {
             "label": "일일 손실 한도",
@@ -333,16 +408,135 @@ def risk_checks() -> list[dict[str, str]]:
             "status": "pass",
             "detail": "동시에 열린 주문 수가 한도를 넘으면 차단합니다.",
         },
-        {"label": "포지션 불일치", "value": "주문 금지", "status": "warn", "detail": "브로커 계좌 조회 API 연결 전에는 대조가 경고 상태입니다."},
+        {
+            "label": "포지션 불일치",
+            "value": str(reconciliation_summary["status_label"]),
+            "status": reconcile_risk_status,
+            "detail": "포지션/계좌 대조가 깨끗하지 않으면 실주문 제출을 차단합니다.",
+        },
     ]
 
 
 def positions() -> list[dict[str, str]]:
-    return [
-        {"symbol": "069500.KS", "asset": "한국주식", "program_qty": "0", "broker_qty": "-", "status": "대조 필요"},
-        {"symbol": "BTCUSDT", "asset": "코인", "program_qty": "0", "broker_qty": "-", "status": "API 필요"},
-        {"symbol": "SPY", "asset": "미국 ETF", "program_qty": "0", "broker_qty": "-", "status": "API 필요"},
-    ]
+    rows: list[dict[str, str]] = []
+    for item in POSITION_RECONCILIATION_BOOK:
+        broker_qty = item["broker_qty"]
+        program_qty = float(item["program_qty"])
+        tolerance_qty = float(item["tolerance_qty"])
+        if broker_qty is None:
+            status = "api_required"
+            status_label = "API 필요"
+            delta_qty = "-"
+            detail = "브로커 포지션 조회 어댑터가 아직 연결되지 않았습니다."
+        else:
+            numeric_broker_qty = float(broker_qty)
+            delta = program_qty - numeric_broker_qty
+            delta_qty = format_quantity(delta)
+            if abs(delta) <= tolerance_qty:
+                status = "pass"
+                status_label = "일치"
+                detail = "프로그램 포지션과 브로커 포지션이 허용 오차 안에 있습니다."
+            else:
+                status = "mismatch"
+                status_label = "불일치"
+                detail = "프로그램 포지션과 브로커 포지션 수량이 다릅니다."
+        rows.append(
+            {
+                "symbol": str(item["symbol"]),
+                "asset": str(item["asset"]),
+                "broker_id": str(item["broker_id"]),
+                "broker_name": str(item["broker_name"]),
+                "currency": str(item["currency"]),
+                "program_qty": format_quantity(program_qty),
+                "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "API 필요",
+                "delta_qty": delta_qty,
+                "status": status,
+                "status_label": status_label,
+                "detail": detail,
+            }
+        )
+    return rows
+
+
+def account_reconciliation_rows() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for item in ACCOUNT_RECONCILIATION_BOOK:
+        broker_cash = item["broker_cash"]
+        program_cash = item["program_cash"]
+        if broker_cash is None or program_cash is None:
+            status = "api_required"
+            status_label = "API 필요"
+            delta_cash = "-"
+        else:
+            numeric_program_cash = float(program_cash)
+            numeric_broker_cash = float(broker_cash)
+            delta = numeric_program_cash - numeric_broker_cash
+            delta_cash = format_money(delta, str(item["currency"]))
+            status = "pass" if abs(delta) <= 1.0 else "mismatch"
+            status_label = "일치" if status == "pass" else "불일치"
+        rows.append(
+            {
+                "broker_id": str(item["broker_id"]),
+                "broker_name": str(item["broker_name"]),
+                "account": str(item["account"]),
+                "currency": str(item["currency"]),
+                "program_cash": format_money(program_cash, str(item["currency"])) if program_cash is not None else "대조 대기",
+                "broker_cash": format_money(broker_cash, str(item["currency"])) if broker_cash is not None else "API 필요",
+                "delta_cash": delta_cash,
+                "status": status,
+                "status_label": status_label,
+                "detail": str(item["detail"]),
+            }
+        )
+    return rows
+
+
+def reconciliation_snapshot() -> dict[str, Any]:
+    position_rows = positions()
+    account_rows = account_reconciliation_rows()
+    api_required_count = sum(1 for item in position_rows + account_rows if item["status"] == "api_required")
+    mismatch_count = sum(1 for item in position_rows + account_rows if item["status"] == "mismatch")
+    pass_count = sum(1 for item in position_rows + account_rows if item["status"] == "pass")
+    status = "fail" if mismatch_count else "warn" if api_required_count else "pass"
+    status_label = "불일치" if mismatch_count else "API 필요" if api_required_count else "정상"
+    return {
+        "summary": {
+            "status": status,
+            "status_label": status_label,
+            "last_run": STATE["reconciliation_last_run"] or "미실행",
+            "position_count": len(position_rows),
+            "account_count": len(account_rows),
+            "api_required_count": api_required_count,
+            "mismatch_count": mismatch_count,
+            "pass_count": pass_count,
+        },
+        "positions": position_rows,
+        "accounts": account_rows,
+        "next_actions": reconciliation_next_actions(api_required_count, mismatch_count),
+    }
+
+
+def reconciliation_next_actions(api_required_count: int, mismatch_count: int) -> list[str]:
+    actions: list[str] = []
+    if api_required_count:
+        actions.append("KIS/Binance 계좌·포지션 조회 어댑터 연결")
+    if mismatch_count:
+        actions.append("불일치 포지션 수동 확인 후 주문 잠금 유지")
+    actions.append("대조 결과가 정상일 때만 SMALL_LIVE 승인 검토")
+    return actions
+
+
+def format_quantity(value: float) -> str:
+    if abs(value - int(value)) < 0.0000001:
+        return f"{int(value)}"
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def format_money(value: object, currency: str) -> str:
+    numeric = float(value)
+    if currency == "KRW":
+        return f"{numeric:,.0f} KRW"
+    return f"{numeric:,.2f} {currency}"
 
 
 def risk_setting_rows() -> list[dict[str, object]]:
@@ -420,10 +614,147 @@ def order_queue_summary() -> dict[str, int]:
     }
 
 
+def operation_report(
+    reconciliation: dict[str, Any],
+    checks: list[Check],
+    preflight: list[dict[str, str]],
+) -> dict[str, Any]:
+    blocker_count = sum(1 for check in checks if check.status == "fail")
+    warning_count = sum(1 for check in checks if check.status == "warn")
+    hard_stop_count = sum(1 for check in preflight if check["status"] == "fail")
+    queue = order_queue_summary()
+    return {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "sections": [
+            {
+                "label": "Live Readiness",
+                "status": "fail" if blocker_count else "warn" if warning_count else "pass",
+                "value": f"blocker {blocker_count} / warn {warning_count}",
+                "detail": "실거래 모드 전환을 막는 readiness 상태입니다.",
+            },
+            {
+                "label": "포지션·계좌 대조",
+                "status": str(reconciliation["summary"]["status"]),
+                "value": str(reconciliation["summary"]["status_label"]),
+                "detail": f"API 필요 {reconciliation['summary']['api_required_count']}개, 불일치 {reconciliation['summary']['mismatch_count']}개",
+            },
+            {
+                "label": "주문 큐",
+                "status": "warn" if queue["retryable"] or queue["blocked"] else "pass",
+                "value": f"total {queue['total']}",
+                "detail": f"차단 {queue['blocked']}건, 재시도 가능 {queue['retryable']}건, 취소 {queue['canceled']}건",
+            },
+            {
+                "label": "최종 Preflight",
+                "status": "fail" if hard_stop_count else "pass",
+                "value": f"hard stop {hard_stop_count}",
+                "detail": "실제 브로커 어댑터 연결 전 최종 승인 패키지입니다.",
+            },
+        ],
+    }
+
+
+def final_preflight_checks(
+    strategies: list[dict[str, Any]],
+    brokers: list[dict[str, object]],
+    reconciliation: dict[str, Any],
+) -> list[dict[str, str]]:
+    checklist = checklist_rows()
+    checklist_missing = [item for item in checklist if item["required"] and not item["checked"]]
+    live_ready_count = sum(1 for strategy in strategies if strategy.get("live_allowed") is True)
+    adapter_blocked = [broker for broker in brokers if broker["live_order_adapter_ready"] is not True]
+    missing_brokers = [broker for broker in brokers if broker["status"] == "missing_credentials"]
+    reconcile_summary = reconciliation["summary"]
+    queue = order_queue_summary()
+    return [
+        {
+            "label": "실거래 환경 변수",
+            "status": "pass" if real_orders_enabled() else "fail",
+            "detail": "LIVE_TRADER_ENABLE_REAL_ORDERS=true가 설정되어야 실거래 라우트 검토가 가능합니다.",
+        },
+        {
+            "label": "브로커 API 키",
+            "status": "fail" if missing_brokers else "pass",
+            "detail": f"필수 브로커 환경 변수 누락 {len(missing_brokers)}개 그룹",
+        },
+        {
+            "label": "브로커 주문 어댑터",
+            "status": "fail" if adapter_blocked else "pass",
+            "detail": "KIS/Binance signed order adapter가 구현·테스트·감사되어야 합니다.",
+        },
+        {
+            "label": "포지션·계좌 대조",
+            "status": "pass" if reconcile_summary["status"] == "pass" else "fail",
+            "detail": f"{reconcile_summary['status_label']} 상태입니다. 마지막 대조: {reconcile_summary['last_run']}",
+        },
+        {
+            "label": "전략 승인",
+            "status": "pass" if live_ready_count else "fail",
+            "detail": f"live_allowed 전략 {live_ready_count}개",
+        },
+        {
+            "label": "필수 운영 체크리스트",
+            "status": "fail" if checklist_missing else "pass",
+            "detail": f"미완료 필수 항목 {len(checklist_missing)}개",
+        },
+        {
+            "label": "Kill Switch",
+            "status": "fail" if STATE["kill_switch"] else "pass",
+            "detail": "Kill Switch가 켜져 있으면 MONITOR 외 모드로 전환할 수 없습니다.",
+        },
+        {
+            "label": "운용자 확인",
+            "status": "pass" if STATE["operator_confirmed"] else "warn",
+            "detail": "첫 주문 전 운용자의 수동 확인이 필요합니다.",
+        },
+        {
+            "label": "Dry Run 보호",
+            "status": "pass" if STATE["dry_run"] else "warn",
+            "detail": "Dry Run이 꺼진 상태에서는 실제 전송 차단 조건을 더 엄격히 확인해야 합니다.",
+        },
+        {
+            "label": "주문 큐 잔여",
+            "status": "warn" if queue["retryable"] else "pass",
+            "detail": f"재시도 가능 주문 {queue['retryable']}건",
+        },
+    ]
+
+
+def launch_report(preflight: list[dict[str, str]]) -> dict[str, Any]:
+    hard_stops = [check for check in preflight if check["status"] == "fail"]
+    warnings = [check for check in preflight if check["status"] == "warn"]
+    if hard_stops:
+        small_live_status = "blocked"
+        full_live_status = "blocked"
+        lock_reason = f"hard stop {len(hard_stops)}개가 남아 있습니다."
+    elif warnings:
+        small_live_status = "review_required"
+        full_live_status = "blocked"
+        lock_reason = f"warning {len(warnings)}개 수동 검토가 필요합니다."
+    else:
+        small_live_status = "ready"
+        full_live_status = "ready"
+        lock_reason = "모든 최종 점검을 통과했습니다."
+    return {
+        "last_run": STATE["preflight_last_run"] or "미실행",
+        "hard_stop_count": len(hard_stops),
+        "warning_count": len(warnings),
+        "real_order_lock": "locked" if hard_stops or warnings else "ready",
+        "small_live_status": small_live_status,
+        "full_live_status": full_live_status,
+        "lock_reason": lock_reason,
+        "next_actions": [check["label"] for check in hard_stops[:6]] or [check["label"] for check in warnings[:6]] or ["SMALL_LIVE 소액 승인 검토"],
+    }
+
+
 def snapshot() -> dict[str, Any]:
     brokers = [broker.to_dict() for broker in broker_readiness()]
     strategies = strategy_rows()
-    checks = readiness_checks(strategies, brokers)
+    reconciliation = reconciliation_snapshot()
+    checks = readiness_checks(strategies, brokers, reconciliation["summary"])
+    preflight = final_preflight_checks(strategies, brokers, reconciliation)
+    report = operation_report(reconciliation, checks, preflight)
+    launch = launch_report(preflight)
     blockers = [check for check in checks if check.status == "fail"]
     warnings = [check for check in checks if check.status == "warn"]
     return {
@@ -442,7 +773,7 @@ def snapshot() -> dict[str, Any]:
         },
         "sessions": market_sessions(),
         "readiness": [check.to_dict() for check in checks],
-        "risk_checks": risk_checks(),
+        "risk_checks": risk_checks(reconciliation["summary"]),
         "risk_settings": risk_setting_rows(),
         "checklist": checklist_rows(),
         "retry_policy": retry_policy_rows(),
@@ -453,7 +784,12 @@ def snapshot() -> dict[str, Any]:
         "strategies": strategies,
         "orders": order_rows(),
         "dry_run_ledger": dry_run_ledger_rows(),
-        "positions": positions(),
+        "reconciliation": reconciliation,
+        "accounts": reconciliation["accounts"],
+        "positions": reconciliation["positions"],
+        "operation_report": report,
+        "final_preflight": preflight,
+        "launch_report": launch,
         "audit": list(reversed(STATE["audit"][-30:])),
     }
 
@@ -559,6 +895,41 @@ def run_broker_check(broker_id: str) -> dict[str, Any]:
         "ok": True,
         "reason": f"브로커 점검 완료: fail {item['fail_count']}개, warn {item['warn_count']}개",
         "diagnostics": diagnostics,
+        "snapshot": snapshot(),
+    }
+
+
+def run_reconciliation() -> dict[str, Any]:
+    STATE["reconciliation_last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    reconciliation = reconciliation_snapshot()
+    summary = reconciliation["summary"]
+    blocking_count = int(summary["api_required_count"]) + int(summary["mismatch_count"])
+    append_audit(
+        "danger" if blocking_count else "info",
+        "포지션/계좌 대조",
+        f"{summary['status_label']}: API 필요 {summary['api_required_count']}개, 불일치 {summary['mismatch_count']}개",
+    )
+    return {
+        "ok": True,
+        "reason": f"대조 완료: {summary['status_label']} 상태",
+        "reconciliation": reconciliation,
+        "snapshot": snapshot(),
+    }
+
+
+def run_final_preflight() -> dict[str, Any]:
+    STATE["preflight_last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data = snapshot()
+    hard_stop_count = int(data["launch_report"]["hard_stop_count"])
+    warning_count = int(data["launch_report"]["warning_count"])
+    append_audit(
+        "danger" if hard_stop_count else "warn" if warning_count else "info",
+        "최종 Preflight",
+        f"hard stop {hard_stop_count}개, warning {warning_count}개. {data['launch_report']['lock_reason']}",
+    )
+    return {
+        "ok": True,
+        "reason": f"최종 점검 완료: hard stop {hard_stop_count}개, warning {warning_count}개",
         "snapshot": snapshot(),
     }
 

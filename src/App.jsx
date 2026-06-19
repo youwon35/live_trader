@@ -35,6 +35,8 @@ import {
   exportAudit,
   getSnapshot,
   runBrokerCheck,
+  runFinalPreflight,
+  runReconciliation,
   retryOrder,
   setChecklistItem,
   setFlag,
@@ -51,6 +53,7 @@ const navItems = [
   { id: "brokers", label: "Brokers", icon: Network },
   { id: "strategies", label: "Strategies", icon: DatabaseZap },
   { id: "audit", label: "Audit", icon: FileClock },
+  { id: "preflight", label: "Preflight", icon: ShieldCheck },
 ];
 
 const fallbackSnapshot = {
@@ -75,6 +78,34 @@ const fallbackSnapshot = {
   strategies: [],
   orders: [],
   positions: [],
+  accounts: [],
+  reconciliation: {
+    summary: {
+      status: "warn",
+      status_label: "API 필요",
+      last_run: "미실행",
+      position_count: 0,
+      account_count: 0,
+      api_required_count: 0,
+      mismatch_count: 0,
+      pass_count: 0,
+    },
+    positions: [],
+    accounts: [],
+    next_actions: [],
+  },
+  operation_report: { generated_at: "-", sections: [] },
+  final_preflight: [],
+  launch_report: {
+    last_run: "미실행",
+    hard_stop_count: 0,
+    warning_count: 0,
+    real_order_lock: "locked",
+    small_live_status: "blocked",
+    full_live_status: "blocked",
+    lock_reason: "Python server connection is required.",
+    next_actions: [],
+  },
   audit: [],
 };
 
@@ -254,6 +285,8 @@ function App() {
           onRetryOrder={(orderId) => runAction(() => retryOrder(orderId))}
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
           onBrokerCheck={(brokerId) => runAction(() => runBrokerCheck(brokerId))}
+          onReconcile={() => runAction(runReconciliation)}
+          onPreflight={() => runAction(runFinalPreflight)}
           onAuditExport={runAuditExport}
           exportResult={exportResult}
         />
@@ -290,6 +323,8 @@ function WorkspaceContent({
   onRetryOrder,
   onCancelOrder,
   onBrokerCheck,
+  onReconcile,
+  onPreflight,
   onAuditExport,
   exportResult,
 }) {
@@ -322,6 +357,7 @@ function WorkspaceContent({
           <GateRunbookPanel />
           <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
           <RiskPanel checks={snapshot.risk_checks} />
+          <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
           <PositionPanel positions={snapshot.positions} />
         </div>
       </section>
@@ -348,7 +384,7 @@ function WorkspaceContent({
           <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
           <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
           <DryRunLedgerPanel ledger={snapshot.dry_run_ledger} />
-          <PositionPanel positions={snapshot.positions} />
+          <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
         </div>
       </section>
     );
@@ -395,7 +431,26 @@ function WorkspaceContent({
         </div>
         <div className="content-column">
           <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
+          <OperationsReportPanel report={snapshot.operation_report} />
           <RiskPanel checks={snapshot.risk_checks} />
+        </div>
+      </section>
+    );
+  }
+
+  if (selectedNav === "preflight") {
+    return (
+      <section className="content-grid">
+        <div className="content-column">
+          <FinalPreflightPanel checks={snapshot.final_preflight} onPreflight={onPreflight} />
+          <LaunchReportPanel report={snapshot.launch_report} />
+          <ReadinessPanel checks={snapshot.readiness} />
+        </div>
+        <div className="content-column">
+          <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
+          <AccountReconciliationPanel accounts={snapshot.accounts} />
+          <PositionPanel positions={snapshot.positions} />
+          <OperationsReportPanel report={snapshot.operation_report} />
         </div>
       </section>
     );
@@ -413,12 +468,15 @@ function WorkspaceContent({
           <ReadinessPanel checks={snapshot.readiness} />
           <RunbookChecklistPanel checklist={snapshot.checklist} onChecklist={onChecklist} />
           <RiskPanel checks={snapshot.risk_checks} />
+          <FinalPreflightPanel checks={snapshot.final_preflight} onPreflight={onPreflight} compact />
           <StrategyPanel strategies={snapshot.strategies} />
           <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
           <AuditPanel audit={snapshot.audit} />
         </div>
         <div className="content-column">
           <BrokerPanel brokers={snapshot.brokers} />
+          <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
+          <AccountReconciliationPanel accounts={snapshot.accounts} />
           <PositionPanel positions={snapshot.positions} />
         </div>
       </section>
@@ -431,8 +489,25 @@ function StatusPill({ children, tone = "neutral" }) {
 }
 
 function statusTone(status) {
-  if (status === "pass" || status === "connected" || status === "open" || status === "dry_run" || status === "interface_ready") return "success";
-  if (status === "warn" || status === "watch" || status === "adapter_required" || status === "adapter_blocked" || status === "blocked_stub") {
+  if (
+    status === "pass" ||
+    status === "connected" ||
+    status === "open" ||
+    status === "dry_run" ||
+    status === "interface_ready" ||
+    status === "ready"
+  ) {
+    return "success";
+  }
+  if (
+    status === "warn" ||
+    status === "watch" ||
+    status === "adapter_required" ||
+    status === "adapter_blocked" ||
+    status === "blocked_stub" ||
+    status === "api_required" ||
+    status === "review_required"
+  ) {
     return "warning";
   }
   if (
@@ -440,7 +515,9 @@ function statusTone(status) {
     status === "blocked" ||
     status === "missing_credentials" ||
     status === "risk_blocked" ||
-    status === "retry_exhausted"
+    status === "retry_exhausted" ||
+    status === "mismatch" ||
+    status === "locked"
   ) {
     return "danger";
   }
@@ -989,6 +1066,141 @@ function AuditExportPanel({ onExport, exportResult }) {
   );
 }
 
+function ReconciliationSummaryPanel({ reconciliation, onReconcile }) {
+  const summary = reconciliation?.summary ?? fallbackSnapshot.reconciliation.summary;
+  const actions = reconciliation?.next_actions ?? [];
+  const items = [
+    { label: "상태", value: summary.status_label, tone: statusTone(summary.status) },
+    { label: "포지션", value: summary.position_count, tone: "info" },
+    { label: "계좌", value: summary.account_count, tone: "info" },
+    { label: "API 필요", value: summary.api_required_count, tone: summary.api_required_count ? "warning" : "success" },
+    { label: "불일치", value: summary.mismatch_count, tone: summary.mismatch_count ? "danger" : "success" },
+  ];
+  return (
+    <section className="panel reconciliation-panel">
+      <PanelHeader title="포지션·계좌 대조 요약" subtitle={`마지막 대조 ${summary.last_run}`} />
+      <div className="panel-action-line">
+        <StatusPill tone={statusTone(summary.status)}>{summary.status_label}</StatusPill>
+        <button className="mini-button" type="button" onClick={onReconcile}>
+          <RefreshCcw size={14} />
+          대조 실행
+        </button>
+      </div>
+      <div className="metric-grid">
+        {items.map((item) => (
+          <div className="metric-card" key={item.label}>
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+            <StatusPill tone={item.tone}>RECON</StatusPill>
+          </div>
+        ))}
+      </div>
+      <div className="next-actions">
+        {actions.map((action) => (
+          <span key={action}>{action}</span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AccountReconciliationPanel({ accounts }) {
+  return (
+    <section className="panel account-panel">
+      <PanelHeader title="계좌 현금 대조" subtitle="프로그램 원장과 브로커 계좌 현금성 잔고를 비교합니다." />
+      <div className="account-list">
+        {accounts.map((account) => (
+          <div className="account-row" key={account.broker_id}>
+            <WalletCards size={16} />
+            <div>
+              <strong>{account.account}</strong>
+              <span>{account.broker_name} · {account.currency}</span>
+            </div>
+            <em>{account.program_cash} / {account.broker_cash}</em>
+            <StatusPill tone={statusTone(account.status)}>{account.status_label}</StatusPill>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function OperationsReportPanel({ report }) {
+  return (
+    <section className="panel operations-report-panel">
+      <PanelHeader title="운용 리포트" subtitle={`생성 시각 ${report.generated_at}`} />
+      <div className="compact-list">
+        {report.sections.map((section) => (
+          <div className="compact-row report-row" key={section.label}>
+            <strong>{section.label}</strong>
+            <span>{section.value} · {section.detail}</span>
+            <StatusPill tone={statusTone(section.status)}>{section.status}</StatusPill>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function FinalPreflightPanel({ checks, onPreflight, compact = false }) {
+  const visibleChecks = compact ? checks.slice(0, 6) : checks;
+  return (
+    <section className="panel final-preflight-panel">
+      <PanelHeader title="최종 Preflight" subtitle="실브로커 어댑터 연결 직전의 hard stop과 warning을 점검합니다." />
+      <div className="panel-action-line">
+        <StatusPill tone={checks.some((check) => check.status === "fail") ? "danger" : checks.some((check) => check.status === "warn") ? "warning" : "success"}>
+          {checks.filter((check) => check.status === "fail").length} hard stop
+        </StatusPill>
+        <button className="mini-button" type="button" onClick={onPreflight}>
+          <BadgeCheck size={14} />
+          최종 점검
+        </button>
+      </div>
+      <div className="check-list">
+        {visibleChecks.map((check) => (
+          <StatusRow key={check.label} label={check.label} status={check.status} detail={check.detail} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function LaunchReportPanel({ report }) {
+  const items = [
+    { label: "실주문 잠금", value: report.real_order_lock, tone: statusTone(report.real_order_lock) },
+    { label: "SMALL LIVE", value: report.small_live_status, tone: statusTone(report.small_live_status) },
+    { label: "FULL LIVE", value: report.full_live_status, tone: statusTone(report.full_live_status) },
+    { label: "Hard Stop", value: report.hard_stop_count, tone: report.hard_stop_count ? "danger" : "success" },
+    { label: "Warning", value: report.warning_count, tone: report.warning_count ? "warning" : "success" },
+  ];
+  return (
+    <section className="panel launch-report-panel">
+      <PanelHeader title="실거래 승인 패키지" subtitle={`마지막 최종 점검 ${report.last_run}`} />
+      <div className="launch-lock">
+        <ShieldAlert size={18} />
+        <div>
+          <strong>{report.lock_reason}</strong>
+          <span>실제 주문 전송은 모든 hard stop과 warning 해소 후에만 검토합니다.</span>
+        </div>
+      </div>
+      <div className="metric-grid">
+        {items.map((item) => (
+          <div className="metric-card" key={item.label}>
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+            <StatusPill tone={item.tone}>LOCK</StatusPill>
+          </div>
+        ))}
+      </div>
+      <div className="next-actions">
+        {report.next_actions.map((action) => (
+          <span key={action}>{action}</span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function StrategyPanel({ strategies }) {
   return (
     <section className="panel strategy-panel">
@@ -1084,10 +1296,10 @@ function PositionPanel({ positions }) {
             <WalletCards size={16} />
             <div>
               <strong>{position.symbol}</strong>
-              <span>{position.asset}</span>
+              <span>{position.asset} · {position.broker_name}</span>
             </div>
-            <em>{position.program_qty} / {position.broker_qty}</em>
-            <StatusPill tone="warning">{position.status}</StatusPill>
+            <em>{position.program_qty} / {position.broker_qty} · Δ {position.delta_qty}</em>
+            <StatusPill tone={statusTone(position.status)}>{position.status_label}</StatusPill>
           </div>
         ))}
       </div>

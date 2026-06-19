@@ -52,6 +52,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/broker-check":
             self.send_json(state.run_broker_check(str(payload.get("broker_id", ""))))
             return
+        if parsed.path == "/api/reconcile":
+            self.send_json(state.run_reconciliation())
+            return
+        if parsed.path == "/api/preflight":
+            self.send_json(state.run_final_preflight())
+            return
         if parsed.path == "/api/audit-export":
             self.send_json(state.export_audit(str(payload.get("format", "csv"))))
             return

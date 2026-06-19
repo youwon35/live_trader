@@ -34,6 +34,14 @@ export async function runBrokerCheck(brokerId) {
   return request("/api/broker-check", { method: "POST", body: { broker_id: brokerId } });
 }
 
+export async function runReconciliation() {
+  return request("/api/reconcile", { method: "POST", body: {} });
+}
+
+export async function runFinalPreflight() {
+  return request("/api/preflight", { method: "POST", body: {} });
+}
+
 export async function exportAudit(format) {
   return request("/api/audit-export", { method: "POST", body: { format } });
 }

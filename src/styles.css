@@ -463,6 +463,49 @@ button {
   white-space: nowrap;
 }
 
+.panel-action-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 34px;
+  margin-bottom: 9px;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.metric-card {
+  display: grid;
+  gap: 6px;
+  min-height: 72px;
+  padding: 10px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.metric-card span:first-child {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-bold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-card strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: var(--font-weight-strong);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .queue-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -494,6 +537,7 @@ button {
 .check-list,
 .broker-list,
 .position-list,
+.account-list,
 .audit-list,
 .checklist-list,
 .settings-list {
@@ -1160,7 +1204,8 @@ button {
   font-size: var(--font-size-small);
 }
 
-.position-row {
+.position-row,
+.account-row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
@@ -1172,31 +1217,71 @@ button {
   border-radius: var(--radius-lg);
 }
 
-.position-row svg {
+.position-row svg,
+.account-row svg {
   color: var(--icon-blue);
 }
 
 .position-row strong,
-.position-row span {
+.position-row span,
+.account-row strong,
+.account-row span {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.position-row strong {
+.position-row strong,
+.account-row strong {
   font-size: 13px;
 }
 
 .position-row span,
-.position-row em {
+.position-row em,
+.account-row span,
+.account-row em {
   color: var(--text-muted);
   font-size: var(--font-size-small);
 }
 
-.position-row em {
+.position-row em,
+.account-row em {
   font-style: normal;
   font-weight: var(--font-weight-bold);
+}
+
+.launch-lock {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  min-height: 52px;
+  margin-bottom: 9px;
+  padding: 9px 10px;
+  color: var(--danger-soft-text);
+  background: var(--danger-surface);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-lg);
+}
+
+.launch-lock strong,
+.launch-lock span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.launch-lock strong {
+  font-size: 13px;
+  font-weight: var(--font-weight-bold);
+}
+
+.launch-lock span {
+  margin-top: 2px;
+  color: var(--danger-soft-text);
+  font-size: var(--font-size-small);
 }
 
 .audit-row {
@@ -1430,6 +1515,7 @@ button {
 
   .summary-grid,
   .queue-grid,
+  .metric-grid,
   .risk-grid,
   .workflow-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1452,7 +1538,7 @@ button {
   }
 
   .nav-list {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(44px, 1fr));
   }
 
   .nav-item {
@@ -1504,6 +1590,7 @@ button {
   .mode-selector,
   .summary-grid,
   .queue-grid,
+  .metric-grid,
   .risk-grid,
   .workflow-strip {
     grid-template-columns: 1fr;
@@ -1522,6 +1609,18 @@ button {
 
   .market-item {
     grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .position-row,
+  .account-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .position-row em,
+  .account-row em,
+  .position-row .status-pill,
+  .account-row .status-pill {
+    grid-column: 2;
   }
 
   .market-item .status-pill {
