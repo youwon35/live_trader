@@ -20,6 +20,26 @@ body {
   line-height: var(--line-height);
 }
 
+:root[data-ui-theme='light'] {
+  --text: #0b1220;
+  --text-soft: #172033;
+  --text-muted: #334155;
+  --table-head: #0f172a;
+  --table-cell: #1e293b;
+  --icon-blue: #2563eb;
+  --success-text: #047857;
+  --success-soft-text: #065f46;
+  --success-surface: rgba(5, 150, 105, 0.1);
+  --success-border: rgba(5, 150, 105, 0.36);
+  --danger-text: #b42318;
+  --danger-soft-text: #991b1b;
+  --danger-surface: rgba(220, 38, 38, 0.09);
+  --danger-border: rgba(220, 38, 38, 0.4);
+  --warning-text: #92400e;
+  --warning-surface: rgba(245, 158, 11, 0.13);
+  --warning-border: rgba(217, 119, 6, 0.42);
+}
+
 button,
 input {
   font: inherit;
@@ -533,7 +553,10 @@ button {
 }
 
 .env-list span {
-  padding: 4px 7px;
+  display: inline-grid;
+  place-items: center;
+  min-height: 26px;
+  padding: 0 8px 1px;
   color: var(--success-soft-text);
   background: var(--success-surface);
   border: 1px solid var(--success-border);
@@ -771,16 +794,18 @@ button {
 }
 
 .status-pill {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: inline-grid;
+  place-items: center;
   width: fit-content;
-  min-height: 23px;
-  padding: 0 8px;
+  min-width: 0;
+  height: 24px;
+  min-height: 24px;
+  padding: 0 9px 1px;
   border-radius: var(--radius-pill);
   font-size: var(--font-size-caption);
   font-weight: var(--font-weight-strong);
-  line-height: 1;
+  line-height: 1.15;
+  text-align: center;
   white-space: nowrap;
 }
 
@@ -814,6 +839,81 @@ button {
   border: 1px solid var(--border);
 }
 
+.compact-list {
+  display: grid;
+  gap: 8px;
+}
+
+.compact-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(0, 1.4fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 46px;
+  padding: 8px 10px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.compact-row strong,
+.compact-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compact-row strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--font-weight-bold);
+}
+
+.compact-row span {
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+}
+
+.workflow-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.workflow-step {
+  display: grid;
+  gap: 6px;
+  min-height: 94px;
+  padding: 10px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.workflow-step span {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  color: var(--text-inverse);
+  background: var(--primary);
+  border-radius: var(--radius-pill);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-strong);
+}
+
+.workflow-step strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--font-weight-strong);
+}
+
+.workflow-step em {
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  font-style: normal;
+}
+
 .spin {
   animation: spin 800ms linear infinite;
 }
@@ -831,7 +931,8 @@ button {
   }
 
   .summary-grid,
-  .risk-grid {
+  .risk-grid,
+  .workflow-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -903,7 +1004,12 @@ button {
   .market-strip,
   .mode-selector,
   .summary-grid,
-  .risk-grid {
+  .risk-grid,
+  .workflow-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .compact-row {
     grid-template-columns: 1fr;
   }
 

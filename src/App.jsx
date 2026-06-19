@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   BadgeCheck,
@@ -195,36 +195,149 @@ function App() {
           </section>
         )}
 
-        <section className="command-grid">
-          <ModeConsole
-            mode={snapshot.mode}
-            canLive={canLive}
-            canFullLive={canFullLive}
-            onMode={(mode) => runAction(() => setMode(mode))}
-            onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
-            operatorConfirmed={snapshot.operator_confirmed}
-            newEntriesBlocked={snapshot.new_entries_blocked}
-            onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
-            onTestIntent={() => runAction(submitTestIntent)}
-          />
-          <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
-        </section>
-
-        <section className="content-grid">
-          <div className="content-column">
-            <ReadinessPanel checks={snapshot.readiness} />
-            <RiskPanel checks={snapshot.risk_checks} />
-            <StrategyPanel strategies={snapshot.strategies} />
-            <OrderPanel orders={snapshot.orders} />
-            <AuditPanel audit={snapshot.audit} />
-          </div>
-          <div className="content-column">
-            <BrokerPanel brokers={snapshot.brokers} />
-            <PositionPanel positions={snapshot.positions} />
-          </div>
-        </section>
+        <WorkspaceContent
+          selectedNav={selectedNav}
+          snapshot={snapshot}
+          canLive={canLive}
+          canFullLive={canFullLive}
+          onMode={(mode) => runAction(() => setMode(mode))}
+          onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
+          onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
+          onTestIntent={() => runAction(submitTestIntent)}
+        />
       </main>
     </div>
+  );
+}
+
+function WorkspaceContent({
+  selectedNav,
+  snapshot,
+  canLive,
+  canFullLive,
+  onMode,
+  onConfirm,
+  onEntryBlock,
+  onTestIntent,
+}) {
+  const modeConsole = (
+    <ModeConsole
+      mode={snapshot.mode}
+      canLive={canLive}
+      canFullLive={canFullLive}
+      onMode={onMode}
+      onConfirm={onConfirm}
+      operatorConfirmed={snapshot.operator_confirmed}
+      newEntriesBlocked={snapshot.new_entries_blocked}
+      onEntryBlock={onEntryBlock}
+      onTestIntent={onTestIntent}
+    />
+  );
+
+  if (selectedNav === "gate") {
+    return (
+      <section className="content-grid">
+        <div className="content-column">
+          {modeConsole}
+          <ReadinessPanel checks={snapshot.readiness} />
+          <RiskPanel checks={snapshot.risk_checks} />
+        </div>
+        <div className="content-column">
+          <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
+          <GateRunbookPanel />
+          <PositionPanel positions={snapshot.positions} />
+        </div>
+      </section>
+    );
+  }
+
+  if (selectedNav === "orders") {
+    return (
+      <section className="content-grid">
+        <div className="content-column">
+          <OrderCommandPanel
+            newEntriesBlocked={snapshot.new_entries_blocked}
+            killSwitch={snapshot.kill_switch}
+            onEntryBlock={onEntryBlock}
+            onTestIntent={onTestIntent}
+          />
+          <OrderPanel orders={snapshot.orders} />
+          <RiskPanel checks={snapshot.risk_checks} />
+        </div>
+        <div className="content-column">
+          <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
+          <PositionPanel positions={snapshot.positions} />
+        </div>
+      </section>
+    );
+  }
+
+  if (selectedNav === "brokers") {
+    return (
+      <section className="content-grid">
+        <div className="content-column">
+          <BrokerPanel brokers={snapshot.brokers} />
+          <BrokerRequirementsPanel brokers={snapshot.brokers} />
+        </div>
+        <div className="content-column">
+          <PositionPanel positions={snapshot.positions} />
+          <ReadinessPanel checks={snapshot.readiness} />
+        </div>
+      </section>
+    );
+  }
+
+  if (selectedNav === "strategies") {
+    return (
+      <section className="content-grid">
+        <div className="content-column">
+          <StrategyPanel strategies={snapshot.strategies} />
+          <StrategyWorkflowPanel />
+        </div>
+        <div className="content-column">
+          <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
+          <ReadinessPanel checks={snapshot.readiness} />
+        </div>
+      </section>
+    );
+  }
+
+  if (selectedNav === "audit") {
+    return (
+      <section className="content-grid">
+        <div className="content-column">
+          <AuditPanel audit={snapshot.audit} />
+          <AuditExportPanel />
+        </div>
+        <div className="content-column">
+          <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
+          <RiskPanel checks={snapshot.risk_checks} />
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <>
+      <section className="command-grid">
+        {modeConsole}
+        <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
+      </section>
+
+      <section className="content-grid">
+        <div className="content-column">
+          <ReadinessPanel checks={snapshot.readiness} />
+          <RiskPanel checks={snapshot.risk_checks} />
+          <StrategyPanel strategies={snapshot.strategies} />
+          <OrderPanel orders={snapshot.orders} />
+          <AuditPanel audit={snapshot.audit} />
+        </div>
+        <div className="content-column">
+          <BrokerPanel brokers={snapshot.brokers} />
+          <PositionPanel positions={snapshot.positions} />
+        </div>
+      </section>
+    </>
   );
 }
 
@@ -392,6 +505,108 @@ function RiskPanel({ checks }) {
             <em>{check.value}</em>
           </div>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function GateRunbookPanel() {
+  const items = [
+    ["API", "실계좌 키와 주문 어댑터 확인"],
+    ["권한", "live_allowed 전략만 통과"],
+    ["대조", "브로커 포지션과 프로그램 포지션 비교"],
+    ["승인", "운용자 확인 후 SMALL_LIVE부터 시작"],
+  ];
+  return (
+    <section className="panel">
+      <PanelHeader title="Live Gate 체크라인" subtitle="실거래 전환 전 필요한 운영 조건입니다." />
+      <div className="compact-list">
+        {items.map(([label, detail]) => (
+          <div className="compact-row" key={label}>
+            <strong>{label}</strong>
+            <span>{detail}</span>
+            <StatusPill tone="neutral">필수</StatusPill>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function OrderCommandPanel({ newEntriesBlocked, killSwitch, onEntryBlock, onTestIntent }) {
+  return (
+    <section className="panel">
+      <PanelHeader title="주문 제어" subtitle="실주문 전송 전 차단 상태와 테스트 게이트를 관리합니다." />
+      <div className="operator-actions">
+        <button className={`secondary-button ${newEntriesBlocked ? "active" : ""}`} type="button" onClick={onEntryBlock}>
+          <ShieldCheck size={16} />
+          신규 진입 차단
+        </button>
+        <button className="primary-button" type="button" onClick={onTestIntent}>
+          <TerminalSquare size={16} />
+          테스트 주문 게이트
+        </button>
+        <StatusPill tone={killSwitch ? "danger" : "success"}>{killSwitch ? "KILL ON" : "KILL OFF"}</StatusPill>
+      </div>
+    </section>
+  );
+}
+
+function BrokerRequirementsPanel({ brokers }) {
+  return (
+    <section className="panel">
+      <PanelHeader title="브로커 준비 항목" subtitle="실제 주문 연결 전에 비어 있는 환경 값을 확인합니다." />
+      <div className="compact-list">
+        {brokers.map((broker) => (
+          <div className="compact-row" key={broker.broker_id}>
+            <strong>{broker.name}</strong>
+            <span>{broker.missing_env.length ? `${broker.missing_env.length}개 값 필요` : "환경 값 입력됨"}</span>
+            <StatusPill tone={broker.order_ready ? "success" : "danger"}>{broker.order_ready ? "ready" : "blocked"}</StatusPill>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function StrategyWorkflowPanel() {
+  const steps = [
+    ["BACKTEST", "최종 테스트 통과"],
+    ["SHADOW", "실시간 신호 기록"],
+    ["PAPER", "모의 체결 검증"],
+    ["LIVE", "live_allowed 승인"],
+  ];
+  return (
+    <section className="panel">
+      <PanelHeader title="전략 승급 흐름" subtitle="실거래 전략은 승인 단계와 계약 권한을 모두 통과해야 합니다." />
+      <div className="workflow-strip">
+        {steps.map(([label, detail], index) => (
+          <div className="workflow-step" key={label}>
+            <span>{index + 1}</span>
+            <strong>{label}</strong>
+            <em>{detail}</em>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AuditExportPanel() {
+  return (
+    <section className="panel">
+      <PanelHeader title="감사 로그 틀" subtitle="주문 차단, 모드 변경, 설정 변경을 내보내기 위한 영역입니다." />
+      <div className="compact-list">
+        <div className="compact-row">
+          <strong>CSV</strong>
+          <span>운영 이벤트 원장</span>
+          <StatusPill tone="neutral">준비</StatusPill>
+        </div>
+        <div className="compact-row">
+          <strong>HTML</strong>
+          <span>인쇄용 운용 리포트</span>
+          <StatusPill tone="neutral">준비</StatusPill>
+        </div>
       </div>
     </section>
   );
