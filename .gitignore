@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build/
+release/
+qa/
+__pycache__/
+live_trader/__pycache__/
+.server.pid
+.venv/
+*.log
