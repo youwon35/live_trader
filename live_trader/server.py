@@ -40,6 +40,15 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/checklist":
             self.send_json(state.set_checklist_item(str(payload.get("name", "")), bool(payload.get("value"))))
             return
+        if parsed.path == "/api/retry-policy":
+            self.send_json(state.set_retry_policy(str(payload.get("name", "")), payload.get("value")))
+            return
+        if parsed.path == "/api/order-retry":
+            self.send_json(state.retry_order(str(payload.get("order_id", ""))))
+            return
+        if parsed.path == "/api/order-cancel":
+            self.send_json(state.cancel_order(str(payload.get("order_id", ""))))
+            return
         if parsed.path == "/api/audit-export":
             self.send_json(state.export_audit(str(payload.get("format", "csv"))))
             return

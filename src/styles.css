@@ -463,6 +463,34 @@ button {
   white-space: nowrap;
 }
 
+.queue-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.queue-card {
+  display: grid;
+  gap: 6px;
+  min-height: 72px;
+  padding: 10px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.queue-card span:first-child {
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-bold);
+}
+
+.queue-card strong {
+  color: var(--text);
+  font-size: 19px;
+  font-weight: var(--font-weight-strong);
+}
+
 .check-list,
 .broker-list,
 .position-list,
@@ -672,7 +700,19 @@ button {
   gap: 6px;
 }
 
-.setting-row input {
+.setting-row .switch-label {
+  grid-template-columns: auto minmax(34px, auto);
+  justify-content: end;
+}
+
+.switch-label input {
+  width: 16px;
+  height: 16px;
+  min-height: 16px;
+  accent-color: var(--primary);
+}
+
+.setting-row input[type="number"] {
   width: 100%;
   min-height: 32px;
   padding: 0 8px;
@@ -769,7 +809,8 @@ button {
 
 .order-table .table-head,
 .order-table .table-row {
-  grid-template-columns: 66px 132px minmax(170px, 1fr) 100px 60px 112px minmax(260px, 1.4fr);
+  grid-template-columns: 66px 132px minmax(160px, 1fr) 96px 56px 112px 76px 58px 64px minmax(280px, 1.3fr) 74px;
+  min-width: 1240px;
 }
 
 .table-head {
@@ -813,6 +854,83 @@ button {
 .side-buy {
   color: var(--success-text) !important;
   font-weight: var(--font-weight-strong);
+}
+
+.order-ledger-list {
+  display: grid;
+  gap: 8px;
+}
+
+.order-ledger-row {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.order-ledger-head,
+.order-ledger-foot {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.order-ledger-head strong,
+.order-ledger-head span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.order-ledger-head strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--font-weight-bold);
+}
+
+.order-ledger-head span {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+}
+
+.order-ledger-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.order-ledger-meta span {
+  display: inline-grid;
+  place-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  color: var(--text-soft);
+  background: var(--panel-strong);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-bold);
+}
+
+.order-ledger-foot em {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.order-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
 }
 
 .empty-row {
@@ -994,7 +1112,12 @@ button {
   font-size: var(--font-size-small);
 }
 
-.mini-button {
+.ledger-row span {
+  min-width: 0;
+}
+
+.mini-button,
+.mini-icon-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1008,6 +1131,16 @@ button {
   font-size: var(--font-size-caption);
   font-weight: var(--font-weight-strong);
   white-space: nowrap;
+}
+
+.mini-icon-button {
+  width: 30px;
+  padding: 0;
+}
+
+.mini-icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .export-result {
@@ -1082,6 +1215,7 @@ button {
   }
 
   .summary-grid,
+  .queue-grid,
   .risk-grid,
   .workflow-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1155,6 +1289,7 @@ button {
   .market-strip,
   .mode-selector,
   .summary-grid,
+  .queue-grid,
   .risk-grid,
   .workflow-strip {
     grid-template-columns: 1fr;

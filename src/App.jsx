@@ -5,6 +5,7 @@ import {
   Bell,
   CircleStop,
   ClipboardCheck,
+  Clock3,
   DatabaseZap,
   Download,
   FileClock,
@@ -18,6 +19,7 @@ import {
   Power,
   Radio,
   RefreshCcw,
+  RotateCcw,
   Route,
   Search,
   ShieldAlert,
@@ -28,7 +30,18 @@ import {
   TerminalSquare,
   WalletCards,
 } from "lucide-react";
-import { exportAudit, getSnapshot, setChecklistItem, setFlag, setMode, setRiskSetting, submitTestIntent } from "./api";
+import {
+  cancelOrder,
+  exportAudit,
+  getSnapshot,
+  retryOrder,
+  setChecklistItem,
+  setFlag,
+  setMode,
+  setRetryPolicy,
+  setRiskSetting,
+  submitTestIntent,
+} from "./api";
 
 const navItems = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -52,6 +65,9 @@ const fallbackSnapshot = {
   risk_checks: [],
   risk_settings: [],
   checklist: [],
+  retry_policy: [],
+  order_queue: { total: 0, blocked: 0, dry_run: 0, retryable: 0, canceled: 0 },
+  dry_run_ledger: [],
   brokers: [],
   strategies: [],
   orders: [],
@@ -231,6 +247,9 @@ function App() {
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
           onChecklist={(name, value) => runAction(() => setChecklistItem(name, value))}
+          onRetryPolicy={(name, value) => runAction(() => setRetryPolicy(name, value))}
+          onRetryOrder={(orderId) => runAction(() => retryOrder(orderId))}
+          onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
           onAuditExport={runAuditExport}
           exportResult={exportResult}
         />
@@ -263,6 +282,9 @@ function WorkspaceContent({
   onTestIntent,
   onRiskSetting,
   onChecklist,
+  onRetryPolicy,
+  onRetryOrder,
+  onCancelOrder,
   onAuditExport,
   exportResult,
 }) {
@@ -313,11 +335,14 @@ function WorkspaceContent({
             onEntryBlock={onEntryBlock}
             onTestIntent={onTestIntent}
           />
-          <OrderPanel orders={snapshot.orders} />
+          <OrderQueueSummaryPanel summary={snapshot.order_queue} />
+          <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
           <RiskPanel checks={snapshot.risk_checks} />
         </div>
         <div className="content-column">
           <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
+          <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
+          <DryRunLedgerPanel ledger={snapshot.dry_run_ledger} />
           <PositionPanel positions={snapshot.positions} />
         </div>
       </section>
@@ -382,7 +407,7 @@ function WorkspaceContent({
           <RunbookChecklistPanel checklist={snapshot.checklist} onChecklist={onChecklist} />
           <RiskPanel checks={snapshot.risk_checks} />
           <StrategyPanel strategies={snapshot.strategies} />
-          <OrderPanel orders={snapshot.orders} />
+          <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
           <AuditPanel audit={snapshot.audit} />
         </div>
         <div className="content-column">
@@ -400,8 +425,11 @@ function StatusPill({ children, tone = "neutral" }) {
 
 function statusTone(status) {
   if (status === "pass" || status === "connected" || status === "open" || status === "dry_run") return "success";
-  if (status === "warn" || status === "watch" || status === "adapter_required") return "warning";
-  if (status === "fail" || status === "blocked" || status === "missing_credentials" || status === "risk_blocked") return "danger";
+  if (status === "warn" || status === "watch" || status === "adapter_required" || status === "adapter_blocked") return "warning";
+  if (status === "fail" || status === "blocked" || status === "missing_credentials" || status === "risk_blocked" || status === "retry_exhausted") {
+    return "danger";
+  }
+  if (status === "canceled") return "neutral";
   return "neutral";
 }
 
@@ -683,6 +711,103 @@ function OrderCommandPanel({ newEntriesBlocked, dryRun, killSwitch, onDryRun, on
   );
 }
 
+function OrderQueueSummaryPanel({ summary }) {
+  const items = [
+    { label: "전체 주문", value: summary.total, tone: summary.total ? "info" : "neutral" },
+    { label: "차단", value: summary.blocked, tone: summary.blocked ? "danger" : "success" },
+    { label: "Dry Run", value: summary.dry_run, tone: summary.dry_run ? "success" : "neutral" },
+    { label: "재시도 가능", value: summary.retryable, tone: summary.retryable ? "warning" : "neutral" },
+    { label: "취소", value: summary.canceled, tone: summary.canceled ? "neutral" : "success" },
+  ];
+  return (
+    <section className="panel order-queue-panel">
+      <PanelHeader title="주문 큐 요약" subtitle="주문 의도의 현재 생명주기 상태입니다." />
+      <div className="queue-grid">
+        {items.map((item) => (
+          <div className="queue-card" key={item.label}>
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+            <StatusPill tone={item.tone}>QUEUE</StatusPill>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function RetryPolicyPanel({ policy, onRetryPolicy }) {
+  function commitNumber(event, setting) {
+    const nextValue = event.currentTarget.value;
+    if (Number(nextValue) !== Number(setting.value)) {
+      onRetryPolicy(setting.key, nextValue);
+    }
+  }
+
+  return (
+    <section className="panel retry-policy-panel">
+      <PanelHeader title="재시도 정책" subtitle="브로커 전송 전 단계에서 사용할 재시도 기준입니다." />
+      <div className="settings-list">
+        {policy.map((setting) => (
+          <div className="setting-row" key={setting.key}>
+            <Clock3 size={16} />
+            <div>
+              <strong>{setting.label}</strong>
+              <span>{setting.detail}</span>
+            </div>
+            {setting.type === "boolean" ? (
+              <label className="switch-label">
+                <input
+                  type="checkbox"
+                  checked={setting.value}
+                  onChange={(event) => onRetryPolicy(setting.key, event.currentTarget.checked)}
+                />
+                <span>{setting.value ? "ON" : "OFF"}</span>
+              </label>
+            ) : (
+              <label>
+                <input
+                  key={`${setting.key}-${setting.value}`}
+                  type="number"
+                  defaultValue={setting.value}
+                  min={setting.min}
+                  max={setting.max}
+                  step={setting.step}
+                  onBlur={(event) => commitNumber(event, setting)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
+                />
+                <span>{setting.unit}</span>
+              </label>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function DryRunLedgerPanel({ ledger }) {
+  return (
+    <section className="panel dry-ledger-panel">
+      <PanelHeader title="Dry Run 주문 원장" subtitle="브로커 전송 없이 기록된 주문 의도와 차단 결과입니다." />
+      <div className="compact-list">
+        {ledger.length === 0 ? (
+          <EmptyRow text="아직 Dry Run 주문 의도가 없습니다." />
+        ) : (
+          ledger.map((order) => (
+            <div className="compact-row ledger-row" key={order.order_id}>
+              <strong>{order.symbol}</strong>
+              <span>{order.order_id} · {order.attempts}/{order.max_attempts}회 · {order.reason}</span>
+              <StatusPill tone={statusTone(order.state)}>{order.state}</StatusPill>
+            </div>
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
+
 function BrokerRequirementsPanel({ brokers }) {
   return (
     <section className="panel">
@@ -783,32 +908,55 @@ function StrategyPanel({ strategies }) {
   );
 }
 
-function OrderPanel({ orders }) {
+function OrderPanel({ orders, onRetryOrder, onCancelOrder }) {
   return (
     <section className="panel order-panel">
-      <PanelHeader title="Order Blotter" subtitle="차단된 주문도 감사 추적을 위해 남깁니다." />
-      <div className="data-table order-table">
-        <div className="table-head">
-          <span>시간</span>
-          <span>주문ID</span>
-          <span>전략</span>
-          <span>심볼</span>
-          <span>방향</span>
-          <span>상태</span>
-          <span>사유</span>
-        </div>
+      <PanelHeader title="Order Blotter" subtitle="차단, Dry Run, 재시도, 취소 이벤트를 감사 추적합니다." />
+      <div className="order-ledger-list">
         {orders.length === 0 ? (
           <EmptyRow text="아직 주문 이벤트가 없습니다. 테스트 주문 게이트를 누르면 차단 이벤트가 생성됩니다." />
         ) : (
           orders.map((order) => (
-            <div className="table-row" key={order.order_id}>
-              <span>{order.time}</span>
-              <strong>{order.order_id}</strong>
-              <span>{order.strategy_id}</span>
-              <span>{order.symbol}</span>
-              <span className="side-buy">{order.side}</span>
-              <StatusPill tone={statusTone(order.state)}>{order.state}</StatusPill>
-              <em>{order.reason}</em>
+            <div className="order-ledger-row" key={order.order_id}>
+              <div className="order-ledger-head">
+                <div>
+                  <strong>{order.order_id}</strong>
+                  <span>{order.time} · {order.strategy_id}</span>
+                </div>
+                <StatusPill tone={statusTone(order.state)}>{order.state}</StatusPill>
+              </div>
+              <div className="order-ledger-meta">
+                <span>{order.symbol}</span>
+                <span className="side-buy">{order.side}</span>
+                <span>큐 {order.queue_state}</span>
+                <span>시도 {order.attempts}/{order.max_attempts}</span>
+                <span>다음 {order.next_retry_at}</span>
+              </div>
+              <div className="order-ledger-foot">
+                <em>{order.reason}</em>
+                <div className="order-actions">
+                  <button
+                    className="mini-icon-button"
+                    type="button"
+                    title="재시도"
+                    aria-label={`${order.order_id} 재시도`}
+                    disabled={!order.retryable}
+                    onClick={() => onRetryOrder(order.order_id)}
+                  >
+                    <RotateCcw size={13} />
+                  </button>
+                  <button
+                    className="mini-icon-button"
+                    type="button"
+                    title="취소"
+                    aria-label={`${order.order_id} 취소`}
+                    disabled={order.state === "canceled"}
+                    onClick={() => onCancelOrder(order.order_id)}
+                  >
+                    <CircleStop size={13} />
+                  </button>
+                </div>
+              </div>
             </div>
           ))
         )}

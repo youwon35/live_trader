@@ -4,7 +4,7 @@ import os
 import csv
 import html
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 from typing import Any, Literal
 
@@ -109,6 +109,48 @@ CHECKLIST_ITEMS: tuple[dict[str, object], ...] = (
     },
 )
 
+RETRY_POLICY_META: dict[str, dict[str, object]] = {
+    "max_attempts": {
+        "label": "최대 재시도",
+        "unit": "회",
+        "type": "number",
+        "min": 1.0,
+        "max": 10.0,
+        "step": 1.0,
+        "detail": "같은 주문 의도가 실패했을 때 자동/수동 재시도가 가능한 최대 횟수입니다.",
+    },
+    "backoff_sec": {
+        "label": "재시도 대기",
+        "unit": "초",
+        "type": "number",
+        "min": 5.0,
+        "max": 3600.0,
+        "step": 5.0,
+        "detail": "실패 후 다음 재시도 가능 시각까지 기다리는 기본 시간입니다.",
+    },
+    "retry_on_network_error": {
+        "label": "네트워크 오류 재시도",
+        "unit": "",
+        "type": "boolean",
+        "detail": "브로커 API 네트워크 오류일 때 재시도 대상으로 표시합니다.",
+    },
+    "retry_on_rate_limit": {
+        "label": "레이트 리밋 재시도",
+        "unit": "",
+        "type": "boolean",
+        "detail": "거래소 레이트 리밋 응답일 때 재시도 대상으로 표시합니다.",
+    },
+}
+
+DEFAULT_RETRY_POLICY: dict[str, float | bool] = {
+    "max_attempts": 3.0,
+    "backoff_sec": 30.0,
+    "retry_on_network_error": True,
+    "retry_on_rate_limit": True,
+}
+
+FINAL_ORDER_STATES = {"dry_run", "sent", "filled", "canceled", "retry_exhausted"}
+
 
 @dataclass(frozen=True)
 class Check:
@@ -128,6 +170,7 @@ STATE: dict[str, Any] = {
     "operator_confirmed": False,
     "risk_settings": dict(DEFAULT_RISK_SETTINGS),
     "checklist": {str(item["key"]): False for item in CHECKLIST_ITEMS},
+    "retry_policy": dict(DEFAULT_RETRY_POLICY),
     "orders": [],
     "audit": [
         {
@@ -148,6 +191,10 @@ STATE: dict[str, Any] = {
 
 def now_text() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+def future_text(seconds: float) -> str:
+    return (datetime.now() + timedelta(seconds=max(0.0, seconds))).strftime("%H:%M:%S")
 
 
 def env_enabled(name: str, default: bool = False) -> bool:
@@ -325,6 +372,54 @@ def checklist_rows() -> list[dict[str, object]]:
     ]
 
 
+def retry_policy_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for key, meta in RETRY_POLICY_META.items():
+        rows.append(
+            {
+                "key": key,
+                "value": STATE["retry_policy"][key],
+                **meta,
+            }
+        )
+    return rows
+
+
+def can_retry_order(order: dict[str, Any]) -> bool:
+    if order.get("state") in FINAL_ORDER_STATES:
+        return False
+    if order.get("queue_state") == "canceled":
+        return False
+    max_attempts = int(float(STATE["retry_policy"]["max_attempts"]))
+    return int(order.get("attempts", 0)) < max_attempts
+
+
+def order_rows() -> list[dict[str, Any]]:
+    return [
+        {
+            **order,
+            "retryable": can_retry_order(order),
+            "max_attempts": int(float(STATE["retry_policy"]["max_attempts"])),
+        }
+        for order in STATE["orders"]
+    ]
+
+
+def dry_run_ledger_rows() -> list[dict[str, Any]]:
+    return [order for order in order_rows() if order.get("dry_run") is True][:20]
+
+
+def order_queue_summary() -> dict[str, int]:
+    rows = order_rows()
+    return {
+        "total": len(rows),
+        "blocked": sum(1 for order in rows if order["state"] == "risk_blocked"),
+        "dry_run": sum(1 for order in rows if order.get("dry_run") is True),
+        "retryable": sum(1 for order in rows if order["retryable"]),
+        "canceled": sum(1 for order in rows if order["state"] == "canceled"),
+    }
+
+
 def snapshot() -> dict[str, Any]:
     brokers = [broker.to_dict() for broker in broker_readiness()]
     strategies = strategy_rows()
@@ -350,9 +445,12 @@ def snapshot() -> dict[str, Any]:
         "risk_checks": risk_checks(),
         "risk_settings": risk_setting_rows(),
         "checklist": checklist_rows(),
+        "retry_policy": retry_policy_rows(),
+        "order_queue": order_queue_summary(),
         "brokers": brokers,
         "strategies": strategies,
-        "orders": STATE["orders"],
+        "orders": order_rows(),
+        "dry_run_ledger": dry_run_ledger_rows(),
         "positions": positions(),
         "audit": list(reversed(STATE["audit"][-30:])),
     }
@@ -424,6 +522,27 @@ def set_checklist_item(name: str, value: bool) -> dict[str, Any]:
     return {"ok": True, "reason": "checklist changed", "snapshot": snapshot()}
 
 
+def set_retry_policy(name: str, value: object) -> dict[str, Any]:
+    meta = RETRY_POLICY_META.get(name)
+    if not meta:
+        return {"ok": False, "reason": "unknown retry policy", "snapshot": snapshot()}
+    if meta["type"] == "boolean":
+        STATE["retry_policy"][name] = bool(value)
+        append_audit("info", "재시도 정책 변경", f"{meta['label']} 값이 {bool(value)}(으)로 변경되었습니다.")
+        return {"ok": True, "reason": "retry policy changed", "snapshot": snapshot()}
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "retry policy must be numeric", "snapshot": snapshot()}
+    minimum = float(meta["min"])
+    maximum = float(meta["max"])
+    if numeric < minimum or numeric > maximum:
+        return {"ok": False, "reason": f"{meta['label']} 값은 {minimum:g}~{maximum:g} 범위여야 합니다.", "snapshot": snapshot()}
+    STATE["retry_policy"][name] = float(int(numeric))
+    append_audit("info", "재시도 정책 변경", f"{meta['label']} 값이 {int(numeric)}{meta['unit']}(으)로 변경되었습니다.")
+    return {"ok": True, "reason": "retry policy changed", "snapshot": snapshot()}
+
+
 def export_audit(format_name: str) -> dict[str, Any]:
     normalized = format_name.lower().strip()
     if normalized not in {"csv", "html"}:
@@ -478,37 +597,96 @@ def export_audit(format_name: str) -> dict[str, Any]:
     }
 
 
+def evaluate_order_gate(checks: dict[str, Any], side: str, dry_run: bool) -> tuple[bool, str, str, str]:
+    blocker_count = int(checks["summary"]["blocker_count"])
+    if STATE["new_entries_blocked"] and side == "BUY":
+        return False, "risk_blocked", "blocked", "신규 진입 차단이 켜져 있어 BUY 주문을 차단했습니다."
+    if blocker_count:
+        return False, "risk_blocked", "blocked", f"readiness blocker {blocker_count}개가 남아 있어 실거래 주문을 제출하지 않았습니다."
+    if dry_run:
+        return True, "dry_run", "simulated", "Dry Run 보호가 켜져 있어 브로커 전송 없이 주문 의도를 감사 로그에만 기록했습니다."
+    return False, "adapter_blocked", "held", "실제 주문 어댑터 안전 검증 전이므로 브로커 전송을 차단했습니다."
+
+
+def next_order_id(state_name: str, dry_run: bool) -> str:
+    if state_name == "dry_run" or dry_run:
+        prefix = "LIVE-DRY"
+    elif state_name == "canceled":
+        prefix = "LIVE-CXL"
+    else:
+        prefix = "LIVE-BLOCK"
+    return f"{prefix}-{len(STATE['orders']) + 1:04d}"
+
+
 def submit_test_intent() -> dict[str, Any]:
     checks = snapshot()
     strategy = next((item for item in checks["strategies"] if item["live_allowed"]), checks["strategies"][0])
     side = "BUY"
-    blocker_count = int(checks["summary"]["blocker_count"])
-    order_state = "risk_blocked"
-    ok = False
-    reason = "readiness blocker가 남아 있어 실거래 주문을 제출하지 않았습니다."
-    if STATE["new_entries_blocked"] and side == "BUY":
-        reason = "신규 진입 차단이 켜져 있어 BUY 주문을 차단했습니다."
-    elif blocker_count:
-        reason = f"readiness blocker {blocker_count}개가 남아 있어 실거래 주문을 제출하지 않았습니다."
-    elif STATE["dry_run"]:
-        order_state = "dry_run"
-        ok = True
-        reason = "Dry Run 보호가 켜져 있어 브로커 전송 없이 주문 의도를 감사 로그에만 기록했습니다."
-    else:
-        reason = "실제 주문 어댑터 안전 검증 전이므로 브로커 전송을 차단했습니다."
-    order_prefix = "LIVE-DRY" if order_state == "dry_run" else "LIVE-BLOCK"
+    dry_run = bool(STATE["dry_run"])
+    ok, order_state, queue_state, reason = evaluate_order_gate(checks, side, dry_run)
+    retry_backoff = float(STATE["retry_policy"]["backoff_sec"])
     order = {
         "time": now_text(),
-        "order_id": f"{order_prefix}-{len(STATE['orders']) + 1:04d}",
+        "created_at": now_text(),
+        "updated_at": now_text(),
+        "order_id": next_order_id(order_state, dry_run),
         "strategy_id": strategy["strategy_id"],
         "symbol": strategy["symbol"],
         "side": side,
         "qty": "1",
         "notional": "테스트",
         "state": order_state,
+        "queue_state": queue_state,
+        "attempts": 1,
+        "next_retry_at": future_text(retry_backoff) if order_state in {"risk_blocked", "adapter_blocked"} else "-",
+        "broker_order_id": "-",
+        "dry_run": dry_run,
         "reason": reason,
     }
     STATE["orders"].insert(0, order)
     STATE["orders"] = STATE["orders"][:50]
     append_audit("info" if ok else "danger", "주문 게이트", f"{order['symbol']} {side}: {reason}")
     return {"ok": ok, "reason": reason, "snapshot": snapshot()}
+
+
+def find_order(order_id: str) -> dict[str, Any] | None:
+    return next((order for order in STATE["orders"] if order.get("order_id") == order_id), None)
+
+
+def retry_order(order_id: str) -> dict[str, Any]:
+    order = find_order(order_id)
+    if not order:
+        return {"ok": False, "reason": "order not found", "snapshot": snapshot()}
+    if not can_retry_order(order):
+        append_audit("warn", "주문 재시도 차단", f"{order_id} 주문은 재시도 대상이 아닙니다.")
+        return {"ok": False, "reason": "order is not retryable", "snapshot": snapshot()}
+
+    order["attempts"] = int(order.get("attempts", 0)) + 1
+    order["updated_at"] = now_text()
+    checks = snapshot()
+    ok, state_name, queue_state, reason = evaluate_order_gate(checks, str(order.get("side", "BUY")), bool(order.get("dry_run", STATE["dry_run"])))
+    if not ok and order["attempts"] >= int(float(STATE["retry_policy"]["max_attempts"])):
+        state_name = "retry_exhausted"
+        queue_state = "failed"
+        reason = f"재시도 {order['attempts']}회가 모두 소진되었습니다. 마지막 사유: {reason}"
+    order["state"] = state_name
+    order["queue_state"] = queue_state
+    order["reason"] = reason
+    order["next_retry_at"] = future_text(float(STATE["retry_policy"]["backoff_sec"])) if can_retry_order(order) else "-"
+    append_audit("info" if ok else "warn", "주문 재시도", f"{order_id}: {reason}")
+    return {"ok": ok, "reason": reason, "snapshot": snapshot()}
+
+
+def cancel_order(order_id: str) -> dict[str, Any]:
+    order = find_order(order_id)
+    if not order:
+        return {"ok": False, "reason": "order not found", "snapshot": snapshot()}
+    if order.get("state") == "canceled":
+        return {"ok": True, "reason": "order already canceled", "snapshot": snapshot()}
+    order["state"] = "canceled"
+    order["queue_state"] = "canceled"
+    order["updated_at"] = now_text()
+    order["next_retry_at"] = "-"
+    order["reason"] = "운용자 요청으로 주문 큐 항목을 취소했습니다."
+    append_audit("warn", "주문 취소", f"{order_id} 주문 큐 항목을 취소했습니다.")
+    return {"ok": True, "reason": "order canceled", "snapshot": snapshot()}
