@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from io import StringIO
 from typing import Any, Literal
 
-from .brokers import broker_readiness, real_orders_enabled
+from .brokers import broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts
 
 
@@ -448,6 +448,8 @@ def snapshot() -> dict[str, Any]:
         "retry_policy": retry_policy_rows(),
         "order_queue": order_queue_summary(),
         "brokers": brokers,
+        "broker_diagnostics": broker_diagnostics(),
+        "broker_adapter_contract": broker_adapter_contract(),
         "strategies": strategies,
         "orders": order_rows(),
         "dry_run_ledger": dry_run_ledger_rows(),
@@ -541,6 +543,24 @@ def set_retry_policy(name: str, value: object) -> dict[str, Any]:
     STATE["retry_policy"][name] = float(int(numeric))
     append_audit("info", "재시도 정책 변경", f"{meta['label']} 값이 {int(numeric)}{meta['unit']}(으)로 변경되었습니다.")
     return {"ok": True, "reason": "retry policy changed", "snapshot": snapshot()}
+
+
+def run_broker_check(broker_id: str) -> dict[str, Any]:
+    diagnostics = broker_diagnostics(broker_id)
+    if not diagnostics:
+        return {"ok": False, "reason": "unknown broker", "snapshot": snapshot()}
+    item = diagnostics[0]
+    append_audit(
+        "danger" if item["fail_count"] else "warn" if item["warn_count"] else "info",
+        "브로커 연결 점검",
+        f"{item['name']}: fail {item['fail_count']}개, warn {item['warn_count']}개",
+    )
+    return {
+        "ok": True,
+        "reason": f"브로커 점검 완료: fail {item['fail_count']}개, warn {item['warn_count']}개",
+        "diagnostics": diagnostics,
+        "snapshot": snapshot(),
+    }
 
 
 def export_audit(format_name: str) -> dict[str, Any]:

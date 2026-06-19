@@ -30,6 +30,10 @@ export async function cancelOrder(orderId) {
   return request("/api/order-cancel", { method: "POST", body: { order_id: orderId } });
 }
 
+export async function runBrokerCheck(brokerId) {
+  return request("/api/broker-check", { method: "POST", body: { broker_id: brokerId } });
+}
+
 export async function exportAudit(format) {
   return request("/api/audit-export", { method: "POST", body: { format } });
 }

@@ -49,6 +49,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/order-cancel":
             self.send_json(state.cancel_order(str(payload.get("order_id", ""))))
             return
+        if parsed.path == "/api/broker-check":
+            self.send_json(state.run_broker_check(str(payload.get("broker_id", ""))))
+            return
         if parsed.path == "/api/audit-export":
             self.send_json(state.export_audit(str(payload.get("format", "csv"))))
             return

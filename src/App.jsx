@@ -34,6 +34,7 @@ import {
   cancelOrder,
   exportAudit,
   getSnapshot,
+  runBrokerCheck,
   retryOrder,
   setChecklistItem,
   setFlag,
@@ -69,6 +70,8 @@ const fallbackSnapshot = {
   order_queue: { total: 0, blocked: 0, dry_run: 0, retryable: 0, canceled: 0 },
   dry_run_ledger: [],
   brokers: [],
+  broker_diagnostics: [],
+  broker_adapter_contract: [],
   strategies: [],
   orders: [],
   positions: [],
@@ -250,6 +253,7 @@ function App() {
           onRetryPolicy={(name, value) => runAction(() => setRetryPolicy(name, value))}
           onRetryOrder={(orderId) => runAction(() => retryOrder(orderId))}
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
+          onBrokerCheck={(brokerId) => runAction(() => runBrokerCheck(brokerId))}
           onAuditExport={runAuditExport}
           exportResult={exportResult}
         />
@@ -285,6 +289,7 @@ function WorkspaceContent({
   onRetryPolicy,
   onRetryOrder,
   onCancelOrder,
+  onBrokerCheck,
   onAuditExport,
   exportResult,
 }) {
@@ -354,10 +359,12 @@ function WorkspaceContent({
       <section className="content-grid">
         <div className="content-column">
           <BrokerPanel brokers={snapshot.brokers} />
-          <BrokerRequirementsPanel brokers={snapshot.brokers} />
+          <BrokerConnectionWizardPanel diagnostics={snapshot.broker_diagnostics} onBrokerCheck={onBrokerCheck} />
         </div>
         <div className="content-column">
-          <PositionPanel positions={snapshot.positions} />
+          <BrokerCapabilityPanel diagnostics={snapshot.broker_diagnostics} />
+          <BrokerAdapterContractPanel contract={snapshot.broker_adapter_contract} />
+          <BrokerRequirementsPanel brokers={snapshot.brokers} />
           <ReadinessPanel checks={snapshot.readiness} />
         </div>
       </section>
@@ -424,9 +431,17 @@ function StatusPill({ children, tone = "neutral" }) {
 }
 
 function statusTone(status) {
-  if (status === "pass" || status === "connected" || status === "open" || status === "dry_run") return "success";
-  if (status === "warn" || status === "watch" || status === "adapter_required" || status === "adapter_blocked") return "warning";
-  if (status === "fail" || status === "blocked" || status === "missing_credentials" || status === "risk_blocked" || status === "retry_exhausted") {
+  if (status === "pass" || status === "connected" || status === "open" || status === "dry_run" || status === "interface_ready") return "success";
+  if (status === "warn" || status === "watch" || status === "adapter_required" || status === "adapter_blocked" || status === "blocked_stub") {
+    return "warning";
+  }
+  if (
+    status === "fail" ||
+    status === "blocked" ||
+    status === "missing_credentials" ||
+    status === "risk_blocked" ||
+    status === "retry_exhausted"
+  ) {
     return "danger";
   }
   if (status === "canceled") return "neutral";
@@ -570,6 +585,100 @@ function BrokerPanel({ brokers }) {
                 </span>
               ))}
             </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function BrokerConnectionWizardPanel({ diagnostics, onBrokerCheck }) {
+  return (
+    <section className="panel broker-wizard-panel">
+      <PanelHeader title="API 키 점검 마법사" subtitle="실제 키 원문은 표시하지 않고 존재 여부와 어댑터 준비 상태만 점검합니다." />
+      <div className="wizard-list">
+        {diagnostics.map((broker) => (
+          <div className="wizard-card" key={broker.broker_id}>
+            <div className="wizard-head">
+              <div>
+                <strong>{broker.name}</strong>
+                <span>{broker.docs}</span>
+              </div>
+              <button className="mini-button" type="button" onClick={() => onBrokerCheck(broker.broker_id)}>
+                <RefreshCcw size={14} />
+                점검
+              </button>
+            </div>
+            <div className="wizard-steps">
+              {broker.steps.map((step) => (
+                <div className={`wizard-step ${step.status}`} key={step.key}>
+                  {step.status === "pass" ? <ShieldCheck size={15} /> : <ShieldAlert size={15} />}
+                  <div>
+                    <strong>{step.label}</strong>
+                    <span>{step.detail}</span>
+                  </div>
+                  <StatusPill tone={statusTone(step.status)}>{step.status}</StatusPill>
+                </div>
+              ))}
+            </div>
+            <div className="env-check-grid">
+              {broker.env.map((item) => (
+                <div className={`env-check ${item.present ? "present" : "missing"}`} key={item.name}>
+                  <strong>{item.name}</strong>
+                  <span>{item.present ? item.masked || "입력됨" : "missing"}</span>
+                </div>
+              ))}
+            </div>
+            <div className="next-actions">
+              {broker.next_actions.map((action) => (
+                <span key={action}>{action}</span>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function BrokerCapabilityPanel({ diagnostics }) {
+  return (
+    <section className="panel broker-capability-panel">
+      <PanelHeader title="브로커 Capability" subtitle="실계좌 연결에 필요한 기능별 구현/차단 상태입니다." />
+      <div className="capability-list">
+        {diagnostics.map((broker) => (
+          <div className="capability-broker" key={broker.broker_id}>
+            <div className="capability-broker-title">
+              <Network size={16} />
+              <strong>{broker.name}</strong>
+              <StatusPill tone={statusTone(broker.status)}>{broker.status}</StatusPill>
+            </div>
+            <div className="capability-grid">
+              {broker.capabilities.map((capability) => (
+                <div className={`capability-item ${capability.status}`} key={capability.key}>
+                  <strong>{capability.label}</strong>
+                  <span>{capability.detail}</span>
+                  <StatusPill tone={statusTone(capability.status)}>{capability.implemented ? "ready" : "필요"}</StatusPill>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function BrokerAdapterContractPanel({ contract }) {
+  return (
+    <section className="panel broker-contract-panel">
+      <PanelHeader title="어댑터 인터페이스 계약" subtitle="KIS/Binance 어댑터가 공통으로 구현해야 할 메서드입니다." />
+      <div className="compact-list">
+        {contract.map((item) => (
+          <div className="compact-row" key={item.method}>
+            <strong>{item.method}</strong>
+            <span>{item.purpose}</span>
+            <StatusPill tone={statusTone(item.status)}>{item.status}</StatusPill>
           </div>
         ))}
       </div>
