@@ -10,6 +10,8 @@ if (-not (Test-Path ".venv")) {
 npm install
 npm run build
 
+.\.venv\Scripts\python.exe tools\create_icon.py
+
 if (Test-Path "build") {
   Remove-Item -Recurse -Force "build"
 }
@@ -22,6 +24,7 @@ if (Test-Path "release") {
   --noconsole `
   --onefile `
   --name LiveTrader `
+  --icon "assets\app-icon.ico" `
   --distpath release `
   --workpath build `
   --add-data "dist;dist" `
