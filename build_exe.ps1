@@ -20,8 +20,10 @@ if (Test-Path "release") {
 .\.venv\Scripts\python.exe -m PyInstaller `
   --noconfirm `
   --noconsole `
+  --onefile `
   --name LiveTrader `
   --distpath release `
   --workpath build `
   --add-data "dist;dist" `
+  --collect-submodules webview `
   live_trader\__main__.py
