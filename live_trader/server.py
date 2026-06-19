@@ -34,6 +34,15 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/flag":
             self.send_json(state.set_flag(str(payload.get("name", "")), bool(payload.get("value"))))
             return
+        if parsed.path == "/api/risk-setting":
+            self.send_json(state.set_risk_setting(str(payload.get("name", "")), payload.get("value")))
+            return
+        if parsed.path == "/api/checklist":
+            self.send_json(state.set_checklist_item(str(payload.get("name", "")), bool(payload.get("value"))))
+            return
+        if parsed.path == "/api/audit-export":
+            self.send_json(state.export_audit(str(payload.get("format", "csv"))))
+            return
         if parsed.path == "/api/test-intent":
             self.send_json(state.submit_test_intent())
             return

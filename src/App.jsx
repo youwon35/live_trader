@@ -4,7 +4,9 @@ import {
   BadgeCheck,
   Bell,
   CircleStop,
+  ClipboardCheck,
   DatabaseZap,
+  Download,
   FileClock,
   KeyRound,
   LayoutDashboard,
@@ -20,12 +22,13 @@ import {
   Search,
   ShieldAlert,
   ShieldCheck,
+  SlidersHorizontal,
   Siren,
   Sun,
   TerminalSquare,
   WalletCards,
 } from "lucide-react";
-import { getSnapshot, setFlag, setMode, submitTestIntent } from "./api";
+import { exportAudit, getSnapshot, setChecklistItem, setFlag, setMode, setRiskSetting, submitTestIntent } from "./api";
 
 const navItems = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -39,6 +42,7 @@ const navItems = [
 const fallbackSnapshot = {
   generated_at: "-",
   mode: "MONITOR",
+  dry_run: true,
   kill_switch: false,
   new_entries_blocked: true,
   operator_confirmed: false,
@@ -46,6 +50,8 @@ const fallbackSnapshot = {
   sessions: [],
   readiness: [{ label: "Python API", status: "fail", detail: "Python server connection is required." }],
   risk_checks: [],
+  risk_settings: [],
+  checklist: [],
   brokers: [],
   strategies: [],
   orders: [],
@@ -67,6 +73,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [theme, setTheme] = useState(getInitialTheme);
+  const [exportResult, setExportResult] = useState(null);
 
   async function refresh() {
     try {
@@ -103,6 +110,23 @@ function App() {
       setError(result.ok === false ? result.reason : "");
     } catch (err) {
       setError(err instanceof Error ? err.message : "요청 실패");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runAuditExport(format) {
+    setLoading(true);
+    try {
+      const result = await exportAudit(format);
+      if (result.snapshot) setSnapshot(result.snapshot);
+      setExportResult(result);
+      setError(result.ok === false ? result.reason : "");
+      if (result.ok !== false && result.content) {
+        downloadExport(result);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "내보내기 실패");
     } finally {
       setLoading(false);
     }
@@ -202,12 +226,29 @@ function App() {
           canFullLive={canFullLive}
           onMode={(mode) => runAction(() => setMode(mode))}
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
+          onDryRun={() => runAction(() => setFlag("dry_run", !snapshot.dry_run))}
           onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
           onTestIntent={() => runAction(submitTestIntent)}
+          onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
+          onChecklist={(name, value) => runAction(() => setChecklistItem(name, value))}
+          onAuditExport={runAuditExport}
+          exportResult={exportResult}
         />
       </main>
     </div>
   );
+}
+
+function downloadExport(result) {
+  const blob = new Blob([result.content], { type: result.mime || "text/plain;charset=utf-8" });
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = result.filename || `live-trader-audit.${result.format || "txt"}`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.URL.revokeObjectURL(url);
 }
 
 function WorkspaceContent({
@@ -217,8 +258,13 @@ function WorkspaceContent({
   canFullLive,
   onMode,
   onConfirm,
+  onDryRun,
   onEntryBlock,
   onTestIntent,
+  onRiskSetting,
+  onChecklist,
+  onAuditExport,
+  exportResult,
 }) {
   const modeConsole = (
     <ModeConsole
@@ -227,6 +273,8 @@ function WorkspaceContent({
       canFullLive={canFullLive}
       onMode={onMode}
       onConfirm={onConfirm}
+      dryRun={snapshot.dry_run}
+      onDryRun={onDryRun}
       operatorConfirmed={snapshot.operator_confirmed}
       newEntriesBlocked={snapshot.new_entries_blocked}
       onEntryBlock={onEntryBlock}
@@ -239,12 +287,14 @@ function WorkspaceContent({
       <section className="content-grid">
         <div className="content-column">
           {modeConsole}
+          <RunbookChecklistPanel checklist={snapshot.checklist} onChecklist={onChecklist} />
           <ReadinessPanel checks={snapshot.readiness} />
-          <RiskPanel checks={snapshot.risk_checks} />
         </div>
         <div className="content-column">
           <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
           <GateRunbookPanel />
+          <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
+          <RiskPanel checks={snapshot.risk_checks} />
           <PositionPanel positions={snapshot.positions} />
         </div>
       </section>
@@ -257,7 +307,9 @@ function WorkspaceContent({
         <div className="content-column">
           <OrderCommandPanel
             newEntriesBlocked={snapshot.new_entries_blocked}
+            dryRun={snapshot.dry_run}
             killSwitch={snapshot.kill_switch}
+            onDryRun={onDryRun}
             onEntryBlock={onEntryBlock}
             onTestIntent={onTestIntent}
           />
@@ -307,7 +359,7 @@ function WorkspaceContent({
       <section className="content-grid">
         <div className="content-column">
           <AuditPanel audit={snapshot.audit} />
-          <AuditExportPanel />
+          <AuditExportPanel onExport={onAuditExport} exportResult={exportResult} />
         </div>
         <div className="content-column">
           <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
@@ -327,6 +379,7 @@ function WorkspaceContent({
       <section className="content-grid">
         <div className="content-column">
           <ReadinessPanel checks={snapshot.readiness} />
+          <RunbookChecklistPanel checklist={snapshot.checklist} onChecklist={onChecklist} />
           <RiskPanel checks={snapshot.risk_checks} />
           <StrategyPanel strategies={snapshot.strategies} />
           <OrderPanel orders={snapshot.orders} />
@@ -346,9 +399,9 @@ function StatusPill({ children, tone = "neutral" }) {
 }
 
 function statusTone(status) {
-  if (status === "pass" || status === "connected" || status === "open") return "success";
+  if (status === "pass" || status === "connected" || status === "open" || status === "dry_run") return "success";
   if (status === "warn" || status === "watch" || status === "adapter_required") return "warning";
-  if (status === "fail" || status === "blocked" || status === "missing_credentials") return "danger";
+  if (status === "fail" || status === "blocked" || status === "missing_credentials" || status === "risk_blocked") return "danger";
   return "neutral";
 }
 
@@ -374,6 +427,8 @@ function ModeConsole({
   canLive,
   canFullLive,
   onMode,
+  dryRun,
+  onDryRun,
   operatorConfirmed,
   onConfirm,
   newEntriesBlocked,
@@ -409,6 +464,10 @@ function ModeConsole({
         <button className={`secondary-button ${operatorConfirmed ? "active" : ""}`} type="button" onClick={onConfirm}>
           <BadgeCheck size={16} />
           운용자 확인
+        </button>
+        <button className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`} type="button" onClick={onDryRun}>
+          <ShieldCheck size={16} />
+          Dry Run
         </button>
         <button className={`secondary-button ${newEntriesBlocked ? "active" : ""}`} type="button" onClick={onEntryBlock}>
           <ShieldCheck size={16} />
@@ -533,11 +592,83 @@ function GateRunbookPanel() {
   );
 }
 
-function OrderCommandPanel({ newEntriesBlocked, killSwitch, onEntryBlock, onTestIntent }) {
+function RunbookChecklistPanel({ checklist, onChecklist }) {
+  return (
+    <section className="panel checklist-panel">
+      <PanelHeader title="운영 체크리스트" subtitle="필수 항목이 모두 확인되어야 실거래 게이트를 통과할 수 있습니다." />
+      <div className="checklist-list">
+        {checklist.map((item) => (
+          <label className={`checklist-row ${item.checked ? "checked" : ""}`} key={item.key}>
+            <input
+              type="checkbox"
+              checked={item.checked}
+              onChange={(event) => onChecklist(item.key, event.currentTarget.checked)}
+            />
+            <ClipboardCheck size={16} />
+            <div>
+              <strong>{item.label}</strong>
+              <span>{item.detail}</span>
+            </div>
+            <StatusPill tone={item.checked ? "success" : item.required ? "warning" : "neutral"}>
+              {item.checked ? "완료" : item.required ? "필수" : "권장"}
+            </StatusPill>
+          </label>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function RiskSettingsPanel({ settings, onRiskSetting }) {
+  function commitChange(event, setting) {
+    const nextValue = event.currentTarget.value;
+    if (Number(nextValue) !== Number(setting.value)) {
+      onRiskSetting(setting.key, nextValue);
+    }
+  }
+
+  return (
+    <section className="panel risk-settings-panel">
+      <PanelHeader title="리스크 한도 설정" subtitle="주문 전 게이트에서 사용하는 기본 안전 한도입니다." />
+      <div className="settings-list">
+        {settings.map((setting) => (
+          <div className="setting-row" key={setting.key}>
+            <SlidersHorizontal size={16} />
+            <div>
+              <strong>{setting.label}</strong>
+              <span>{setting.detail}</span>
+            </div>
+            <label>
+              <input
+                key={`${setting.key}-${setting.value}`}
+                type="number"
+                defaultValue={setting.value}
+                min={setting.min}
+                max={setting.max}
+                step={setting.step}
+                onBlur={(event) => commitChange(event, setting)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") event.currentTarget.blur();
+                }}
+              />
+              <span>{setting.unit}</span>
+            </label>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function OrderCommandPanel({ newEntriesBlocked, dryRun, killSwitch, onDryRun, onEntryBlock, onTestIntent }) {
   return (
     <section className="panel">
       <PanelHeader title="주문 제어" subtitle="실주문 전송 전 차단 상태와 테스트 게이트를 관리합니다." />
       <div className="operator-actions">
+        <button className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`} type="button" onClick={onDryRun}>
+          <ShieldCheck size={16} />
+          Dry Run
+        </button>
         <button className={`secondary-button ${newEntriesBlocked ? "active" : ""}`} type="button" onClick={onEntryBlock}>
           <ShieldCheck size={16} />
           신규 진입 차단
@@ -592,22 +723,34 @@ function StrategyWorkflowPanel() {
   );
 }
 
-function AuditExportPanel() {
+function AuditExportPanel({ onExport, exportResult }) {
   return (
     <section className="panel">
-      <PanelHeader title="감사 로그 틀" subtitle="주문 차단, 모드 변경, 설정 변경을 내보내기 위한 영역입니다." />
+      <PanelHeader title="감사 로그 내보내기" subtitle="주문 차단, 모드 변경, 설정 변경을 CSV/HTML로 저장합니다." />
       <div className="compact-list">
         <div className="compact-row">
           <strong>CSV</strong>
           <span>운영 이벤트 원장</span>
-          <StatusPill tone="neutral">준비</StatusPill>
+          <button className="mini-button" type="button" onClick={() => onExport("csv")}>
+            <Download size={14} />
+            저장
+          </button>
         </div>
         <div className="compact-row">
           <strong>HTML</strong>
           <span>인쇄용 운용 리포트</span>
-          <StatusPill tone="neutral">준비</StatusPill>
+          <button className="mini-button" type="button" onClick={() => onExport("html")}>
+            <Download size={14} />
+            저장
+          </button>
         </div>
       </div>
+      {exportResult?.ok !== false && exportResult?.filename && (
+        <div className="export-result">
+          <Download size={15} />
+          <span>{exportResult.filename} 생성 완료</span>
+        </div>
+      )}
     </section>
   );
 }
@@ -664,7 +807,7 @@ function OrderPanel({ orders }) {
               <span>{order.strategy_id}</span>
               <span>{order.symbol}</span>
               <span className="side-buy">{order.side}</span>
-              <StatusPill tone="danger">{order.state}</StatusPill>
+              <StatusPill tone={statusTone(order.state)}>{order.state}</StatusPill>
               <em>{order.reason}</em>
             </div>
           ))

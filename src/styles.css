@@ -258,6 +258,18 @@ button {
   border-color: var(--warning-border);
 }
 
+.secondary-button.safe-active {
+  color: var(--success-text);
+  background: var(--success-surface);
+  border-color: var(--success-border);
+}
+
+.secondary-button.danger-active {
+  color: var(--danger-soft-text);
+  background: var(--danger-surface);
+  border-color: var(--danger-border);
+}
+
 .danger-button {
   color: var(--text-inverse);
   background: var(--danger-base);
@@ -454,7 +466,9 @@ button {
 .check-list,
 .broker-list,
 .position-list,
-.audit-list {
+.audit-list,
+.checklist-list,
+.settings-list {
   display: grid;
   gap: 8px;
 }
@@ -569,6 +583,112 @@ button {
   color: var(--danger-soft-text);
   background: var(--danger-surface);
   border-color: var(--danger-border);
+}
+
+.checklist-row {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 54px;
+  padding: 8px 10px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.checklist-row.checked {
+  border-color: var(--success-border);
+}
+
+.checklist-row input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+}
+
+.checklist-row svg {
+  color: var(--icon-blue);
+}
+
+.checklist-row strong,
+.checklist-row span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.checklist-row strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--font-weight-bold);
+}
+
+.checklist-row span {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+}
+
+.setting-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(120px, auto);
+  align-items: center;
+  gap: 9px;
+  min-height: 58px;
+  padding: 8px 10px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.setting-row > svg {
+  color: var(--icon-blue);
+}
+
+.setting-row strong,
+.setting-row span {
+  display: block;
+}
+
+.setting-row strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--font-weight-bold);
+}
+
+.setting-row div span {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  line-height: 1.4;
+}
+
+.setting-row label {
+  display: grid;
+  grid-template-columns: minmax(72px, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.setting-row input {
+  width: 100%;
+  min-height: 32px;
+  padding: 0 8px;
+  color: var(--text);
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-strong);
+}
+
+.setting-row label span {
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-bold);
+  white-space: nowrap;
 }
 
 .risk-grid {
@@ -874,6 +994,37 @@ button {
   font-size: var(--font-size-small);
 }
 
+.mini-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0 9px;
+  color: var(--text-soft);
+  background: var(--button);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-strong);
+  white-space: nowrap;
+}
+
+.export-result {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  color: var(--success-text);
+  background: var(--success-surface);
+  border: 1px solid var(--success-border);
+  border-radius: var(--radius-lg);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-strong);
+}
+
 .workflow-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1010,6 +1161,11 @@ button {
   }
 
   .compact-row {
+    grid-template-columns: 1fr;
+  }
+
+  .checklist-row,
+  .setting-row {
     grid-template-columns: 1fr;
   }
 

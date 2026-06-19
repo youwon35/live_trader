@@ -10,6 +10,18 @@ export async function setFlag(name, value) {
   return request("/api/flag", { method: "POST", body: { name, value } });
 }
 
+export async function setRiskSetting(name, value) {
+  return request("/api/risk-setting", { method: "POST", body: { name, value } });
+}
+
+export async function setChecklistItem(name, value) {
+  return request("/api/checklist", { method: "POST", body: { name, value } });
+}
+
+export async function exportAudit(format) {
+  return request("/api/audit-export", { method: "POST", body: { format } });
+}
+
 export async function submitTestIntent() {
   return request("/api/test-intent", { method: "POST", body: {} });
 }
