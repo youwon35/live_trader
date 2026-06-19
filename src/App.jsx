@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   ListChecks,
   LockKeyhole,
+  Moon,
   Network,
   Play,
   Power,
@@ -20,6 +21,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Siren,
+  Sun,
   TerminalSquare,
   WalletCards,
 } from "lucide-react";
@@ -51,11 +53,20 @@ const fallbackSnapshot = {
   audit: [],
 };
 
+const themeStorageKey = "live-trader.ui-theme.v1";
+
+function getInitialTheme() {
+  if (typeof window === "undefined") return "dark";
+  const savedTheme = window.localStorage.getItem(themeStorageKey);
+  return savedTheme === "light" ? "light" : "dark";
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState(fallbackSnapshot);
   const [selectedNav, setSelectedNav] = useState("overview");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [theme, setTheme] = useState(getInitialTheme);
 
   async function refresh() {
     try {
@@ -74,6 +85,15 @@ function App() {
     const timer = window.setInterval(refresh, 5000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (theme === "light") {
+      document.documentElement.setAttribute("data-ui-theme", "light");
+    } else {
+      document.documentElement.removeAttribute("data-ui-theme");
+    }
+    window.localStorage.setItem(themeStorageKey, theme);
+  }, [theme]);
 
   async function runAction(action) {
     setLoading(true);
@@ -139,6 +159,15 @@ function App() {
             </div>
             <button className="icon-button" type="button" aria-label="새로고침" onClick={refresh}>
               <RefreshCcw size={17} className={loading ? "spin" : ""} />
+            </button>
+            <button
+              className="icon-button"
+              type="button"
+              aria-label={theme === "light" ? "다크 모드로 전환" : "화이트 모드로 전환"}
+              title={theme === "light" ? "다크 모드" : "화이트 모드"}
+              onClick={() => setTheme((value) => (value === "light" ? "dark" : "light"))}
+            >
+              {theme === "light" ? <Moon size={17} /> : <Sun size={17} />}
             </button>
             <button className="icon-button" type="button" aria-label="알림">
               <Bell size={17} />

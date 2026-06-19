@@ -1,4 +1,4 @@
-from .desktop import main
+from live_trader.desktop import main
 
 
 if __name__ == "__main__":
