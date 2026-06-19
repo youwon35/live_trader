@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   BadgeCheck,
@@ -12,9 +12,11 @@ import {
   KeyRound,
   LayoutDashboard,
   ListChecks,
+  Lock,
   LockKeyhole,
   Moon,
   Network,
+  PanelLeft,
   Play,
   Power,
   Radio,
@@ -28,6 +30,7 @@ import {
   Siren,
   Sun,
   TerminalSquare,
+  Unlock,
   WalletCards,
 } from "lucide-react";
 import {
@@ -45,6 +48,7 @@ import {
   setRiskSetting,
   submitTestIntent,
 } from "./api";
+import designTokens from "../../../packages/design/design_tokens.json";
 
 const navItems = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -109,21 +113,323 @@ const fallbackSnapshot = {
   audit: [],
 };
 
-const themeStorageKey = "live-trader.ui-theme.v1";
+const PANEL_SIZE_STORAGE_KEY = "live-trader.panelSizes.v1";
+const PANEL_POSITION_STORAGE_KEY = "live-trader.panelPositions.v1";
+const LAYOUT_MODE_STORAGE_KEY = "live-trader.layoutMode.v1";
+const APPEARANCE_STORAGE_KEY = "live-trader.appearance.v1";
+const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
+const LAYOUT_RESET_EVENT = "live-trader-layout-reset";
+const MIN_PANEL_WIDTH = 260;
+const MIN_PANEL_HEIGHT = 150;
 
-function getInitialTheme() {
-  if (typeof window === "undefined") return "dark";
-  const savedTheme = window.localStorage.getItem(themeStorageKey);
-  return savedTheme === "light" ? "light" : "dark";
+const accentPalettes = Object.fromEntries(
+  Object.entries(designTokens.accent?.palettes ?? {}).map(([id, palette]) => [
+    id,
+    {
+      ...palette,
+      label: palette.labelKo ?? palette.label ?? id,
+    },
+  ]),
+);
+
+const appearanceThemeOptions = [
+  { id: "dark", label: "다크", icon: Moon },
+  { id: "light", label: "화이트", icon: Sun },
+];
+
+const defaultAppearance = {
+  theme: "dark",
+  accent: designTokens.accent?.default ?? "blue",
+};
+
+function readStoredMap(key) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
 }
+
+function writeStoredMap(key, map) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(map));
+  } catch {
+    // Embedded WebView storage can be unavailable; the visible edit still works for the session.
+  }
+}
+
+function normalizeLayoutMode(mode) {
+  return mode === "edit" ? "edit" : "locked";
+}
+
+function readLayoutMode() {
+  try {
+    return normalizeLayoutMode(window.localStorage.getItem(LAYOUT_MODE_STORAGE_KEY));
+  } catch {
+    return "locked";
+  }
+}
+
+function applyLayoutMode(mode) {
+  const nextMode = normalizeLayoutMode(mode);
+  try {
+    document.documentElement.dataset.layoutMode = nextMode;
+  } catch {
+    // React state still carries the mode when document access is unavailable.
+  }
+  try {
+    window.localStorage.setItem(LAYOUT_MODE_STORAGE_KEY, nextMode);
+  } catch {
+    // Non-fatal in locked-down WebView environments.
+  }
+  return nextMode;
+}
+
+function normalizeAppearance(appearance = {}) {
+  return {
+    theme: appearance.theme === "light" ? "light" : "dark",
+    accent: accentPalettes[appearance.accent] ? appearance.accent : defaultAppearance.accent,
+  };
+}
+
+function readAppearance() {
+  try {
+    const raw = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
+    if (raw) return normalizeAppearance(JSON.parse(raw));
+    return normalizeAppearance({ theme: window.localStorage.getItem(LEGACY_THEME_STORAGE_KEY) });
+  } catch {
+    return defaultAppearance;
+  }
+}
+
+function applyAppearance(appearance) {
+  const nextAppearance = normalizeAppearance(appearance);
+  try {
+    const root = document.documentElement;
+    root.dataset.uiTheme = nextAppearance.theme;
+    root.dataset.accent = nextAppearance.accent;
+  } catch {
+    // Appearance remains in React state if document access is unavailable.
+  }
+  try {
+    window.localStorage.setItem(APPEARANCE_STORAGE_KEY, JSON.stringify(nextAppearance));
+  } catch {
+    // Ignore storage failures in embedded runtimes.
+  }
+  return nextAppearance;
+}
+
+function normalizePanelKey(value) {
+  return String(value || "panel")
+    .replace(/\s+/g, "-")
+    .replace(/[^a-zA-Z0-9가-힣_.-]/g, "")
+    .slice(0, 96);
+}
+
+function panelLayoutKey(panel) {
+  if (panel.dataset.layoutKey) return panel.dataset.layoutKey;
+  const title = panel.querySelector(".panel-header h2")?.textContent ?? "panel";
+  const stableClasses = Array.from(panel.classList)
+    .filter((name) => !["panel", "resizable-panel", "dragging-panel"].includes(name))
+    .join(".");
+  const key = normalizePanelKey(`${stableClasses || "panel"}-${title}`);
+  panel.dataset.layoutKey = key;
+  return key;
+}
+
+function validPanelPosition(value) {
+  return value && Number.isFinite(value.x) && Number.isFinite(value.y) ? { x: Number(value.x), y: Number(value.y) } : null;
+}
+
+function panelPositionStyle(position) {
+  return position ? `translate(${Math.round(position.x)}px, ${Math.round(position.y)}px)` : "";
+}
+
+function shouldIgnorePanelDrag(target) {
+  return Boolean(
+    target?.closest?.(
+      'button, input, select, textarea, a, label, [role="button"], [role="separator"], .panel-resize-edge, .panel-resize-corner',
+    ),
+  );
+}
+
+function ensurePanelHandles(panel) {
+  panel.classList.add("resizable-panel");
+  panelLayoutKey(panel);
+
+  const sizes = readStoredMap(PANEL_SIZE_STORAGE_KEY);
+  const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
+  const key = panelLayoutKey(panel);
+  const size = sizes[key];
+  const position = validPanelPosition(positions[key]);
+
+  if (size && Number.isFinite(size.width) && Number.isFinite(size.height)) {
+    panel.style.width = `${Math.max(MIN_PANEL_WIDTH, size.width)}px`;
+    panel.style.height = `${Math.max(MIN_PANEL_HEIGHT, size.height)}px`;
+  }
+  if (position) panel.style.transform = panelPositionStyle(position);
+
+  if (panel.querySelector(":scope > .panel-resize-corner")) return;
+
+  [
+    ["panel-resize-edge panel-resize-east", "vertical"],
+    ["panel-resize-edge panel-resize-south", "horizontal"],
+    ["panel-resize-corner", "vertical"],
+  ].forEach(([className, orientation]) => {
+    const handle = document.createElement("span");
+    handle.className = className;
+    handle.setAttribute("role", "separator");
+    handle.setAttribute("aria-orientation", orientation);
+    handle.setAttribute("aria-label", "패널 크기 조절");
+    panel.appendChild(handle);
+  });
+}
+
+function useEditablePanels(rootRef) {
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return undefined;
+
+    const enhancePanels = () => {
+      root.querySelectorAll(".panel").forEach((panel) => ensurePanelHandles(panel));
+    };
+
+    const resetLayout = () => {
+      root.querySelectorAll(".panel").forEach((panel) => {
+        panel.style.width = "";
+        panel.style.height = "";
+        panel.style.transform = "";
+      });
+    };
+
+    const startResize = (event, panel, axis) => {
+      if (document.documentElement.dataset.layoutMode !== "edit" || event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.target.setPointerCapture?.(event.pointerId);
+
+      const key = panelLayoutKey(panel);
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const bounds = panel.getBoundingClientRect();
+      const maxWidth = Math.max(MIN_PANEL_WIDTH, window.innerWidth * 1.65);
+      const maxHeight = Math.max(MIN_PANEL_HEIGHT, window.innerHeight * 1.7);
+
+      const onMove = (moveEvent) => {
+        const nextWidth =
+          axis === "y" ? bounds.width : Math.min(maxWidth, Math.max(MIN_PANEL_WIDTH, Math.round(bounds.width + moveEvent.clientX - startX)));
+        const nextHeight =
+          axis === "x" ? bounds.height : Math.min(maxHeight, Math.max(MIN_PANEL_HEIGHT, Math.round(bounds.height + moveEvent.clientY - startY)));
+        panel.style.width = `${nextWidth}px`;
+        panel.style.height = `${nextHeight}px`;
+      };
+
+      const onUp = () => {
+        const stored = readStoredMap(PANEL_SIZE_STORAGE_KEY);
+        stored[key] = {
+          width: Math.round(panel.getBoundingClientRect().width),
+          height: Math.round(panel.getBoundingClientRect().height),
+        };
+        writeStoredMap(PANEL_SIZE_STORAGE_KEY, stored);
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+      };
+
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp, { once: true });
+    };
+
+    const startDrag = (event, panel) => {
+      if (document.documentElement.dataset.layoutMode !== "edit" || event.button !== 0 || shouldIgnorePanelDrag(event.target)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.target.setPointerCapture?.(event.pointerId);
+
+      const key = panelLayoutKey(panel);
+      const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
+      const startPosition = validPanelPosition(positions[key]) ?? { x: 0, y: 0 };
+      const startX = event.clientX;
+      const startY = event.clientY;
+      panel.classList.add("dragging-panel");
+
+      const onMove = (moveEvent) => {
+        const rawX = startPosition.x + moveEvent.clientX - startX;
+        const rawY = startPosition.y + moveEvent.clientY - startY;
+        const nextPosition = {
+          x: Math.round(rawX / 8) * 8,
+          y: Math.round(rawY / 8) * 8,
+        };
+        panel.style.transform = panelPositionStyle(nextPosition);
+      };
+
+      const onUp = () => {
+        const inlineTransform = panel.style.transform;
+        const match = inlineTransform.match(/translate\((-?\d+)px,\s*(-?\d+)px\)/);
+        const nextPosition = match ? { x: Number(match[1]), y: Number(match[2]) } : { x: 0, y: 0 };
+        const stored = readStoredMap(PANEL_POSITION_STORAGE_KEY);
+        if (Math.abs(nextPosition.x) < 1 && Math.abs(nextPosition.y) < 1) {
+          delete stored[key];
+          panel.style.transform = "";
+        } else {
+          stored[key] = nextPosition;
+        }
+        writeStoredMap(PANEL_POSITION_STORAGE_KEY, stored);
+        panel.classList.remove("dragging-panel");
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+      };
+
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp, { once: true });
+    };
+
+    const onPointerDown = (event) => {
+      const resizeHandle = event.target.closest(".panel-resize-edge, .panel-resize-corner");
+      const panel = event.target.closest(".panel");
+      if (!panel || !root.contains(panel)) return;
+
+      if (resizeHandle) {
+        const axis = resizeHandle.classList.contains("panel-resize-east")
+          ? "x"
+          : resizeHandle.classList.contains("panel-resize-south")
+            ? "y"
+            : "both";
+        startResize(event, panel, axis);
+        return;
+      }
+
+      if (event.target.closest(".panel-header")) startDrag(event, panel);
+    };
+
+    const observer = new MutationObserver(enhancePanels);
+    enhancePanels();
+    observer.observe(root, { childList: true, subtree: true });
+    root.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener(LAYOUT_RESET_EVENT, resetLayout);
+
+    return () => {
+      observer.disconnect();
+      root.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener(LAYOUT_RESET_EVENT, resetLayout);
+    };
+  }, [rootRef]);
+}
+
+applyAppearance(readAppearance());
+applyLayoutMode(readLayoutMode());
 
 function App() {
   const [snapshot, setSnapshot] = useState(fallbackSnapshot);
   const [selectedNav, setSelectedNav] = useState("overview");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [theme, setTheme] = useState(getInitialTheme);
+  const [appearance, setAppearance] = useState(readAppearance);
+  const [layoutMode, setLayoutMode] = useState(readLayoutMode);
   const [exportResult, setExportResult] = useState(null);
+  const workspaceRef = useRef(null);
+
+  useEditablePanels(workspaceRef);
 
   async function refresh() {
     try {
@@ -144,13 +450,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (theme === "light") {
-      document.documentElement.setAttribute("data-ui-theme", "light");
-    } else {
-      document.documentElement.removeAttribute("data-ui-theme");
-    }
-    window.localStorage.setItem(themeStorageKey, theme);
-  }, [theme]);
+    applyAppearance(appearance);
+  }, [appearance]);
+
+  useEffect(() => {
+    applyLayoutMode(layoutMode);
+  }, [layoutMode]);
 
   async function runAction(action) {
     setLoading(true);
@@ -180,6 +485,24 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function updateAppearance(partial) {
+    setAppearance((current) => applyAppearance({ ...current, ...partial }));
+  }
+
+  function changeLayoutMode(mode) {
+    setLayoutMode(applyLayoutMode(mode));
+  }
+
+  function resetWorkspaceLayout() {
+    try {
+      window.localStorage.removeItem(PANEL_SIZE_STORAGE_KEY);
+      window.localStorage.removeItem(PANEL_POSITION_STORAGE_KEY);
+    } catch {
+      // The event below still resets the visible layout.
+    }
+    window.dispatchEvent(new Event(LAYOUT_RESET_EVENT));
   }
 
   const title = navItems.find((item) => item.id === selectedNav)?.label ?? "Overview";
@@ -220,13 +543,23 @@ function App() {
         </div>
       </aside>
 
-      <main className="workspace">
+      <main className={`workspace layout-${layoutMode}`} ref={workspaceRef} data-layout-mode={layoutMode}>
         <header className="topbar">
           <div>
             <p>{title}</p>
             <h1>Live Trader 실거래 콘솔</h1>
           </div>
           <div className="topbar-actions">
+            <button
+              className={`layout-mode-button ${layoutMode === "edit" ? "active" : ""}`}
+              type="button"
+              aria-pressed={layoutMode === "edit"}
+              onClick={() => changeLayoutMode(layoutMode === "edit" ? "locked" : "edit")}
+              title={layoutMode === "edit" ? "레이아웃 편집 종료" : "레이아웃 편집"}
+            >
+              {layoutMode === "edit" ? <Unlock size={16} /> : <Lock size={16} />}
+              <span>{layoutMode === "edit" ? "편집 중" : "레이아웃"}</span>
+            </button>
             <div className="search-box">
               <Search size={15} />
               <input aria-label="심볼 또는 주문 검색" placeholder="심볼, 전략, 주문 검색" />
@@ -237,12 +570,24 @@ function App() {
             <button
               className="icon-button"
               type="button"
-              aria-label={theme === "light" ? "다크 모드로 전환" : "화이트 모드로 전환"}
-              title={theme === "light" ? "다크 모드" : "화이트 모드"}
-              onClick={() => setTheme((value) => (value === "light" ? "dark" : "light"))}
+              aria-label={appearance.theme === "light" ? "다크 모드로 전환" : "화이트 모드로 전환"}
+              title={appearance.theme === "light" ? "다크 모드" : "화이트 모드"}
+              onClick={() => updateAppearance({ theme: appearance.theme === "light" ? "dark" : "light" })}
             >
-              {theme === "light" ? <Moon size={17} /> : <Sun size={17} />}
+              {appearance.theme === "light" ? <Moon size={17} /> : <Sun size={17} />}
             </button>
+            <div className="accent-dot-row" aria-label="강조 색상">
+              {Object.entries(accentPalettes).map(([id, palette]) => (
+                <button
+                  key={id}
+                  className={`accent-dot ${appearance.accent === id ? "selected" : ""}`}
+                  type="button"
+                  style={{ "--swatch": palette.swatch }}
+                  aria-label={`${palette.label} 강조 색상`}
+                  onClick={() => updateAppearance({ accent: id })}
+                />
+              ))}
+            </div>
             <button className="icon-button" type="button" aria-label="알림">
               <Bell size={17} />
             </button>
@@ -289,6 +634,11 @@ function App() {
           onPreflight={() => runAction(runFinalPreflight)}
           onAuditExport={runAuditExport}
           exportResult={exportResult}
+          appearance={appearance}
+          updateAppearance={updateAppearance}
+          layoutMode={layoutMode}
+          changeLayoutMode={changeLayoutMode}
+          resetWorkspaceLayout={resetWorkspaceLayout}
         />
       </main>
     </div>
@@ -327,6 +677,11 @@ function WorkspaceContent({
   onPreflight,
   onAuditExport,
   exportResult,
+  appearance,
+  updateAppearance,
+  layoutMode,
+  changeLayoutMode,
+  resetWorkspaceLayout,
 }) {
   const modeConsole = (
     <ModeConsole
@@ -474,6 +829,13 @@ function WorkspaceContent({
           <AuditPanel audit={snapshot.audit} />
         </div>
         <div className="content-column">
+          <AppearanceControlPanel
+            appearance={appearance}
+            updateAppearance={updateAppearance}
+            layoutMode={layoutMode}
+            changeLayoutMode={changeLayoutMode}
+            resetWorkspaceLayout={resetWorkspaceLayout}
+          />
           <BrokerPanel brokers={snapshot.brokers} />
           <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
           <AccountReconciliationPanel accounts={snapshot.accounts} />
@@ -523,6 +885,76 @@ function statusTone(status) {
   }
   if (status === "canceled") return "neutral";
   return "neutral";
+}
+
+function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, changeLayoutMode, resetWorkspaceLayout }) {
+  const isLayoutEditing = layoutMode === "edit";
+
+  return (
+    <section className="panel appearance-panel">
+      <PanelHeader title="화면 / 레이아웃" subtitle="백테스터와 같은 UI 토큰, 강조 색상, 패널 편집 모드를 사용합니다." />
+      <div className="settings-control-group">
+        <div>
+          <strong>모드</strong>
+          <span>실거래 콘솔의 밝기와 텍스트 대비를 바꿉니다.</span>
+        </div>
+        <div className="theme-mode-row">
+          {appearanceThemeOptions.map((option) => {
+            const Icon = option.icon;
+            return (
+              <button
+                key={option.id}
+                className={`theme-mode-button ${appearance.theme === option.id ? "selected" : ""}`}
+                type="button"
+                onClick={() => updateAppearance({ theme: option.id })}
+              >
+                <Icon size={16} />
+                {option.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="settings-control-group">
+        <div>
+          <strong>강조 색상</strong>
+          <span>선택된 메뉴, 주요 버튼, 진행 상태의 기준 색을 정합니다.</span>
+        </div>
+        <div className="accent-swatch-row">
+          {Object.entries(accentPalettes).map(([id, palette]) => (
+            <button
+              key={id}
+              className={`accent-swatch ${appearance.accent === id ? "selected" : ""}`}
+              type="button"
+              style={{ "--swatch": palette.swatch }}
+              onClick={() => updateAppearance({ accent: id })}
+            >
+              <i />
+              <span>{palette.label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="layout-settings-card">
+        <div>
+          <strong>{isLayoutEditing ? "레이아웃 편집 중" : "레이아웃 잠금 중"}</strong>
+          <span>{isLayoutEditing ? "패널 헤더를 끌고 오른쪽 아래 핸들로 크기를 조절할 수 있습니다." : "패널 위치와 크기가 고정되어 실수로 바뀌지 않습니다."}</span>
+        </div>
+        <div className="layout-settings-actions">
+          <button className={`ghost-button ${isLayoutEditing ? "active" : ""}`} type="button" onClick={() => changeLayoutMode(isLayoutEditing ? "locked" : "edit")}>
+            {isLayoutEditing ? <Unlock size={16} /> : <Lock size={16} />}
+            {isLayoutEditing ? "편집 종료" : "편집 모드"}
+          </button>
+          <button className="ghost-button" type="button" onClick={resetWorkspaceLayout}>
+            <PanelLeft size={16} />
+            초기화
+          </button>
+        </div>
+      </div>
+    </section>
+  );
 }
 
 function MarketStrip({ sessions }) {
