@@ -1733,6 +1733,135 @@ body {
   border-radius: 7px;
 }
 
+.page-view {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow: hidden;
+  padding: 8px 10px 34px;
+}
+
+.page-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+  flex: 0 0 auto;
+  min-height: 54px;
+  padding: 0 2px 2px;
+}
+
+.page-heading > div:first-child {
+  min-width: 0;
+}
+
+.page-heading > div:first-child > span {
+  display: block;
+  color: var(--primary-border);
+  font-size: 11px;
+  font-weight: 820;
+  line-height: 1.2;
+}
+
+.page-heading h1 {
+  margin: 2px 0 0;
+  color: var(--text);
+  font-size: 22px;
+  font-weight: 850;
+  line-height: 1.1;
+}
+
+.page-heading p {
+  overflow: hidden;
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.page-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  max-width: 520px;
+}
+
+.page-heading-actions > span:last-child {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 720;
+}
+
+.section-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-height: 35px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.section-tabs button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 27px;
+  padding: 0 10px;
+  color: var(--text-soft);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.section-tabs button:hover {
+  color: var(--text);
+  background: var(--button-hover);
+  border-color: var(--border);
+}
+
+.section-tabs button.selected {
+  color: #ffffff;
+  background: var(--primary);
+  border-color: var(--primary-border);
+}
+
+.section-tabs button.selected svg,
+.section-tabs button.selected span {
+  color: currentColor;
+}
+
+.page-view > .command-grid,
+.page-view > .content-grid {
+  padding: 0;
+}
+
+.page-view > .command-grid {
+  flex: 0 0 auto;
+}
+
+.page-view > .content-grid {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
 .command-grid {
   flex: 0 0 auto;
   gap: 8px;
@@ -2067,6 +2196,28 @@ body {
   border-color: #cbd5e1;
 }
 
+:root[data-ui-theme='light'] .page-heading h1 {
+  color: #07111f;
+}
+
+:root[data-ui-theme='light'] .page-heading p,
+:root[data-ui-theme='light'] .page-heading-actions > span:last-child {
+  color: #26364f;
+}
+
+:root[data-ui-theme='light'] .section-tabs {
+  background: var(--panel);
+  border-color: var(--border);
+}
+
+:root[data-ui-theme='light'] .section-tabs button {
+  color: #172033;
+}
+
+:root[data-ui-theme='light'] .section-tabs button.selected {
+  color: #ffffff;
+}
+
 .spin {
   animation: spin 800ms linear infinite;
 }
@@ -2108,6 +2259,7 @@ body {
   }
 
   .nav-list {
+    display: grid;
     grid-template-columns: repeat(auto-fit, minmax(44px, 1fr));
   }
 
@@ -2122,6 +2274,9 @@ body {
   .topbar {
     align-items: flex-start;
     flex-direction: column;
+    flex: 0 0 auto;
+    height: auto;
+    min-height: 0;
   }
 
   .topbar-actions {
@@ -2136,6 +2291,21 @@ body {
   .market-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .page-heading {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .page-heading-actions {
+    justify-content: flex-start;
+    max-width: none;
+  }
+
+  .section-tabs {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }
 }
 
 @media (max-width: 680px) {
@@ -2143,16 +2313,32 @@ body {
     padding: 10px;
   }
 
+  .page-view {
+    padding: 8px 0 28px;
+  }
+
+  .page-heading {
+    padding: 0;
+  }
+
   .topbar-actions,
   .operator-actions {
     display: grid;
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .icon-button,
+  .layout-mode-button,
   .danger-button,
   .primary-button,
   .secondary-button {
+    width: 100%;
+  }
+
+  .search-box,
+  .accent-dot-row,
+  .danger-button {
+    grid-column: 1 / -1;
     width: 100%;
   }
 

@@ -60,6 +60,44 @@ const navItems = [
   { id: "preflight", label: "Preflight", icon: ShieldCheck },
 ];
 
+const pageProfiles = {
+  overview: {
+    title: "Overview",
+    eyebrow: "Live Order Desk",
+    summary: "실거래 게이트, 주문, 브로커, 대조 상태를 한 화면에서 확인합니다.",
+  },
+  gate: {
+    title: "Live Gate",
+    eyebrow: "Approval",
+    summary: "실주문 전환 조건과 운영 체크리스트를 점검합니다.",
+  },
+  orders: {
+    title: "Orders",
+    eyebrow: "Order Queue",
+    summary: "주문 의도, Dry Run 원장, 재시도 정책을 관리합니다.",
+  },
+  brokers: {
+    title: "Brokers",
+    eyebrow: "API Adapters",
+    summary: "KIS/Binance 키, capability, 어댑터 계약 상태를 확인합니다.",
+  },
+  strategies: {
+    title: "Strategies",
+    eyebrow: "Artifacts",
+    summary: "Backtester/Paper 승인 전략과 live_allowed 권한을 검토합니다.",
+  },
+  audit: {
+    title: "Audit",
+    eyebrow: "Operation Log",
+    summary: "모드 전환, 주문 차단, 설정 변경 이력을 추적합니다.",
+  },
+  preflight: {
+    title: "Preflight",
+    eyebrow: "Launch Check",
+    summary: "실브로커 연결 직전 hard stop과 warning을 최종 확인합니다.",
+  },
+};
+
 const fallbackSnapshot = {
   generated_at: "-",
   mode: "MONITOR",
@@ -616,6 +654,7 @@ function App() {
 
         <WorkspaceContent
           selectedNav={selectedNav}
+          onNavigate={setSelectedNav}
           snapshot={snapshot}
           canLive={canLive}
           canFullLive={canFullLive}
@@ -659,6 +698,7 @@ function downloadExport(result) {
 
 function WorkspaceContent({
   selectedNav,
+  onNavigate,
   snapshot,
   canLive,
   canFullLive,
@@ -698,9 +738,14 @@ function WorkspaceContent({
       onTestIntent={onTestIntent}
     />
   );
+  const renderPage = (content) => (
+    <PageView selectedNav={selectedNav} onNavigate={onNavigate} snapshot={snapshot}>
+      {content}
+    </PageView>
+  );
 
   if (selectedNav === "gate") {
-    return (
+    return renderPage(
       <section className="content-grid">
         <div className="content-column">
           {modeConsole}
@@ -715,12 +760,12 @@ function WorkspaceContent({
           <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
           <PositionPanel positions={snapshot.positions} />
         </div>
-      </section>
+      </section>,
     );
   }
 
   if (selectedNav === "orders") {
-    return (
+    return renderPage(
       <section className="content-grid">
         <div className="content-column">
           <OrderCommandPanel
@@ -741,12 +786,12 @@ function WorkspaceContent({
           <DryRunLedgerPanel ledger={snapshot.dry_run_ledger} />
           <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
         </div>
-      </section>
+      </section>,
     );
   }
 
   if (selectedNav === "brokers") {
-    return (
+    return renderPage(
       <section className="content-grid">
         <div className="content-column">
           <BrokerPanel brokers={snapshot.brokers} />
@@ -758,12 +803,12 @@ function WorkspaceContent({
           <BrokerRequirementsPanel brokers={snapshot.brokers} />
           <ReadinessPanel checks={snapshot.readiness} />
         </div>
-      </section>
+      </section>,
     );
   }
 
   if (selectedNav === "strategies") {
-    return (
+    return renderPage(
       <section className="content-grid">
         <div className="content-column">
           <StrategyPanel strategies={snapshot.strategies} />
@@ -773,12 +818,12 @@ function WorkspaceContent({
           <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
           <ReadinessPanel checks={snapshot.readiness} />
         </div>
-      </section>
+      </section>,
     );
   }
 
   if (selectedNav === "audit") {
-    return (
+    return renderPage(
       <section className="content-grid">
         <div className="content-column">
           <AuditPanel audit={snapshot.audit} />
@@ -789,12 +834,12 @@ function WorkspaceContent({
           <OperationsReportPanel report={snapshot.operation_report} />
           <RiskPanel checks={snapshot.risk_checks} />
         </div>
-      </section>
+      </section>,
     );
   }
 
   if (selectedNav === "preflight") {
-    return (
+    return renderPage(
       <section className="content-grid">
         <div className="content-column">
           <FinalPreflightPanel checks={snapshot.final_preflight} onPreflight={onPreflight} />
@@ -807,11 +852,11 @@ function WorkspaceContent({
           <PositionPanel positions={snapshot.positions} />
           <OperationsReportPanel report={snapshot.operation_report} />
         </div>
-      </section>
+      </section>,
     );
   }
 
-  return (
+  return renderPage(
     <>
       <section className="command-grid">
         {modeConsole}
@@ -842,7 +887,53 @@ function WorkspaceContent({
           <PositionPanel positions={snapshot.positions} />
         </div>
       </section>
-    </>
+    </>,
+  );
+}
+
+function PageView({ selectedNav, onNavigate, snapshot, children }) {
+  const profile = pageProfiles[selectedNav] ?? pageProfiles.overview;
+  const blockerCount = snapshot.summary?.blocker_count ?? 0;
+  const warningCount = snapshot.summary?.warning_count ?? 0;
+
+  return (
+    <section className={`page-view ${selectedNav}-view`}>
+      <div className="page-heading">
+        <div>
+          <span>{profile.eyebrow}</span>
+          <h1>{profile.title}</h1>
+          <p>{profile.summary}</p>
+        </div>
+        <div className="page-heading-actions">
+          <StatusPill tone={statusTone(snapshot.summary?.status)}>{snapshot.summary?.status ?? "unknown"}</StatusPill>
+          <StatusPill tone={blockerCount ? "danger" : "success"}>{blockerCount} blocker</StatusPill>
+          <StatusPill tone={warningCount ? "warning" : "success"}>{warningCount} warn</StatusPill>
+          <span>{snapshot.generated_at}</span>
+        </div>
+      </div>
+
+      <div className="section-tabs" role="tablist" aria-label="실거래 화면 전환">
+        {navItems.map((item) => {
+          const Icon = item.icon;
+          const selected = selectedNav === item.id;
+          return (
+            <button
+              key={item.id}
+              className={selected ? "selected" : ""}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              onClick={() => onNavigate(item.id)}
+            >
+              <Icon size={14} />
+              <span>{item.label}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {children}
+    </section>
   );
 }
 
