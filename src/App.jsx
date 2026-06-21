@@ -258,6 +258,208 @@ function applyAppearance(appearance) {
   return nextAppearance;
 }
 
+function normalizeSearchText(value) {
+  return String(value ?? "").toLowerCase().trim();
+}
+
+function searchMatches(query, ...values) {
+  if (!query) return false;
+  return values.some((value) => normalizeSearchText(value).includes(query));
+}
+
+function addSearchResult(results, query, item) {
+  if (results.length >= 12) return;
+  if (searchMatches(query, item.label, item.detail, item.meta)) results.push(item);
+}
+
+function buildSearchResults(snapshot, queryValue) {
+  const query = normalizeSearchText(queryValue);
+  if (!query) return [];
+
+  const results = [];
+  (snapshot.strategies ?? []).forEach((strategy) => {
+    addSearchResult(results, query, {
+      id: `strategy-${strategy.strategy_id}`,
+      type: "전략",
+      label: `${strategy.name} · ${strategy.symbol}`,
+      detail: strategy.block_reason || strategy.lifecycle_status,
+      meta: [strategy.strategy_id, strategy.permission_label, strategy.lifecycle_status].join(" "),
+      targetNav: "strategies",
+      tone: strategy.live_allowed ? "success" : "danger",
+    });
+  });
+
+  (snapshot.orders ?? []).forEach((order) => {
+    addSearchResult(results, query, {
+      id: `order-${order.order_id}`,
+      type: "주문",
+      label: `${order.order_id} · ${order.symbol}`,
+      detail: `${order.state} · ${order.reason}`,
+      meta: [order.strategy_id, order.queue_state, order.side].join(" "),
+      targetNav: "orders",
+      tone: statusTone(order.state),
+    });
+  });
+
+  (snapshot.brokers ?? []).forEach((broker) => {
+    addSearchResult(results, query, {
+      id: `broker-${broker.broker_id}`,
+      type: "브로커",
+      label: broker.name,
+      detail: broker.detail,
+      meta: [broker.status, broker.role, ...(broker.missing_env ?? [])].join(" "),
+      targetNav: "brokers",
+      tone: statusTone(broker.status),
+    });
+  });
+
+  (snapshot.readiness ?? []).forEach((check) => {
+    addSearchResult(results, query, {
+      id: `readiness-${check.label}`,
+      type: "게이트",
+      label: check.label,
+      detail: check.detail,
+      meta: check.status,
+      targetNav: "gate",
+      tone: statusTone(check.status),
+    });
+  });
+
+  (snapshot.positions ?? []).forEach((position) => {
+    addSearchResult(results, query, {
+      id: `position-${position.symbol}`,
+      type: "포지션",
+      label: position.symbol,
+      detail: `${position.status_label} · ${position.broker_name}`,
+      meta: [position.asset, position.currency, position.detail].join(" "),
+      targetNav: "preflight",
+      tone: statusTone(position.status),
+    });
+  });
+
+  (snapshot.accounts ?? []).forEach((account) => {
+    addSearchResult(results, query, {
+      id: `account-${account.broker_id}`,
+      type: "계좌",
+      label: account.account,
+      detail: `${account.status_label} · ${account.broker_name}`,
+      meta: [account.currency, account.detail].join(" "),
+      targetNav: "preflight",
+      tone: statusTone(account.status),
+    });
+  });
+
+  (snapshot.final_preflight ?? []).forEach((check) => {
+    addSearchResult(results, query, {
+      id: `preflight-${check.label}`,
+      type: "최종점검",
+      label: check.label,
+      detail: check.detail,
+      meta: check.status,
+      targetNav: "preflight",
+      tone: statusTone(check.status),
+    });
+  });
+
+  (snapshot.audit ?? []).slice(0, 10).forEach((item, index) => {
+    addSearchResult(results, query, {
+      id: `audit-${item.time}-${index}`,
+      type: "감사",
+      label: item.event,
+      detail: `${item.time} · ${item.detail}`,
+      meta: item.level,
+      targetNav: "audit",
+      tone: statusTone(item.level),
+    });
+  });
+
+  return results;
+}
+
+function buildNotificationItems(snapshot, error) {
+  const items = [];
+  const push = (item) => {
+    if (items.length < 14) items.push(item);
+  };
+
+  if (error) {
+    push({ id: "api-error", tone: "danger", title: "API 연결 오류", detail: error, targetNav: "overview" });
+  }
+  if (snapshot.kill_switch) {
+    push({ id: "kill-switch", tone: "danger", title: "Kill Switch 활성화", detail: "모든 실거래 모드가 MONITOR로 고정됩니다.", targetNav: "overview" });
+  }
+  if (snapshot.summary?.blocker_count) {
+    push({
+      id: "blockers",
+      tone: "danger",
+      title: `Readiness blocker ${snapshot.summary.blocker_count}개`,
+      detail: "실거래 주문 제출 전 hard stop을 해소해야 합니다.",
+      targetNav: "gate",
+    });
+  }
+  if (snapshot.summary?.warning_count) {
+    push({
+      id: "warnings",
+      tone: "warning",
+      title: `Warning ${snapshot.summary.warning_count}개`,
+      detail: "FULL LIVE 전환 전 수동 검토가 필요합니다.",
+      targetNav: "gate",
+    });
+  }
+
+  (snapshot.readiness ?? [])
+    .filter((check) => check.status !== "pass")
+    .slice(0, 4)
+    .forEach((check) => {
+      push({ id: `ready-${check.label}`, tone: statusTone(check.status), title: check.label, detail: check.detail, targetNav: "gate" });
+    });
+
+  (snapshot.brokers ?? [])
+    .filter((broker) => !broker.order_ready)
+    .slice(0, 3)
+    .forEach((broker) => {
+      push({
+        id: `broker-${broker.broker_id}`,
+        tone: "danger",
+        title: `${broker.name} 준비 필요`,
+        detail: broker.missing_env?.length ? `${broker.missing_env.length}개 환경 변수가 비어 있습니다.` : broker.detail,
+        targetNav: "brokers",
+      });
+    });
+
+  if (snapshot.order_queue?.retryable) {
+    push({
+      id: "retryable-orders",
+      tone: "warning",
+      title: `재시도 가능 주문 ${snapshot.order_queue.retryable}건`,
+      detail: "주문 큐에서 재시도 또는 취소 처리가 필요합니다.",
+      targetNav: "orders",
+    });
+  }
+
+  if (snapshot.reconciliation?.summary?.status && snapshot.reconciliation.summary.status !== "pass") {
+    push({
+      id: "reconciliation",
+      tone: statusTone(snapshot.reconciliation.summary.status),
+      title: `포지션·계좌 대조 ${snapshot.reconciliation.summary.status_label}`,
+      detail: `API 필요 ${snapshot.reconciliation.summary.api_required_count}개, 불일치 ${snapshot.reconciliation.summary.mismatch_count}개`,
+      targetNav: "preflight",
+    });
+  }
+
+  (snapshot.final_preflight ?? [])
+    .filter((check) => check.status !== "pass")
+    .slice(0, 3)
+    .forEach((check) => {
+      push({ id: `preflight-${check.label}`, tone: statusTone(check.status), title: check.label, detail: check.detail, targetNav: "preflight" });
+    });
+
+  if (!items.length) {
+    push({ id: "clear", tone: "success", title: "주요 알림 없음", detail: "현재 표시할 blocker 또는 warning이 없습니다.", targetNav: "overview" });
+  }
+  return items;
+}
+
 function normalizePanelKey(value) {
   return String(value || "panel")
     .replace(/\s+/g, "-")
@@ -465,7 +667,10 @@ function App() {
   const [appearance, setAppearance] = useState(readAppearance);
   const [layoutMode, setLayoutMode] = useState(readLayoutMode);
   const [exportResult, setExportResult] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const workspaceRef = useRef(null);
+  const notificationRef = useRef(null);
 
   useEditablePanels(workspaceRef);
 
@@ -494,6 +699,22 @@ function App() {
   useEffect(() => {
     applyLayoutMode(layoutMode);
   }, [layoutMode]);
+
+  useEffect(() => {
+    if (!notificationsOpen) return undefined;
+    const closeOnKey = (event) => {
+      if (event.key === "Escape") setNotificationsOpen(false);
+    };
+    const closeOnPointer = (event) => {
+      if (!notificationRef.current?.contains(event.target)) setNotificationsOpen(false);
+    };
+    window.addEventListener("keydown", closeOnKey);
+    window.addEventListener("pointerdown", closeOnPointer);
+    return () => {
+      window.removeEventListener("keydown", closeOnKey);
+      window.removeEventListener("pointerdown", closeOnPointer);
+    };
+  }, [notificationsOpen]);
 
   async function runAction(action) {
     setLoading(true);
@@ -543,9 +764,15 @@ function App() {
     window.dispatchEvent(new Event(LAYOUT_RESET_EVENT));
   }
 
+  function navigateWorkspace(navId) {
+    setSelectedNav(navId);
+    setNotificationsOpen(false);
+  }
+
   const title = navItems.find((item) => item.id === selectedNav)?.label ?? "Overview";
   const canLive = snapshot.summary.blocker_count === 0;
   const canFullLive = canLive && snapshot.summary.warning_count === 0;
+  const notifications = buildNotificationItems(snapshot, error);
 
   return (
     <div className="app-shell">
@@ -600,7 +827,12 @@ function App() {
             </button>
             <div className="search-box">
               <Search size={15} />
-              <input aria-label="심볼 또는 주문 검색" placeholder="심볼, 전략, 주문 검색" />
+              <input
+                aria-label="심볼 또는 주문 검색"
+                placeholder="심볼, 전략, 주문 검색"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.currentTarget.value)}
+              />
             </div>
             <button className="icon-button" type="button" aria-label="새로고침" onClick={refresh}>
               <RefreshCcw size={17} className={loading ? "spin" : ""} />
@@ -626,9 +858,19 @@ function App() {
                 />
               ))}
             </div>
-            <button className="icon-button" type="button" aria-label="알림">
-              <Bell size={17} />
-            </button>
+            <div className="notification-wrap" ref={notificationRef}>
+              <button
+                className={`icon-button notification-button ${notificationsOpen ? "active" : ""}`}
+                type="button"
+                aria-label="알림"
+                aria-expanded={notificationsOpen}
+                onClick={() => setNotificationsOpen((open) => !open)}
+              >
+                <Bell size={17} />
+                {notifications.length > 0 && <span className="notification-badge">{Math.min(notifications.length, 9)}</span>}
+              </button>
+              {notificationsOpen && <NotificationPanel items={notifications} onNavigate={navigateWorkspace} />}
+            </div>
             <button
               className={`danger-button ${snapshot.kill_switch ? "active" : ""}`}
               type="button"
@@ -654,8 +896,9 @@ function App() {
 
         <WorkspaceContent
           selectedNav={selectedNav}
-          onNavigate={setSelectedNav}
+          onNavigate={navigateWorkspace}
           snapshot={snapshot}
+          searchQuery={searchQuery}
           canLive={canLive}
           canFullLive={canFullLive}
           onMode={(mode) => runAction(() => setMode(mode))}
@@ -700,6 +943,7 @@ function WorkspaceContent({
   selectedNav,
   onNavigate,
   snapshot,
+  searchQuery,
   canLive,
   canFullLive,
   onMode,
@@ -739,7 +983,7 @@ function WorkspaceContent({
     />
   );
   const renderPage = (content) => (
-    <PageView selectedNav={selectedNav} onNavigate={onNavigate} snapshot={snapshot}>
+    <PageView selectedNav={selectedNav} onNavigate={onNavigate} snapshot={snapshot} searchQuery={searchQuery}>
       {content}
     </PageView>
   );
@@ -891,10 +1135,11 @@ function WorkspaceContent({
   );
 }
 
-function PageView({ selectedNav, onNavigate, snapshot, children }) {
+function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) {
   const profile = pageProfiles[selectedNav] ?? pageProfiles.overview;
   const blockerCount = snapshot.summary?.blocker_count ?? 0;
   const warningCount = snapshot.summary?.warning_count ?? 0;
+  const searchResults = buildSearchResults(snapshot, searchQuery);
 
   return (
     <section className={`page-view ${selectedNav}-view`}>
@@ -932,7 +1177,70 @@ function PageView({ selectedNav, onNavigate, snapshot, children }) {
         })}
       </div>
 
+      <SearchResultsPanel query={searchQuery} results={searchResults} onNavigate={onNavigate} />
+
       {children}
+    </section>
+  );
+}
+
+function SearchResultsPanel({ query, results, onNavigate }) {
+  if (!normalizeSearchText(query)) return null;
+  return (
+    <section className="search-results-panel" data-testid="search-results" aria-label="검색 결과">
+      <div className="search-results-head">
+        <strong>검색 결과</strong>
+        <span>{results.length}건</span>
+      </div>
+      <div className="search-result-list">
+        {results.length === 0 ? (
+          <div className="search-empty-row">
+            <TerminalSquare size={15} />
+            <span>검색 결과 없음</span>
+          </div>
+        ) : (
+          results.map((item) => (
+            <button className="search-result-row" type="button" key={item.id} onClick={() => onNavigate(item.targetNav)}>
+              <StatusPill tone={item.tone}>{item.type}</StatusPill>
+              <div>
+                <strong>{item.label}</strong>
+                <span>{item.detail}</span>
+              </div>
+              <em>{pageProfiles[item.targetNav]?.title ?? item.targetNav}</em>
+            </button>
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
+
+function toneLabel(tone) {
+  if (tone === "danger") return "위험";
+  if (tone === "warning") return "주의";
+  if (tone === "success") return "정상";
+  if (tone === "info") return "정보";
+  return "참고";
+}
+
+function NotificationPanel({ items, onNavigate }) {
+  return (
+    <section className="notification-panel" data-testid="notification-panel" aria-label="알림 목록">
+      <div className="notification-head">
+        <strong>알림</strong>
+        <span>{items.length}건</span>
+      </div>
+      <div className="notification-list">
+        {items.map((item) => (
+          <button className="notification-row" type="button" key={item.id} onClick={() => onNavigate(item.targetNav)}>
+            <StatusPill tone={item.tone}>{toneLabel(item.tone)}</StatusPill>
+            <div>
+              <strong>{item.title}</strong>
+              <span>{item.detail}</span>
+            </div>
+          </button>
+        ))}
+      </div>
     </section>
   );
 }
