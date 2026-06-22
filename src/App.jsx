@@ -158,6 +158,7 @@ const LAYOUT_MODE_STORAGE_KEY = "live-trader.layoutMode.v1";
 const APPEARANCE_STORAGE_KEY = "live-trader.appearance.v1";
 const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
 const LAYOUT_RESET_EVENT = "live-trader-layout-reset";
+const LAYOUT_SNAP_SIZE = 8;
 const MIN_PANEL_WIDTH = 260;
 const MIN_PANEL_HEIGHT = 150;
 
@@ -519,10 +520,30 @@ function splitGridTracks(template) {
   return tracks;
 }
 
+function clampNumber(value, min, max, fallback) {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(numberValue)));
+}
+
+function snapLayoutDimension(value, axis) {
+  const snapped = Math.round(Number(value) / LAYOUT_SNAP_SIZE) * LAYOUT_SNAP_SIZE;
+  const viewportLimit = axis === "width" ? window.innerWidth * 1.65 : window.innerHeight * 1.7;
+  const min = axis === "width" ? MIN_PANEL_WIDTH : MIN_PANEL_HEIGHT;
+  return clampNumber(snapped, min, Math.max(min, viewportLimit), min);
+}
+
+function snapLayoutOffset(value, axis) {
+  const snapped = Math.round(Number(value) / LAYOUT_SNAP_SIZE) * LAYOUT_SNAP_SIZE;
+  const viewportSpan = axis === "x" ? window.innerWidth : window.innerHeight;
+  const max = Math.max(axis === "x" ? 2400 : 1600, viewportSpan * 2);
+  return clampNumber(snapped, 0, max, 0);
+}
+
 function applyTrackWidth(panel, width) {
   const context = panelTrackContext(panel);
   if (!context) return false;
-  const widthPx = `${Math.max(MIN_PANEL_WIDTH, Math.round(width))}px`;
+  const widthPx = `${snapLayoutDimension(width, "width")}px`;
   const computedTracks = splitGridTracks(window.getComputedStyle(context.grid).gridTemplateColumns);
   const directTracks = Array.from(context.grid.children).filter((item) =>
     context.grid.classList.contains("content-grid") ? item.classList.contains("content-column") : item.classList.contains("panel"),
@@ -530,6 +551,64 @@ function applyTrackWidth(panel, width) {
   const nextTracks = directTracks.map((_, index) => (index === context.trackIndex ? widthPx : computedTracks[index] || "minmax(0, 1fr)"));
   context.grid.style.gridTemplateColumns = nextTracks.join(" ");
   return true;
+}
+
+function applyPanelOffset(panel, position = {}) {
+  const nextX = snapLayoutOffset(position.x, "x");
+  const nextY = snapLayoutOffset(position.y, "y");
+  panel.style.removeProperty("transform");
+  if (nextX > 0) {
+    panel.dataset.layoutOffsetX = String(nextX);
+    panel.style.marginLeft = `${nextX}px`;
+  } else {
+    delete panel.dataset.layoutOffsetX;
+    panel.style.removeProperty("margin-left");
+  }
+  if (nextY > 0) {
+    panel.dataset.layoutOffsetY = String(nextY);
+    panel.style.marginTop = `${nextY}px`;
+  } else {
+    delete panel.dataset.layoutOffsetY;
+    panel.style.removeProperty("margin-top");
+  }
+}
+
+function clearPanelOffset(panel) {
+  delete panel.dataset.layoutOffsetX;
+  delete panel.dataset.layoutOffsetY;
+  panel.style.removeProperty("transform");
+  panel.style.removeProperty("margin-left");
+  panel.style.removeProperty("margin-top");
+}
+
+function currentPanelOffset(panel, storedPosition = {}) {
+  const inlineX = Number(String(panel.style.marginLeft || "0").replace("px", ""));
+  const inlineY = Number(String(panel.style.marginTop || "0").replace("px", ""));
+  const storedX = Number(storedPosition?.x);
+  const storedY = Number(storedPosition?.y);
+  return {
+    x: snapLayoutOffset(Number.isFinite(inlineX) && inlineX > 0 ? inlineX : storedX, "x"),
+    y: snapLayoutOffset(Number.isFinite(inlineY) && inlineY > 0 ? inlineY : storedY, "y"),
+  };
+}
+
+function isInteractiveLayoutTarget(target) {
+  if (!(target instanceof Element)) return false;
+  return Boolean(
+    target.closest(
+      [
+        "button",
+        "input",
+        "select",
+        "textarea",
+        "a",
+        "summary",
+        "[role='button']",
+        ".panel-resize-edge",
+        ".panel-resize-corner",
+      ].join(", "),
+    ),
+  );
 }
 
 function restoreTrackWidth(panel) {
@@ -545,15 +624,18 @@ function ensurePanelHandles(panel) {
   panelLayoutKey(panel);
 
   const sizes = readStoredMap(PANEL_SIZE_STORAGE_KEY);
+  const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
   const key = panelLayoutKey(panel);
   const size = sizes[key];
+  const position = positions[key];
 
   panel.style.transform = "";
   if (size && Number.isFinite(size.width)) applyTrackWidth(panel, size.width);
   restoreTrackWidth(panel);
   if (size && Number.isFinite(size.height)) {
-    panel.style.height = `${Math.max(MIN_PANEL_HEIGHT, size.height)}px`;
+    panel.style.height = `${snapLayoutDimension(size.height, "height")}px`;
   }
+  applyPanelOffset(panel, position);
 
   if (panel.querySelector(":scope > .panel-resize-north-west")) return;
   panel.querySelectorAll(":scope > .panel-resize-edge, :scope > .panel-resize-corner").forEach((handle) => handle.remove());
@@ -591,7 +673,7 @@ function useEditablePanels(rootRef) {
       root.querySelectorAll(".panel").forEach((panel) => {
         panel.style.width = "";
         panel.style.height = "";
-        panel.style.transform = "";
+        clearPanelOffset(panel);
       });
       root.querySelectorAll(".command-grid, .content-grid").forEach((grid) => {
         grid.style.gridTemplateColumns = "";
@@ -609,20 +691,19 @@ function useEditablePanels(rootRef) {
       const startX = event.clientX;
       const startY = event.clientY;
       const bounds = panel.getBoundingClientRect();
-      const maxWidth = Math.max(MIN_PANEL_WIDTH, window.innerWidth * 1.65);
-      const maxHeight = Math.max(MIN_PANEL_HEIGHT, window.innerHeight * 1.7);
       const affectsWidth = direction.includes("e") || direction.includes("w");
       const affectsHeight = direction.includes("n") || direction.includes("s");
+      document.body.classList.add("is-resizing-layout");
 
       const onMove = (moveEvent) => {
         if (affectsWidth) {
           const deltaX = direction.includes("w") ? startX - moveEvent.clientX : moveEvent.clientX - startX;
-          const nextWidth = Math.min(maxWidth, Math.max(MIN_PANEL_WIDTH, Math.round(bounds.width + deltaX)));
+          const nextWidth = snapLayoutDimension(bounds.width + deltaX, "width");
           if (!applyTrackWidth(panel, nextWidth)) panel.style.width = `${nextWidth}px`;
         }
         if (affectsHeight) {
           const deltaY = direction.includes("n") ? startY - moveEvent.clientY : moveEvent.clientY - startY;
-          const nextHeight = Math.min(maxHeight, Math.max(MIN_PANEL_HEIGHT, Math.round(bounds.height + deltaY)));
+          const nextHeight = snapLayoutDimension(bounds.height + deltaY, "height");
           panel.style.height = `${nextHeight}px`;
         }
       };
@@ -639,12 +720,58 @@ function useEditablePanels(rootRef) {
           tracks[trackContext.key] = Math.round(trackContext.trackElement.getBoundingClientRect().width);
           writeStoredMap(PANEL_TRACK_STORAGE_KEY, tracks);
         }
+        document.body.classList.remove("is-resizing-layout");
         document.removeEventListener("pointermove", onMove);
         document.removeEventListener("pointerup", onUp);
+        document.removeEventListener("pointercancel", onUp);
       };
 
       document.addEventListener("pointermove", onMove);
       document.addEventListener("pointerup", onUp, { once: true });
+      document.addEventListener("pointercancel", onUp, { once: true });
+    };
+
+    const startMove = (event, panel) => {
+      if (document.documentElement.dataset.layoutMode !== "edit" || event.button !== 0) return;
+      if (isInteractiveLayoutTarget(event.target)) return;
+      const header = event.target.closest(".panel-header");
+      if (!header || !panel.contains(header)) return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      const key = panelLayoutKey(panel);
+      const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
+      const startOffset = currentPanelOffset(panel, positions[key]);
+      const startX = event.clientX;
+      const startY = event.clientY;
+      panel.classList.add("dragging-panel");
+      document.body.classList.add("is-moving-layout");
+
+      const onMove = (moveEvent) => {
+        const nextX = snapLayoutOffset(startOffset.x + moveEvent.clientX - startX, "x");
+        const nextY = snapLayoutOffset(startOffset.y + moveEvent.clientY - startY, "y");
+        applyPanelOffset(panel, { x: nextX, y: nextY });
+      };
+
+      const onUp = () => {
+        const nextOffset = currentPanelOffset(panel, positions[key]);
+        const stored = readStoredMap(PANEL_POSITION_STORAGE_KEY);
+        if (nextOffset.x > 0 || nextOffset.y > 0) {
+          stored[key] = nextOffset;
+        } else {
+          delete stored[key];
+        }
+        writeStoredMap(PANEL_POSITION_STORAGE_KEY, stored);
+        panel.classList.remove("dragging-panel");
+        document.body.classList.remove("is-moving-layout");
+        document.removeEventListener("pointermove", onMove, true);
+        document.removeEventListener("pointerup", onUp, true);
+        document.removeEventListener("pointercancel", onUp, true);
+      };
+
+      document.addEventListener("pointermove", onMove, true);
+      document.addEventListener("pointerup", onUp, { once: true, capture: true });
+      document.addEventListener("pointercancel", onUp, { once: true, capture: true });
     };
 
     const onPointerDown = (event) => {
@@ -656,6 +783,7 @@ function useEditablePanels(rootRef) {
         startResize(event, panel, resizeHandle.dataset.resizeDirection || "se");
         return;
       }
+      startMove(event, panel);
     };
 
     const observer = new MutationObserver(enhancePanels);
@@ -841,6 +969,10 @@ function App() {
             >
               {layoutMode === "edit" ? <Unlock size={16} /> : <Lock size={16} />}
               <span>{layoutMode === "edit" ? "편집 중" : "레이아웃"}</span>
+            </button>
+            <button className="ghost-button" type="button" onClick={resetWorkspaceLayout} title="패널 크기와 위치를 기본값으로 되돌립니다.">
+              <RotateCcw size={15} />
+              <span>초기화</span>
             </button>
             <div className="search-box">
               <Search size={15} />

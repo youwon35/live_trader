@@ -2195,7 +2195,30 @@ body {
 }
 
 .workspace.layout-edit .panel-header {
+  cursor: grab;
   user-select: none;
+}
+
+.workspace.layout-edit .panel-header button,
+.workspace.layout-edit .panel-header a,
+.workspace.layout-edit .panel-header [role='button'] {
+  cursor: pointer;
+}
+
+.dragging-panel .panel-header {
+  cursor: grabbing;
+}
+
+.is-resizing-layout,
+.is-resizing-layout *,
+.is-moving-layout,
+.is-moving-layout * {
+  user-select: none !important;
+}
+
+.is-moving-layout,
+.is-moving-layout * {
+  cursor: grabbing !important;
 }
 
 .workspace.layout-locked .panel-resize-edge,
