@@ -589,7 +589,7 @@ button {
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
+  gap: 12px;
 }
 
 .summary-grid div {
@@ -629,7 +629,7 @@ button {
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
+  gap: 12px;
 }
 
 .metric-card {
@@ -663,7 +663,7 @@ button {
 .queue-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
+  gap: 12px;
 }
 
 .queue-card {
@@ -1146,7 +1146,7 @@ button {
 .risk-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  gap: 12px;
 }
 
 .risk-rule {
@@ -1615,7 +1615,7 @@ button {
 .workflow-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
+  gap: 12px;
 }
 
 .workflow-step {
@@ -1709,7 +1709,7 @@ body {
 .nav-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 10px;
 }
 
 .nav-item {
@@ -1771,7 +1771,7 @@ body {
 
 .topbar-actions {
   flex-wrap: wrap;
-  gap: 7px;
+  gap: 10px;
   min-width: 0;
 }
 
@@ -1892,7 +1892,7 @@ body {
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
   min-height: 0;
   overflow: hidden;
   padding: 8px 10px 34px;
@@ -1942,7 +1942,7 @@ body {
 .page-heading-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 10px;
   justify-content: flex-end;
   max-width: 520px;
 }
@@ -1960,9 +1960,9 @@ body {
   display: flex;
   flex: 0 0 auto;
   flex-wrap: wrap;
-  gap: 5px;
-  min-height: 35px;
-  padding: 4px;
+  gap: 10px;
+  min-height: 39px;
+  padding: 5px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -2019,20 +2019,20 @@ body {
 
 .command-grid {
   flex: 0 0 auto;
-  gap: 8px;
+  gap: 14px;
   padding: 8px 10px 0;
 }
 
 .content-grid {
   flex: 1 1 auto;
-  gap: 8px;
+  gap: 14px;
   min-height: 0;
   overflow: auto;
   padding: 8px 10px 34px;
 }
 
 .content-column {
-  gap: 8px;
+  gap: 14px;
 }
 
 .panel {
@@ -2049,7 +2049,7 @@ body {
 .panel-header {
   align-items: center;
   min-height: 44px;
-  margin: -10px -10px 10px;
+  margin: -10px -10px 12px;
   padding: 6px 11px;
   background: var(--panel-header, linear-gradient(180deg, rgba(19, 31, 44, 0.98), rgba(14, 31, 48, 0.98)));
   border-bottom: 1px solid var(--table-border, var(--border));
@@ -2073,7 +2073,15 @@ body {
 .panel-action-line,
 .operator-actions,
 .mode-selector {
-  gap: 6px;
+  gap: 10px;
+}
+
+.panel > .primary-button + .panel-action-line,
+.panel > .secondary-button + .panel-action-line,
+.panel > .danger-button + .panel-action-line,
+.panel > .panel-action-line + .panel-action-line,
+.panel > .mode-selector + .operator-actions {
+  margin-top: 12px;
 }
 
 .mode-button {
@@ -2332,7 +2340,7 @@ body {
 .layout-settings-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 7px;
+  gap: 10px;
   justify-content: flex-end;
 }
 
