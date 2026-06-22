@@ -1845,9 +1845,9 @@ body {
 .accent-dot-row {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 10px;
   height: 35px;
-  padding: 0 7px;
+  padding: 0 10px;
   background: var(--button);
   border: 1px solid var(--border);
   border-radius: 7px;
