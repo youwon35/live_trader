@@ -2143,19 +2143,7 @@ body {
 }
 
 .workspace.layout-edit .panel-header {
-  cursor: grab;
   user-select: none;
-}
-
-.resizable-panel.dragging-panel {
-  z-index: 40;
-  box-shadow:
-    0 0 0 1px rgba(47, 128, 237, 0.34),
-    0 16px 40px rgba(0, 0, 0, 0.34);
-}
-
-.resizable-panel.dragging-panel .panel-header {
-  cursor: grabbing;
 }
 
 .workspace.layout-locked .panel-resize-edge,
@@ -2170,6 +2158,14 @@ body {
   opacity: 0;
   touch-action: none;
   user-select: none;
+}
+
+.panel-resize-north {
+  top: 0;
+  right: 18px;
+  left: 18px;
+  height: 12px;
+  cursor: ns-resize;
 }
 
 .panel-resize-east {
@@ -2188,16 +2184,54 @@ body {
   cursor: ns-resize;
 }
 
+.panel-resize-west {
+  top: 44px;
+  bottom: 18px;
+  left: 0;
+  width: 12px;
+  cursor: ew-resize;
+}
+
 .panel-resize-corner {
-  right: 0;
-  bottom: 0;
   width: 18px;
   height: 18px;
+  opacity: 0.45;
+}
+
+.panel-resize-north-west {
+  top: 0;
+  left: 0;
+  border-top: 2px solid rgba(125, 178, 236, 0.72);
+  border-left: 2px solid rgba(125, 178, 236, 0.72);
+  border-radius: 5px 0 0 0;
+  cursor: nwse-resize;
+}
+
+.panel-resize-north-east {
+  top: 0;
+  right: 0;
+  border-top: 2px solid rgba(125, 178, 236, 0.72);
+  border-right: 2px solid rgba(125, 178, 236, 0.72);
+  border-radius: 0 5px 0 0;
+  cursor: nesw-resize;
+}
+
+.panel-resize-south-east {
+  right: 0;
+  bottom: 0;
   border-right: 2px solid rgba(125, 178, 236, 0.72);
   border-bottom: 2px solid rgba(125, 178, 236, 0.72);
   border-radius: 0 0 5px 0;
   cursor: nwse-resize;
-  opacity: 0.45;
+}
+
+.panel-resize-south-west {
+  bottom: 0;
+  left: 0;
+  border-bottom: 2px solid rgba(125, 178, 236, 0.72);
+  border-left: 2px solid rgba(125, 178, 236, 0.72);
+  border-radius: 0 0 0 5px;
+  cursor: nesw-resize;
 }
 
 .resizable-panel:hover .panel-resize-edge,
@@ -2209,6 +2243,8 @@ body {
 
 .panel-resize-east:hover,
 .panel-resize-south:hover,
+.panel-resize-west:hover,
+.panel-resize-north:hover,
 .panel-resize-corner:hover {
   background: rgba(47, 128, 237, 0.12);
 }
