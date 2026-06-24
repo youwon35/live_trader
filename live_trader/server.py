@@ -13,6 +13,8 @@ from . import state
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8795
 
 
 class LiveTraderHandler(BaseHTTPRequestHandler):
@@ -123,11 +125,11 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def create_server(host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
+def create_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
     return ThreadingHTTPServer((host, port), LiveTraderHandler)
 
 
-def start_in_thread(host: str = "127.0.0.1", port: int = 8765) -> tuple[ThreadingHTTPServer, str]:
+def start_in_thread(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tuple[ThreadingHTTPServer, str]:
     server = create_server(host, port)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -136,8 +138,8 @@ def start_in_thread(host: str = "127.0.0.1", port: int = 8765) -> tuple[Threadin
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", default=8765, type=int)
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", default=DEFAULT_PORT, type=int)
     args = parser.parse_args()
     server = create_server(args.host, args.port)
     print(f"Live Trader server listening on http://{args.host}:{server.server_port}")
