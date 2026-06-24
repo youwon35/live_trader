@@ -7,7 +7,7 @@ from .server import start_in_thread
 
 
 def main() -> None:
-    server, url = start_in_thread(port=0)
+    server, url = start_in_thread()
     try:
         import webview
 
