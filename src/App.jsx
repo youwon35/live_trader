@@ -600,7 +600,7 @@ function snapLayoutOffset(value, axis) {
   const snapped = Math.round(Number(value) / LAYOUT_SNAP_SIZE) * LAYOUT_SNAP_SIZE;
   const viewportSpan = axis === "x" ? window.innerWidth : window.innerHeight;
   const max = Math.max(axis === "x" ? 2400 : 1600, viewportSpan * 2);
-  return clampNumber(snapped, 0, max, 0);
+  return clampNumber(snapped, -max, max, 0);
 }
 
 function applyTrackWidth(panel, width) {
@@ -620,14 +620,14 @@ function applyPanelOffset(panel, position = {}) {
   const nextX = snapLayoutOffset(position.x, "x");
   const nextY = snapLayoutOffset(position.y, "y");
   panel.style.removeProperty("transform");
-  if (nextX > 0) {
+  if (Math.abs(nextX) > 0) {
     panel.dataset.layoutOffsetX = String(nextX);
     panel.style.marginLeft = `${nextX}px`;
   } else {
     delete panel.dataset.layoutOffsetX;
     panel.style.removeProperty("margin-left");
   }
-  if (nextY > 0) {
+  if (Math.abs(nextY) > 0) {
     panel.dataset.layoutOffsetY = String(nextY);
     panel.style.marginTop = `${nextY}px`;
   } else {
@@ -650,8 +650,8 @@ function currentPanelOffset(panel, storedPosition = {}) {
   const storedX = Number(storedPosition?.x);
   const storedY = Number(storedPosition?.y);
   return {
-    x: snapLayoutOffset(Number.isFinite(inlineX) && inlineX > 0 ? inlineX : storedX, "x"),
-    y: snapLayoutOffset(Number.isFinite(inlineY) && inlineY > 0 ? inlineY : storedY, "y"),
+    x: snapLayoutOffset(Number.isFinite(inlineX) && Math.abs(inlineX) > 0 ? inlineX : storedX, "x"),
+    y: snapLayoutOffset(Number.isFinite(inlineY) && Math.abs(inlineY) > 0 ? inlineY : storedY, "y"),
   };
 }
 
@@ -819,7 +819,7 @@ function useEditablePanels(rootRef) {
       const onUp = () => {
         const nextOffset = currentPanelOffset(panel, positions[key]);
         const stored = readStoredMap(PANEL_POSITION_STORAGE_KEY);
-        if (nextOffset.x > 0 || nextOffset.y > 0) {
+        if (Math.abs(nextOffset.x) > 0 || Math.abs(nextOffset.y) > 0) {
           stored[key] = nextOffset;
         } else {
           delete stored[key];
