@@ -24,6 +24,7 @@ import {
   RotateCcw,
   Route,
   Search,
+  Settings,
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
@@ -51,50 +52,56 @@ import {
 import designTokens from "../../../packages/design/design_tokens.json";
 
 const navItems = [
-  { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "gate", label: "Live Gate", icon: ListChecks },
-  { id: "orders", label: "Orders", icon: Route },
-  { id: "brokers", label: "Brokers", icon: Network },
-  { id: "strategies", label: "Strategies", icon: DatabaseZap },
-  { id: "audit", label: "Audit", icon: FileClock },
-  { id: "preflight", label: "Preflight", icon: ShieldCheck },
+  { id: "overview", label: "대시보드", icon: LayoutDashboard },
+  { id: "gate", label: "실거래 게이트", icon: ListChecks },
+  { id: "orders", label: "주문", icon: Route },
+  { id: "brokers", label: "브로커", icon: Network },
+  { id: "strategies", label: "전략", icon: DatabaseZap },
+  { id: "audit", label: "감사 로그", icon: FileClock },
+  { id: "preflight", label: "최종 점검", icon: ShieldCheck },
+  { id: "settings", label: "설정", icon: Settings },
 ];
 
 const pageProfiles = {
   overview: {
-    title: "Overview",
-    eyebrow: "Live Order Desk",
+    title: "대시보드",
+    eyebrow: "실거래 관제",
     summary: "실거래 게이트, 주문, 브로커, 대조 상태를 한 화면에서 확인합니다.",
   },
   gate: {
-    title: "Live Gate",
-    eyebrow: "Approval",
+    title: "실거래 게이트",
+    eyebrow: "승인/차단",
     summary: "실주문 전환 조건과 운영 체크리스트를 점검합니다.",
   },
   orders: {
-    title: "Orders",
-    eyebrow: "Order Queue",
+    title: "주문",
+    eyebrow: "주문 큐",
     summary: "주문 의도, Dry Run 원장, 재시도 정책을 관리합니다.",
   },
   brokers: {
-    title: "Brokers",
-    eyebrow: "API Adapters",
+    title: "브로커",
+    eyebrow: "API 어댑터",
     summary: "KIS/Binance 키, capability, 어댑터 계약 상태를 확인합니다.",
   },
   strategies: {
-    title: "Strategies",
-    eyebrow: "Artifacts",
+    title: "전략",
+    eyebrow: "전략 산출물",
     summary: "Backtester/Paper 승인 전략과 live_allowed 권한을 검토합니다.",
   },
   audit: {
-    title: "Audit",
-    eyebrow: "Operation Log",
+    title: "감사 로그",
+    eyebrow: "운영 기록",
     summary: "모드 전환, 주문 차단, 설정 변경 이력을 추적합니다.",
   },
   preflight: {
-    title: "Preflight",
-    eyebrow: "Launch Check",
+    title: "최종 점검",
+    eyebrow: "출시 전 검사",
     summary: "실브로커 연결 직전 hard stop과 warning을 최종 확인합니다.",
+  },
+  settings: {
+    title: "설정",
+    eyebrow: "화면/운영 환경",
+    summary: "테마, 강조 색상, 레이아웃 편집과 실거래 연결 준비 정보를 관리합니다.",
   },
 };
 
@@ -444,7 +451,7 @@ function buildNotificationItems(snapshot, error) {
     push({ id: "api-error", tone: "danger", title: "API 연결 오류", detail: error, targetNav: "overview" });
   }
   if (snapshot.kill_switch) {
-    push({ id: "kill-switch", tone: "danger", title: "Kill Switch 활성화", detail: "모든 실거래 모드가 MONITOR로 고정됩니다.", targetNav: "overview" });
+    push({ id: "kill-switch", tone: "danger", title: "긴급 차단 활성화", detail: "모든 실거래 모드가 MONITOR로 고정됩니다.", targetNav: "overview" });
   }
   if (snapshot.summary?.blocker_count) {
     push({
@@ -970,7 +977,7 @@ function App() {
     setNotificationsOpen(false);
   }
 
-  const title = navItems.find((item) => item.id === selectedNav)?.label ?? "Overview";
+  const title = navItems.find((item) => item.id === selectedNav)?.label ?? "대시보드";
   const canLive = snapshot.summary.blocker_count === 0;
   const canFullLive = canLive && snapshot.summary.warning_count === 0;
   const notifications = buildNotificationItems(snapshot, error);
@@ -983,8 +990,8 @@ function App() {
             <Radio size={19} />
           </div>
           <div>
-            <strong>Live Trader</strong>
-            <span>Real Order Desk</span>
+            <strong>실거래 콘솔</strong>
+            <span>주문 운영 데스크</span>
           </div>
         </div>
         <nav className="nav-list" aria-label="주요 메뉴">
@@ -1013,7 +1020,7 @@ function App() {
         <header className="topbar">
           <div>
             <p>{title}</p>
-            <h1>Live Trader 실거래 콘솔</h1>
+            <h1>실거래 콘솔</h1>
           </div>
           <div className="topbar-actions">
             <button
@@ -1082,7 +1089,7 @@ function App() {
               onClick={() => runAction(() => setFlag("kill_switch", !snapshot.kill_switch))}
             >
               <CircleStop size={17} />
-              Kill Switch
+              긴급 차단
             </button>
           </div>
         </header>
@@ -1305,6 +1312,28 @@ function WorkspaceContent({
     );
   }
 
+  if (selectedNav === "settings") {
+    return renderPage(
+      <section className="content-grid settings-content-grid">
+        <div className="content-column">
+          <AppearanceControlPanel
+            appearance={appearance}
+            updateAppearance={updateAppearance}
+            layoutMode={layoutMode}
+            changeLayoutMode={changeLayoutMode}
+            resetWorkspaceLayout={resetWorkspaceLayout}
+          />
+          <BrokerRequirementsPanel brokers={snapshot.brokers} />
+        </div>
+        <div className="content-column">
+          <BrokerConnectionWizardPanel diagnostics={snapshot.broker_diagnostics} onBrokerCheck={onBrokerCheck} />
+          <BrokerAdapterContractPanel contract={snapshot.broker_adapter_contract} />
+          <GateRunbookPanel />
+        </div>
+      </section>,
+    );
+  }
+
   return renderPage(
     <>
       <section className="command-grid">
@@ -1323,13 +1352,6 @@ function WorkspaceContent({
           <AuditPanel audit={snapshot.audit} />
         </div>
         <div className="content-column">
-          <AppearanceControlPanel
-            appearance={appearance}
-            updateAppearance={updateAppearance}
-            layoutMode={layoutMode}
-            changeLayoutMode={changeLayoutMode}
-            resetWorkspaceLayout={resetWorkspaceLayout}
-          />
           <BrokerPanel brokers={snapshot.brokers} />
           <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
           <AccountReconciliationPanel accounts={snapshot.accounts} />
@@ -1839,7 +1861,7 @@ function GateRunbookPanel() {
   ];
   return (
     <section className="panel">
-      <PanelHeader title="Live Gate 체크라인" subtitle="실거래 전환 전 필요한 운영 조건입니다." />
+      <PanelHeader title="실거래 게이트 체크라인" subtitle="실거래 전환 전 필요한 운영 조건입니다." />
       <div className="compact-list">
         {items.map(([label, detail]) => (
           <div className="compact-row" key={label}>
@@ -2193,7 +2215,7 @@ function FinalPreflightPanel({ checks, onPreflight, compact = false }) {
   const visibleChecks = compact ? checks.slice(0, 6) : checks;
   return (
     <section className="panel final-preflight-panel">
-      <PanelHeader title="최종 Preflight" subtitle="실브로커 어댑터 연결 직전의 hard stop과 warning을 점검합니다." />
+      <PanelHeader title="최종 점검" subtitle="실브로커 어댑터 연결 직전의 hard stop과 warning을 점검합니다." />
       <div className="panel-action-line">
         <StatusPill tone={checks.some((check) => check.status === "fail") ? "danger" : checks.some((check) => check.status === "warn") ? "warning" : "success"}>
           {checks.filter((check) => check.status === "fail").length} hard stop
@@ -2357,7 +2379,7 @@ function PositionPanel({ positions }) {
 function AuditPanel({ audit }) {
   return (
     <section className="panel audit-panel">
-      <PanelHeader title="Audit Stream" subtitle="모드 전환, 주문 차단, 설정 변경을 시간순으로 추적합니다." />
+      <PanelHeader title="감사 스트림" subtitle="모드 전환, 주문 차단, 설정 변경을 시간순으로 추적합니다." />
       <div className="audit-list">
         {audit.map((item, index) => (
           <div className={`audit-row ${item.level}`} key={`${item.time}-${index}`}>
