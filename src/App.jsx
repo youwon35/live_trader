@@ -171,6 +171,47 @@ const accentPalettes = Object.fromEntries(
     },
   ]),
 );
+const fallbackAccentId = designTokens.accent?.default ?? "blue";
+const fallbackAccentSwatch = accentPalettes[fallbackAccentId]?.swatch ?? "#2f80ed";
+
+function normalizeHexColor(value, fallback = fallbackAccentSwatch) {
+  const text = String(value || "").trim();
+  const shortMatch = text.match(/^#?([0-9a-f]{3})$/i);
+  if (shortMatch) {
+    return `#${shortMatch[1]
+      .split("")
+      .map((char) => `${char}${char}`)
+      .join("")}`.toLowerCase();
+  }
+  const match = text.match(/^#?([0-9a-f]{6})$/i);
+  return match ? `#${match[1]}`.toLowerCase() : fallback;
+}
+
+function hexToRgb(hex) {
+  const normalized = normalizeHexColor(hex);
+  return {
+    r: parseInt(normalized.slice(1, 3), 16),
+    g: parseInt(normalized.slice(3, 5), 16),
+    b: parseInt(normalized.slice(5, 7), 16),
+  };
+}
+
+function customAccentVars(color) {
+  const primary = normalizeHexColor(color);
+  const { r, g, b } = hexToRgb(primary);
+  return {
+    "--primary": primary,
+    "--primary-hover": `color-mix(in srgb, ${primary} 70%, #000000)`,
+    "--primary-border": `color-mix(in srgb, ${primary} 76%, #ffffff)`,
+    "--icon-blue": `color-mix(in srgb, ${primary} 68%, #ffffff)`,
+    "--secondary": `color-mix(in srgb, ${primary} 48%, #55d6be)`,
+    "--primary-gradient": primary,
+    "--progress-gradient": primary,
+    "--focus-primary": `0 0 0 3px rgba(${r}, ${g}, ${b}, 0.2)`,
+  };
+}
+
+const customAccentVarNames = Object.keys(customAccentVars(fallbackAccentSwatch));
 
 const appearanceThemeOptions = [
   { id: "dark", label: "다크", icon: Moon },
@@ -179,7 +220,8 @@ const appearanceThemeOptions = [
 
 const defaultAppearance = {
   theme: "dark",
-  accent: designTokens.accent?.default ?? "blue",
+  accent: fallbackAccentId,
+  customAccent: fallbackAccentSwatch,
 };
 
 function readStoredMap(key) {
@@ -227,10 +269,23 @@ function applyLayoutMode(mode) {
 }
 
 function normalizeAppearance(appearance = {}) {
+  const legacyAccentSwatch = accentPalettes[appearance.accent]?.swatch ?? fallbackAccentSwatch;
+  const accent = appearance.accent === "custom" || accentPalettes[appearance.accent] ? appearance.accent : defaultAppearance.accent;
   return {
     theme: appearance.theme === "light" ? "light" : "dark",
-    accent: accentPalettes[appearance.accent] ? appearance.accent : defaultAppearance.accent,
+    accent,
+    customAccent: normalizeHexColor(appearance.customAccent, legacyAccentSwatch),
   };
+}
+
+function applyCustomAccent(root, appearance) {
+  if (appearance.accent !== "custom") {
+    customAccentVarNames.forEach((name) => root.style.removeProperty(name));
+    return;
+  }
+  Object.entries(customAccentVars(appearance.customAccent)).forEach(([name, value]) => {
+    root.style.setProperty(name, value);
+  });
 }
 
 function readAppearance() {
@@ -249,6 +304,7 @@ function applyAppearance(appearance) {
     const root = document.documentElement;
     root.dataset.uiTheme = nextAppearance.theme;
     root.dataset.accent = nextAppearance.accent;
+    applyCustomAccent(root, nextAppearance);
   } catch {
     // Appearance remains in React state if document access is unavailable.
   }
@@ -1437,6 +1493,9 @@ function statusTone(status) {
 
 function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, changeLayoutMode, resetWorkspaceLayout }) {
   const isLayoutEditing = layoutMode === "edit";
+  const handleCustomAccentChange = (event) => {
+    updateAppearance({ accent: "custom", customAccent: event.target.value });
+  };
 
   return (
     <section className="panel appearance-panel">
@@ -1469,19 +1528,27 @@ function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, chan
           <strong>강조 색상</strong>
           <span>선택된 메뉴, 주요 버튼, 진행 상태의 기준 색을 정합니다.</span>
         </div>
-        <div className="accent-swatch-row">
-          {Object.entries(accentPalettes).map(([id, palette]) => (
-            <button
-              key={id}
-              className={`accent-swatch ${appearance.accent === id ? "selected" : ""}`}
-              type="button"
-              style={{ "--swatch": palette.swatch }}
-              onClick={() => updateAppearance({ accent: id })}
-            >
+        <div className="custom-accent-row">
+          <label
+            className={`custom-accent-picker ${appearance.accent === "custom" ? "selected" : ""}`}
+            style={{ "--custom-accent": appearance.customAccent }}
+            onClick={() => updateAppearance({ accent: "custom" })}
+          >
+            <span className="custom-accent-wheel" aria-hidden="true">
               <i />
-              <span>{palette.label}</span>
-            </button>
-          ))}
+            </span>
+            <span className="custom-accent-label">
+              <strong>사용자 색상</strong>
+              <em>{appearance.customAccent}</em>
+            </span>
+            <input
+              type="color"
+              value={appearance.customAccent}
+              aria-label="사용자 강조 색상"
+              onInput={handleCustomAccentChange}
+              onChange={handleCustomAccentChange}
+            />
+          </label>
         </div>
       </div>
 
