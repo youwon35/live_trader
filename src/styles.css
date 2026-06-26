@@ -2059,6 +2059,128 @@ body {
   color: var(--danger-soft-text);
 }
 
+.doctor-panel {
+  min-height: 0;
+}
+
+.doctor-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.doctor-hero span,
+.doctor-card span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.doctor-hero strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 24px;
+  font-weight: 900;
+  line-height: 1.1;
+}
+
+.doctor-hero p {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.doctor-run-button {
+  min-width: 132px;
+}
+
+.doctor-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.doctor-card {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-height: 96px;
+  padding: 12px;
+  text-align: left;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.doctor-card:hover {
+  border-color: var(--border-hover);
+  background: var(--button-hover);
+}
+
+.doctor-step {
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  color: var(--text);
+  background: var(--button);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.doctor-card strong {
+  display: block;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+.doctor-card div span {
+  display: block;
+  margin-top: 5px;
+  line-height: 1.4;
+  white-space: normal;
+}
+
+.doctor-status {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.doctor-card.success {
+  border-color: var(--success-border);
+}
+
+.doctor-card.warning {
+  border-color: var(--warning-border);
+}
+
+.doctor-card.danger {
+  border-color: var(--danger-border);
+}
+
+.doctor-card.success .doctor-status {
+  color: var(--success-text);
+}
+
+.doctor-card.warning .doctor-status {
+  color: var(--warning-text);
+}
+
+.doctor-card.danger .doctor-status {
+  color: var(--danger-soft-text);
+}
+
 .alert-band {
   flex: 0 0 auto;
   min-height: 45px;

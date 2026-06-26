@@ -2,6 +2,14 @@ export async function getSnapshot() {
   return request("/api/snapshot");
 }
 
+export async function getUiSettings() {
+  return request("/api/ui-settings");
+}
+
+export async function saveUiSettings(settings) {
+  return request("/api/ui-settings", { method: "POST", body: settings });
+}
+
 export async function setMode(mode) {
   return request("/api/mode", { method: "POST", body: { mode } });
 }

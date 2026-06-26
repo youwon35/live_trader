@@ -37,6 +37,7 @@ import {
   cancelOrder,
   exportAudit,
   getSnapshot,
+  getUiSettings,
   runBrokerCheck,
   runFinalPreflight,
   runReconciliation,
@@ -46,12 +47,13 @@ import {
   setMode,
   setRetryPolicy,
   setRiskSetting,
+  saveUiSettings,
   submitTestIntent,
 } from "./api";
 import designTokens from "../../../packages/design/design_tokens.json";
 
 const navItems = [
-  { id: "overview", label: "대시보드", icon: LayoutDashboard },
+  { id: "overview", label: "사전점검", icon: LayoutDashboard },
   { id: "gate", label: "실거래 게이트", icon: ListChecks },
   { id: "orders", label: "주문", icon: Route },
   { id: "brokers", label: "API", icon: Network },
@@ -63,9 +65,9 @@ const navItems = [
 
 const pageProfiles = {
   overview: {
-    title: "대시보드",
-    eyebrow: "실거래 관제",
-    summary: "실거래 게이트, 주문, 브로커, 대조 상태를 한 화면에서 확인합니다.",
+    title: "사전점검",
+    eyebrow: "Live Doctor",
+    summary: "실거래 전 API, 리스크, 체크리스트, 대조 상태를 한 번에 점검합니다.",
   },
   gate: {
     title: "실거래 게이트",
@@ -164,12 +166,37 @@ const SIDEBAR_COLLAPSED_STORAGE_KEY = "live-trader.sidebarCollapsed.v1";
 const APPEARANCE_STORAGE_KEY = "live-trader.appearance.v1";
 const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
 const LAYOUT_RESET_EVENT = "live-trader-layout-reset";
+const LAYOUT_RESTORE_EVENT = "live-trader-layout-restore";
 const LAYOUT_SNAP_SIZE = 8;
 const LAYOUT_COLLISION_GAP = 8;
 const LAYOUT_MAX_DIMENSION = 100000;
 const LAYOUT_MAX_OFFSET = 100000;
 const MIN_PANEL_WIDTH = 260;
 const MIN_PANEL_HEIGHT = 150;
+
+function readStoredValue(key, fallback = null) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function collectUiSettings() {
+  return {
+    appearance: readAppearance(),
+    layoutMode: readLayoutMode(),
+    sidebarCollapsed: readSidebarCollapsed(),
+    panelSizes: readStoredValue(PANEL_SIZE_STORAGE_KEY, {}),
+    panelPositions: readStoredValue(PANEL_POSITION_STORAGE_KEY, {}),
+  };
+}
+
+function persistUiSettings(partial = {}) {
+  const payload = { ...collectUiSettings(), ...partial };
+  saveUiSettings(payload).catch(() => {});
+}
 
 const accentPalettes = Object.fromEntries(
   Object.entries(designTokens.accent?.palettes ?? {}).map(([id, palette]) => [
@@ -248,6 +275,9 @@ function writeStoredMap(key, map) {
   } catch {
     // Embedded WebView storage can be unavailable; the visible edit still works for the session.
   }
+  persistUiSettings({
+    [key === PANEL_SIZE_STORAGE_KEY ? "panelSizes" : "panelPositions"]: map,
+  });
 }
 
 function normalizeLayoutMode(mode) {
@@ -339,6 +369,26 @@ function applyAppearance(appearance) {
     // Ignore storage failures in embedded runtimes.
   }
   return nextAppearance;
+}
+
+function restoreUiSettings(settings = {}) {
+  if (settings.panelSizes) {
+    try {
+      window.localStorage.setItem(PANEL_SIZE_STORAGE_KEY, JSON.stringify(settings.panelSizes));
+    } catch {
+      // Keep startup usable even if the embedded runtime blocks storage.
+    }
+  }
+  if (settings.panelPositions) {
+    try {
+      window.localStorage.setItem(PANEL_POSITION_STORAGE_KEY, JSON.stringify(settings.panelPositions));
+    } catch {
+      // Keep startup usable even if the embedded runtime blocks storage.
+    }
+  }
+  if (settings.layoutMode) applyLayoutMode(settings.layoutMode);
+  if (typeof settings.sidebarCollapsed === "boolean") saveSidebarCollapsed(settings.sidebarCollapsed);
+  if (settings.appearance) applyAppearance(settings.appearance);
 }
 
 function normalizeSearchText(value) {
@@ -863,11 +913,13 @@ function useEditablePanels(rootRef) {
     observer.observe(root, { childList: true, subtree: true });
     root.addEventListener("pointerdown", onPointerDown);
     window.addEventListener(LAYOUT_RESET_EVENT, resetLayout);
+    window.addEventListener(LAYOUT_RESTORE_EVENT, enhancePanels);
 
     return () => {
       observer.disconnect();
       root.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener(LAYOUT_RESET_EVENT, resetLayout);
+      window.removeEventListener(LAYOUT_RESTORE_EVENT, enhancePanels);
     };
   }, [rootRef]);
 }
@@ -912,6 +964,24 @@ function App() {
   useEffect(() => {
     applyAppearance(appearance);
   }, [appearance]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getUiSettings()
+      .then((result) => {
+        if (cancelled || !result?.settings) return;
+        restoreUiSettings(result.settings);
+        const restoredAppearance = result.settings.appearance ? applyAppearance(result.settings.appearance) : readAppearance();
+        setAppearance(restoredAppearance);
+        setLayoutMode(readLayoutMode());
+        setSidebarCollapsed(readSidebarCollapsed());
+        window.dispatchEvent(new Event(LAYOUT_RESTORE_EVENT));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     applyLayoutMode(layoutMode);
@@ -964,17 +1034,24 @@ function App() {
   }
 
   function updateAppearance(partial) {
-    setAppearance((current) => applyAppearance({ ...current, ...partial }));
+    setAppearance((current) => {
+      const next = applyAppearance({ ...current, ...partial });
+      persistUiSettings({ appearance: next });
+      return next;
+    });
   }
 
   function changeLayoutMode(mode) {
-    setLayoutMode(applyLayoutMode(mode));
+    const next = applyLayoutMode(mode);
+    setLayoutMode(next);
+    persistUiSettings({ layoutMode: next });
   }
 
   function toggleSidebarCollapsed() {
     setSidebarCollapsed((current) => {
       const next = !current;
       saveSidebarCollapsed(next);
+      persistUiSettings({ sidebarCollapsed: next });
       return next;
     });
   }
@@ -983,6 +1060,7 @@ function App() {
     try {
       window.localStorage.removeItem(PANEL_SIZE_STORAGE_KEY);
       window.localStorage.removeItem(PANEL_POSITION_STORAGE_KEY);
+      persistUiSettings({ panelSizes: {}, panelPositions: {} });
     } catch {
       // The event below still resets the visible layout.
     }
@@ -994,7 +1072,7 @@ function App() {
     setNotificationsOpen(false);
   }
 
-  const title = navItems.find((item) => item.id === selectedNav)?.label ?? "대시보드";
+  const title = navItems.find((item) => item.id === selectedNav)?.label ?? "사전점검";
   const canLive = snapshot.summary.blocker_count === 0;
   const canFullLive = canLive && snapshot.summary.warning_count === 0;
   const notifications = buildNotificationItems(snapshot, error);
@@ -1319,30 +1397,126 @@ function WorkspaceContent({
   }
 
   return renderPage(
-    <>
-      <section className="command-grid">
-        {modeConsole}
-        <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
-      </section>
-
-      <section className="content-grid">
-        <div className="content-column">
-          <ReadinessPanel checks={snapshot.readiness} />
-          <RunbookChecklistPanel checklist={snapshot.checklist} onChecklist={onChecklist} />
-          <RiskPanel checks={snapshot.risk_checks} />
-          <FinalPreflightPanel checks={snapshot.final_preflight} onPreflight={onPreflight} compact />
-          <StrategyPanel strategies={snapshot.strategies} />
-          <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
-          <AuditPanel audit={snapshot.audit} />
-        </div>
-        <div className="content-column">
-          <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
-          <AccountReconciliationPanel accounts={snapshot.accounts} />
-          <PositionPanel positions={snapshot.positions} />
-        </div>
-      </section>
-    </>,
+    <PreTradeDoctorPanel snapshot={snapshot} onNavigate={onNavigate} onReconcile={onReconcile} onPreflight={onPreflight} />,
   );
+}
+
+function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight }) {
+  const [running, setRunning] = useState(false);
+  const [hasRun, setHasRun] = useState(false);
+  const items = buildDoctorItems(snapshot);
+  const problemCount = items.filter((item) => item.tone !== "success").length;
+  const failCount = items.filter((item) => item.tone === "danger").length;
+  const warnCount = items.filter((item) => item.tone === "warning").length;
+
+  async function runDoctor() {
+    setRunning(true);
+    setHasRun(true);
+    try {
+      await onReconcile();
+      await onPreflight();
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <section className="panel doctor-panel">
+      <PanelHeader title="실거래 Doctor" subtitle="실계좌 주문 전에 꼭 필요한 항목만 압축해서 점검합니다." />
+      <div className="doctor-hero">
+        <div>
+          <span>점검 결과</span>
+          <strong>{hasRun ? (problemCount ? "조치 필요" : "통과") : "대기"}</strong>
+          <p>{hasRun ? `hard stop ${failCount}개, warning ${warnCount}개를 확인했습니다.` : "점검 실행 버튼을 눌러 API, 리스크, 체크리스트, 대조 상태를 검사하세요."}</p>
+        </div>
+        <button className="primary-button doctor-run-button" type="button" onClick={runDoctor} disabled={running}>
+          <Play size={16} />
+          {running ? "점검 중" : "점검 실행"}
+        </button>
+      </div>
+      <div className="doctor-grid">
+        {items.map((item) => (
+          <button className={`doctor-card ${item.tone}`} type="button" key={item.id} onClick={() => onNavigate(item.targetNav)}>
+            <span className="doctor-step">{item.index}</span>
+            <div>
+              <strong>{item.title}</strong>
+              <span>{item.detail}</span>
+            </div>
+            <span className="doctor-status">{item.status}</span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function buildDoctorItems(snapshot) {
+  const readinessFails = (snapshot.readiness ?? []).filter((check) => check.status === "fail");
+  const readinessWarns = (snapshot.readiness ?? []).filter((check) => check.status === "warn");
+  const missingChecklist = (snapshot.checklist ?? []).filter((item) => item.required && !item.checked);
+  const riskFailures = (snapshot.risk_checks ?? []).filter((check) => check.status === "fail");
+  const riskWarnings = (snapshot.risk_checks ?? []).filter((check) => check.status === "warn");
+  const reconciliation = snapshot.reconciliation?.summary ?? {};
+  const finalFailures = (snapshot.final_preflight ?? []).filter((check) => check.status === "fail");
+  const finalWarnings = (snapshot.final_preflight ?? []).filter((check) => check.status === "warn");
+  const strategyBlocked = (snapshot.strategies ?? []).filter((strategy) => !strategy.live_allowed);
+
+  return [
+    {
+      id: "doctor-api",
+      index: 1,
+      title: "API / 브로커 연결",
+      detail: readinessFails.length ? `${readinessFails.length}개 연결 blocker가 남아 있습니다.` : "실거래 API 키와 브로커 어댑터 상태를 확인했습니다.",
+      tone: readinessFails.length ? "danger" : readinessWarns.length ? "warning" : "success",
+      status: readinessFails.length ? "조치" : readinessWarns.length ? "주의" : "통과",
+      targetNav: "brokers",
+    },
+    {
+      id: "doctor-checklist",
+      index: 2,
+      title: "운영 체크리스트",
+      detail: missingChecklist.length ? `필수 확인 ${missingChecklist.length}개가 남아 있습니다.` : "필수 운영 확인이 완료되었습니다.",
+      tone: missingChecklist.length ? "danger" : "success",
+      status: missingChecklist.length ? "조치" : "통과",
+      targetNav: "gate",
+    },
+    {
+      id: "doctor-risk",
+      index: 3,
+      title: "리스크 한도",
+      detail: riskFailures.length ? `리스크 차단 ${riskFailures.length}개가 있습니다.` : riskWarnings.length ? `warning ${riskWarnings.length}개를 검토하세요.` : "손실/노출/슬리피지 규칙이 정상입니다.",
+      tone: riskFailures.length ? "danger" : riskWarnings.length ? "warning" : "success",
+      status: riskFailures.length ? "차단" : riskWarnings.length ? "주의" : "통과",
+      targetNav: "gate",
+    },
+    {
+      id: "doctor-strategy",
+      index: 4,
+      title: "전략 live_allowed",
+      detail: strategyBlocked.length ? `실거래 허용 전 전략 ${strategyBlocked.length}개를 검토해야 합니다.` : "실거래 허용 전략을 확인했습니다.",
+      tone: strategyBlocked.length ? "warning" : "success",
+      status: strategyBlocked.length ? "검토" : "통과",
+      targetNav: "strategies",
+    },
+    {
+      id: "doctor-reconciliation",
+      index: 5,
+      title: "포지션·계좌 대조",
+      detail: reconciliation.mismatch_count ? `불일치 ${reconciliation.mismatch_count}개가 있습니다.` : reconciliation.api_required_count ? `API 조회 필요 ${reconciliation.api_required_count}건이 있습니다.` : "계좌/포지션 대조가 정상입니다.",
+      tone: reconciliation.mismatch_count ? "danger" : reconciliation.api_required_count ? "warning" : "success",
+      status: reconciliation.mismatch_count ? "조치" : reconciliation.api_required_count ? "API" : "통과",
+      targetNav: "preflight",
+    },
+    {
+      id: "doctor-final",
+      index: 6,
+      title: "최종 Preflight",
+      detail: finalFailures.length ? `hard stop ${finalFailures.length}개가 남아 있습니다.` : finalWarnings.length ? `warning ${finalWarnings.length}개를 확인하세요.` : "최종 점검을 통과했습니다.",
+      tone: finalFailures.length ? "danger" : finalWarnings.length ? "warning" : "success",
+      status: finalFailures.length ? "차단" : finalWarnings.length ? "주의" : "통과",
+      targetNav: "preflight",
+    },
+  ];
 }
 
 function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) {

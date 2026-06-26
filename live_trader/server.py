@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,6 +16,25 @@ ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8795
+SETTINGS_DIR = Path(os.getenv("APPDATA") or Path.home()) / "LiveTrader"
+UI_SETTINGS_FILE = SETTINGS_DIR / "ui-settings.json"
+
+
+def read_ui_settings() -> dict[str, object]:
+    try:
+        if UI_SETTINGS_FILE.exists():
+            return json.loads(UI_SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {}
+
+
+def write_ui_settings(payload: dict[str, object]) -> dict[str, object]:
+    current = read_ui_settings()
+    current.update(payload)
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    UI_SETTINGS_FILE.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    return current
 
 
 class LiveTraderHandler(BaseHTTPRequestHandler):
@@ -24,6 +44,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/snapshot":
             self.send_json(state.snapshot())
+            return
+        if parsed.path == "/api/ui-settings":
+            self.send_json({"ok": True, "settings": read_ui_settings()})
             return
         self.serve_static(parsed.path)
 
@@ -65,6 +88,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/test-intent":
             self.send_json(state.submit_test_intent())
+            return
+        if parsed.path == "/api/ui-settings":
+            self.send_json({"ok": True, "settings": write_ui_settings(payload)})
             return
         self.send_error(404, "Unknown API endpoint")
 
