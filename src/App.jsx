@@ -23,7 +23,6 @@ import {
   RefreshCcw,
   RotateCcw,
   Route,
-  Search,
   Settings,
   ShieldAlert,
   ShieldCheck,
@@ -161,6 +160,7 @@ const fallbackSnapshot = {
 const PANEL_SIZE_STORAGE_KEY = "live-trader.panelSizes.v1";
 const PANEL_POSITION_STORAGE_KEY = "live-trader.panelPositions.v1";
 const LAYOUT_MODE_STORAGE_KEY = "live-trader.layoutMode.v1";
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "live-trader.sidebarCollapsed.v1";
 const APPEARANCE_STORAGE_KEY = "live-trader.appearance.v1";
 const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
 const LAYOUT_RESET_EVENT = "live-trader-layout-reset";
@@ -259,6 +259,22 @@ function readLayoutMode() {
     return normalizeLayoutMode(window.localStorage.getItem(LAYOUT_MODE_STORAGE_KEY));
   } catch {
     return "locked";
+  }
+}
+
+function readSidebarCollapsed() {
+  try {
+    return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function saveSidebarCollapsed(value) {
+  try {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, value ? "true" : "false");
+  } catch {
+    // The current session can still toggle the sidebar if WebView storage is unavailable.
   }
 }
 
@@ -866,6 +882,7 @@ function App() {
   const [error, setError] = useState("");
   const [appearance, setAppearance] = useState(readAppearance);
   const [layoutMode, setLayoutMode] = useState(readLayoutMode);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
   const [exportResult, setExportResult] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -954,6 +971,14 @@ function App() {
     setLayoutMode(applyLayoutMode(mode));
   }
 
+  function toggleSidebarCollapsed() {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      saveSidebarCollapsed(next);
+      return next;
+    });
+  }
+
   function resetWorkspaceLayout() {
     try {
       window.localStorage.removeItem(PANEL_SIZE_STORAGE_KEY);
@@ -975,7 +1000,7 @@ function App() {
   const notifications = buildNotificationItems(snapshot, error);
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
         <div className="brand-block" aria-label="Live Trader">
           <div className="brand-mark">
@@ -1010,9 +1035,17 @@ function App() {
 
       <main className={`workspace layout-${layoutMode}`} ref={workspaceRef} data-layout-mode={layoutMode}>
         <header className="topbar">
-          <div>
-            <p>{title}</p>
-            <h1>실거래 콘솔</h1>
+          <div className="topbar-left">
+            <button
+              className={`icon-button sidebar-toggle ${sidebarCollapsed ? "active" : ""}`}
+              type="button"
+              aria-label={sidebarCollapsed ? "탭 화면 펼치기" : "탭 화면 접기"}
+              aria-pressed={sidebarCollapsed}
+              title={sidebarCollapsed ? "탭 화면 펼치기" : "탭 화면 접기"}
+              onClick={toggleSidebarCollapsed}
+            >
+              <PanelLeft size={18} />
+            </button>
           </div>
           <div className="topbar-actions">
             <button
@@ -1020,48 +1053,15 @@ function App() {
               type="button"
               aria-pressed={layoutMode === "edit"}
               onClick={() => changeLayoutMode(layoutMode === "edit" ? "locked" : "edit")}
-              title={layoutMode === "edit" ? "레이아웃 편집 종료" : "레이아웃 편집"}
+              title={layoutMode === "edit" ? "레이아웃 편집 모드를 끄고 조작을 잠급니다." : "레이아웃 편집 모드를 켜서 패널 크기 조절을 활성화합니다."}
             >
               {layoutMode === "edit" ? <Unlock size={16} /> : <Lock size={16} />}
-              <span>{layoutMode === "edit" ? "편집 중" : "레이아웃"}</span>
+              <span>{layoutMode === "edit" ? "레이아웃 편집" : "레이아웃 잠금"}</span>
             </button>
-            <button className="ghost-button" type="button" onClick={resetWorkspaceLayout} title="패널 크기와 위치를 기본값으로 되돌립니다.">
+            <button className="layout-reset-button" type="button" onClick={resetWorkspaceLayout} title="패널 크기와 위치를 기본값으로 되돌립니다.">
               <RotateCcw size={15} />
-              <span>초기화</span>
+              <span>레이아웃 초기화</span>
             </button>
-            <div className="search-box">
-              <Search size={15} />
-              <input
-                aria-label="심볼 또는 주문 검색"
-                placeholder="심볼, 전략, 주문 검색"
-                value={searchQuery}
-                onChange={(event) => setSearchQuery(event.currentTarget.value)}
-              />
-            </div>
-            <button className="icon-button" type="button" aria-label="새로고침" onClick={refresh}>
-              <RefreshCcw size={17} className={loading ? "spin" : ""} />
-            </button>
-            <button
-              className="icon-button"
-              type="button"
-              aria-label={appearance.theme === "light" ? "다크 모드로 전환" : "화이트 모드로 전환"}
-              title={appearance.theme === "light" ? "다크 모드" : "화이트 모드"}
-              onClick={() => updateAppearance({ theme: appearance.theme === "light" ? "dark" : "light" })}
-            >
-              {appearance.theme === "light" ? <Moon size={17} /> : <Sun size={17} />}
-            </button>
-            <div className="accent-dot-row" aria-label="강조 색상">
-              {Object.entries(accentPalettes).map(([id, palette]) => (
-                <button
-                  key={id}
-                  className={`accent-dot ${appearance.accent === id ? "selected" : ""}`}
-                  type="button"
-                  style={{ "--swatch": palette.swatch }}
-                  aria-label={`${palette.label} 강조 색상`}
-                  onClick={() => updateAppearance({ accent: id })}
-                />
-              ))}
-            </div>
             <div className="notification-wrap" ref={notificationRef}>
               <button
                 className={`icon-button notification-button ${notificationsOpen ? "active" : ""}`}
@@ -1600,7 +1600,7 @@ function MarketStrip({ sessions }) {
             <strong>{session.label}</strong>
             <span>{session.detail}</span>
           </div>
-          <StatusPill tone={statusTone(session.state)}>{session.time}</StatusPill>
+          <span className={`market-time ${statusTone(session.state)}`}>{session.time}</span>
         </div>
       ))}
     </section>
@@ -1683,7 +1683,7 @@ function SummaryPanel({ summary, generatedAt }) {
           <div key={item.label}>
             <span>{item.label}</span>
             <strong>{item.value}</strong>
-            <StatusPill tone={item.tone}>LIVE GATE</StatusPill>
+            <span className={`summary-state ${item.tone}`}>{item.tone === "success" ? "정상" : "확인 필요"}</span>
           </div>
         ))}
       </div>
@@ -1956,7 +1956,7 @@ function OrderCommandPanel({ newEntriesBlocked, dryRun, killSwitch, onDryRun, on
           <TerminalSquare size={16} />
           테스트 주문 게이트
         </button>
-        <StatusPill tone={killSwitch ? "danger" : "success"}>{killSwitch ? "KILL ON" : "KILL OFF"}</StatusPill>
+        <span className={`inline-state ${killSwitch ? "danger" : "success"}`}>{killSwitch ? "긴급 차단 켜짐" : "긴급 차단 꺼짐"}</span>
       </div>
     </section>
   );
@@ -1978,7 +1978,7 @@ function OrderQueueSummaryPanel({ summary }) {
           <div className="queue-card" key={item.label}>
             <span>{item.label}</span>
             <strong>{item.value}</strong>
-            <StatusPill tone={item.tone}>QUEUE</StatusPill>
+            <span className={`summary-state ${item.tone}`}>{item.tone === "success" ? "정상" : "확인"}</span>
           </div>
         ))}
       </div>
@@ -2156,7 +2156,7 @@ function ReconciliationSummaryPanel({ reconciliation, onReconcile }) {
           <div className="metric-card" key={item.label}>
             <span>{item.label}</span>
             <strong>{item.value}</strong>
-            <StatusPill tone={item.tone}>RECON</StatusPill>
+            <span className={`summary-state ${item.tone}`}>{item.tone === "success" ? "정상" : "확인"}</span>
           </div>
         ))}
       </div>
@@ -2253,7 +2253,7 @@ function LaunchReportPanel({ report }) {
           <div className="metric-card" key={item.label}>
             <span>{item.label}</span>
             <strong>{item.value}</strong>
-            <StatusPill tone={item.tone}>LOCK</StatusPill>
+            <span className={`summary-state ${item.tone}`}>{item.tone === "success" ? "해제 가능" : "차단"}</span>
           </div>
         ))}
       </div>
