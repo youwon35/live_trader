@@ -167,6 +167,8 @@ const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
 const LAYOUT_RESET_EVENT = "live-trader-layout-reset";
 const LAYOUT_SNAP_SIZE = 8;
 const LAYOUT_COLLISION_GAP = 8;
+const LAYOUT_MAX_DIMENSION = 100000;
+const LAYOUT_MAX_OFFSET = 100000;
 const MIN_PANEL_WIDTH = 260;
 const MIN_PANEL_HEIGHT = 150;
 
@@ -592,16 +594,13 @@ function clampNumber(value, min, max, fallback) {
 
 function snapLayoutDimension(value, axis) {
   const snapped = Math.round(Number(value) / LAYOUT_SNAP_SIZE) * LAYOUT_SNAP_SIZE;
-  const viewportLimit = axis === "width" ? window.innerWidth * 1.65 : window.innerHeight * 1.7;
   const min = axis === "width" ? MIN_PANEL_WIDTH : MIN_PANEL_HEIGHT;
-  return clampNumber(snapped, min, Math.max(min, viewportLimit), min);
+  return clampNumber(snapped, min, LAYOUT_MAX_DIMENSION, min);
 }
 
 function snapLayoutOffset(value, axis) {
   const snapped = Math.round(Number(value) / LAYOUT_SNAP_SIZE) * LAYOUT_SNAP_SIZE;
-  const viewportSpan = axis === "x" ? window.innerWidth : window.innerHeight;
-  const max = Math.max(axis === "x" ? 2400 : 1600, viewportSpan * 2);
-  return clampNumber(snapped, -max, max, 0);
+  return clampNumber(snapped, -LAYOUT_MAX_OFFSET, LAYOUT_MAX_OFFSET, 0);
 }
 
 function panelRectsOverlap(left, right, gap = LAYOUT_COLLISION_GAP) {
