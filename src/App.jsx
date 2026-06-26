@@ -38,7 +38,6 @@ import {
   exportAudit,
   getSnapshot,
   getUiSettings,
-  runBrokerCheck,
   runFinalPreflight,
   runReconciliation,
   retryOrder,
@@ -164,6 +163,7 @@ const PANEL_POSITION_STORAGE_KEY = "live-trader.panelPositions.v1";
 const LAYOUT_MODE_STORAGE_KEY = "live-trader.layoutMode.v1";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "live-trader.sidebarCollapsed.v1";
 const APPEARANCE_STORAGE_KEY = "live-trader.appearance.v1";
+const NOTIFICATION_ACK_STORAGE_KEY = "live-trader.notifications.ack.v1";
 const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
 const LAYOUT_RESET_EVENT = "live-trader-layout-reset";
 const LAYOUT_RESTORE_EVENT = "live-trader-layout-restore";
@@ -593,6 +593,13 @@ function buildNotificationItems(snapshot, error) {
   return items;
 }
 
+function notificationFingerprint(items) {
+  return items
+    .filter((item) => item.id !== "clear")
+    .map((item) => [item.id, item.tone, item.title, item.detail].join(":"))
+    .join("|");
+}
+
 function normalizePanelKey(value) {
   return String(value || "panel")
     .replace(/\s+/g, "-")
@@ -938,6 +945,7 @@ function App() {
   const [exportResult, setExportResult] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [acknowledgedNotifications, setAcknowledgedNotifications] = useState(() => readStoredValue(NOTIFICATION_ACK_STORAGE_KEY, ""));
   const workspaceRef = useRef(null);
   const notificationRef = useRef(null);
 
@@ -1072,10 +1080,21 @@ function App() {
     setNotificationsOpen(false);
   }
 
+  function acknowledgeNotifications(key) {
+    setAcknowledgedNotifications(key);
+    try {
+      window.localStorage.setItem(NOTIFICATION_ACK_STORAGE_KEY, JSON.stringify(key));
+    } catch {
+      // The badge can reset in storage-restricted runtimes, but the session state still updates.
+    }
+  }
+
   const title = navItems.find((item) => item.id === selectedNav)?.label ?? "사전점검";
   const canLive = snapshot.summary.blocker_count === 0;
   const canFullLive = canLive && snapshot.summary.warning_count === 0;
   const notifications = buildNotificationItems(snapshot, error);
+  const notificationKey = notificationFingerprint(notifications);
+  const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
@@ -1146,10 +1165,13 @@ function App() {
                 type="button"
                 aria-label="알림"
                 aria-expanded={notificationsOpen}
-                onClick={() => setNotificationsOpen((open) => !open)}
+                onClick={() => {
+                  if (!notificationsOpen && notificationKey) acknowledgeNotifications(notificationKey);
+                  setNotificationsOpen((open) => !open);
+                }}
               >
                 <Bell size={17} />
-                {notifications.length > 0 && <span className="notification-badge">{Math.min(notifications.length, 9)}</span>}
+                {unreadNotificationCount > 0 && <span className="notification-badge">{Math.min(unreadNotificationCount, 9)}</span>}
               </button>
               {notificationsOpen && <NotificationPanel items={notifications} onNavigate={navigateWorkspace} />}
             </div>
@@ -1193,7 +1215,6 @@ function App() {
           onRetryPolicy={(name, value) => runAction(() => setRetryPolicy(name, value))}
           onRetryOrder={(orderId) => runAction(() => retryOrder(orderId))}
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
-          onBrokerCheck={(brokerId) => runAction(() => runBrokerCheck(brokerId))}
           onReconcile={() => runAction(runReconciliation)}
           onPreflight={() => runAction(runFinalPreflight)}
           onAuditExport={runAuditExport}
@@ -1238,7 +1259,6 @@ function WorkspaceContent({
   onRetryPolicy,
   onRetryOrder,
   onCancelOrder,
-  onBrokerCheck,
   onReconcile,
   onPreflight,
   onAuditExport,
@@ -1321,11 +1341,9 @@ function WorkspaceContent({
       <section className="content-grid">
         <div className="content-column">
           <BrokerPanel brokers={snapshot.brokers} />
-          <BrokerConnectionWizardPanel diagnostics={snapshot.broker_diagnostics} onBrokerCheck={onBrokerCheck} />
-          <BrokerCapabilityPanel diagnostics={snapshot.broker_diagnostics} />
         </div>
         <div className="content-column">
-          <ReadinessPanel checks={snapshot.readiness} />
+          <BrokerCapabilityPanel diagnostics={snapshot.broker_diagnostics} />
         </div>
       </section>,
     );
@@ -1453,6 +1471,16 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight })
 function buildDoctorItems(snapshot) {
   const readinessFails = (snapshot.readiness ?? []).filter((check) => check.status === "fail");
   const readinessWarns = (snapshot.readiness ?? []).filter((check) => check.status === "warn");
+  const brokerDiagnostics = snapshot.broker_diagnostics ?? [];
+  const missingBrokerEnvCount =
+    brokerDiagnostics.reduce((count, broker) => count + (broker.env ?? []).filter((item) => !item.present).length, 0) ||
+    (snapshot.brokers ?? []).reduce((count, broker) => count + (broker.missing_env?.length ?? 0), 0);
+  const diagnosticFailures = brokerDiagnostics.reduce((count, broker) => count + (broker.steps ?? []).filter((step) => step.status === "fail").length, 0);
+  const diagnosticWarnings = brokerDiagnostics.reduce((count, broker) => count + (broker.steps ?? []).filter((step) => step.status === "warn").length, 0);
+  const missingCapabilities = brokerDiagnostics.reduce(
+    (count, broker) => count + (broker.capabilities ?? []).filter((capability) => !capability.implemented).length,
+    0,
+  );
   const missingChecklist = (snapshot.checklist ?? []).filter((item) => item.required && !item.checked);
   const riskFailures = (snapshot.risk_checks ?? []).filter((check) => check.status === "fail");
   const riskWarnings = (snapshot.risk_checks ?? []).filter((check) => check.status === "warn");
@@ -1466,9 +1494,17 @@ function buildDoctorItems(snapshot) {
       id: "doctor-api",
       index: 1,
       title: "API / 브로커 연결",
-      detail: readinessFails.length ? `${readinessFails.length}개 연결 blocker가 남아 있습니다.` : "실거래 API 키와 브로커 어댑터 상태를 확인했습니다.",
-      tone: readinessFails.length ? "danger" : readinessWarns.length ? "warning" : "success",
-      status: readinessFails.length ? "조치" : readinessWarns.length ? "주의" : "통과",
+      detail: missingBrokerEnvCount
+        ? `API 환경 변수 ${missingBrokerEnvCount}개가 비어 있습니다.`
+        : diagnosticFailures || readinessFails.length
+          ? `브로커/API hard stop ${diagnosticFailures + readinessFails.length}개가 남아 있습니다.`
+          : missingCapabilities
+            ? `주문 capability ${missingCapabilities}개 구현 확인이 필요합니다.`
+            : diagnosticWarnings || readinessWarns.length
+              ? `API warning ${diagnosticWarnings + readinessWarns.length}개를 검토하세요.`
+              : "실거래 API 키와 브로커 어댑터 상태를 확인했습니다.",
+      tone: missingBrokerEnvCount || diagnosticFailures || readinessFails.length ? "danger" : missingCapabilities || diagnosticWarnings || readinessWarns.length ? "warning" : "success",
+      status: missingBrokerEnvCount || diagnosticFailures || readinessFails.length ? "조치" : missingCapabilities || diagnosticWarnings || readinessWarns.length ? "주의" : "통과",
       targetNav: "brokers",
     },
     {
@@ -1870,55 +1906,6 @@ function BrokerPanel({ brokers }) {
                 <span className={broker.missing_env.includes(name) ? "missing" : ""} key={name}>
                   {name}
                 </span>
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function BrokerConnectionWizardPanel({ diagnostics, onBrokerCheck }) {
-  return (
-    <section className="panel broker-wizard-panel">
-      <PanelHeader title="API 키 점검 마법사" subtitle="실제 키 원문은 표시하지 않고 존재 여부와 어댑터 준비 상태만 점검합니다." />
-      <div className="wizard-list">
-        {diagnostics.map((broker) => (
-          <div className="wizard-card" key={broker.broker_id}>
-            <div className="wizard-head">
-              <div>
-                <strong>{broker.name}</strong>
-                <span>{broker.docs}</span>
-              </div>
-              <button className="mini-button" type="button" onClick={() => onBrokerCheck(broker.broker_id)}>
-                <RefreshCcw size={14} />
-                점검
-              </button>
-            </div>
-            <div className="wizard-steps">
-              {broker.steps.map((step) => (
-                <div className={`wizard-step ${step.status}`} key={step.key}>
-                  {step.status === "pass" ? <ShieldCheck size={15} /> : <ShieldAlert size={15} />}
-                  <div>
-                    <strong>{step.label}</strong>
-                    <span>{step.detail}</span>
-                  </div>
-                  <StatusPill tone={statusTone(step.status)}>{step.status}</StatusPill>
-                </div>
-              ))}
-            </div>
-            <div className="env-check-grid">
-              {broker.env.map((item) => (
-                <div className={`env-check ${item.present ? "present" : "missing"}`} key={item.name}>
-                  <strong>{item.name}</strong>
-                  <span>{item.present ? item.masked || "입력됨" : "missing"}</span>
-                </div>
-              ))}
-            </div>
-            <div className="next-actions">
-              {broker.next_actions.map((action) => (
-                <span key={action}>{action}</span>
               ))}
             </div>
           </div>
