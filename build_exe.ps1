@@ -19,14 +19,16 @@ if (Test-Path "release") {
   Remove-Item -Recurse -Force "release"
 }
 
+$root = (Get-Location).Path
 .\.venv\Scripts\python.exe -m PyInstaller `
   --noconfirm `
   --noconsole `
   --onefile `
   --name LiveTrader `
-  --icon "assets\app-icon.ico" `
+  --icon "$root\assets\app-icon.ico" `
   --distpath release `
   --workpath build `
-  --add-data "dist;dist" `
+  --specpath build `
+  --add-data "$root\dist;dist" `
   --collect-submodules webview `
   live_trader\__main__.py
