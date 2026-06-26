@@ -1315,7 +1315,6 @@ function WorkspaceContent({
       <section className="content-grid">
         <div className="content-column">
           <StrategyPanel strategies={snapshot.strategies} />
-          <StrategyWorkflowPanel />
         </div>
       </section>,
     );
@@ -1576,8 +1575,6 @@ function buildDoctorItems(snapshot) {
 
 function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) {
   const profile = pageProfiles[selectedNav] ?? pageProfiles.overview;
-  const blockerCount = snapshot.summary?.blocker_count ?? 0;
-  const warningCount = snapshot.summary?.warning_count ?? 0;
   const searchResults = buildSearchResults(snapshot, searchQuery);
 
   return (
@@ -1589,9 +1586,6 @@ function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) 
           <p>{profile.summary}</p>
         </div>
         <div className="page-heading-actions">
-          <StatusPill tone={statusTone(snapshot.summary?.status)}>{snapshot.summary?.status ?? "unknown"}</StatusPill>
-          <StatusPill tone={blockerCount ? "danger" : "success"}>{blockerCount} blocker</StatusPill>
-          <StatusPill tone={warningCount ? "warning" : "success"}>{warningCount} warn</StatusPill>
           <span>{snapshot.generated_at}</span>
         </div>
       </div>
@@ -1880,7 +1874,6 @@ function BrokerPanel({ brokers }) {
                 <strong>{broker.name}</strong>
                 <span>{broker.role}</span>
               </div>
-              <StatusPill tone={statusTone(broker.status)}>{broker.status}</StatusPill>
             </div>
             <p>{broker.detail}</p>
             <div className="env-list">
@@ -1907,14 +1900,12 @@ function BrokerCapabilityPanel({ diagnostics }) {
             <div className="capability-broker-title">
               <Network size={16} />
               <strong>{broker.name}</strong>
-              <StatusPill tone={statusTone(broker.status)}>{broker.status}</StatusPill>
             </div>
             <div className="capability-grid">
               {broker.capabilities.map((capability) => (
                 <div className={`capability-item ${capability.status}`} key={capability.key}>
                   <strong>{capability.label}</strong>
                   <span>{capability.detail}</span>
-                  <StatusPill tone={statusTone(capability.status)}>{capability.implemented ? "ready" : "필요"}</StatusPill>
                 </div>
               ))}
             </div>
@@ -2112,29 +2103,6 @@ function BrokerRequirementsPanel({ brokers }) {
             <strong>{broker.name}</strong>
             <span>{broker.missing_env.length ? `${broker.missing_env.length}개 값 필요` : "환경 값 입력됨"}</span>
             <StatusPill tone={broker.order_ready ? "success" : "danger"}>{broker.order_ready ? "ready" : "blocked"}</StatusPill>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function StrategyWorkflowPanel() {
-  const steps = [
-    ["BACKTEST", "최종 테스트 통과"],
-    ["SHADOW", "실시간 신호 기록"],
-    ["PAPER", "모의 체결 검증"],
-    ["LIVE", "live_allowed 승인"],
-  ];
-  return (
-    <section className="panel">
-      <PanelHeader title="전략 승급 흐름" subtitle="실거래 전략은 승인 단계와 계약 권한을 모두 통과해야 합니다." />
-      <div className="workflow-strip">
-        {steps.map(([label, detail], index) => (
-          <div className="workflow-step" key={label}>
-            <span>{index + 1}</span>
-            <strong>{label}</strong>
-            <em>{detail}</em>
           </div>
         ))}
       </div>

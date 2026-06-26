@@ -2061,6 +2061,8 @@ body {
 
 .doctor-panel {
   min-height: 0;
+  overflow: auto;
+  padding-bottom: 24px;
 }
 
 .doctor-hero {
@@ -2277,7 +2279,7 @@ body {
   flex-direction: column;
   gap: 10px;
   min-height: 0;
-  overflow: hidden;
+  overflow: auto;
   padding: 14px 16px 48px;
 }
 
