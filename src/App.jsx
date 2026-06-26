@@ -21,7 +21,6 @@ import {
   Radio,
   RefreshCcw,
   RotateCcw,
-  Route,
   Settings,
   ShieldAlert,
   ShieldCheck,
@@ -51,12 +50,10 @@ import designTokens from "../../../packages/design/design_tokens.json";
 
 const navItems = [
   { id: "overview", label: "사전점검", icon: LayoutDashboard },
-  { id: "gate", label: "실거래 게이트", icon: ListChecks },
-  { id: "orders", label: "주문", icon: Route },
-  { id: "brokers", label: "API", icon: Network },
   { id: "strategies", label: "전략", icon: DatabaseZap },
-  { id: "audit", label: "감사 로그", icon: FileClock },
-  { id: "preflight", label: "최종 점검", icon: ShieldCheck },
+  { id: "gate", label: "실거래 게이트", icon: ListChecks },
+  { id: "audit", label: "로그", icon: FileClock },
+  { id: "brokers", label: "API", icon: Network },
   { id: "settings", label: "설정", icon: Settings },
 ];
 
@@ -69,12 +66,7 @@ const pageProfiles = {
   gate: {
     title: "실거래 게이트",
     eyebrow: "승인/차단",
-    summary: "실거래 모드와 주문 전 리스크 한도만 관리합니다.",
-  },
-  orders: {
-    title: "주문",
-    eyebrow: "주문 큐",
-    summary: "주문 의도, Dry Run 원장, 재시도 정책을 관리합니다.",
+    summary: "실거래 모드, 리스크 한도, 주문 큐와 재시도 정책을 관리합니다.",
   },
   brokers: {
     title: "API",
@@ -87,14 +79,9 @@ const pageProfiles = {
     summary: "Backtester/Paper 승인 전략과 live_allowed 권한을 검토합니다.",
   },
   audit: {
-    title: "감사 로그",
+    title: "로그",
     eyebrow: "운영 기록",
     summary: "모드 전환, 주문 차단, 설정 변경 이력을 추적합니다.",
-  },
-  preflight: {
-    title: "최종 점검",
-    eyebrow: "출시 전 검사",
-    summary: "실브로커 연결 직전 hard stop과 warning을 최종 확인합니다.",
   },
   settings: {
     title: "설정",
@@ -427,7 +414,7 @@ function buildSearchResults(snapshot, queryValue) {
       label: `${order.order_id} · ${order.symbol}`,
       detail: `${order.state} · ${order.reason}`,
       meta: [order.strategy_id, order.queue_state, order.side].join(" "),
-      targetNav: "orders",
+      targetNav: "gate",
       tone: statusTone(order.state),
     });
   });
@@ -463,7 +450,7 @@ function buildSearchResults(snapshot, queryValue) {
       label: position.symbol,
       detail: `${position.status_label} · ${position.broker_name}`,
       meta: [position.asset, position.currency, position.detail].join(" "),
-      targetNav: "preflight",
+      targetNav: "overview",
       tone: statusTone(position.status),
     });
   });
@@ -475,7 +462,7 @@ function buildSearchResults(snapshot, queryValue) {
       label: account.account,
       detail: `${account.status_label} · ${account.broker_name}`,
       meta: [account.currency, account.detail].join(" "),
-      targetNav: "preflight",
+      targetNav: "overview",
       tone: statusTone(account.status),
     });
   });
@@ -487,7 +474,7 @@ function buildSearchResults(snapshot, queryValue) {
       label: check.label,
       detail: check.detail,
       meta: check.status,
-      targetNav: "preflight",
+      targetNav: "overview",
       tone: statusTone(check.status),
     });
   });
@@ -564,7 +551,7 @@ function buildNotificationItems(snapshot, error) {
       tone: "warning",
       title: `재시도 가능 주문 ${snapshot.order_queue.retryable}건`,
       detail: "주문 큐에서 재시도 또는 취소 처리가 필요합니다.",
-      targetNav: "orders",
+      targetNav: "gate",
     });
   }
 
@@ -574,7 +561,7 @@ function buildNotificationItems(snapshot, error) {
       tone: statusTone(snapshot.reconciliation.summary.status),
       title: `포지션·계좌 대조 ${snapshot.reconciliation.summary.status_label}`,
       detail: `API 필요 ${snapshot.reconciliation.summary.api_required_count}개, 불일치 ${snapshot.reconciliation.summary.mismatch_count}개`,
-      targetNav: "preflight",
+      targetNav: "overview",
     });
   }
 
@@ -582,7 +569,7 @@ function buildNotificationItems(snapshot, error) {
     .filter((check) => check.status !== "pass")
     .slice(0, 3)
     .forEach((check) => {
-      push({ id: `preflight-${check.label}`, tone: statusTone(check.status), title: check.label, detail: check.detail, targetNav: "preflight" });
+      push({ id: `preflight-${check.label}`, tone: statusTone(check.status), title: check.label, detail: check.detail, targetNav: "overview" });
     });
 
   if (!items.length) {
@@ -1291,18 +1278,6 @@ function WorkspaceContent({
       <section className="content-grid">
         <div className="content-column">
           {modeConsole}
-        </div>
-        <div className="content-column">
-          <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
-        </div>
-      </section>,
-    );
-  }
-
-  if (selectedNav === "orders") {
-    return renderPage(
-      <section className="content-grid">
-        <div className="content-column">
           <OrderCommandPanel
             newEntriesBlocked={snapshot.new_entries_blocked}
             dryRun={snapshot.dry_run}
@@ -1315,6 +1290,7 @@ function WorkspaceContent({
           <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
         </div>
         <div className="content-column">
+          <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
           <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
         </div>
       </section>,
@@ -1360,23 +1336,6 @@ function WorkspaceContent({
     );
   }
 
-  if (selectedNav === "preflight") {
-    return renderPage(
-      <section className="content-grid">
-        <div className="content-column">
-          <FinalPreflightPanel checks={snapshot.final_preflight} onPreflight={onPreflight} />
-          <LaunchReportPanel report={snapshot.launch_report} />
-        </div>
-        <div className="content-column">
-          <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
-          <AccountReconciliationPanel accounts={snapshot.accounts} />
-          <PositionPanel positions={snapshot.positions} />
-          <OperationsReportPanel report={snapshot.operation_report} />
-        </div>
-      </section>,
-    );
-  }
-
   if (selectedNav === "settings") {
     return renderPage(
       <section className="content-grid settings-content-grid">
@@ -1401,7 +1360,9 @@ function WorkspaceContent({
 function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight }) {
   const [running, setRunning] = useState(false);
   const [hasRun, setHasRun] = useState(false);
+  const [selectedDoctorId, setSelectedDoctorId] = useState(null);
   const items = buildDoctorItems(snapshot);
+  const selectedItem = items.find((item) => item.id === selectedDoctorId) ?? items[0];
   const problemCount = items.filter((item) => item.tone !== "success").length;
   const failCount = items.filter((item) => item.tone === "danger").length;
   const warnCount = items.filter((item) => item.tone === "warning").length;
@@ -1433,7 +1394,12 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight })
       </div>
       <div className="doctor-grid">
         {items.map((item) => (
-          <button className={`doctor-card ${item.tone}`} type="button" key={item.id} onClick={() => onNavigate(item.targetNav)}>
+          <button
+            className={`doctor-card ${item.tone} ${selectedItem?.id === item.id ? "selected" : ""}`}
+            type="button"
+            key={item.id}
+            onClick={() => setSelectedDoctorId(item.id)}
+          >
             <span className="doctor-step">{item.index}</span>
             <div>
               <strong>{item.title}</strong>
@@ -1443,8 +1409,45 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight })
           </button>
         ))}
       </div>
+      {selectedItem && (
+        <div className="doctor-detail-panel">
+          <div className="doctor-detail-head">
+            <div>
+              <span>상세 점검</span>
+              <strong>{selectedItem.title}</strong>
+            </div>
+            <button className="mini-button" type="button" onClick={() => onNavigate(selectedItem.targetNav)}>
+              관련 탭 열기
+            </button>
+          </div>
+          <div className="doctor-detail-list">
+            {selectedItem.details.map((detail) => (
+              <div className={`doctor-detail-row ${detail.tone}`} key={`${selectedItem.id}-${detail.label}-${detail.value}`}>
+                <StatusPill tone={detail.tone}>{detail.status}</StatusPill>
+                <div>
+                  <strong>{detail.label}</strong>
+                  <span>{detail.value}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </section>
   );
+}
+
+function detailTone(status) {
+  return statusTone(status === true ? "pass" : status === false ? "fail" : status);
+}
+
+function makeDetail(label, value, status = "neutral") {
+  return {
+    label,
+    value: String(value ?? "-"),
+    tone: detailTone(status),
+    status: status === "pass" || status === true ? "통과" : status === "warn" ? "주의" : status === "fail" || status === false ? "조치" : "확인",
+  };
 }
 
 function buildDoctorItems(snapshot) {
@@ -1467,6 +1470,37 @@ function buildDoctorItems(snapshot) {
   const finalFailures = (snapshot.final_preflight ?? []).filter((check) => check.status === "fail");
   const finalWarnings = (snapshot.final_preflight ?? []).filter((check) => check.status === "warn");
   const strategyBlocked = (snapshot.strategies ?? []).filter((strategy) => !strategy.live_allowed);
+  const apiDetails = [
+    ...(snapshot.brokers ?? []).flatMap((broker) =>
+      (broker.missing_env?.length ? broker.missing_env : broker.required_env ?? []).map((name) =>
+        makeDetail(`${broker.name} · ${name}`, broker.missing_env?.includes(name) ? "환경 변수가 비어 있습니다." : "환경 변수가 입력되어 있습니다.", broker.missing_env?.includes(name) ? "fail" : "pass"),
+      ),
+    ),
+    ...brokerDiagnostics.flatMap((broker) => [
+      ...(broker.steps ?? []).map((step) => makeDetail(`${broker.name} · ${step.label}`, step.detail, step.status)),
+      ...(broker.capabilities ?? []).map((capability) => makeDetail(`${broker.name} · ${capability.label}`, capability.detail, capability.implemented ? "pass" : "warn")),
+    ]),
+    ...readinessFails.map((check) => makeDetail(check.label, check.detail, check.status)),
+    ...readinessWarns.map((check) => makeDetail(check.label, check.detail, check.status)),
+  ];
+  const checklistDetails = (snapshot.checklist ?? []).map((item) => makeDetail(item.label, item.detail, item.checked ? "pass" : item.required ? "fail" : "warn"));
+  const riskDetails = (snapshot.risk_checks ?? []).map((check) => makeDetail(check.label, `${check.detail} · ${check.value}`, check.status));
+  const strategyDetails = (snapshot.strategies ?? []).map((strategy) =>
+    makeDetail(strategy.name, `${strategy.symbol} · ${strategy.block_reason || strategy.lifecycle_status}`, strategy.live_allowed ? "pass" : "warn"),
+  );
+  const reconciliationDetails = [
+    makeDetail("대조 상태", `${reconciliation.status_label ?? reconciliation.status ?? "-"} · 마지막 대조 ${reconciliation.last_run ?? "-"}`, reconciliation.status ?? "neutral"),
+    makeDetail("포지션", `${reconciliation.position_count ?? 0}개 · 불일치 ${reconciliation.mismatch_count ?? 0}개`, reconciliation.mismatch_count ? "fail" : "pass"),
+    makeDetail("계좌", `${reconciliation.account_count ?? 0}개 · API 필요 ${reconciliation.api_required_count ?? 0}건`, reconciliation.api_required_count ? "warn" : "pass"),
+    ...(snapshot.positions ?? []).map((position) => makeDetail(position.symbol, `${position.broker_name} · ${position.status_label} · ${position.detail}`, position.status)),
+    ...(snapshot.accounts ?? []).map((account) => makeDetail(account.account, `${account.broker_name} · ${account.currency} · ${account.detail}`, account.status)),
+  ];
+  const finalDetails = [
+    ...(snapshot.final_preflight ?? []).map((check) => makeDetail(check.label, check.detail, check.status)),
+    ...((snapshot.launch_report?.hard_stops ?? []).map((item) => makeDetail(`Hard stop · ${item.label}`, item.detail, "fail"))),
+    ...((snapshot.launch_report?.warnings ?? []).map((item) => makeDetail(`Warning · ${item.label}`, item.detail, "warn"))),
+    ...((snapshot.operation_report?.next_actions ?? []).map((action) => makeDetail("다음 조치", action, "warn"))),
+  ];
 
   return [
     {
@@ -1485,6 +1519,7 @@ function buildDoctorItems(snapshot) {
       tone: missingBrokerEnvCount || diagnosticFailures || readinessFails.length ? "danger" : missingCapabilities || diagnosticWarnings || readinessWarns.length ? "warning" : "success",
       status: missingBrokerEnvCount || diagnosticFailures || readinessFails.length ? "조치" : missingCapabilities || diagnosticWarnings || readinessWarns.length ? "주의" : "통과",
       targetNav: "brokers",
+      details: apiDetails.length ? apiDetails : [makeDetail("API / 브로커", "점검할 API 문제가 없습니다.", "pass")],
     },
     {
       id: "doctor-checklist",
@@ -1494,6 +1529,7 @@ function buildDoctorItems(snapshot) {
       tone: missingChecklist.length ? "danger" : "success",
       status: missingChecklist.length ? "조치" : "통과",
       targetNav: "gate",
+      details: checklistDetails.length ? checklistDetails : [makeDetail("운영 체크리스트", "점검할 체크리스트가 없습니다.", "pass")],
     },
     {
       id: "doctor-risk",
@@ -1503,6 +1539,7 @@ function buildDoctorItems(snapshot) {
       tone: riskFailures.length ? "danger" : riskWarnings.length ? "warning" : "success",
       status: riskFailures.length ? "차단" : riskWarnings.length ? "주의" : "통과",
       targetNav: "gate",
+      details: riskDetails.length ? riskDetails : [makeDetail("리스크 한도", "점검할 리스크 항목이 없습니다.", "pass")],
     },
     {
       id: "doctor-strategy",
@@ -1512,6 +1549,7 @@ function buildDoctorItems(snapshot) {
       tone: strategyBlocked.length ? "warning" : "success",
       status: strategyBlocked.length ? "검토" : "통과",
       targetNav: "strategies",
+      details: strategyDetails.length ? strategyDetails : [makeDetail("전략", "점검할 전략이 없습니다.", "warn")],
     },
     {
       id: "doctor-reconciliation",
@@ -1520,7 +1558,8 @@ function buildDoctorItems(snapshot) {
       detail: reconciliation.mismatch_count ? `불일치 ${reconciliation.mismatch_count}개가 있습니다.` : reconciliation.api_required_count ? `API 조회 필요 ${reconciliation.api_required_count}건이 있습니다.` : "계좌/포지션 대조가 정상입니다.",
       tone: reconciliation.mismatch_count ? "danger" : reconciliation.api_required_count ? "warning" : "success",
       status: reconciliation.mismatch_count ? "조치" : reconciliation.api_required_count ? "API" : "통과",
-      targetNav: "preflight",
+      targetNav: "overview",
+      details: reconciliationDetails,
     },
     {
       id: "doctor-final",
@@ -1529,7 +1568,8 @@ function buildDoctorItems(snapshot) {
       detail: finalFailures.length ? `hard stop ${finalFailures.length}개가 남아 있습니다.` : finalWarnings.length ? `warning ${finalWarnings.length}개를 확인하세요.` : "최종 점검을 통과했습니다.",
       tone: finalFailures.length ? "danger" : finalWarnings.length ? "warning" : "success",
       status: finalFailures.length ? "차단" : finalWarnings.length ? "주의" : "통과",
-      targetNav: "preflight",
+      targetNav: "overview",
+      details: finalDetails.length ? finalDetails : [makeDetail("최종 Preflight", "점검할 hard stop이 없습니다.", "pass")],
     },
   ];
 }
@@ -2105,7 +2145,7 @@ function StrategyWorkflowPanel() {
 function AuditExportPanel({ onExport, exportResult }) {
   return (
     <section className="panel">
-      <PanelHeader title="감사 로그 내보내기" subtitle="주문 차단, 모드 변경, 설정 변경을 CSV/HTML로 저장합니다." />
+      <PanelHeader title="로그 내보내기" subtitle="주문 차단, 모드 변경, 설정 변경을 CSV/HTML로 저장합니다." />
       <div className="compact-list">
         <div className="compact-row">
           <strong>CSV</strong>
