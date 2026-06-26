@@ -2,6 +2,8 @@ node_modules/
 dist/
 build/
 release/
+build_pending/
+release_pending/
 qa/
 __pycache__/
 live_trader/__pycache__/
