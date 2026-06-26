@@ -166,6 +166,7 @@ const APPEARANCE_STORAGE_KEY = "live-trader.appearance.v1";
 const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
 const LAYOUT_RESET_EVENT = "live-trader-layout-reset";
 const LAYOUT_SNAP_SIZE = 8;
+const LAYOUT_COLLISION_GAP = 8;
 const MIN_PANEL_WIDTH = 260;
 const MIN_PANEL_HEIGHT = 150;
 
@@ -603,6 +604,26 @@ function snapLayoutOffset(value, axis) {
   return clampNumber(snapped, -max, max, 0);
 }
 
+function panelRectsOverlap(left, right, gap = LAYOUT_COLLISION_GAP) {
+  return (
+    left.left < right.right + gap &&
+    left.right + gap > right.left &&
+    left.top < right.bottom + gap &&
+    left.bottom + gap > right.top
+  );
+}
+
+function panelOverlapsPeers(activePanel) {
+  const scope = activePanel.closest(".page-view") || activePanel.parentElement;
+  if (!scope) return false;
+  const activeRect = activePanel.getBoundingClientRect();
+  return Array.from(scope.querySelectorAll(".panel")).some((panel) => {
+    if (panel === activePanel || !(panel instanceof HTMLElement)) return false;
+    const rect = panel.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && panelRectsOverlap(activeRect, rect);
+  });
+}
+
 function applyTrackWidth(panel, width) {
   const context = panelTrackContext(panel);
   if (!context) return false;
@@ -756,6 +777,7 @@ function useEditablePanels(rootRef) {
       const bounds = panel.getBoundingClientRect();
       const affectsWidth = direction.includes("e") || direction.includes("w");
       const affectsHeight = direction.includes("n") || direction.includes("s");
+      let lastValidSize = { width: bounds.width, height: bounds.height };
       document.body.classList.add("is-resizing-layout");
 
       const onMove = (moveEvent) => {
@@ -769,6 +791,15 @@ function useEditablePanels(rootRef) {
           const nextHeight = snapLayoutDimension(bounds.height + deltaY, "height");
           panel.style.height = `${nextHeight}px`;
         }
+        if (panelOverlapsPeers(panel)) {
+          if (affectsWidth) {
+            if (!applyTrackWidth(panel, lastValidSize.width)) panel.style.width = `${lastValidSize.width}px`;
+          }
+          if (affectsHeight) panel.style.height = `${lastValidSize.height}px`;
+          return;
+        }
+        const rect = panel.getBoundingClientRect();
+        lastValidSize = { width: rect.width, height: rect.height };
       };
 
       const onUp = () => {
@@ -807,6 +838,7 @@ function useEditablePanels(rootRef) {
       const startOffset = currentPanelOffset(panel, positions[key]);
       const startX = event.clientX;
       const startY = event.clientY;
+      let lastValidOffset = startOffset;
       panel.classList.add("dragging-panel");
       document.body.classList.add("is-moving-layout");
 
@@ -814,6 +846,11 @@ function useEditablePanels(rootRef) {
         const nextX = snapLayoutOffset(startOffset.x + moveEvent.clientX - startX, "x");
         const nextY = snapLayoutOffset(startOffset.y + moveEvent.clientY - startY, "y");
         applyPanelOffset(panel, { x: nextX, y: nextY });
+        if (panelOverlapsPeers(panel)) {
+          applyPanelOffset(panel, lastValidOffset);
+          return;
+        }
+        lastValidOffset = currentPanelOffset(panel, positions[key]);
       };
 
       const onUp = () => {
