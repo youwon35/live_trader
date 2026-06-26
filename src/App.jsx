@@ -160,7 +160,6 @@ const fallbackSnapshot = {
 
 const PANEL_SIZE_STORAGE_KEY = "live-trader.panelSizes.v1";
 const PANEL_POSITION_STORAGE_KEY = "live-trader.panelPositions.v1";
-const PANEL_TRACK_STORAGE_KEY = "live-trader.panelTracks.v1";
 const LAYOUT_MODE_STORAGE_KEY = "live-trader.layoutMode.v1";
 const APPEARANCE_STORAGE_KEY = "live-trader.appearance.v1";
 const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
@@ -546,46 +545,6 @@ function panelLayoutKey(panel) {
   return key;
 }
 
-function panelTrackContext(panel) {
-  const grid = panel.closest(".content-grid, .command-grid");
-  if (!grid) return null;
-  const page = panel.closest(".page-view");
-  const grids = Array.from(page?.querySelectorAll(".command-grid, .content-grid") ?? [grid]);
-  const gridIndex = Math.max(0, grids.indexOf(grid));
-  const tracks = grid.classList.contains("content-grid")
-    ? Array.from(grid.children).filter((item) => item.classList.contains("content-column"))
-    : Array.from(grid.children).filter((item) => item.classList.contains("panel"));
-  const trackElement = grid.classList.contains("content-grid") ? panel.closest(".content-column") : panel;
-  const trackIndex = tracks.indexOf(trackElement);
-  if (trackIndex < 0) return null;
-  const pageKey = normalizePanelKey(page?.className || "workspace");
-  const gridKey = grid.classList.contains("command-grid") ? "command" : "content";
-  return {
-    grid,
-    trackIndex,
-    trackElement,
-    key: `${pageKey}-${gridKey}-${gridIndex}-${trackIndex}`,
-  };
-}
-
-function splitGridTracks(template) {
-  const tracks = [];
-  let current = "";
-  let depth = 0;
-  for (const char of template) {
-    if (char === "(") depth += 1;
-    if (char === ")") depth = Math.max(0, depth - 1);
-    if (char === " " && depth === 0) {
-      if (current.trim()) tracks.push(current.trim());
-      current = "";
-    } else {
-      current += char;
-    }
-  }
-  if (current.trim()) tracks.push(current.trim());
-  return tracks;
-}
-
 function clampNumber(value, min, max, fallback) {
   const numberValue = Number(value);
   if (!Number.isFinite(numberValue)) return fallback;
@@ -621,19 +580,6 @@ function panelOverlapsPeers(activePanel) {
     const rect = panel.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0 && panelRectsOverlap(activeRect, rect);
   });
-}
-
-function applyTrackWidth(panel, width) {
-  const context = panelTrackContext(panel);
-  if (!context) return false;
-  const widthPx = `${snapLayoutDimension(width, "width")}px`;
-  const computedTracks = splitGridTracks(window.getComputedStyle(context.grid).gridTemplateColumns);
-  const directTracks = Array.from(context.grid.children).filter((item) =>
-    context.grid.classList.contains("content-grid") ? item.classList.contains("content-column") : item.classList.contains("panel"),
-  );
-  const nextTracks = directTracks.map((_, index) => (index === context.trackIndex ? widthPx : computedTracks[index] || "minmax(0, 1fr)"));
-  context.grid.style.gridTemplateColumns = nextTracks.join(" ");
-  return true;
 }
 
 function applyPanelOffset(panel, position = {}) {
@@ -694,14 +640,6 @@ function isInteractiveLayoutTarget(target) {
   );
 }
 
-function restoreTrackWidth(panel) {
-  const context = panelTrackContext(panel);
-  if (!context) return;
-  const tracks = readStoredMap(PANEL_TRACK_STORAGE_KEY);
-  const width = tracks[context.key];
-  if (Number.isFinite(width)) applyTrackWidth(panel, width);
-}
-
 function ensurePanelHandles(panel) {
   panel.classList.add("resizable-panel");
   panelLayoutKey(panel);
@@ -713,8 +651,9 @@ function ensurePanelHandles(panel) {
   const position = positions[key];
 
   panel.style.transform = "";
-  if (size && Number.isFinite(size.width)) applyTrackWidth(panel, size.width);
-  restoreTrackWidth(panel);
+  if (size && Number.isFinite(size.width)) {
+    panel.style.width = `${snapLayoutDimension(size.width, "width")}px`;
+  }
   if (size && Number.isFinite(size.height)) {
     panel.style.height = `${snapLayoutDimension(size.height, "height")}px`;
   }
@@ -724,10 +663,6 @@ function ensurePanelHandles(panel) {
   panel.querySelectorAll(":scope > .panel-resize-edge, :scope > .panel-resize-corner").forEach((handle) => handle.remove());
 
   [
-    ["panel-resize-edge panel-resize-north", "horizontal", "n"],
-    ["panel-resize-edge panel-resize-east", "vertical", "e"],
-    ["panel-resize-edge panel-resize-south", "horizontal", "s"],
-    ["panel-resize-edge panel-resize-west", "vertical", "w"],
     ["panel-resize-corner panel-resize-north-west", "vertical", "nw"],
     ["panel-resize-corner panel-resize-north-east", "vertical", "ne"],
     ["panel-resize-corner panel-resize-south-east", "vertical", "se"],
@@ -770,35 +705,54 @@ function useEditablePanels(rootRef) {
       event.target.setPointerCapture?.(event.pointerId);
 
       const key = panelLayoutKey(panel);
-      const trackContext = panelTrackContext(panel);
       const startX = event.clientX;
       const startY = event.clientY;
       const bounds = panel.getBoundingClientRect();
+      const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
+      const startOffset = currentPanelOffset(panel, positions[key]);
       const affectsWidth = direction.includes("e") || direction.includes("w");
       const affectsHeight = direction.includes("n") || direction.includes("s");
-      let lastValidSize = { width: bounds.width, height: bounds.height };
+      let lastValidLayout = {
+        width: bounds.width,
+        height: bounds.height,
+        x: startOffset.x,
+        y: startOffset.y,
+      };
       document.body.classList.add("is-resizing-layout");
 
       const onMove = (moveEvent) => {
+        let nextWidth = bounds.width;
+        let nextHeight = bounds.height;
+        const nextOffset = { ...startOffset };
         if (affectsWidth) {
-          const deltaX = direction.includes("w") ? startX - moveEvent.clientX : moveEvent.clientX - startX;
-          const nextWidth = snapLayoutDimension(bounds.width + deltaX, "width");
-          if (!applyTrackWidth(panel, nextWidth)) panel.style.width = `${nextWidth}px`;
+          const horizontalSign = direction.includes("w") ? -1 : 1;
+          nextWidth = snapLayoutDimension(bounds.width + (moveEvent.clientX - startX) * horizontalSign, "width");
+          panel.style.width = `${nextWidth}px`;
+          if (direction.includes("w")) {
+            nextOffset.x = snapLayoutOffset(startOffset.x + bounds.width - nextWidth, "x");
+          }
         }
         if (affectsHeight) {
-          const deltaY = direction.includes("n") ? startY - moveEvent.clientY : moveEvent.clientY - startY;
-          const nextHeight = snapLayoutDimension(bounds.height + deltaY, "height");
+          const verticalSign = direction.includes("n") ? -1 : 1;
+          nextHeight = snapLayoutDimension(bounds.height + (moveEvent.clientY - startY) * verticalSign, "height");
           panel.style.height = `${nextHeight}px`;
-        }
-        if (panelOverlapsPeers(panel)) {
-          if (affectsWidth) {
-            if (!applyTrackWidth(panel, lastValidSize.width)) panel.style.width = `${lastValidSize.width}px`;
+          if (direction.includes("n")) {
+            nextOffset.y = snapLayoutOffset(startOffset.y + bounds.height - nextHeight, "y");
           }
-          if (affectsHeight) panel.style.height = `${lastValidSize.height}px`;
+        }
+        applyPanelOffset(panel, nextOffset);
+        if (panelOverlapsPeers(panel)) {
+          panel.style.width = `${lastValidLayout.width}px`;
+          panel.style.height = `${lastValidLayout.height}px`;
+          applyPanelOffset(panel, { x: lastValidLayout.x, y: lastValidLayout.y });
           return;
         }
         const rect = panel.getBoundingClientRect();
-        lastValidSize = { width: rect.width, height: rect.height };
+        lastValidLayout = {
+          width: rect.width,
+          height: rect.height,
+          ...currentPanelOffset(panel, positions[key]),
+        };
       };
 
       const onUp = () => {
@@ -808,11 +762,14 @@ function useEditablePanels(rootRef) {
           height: Math.round(panel.getBoundingClientRect().height),
         };
         writeStoredMap(PANEL_SIZE_STORAGE_KEY, stored);
-        if (trackContext && affectsWidth) {
-          const tracks = readStoredMap(PANEL_TRACK_STORAGE_KEY);
-          tracks[trackContext.key] = Math.round(trackContext.trackElement.getBoundingClientRect().width);
-          writeStoredMap(PANEL_TRACK_STORAGE_KEY, tracks);
+        const nextOffset = currentPanelOffset(panel, positions[key]);
+        const positionStore = readStoredMap(PANEL_POSITION_STORAGE_KEY);
+        if (Math.abs(nextOffset.x) > 0 || Math.abs(nextOffset.y) > 0) {
+          positionStore[key] = nextOffset;
+        } else {
+          delete positionStore[key];
         }
+        writeStoredMap(PANEL_POSITION_STORAGE_KEY, positionStore);
         document.body.classList.remove("is-resizing-layout");
         document.removeEventListener("pointermove", onMove);
         document.removeEventListener("pointerup", onUp);
@@ -1001,7 +958,6 @@ function App() {
     try {
       window.localStorage.removeItem(PANEL_SIZE_STORAGE_KEY);
       window.localStorage.removeItem(PANEL_POSITION_STORAGE_KEY);
-      window.localStorage.removeItem(PANEL_TRACK_STORAGE_KEY);
     } catch {
       // The event below still resets the visible layout.
     }
@@ -1509,7 +1465,11 @@ function NotificationPanel({ items, onNavigate }) {
 }
 
 function StatusPill({ children, tone = "neutral" }) {
-  return <span className={`status-pill ${tone}`}>{children}</span>;
+  return (
+    <span className={`status-pill ${tone}`}>
+      <span className="status-pill-text">{children}</span>
+    </span>
+  );
 }
 
 function statusTone(status) {

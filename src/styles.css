@@ -1482,9 +1482,8 @@ button {
 }
 
 .status-pill {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: inline-grid;
+  place-items: center;
   width: fit-content;
   min-width: 0;
   height: 24px;
@@ -1497,6 +1496,15 @@ button {
   text-align: center;
   white-space: nowrap;
   vertical-align: middle;
+}
+
+.status-pill-text {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: inherit;
+  line-height: 1;
+  transform: translateY(1px);
 }
 
 .status-pill.success {
@@ -2099,10 +2107,10 @@ body {
 
 .panel-header {
   align-items: center;
-  height: 32px;
-  min-height: 32px;
+  height: auto;
+  min-height: var(--panel-header-min-height, 48px);
   margin: -10px -10px 10px;
-  padding: 0 16px;
+  padding: var(--panel-header-padding, 8px 16px 9px);
   background: var(--panel-header);
   border-bottom: 1px solid var(--table-border, var(--border));
 }
@@ -2111,7 +2119,7 @@ body {
   color: var(--text);
   font-size: 13px;
   font-weight: 700;
-  line-height: 1.2;
+  line-height: var(--panel-header-title-line-height, 1.35);
 }
 
 .panel-header p {
@@ -2119,7 +2127,7 @@ body {
   max-width: 100%;
   margin-top: 2px;
   font-size: 11px;
-  line-height: 1.2;
+  line-height: var(--panel-header-subtitle-line-height, 1.45);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2162,9 +2170,8 @@ body {
 }
 
 .status-pill {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: inline-grid;
+  place-items: center;
   height: 24px;
   min-height: 24px;
   padding: 0 9px;
@@ -2557,6 +2564,30 @@ body {
   color: #26364f;
 }
 
+:root[data-ui-theme='light'] .alert-band {
+  color: #7f1d1d;
+  background: #fff1f2;
+  border-color: #ef4444;
+}
+
+:root[data-ui-theme='light'] .alert-band strong,
+:root[data-ui-theme='light'] .alert-band span,
+:root[data-ui-theme='light'] .alert-band svg {
+  color: #7f1d1d;
+}
+
+:root[data-ui-theme='light'] .layout-mode-button,
+:root[data-ui-theme='light'] .ghost-button,
+:root[data-ui-theme='light'] .secondary-button,
+:root[data-ui-theme='light'] .mini-button,
+:root[data-ui-theme='light'] .mini-icon-button,
+:root[data-ui-theme='light'] .theme-mode-button,
+:root[data-ui-theme='light'] .accent-swatch,
+:root[data-ui-theme='light'] .section-tabs button {
+  color: #0f172a;
+  font-weight: 800;
+}
+
 :root[data-ui-theme='light'] .nav-item.active,
 :root[data-ui-theme='light'] .layout-mode-button.active,
 :root[data-ui-theme='light'] .ghost-button.active,
@@ -2602,6 +2633,30 @@ body {
   color: #1e293b;
   background: #eef2f7;
   border-color: #cbd5e1;
+}
+
+:root[data-ui-theme='light'] .status-pill.danger {
+  color: #991b1b;
+  background: #fff1f2;
+  border-color: #ef4444;
+}
+
+:root[data-ui-theme='light'] .status-pill.warning {
+  color: #92400e;
+  background: #fffbeb;
+  border-color: #f59e0b;
+}
+
+:root[data-ui-theme='light'] .status-pill.success {
+  color: #047857;
+  background: #ecfdf5;
+  border-color: #10b981;
+}
+
+:root[data-ui-theme='light'] .status-pill.info {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #60a5fa;
 }
 
 :root[data-ui-theme='light'] .page-heading h1 {
