@@ -126,11 +126,16 @@ button {
   text-align: left;
 }
 
-.nav-item:hover,
-.nav-item.active {
+.nav-item:hover {
   color: var(--text);
   background: var(--button-hover);
   border-color: var(--border);
+}
+
+.nav-item.active {
+  color: #ffffff;
+  background: var(--primary);
+  border-color: var(--primary-border);
 }
 
 .nav-item span {
@@ -148,13 +153,13 @@ button {
   gap: 8px;
   margin-top: auto;
   padding: 10px;
-  background: var(--panel);
+  background: #ffffff;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
 }
 
 .sidebar-footer > span {
-  color: var(--text-muted);
+  color: #111827;
   font-size: var(--font-size-small);
   font-weight: var(--font-weight-bold);
 }
@@ -1781,8 +1786,8 @@ body {
 
 .nav-item.active {
   color: #ffffff;
-  background: #000000;
-  border-color: #000000;
+  background: var(--primary);
+  border-color: var(--primary-border);
   box-shadow: none;
 }
 
@@ -1795,9 +1800,19 @@ body {
 
 .sidebar-footer {
   padding: 13px 14px;
-  background: rgba(9, 24, 39, 0.9);
+  background: #ffffff;
   border-color: var(--border);
   border-radius: 8px;
+}
+
+.sidebar-footer > span {
+  color: #111827;
+}
+
+.sidebar-footer .status-pill {
+  color: #111827;
+  background: #ffffff;
+  border-color: #cbd5e1;
 }
 
 .workspace {
@@ -2712,8 +2727,8 @@ body {
 
 :root[data-ui-theme='light'] .nav-item.active {
   color: #ffffff;
-  background: #000000;
-  border-color: #000000;
+  background: var(--primary);
+  border-color: var(--primary-border);
 }
 
 :root[data-ui-theme='light'] .nav-item:hover,

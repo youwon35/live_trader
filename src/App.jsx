@@ -54,7 +54,7 @@ const navItems = [
   { id: "overview", label: "대시보드", icon: LayoutDashboard },
   { id: "gate", label: "실거래 게이트", icon: ListChecks },
   { id: "orders", label: "주문", icon: Route },
-  { id: "brokers", label: "브로커", icon: Network },
+  { id: "brokers", label: "API", icon: Network },
   { id: "strategies", label: "전략", icon: DatabaseZap },
   { id: "audit", label: "감사 로그", icon: FileClock },
   { id: "preflight", label: "최종 점검", icon: ShieldCheck },
@@ -78,9 +78,9 @@ const pageProfiles = {
     summary: "주문 의도, Dry Run 원장, 재시도 정책을 관리합니다.",
   },
   brokers: {
-    title: "브로커",
-    eyebrow: "API 어댑터",
-    summary: "KIS/Binance 키, capability, 어댑터 계약 상태를 확인합니다.",
+    title: "API",
+    eyebrow: "브로커/API 관리",
+    summary: "KIS/Binance 연결, 환경 변수, 주문 어댑터, 인터페이스 계약을 한곳에서 관리합니다.",
   },
   strategies: {
     title: "전략",
@@ -100,7 +100,7 @@ const pageProfiles = {
   settings: {
     title: "설정",
     eyebrow: "화면/운영 환경",
-    summary: "테마, 강조 색상, 레이아웃 편집과 실거래 연결 준비 정보를 관리합니다.",
+    summary: "테마, 강조 색상, 레이아웃 편집 같은 화면 환경만 관리합니다.",
   },
 };
 
@@ -1244,11 +1244,9 @@ function WorkspaceContent({
         <div className="content-column">
           <BrokerPanel brokers={snapshot.brokers} />
           <BrokerConnectionWizardPanel diagnostics={snapshot.broker_diagnostics} onBrokerCheck={onBrokerCheck} />
+          <BrokerCapabilityPanel diagnostics={snapshot.broker_diagnostics} />
         </div>
         <div className="content-column">
-          <BrokerCapabilityPanel diagnostics={snapshot.broker_diagnostics} />
-          <BrokerAdapterContractPanel contract={snapshot.broker_adapter_contract} />
-          <BrokerRequirementsPanel brokers={snapshot.brokers} />
           <ReadinessPanel checks={snapshot.readiness} />
         </div>
       </section>,
@@ -1315,12 +1313,6 @@ function WorkspaceContent({
             changeLayoutMode={changeLayoutMode}
             resetWorkspaceLayout={resetWorkspaceLayout}
           />
-          <BrokerRequirementsPanel brokers={snapshot.brokers} />
-        </div>
-        <div className="content-column">
-          <BrokerConnectionWizardPanel diagnostics={snapshot.broker_diagnostics} onBrokerCheck={onBrokerCheck} />
-          <BrokerAdapterContractPanel contract={snapshot.broker_adapter_contract} />
-          <GateRunbookPanel />
         </div>
       </section>,
     );
@@ -1344,7 +1336,6 @@ function WorkspaceContent({
           <AuditPanel audit={snapshot.audit} />
         </div>
         <div className="content-column">
-          <BrokerPanel brokers={snapshot.brokers} />
           <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
           <AccountReconciliationPanel accounts={snapshot.accounts} />
           <PositionPanel positions={snapshot.positions} />
@@ -1374,26 +1365,6 @@ function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) 
           <StatusPill tone={warningCount ? "warning" : "success"}>{warningCount} warn</StatusPill>
           <span>{snapshot.generated_at}</span>
         </div>
-      </div>
-
-      <div className="section-tabs" role="tablist" aria-label="실거래 화면 전환">
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const selected = selectedNav === item.id;
-          return (
-            <button
-              key={item.id}
-              className={selected ? "selected" : ""}
-              type="button"
-              role="tab"
-              aria-selected={selected}
-              onClick={() => onNavigate(item.id)}
-            >
-              <Icon size={14} />
-              <span>{item.label}</span>
-            </button>
-          );
-        })}
       </div>
 
       <SearchResultsPanel query={searchQuery} results={searchResults} onNavigate={onNavigate} />
