@@ -4,7 +4,6 @@ import {
   BadgeCheck,
   Bell,
   CircleStop,
-  ClipboardCheck,
   Clock3,
   DatabaseZap,
   Download,
@@ -41,7 +40,6 @@ import {
   runFinalPreflight,
   runReconciliation,
   retryOrder,
-  setChecklistItem,
   setFlag,
   setMode,
   setRetryPolicy,
@@ -71,7 +69,7 @@ const pageProfiles = {
   gate: {
     title: "실거래 게이트",
     eyebrow: "승인/차단",
-    summary: "실주문 전환 조건과 운영 체크리스트를 점검합니다.",
+    summary: "실거래 모드와 주문 전 리스크 한도만 관리합니다.",
   },
   orders: {
     title: "주문",
@@ -1211,7 +1209,6 @@ function App() {
           onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
-          onChecklist={(name, value) => runAction(() => setChecklistItem(name, value))}
           onRetryPolicy={(name, value) => runAction(() => setRetryPolicy(name, value))}
           onRetryOrder={(orderId) => runAction(() => retryOrder(orderId))}
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
@@ -1255,7 +1252,6 @@ function WorkspaceContent({
   onEntryBlock,
   onTestIntent,
   onRiskSetting,
-  onChecklist,
   onRetryPolicy,
   onRetryOrder,
   onCancelOrder,
@@ -1295,16 +1291,9 @@ function WorkspaceContent({
       <section className="content-grid">
         <div className="content-column">
           {modeConsole}
-          <RunbookChecklistPanel checklist={snapshot.checklist} onChecklist={onChecklist} />
-          <ReadinessPanel checks={snapshot.readiness} />
         </div>
         <div className="content-column">
-          <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
-          <GateRunbookPanel />
           <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
-          <RiskPanel checks={snapshot.risk_checks} />
-          <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
-          <PositionPanel positions={snapshot.positions} />
         </div>
       </section>,
     );
@@ -1324,13 +1313,9 @@ function WorkspaceContent({
           />
           <OrderQueueSummaryPanel summary={snapshot.order_queue} />
           <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
-          <RiskPanel checks={snapshot.risk_checks} />
         </div>
         <div className="content-column">
-          <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
           <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
-          <DryRunLedgerPanel ledger={snapshot.dry_run_ledger} />
-          <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
         </div>
       </section>,
     );
@@ -1356,10 +1341,6 @@ function WorkspaceContent({
           <StrategyPanel strategies={snapshot.strategies} />
           <StrategyWorkflowPanel />
         </div>
-        <div className="content-column">
-          <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
-          <ReadinessPanel checks={snapshot.readiness} />
-        </div>
       </section>,
     );
   }
@@ -1372,7 +1353,6 @@ function WorkspaceContent({
           <AuditExportPanel onExport={onAuditExport} exportResult={exportResult} />
         </div>
         <div className="content-column">
-          <SummaryPanel summary={snapshot.summary} generatedAt={snapshot.generated_at} />
           <OperationsReportPanel report={snapshot.operation_report} />
           <RiskPanel checks={snapshot.risk_checks} />
         </div>
@@ -1386,7 +1366,6 @@ function WorkspaceContent({
         <div className="content-column">
           <FinalPreflightPanel checks={snapshot.final_preflight} onPreflight={onPreflight} />
           <LaunchReportPanel report={snapshot.launch_report} />
-          <ReadinessPanel checks={snapshot.readiness} />
         </div>
         <div className="content-column">
           <ReconciliationSummaryPanel reconciliation={snapshot.reconciliation} onReconcile={onReconcile} />
@@ -1848,43 +1827,6 @@ function ModeConsole({
   );
 }
 
-function SummaryPanel({ summary, generatedAt }) {
-  const items = [
-    { label: "상태", value: summary.status, tone: statusTone(summary.status) },
-    { label: "Blocker", value: summary.blocker_count, tone: summary.blocker_count ? "danger" : "success" },
-    { label: "Warning", value: summary.warning_count, tone: summary.warning_count ? "warning" : "success" },
-    { label: "Live 전략", value: summary.live_strategy_count, tone: summary.live_strategy_count ? "success" : "danger" },
-    { label: "브로커 준비", value: summary.broker_ready_count, tone: summary.broker_ready_count ? "success" : "danger" },
-  ];
-  return (
-    <section className="panel summary-panel">
-      <PanelHeader title="운용 요약" subtitle={`마지막 갱신 ${generatedAt}`} />
-      <div className="summary-grid">
-        {items.map((item) => (
-          <div key={item.label}>
-            <span>{item.label}</span>
-            <strong>{item.value}</strong>
-            <span className={`summary-state ${item.tone}`}>{item.tone === "success" ? "정상" : "확인 필요"}</span>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function ReadinessPanel({ checks }) {
-  return (
-    <section className="panel readiness-panel">
-      <PanelHeader title="Live Readiness" subtitle="API, 계약, 권한, 운용자 확인을 동시에 검사합니다." />
-      <div className="check-list">
-        {checks.map((check) => (
-          <StatusRow key={check.label} label={check.label} status={check.status} detail={check.detail} />
-        ))}
-      </div>
-    </section>
-  );
-}
-
 function BrokerPanel({ brokers }) {
   return (
     <section className="panel broker-panel">
@@ -1974,56 +1916,6 @@ function RiskPanel({ checks }) {
             </div>
             <em>{check.value}</em>
           </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function GateRunbookPanel() {
-  const items = [
-    ["API", "실계좌 키와 주문 어댑터 확인"],
-    ["권한", "live_allowed 전략만 통과"],
-    ["대조", "브로커 포지션과 프로그램 포지션 비교"],
-    ["승인", "운용자 확인 후 SMALL_LIVE부터 시작"],
-  ];
-  return (
-    <section className="panel">
-      <PanelHeader title="실거래 게이트 체크라인" subtitle="실거래 전환 전 필요한 운영 조건입니다." />
-      <div className="compact-list">
-        {items.map(([label, detail]) => (
-          <div className="compact-row" key={label}>
-            <strong>{label}</strong>
-            <span>{detail}</span>
-            <StatusPill tone="neutral">필수</StatusPill>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function RunbookChecklistPanel({ checklist, onChecklist }) {
-  return (
-    <section className="panel checklist-panel">
-      <PanelHeader title="운영 체크리스트" subtitle="필수 항목이 모두 확인되어야 실거래 게이트를 통과할 수 있습니다." />
-      <div className="checklist-list">
-        {checklist.map((item) => (
-          <label className={`checklist-row ${item.checked ? "checked" : ""}`} key={item.key}>
-            <input
-              type="checkbox"
-              checked={item.checked}
-              onChange={(event) => onChecklist(item.key, event.currentTarget.checked)}
-            />
-            <ClipboardCheck size={16} />
-            <div>
-              <strong>{item.label}</strong>
-              <span>{item.detail}</span>
-            </div>
-            <StatusPill tone={item.checked ? "success" : item.required ? "warning" : "neutral"}>
-              {item.checked ? "완료" : item.required ? "필수" : "권장"}
-            </StatusPill>
-          </label>
         ))}
       </div>
     </section>
@@ -2165,27 +2057,6 @@ function RetryPolicyPanel({ policy, onRetryPolicy }) {
             )}
           </div>
         ))}
-      </div>
-    </section>
-  );
-}
-
-function DryRunLedgerPanel({ ledger }) {
-  return (
-    <section className="panel dry-ledger-panel">
-      <PanelHeader title="Dry Run 주문 원장" subtitle="브로커 전송 없이 기록된 주문 의도와 차단 결과입니다." />
-      <div className="compact-list">
-        {ledger.length === 0 ? (
-          <EmptyRow text="아직 Dry Run 주문 의도가 없습니다." />
-        ) : (
-          ledger.map((order) => (
-            <div className="compact-row ledger-row" key={order.order_id}>
-              <strong>{order.symbol}</strong>
-              <span>{order.order_id} · {order.attempts}/{order.max_attempts}회 · {order.reason}</span>
-              <StatusPill tone={statusTone(order.state)}>{order.state}</StatusPill>
-            </div>
-          ))
-        )}
       </div>
     </section>
   );
