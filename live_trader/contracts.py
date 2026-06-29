@@ -11,13 +11,57 @@ SHARED_STRATEGY_SCHEMA_VERSION = "market-strategy-v1"
 TRADER_STRATEGY_CONTRACT_VERSION = "trader-strategy-contract-v2"
 
 
+PLUGIN_ALIASES = {
+    "ma-cross": "moving_average_cross",
+    "moving-average-cross": "moving_average_cross",
+    "rsi-revert": "rsi_revert",
+    "custom-draft": "strategy_builder_custom",
+    "strategy-builder-custom": "strategy_builder_custom",
+}
+
+PLUGIN_LABELS = {
+    "moving_average_cross": "Backtester Moving Average Cross",
+    "rsi_revert": "Backtester RSI Revert",
+    "breakout": "Backtester Breakout",
+    "strategy_builder_custom": "Backtester Strategy Builder Custom",
+    "threshold_momentum": "Threshold Momentum",
+}
+
+
+def _dict_value(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _normalize_plugin_id(plugin_id: Any) -> str:
+    text = str(plugin_id or "").strip()
+    return PLUGIN_ALIASES.get(text, text or "unknown")
+
+
+def _custom_definition_from_artifact(artifact: dict[str, Any], strategy_contract: dict[str, Any]) -> dict[str, Any]:
+    parameters = _dict_value(artifact.get("parameters"))
+    settings = _dict_value(artifact.get("settings"))
+    for candidate in (
+        artifact.get("customStrategyDefinition"),
+        artifact.get("custom_strategy_definition"),
+        parameters.get("customStrategyDefinition"),
+        parameters.get("custom_strategy_definition"),
+        settings.get("customStrategyDefinition"),
+        settings.get("custom_strategy_definition"),
+        strategy_contract.get("customStrategyDefinition"),
+        strategy_contract.get("custom_strategy_definition"),
+    ):
+        if isinstance(candidate, dict):
+            return candidate
+    return {}
+
+
 def can_trader_use_artifact(artifact: dict[str, Any]) -> bool:
-    permissions = artifact.get("permissions") or {}
+    permissions = _dict_value(artifact.get("permissions"))
     return permissions.get("trader_export_allowed") is True or artifact.get("trader_export_allowed") is True
 
 
 def can_live_use_artifact(artifact: dict[str, Any]) -> bool:
-    permissions = artifact.get("permissions") or {}
+    permissions = _dict_value(artifact.get("permissions"))
     return permissions.get("live_allowed") is True or artifact.get("live_allowed") is True
 
 
@@ -47,6 +91,19 @@ def load_strategy_artifacts(limit: int = 16) -> list[dict[str, Any]]:
 
 
 def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    dataset = _dict_value(artifact.get("dataset"))
+    data_artifact = _dict_value(artifact.get("dataArtifact") or artifact.get("data_artifact"))
+    lifecycle = _dict_value(artifact.get("lifecycle"))
+    final_test = _dict_value(artifact.get("finalTest") or artifact.get("final_test"))
+    strategy_contract = _dict_value(artifact.get("strategy_contract") or artifact.get("strategyContract"))
+    trader_contract = _dict_value(artifact.get("trader_contract") or artifact.get("traderContract"))
+    custom_definition = _custom_definition_from_artifact(artifact, strategy_contract)
+    plugin_id = _normalize_plugin_id(
+        artifact.get("plugin")
+        or artifact.get("pluginId")
+        or custom_definition.get("pluginId")
+        or artifact.get("strategyId")
+    )
     strategy_id = str(
         artifact.get("strategy_id")
         or artifact.get("strategyId")
@@ -63,11 +120,16 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     return {
         "strategy_id": strategy_id,
         "name": str(artifact.get("name") or artifact.get("strategyName") or strategy_id),
-        "symbol": str(artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN"),
-        "asset": str(artifact.get("asset") or artifact.get("assetClass") or "unknown"),
-        "timeframe": str(artifact.get("timeframe") or artifact.get("interval") or "-"),
-        "lifecycle_status": str(artifact.get("lifecycleStatus") or artifact.get("stage") or "draft"),
-        "final_test_status": str(artifact.get("finalTestStatus") or artifact.get("test_status") or ""),
+        "symbol": str(artifact.get("symbol") or dataset.get("symbol") or data_artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN"),
+        "asset": str(artifact.get("asset") or dataset.get("assetClass") or data_artifact.get("assetClass") or artifact.get("assetClass") or "unknown"),
+        "timeframe": str(artifact.get("timeframe") or dataset.get("interval") or data_artifact.get("interval") or artifact.get("interval") or "-"),
+        "plugin": plugin_id,
+        "plugin_label": PLUGIN_LABELS.get(plugin_id, plugin_id),
+        "plugin_version": str(artifact.get("plugin_version") or artifact.get("pluginVersion") or strategy_contract.get("strategyVersion") or "-"),
+        "strategy_contract_version": str(strategy_contract.get("contractVersion") or artifact.get("strategy_plugin_contract_version") or ""),
+        "strategy_engine_version": str(artifact.get("strategy_engine_version") or artifact.get("strategyEngineVersion") or ""),
+        "lifecycle_status": str(artifact.get("lifecycleStatus") or lifecycle.get("status") or artifact.get("status") or artifact.get("stage") or "draft"),
+        "final_test_status": str(artifact.get("finalTestStatus") or final_test.get("status") or artifact.get("test_status") or ""),
         "score": artifact.get("score") or artifact.get("qualityScore") or "-",
         "permissions": {
             "trader_export_allowed": permissions.get("trader_export_allowed") is True,
@@ -75,10 +137,14 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
             "fail_reasons": list(permissions.get("fail_reasons") or artifact.get("fail_reasons") or []),
         },
         "contract_version": str(
-            artifact.get("contractVersion")
+            trader_contract.get("contract_version")
+            or trader_contract.get("contractVersion")
+            or artifact.get("contractVersion")
             or artifact.get("traderStrategyContractVersion")
             or TRADER_STRATEGY_CONTRACT_VERSION
         ),
+        "data_mode": str(artifact.get("data_mode") or dataset.get("data_mode") or data_artifact.get("data_mode") or "real"),
+        "source_app": str(artifact.get("savedBy") or artifact.get("sourceApp") or ""),
         "source_path": str(artifact.get("_source_path") or ""),
     }
 
