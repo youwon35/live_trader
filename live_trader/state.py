@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from .brokers import broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts
+from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
@@ -231,6 +232,10 @@ STATE: dict[str, Any] = {
     "risk_settings": dict(DEFAULT_RISK_SETTINGS),
     "checklist": {str(item["key"]): False for item in CHECKLIST_ITEMS},
     "retry_policy": dict(DEFAULT_RETRY_POLICY),
+    "automation": {
+        "stock": {"enabled": False, "provider": "kis", "last_action": "대기"},
+        "crypto": {"enabled": False, "provider": "binance", "last_action": "대기"},
+    },
     "reconciliation_last_run": None,
     "preflight_last_run": None,
     "orders": [],
@@ -283,6 +288,76 @@ def strategy_rows() -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers: list[dict[str, object]] | None = None) -> list[dict[str, Any]]:
+    strategies = strategies if strategies is not None else strategy_rows()
+    brokers = brokers if brokers is not None else [broker.to_dict() for broker in broker_readiness()]
+    broker_map = {str(broker["broker_id"]): broker for broker in brokers}
+    stock_strategies = [strategy for strategy in strategies if strategy_broker_id(strategy) == "kis"]
+    crypto_strategies = [strategy for strategy in strategies if strategy_broker_id(strategy) in {"binance", "upbit"}]
+    stock_provider = str(STATE["automation"]["stock"].get("provider") or "kis")
+    crypto_provider = str(STATE["automation"]["crypto"].get("provider") or "binance")
+    return [
+        {
+            "id": "stock",
+            "title": "주식/ETF 자동화",
+            "provider": stock_provider,
+            "provider_label": "한국투자증권 Open API",
+            "broker_ids": ["kis"],
+            "asset_scope": ["한국주식", "미국주식", "금 ETF", "오일 ETF"],
+            "enabled": bool(STATE["automation"]["stock"]["enabled"]),
+            "last_action": STATE["automation"]["stock"]["last_action"],
+            "ready": bool(broker_map.get("kis", {}).get("order_ready")),
+            "strategy_count": len(stock_strategies),
+            "live_strategy_count": sum(1 for strategy in stock_strategies if strategy.get("live_allowed")),
+            "detail": "KIS 실계좌 API로 주식/ETF 주문을 라우팅합니다.",
+            "sample_request": build_adapter_preview("kis", stock_strategies),
+        },
+        {
+            "id": "crypto",
+            "title": "코인 자동화",
+            "provider": crypto_provider,
+            "provider_label": "Binance API" if crypto_provider == "binance" else "Upbit API",
+            "broker_ids": ["binance", "upbit"],
+            "asset_scope": ["Binance 현물", "Upbit KRW 마켓"],
+            "enabled": bool(STATE["automation"]["crypto"]["enabled"]),
+            "last_action": STATE["automation"]["crypto"]["last_action"],
+            "ready": bool(broker_map.get(crypto_provider, {}).get("order_ready")),
+            "strategy_count": len(crypto_strategies),
+            "live_strategy_count": sum(1 for strategy in crypto_strategies if strategy.get("live_allowed")),
+            "detail": "선택한 코인 거래소 API로 코인 주문을 라우팅합니다.",
+            "sample_request": build_adapter_preview(crypto_provider, crypto_strategies),
+        },
+    ]
+
+
+def strategy_broker_id(strategy: dict[str, Any]) -> str:
+    asset = f"{strategy.get('asset', '')} {strategy.get('symbol', '')}".lower()
+    if any(token in asset for token in ("crypto", "coin", "btc", "eth", "usdt", "코인")):
+        return "binance"
+    return "kis"
+
+
+def build_adapter_preview(provider: str, strategies: list[dict[str, Any]]) -> dict[str, Any]:
+    strategy = next((item for item in strategies if item.get("live_allowed")), strategies[0] if strategies else {})
+    symbol = str(strategy.get("symbol") or ("BTCUSDT" if provider == "binance" else "KRW-BTC" if provider == "upbit" else "069500.KS"))
+    intent = {
+        "broker_id": provider,
+        "strategy_id": strategy.get("strategy_id", "sample"),
+        "symbol": symbol,
+        "market": symbol if provider == "upbit" else "",
+        "asset": strategy.get("asset", ""),
+        "side": "BUY",
+        "quantity": 1,
+        "price": 1000 if provider != "binance" else 1,
+        "order_type": "LIMIT" if provider == "binance" else "limit" if provider == "upbit" else "00",
+    }
+    if provider == "kis":
+        return build_kis_live_order_request(intent).preview()
+    if provider == "upbit":
+        return build_upbit_order_request(intent).preview()
+    return build_binance_spot_order_request(intent, test=True).preview()
 
 
 def market_sessions() -> list[dict[str, str]]:
@@ -750,6 +825,7 @@ def launch_report(preflight: list[dict[str, str]]) -> dict[str, Any]:
 def snapshot() -> dict[str, Any]:
     brokers = [broker.to_dict() for broker in broker_readiness()]
     strategies = strategy_rows()
+    automations = automation_profiles(strategies, brokers)
     reconciliation = reconciliation_snapshot()
     checks = readiness_checks(strategies, brokers, reconciliation["summary"])
     preflight = final_preflight_checks(strategies, brokers, reconciliation)
@@ -781,6 +857,7 @@ def snapshot() -> dict[str, Any]:
         "brokers": brokers,
         "broker_diagnostics": broker_diagnostics(),
         "broker_adapter_contract": broker_adapter_contract(),
+        "automation_profiles": automations,
         "strategies": strategies,
         "orders": order_rows(),
         "dry_run_ledger": dry_run_ledger_rows(),
@@ -829,6 +906,40 @@ def set_flag(name: str, value: bool) -> dict[str, Any]:
         STATE["mode"] = "MONITOR"
         STATE["new_entries_blocked"] = True
     return {"ok": True, "reason": "flag changed", "snapshot": snapshot()}
+
+
+def set_automation_profile(profile_id: str, enabled: bool, provider: str | None = None) -> dict[str, Any]:
+    profile_id = profile_id if profile_id in {"stock", "crypto"} else ""
+    if not profile_id:
+        return {"ok": False, "reason": "unknown automation profile", "snapshot": snapshot()}
+    if provider:
+        normalized_provider = provider.lower().strip()
+        if profile_id == "stock" and normalized_provider != "kis":
+            return {"ok": False, "reason": "주식/ETF 자동화 provider는 kis만 허용합니다.", "snapshot": snapshot()}
+        if profile_id == "crypto" and normalized_provider not in {"binance", "upbit"}:
+            return {"ok": False, "reason": "코인 자동화 provider는 binance 또는 upbit만 허용합니다.", "snapshot": snapshot()}
+        STATE["automation"][profile_id]["provider"] = normalized_provider
+
+    data = snapshot()
+    profile = next((item for item in data["automation_profiles"] if item["id"] == profile_id), None)
+    if not profile:
+        return {"ok": False, "reason": "automation profile not found", "snapshot": snapshot()}
+    if enabled:
+        if data["summary"]["blocker_count"]:
+            reason = f"readiness blocker {data['summary']['blocker_count']}개 때문에 자동화 시작이 차단되었습니다."
+            STATE["automation"][profile_id]["last_action"] = reason
+            append_audit("danger", "자동화 시작 차단", f"{profile['title']}: {reason}")
+            return {"ok": False, "reason": reason, "snapshot": snapshot()}
+        if profile["live_strategy_count"] <= 0:
+            reason = "live_allowed=true 전략이 없어 자동화 시작이 차단되었습니다."
+            STATE["automation"][profile_id]["last_action"] = reason
+            append_audit("danger", "자동화 시작 차단", f"{profile['title']}: {reason}")
+            return {"ok": False, "reason": reason, "snapshot": snapshot()}
+    STATE["automation"][profile_id]["enabled"] = bool(enabled)
+    action = "시작" if enabled else "중지"
+    STATE["automation"][profile_id]["last_action"] = f"{action} 요청 {now_text()}"
+    append_audit("info" if enabled else "warn", f"{profile['title']} {action}", f"{profile['provider_label']} 라우트로 자동화 {action} 상태를 기록했습니다.")
+    return {"ok": True, "reason": f"{profile['title']} {action}", "snapshot": snapshot()}
 
 
 def set_risk_setting(name: str, value: object) -> dict[str, Any]:

@@ -40,6 +40,7 @@ import {
   runReconciliation,
   retryOrder,
   setFlag,
+  setAutomationProfile,
   setMode,
   setRetryPolicy,
   setRiskSetting,
@@ -50,6 +51,7 @@ import designTokens from "../../../packages/design/design_tokens.json";
 
 const navItems = [
   { id: "overview", label: "사전점검", icon: LayoutDashboard },
+  { id: "automation", label: "자동화", icon: Power },
   { id: "strategies", label: "전략", icon: DatabaseZap },
   { id: "gate", label: "실거래 게이트", icon: ListChecks },
   { id: "audit", label: "로그", icon: FileClock },
@@ -67,6 +69,11 @@ const pageProfiles = {
     title: "실거래 게이트",
     eyebrow: "승인/차단",
     summary: "실거래 모드, 리스크 한도, 주문 큐와 재시도 정책을 관리합니다.",
+  },
+  automation: {
+    title: "자동화",
+    eyebrow: "브로커별 실행",
+    summary: "주식/ETF는 한국투자증권, 코인은 Binance 또는 Upbit로 분리해 자동화를 시작합니다.",
   },
   brokers: {
     title: "API",
@@ -109,6 +116,7 @@ const fallbackSnapshot = {
   brokers: [],
   broker_diagnostics: [],
   broker_adapter_contract: [],
+  automation_profiles: [],
   strategies: [],
   orders: [],
   positions: [],
@@ -1194,6 +1202,7 @@ function App() {
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
           onDryRun={() => runAction(() => setFlag("dry_run", !snapshot.dry_run))}
           onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
+          onAutomation={(profileId, enabled, provider) => runAction(() => setAutomationProfile(profileId, enabled, provider))}
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
           onRetryPolicy={(name, value) => runAction(() => setRetryPolicy(name, value))}
@@ -1237,6 +1246,7 @@ function WorkspaceContent({
   onConfirm,
   onDryRun,
   onEntryBlock,
+  onAutomation,
   onTestIntent,
   onRiskSetting,
   onRetryPolicy,
@@ -1272,6 +1282,20 @@ function WorkspaceContent({
       {content}
     </PageView>
   );
+
+  if (selectedNav === "automation") {
+    return renderPage(
+      <section className="content-grid">
+        <div className="content-column">
+          <AutomationLauncherPanel profiles={snapshot.automation_profiles} strategies={snapshot.strategies} onAutomation={onAutomation} />
+        </div>
+        <div className="content-column">
+          <AutomationFlowPanel />
+          <StrategyPanel strategies={snapshot.strategies} />
+        </div>
+      </section>,
+    );
+  }
 
   if (selectedNav === "gate") {
     return renderPage(
@@ -1899,6 +1923,119 @@ function BrokerPanel({ brokers }) {
       </div>
     </section>
   );
+}
+
+function AutomationLauncherPanel({ profiles, strategies, onAutomation }) {
+  const rows = profiles?.length ? profiles : fallbackSnapshot.automation_profiles;
+  return (
+    <section className="panel automation-panel">
+      <PanelHeader title="브로커별 자동화" subtitle="실거래 자동화는 자산군과 브로커별로 분리해서 시작합니다." />
+      <div className="automation-list">
+        {rows.map((profile) => {
+          const routeStrategies = strategies.filter((strategy) => profile.id === "stock" ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy));
+          return (
+            <div className={`automation-card ${profile.enabled ? "running" : ""}`} key={profile.id}>
+              <div className="automation-card-head">
+                <div>
+                  <strong>{profile.title}</strong>
+                  <span>{profile.provider_label}</span>
+                </div>
+                <StatusPill tone={profile.enabled ? "success" : profile.ready ? "info" : "danger"}>
+                  {profile.enabled ? "실행 중" : profile.ready ? "대기" : "차단"}
+                </StatusPill>
+              </div>
+              <p>{profile.detail}</p>
+              <div className="automation-scope">
+                {profile.asset_scope.map((item) => (
+                  <span key={item}>{item}</span>
+                ))}
+              </div>
+              {profile.id === "crypto" && (
+                <div className="provider-toggle" aria-label="코인 거래소 선택">
+                  {["binance", "upbit"].map((provider) => (
+                    <button
+                      className={profile.provider === provider ? "active" : ""}
+                      type="button"
+                      key={provider}
+                      onClick={() => onAutomation(profile.id, profile.enabled, provider)}
+                    >
+                      {provider === "binance" ? "Binance" : "Upbit"}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="automation-metrics">
+                <div>
+                  <span>연결 브로커</span>
+                  <strong>{profile.broker_ids.join(", ")}</strong>
+                </div>
+                <div>
+                  <span>전략</span>
+                  <strong>{profile.strategy_count}개</strong>
+                </div>
+                <div>
+                  <span>LIVE 허용</span>
+                  <strong>{profile.live_strategy_count}개</strong>
+                </div>
+              </div>
+              <div className="adapter-preview">
+                <strong>API 요청 미리보기</strong>
+                <span>{profile.sample_request?.method} {profile.sample_request?.endpoint}</span>
+                <code>{profile.sample_request?.provider} · {profile.sample_request?.can_send ? "전송 가능" : "키/게이트 필요"}</code>
+              </div>
+              <div className="automation-strategies">
+                {routeStrategies.slice(0, 4).map((strategy) => (
+                  <span key={strategy.strategy_id}>{strategy.name} · {strategy.symbol}</span>
+                ))}
+                {!routeStrategies.length && <span>연결 가능한 전략 artifact가 없습니다.</span>}
+              </div>
+              <div className="automation-actions">
+                <button
+                  className={profile.enabled ? "secondary-button danger-active" : "primary-button"}
+                  type="button"
+                  onClick={() => onAutomation(profile.id, !profile.enabled, profile.provider)}
+                >
+                  <Power size={16} />
+                  {profile.enabled ? "자동화 중지" : `${profile.title} 시작`}
+                </button>
+                <span>{profile.last_action}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function AutomationFlowPanel() {
+  const steps = [
+    ["1", "Backtester 전략", "artifact/live_allowed 계약을 읽습니다."],
+    ["2", "신호 변환", "전략 신호를 표준 OrderIntent로 바꿉니다."],
+    ["3", "공통 게이트", "Kill Switch, 리스크, 대조, 체크리스트를 통과해야 합니다."],
+    ["4", "브로커 라우터", "KIS/Binance/Upbit 어댑터로만 주문 요청을 만듭니다."],
+  ];
+  return (
+    <section className="panel automation-flow-panel">
+      <PanelHeader title="자동거래 흐름" subtitle="단일 버튼이 모든 시장을 처리하지 않고, 브로커별 라우트가 분리됩니다." />
+      <div className="automation-flow">
+        {steps.map(([number, title, detail]) => (
+          <div className="automation-step" key={number}>
+            <span>{number}</span>
+            <div>
+              <strong>{title}</strong>
+              <p>{detail}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function isCryptoStrategy(strategy) {
+  const text = `${strategy.asset ?? ""} ${strategy.symbol ?? ""}`.toLowerCase();
+  return ["crypto", "coin", "btc", "eth", "usdt", "코인"].some((token) => text.includes(token));
 }
 
 function BrokerCapabilityPanel({ diagnostics }) {

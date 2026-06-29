@@ -845,7 +845,8 @@ button {
 }
 
 .wizard-list,
-.capability-list {
+.capability-list,
+.automation-list {
   display: grid;
   gap: 9px;
 }
@@ -896,6 +897,155 @@ button {
 
 .capability-broker-title svg {
   color: var(--icon-blue);
+}
+
+.automation-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.automation-card.running {
+  border-color: var(--success-border);
+  box-shadow: 0 0 0 1px var(--success-border);
+}
+
+.automation-card-head,
+.automation-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.automation-card-head strong,
+.automation-card-head span {
+  display: block;
+}
+
+.automation-card-head strong {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: var(--font-weight-strong);
+}
+
+.automation-card-head span,
+.automation-card p,
+.automation-actions > span,
+.adapter-preview span,
+.adapter-preview code,
+.automation-step p {
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+}
+
+.automation-card p,
+.automation-step p {
+  margin: 0;
+}
+
+.automation-scope,
+.automation-strategies {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.automation-scope span,
+.automation-strategies span,
+.adapter-preview code {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-bold);
+}
+
+.provider-toggle {
+  display: inline-flex;
+  width: fit-content;
+  padding: 3px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.provider-toggle button {
+  min-height: 30px;
+  padding: 0 12px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  font-weight: var(--font-weight-bold);
+  cursor: pointer;
+}
+
+.provider-toggle button.active {
+  color: #ffffff;
+  background: var(--primary);
+}
+
+.automation-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.automation-metrics div,
+.adapter-preview,
+.automation-step {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.automation-metrics span {
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-bold);
+}
+
+.automation-metrics strong,
+.adapter-preview strong,
+.automation-step strong {
+  color: var(--text);
+  font-weight: var(--font-weight-bold);
+}
+
+.adapter-preview {
+  align-items: start;
+}
+
+.automation-flow {
+  display: grid;
+  gap: 8px;
+}
+
+.automation-step {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+}
+
+.automation-step > span {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  color: #ffffff;
+  background: var(--primary);
+  border-radius: 50%;
+  font-weight: var(--font-weight-strong);
 }
 
 .wizard-steps,

@@ -5,6 +5,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+from .live_adapters import (
+    build_binance_spot_order_request,
+    build_kis_live_order_request,
+    build_upbit_order_request,
+    issue_kis_access_token,
+    send_prepared_request,
+)
 
 BrokerStatus = Literal["connected", "missing_credentials", "adapter_required", "disabled"]
 CheckStatus = Literal["pass", "warn", "fail"]
@@ -48,12 +55,14 @@ BROKER_SPECS = (
         "base_urls": ("https://openapi.koreainvestment.com:9443",),
         "docs": "KIS Open API 실전/모의투자 REST",
         "capabilities": (
-            ("auth_token", "접근 토큰 발급", False, "KIS OAuth token 발급/갱신 구현 필요"),
+            ("auth_token", "접근 토큰 발급", True, "KIS OAuth token 발급 요청 구현됨"),
             ("account_balance", "계좌 잔고 조회", False, "계좌 상품코드별 잔고 조회 API 연결 필요"),
             ("positions", "보유/체결 조회", False, "국내/해외 주식 포지션 대조 API 연결 필요"),
-            ("place_order", "현금 주문 전송", False, "서명 헤더와 TR ID 검증 후 구현"),
+            ("place_order", "현금 주문 전송", True, "국내/해외 주식 실계좌 주문 요청 생성 구현됨"),
             ("cancel_order", "주문 취소/정정", False, "원주문번호 기반 취소/정정 API 구현 필요"),
         ),
+        "automation_group": "stock",
+        "asset_scope": ("한국주식", "미국주식", "금/오일 ETF", "ETF"),
     },
     {
         "broker_id": "binance",
@@ -65,10 +74,28 @@ BROKER_SPECS = (
         "capabilities": (
             ("account_balance", "계좌 잔고 조회", False, "signed account endpoint 구현 필요"),
             ("positions", "보유 자산 조회", False, "spot asset balance 대조 구현 필요"),
-            ("place_order", "현물 주문 전송", False, "HMAC 서명 주문 전송 구현 필요"),
+            ("place_order", "현물 주문 전송", True, "POST /api/v3/order signed 요청 생성 구현됨"),
             ("cancel_order", "주문 취소", False, "orderId/clientOrderId 취소 구현 필요"),
             ("user_stream", "체결 스트림", False, "listenKey 발급과 WebSocket 수신 구현 필요"),
         ),
+        "automation_group": "crypto",
+        "asset_scope": ("코인 현물",),
+    },
+    {
+        "broker_id": "upbit",
+        "name": "Upbit API",
+        "role": "원화 마켓 코인 실거래 후보",
+        "required_env": ("UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY"),
+        "base_urls": ("https://api.upbit.com",),
+        "docs": "Upbit REST API Orders",
+        "capabilities": (
+            ("account_balance", "계좌 잔고 조회", False, "전체 계좌 조회 API 연결 필요"),
+            ("positions", "보유 자산 조회", False, "원화/코인 잔고 대조 구현 필요"),
+            ("place_order", "코인 주문 전송", True, "POST /v1/orders JWT 서명 요청 생성 구현됨"),
+            ("cancel_order", "주문 취소", False, "uuid 기반 주문 취소 API 구현 필요"),
+        ),
+        "automation_group": "crypto",
+        "asset_scope": ("KRW 코인",),
     },
 )
 
@@ -107,8 +134,8 @@ def broker_readiness() -> list[BrokerReadiness]:
             status = "adapter_required"
             detail = "환경 변수는 준비될 수 있지만 LIVE_TRADER_ENABLE_REAL_ORDERS=true와 실제 주문 어댑터 검증이 필요합니다."
         else:
-            status = "adapter_required"
-            detail = "실제 주문 서명/전송 어댑터 코드가 아직 안전 검증 전이므로 주문은 차단됩니다."
+            status = "connected"
+            detail = "주문 요청 생성 어댑터가 준비되었습니다. 계좌/포지션 대조와 운영 게이트를 통과해야 전송됩니다."
         rows.append(
             BrokerReadiness(
                 broker_id=str(spec["broker_id"]),
@@ -117,7 +144,7 @@ def broker_readiness() -> list[BrokerReadiness]:
                 status=status,
                 required_env=required,
                 missing_env=missing,
-                live_order_adapter_ready=False,
+                live_order_adapter_ready=not missing and adapter_enabled,
                 detail=detail,
             )
         )
@@ -166,8 +193,8 @@ def broker_diagnostics(broker_id: str | None = None) -> list[dict[str, Any]]:
             {
                 "key": "adapter_code",
                 "label": "주문 어댑터",
-                "status": "fail",
-                "detail": "실제 서명/전송 어댑터가 아직 안전 검증 전입니다.",
+                "status": "pass" if adapter_enabled else "fail",
+                "detail": "주문 요청 생성 어댑터가 활성화되어 있습니다." if adapter_enabled else "실제 주문 어댑터는 LIVE_TRADER_ENABLE_REAL_ORDERS=true일 때만 활성화됩니다.",
             },
             {
                 "key": "network_probe",
@@ -178,7 +205,7 @@ def broker_diagnostics(broker_id: str | None = None) -> list[dict[str, Any]]:
         ]
         fail_count = sum(1 for step in steps if step["status"] == "fail")
         warn_count = sum(1 for step in steps if step["status"] == "warn")
-        status: BrokerStatus = "missing_credentials" if missing else "adapter_required"
+        status: BrokerStatus = "missing_credentials" if missing else "connected" if adapter_enabled else "adapter_required"
         rows.append(
             {
                 "broker_id": spec["broker_id"],
@@ -188,6 +215,8 @@ def broker_diagnostics(broker_id: str | None = None) -> list[dict[str, Any]]:
                 "checked_at": now_text(),
                 "docs": spec["docs"],
                 "base_urls": list(spec["base_urls"]),
+                "automation_group": spec.get("automation_group", ""),
+                "asset_scope": list(spec.get("asset_scope", ())),
                 "env": env_rows,
                 "steps": steps,
                 "capabilities": capabilities,
@@ -205,7 +234,7 @@ def broker_next_actions(missing: list[str], adapter_enabled: bool) -> list[str]:
         actions.append(f"환경 변수 입력 필요: {', '.join(missing)}")
     if not adapter_enabled:
         actions.append("LIVE_TRADER_ENABLE_REAL_ORDERS=true 설정 필요")
-    actions.append("실제 REST/WebSocket 서명 어댑터 구현 및 별도 테스트 필요")
+    actions.append("공식 API 샌드박스/소액 주문으로 별도 테스트 필요")
     actions.append("소액 Dry Run/Shadow 검증 후 Small Live 승인 필요")
     return actions
 
@@ -215,7 +244,7 @@ def broker_adapter_contract() -> list[dict[str, str]]:
         {"method": "health_check", "purpose": "키/권한/시각 동기화 점검", "status": "interface_ready"},
         {"method": "get_account_snapshot", "purpose": "현금/잔고/평가금액 조회", "status": "interface_ready"},
         {"method": "list_positions", "purpose": "브로커 포지션 대조", "status": "interface_ready"},
-        {"method": "place_order", "purpose": "서명된 실주문 전송", "status": "blocked_stub"},
+        {"method": "place_order", "purpose": "서명된 실주문 요청 생성/전송", "status": "interface_ready"},
         {"method": "cancel_order", "purpose": "주문 취소/정정", "status": "blocked_stub"},
         {"method": "stream_executions", "purpose": "체결/계좌 이벤트 스트림", "status": "blocked_stub"},
     ]
@@ -226,10 +255,10 @@ class BrokerNotReadyError(RuntimeError):
 
 
 class LiveBrokerRouter:
-    """Real broker router boundary.
+    """Provider-specific live broker boundary.
 
-    This class deliberately refuses live orders until provider-specific signed
-    REST/WebSocket order adapters are implemented and audited.
+    The router can build signed official API requests, but order submission is
+    still gated by LIVE_TRADER_ENABLE_REAL_ORDERS and the state-layer risk checks.
     """
 
     def health_check(self, broker_id: str) -> dict[str, object]:
@@ -244,10 +273,17 @@ class LiveBrokerRouter:
         raise BrokerNotReadyError("Broker position adapters are not implemented yet.")
 
     def place_order(self, intent: dict[str, object]) -> dict[str, object]:
-        _ = intent
-        raise BrokerNotReadyError(
-            "Live broker adapters are not implemented. Add provider-specific KIS/Binance signed order code before enabling real orders."
-        )
+        if not real_orders_enabled():
+            raise BrokerNotReadyError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 아니므로 실주문 전송을 차단했습니다.")
+        broker_id = str(intent.get("broker_id") or intent.get("broker") or "").lower()
+        if broker_id == "kis":
+            token = issue_kis_access_token()
+            return send_prepared_request(build_kis_live_order_request(intent, access_token=token))
+        if broker_id == "binance":
+            return send_prepared_request(build_binance_spot_order_request(intent))
+        if broker_id == "upbit":
+            return send_prepared_request(build_upbit_order_request(intent))
+        raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
 
     def cancel_order(self, broker_id: str, broker_order_id: str) -> dict[str, object]:
         _ = (broker_id, broker_order_id)

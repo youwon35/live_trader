@@ -59,6 +59,15 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/flag":
             self.send_json(state.set_flag(str(payload.get("name", "")), bool(payload.get("value"))))
             return
+        if parsed.path == "/api/automation":
+            self.send_json(
+                state.set_automation_profile(
+                    str(payload.get("profile_id", "")),
+                    bool(payload.get("enabled")),
+                    str(payload.get("provider", "")) if payload.get("provider") is not None else None,
+                )
+            )
+            return
         if parsed.path == "/api/risk-setting":
             self.send_json(state.set_risk_setting(str(payload.get("name", "")), payload.get("value")))
             return
