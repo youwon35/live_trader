@@ -67,6 +67,60 @@ def can_live_use_artifact(artifact: dict[str, Any]) -> bool:
     return permissions.get("live_allowed") is True or artifact.get("live_allowed") is True
 
 
+def _verification_badge(status: str, label: str, detail: str) -> dict[str, str]:
+    return {"status": status, "label": label, "detail": detail}
+
+
+def _reason_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if value in (None, ""):
+        return []
+    return [value]
+
+
+def _backtester_verification_badge(
+    permissions: dict[str, Any],
+    final_test_status: str,
+) -> dict[str, str]:
+    fail_reasons = _reason_list(permissions.get("fail_reasons"))
+    if permissions.get("trader_export_allowed") is True:
+        return _verification_badge("pass", "Backtester 검증", "trader_export_allowed=true artifact입니다.")
+    if fail_reasons:
+        return _verification_badge("watch", "Backtester 미검증", "; ".join(str(reason) for reason in fail_reasons))
+    if final_test_status.lower() in {"pass", "passed", "ok", "success"}:
+        return _verification_badge("pass", "Backtester pass", f"final test 상태가 {final_test_status}입니다.")
+    if final_test_status.lower() in {"fail", "failed", "error", "blocked"}:
+        return _verification_badge("fail", "Backtester fail", f"final test 상태가 {final_test_status}입니다.")
+    return _verification_badge("unknown", "Backtester 정보 없음", "artifact에 Backtester 검증 정보가 없습니다.")
+
+
+def _paper_verification_badge(
+    artifact: dict[str, Any],
+    permissions: dict[str, Any],
+    lifecycle_status: str,
+) -> dict[str, str]:
+    normalized_status = lifecycle_status.lower()
+    paper_verified = (
+        permissions.get("paper_trader_verified") is True
+        or artifact.get("paper_trader_verified") is True
+        or normalized_status in {"paper", "paper-approved", "live-small", "live", "live-full", "production"}
+    )
+    if paper_verified:
+        return _verification_badge("pass", "Paper 검증", f"lifecycle={lifecycle_status or 'paper'}")
+    if normalized_status == "shadow":
+        return _verification_badge("watch", "Shadow 검증 중", "Paper Trader 승급 전 Shadow 검증 단계입니다.")
+    return _verification_badge("wait", "Paper 미검증", "Paper Trader 승인/성과 검증 정보가 아직 없습니다.")
+
+
+def _live_verification_badge(permissions: dict[str, Any]) -> dict[str, str]:
+    if permissions.get("live_allowed") is True:
+        return _verification_badge("pass", "Live 허용", "live_allowed=true artifact입니다.")
+    fail_reasons = _reason_list(permissions.get("fail_reasons"))
+    detail = "; ".join(str(reason) for reason in fail_reasons) if fail_reasons else "live_allowed 권한이 없습니다."
+    return _verification_badge("fail", "Live 차단", detail)
+
+
 def _appdata_strategy_artifact_dir() -> Path:
     appdata = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming"))
     return appdata / "trading_programs" / "strategies"
@@ -169,6 +223,19 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         permissions["live_allowed"] = artifact.get("live_allowed") is True
     if "trader_export_allowed" not in permissions and "trader_export_allowed" in artifact:
         permissions["trader_export_allowed"] = artifact.get("trader_export_allowed") is True
+    lifecycle_status = str(artifact.get("lifecycleStatus") or lifecycle.get("status") or artifact.get("status") or artifact.get("stage") or "draft")
+    final_test_status = str(artifact.get("finalTestStatus") or final_test.get("status") or artifact.get("test_status") or "")
+    normalized_permissions = {
+        "trader_export_allowed": permissions.get("trader_export_allowed") is True,
+        "live_allowed": permissions.get("live_allowed") is True,
+        "paper_trader_verified": permissions.get("paper_trader_verified") is True,
+        "fail_reasons": _reason_list(permissions.get("fail_reasons") or artifact.get("fail_reasons")),
+    }
+    verification = {
+        "backtester": _backtester_verification_badge(normalized_permissions, final_test_status),
+        "paper_trader": _paper_verification_badge(artifact, normalized_permissions, lifecycle_status),
+        "live": _live_verification_badge(normalized_permissions),
+    }
 
     return {
         "strategy_id": strategy_id,
@@ -182,14 +249,13 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "plugin_version": str(artifact.get("plugin_version") or artifact.get("pluginVersion") or strategy_contract.get("strategyVersion") or "-"),
         "strategy_contract_version": str(strategy_contract.get("contractVersion") or artifact.get("strategy_plugin_contract_version") or ""),
         "strategy_engine_version": str(artifact.get("strategy_engine_version") or artifact.get("strategyEngineVersion") or ""),
-        "lifecycle_status": str(artifact.get("lifecycleStatus") or lifecycle.get("status") or artifact.get("status") or artifact.get("stage") or "draft"),
-        "final_test_status": str(artifact.get("finalTestStatus") or final_test.get("status") or artifact.get("test_status") or ""),
+        "lifecycle_status": lifecycle_status,
+        "final_test_status": final_test_status,
         "score": artifact.get("score") or artifact.get("qualityScore") or "-",
-        "permissions": {
-            "trader_export_allowed": permissions.get("trader_export_allowed") is True,
-            "live_allowed": permissions.get("live_allowed") is True,
-            "fail_reasons": list(permissions.get("fail_reasons") or artifact.get("fail_reasons") or []),
-        },
+        "permissions": normalized_permissions,
+        "verification": verification,
+        "backtester_verified": verification["backtester"]["status"] == "pass",
+        "paper_trader_verified": verification["paper_trader"]["status"] == "pass",
         "contract_version": str(
             trader_contract.get("contract_version")
             or trader_contract.get("contractVersion")

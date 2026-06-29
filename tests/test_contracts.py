@@ -48,6 +48,32 @@ class StrategyContractTest(unittest.TestCase):
         self.assertEqual(artifact["lifecycle_status"], "paper")
         self.assertEqual(artifact["final_test_status"], "pass")
         self.assertTrue(can_live_use_artifact(artifact))
+        self.assertEqual(artifact["verification"]["backtester"]["status"], "pass")
+        self.assertEqual(artifact["verification"]["paper_trader"]["status"], "pass")
+        self.assertEqual(artifact["verification"]["live"]["status"], "pass")
+
+    def test_unverified_backtester_artifact_stays_visible_with_verification_badges(self) -> None:
+        artifact = normalize_strategy_artifact(
+            {
+                "id": "BT-LIVE-WATCH-001",
+                "name": "Watch Only Candidate",
+                "dataset": {"symbol": "005930.KS", "assetClass": "KR-STOCK", "interval": "1d"},
+                "plugin": "threshold_momentum",
+                "lifecycle": {"status": "draft"},
+                "permissions": {
+                    "trader_export_allowed": False,
+                    "live_allowed": False,
+                    "fail_reasons": ["최종 검증 미통과"],
+                },
+            }
+        )
+
+        self.assertEqual(artifact["strategy_id"], "BT-LIVE-WATCH-001")
+        self.assertFalse(can_live_use_artifact(artifact))
+        self.assertEqual(artifact["verification"]["backtester"]["status"], "watch")
+        self.assertEqual(artifact["verification"]["paper_trader"]["status"], "wait")
+        self.assertEqual(artifact["verification"]["live"]["status"], "fail")
+        self.assertIn("최종 검증 미통과", artifact["verification"]["backtester"]["detail"])
 
     def test_strategy_paths_can_be_configured_from_shared_environment(self) -> None:
         previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")

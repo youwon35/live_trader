@@ -25,7 +25,6 @@ import {
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
-  Siren,
   Sun,
   TerminalSquare,
   Unlock,
@@ -1284,7 +1283,8 @@ function WorkspaceContent({
           <AutomationLauncherPanel profiles={snapshot.automation_profiles} strategies={snapshot.strategies} onAutomation={onAutomation} />
         </div>
         <div className="content-column">
-          <AutomationFlowPanel />
+          <OrderQueueSummaryPanel summary={snapshot.order_queue} />
+          <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
         </div>
       </section>,
     );
@@ -1321,15 +1321,9 @@ function WorkspaceContent({
 
   if (selectedNav === "audit") {
     return renderPage(
-      <section className="content-grid">
-        <div className="content-column">
-          <AuditPanel audit={snapshot.audit} />
-          <AuditExportPanel onExport={onAuditExport} exportResult={exportResult} />
-        </div>
-        <div className="content-column">
-          <OperationsReportPanel report={snapshot.operation_report} />
-          <RiskPanel checks={snapshot.risk_checks} />
-        </div>
+      <section className="audit-page-layout">
+        <AuditExportPanel onExport={onAuditExport} exportResult={exportResult} />
+        <AuditPanel audit={snapshot.audit} />
       </section>,
     );
   }
@@ -1363,13 +1357,10 @@ function LivePreparationPanel({
   onTestIntent,
   onRiskSetting,
   onRetryPolicy,
-  onRetryOrder,
-  onCancelOrder,
 }) {
   const [assetTab, setAssetTab] = useState("stock");
   const isStock = assetTab === "stock";
   const filteredStrategies = (snapshot.strategies ?? []).filter((strategy) => (isStock ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy)));
-  const activeProfile = (snapshot.automation_profiles ?? []).find((profile) => profile.id === assetTab);
   const tabItems = [
     { id: "stock", label: "주식/ETF", detail: "한국투자증권 KIS", count: (snapshot.strategies ?? []).filter((strategy) => !isCryptoStrategy(strategy)).length },
     { id: "crypto", label: "코인", detail: "Binance / Upbit", count: (snapshot.strategies ?? []).filter(isCryptoStrategy).length },
@@ -1392,20 +1383,15 @@ function LivePreparationPanel({
       </div>
       <section className="content-grid">
         <div className="content-column">
-          <PreparationSummaryPanel profile={activeProfile} />
           <StrategyPanel strategies={filteredStrategies} />
           <OperationalSafeguardsPanel
-            operatorConfirmed={snapshot.operator_confirmed}
             dryRun={snapshot.dry_run}
             newEntriesBlocked={snapshot.new_entries_blocked}
             killSwitch={snapshot.kill_switch}
-            onConfirm={onConfirm}
             onDryRun={onDryRun}
             onEntryBlock={onEntryBlock}
             onTestIntent={onTestIntent}
           />
-          <OrderQueueSummaryPanel summary={snapshot.order_queue} />
-          <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
         </div>
         <div className="content-column">
           <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
@@ -1416,43 +1402,11 @@ function LivePreparationPanel({
   );
 }
 
-function PreparationSummaryPanel({ profile }) {
-  if (!profile) return null;
-  return (
-    <section className="panel preparation-summary-panel">
-      <PanelHeader title={`${profile.title} 준비 상태`} subtitle={profile.detail} />
-      <div className="automation-metrics">
-        <div>
-          <span>현재 모드</span>
-          <strong>{profile.mode}</strong>
-        </div>
-        <div>
-          <span>브로커</span>
-          <strong>{profile.provider_label}</strong>
-        </div>
-        <div>
-          <span>LIVE 허용 전략</span>
-          <strong>{profile.live_strategy_count}개</strong>
-        </div>
-      </div>
-      <div className="automation-scope">
-        {profile.asset_scope.map((item) => (
-          <span key={item}>{item}</span>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function OperationalSafeguardsPanel({ operatorConfirmed, dryRun, newEntriesBlocked, killSwitch, onConfirm, onDryRun, onEntryBlock, onTestIntent }) {
+function OperationalSafeguardsPanel({ dryRun, newEntriesBlocked, killSwitch, onDryRun, onEntryBlock, onTestIntent }) {
   return (
     <section className="panel operational-safeguards-panel">
       <PanelHeader title="운영 차단 설정" subtitle="자동화 모드 전환 전에 공통 보호 장치를 확인합니다." />
       <div className="operator-actions">
-        <button className={`secondary-button ${operatorConfirmed ? "active" : ""}`} type="button" onClick={onConfirm}>
-          <BadgeCheck size={16} />
-          운용자 확인
-        </button>
         <button className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`} type="button" onClick={onDryRun}>
           <ShieldCheck size={16} />
           Dry Run
@@ -1792,6 +1746,15 @@ function statusToneFromLabel(value) {
   return null;
 }
 
+function verificationTone(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (["pass", "passed", "ready", "valid", "ok"].includes(normalized)) return "success";
+  if (["fail", "failed", "rejected", "blocked"].includes(normalized)) return "danger";
+  if (["watch", "warn", "warning", "unknown"].includes(normalized)) return "warning";
+  if (["wait", "empty", "missing"].includes(normalized)) return "neutral";
+  return "info";
+}
+
 function statusTone(status) {
   if (
     status === "pass" ||
@@ -2018,122 +1981,122 @@ function BrokerPanel({ brokers }) {
 
 function AutomationLauncherPanel({ profiles, strategies, onAutomation }) {
   const rows = profiles?.length ? profiles : fallbackSnapshot.automation_profiles;
+  const [assetTab, setAssetTab] = useState(rows[0]?.id ?? "stock");
+  const activeProfile = rows.find((profile) => profile.id === assetTab) ?? rows[0];
   const modes = [
     { id: "MONITOR", label: "MONITOR", icon: Power },
     { id: "SMALL_LIVE", label: "SMALL LIVE", icon: Play },
     { id: "FULL_LIVE", label: "FULL LIVE", icon: LockKeyhole },
   ];
+  const tabs = rows.map((profile) => ({
+    id: profile.id,
+    label: profile.id === "stock" ? "주식/ETF" : "코인",
+    detail: `${profile.provider_label} · 전략 ${profile.strategy_count}개`,
+  }));
+
+  if (!activeProfile) {
+    return (
+      <section className="panel automation-panel">
+        <PanelHeader title="브로커별 자동화" subtitle="실거래 자동화는 자산군과 브로커별로 분리해서 시작합니다." />
+        <EmptyRow text="사용 가능한 자동화 프로필이 없습니다." />
+      </section>
+    );
+  }
+
+  const routeStrategies = strategies.filter((strategy) => (activeProfile.id === "stock" ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy)));
+
   return (
     <section className="panel automation-panel">
       <PanelHeader title="브로커별 자동화" subtitle="실거래 자동화는 자산군과 브로커별로 분리해서 시작합니다." />
-      <div className="automation-list">
-        {rows.map((profile) => {
-          const routeStrategies = strategies.filter((strategy) => profile.id === "stock" ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy));
-          return (
-            <div className={`automation-card ${profile.enabled ? "running" : ""}`} key={profile.id}>
-              <div className="automation-card-head">
-                <div>
-                  <strong>{profile.title}</strong>
-                  <span>{profile.provider_label}</span>
-                </div>
-                <StatusPill tone={profile.enabled ? "success" : profile.ready ? "info" : "danger"}>
-                  {profile.enabled ? "실행 중" : profile.ready ? "대기" : "차단"}
-                </StatusPill>
-              </div>
-              <p>{profile.detail}</p>
-              <div className="automation-scope">
-                {profile.asset_scope.map((item) => (
-                  <span key={item}>{item}</span>
-                ))}
-              </div>
-              {profile.id === "crypto" && (
-                <div className="provider-toggle" aria-label="코인 거래소 선택">
-                  {["binance", "upbit"].map((provider) => (
-                    <button
-                      className={profile.provider === provider ? "active" : ""}
-                      type="button"
-                      key={provider}
-                      onClick={() => onAutomation(profile.id, profile.enabled, provider, profile.mode)}
-                    >
-                      {provider === "binance" ? "Binance" : "Upbit"}
-                    </button>
-                  ))}
-                </div>
-              )}
-              <div className="automation-mode-grid">
-                {modes.map((mode) => {
-                  const Icon = mode.icon;
-                  const active = profile.mode === mode.id;
-                  return (
-                    <button
-                      className={`mode-button ${active ? "active" : ""}`}
-                      type="button"
-                      key={mode.id}
-                      onClick={() => onAutomation(profile.id, mode.id !== "MONITOR", profile.provider, mode.id)}
-                    >
-                      <Icon size={16} />
-                      <span>{mode.label}</span>
-                      {mode.id !== "MONITOR" && <LockKeyhole size={13} />}
-                    </button>
-                  );
-                })}
-              </div>
-              <div className="automation-metrics">
-                <div>
-                  <span>연결 브로커</span>
-                  <strong>{profile.broker_ids.join(", ")}</strong>
-                </div>
-                <div>
-                  <span>전략</span>
-                  <strong>{profile.strategy_count}개</strong>
-                </div>
-                <div>
-                  <span>LIVE 허용</span>
-                  <strong>{profile.live_strategy_count}개</strong>
-                </div>
-              </div>
-              <div className="adapter-preview">
-                <strong>API 요청 미리보기</strong>
-                <span>{profile.sample_request?.method} {profile.sample_request?.endpoint}</span>
-                <code>{profile.sample_request?.provider} · {profile.sample_request?.can_send ? "전송 가능" : "키/게이트 필요"}</code>
-              </div>
-              <div className="automation-strategies">
-                {routeStrategies.slice(0, 4).map((strategy) => (
-                  <span key={strategy.strategy_id}>{strategy.name} · {strategy.symbol}</span>
-                ))}
-                {!routeStrategies.length && <span>연결 가능한 전략 artifact가 없습니다.</span>}
-              </div>
-              <div className="automation-actions">
-                <span>{profile.last_action}</span>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function AutomationFlowPanel() {
-  const steps = [
-    ["1", "Backtester 전략", "artifact/live_allowed 계약을 읽습니다."],
-    ["2", "신호 변환", "전략 신호를 표준 OrderIntent로 바꿉니다."],
-    ["3", "공통 게이트", "Kill Switch, 리스크, 대조, 체크리스트를 통과해야 합니다."],
-    ["4", "브로커 라우터", "KIS/Binance/Upbit 어댑터로만 주문 요청을 만듭니다."],
-  ];
-  return (
-    <section className="panel automation-flow-panel">
-      <PanelHeader title="자동거래 흐름" subtitle="단일 버튼이 모든 시장을 처리하지 않고, 브로커별 라우트가 분리됩니다." />
-      <div className="automation-flow">
-        {steps.map(([number, title, detail]) => (
-          <div className="automation-step" key={number}>
-            <span>{number}</span>
-            <div>
-              <strong>{title}</strong>
-              <p>{detail}</p>
-            </div>
-          </div>
+      <div className="internal-tabs automation-profile-tabs" role="tablist" aria-label="자동화 자산군">
+        {tabs.map((tab) => (
+          <button
+            className={assetTab === tab.id ? "active" : ""}
+            type="button"
+            key={tab.id}
+            onClick={() => setAssetTab(tab.id)}
+          >
+            <strong>{tab.label}</strong>
+            <span>{tab.detail}</span>
+          </button>
         ))}
+      </div>
+      <div className={`automation-card ${activeProfile.enabled ? "running" : ""}`}>
+        <div className="automation-card-head">
+          <div>
+            <strong>{activeProfile.title}</strong>
+            <span>{activeProfile.provider_label}</span>
+          </div>
+          <StatusPill tone={activeProfile.enabled ? "success" : activeProfile.ready ? "info" : "danger"}>
+            {activeProfile.enabled ? "실행 중" : activeProfile.ready ? "대기" : "차단"}
+          </StatusPill>
+        </div>
+        <p>{activeProfile.detail}</p>
+        <div className="automation-scope">
+          {activeProfile.asset_scope.map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
+        {activeProfile.id === "crypto" && (
+          <div className="provider-toggle" aria-label="코인 거래소 선택">
+            {["binance", "upbit"].map((provider) => (
+              <button
+                className={activeProfile.provider === provider ? "active" : ""}
+                type="button"
+                key={provider}
+                onClick={() => onAutomation(activeProfile.id, activeProfile.enabled, provider, activeProfile.mode)}
+              >
+                {provider === "binance" ? "Binance" : "Upbit"}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="automation-mode-grid">
+          {modes.map((mode) => {
+            const Icon = mode.icon;
+            const active = activeProfile.mode === mode.id;
+            return (
+              <button
+                className={`mode-button ${active ? "active" : ""}`}
+                type="button"
+                key={mode.id}
+                onClick={() => onAutomation(activeProfile.id, mode.id !== "MONITOR", activeProfile.provider, mode.id)}
+              >
+                <Icon size={16} />
+                <span>{mode.label}</span>
+                {mode.id !== "MONITOR" && <LockKeyhole size={13} />}
+              </button>
+            );
+          })}
+        </div>
+        <div className="automation-metrics">
+          <div>
+            <span>연결 브로커</span>
+            <strong>{activeProfile.broker_ids.join(", ")}</strong>
+          </div>
+          <div>
+            <span>전략</span>
+            <strong>{activeProfile.strategy_count}개</strong>
+          </div>
+          <div>
+            <span>LIVE 허용</span>
+            <strong>{activeProfile.live_strategy_count}개</strong>
+          </div>
+        </div>
+        <div className="adapter-preview">
+          <strong>API 요청 미리보기</strong>
+          <span>{activeProfile.sample_request?.method} {activeProfile.sample_request?.endpoint}</span>
+          <code>{activeProfile.sample_request?.provider} · {activeProfile.sample_request?.can_send ? "전송 가능" : "키/게이트 필요"}</code>
+        </div>
+        <div className="automation-strategies">
+          {routeStrategies.slice(0, 4).map((strategy) => (
+            <span key={strategy.strategy_id}>{strategy.name} · {strategy.symbol}</span>
+          ))}
+          {!routeStrategies.length && <span>연결 가능한 전략 artifact가 없습니다.</span>}
+        </div>
+        <div className="automation-actions">
+          <span>{activeProfile.last_action}</span>
+        </div>
       </div>
     </section>
   );
@@ -2366,25 +2329,20 @@ function BrokerRequirementsPanel({ brokers }) {
 
 function AuditExportPanel({ onExport, exportResult }) {
   return (
-    <section className="panel">
-      <PanelHeader title="로그 내보내기" subtitle="주문 차단, 모드 변경, 설정 변경을 CSV/HTML로 저장합니다." />
-      <div className="compact-list">
-        <div className="compact-row">
-          <strong>CSV</strong>
-          <span>운영 이벤트 원장</span>
-          <button className="mini-button" type="button" onClick={() => onExport("csv")}>
-            <Download size={14} />
-            저장
-          </button>
-        </div>
-        <div className="compact-row">
-          <strong>HTML</strong>
-          <span>인쇄용 운용 리포트</span>
-          <button className="mini-button" type="button" onClick={() => onExport("html")}>
-            <Download size={14} />
-            저장
-          </button>
-        </div>
+    <section className="mini-export-panel" aria-label="로그 내보내기">
+      <div>
+        <strong>내보내기</strong>
+        <span>운영 이벤트 원장 저장</span>
+      </div>
+      <div className="export-actions">
+        <button className="mini-button" type="button" onClick={() => onExport("csv")}>
+          <Download size={14} />
+          CSV
+        </button>
+        <button className="mini-button" type="button" onClick={() => onExport("html")}>
+          <Download size={14} />
+          HTML
+        </button>
       </div>
       {exportResult?.ok !== false && exportResult?.filename && (
         <div className="export-result">
@@ -2541,19 +2499,34 @@ function StrategyPanel({ strategies }) {
           <span>심볼</span>
           <span>상태</span>
           <span>Score</span>
+          <span>검증</span>
           <span>권한</span>
           <span>차단 사유</span>
         </div>
-        {strategies.map((strategy) => (
-          <div className="table-row" key={strategy.strategy_id}>
-            <strong>{strategy.name}</strong>
-            <span>{strategy.symbol}</span>
-            <span>{strategy.lifecycle_status}</span>
-            <span>{strategy.score}</span>
-            <StatusPill tone={strategy.live_allowed ? "success" : "danger"}>{strategy.permission_label}</StatusPill>
-            <em>{strategy.block_reason}</em>
-          </div>
-        ))}
+        {strategies.map((strategy) => {
+          const backtester = strategy.verification?.backtester || {
+            label: strategy.backtester_label || "Backtester 정보 없음",
+            status: strategy.backtester_verified ? "pass" : "unknown",
+          };
+          const paper = strategy.verification?.paper_trader || {
+            label: strategy.paper_trader_label || "Paper 미검증",
+            status: strategy.paper_trader_verified ? "pass" : "wait",
+          };
+          return (
+            <div className="table-row" key={strategy.strategy_id}>
+              <strong>{strategy.name}</strong>
+              <span>{strategy.symbol}</span>
+              <span>{strategy.lifecycle_status}</span>
+              <span>{strategy.score}</span>
+              <span className="strategy-verification-pills">
+                <StatusPill tone={verificationTone(backtester.status)}>{backtester.label}</StatusPill>
+                <StatusPill tone={verificationTone(paper.status)}>{paper.label}</StatusPill>
+              </span>
+              <StatusPill tone={strategy.live_allowed ? "success" : "danger"}>{strategy.permission_label}</StatusPill>
+              <em>{strategy.block_reason}</em>
+            </div>
+          );
+        })}
       </div>
     </section>
   );
@@ -2562,7 +2535,7 @@ function StrategyPanel({ strategies }) {
 function OrderPanel({ orders, onRetryOrder, onCancelOrder }) {
   return (
     <section className="panel order-panel">
-      <PanelHeader title="Order Blotter" subtitle="차단, Dry Run, 재시도, 취소 이벤트를 감사 추적합니다." />
+      <PanelHeader title="주문 기록" subtitle="차단, Dry Run, 재시도, 취소 이벤트를 감사 추적합니다." />
       <div className="order-ledger-list">
         {orders.length === 0 ? (
           <EmptyRow text="아직 주문 이벤트가 없습니다. 테스트 주문 게이트를 누르면 차단 이벤트가 생성됩니다." />
@@ -2638,21 +2611,93 @@ function PositionPanel({ positions }) {
 }
 
 function AuditPanel({ audit }) {
+  const [query, setQuery] = useState("");
+  const [channel, setChannel] = useState("all");
+  const [level, setLevel] = useState("all");
+  const [sort, setSort] = useState("latest");
+  const rows = audit.map((item, index) => {
+    const logChannel = inferLogChannel(item);
+    const normalizedLevel = item.level === "danger" ? "ERROR" : item.level === "warn" ? "WARN" : "INFO";
+    return {
+      id: `${item.time}-${index}`,
+      time: item.time,
+      level: normalizedLevel,
+      channel: logChannel,
+      module: item.event,
+      message: item.detail,
+      raw: `${item.time} ${normalizedLevel} ${logChannel} ${item.event} ${item.detail}`.toLowerCase(),
+    };
+  });
+  const visibleRows = rows
+    .filter((row) => channel === "all" || row.channel === channel)
+    .filter((row) => level === "all" || row.level === level)
+    .filter((row) => !query.trim() || row.raw.includes(query.trim().toLowerCase()))
+    .sort((a, b) => (sort === "latest" ? rows.indexOf(a) - rows.indexOf(b) : rows.indexOf(b) - rows.indexOf(a)));
+  const channels = ["all", ...Array.from(new Set(rows.map((row) => row.channel)))];
+
   return (
     <section className="panel audit-panel">
-      <PanelHeader title="감사 스트림" subtitle="모드 전환, 주문 차단, 설정 변경을 시간순으로 추적합니다." />
-      <div className="audit-list">
-        {audit.map((item, index) => (
-          <div className={`audit-row ${item.level}`} key={`${item.time}-${index}`}>
-            <Siren size={15} />
-            <span>{item.time}</span>
-            <strong>{item.event}</strong>
-            <em>{item.detail}</em>
-          </div>
-        ))}
+      <PanelHeader title="실행 로그" subtitle="시간, 채널, 모듈, 메시지를 기준으로 실행 이력을 확인합니다." />
+      <div className="execution-log-toolbar">
+        <input
+          type="search"
+          value={query}
+          placeholder="시간, 채널, 모듈, 메시지 검색"
+          onChange={(event) => setQuery(event.currentTarget.value)}
+        />
+        <label>
+          <span>채널</span>
+          <select value={channel} onChange={(event) => setChannel(event.currentTarget.value)}>
+            {channels.map((item) => (
+              <option value={item} key={item}>
+                {item === "all" ? "전체" : item}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>레벨</span>
+          <select value={level} onChange={(event) => setLevel(event.currentTarget.value)}>
+            <option value="all">전체</option>
+            <option value="INFO">INFO</option>
+            <option value="WARN">WARN</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+        </label>
+        <label>
+          <span>정렬</span>
+          <select value={sort} onChange={(event) => setSort(event.currentTarget.value)}>
+            <option value="latest">최신순</option>
+            <option value="oldest">오래된순</option>
+          </select>
+        </label>
+      </div>
+      <div className="execution-log-list">
+        {visibleRows.length ? (
+          visibleRows.map((row) => (
+            <div className={`execution-log-row ${row.level.toLowerCase()}`} key={row.id}>
+              <span className="log-time">{row.time}</span>
+              <strong className="log-level">{row.level}</strong>
+              <span className="log-channel">{row.channel}</span>
+              <span className="log-module">[{row.module}]</span>
+              <span className="log-message">{row.message}</span>
+            </div>
+          ))
+        ) : (
+          <EmptyRow text="검색 조건에 맞는 로그가 없습니다." />
+        )}
       </div>
     </section>
   );
+}
+
+function inferLogChannel(item) {
+  const text = `${item.event ?? ""} ${item.detail ?? ""}`.toLowerCase();
+  if (text.includes("주문") || text.includes("order")) return "ORDER";
+  if (text.includes("api") || text.includes("broker") || text.includes("kis") || text.includes("binance")) return "API";
+  if (text.includes("전략") || text.includes("contract") || text.includes("artifact")) return "STRATEGY";
+  if (text.includes("risk") || text.includes("리스크") || item.level === "danger") return "RISK";
+  return "SYSTEM";
 }
 
 function StatusRow({ label, status, detail }) {

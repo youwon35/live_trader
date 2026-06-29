@@ -279,12 +279,19 @@ def strategy_rows() -> list[dict[str, Any]]:
     for artifact in artifacts:
         live_allowed = can_live_use_artifact(artifact)
         fail_reasons = artifact.get("permissions", {}).get("fail_reasons", [])
+        verification = artifact.get("verification") if isinstance(artifact.get("verification"), dict) else {}
+        backtester_verification = verification.get("backtester") if isinstance(verification.get("backtester"), dict) else {}
+        paper_verification = verification.get("paper_trader") if isinstance(verification.get("paper_trader"), dict) else {}
         rows.append(
             {
                 **artifact,
                 "live_allowed": live_allowed,
                 "permission_label": "LIVE OK" if live_allowed else "LIVE BLOCKED",
                 "block_reason": "; ".join(fail_reasons) if fail_reasons else ("실거래 허용" if live_allowed else "live_allowed 권한이 없습니다."),
+                "backtester_verified": backtester_verification.get("status") == "pass",
+                "paper_trader_verified": paper_verification.get("status") == "pass",
+                "backtester_label": str(backtester_verification.get("label", "Backtester 정보 없음")),
+                "paper_trader_label": str(paper_verification.get("label", "Paper 미검증")),
             }
         )
     return rows
