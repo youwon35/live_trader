@@ -51,8 +51,7 @@ import designTokens from "../../../packages/design/design_tokens.json";
 
 const navItems = [
   { id: "overview", label: "사전점검", icon: LayoutDashboard },
-  { id: "strategies", label: "전략", icon: DatabaseZap },
-  { id: "gate", label: "실거래 게이트", icon: ListChecks },
+  { id: "gate", label: "실거래 준비", icon: ListChecks },
   { id: "automation", label: "자동화", icon: Power },
   { id: "audit", label: "로그", icon: FileClock },
   { id: "brokers", label: "API", icon: Network },
@@ -66,9 +65,9 @@ const pageProfiles = {
     summary: "실거래 전 API, 리스크, 체크리스트, 대조 상태를 한 번에 점검합니다.",
   },
   gate: {
-    title: "실거래 게이트",
-    eyebrow: "승인/차단",
-    summary: "실거래 모드, 리스크 한도, 주문 큐와 재시도 정책을 관리합니다.",
+    title: "실거래 준비",
+    eyebrow: "자산군별 준비",
+    summary: "주식/ETF와 코인의 전략, 리스크 한도, 운영 차단 설정을 분리해서 준비합니다.",
   },
   automation: {
     title: "자동화",
@@ -79,11 +78,6 @@ const pageProfiles = {
     title: "API",
     eyebrow: "브로커/API 관리",
     summary: "KIS/Binance 연결, 환경 변수, 주문 어댑터, 인터페이스 계약을 한곳에서 관리합니다.",
-  },
-  strategies: {
-    title: "전략",
-    eyebrow: "전략 산출물",
-    summary: "Backtester/Paper 승인 전략과 live_allowed 권한을 검토합니다.",
   },
   audit: {
     title: "로그",
@@ -410,7 +404,7 @@ function buildSearchResults(snapshot, queryValue) {
       label: `${strategy.name} · ${strategy.symbol}`,
       detail: strategy.block_reason || strategy.lifecycle_status,
       meta: [strategy.strategy_id, strategy.permission_label, strategy.lifecycle_status].join(" "),
-      targetNav: "strategies",
+      targetNav: "gate",
       tone: strategy.live_allowed ? "success" : "danger",
     });
   });
@@ -1118,8 +1112,8 @@ function App() {
           })}
         </nav>
         <div className="sidebar-footer">
-          <span>운용 모드</span>
-          <StatusPill tone={snapshot.mode === "MONITOR" ? "info" : "danger"}>{snapshot.mode}</StatusPill>
+          <span>전체 차단</span>
+          <StatusPill tone={snapshot.kill_switch ? "danger" : "success"}>{snapshot.kill_switch ? "ON" : "OFF"}</StatusPill>
         </div>
       </aside>
 
@@ -1202,7 +1196,7 @@ function App() {
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
           onDryRun={() => runAction(() => setFlag("dry_run", !snapshot.dry_run))}
           onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
-          onAutomation={(profileId, enabled, provider) => runAction(() => setAutomationProfile(profileId, enabled, provider))}
+          onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
           onRetryPolicy={(name, value) => runAction(() => setRetryPolicy(name, value))}
@@ -1291,7 +1285,6 @@ function WorkspaceContent({
         </div>
         <div className="content-column">
           <AutomationFlowPanel />
-          <StrategyPanel strategies={snapshot.strategies} />
         </div>
       </section>,
     );
@@ -1299,17 +1292,17 @@ function WorkspaceContent({
 
   if (selectedNav === "gate") {
     return renderPage(
-      <section className="content-grid">
-        <div className="content-column">
-          {modeConsole}
-          <OrderQueueSummaryPanel summary={snapshot.order_queue} />
-          <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
-        </div>
-        <div className="content-column">
-          <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
-          <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
-        </div>
-      </section>,
+      <LivePreparationPanel
+        snapshot={snapshot}
+        onConfirm={onConfirm}
+        onDryRun={onDryRun}
+        onEntryBlock={onEntryBlock}
+        onTestIntent={onTestIntent}
+        onRiskSetting={onRiskSetting}
+        onRetryPolicy={onRetryPolicy}
+        onRetryOrder={onRetryOrder}
+        onCancelOrder={onCancelOrder}
+      />,
     );
   }
 
@@ -1321,16 +1314,6 @@ function WorkspaceContent({
         </div>
         <div className="content-column">
           <BrokerCapabilityPanel diagnostics={snapshot.broker_diagnostics} />
-        </div>
-      </section>,
-    );
-  }
-
-  if (selectedNav === "strategies") {
-    return renderPage(
-      <section className="content-grid">
-        <div className="content-column">
-          <StrategyPanel strategies={snapshot.strategies} />
         </div>
       </section>,
     );
@@ -1369,6 +1352,122 @@ function WorkspaceContent({
 
   return renderPage(
     <PreTradeDoctorPanel snapshot={snapshot} onNavigate={onNavigate} onReconcile={onReconcile} onPreflight={onPreflight} />,
+  );
+}
+
+function LivePreparationPanel({
+  snapshot,
+  onConfirm,
+  onDryRun,
+  onEntryBlock,
+  onTestIntent,
+  onRiskSetting,
+  onRetryPolicy,
+  onRetryOrder,
+  onCancelOrder,
+}) {
+  const [assetTab, setAssetTab] = useState("stock");
+  const isStock = assetTab === "stock";
+  const filteredStrategies = (snapshot.strategies ?? []).filter((strategy) => (isStock ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy)));
+  const activeProfile = (snapshot.automation_profiles ?? []).find((profile) => profile.id === assetTab);
+  const tabItems = [
+    { id: "stock", label: "주식/ETF", detail: "한국투자증권 KIS", count: (snapshot.strategies ?? []).filter((strategy) => !isCryptoStrategy(strategy)).length },
+    { id: "crypto", label: "코인", detail: "Binance / Upbit", count: (snapshot.strategies ?? []).filter(isCryptoStrategy).length },
+  ];
+
+  return (
+    <section className="live-prep-shell">
+      <div className="internal-tabs prep-tabs" role="tablist" aria-label="실거래 준비 자산군">
+        {tabItems.map((item) => (
+          <button
+            className={assetTab === item.id ? "active" : ""}
+            type="button"
+            key={item.id}
+            onClick={() => setAssetTab(item.id)}
+          >
+            <strong>{item.label}</strong>
+            <span>{item.detail} · 전략 {item.count}개</span>
+          </button>
+        ))}
+      </div>
+      <section className="content-grid">
+        <div className="content-column">
+          <PreparationSummaryPanel profile={activeProfile} />
+          <StrategyPanel strategies={filteredStrategies} />
+          <OperationalSafeguardsPanel
+            operatorConfirmed={snapshot.operator_confirmed}
+            dryRun={snapshot.dry_run}
+            newEntriesBlocked={snapshot.new_entries_blocked}
+            killSwitch={snapshot.kill_switch}
+            onConfirm={onConfirm}
+            onDryRun={onDryRun}
+            onEntryBlock={onEntryBlock}
+            onTestIntent={onTestIntent}
+          />
+          <OrderQueueSummaryPanel summary={snapshot.order_queue} />
+          <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
+        </div>
+        <div className="content-column">
+          <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
+          <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
+        </div>
+      </section>
+    </section>
+  );
+}
+
+function PreparationSummaryPanel({ profile }) {
+  if (!profile) return null;
+  return (
+    <section className="panel preparation-summary-panel">
+      <PanelHeader title={`${profile.title} 준비 상태`} subtitle={profile.detail} />
+      <div className="automation-metrics">
+        <div>
+          <span>현재 모드</span>
+          <strong>{profile.mode}</strong>
+        </div>
+        <div>
+          <span>브로커</span>
+          <strong>{profile.provider_label}</strong>
+        </div>
+        <div>
+          <span>LIVE 허용 전략</span>
+          <strong>{profile.live_strategy_count}개</strong>
+        </div>
+      </div>
+      <div className="automation-scope">
+        {profile.asset_scope.map((item) => (
+          <span key={item}>{item}</span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function OperationalSafeguardsPanel({ operatorConfirmed, dryRun, newEntriesBlocked, killSwitch, onConfirm, onDryRun, onEntryBlock, onTestIntent }) {
+  return (
+    <section className="panel operational-safeguards-panel">
+      <PanelHeader title="운영 차단 설정" subtitle="자동화 모드 전환 전에 공통 보호 장치를 확인합니다." />
+      <div className="operator-actions">
+        <button className={`secondary-button ${operatorConfirmed ? "active" : ""}`} type="button" onClick={onConfirm}>
+          <BadgeCheck size={16} />
+          운용자 확인
+        </button>
+        <button className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`} type="button" onClick={onDryRun}>
+          <ShieldCheck size={16} />
+          Dry Run
+        </button>
+        <button className={`secondary-button ${newEntriesBlocked ? "active" : ""}`} type="button" onClick={onEntryBlock}>
+          <ShieldCheck size={16} />
+          신규 진입 차단
+        </button>
+        <button className="primary-button" type="button" onClick={onTestIntent}>
+          <TerminalSquare size={16} />
+          테스트 주문 게이트
+        </button>
+        <span className={`inline-state ${killSwitch ? "danger" : "success"}`}>{killSwitch ? "긴급 차단 켜짐" : "긴급 차단 꺼짐"}</span>
+      </div>
+    </section>
   );
 }
 
@@ -1919,6 +2018,11 @@ function BrokerPanel({ brokers }) {
 
 function AutomationLauncherPanel({ profiles, strategies, onAutomation }) {
   const rows = profiles?.length ? profiles : fallbackSnapshot.automation_profiles;
+  const modes = [
+    { id: "MONITOR", label: "MONITOR", icon: Power },
+    { id: "SMALL_LIVE", label: "SMALL LIVE", icon: Play },
+    { id: "FULL_LIVE", label: "FULL LIVE", icon: LockKeyhole },
+  ];
   return (
     <section className="panel automation-panel">
       <PanelHeader title="브로커별 자동화" subtitle="실거래 자동화는 자산군과 브로커별로 분리해서 시작합니다." />
@@ -1949,13 +2053,31 @@ function AutomationLauncherPanel({ profiles, strategies, onAutomation }) {
                       className={profile.provider === provider ? "active" : ""}
                       type="button"
                       key={provider}
-                      onClick={() => onAutomation(profile.id, profile.enabled, provider)}
+                      onClick={() => onAutomation(profile.id, profile.enabled, provider, profile.mode)}
                     >
                       {provider === "binance" ? "Binance" : "Upbit"}
                     </button>
                   ))}
                 </div>
               )}
+              <div className="automation-mode-grid">
+                {modes.map((mode) => {
+                  const Icon = mode.icon;
+                  const active = profile.mode === mode.id;
+                  return (
+                    <button
+                      className={`mode-button ${active ? "active" : ""}`}
+                      type="button"
+                      key={mode.id}
+                      onClick={() => onAutomation(profile.id, mode.id !== "MONITOR", profile.provider, mode.id)}
+                    >
+                      <Icon size={16} />
+                      <span>{mode.label}</span>
+                      {mode.id !== "MONITOR" && <LockKeyhole size={13} />}
+                    </button>
+                  );
+                })}
+              </div>
               <div className="automation-metrics">
                 <div>
                   <span>연결 브로커</span>
@@ -1982,14 +2104,6 @@ function AutomationLauncherPanel({ profiles, strategies, onAutomation }) {
                 {!routeStrategies.length && <span>연결 가능한 전략 artifact가 없습니다.</span>}
               </div>
               <div className="automation-actions">
-                <button
-                  className={profile.enabled ? "secondary-button danger-active" : "primary-button"}
-                  type="button"
-                  onClick={() => onAutomation(profile.id, !profile.enabled, profile.provider)}
-                >
-                  <Power size={16} />
-                  {profile.enabled ? "자동화 중지" : `${profile.title} 시작`}
-                </button>
                 <span>{profile.last_action}</span>
               </div>
             </div>

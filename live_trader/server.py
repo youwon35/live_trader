@@ -65,6 +65,7 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                     str(payload.get("profile_id", "")),
                     bool(payload.get("enabled")),
                     str(payload.get("provider", "")) if payload.get("provider") is not None else None,
+                    str(payload.get("mode", "")) if payload.get("mode") is not None else None,
                 )
             )
             return

@@ -913,12 +913,71 @@ button {
   box-shadow: 0 0 0 1px var(--success-border);
 }
 
+.live-prep-shell {
+  display: grid;
+  gap: 12px;
+}
+
+.internal-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.internal-tabs button {
+  display: grid;
+  gap: 3px;
+  min-height: 58px;
+  padding: 10px 12px;
+  text-align: left;
+  color: var(--text-muted);
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.internal-tabs button.active {
+  color: #ffffff;
+  background: var(--primary);
+  border-color: var(--primary-border);
+}
+
+.internal-tabs strong,
+.internal-tabs span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.internal-tabs strong {
+  color: inherit;
+  font-size: 14px;
+  font-weight: var(--font-weight-strong);
+}
+
+.internal-tabs span {
+  color: inherit;
+  font-size: var(--font-size-small);
+  opacity: 0.88;
+}
+
 .automation-card-head,
 .automation-actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.automation-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .automation-card-head strong,

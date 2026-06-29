@@ -18,8 +18,8 @@ export async function setFlag(name, value) {
   return request("/api/flag", { method: "POST", body: { name, value } });
 }
 
-export async function setAutomationProfile(profileId, enabled, provider) {
-  return request("/api/automation", { method: "POST", body: { profile_id: profileId, enabled, provider } });
+export async function setAutomationProfile(profileId, enabled, provider, mode) {
+  return request("/api/automation", { method: "POST", body: { profile_id: profileId, enabled, provider, mode } });
 }
 
 export async function setRiskSetting(name, value) {
