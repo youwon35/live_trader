@@ -51,9 +51,9 @@ import designTokens from "../../../packages/design/design_tokens.json";
 
 const navItems = [
   { id: "overview", label: "사전점검", icon: LayoutDashboard },
-  { id: "automation", label: "자동화", icon: Power },
   { id: "strategies", label: "전략", icon: DatabaseZap },
   { id: "gate", label: "실거래 게이트", icon: ListChecks },
+  { id: "automation", label: "자동화", icon: Power },
   { id: "audit", label: "로그", icon: FileClock },
   { id: "brokers", label: "API", icon: Network },
   { id: "settings", label: "설정", icon: Settings },
