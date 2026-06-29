@@ -1302,14 +1302,6 @@ function WorkspaceContent({
       <section className="content-grid">
         <div className="content-column">
           {modeConsole}
-          <OrderCommandPanel
-            newEntriesBlocked={snapshot.new_entries_blocked}
-            dryRun={snapshot.dry_run}
-            killSwitch={snapshot.kill_switch}
-            onDryRun={onDryRun}
-            onEntryBlock={onEntryBlock}
-            onTestIntent={onTestIntent}
-          />
           <OrderQueueSummaryPanel summary={snapshot.order_queue} />
           <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
         </div>
