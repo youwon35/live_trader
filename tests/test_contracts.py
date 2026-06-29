@@ -1,6 +1,15 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
-from live_trader.contracts import can_live_use_artifact, normalize_strategy_artifact
+from live_trader.contracts import (
+    can_live_use_artifact,
+    normalize_strategy_artifact,
+    strategy_artifact_dirs,
+    strategy_plugin_dirs,
+    strategy_plugin_status,
+)
 
 
 class StrategyContractTest(unittest.TestCase):
@@ -39,6 +48,31 @@ class StrategyContractTest(unittest.TestCase):
         self.assertEqual(artifact["lifecycle_status"], "paper")
         self.assertEqual(artifact["final_test_status"], "pass")
         self.assertTrue(can_live_use_artifact(artifact))
+
+    def test_strategy_paths_can_be_configured_from_shared_environment(self) -> None:
+        previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
+        previous_plugin = os.environ.get("LIVE_TRADER_STRATEGY_PLUGIN_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                artifact_dir = Path(tmp) / "shared-strategies"
+                plugin_dir = artifact_dir / "plugins"
+                plugin_dir.mkdir(parents=True)
+                (plugin_dir / "unit_strategy.py").write_text("PLUGIN_ID = 'unit'\n", encoding="utf-8")
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
+                os.environ["LIVE_TRADER_STRATEGY_PLUGIN_DIR"] = str(plugin_dir)
+
+                self.assertEqual(strategy_artifact_dirs()[0], artifact_dir)
+                self.assertEqual(strategy_plugin_dirs()[0], plugin_dir)
+                self.assertEqual(strategy_plugin_status()[0]["count"], 1)
+        finally:
+            if previous_artifact is None:
+                os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+            else:
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact
+            if previous_plugin is None:
+                os.environ.pop("LIVE_TRADER_STRATEGY_PLUGIN_DIR", None)
+            else:
+                os.environ["LIVE_TRADER_STRATEGY_PLUGIN_DIR"] = previous_plugin
 
 
 if __name__ == "__main__":

@@ -27,6 +27,8 @@ PLUGIN_LABELS = {
     "threshold_momentum": "Threshold Momentum",
 }
 
+PRIMARY_STRATEGY_ARTIFACT_DIR = Path("F:/stock_market_data/strategies")
+
 
 def _dict_value(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
@@ -65,11 +67,62 @@ def can_live_use_artifact(artifact: dict[str, Any]) -> bool:
     return permissions.get("live_allowed") is True or artifact.get("live_allowed") is True
 
 
-def strategy_artifact_dirs() -> list[Path]:
+def _appdata_strategy_artifact_dir() -> Path:
     appdata = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming"))
+    return appdata / "trading_programs" / "strategies"
+
+
+def _env_paths(*keys: str) -> list[Path]:
+    paths: list[Path] = []
+    for key in keys:
+        raw = os.getenv(key, "")
+        for part in raw.split(os.pathsep):
+            value = part.strip()
+            if value:
+                paths.append(Path(os.path.expandvars(value)).expanduser())
+    return paths
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    output: list[Path] = []
+    for path in paths:
+        key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(path)
+    return output
+
+
+def strategy_artifact_dirs() -> list[Path]:
+    configured = _env_paths("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", "TRADER_STRATEGY_ARTIFACT_DIR")
+    return _dedupe_paths(
+        configured
+        + [
+            PRIMARY_STRATEGY_ARTIFACT_DIR,
+            _appdata_strategy_artifact_dir(),
+        ]
+    )
+
+
+def strategy_plugin_dirs() -> list[Path]:
+    configured = _env_paths("LIVE_TRADER_STRATEGY_PLUGIN_DIR", "TRADER_STRATEGY_PLUGIN_DIR")
+    if configured:
+        return _dedupe_paths(configured)
+    return _dedupe_paths([folder / "plugins" for folder in strategy_artifact_dirs()])
+
+
+def strategy_plugin_status() -> list[dict[str, Any]]:
     return [
-        Path("F:/stock_market_data/strategies"),
-        appdata / "trading_programs" / "strategies",
+        {
+            "folder": str(folder),
+            "exists": folder.exists(),
+            "count": len([path for path in folder.glob("*.py") if path.is_file() and not path.name.startswith("_")])
+            if folder.exists()
+            else 0,
+        }
+        for folder in strategy_plugin_dirs()
     ]
 
 
@@ -125,6 +178,7 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "timeframe": str(artifact.get("timeframe") or dataset.get("interval") or data_artifact.get("interval") or artifact.get("interval") or "-"),
         "plugin": plugin_id,
         "plugin_label": PLUGIN_LABELS.get(plugin_id, plugin_id),
+        "plugin_source_dirs": [str(path) for path in strategy_plugin_dirs()],
         "plugin_version": str(artifact.get("plugin_version") or artifact.get("pluginVersion") or strategy_contract.get("strategyVersion") or "-"),
         "strategy_contract_version": str(strategy_contract.get("contractVersion") or artifact.get("strategy_plugin_contract_version") or ""),
         "strategy_engine_version": str(artifact.get("strategy_engine_version") or artifact.get("strategyEngineVersion") or ""),

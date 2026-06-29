@@ -9,7 +9,7 @@ from io import StringIO
 from typing import Any, Literal
 
 from .brokers import broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
-from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts
+from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts, strategy_plugin_status
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 
 
@@ -233,8 +233,8 @@ STATE: dict[str, Any] = {
     "checklist": {str(item["key"]): False for item in CHECKLIST_ITEMS},
     "retry_policy": dict(DEFAULT_RETRY_POLICY),
     "automation": {
-        "stock": {"enabled": False, "provider": "kis", "last_action": "대기"},
-        "crypto": {"enabled": False, "provider": "binance", "last_action": "대기"},
+        "stock": {"enabled": False, "provider": "kis", "mode": "MONITOR", "last_action": "대기"},
+        "crypto": {"enabled": False, "provider": "binance", "mode": "MONITOR", "last_action": "대기"},
     },
     "reconciliation_last_run": None,
     "preflight_last_run": None,
@@ -306,6 +306,7 @@ def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers:
             "provider_label": "한국투자증권 Open API",
             "broker_ids": ["kis"],
             "asset_scope": ["한국주식", "미국주식", "금 ETF", "오일 ETF"],
+            "mode": str(STATE["automation"]["stock"].get("mode") or "MONITOR"),
             "enabled": bool(STATE["automation"]["stock"]["enabled"]),
             "last_action": STATE["automation"]["stock"]["last_action"],
             "ready": bool(broker_map.get("kis", {}).get("order_ready")),
@@ -321,6 +322,7 @@ def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers:
             "provider_label": "Binance API" if crypto_provider == "binance" else "Upbit API",
             "broker_ids": ["binance", "upbit"],
             "asset_scope": ["Binance 현물", "Upbit KRW 마켓"],
+            "mode": str(STATE["automation"]["crypto"].get("mode") or "MONITOR"),
             "enabled": bool(STATE["automation"]["crypto"]["enabled"]),
             "last_action": STATE["automation"]["crypto"]["last_action"],
             "ready": bool(broker_map.get(crypto_provider, {}).get("order_ready")),
@@ -859,6 +861,7 @@ def snapshot() -> dict[str, Any]:
         "broker_adapter_contract": broker_adapter_contract(),
         "automation_profiles": automations,
         "strategies": strategies,
+        "strategy_plugin_sources": strategy_plugin_status(),
         "orders": order_rows(),
         "dry_run_ledger": dry_run_ledger_rows(),
         "reconciliation": reconciliation,
@@ -908,7 +911,7 @@ def set_flag(name: str, value: bool) -> dict[str, Any]:
     return {"ok": True, "reason": "flag changed", "snapshot": snapshot()}
 
 
-def set_automation_profile(profile_id: str, enabled: bool, provider: str | None = None) -> dict[str, Any]:
+def set_automation_profile(profile_id: str, enabled: bool, provider: str | None = None, mode: str | None = None) -> dict[str, Any]:
     profile_id = profile_id if profile_id in {"stock", "crypto"} else ""
     if not profile_id:
         return {"ok": False, "reason": "unknown automation profile", "snapshot": snapshot()}
@@ -920,25 +923,36 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
             return {"ok": False, "reason": "코인 자동화 provider는 binance 또는 upbit만 허용합니다.", "snapshot": snapshot()}
         STATE["automation"][profile_id]["provider"] = normalized_provider
 
+    next_mode = str(mode or ("SMALL_LIVE" if enabled else "MONITOR")).strip().upper()
+    if next_mode not in {"MONITOR", "SMALL_LIVE", "FULL_LIVE"}:
+        return {"ok": False, "reason": "automation mode must be MONITOR, SMALL_LIVE, or FULL_LIVE", "snapshot": snapshot()}
+    enabled = next_mode != "MONITOR" if mode is not None else enabled
+
     data = snapshot()
     profile = next((item for item in data["automation_profiles"] if item["id"] == profile_id), None)
     if not profile:
         return {"ok": False, "reason": "automation profile not found", "snapshot": snapshot()}
-    if enabled:
+    if next_mode != "MONITOR":
         if data["summary"]["blocker_count"]:
-            reason = f"readiness blocker {data['summary']['blocker_count']}개 때문에 자동화 시작이 차단되었습니다."
+            reason = f"readiness blocker {data['summary']['blocker_count']}개 때문에 {next_mode} 전환이 차단되었습니다."
             STATE["automation"][profile_id]["last_action"] = reason
             append_audit("danger", "자동화 시작 차단", f"{profile['title']}: {reason}")
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
         if profile["live_strategy_count"] <= 0:
-            reason = "live_allowed=true 전략이 없어 자동화 시작이 차단되었습니다."
+            reason = "live_allowed=true 전략이 없어 자동화 전환이 차단되었습니다."
             STATE["automation"][profile_id]["last_action"] = reason
             append_audit("danger", "자동화 시작 차단", f"{profile['title']}: {reason}")
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
+        if next_mode == "FULL_LIVE" and data["summary"]["warning_count"]:
+            reason = f"warning {data['summary']['warning_count']}개 때문에 FULL_LIVE 전환이 차단되었습니다."
+            STATE["automation"][profile_id]["last_action"] = reason
+            append_audit("warn", "자동화 FULL LIVE 차단", f"{profile['title']}: {reason}")
+            return {"ok": False, "reason": reason, "snapshot": snapshot()}
     STATE["automation"][profile_id]["enabled"] = bool(enabled)
-    action = "시작" if enabled else "중지"
-    STATE["automation"][profile_id]["last_action"] = f"{action} 요청 {now_text()}"
-    append_audit("info" if enabled else "warn", f"{profile['title']} {action}", f"{profile['provider_label']} 라우트로 자동화 {action} 상태를 기록했습니다.")
+    STATE["automation"][profile_id]["mode"] = next_mode
+    action = f"{next_mode} 전환"
+    STATE["automation"][profile_id]["last_action"] = f"{action} {now_text()}"
+    append_audit("info" if next_mode == "MONITOR" else "warn", f"{profile['title']} {action}", f"{profile['provider_label']} 라우트의 자동화 모드를 {next_mode}(으)로 기록했습니다.")
     return {"ok": True, "reason": f"{profile['title']} {action}", "snapshot": snapshot()}
 
 
