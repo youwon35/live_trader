@@ -211,6 +211,7 @@ ACCOUNT_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
 )
 
 FINAL_ORDER_STATES = {"dry_run", "sent", "filled", "canceled", "retry_exhausted"}
+AUDIT_LOG_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -883,6 +884,8 @@ def snapshot() -> dict[str, Any]:
 
 def append_audit(level: str, event: str, detail: str) -> None:
     STATE["audit"].append({"time": now_text(), "level": level, "event": event, "detail": detail})
+    if len(STATE["audit"]) > AUDIT_LOG_LIMIT:
+        del STATE["audit"][: len(STATE["audit"]) - AUDIT_LOG_LIMIT]
 
 
 def set_mode(mode: str) -> dict[str, Any]:
