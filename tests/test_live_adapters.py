@@ -1,0 +1,212 @@
+import os
+import unittest
+from unittest.mock import patch
+
+from live_trader.live_adapters import (
+    BINANCE_TEST_ORDER_ENDPOINT,
+    KIS_DOMESTIC_ORDER_ENDPOINT,
+    KIS_OVERSEAS_ORDER_ENDPOINT,
+    UPBIT_ORDER_ENDPOINT,
+    build_binance_spot_order_request,
+    build_kis_live_order_request,
+    build_upbit_order_request,
+    sign_binance_query,
+)
+
+
+ADAPTER_ENV_KEYS = (
+    "KIS_APP_KEY",
+    "KIS_APP_SECRET",
+    "KIS_ACCOUNT_NO",
+    "KIS_ACCOUNT_PRODUCT_CODE",
+    "KIS_BASE_URL",
+    "BINANCE_API_KEY",
+    "BINANCE_API_SECRET",
+    "BINANCE_BASE_URL",
+    "UPBIT_ACCESS_KEY",
+    "UPBIT_SECRET_KEY",
+    "UPBIT_BASE_URL",
+)
+
+
+class EnvRestoreMixin:
+    def setUp(self) -> None:
+        self.previous_env = {key: os.environ.get(key) for key in ADAPTER_ENV_KEYS}
+        for key in ADAPTER_ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def tearDown(self) -> None:
+        for key, value in self.previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
+    def test_kis_domestic_order_request_uses_safe_headers_and_cash_order_body(self) -> None:
+        os.environ.update(
+            {
+                "KIS_APP_KEY": "kis-app-key",
+                "KIS_APP_SECRET": "kis-app-secret",
+                "KIS_ACCOUNT_NO": "12345678-01",
+                "KIS_ACCOUNT_PRODUCT_CODE": "01",
+                "KIS_BASE_URL": "https://kis.example.test",
+            }
+        )
+
+        prepared = build_kis_live_order_request(
+            {
+                "symbol": "005930.KS",
+                "asset": "KR-STOCK",
+                "side": "BUY",
+                "quantity": 3,
+                "price": 71000,
+                "order_type": "00",
+            },
+            access_token="token-123",
+        )
+
+        self.assertTrue(prepared.can_send)
+        self.assertEqual(prepared.provider, "kis")
+        self.assertEqual(prepared.endpoint, KIS_DOMESTIC_ORDER_ENDPOINT)
+        self.assertEqual(prepared.url, "https://kis.example.test" + KIS_DOMESTIC_ORDER_ENDPOINT)
+        self.assertEqual(prepared.headers["tr_id"], "TTTC0012U")
+        self.assertEqual(prepared.headers["authorization"], "Bearer token-123")
+        self.assertEqual(prepared.safe_headers["appkey_configured"], True)
+        self.assertEqual(prepared.safe_headers["appsecret_configured"], True)
+        self.assertEqual(prepared.safe_headers["authorization_configured"], True)
+        self.assertEqual(prepared.body["CANO"], "12345678")
+        self.assertEqual(prepared.body["ACNT_PRDT_CD"], "01")
+        self.assertEqual(prepared.body["PDNO"], "005930")
+        self.assertEqual(prepared.body["ORD_QTY"], "3")
+        self.assertEqual(prepared.body["ORD_UNPR"], "71000")
+
+    def test_kis_overseas_sell_order_request_uses_overseas_endpoint_and_tr_id(self) -> None:
+        os.environ.update(
+            {
+                "KIS_APP_KEY": "kis-app-key",
+                "KIS_APP_SECRET": "kis-app-secret",
+                "KIS_ACCOUNT_NO": "87654321",
+                "KIS_ACCOUNT_PRODUCT_CODE": "01",
+            }
+        )
+
+        prepared = build_kis_live_order_request(
+            {
+                "symbol": "AAPL",
+                "asset": "US-STOCK",
+                "side": "SELL",
+                "quantity": 2,
+                "price": 199.125,
+            }
+        )
+
+        self.assertTrue(prepared.can_send)
+        self.assertEqual(prepared.endpoint, KIS_OVERSEAS_ORDER_ENDPOINT)
+        self.assertEqual(prepared.headers["tr_id"], "TTTT1006U")
+        self.assertEqual(prepared.body["OVRS_EXCG_CD"], "NASD")
+        self.assertEqual(prepared.body["PDNO"], "AAPL")
+        self.assertEqual(prepared.body["ORD_QTY"], "2")
+        self.assertEqual(prepared.body["OVRS_ORD_UNPR"], "199.125")
+
+    def test_binance_test_order_request_signs_query_without_leaking_secret_in_preview(self) -> None:
+        os.environ.update(
+            {
+                "BINANCE_API_KEY": "binance-key",
+                "BINANCE_API_SECRET": "binance-secret",
+                "BINANCE_BASE_URL": "https://binance.example.test",
+            }
+        )
+
+        with patch("live_trader.live_adapters.time.time", return_value=1700000000.123):
+            prepared = build_binance_spot_order_request(
+                {
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": "0.125",
+                    "order_type": "LIMIT",
+                    "price": "43000.5",
+                    "time_in_force": "GTC",
+                },
+                test=True,
+            )
+
+        expected_query = {
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "type": "LIMIT",
+            "quantity": "0.125",
+            "timestamp": 1700000000123,
+            "timeInForce": "GTC",
+            "price": "43000.5",
+        }
+        expected_signed_query = sign_binance_query(expected_query, "binance-secret")
+
+        self.assertTrue(prepared.can_send)
+        self.assertEqual(prepared.provider, "binance")
+        self.assertEqual(prepared.endpoint, BINANCE_TEST_ORDER_ENDPOINT)
+        self.assertEqual(prepared.url, f"https://binance.example.test{BINANCE_TEST_ORDER_ENDPOINT}?{expected_signed_query}")
+        self.assertEqual(prepared.headers["X-MBX-APIKEY"], "binance-key")
+        self.assertEqual(prepared.safe_headers["X-MBX-APIKEY_configured"], True)
+        self.assertEqual(prepared.preview()["query"]["signature"], "***")
+
+    def test_upbit_order_request_builds_signed_limit_order_preview(self) -> None:
+        os.environ.update(
+            {
+                "UPBIT_ACCESS_KEY": "upbit-access",
+                "UPBIT_SECRET_KEY": "upbit-secret",
+                "UPBIT_BASE_URL": "https://upbit.example.test",
+            }
+        )
+
+        prepared = build_upbit_order_request(
+            {
+                "market": "KRW-BTC",
+                "side": "BUY",
+                "order_type": "limit",
+                "quantity": "0.01",
+                "price": "50000000",
+            }
+        )
+
+        self.assertTrue(prepared.can_send)
+        self.assertEqual(prepared.provider, "upbit")
+        self.assertEqual(prepared.endpoint, UPBIT_ORDER_ENDPOINT)
+        self.assertEqual(prepared.url, "https://upbit.example.test" + UPBIT_ORDER_ENDPOINT)
+        self.assertEqual(prepared.headers["Content-Type"], "application/json")
+        self.assertTrue(prepared.headers["Authorization"].startswith("Bearer "))
+        self.assertEqual(prepared.safe_headers["authorization_configured"], True)
+        self.assertEqual(prepared.body["market"], "KRW-BTC")
+        self.assertEqual(prepared.body["side"], "bid")
+        self.assertEqual(prepared.body["ord_type"], "limit")
+        self.assertEqual(prepared.body["volume"], "0.01")
+        self.assertEqual(prepared.body["price"], "50000000")
+
+    def test_missing_settings_and_invalid_intent_are_reported_as_blocked_reasons(self) -> None:
+        kis = build_kis_live_order_request({"symbol": "", "side": "BUY", "quantity": 0, "price": 0})
+        binance = build_binance_spot_order_request({"symbol": "", "side": "BUY", "quantity": 0})
+        upbit = build_upbit_order_request({"market": "", "side": "SELL", "quantity": 0})
+
+        self.assertFalse(kis.can_send)
+        self.assertIn("KIS_APP_KEY", kis.blocked_reasons)
+        self.assertIn("KIS_APP_SECRET", kis.blocked_reasons)
+        self.assertIn("KIS_ACCOUNT_NO", kis.blocked_reasons)
+        self.assertIn("KIS_ACCOUNT_PRODUCT_CODE", kis.blocked_reasons)
+        self.assertIn("symbol", kis.blocked_reasons)
+        self.assertIn("quantity", kis.blocked_reasons)
+
+        self.assertFalse(binance.can_send)
+        self.assertIn("BINANCE_API_KEY", binance.blocked_reasons)
+        self.assertIn("BINANCE_API_SECRET", binance.blocked_reasons)
+        self.assertIn("symbol", binance.blocked_reasons)
+        self.assertIn("quantity", binance.blocked_reasons)
+
+        self.assertFalse(upbit.can_send)
+        self.assertIn("UPBIT_ACCESS_KEY", upbit.blocked_reasons)
+        self.assertIn("UPBIT_SECRET_KEY", upbit.blocked_reasons)
+        self.assertIn("market", upbit.blocked_reasons)
+
+
+if __name__ == "__main__":
+    unittest.main()
