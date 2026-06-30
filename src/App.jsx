@@ -1407,15 +1407,15 @@ function OperationalSafeguardsPanel({ dryRun, newEntriesBlocked, killSwitch, onD
     <section className="panel operational-safeguards-panel">
       <PanelHeader title="운영 차단 설정" subtitle="자동화 모드 전환 전에 공통 보호 장치를 확인합니다." />
       <div className="operator-actions">
-        <button className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`} type="button" onClick={onDryRun}>
+        <button className={`secondary-button ts-action-button ${dryRun ? "safe-active" : "danger-active"}`} data-action-status={dryRun ? "success" : "error"} type="button" onClick={onDryRun}>
           <ShieldCheck size={16} />
           Dry Run
         </button>
-        <button className={`secondary-button ${newEntriesBlocked ? "active" : ""}`} type="button" onClick={onEntryBlock}>
+        <button className={`secondary-button ts-action-button ${newEntriesBlocked ? "active" : ""}`} data-action-status={newEntriesBlocked ? "success" : undefined} type="button" onClick={onEntryBlock}>
           <ShieldCheck size={16} />
           신규 진입 차단
         </button>
-        <button className="primary-button" type="button" onClick={onTestIntent}>
+        <button className="primary-button ts-action-button" type="button" onClick={onTestIntent}>
           <TerminalSquare size={16} />
           테스트 주문 게이트
         </button>
@@ -1455,7 +1455,7 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight })
           <strong>{hasRun ? (problemCount ? "조치 필요" : "통과") : "대기"}</strong>
           <p>{hasRun ? `hard stop ${failCount}개, warning ${warnCount}개를 확인했습니다.` : "점검 실행 버튼을 눌러 API, 리스크, 체크리스트, 대조 상태를 검사하세요."}</p>
         </div>
-        <button className="primary-button doctor-run-button" type="button" onClick={runDoctor} disabled={running}>
+        <button className="primary-button doctor-run-button ts-action-button" data-action-status={running ? "pending" : hasRun ? (problemCount ? "error" : "success") : undefined} type="button" onClick={runDoctor} disabled={running}>
           <Play size={16} />
           {running ? "점검 중" : "점검 실행"}
         </button>
@@ -1918,7 +1918,9 @@ function ModeConsole({
             <button
               type="button"
               key={item.id}
-              className={`mode-button ${mode === item.id ? "active" : ""}`}
+              className={`mode-button ts-action-button ${mode === item.id ? "active" : ""}`}
+              data-action-status={mode === item.id ? "success" : undefined}
+              aria-pressed={mode === item.id}
               onClick={() => onMode(item.id)}
             >
               <Icon size={16} />
@@ -1929,19 +1931,19 @@ function ModeConsole({
         })}
       </div>
       <div className="operator-actions">
-        <button className={`secondary-button ${operatorConfirmed ? "active" : ""}`} type="button" onClick={onConfirm}>
+        <button className={`secondary-button ts-action-button ${operatorConfirmed ? "active" : ""}`} data-action-status={operatorConfirmed ? "success" : undefined} type="button" onClick={onConfirm}>
           <BadgeCheck size={16} />
           운용자 확인
         </button>
-        <button className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`} type="button" onClick={onDryRun}>
+        <button className={`secondary-button ts-action-button ${dryRun ? "safe-active" : "danger-active"}`} data-action-status={dryRun ? "success" : "error"} type="button" onClick={onDryRun}>
           <ShieldCheck size={16} />
           Dry Run
         </button>
-        <button className={`secondary-button ${newEntriesBlocked ? "active" : ""}`} type="button" onClick={onEntryBlock}>
+        <button className={`secondary-button ts-action-button ${newEntriesBlocked ? "active" : ""}`} data-action-status={newEntriesBlocked ? "success" : undefined} type="button" onClick={onEntryBlock}>
           <ShieldCheck size={16} />
           신규 진입 차단
         </button>
-        <button className="primary-button" type="button" onClick={onTestIntent}>
+        <button className="primary-button ts-action-button" type="button" onClick={onTestIntent}>
           <TerminalSquare size={16} />
           테스트 주문 게이트
         </button>
@@ -2057,7 +2059,9 @@ function AutomationLauncherPanel({ profiles, strategies, onAutomation }) {
             const active = activeProfile.mode === mode.id;
             return (
               <button
-                className={`mode-button ${active ? "active" : ""}`}
+                className={`mode-button ts-action-button ${active ? "active" : ""}`}
+                data-action-status={active ? "success" : undefined}
+                aria-pressed={active}
                 type="button"
                 key={mode.id}
                 onClick={() => onAutomation(activeProfile.id, mode.id !== "MONITOR", activeProfile.provider, mode.id)}
@@ -2216,15 +2220,15 @@ function OrderCommandPanel({ newEntriesBlocked, dryRun, killSwitch, onDryRun, on
     <section className="panel">
       <PanelHeader title="주문 제어" subtitle="실주문 전송 전 차단 상태와 테스트 게이트를 관리합니다." />
       <div className="operator-actions">
-        <button className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`} type="button" onClick={onDryRun}>
+        <button className={`secondary-button ts-action-button ${dryRun ? "safe-active" : "danger-active"}`} data-action-status={dryRun ? "success" : "error"} type="button" onClick={onDryRun}>
           <ShieldCheck size={16} />
           Dry Run
         </button>
-        <button className={`secondary-button ${newEntriesBlocked ? "active" : ""}`} type="button" onClick={onEntryBlock}>
+        <button className={`secondary-button ts-action-button ${newEntriesBlocked ? "active" : ""}`} data-action-status={newEntriesBlocked ? "success" : undefined} type="button" onClick={onEntryBlock}>
           <ShieldCheck size={16} />
           신규 진입 차단
         </button>
-        <button className="primary-button" type="button" onClick={onTestIntent}>
+        <button className="primary-button ts-action-button" type="button" onClick={onTestIntent}>
           <TerminalSquare size={16} />
           테스트 주문 게이트
         </button>
