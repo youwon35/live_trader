@@ -22,6 +22,7 @@ import {
   Radio,
   RefreshCcw,
   RotateCcw,
+  Search,
   Settings,
   ShieldAlert,
   ShieldCheck,
@@ -56,6 +57,7 @@ import {
   createMetricGrid,
   createPageHeader,
   createPanelHeader,
+  createSearchField,
   createSegmentedControl,
 } from "../../../packages/design/ui-primitives.js";
 import designTokens from "../../../packages/design/design_tokens.json";
@@ -68,6 +70,7 @@ const MetricCard = createMetricCard(React);
 const MetricGrid = createMetricGrid(React);
 const PageHeader = createPageHeader(React);
 const PanelHeader = createPanelHeader(React);
+const SearchField = createSearchField(React);
 const SegmentedControl = createSegmentedControl(React);
 
 const navItems = [
@@ -2657,11 +2660,12 @@ function AuditPanel({ audit }) {
     <section className="panel audit-panel">
       <PanelHeader title="실행 로그" subtitle="시간, 채널, 모듈, 메시지를 기준으로 실행 이력을 확인합니다." />
       <div className="execution-log-toolbar">
-        <input
-          type="search"
-          value={query}
-          placeholder="시간, 채널, 모듈, 메시지 검색"
+        <SearchField
+          ariaLabel="실행 로그 검색"
+          icon={<Search size={15} />}
           onChange={(event) => setQuery(event.currentTarget.value)}
+          placeholder="시간, 채널, 모듈, 메시지 검색"
+          value={query}
         />
         <FormField label="채널">
           <select value={channel} onChange={(event) => setChannel(event.currentTarget.value)}>
