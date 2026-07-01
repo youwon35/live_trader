@@ -112,7 +112,7 @@ const pageProfiles = {
   settings: {
     title: "설정",
     eyebrow: "화면/운영 환경",
-    summary: "테마, 강조 색상, 레이아웃, 주문 안전 게이트를 관리합니다.",
+    summary: "테마, 강조 색상, 레이아웃 편집 같은 화면 환경만 관리합니다.",
   },
 };
 
@@ -123,7 +123,6 @@ const fallbackSnapshot = {
   kill_switch: false,
   new_entries_blocked: true,
   operator_confirmed: false,
-  pre_trade_risk_gate_enabled: true,
   summary: { status: "blocked", blocker_count: 1, warning_count: 0, live_strategy_count: 0, broker_ready_count: 0 },
   sessions: [],
   readiness: [{ label: "Python API", status: "fail", detail: "Python server connection is required." }],
@@ -1223,7 +1222,6 @@ function App() {
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
           onDryRun={() => runAction(() => setFlag("dry_run", !snapshot.dry_run))}
           onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
-          onRiskGateToggle={(enabled) => runAction(() => setFlag("pre_trade_risk_gate_enabled", enabled))}
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
@@ -1296,7 +1294,6 @@ function WorkspaceContent({
   onConfirm,
   onDryRun,
   onEntryBlock,
-  onRiskGateToggle,
   onAutomation,
   onTestIntent,
   onRiskSetting,
@@ -1394,7 +1391,6 @@ function WorkspaceContent({
             changeLayoutMode={changeLayoutMode}
             resetWorkspaceLayout={resetWorkspaceLayout}
           />
-          <OrderGateSettingsPanel enabled={snapshot.pre_trade_risk_gate_enabled} onToggle={onRiskGateToggle} />
         </div>
       </section>,
     );
@@ -1918,40 +1914,6 @@ function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, chan
             <PanelLeft size={16} />
             초기화
           </button>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function OrderGateSettingsPanel({ enabled, onToggle }) {
-  return (
-    <section className="panel order-gate-settings-panel">
-      <PanelHeader title="주문 안전 게이트" subtitle="전략 신호가 주문으로 바뀌기 전에 반드시 거치는 공통 검문입니다." />
-      <div className="settings-list">
-        <div className="setting-row">
-          <ShieldCheck size={16} />
-          <div>
-            <strong>공통 주문 리스크 게이트</strong>
-            <span>{enabled ? "OrderIntent를 공통 PreTradeRiskGate로 검사합니다." : "OFF 상태에서는 안전을 위해 모든 주문 의도를 차단합니다."}</span>
-          </div>
-          <ToggleSwitch
-            checked={Boolean(enabled)}
-            checkedLabel="ON"
-            className="switch-label"
-            label="공통 주문 리스크 게이트"
-            onChange={onToggle}
-            showState
-            uncheckedLabel="OFF"
-          />
-        </div>
-        <div className="setting-row">
-          <ShieldAlert size={16} />
-          <div>
-            <strong>OFF 동작</strong>
-            <span>리스크 검사를 우회하지 않고, 주문 생성 경로를 잠가 실거래 안전성을 유지합니다.</span>
-          </div>
-          <StatusPill tone={enabled ? "success" : "danger"}>{enabled ? "검문 사용" : "주문 차단"}</StatusPill>
         </div>
       </div>
     </section>
