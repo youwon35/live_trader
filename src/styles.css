@@ -2953,6 +2953,12 @@ body {
   box-shadow: var(--panel-shadow);
 }
 
+.panel.doctor-panel {
+  min-height: 0;
+  overflow: auto;
+  padding-bottom: 24px;
+}
+
 .panel-header {
   align-items: center;
   height: auto;
