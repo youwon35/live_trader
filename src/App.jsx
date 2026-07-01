@@ -59,6 +59,7 @@ import {
   createPanelHeader,
   createSearchField,
   createSegmentedControl,
+  createToggleSwitch,
 } from "../../../packages/design/ui-primitives.js";
 import designTokens from "../../../packages/design/design_tokens.json";
 
@@ -72,6 +73,7 @@ const PageHeader = createPageHeader(React);
 const PanelHeader = createPanelHeader(React);
 const SearchField = createSearchField(React);
 const SegmentedControl = createSegmentedControl(React);
+const ToggleSwitch = createToggleSwitch(React);
 
 const navItems = [
   { id: "overview", label: "사전점검", icon: LayoutDashboard },
@@ -2291,14 +2293,15 @@ function RetryPolicyPanel({ policy, onRetryPolicy }) {
               <span>{setting.detail}</span>
             </div>
             {setting.type === "boolean" ? (
-              <label className="switch-label">
-                <input
-                  type="checkbox"
-                  checked={setting.value}
-                  onChange={(event) => onRetryPolicy(setting.key, event.currentTarget.checked)}
-                />
-                <span>{setting.value ? "ON" : "OFF"}</span>
-              </label>
+              <ToggleSwitch
+                checked={Boolean(setting.value)}
+                checkedLabel="ON"
+                className="switch-label"
+                label={setting.label}
+                onChange={(checked) => onRetryPolicy(setting.key, checked)}
+                showState
+                uncheckedLabel="OFF"
+              />
             ) : (
               <label>
                 <input
