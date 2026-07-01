@@ -53,6 +53,7 @@ import { createStatusPill } from "../../../packages/design/status-pill.js";
 import {
   createEmptyState,
   createFormField,
+  createIconButton,
   createMetricCard,
   createMetricGrid,
   createPageHeader,
@@ -67,6 +68,7 @@ const ActionButton = createActionButton(React);
 const StatusPill = createStatusPill(React);
 const EmptyState = createEmptyState(React);
 const FormField = createFormField(React);
+const IconButton = createIconButton(React);
 const MetricCard = createMetricCard(React);
 const MetricGrid = createMetricGrid(React);
 const PageHeader = createPageHeader(React);
@@ -1146,16 +1148,16 @@ function App() {
       <main className={`workspace layout-${layoutMode}`} ref={workspaceRef} data-layout-mode={layoutMode}>
         <header className="topbar">
           <div className="topbar-left">
-            <button
-              className={`icon-button sidebar-toggle ${sidebarCollapsed ? "active" : ""}`}
-              type="button"
+            <IconButton
+              className="sidebar-toggle"
+              active={sidebarCollapsed}
               aria-label={sidebarCollapsed ? "탭 화면 펼치기" : "탭 화면 접기"}
-              aria-pressed={sidebarCollapsed}
+              pressed={sidebarCollapsed}
               title={sidebarCollapsed ? "탭 화면 펼치기" : "탭 화면 접기"}
               onClick={toggleSidebarCollapsed}
             >
               <PanelLeft size={18} />
-            </button>
+            </IconButton>
           </div>
           <div className="topbar-actions">
             <button
@@ -1173,9 +1175,9 @@ function App() {
               <span>레이아웃 초기화</span>
             </button>
             <div className="notification-wrap" ref={notificationRef}>
-              <button
-                className={`icon-button notification-button ${notificationsOpen ? "active" : ""}`}
-                type="button"
+              <IconButton
+                className="notification-button"
+                active={notificationsOpen}
                 aria-label="알림"
                 aria-expanded={notificationsOpen}
                 onClick={() => {
@@ -1185,7 +1187,7 @@ function App() {
               >
                 <Bell size={17} />
                 {unreadNotificationCount > 0 && <span className="notification-badge">{Math.min(unreadNotificationCount, 9)}</span>}
-              </button>
+              </IconButton>
               {notificationsOpen && <NotificationPanel items={notifications} onNavigate={navigateWorkspace} />}
             </div>
             <button
