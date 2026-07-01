@@ -231,8 +231,8 @@ Main backend files:
 
 - `live_trader\server.py`
 - `live_trader\state.py`
-- `live_trader\order_management.py`
-- `live_trader\risk_engine.py`
+- `live_trader\order_management.py`: compatibility wrapper; actual `OrderIntent` comes from shared `packages\trading_runtime`.
+- `live_trader\risk_engine.py`: compatibility wrapper; actual `PreTradeContext`, `PreTradeRiskGate`, and report classes come from shared `packages\trading_runtime`.
 - `live_trader\brokers.py`
 - `live_trader\contracts.py`
 - `live_trader\live_adapters.py`
@@ -269,8 +269,8 @@ Important endpoints:
 
 As of 2026-07-02, live order test/retry paths no longer use only a simple readiness/dry-run check.
 
-- `live_trader\order_management.py` defines the live `OrderIntent` contract.
-- `live_trader\risk_engine.py` defines `PreTradeRiskGate`, `PreTradeContext`, and `PreTradeRiskReport`.
+- Paper Trader and Live Trader share the real order/risk implementation in `trading-system\packages\trading_runtime`.
+- `live_trader\order_management.py` and `live_trader\risk_engine.py` are local compatibility wrappers so existing imports remain stable.
 - `live_trader\state.py` converts a strategy/test order into `OrderIntent`, builds `PreTradeContext` from current mode, dry-run, kill switch, readiness, reconciliation, broker readiness, and risk settings, then evaluates the intent through `PreTradeRiskGate`.
 - Orders now keep a `risk_report` payload so the UI/log layer can later explain exactly which checks passed, warned, or blocked the order.
 - Non-dry-run broker transmission still remains blocked until the real send layer and adapter verification are intentionally enabled.
@@ -392,6 +392,7 @@ The build script:
 - runs `npm run build`
 - creates/updates app icon files
 - runs PyInstaller
+- adds `packages\trading_runtime` to the PyInstaller search path and hidden imports so the EXE uses the shared order/risk engine.
 
 Notes from recent builds:
 
@@ -477,7 +478,7 @@ Critical gaps before real money should be enabled:
 - Upbit account/balance/cancel APIs still need real implementation.
 - Real broker submission must be audited with sandbox or tiny live orders before enabling.
 - Strategy plugin execution pipeline from Backtester artifacts to live signals still needs production-grade implementation.
-- Risk engine now runs for live test/retry order intents, but the future continuous automation engine must use the same `OrderIntent -> PreTradeRiskGate -> adapter` boundary before any broker transmission.
+- Shared risk engine now runs for live test/retry order intents, but the future continuous automation engine must use the same `OrderIntent -> PreTradeRiskGate -> adapter` boundary before any broker transmission.
 - Logs are currently derived from audit events, not yet a true streaming engine log source.
 
 UI gaps to watch:

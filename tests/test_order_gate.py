@@ -13,6 +13,11 @@ class OrderGateTest(unittest.TestCase):
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
 
+    def test_order_and_risk_classes_come_from_shared_runtime(self) -> None:
+        self.assertEqual(state.OrderIntent.__module__, "trading_runtime.order_management")
+        self.assertEqual(state.PreTradeRiskGate.__module__, "trading_runtime.risk_engine")
+        self.assertEqual(state.PreTradeContext.__module__, "trading_runtime.risk_engine")
+
     def test_order_gate_blocks_buy_when_new_entries_are_blocked(self) -> None:
         state.STATE["new_entries_blocked"] = True
 

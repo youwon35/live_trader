@@ -1,25 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from pathlib import Path
+import sys
 
 
-LiveOrderMode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
-OrderSide = Literal["BUY", "SELL"]
+def _ensure_shared_runtime_path() -> None:
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "packages" / "trading_runtime"
+        if candidate.exists():
+            path = str(candidate)
+            if path not in sys.path:
+                sys.path.insert(0, path)
+            return
 
 
-@dataclass(frozen=True)
-class OrderIntent:
-    strategy_id: str
-    asset: str
-    symbol: str
-    side: OrderSide
-    quantity: float
-    reference_price: float
-    mode: LiveOrderMode
-    reason: str
-    metadata: dict[str, Any] = field(default_factory=dict)
+_ensure_shared_runtime_path()
 
-    @property
-    def notional(self) -> float:
-        return self.quantity * self.reference_price
+from trading_runtime.order_management import OrderIntent, OrderSide, TradingOrderMode  # noqa: E402
+
+LiveOrderMode = TradingOrderMode
+
+__all__ = ["LiveOrderMode", "OrderIntent", "OrderSide", "TradingOrderMode"]

@@ -20,6 +20,10 @@ if (Test-Path "release") {
 }
 
 $root = (Get-Location).Path
+$sharedRuntime = [System.IO.Path]::GetFullPath((Join-Path $root "..\..\packages\trading_runtime"))
+if (-not (Test-Path -LiteralPath $sharedRuntime)) {
+  throw "Shared trading_runtime package was not found: $sharedRuntime"
+}
 .\.venv\Scripts\python.exe -m PyInstaller `
   --noconfirm `
   --noconsole `
@@ -30,5 +34,8 @@ $root = (Get-Location).Path
   --workpath build `
   --specpath build `
   --add-data "$root\dist;dist" `
+  --paths "$sharedRuntime" `
+  --hidden-import trading_runtime.order_management `
+  --hidden-import trading_runtime.risk_engine `
   --collect-submodules webview `
   live_trader\__main__.py
