@@ -244,6 +244,27 @@ function hexToRgb(hex) {
   };
 }
 
+function relativeLuminanceChannel(value) {
+  const channel = value / 255;
+  return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+}
+
+function accentContrastText(color) {
+  const { r, g, b } = hexToRgb(color);
+  const luminance =
+    0.2126 * relativeLuminanceChannel(r) +
+    0.7152 * relativeLuminanceChannel(g) +
+    0.0722 * relativeLuminanceChannel(b);
+  const whiteContrast = 1.05 / (luminance + 0.05);
+  const darkContrast = (luminance + 0.05) / 0.05;
+  return whiteContrast >= darkContrast ? "#ffffff" : "#0f172a";
+}
+
+function accentColorForContrast(accent, customAccent) {
+  if (accent === "custom") return normalizeHexColor(customAccent);
+  return normalizeHexColor(accentPalettes[accent]?.swatch ?? fallbackAccentSwatch, fallbackAccentSwatch);
+}
+
 function customAccentVars(color) {
   const primary = normalizeHexColor(color);
   const { r, g, b } = hexToRgb(primary);
@@ -355,6 +376,10 @@ function applyCustomAccent(root, appearance) {
   });
 }
 
+function applyAccentContrast(root, appearance) {
+  root.style.setProperty("--accent-contrast-text", accentContrastText(accentColorForContrast(appearance.accent, appearance.customAccent)));
+}
+
 function readAppearance() {
   try {
     const raw = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
@@ -372,6 +397,7 @@ function applyAppearance(appearance) {
     root.dataset.uiTheme = nextAppearance.theme;
     root.dataset.accent = nextAppearance.accent;
     applyCustomAccent(root, nextAppearance);
+    applyAccentContrast(root, nextAppearance);
   } catch {
     // Appearance remains in React state if document access is unavailable.
   }

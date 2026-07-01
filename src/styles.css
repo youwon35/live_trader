@@ -1,5 +1,9 @@
 @import "../../../packages/design/design-tokens.css";
 
+:root {
+  --accent-contrast-text: #ffffff;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -133,7 +137,7 @@ button {
 }
 
 .nav-item.active {
-  color: var(--status-pill-text, #0f172a);
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border-color: var(--primary-border);
 }
@@ -430,7 +434,7 @@ button {
 }
 
 .primary-button {
-  color: var(--text-inverse);
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border: 1px solid var(--primary-border);
 }
@@ -2348,7 +2352,7 @@ body {
 }
 
 .nav-item.active {
-  color: var(--status-pill-text, #0f172a);
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border-color: var(--primary-border);
   box-shadow: none;
@@ -2493,14 +2497,14 @@ body {
 .layout-reset-button.active,
 .ghost-button.active,
 .secondary-button.active {
-  color: #ffffff;
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border-color: var(--primary-border);
   box-shadow: none;
 }
 
 .primary-button {
-  color: #ffffff;
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border-color: var(--primary-border);
   box-shadow: none;
@@ -2958,7 +2962,7 @@ body {
 }
 
 .section-tabs button.selected {
-  color: #ffffff;
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border-color: var(--primary-border);
 }
@@ -3534,7 +3538,7 @@ body {
 :root[data-ui-theme='light'] .secondary-button.active,
 :root[data-ui-theme='light'] .primary-button,
 :root[data-ui-theme='light'] .section-tabs button.selected {
-  color: #ffffff;
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border-color: var(--primary-border);
   box-shadow: none;
@@ -3547,7 +3551,7 @@ body {
 }
 
 :root[data-ui-theme='light'] .nav-item.active {
-  color: var(--status-pill-text, #0f172a);
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border-color: var(--primary-border);
 }
@@ -3618,7 +3622,7 @@ body {
 }
 
 :root[data-ui-theme='light'] .section-tabs button.selected {
-  color: #ffffff;
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border-color: var(--primary-border);
 }
@@ -3818,7 +3822,7 @@ body {
 
 /* Shared button containment pass: keep action rows inside their panels and remove primary outlines. */
 .primary-button {
-  color: #ffffff !important;
+  color: var(--accent-contrast-text, #ffffff) !important;
   background-color: var(--primary, #2f80ed) !important;
   background-image: none !important;
   border-color: transparent !important;
