@@ -49,16 +49,26 @@ import {
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
-import { createEmptyState, createMetricCard, createMetricGrid, createPageHeader, createPanelHeader } from "../../../packages/design/ui-primitives.js";
+import {
+  createEmptyState,
+  createFormField,
+  createMetricCard,
+  createMetricGrid,
+  createPageHeader,
+  createPanelHeader,
+  createSegmentedControl,
+} from "../../../packages/design/ui-primitives.js";
 import designTokens from "../../../packages/design/design_tokens.json";
 
 const ActionButton = createActionButton(React);
 const StatusPill = createStatusPill(React);
 const EmptyState = createEmptyState(React);
+const FormField = createFormField(React);
 const MetricCard = createMetricCard(React);
 const MetricGrid = createMetricGrid(React);
 const PageHeader = createPageHeader(React);
 const PanelHeader = createPanelHeader(React);
+const SegmentedControl = createSegmentedControl(React);
 
 const navItems = [
   { id: "overview", label: "사전점검", icon: LayoutDashboard },
@@ -1806,22 +1816,18 @@ function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, chan
           <strong>모드</strong>
           <span>실거래 콘솔의 밝기와 텍스트 대비를 바꿉니다.</span>
         </div>
-        <div className="theme-mode-row">
-          {appearanceThemeOptions.map((option) => {
-            const Icon = option.icon;
-            return (
-              <button
-                key={option.id}
-                className={`theme-mode-button ${appearance.theme === option.id ? "selected" : ""}`}
-                type="button"
-                onClick={() => updateAppearance({ theme: option.id })}
-              >
-                <Icon size={16} />
-                {option.label}
-              </button>
-            );
-          })}
-        </div>
+        <SegmentedControl
+          activeClassName="selected"
+          buttonClassName="theme-mode-button"
+          className="theme-mode-row"
+          onChange={(theme) => updateAppearance({ theme })}
+          options={appearanceThemeOptions.map((option) => ({
+            icon: option.icon,
+            label: option.label,
+            value: option.id,
+          }))}
+          value={appearance.theme}
+        />
       </div>
 
       <div className="settings-control-group">
@@ -2657,8 +2663,7 @@ function AuditPanel({ audit }) {
           placeholder="시간, 채널, 모듈, 메시지 검색"
           onChange={(event) => setQuery(event.currentTarget.value)}
         />
-        <label>
-          <span>채널</span>
+        <FormField label="채널">
           <select value={channel} onChange={(event) => setChannel(event.currentTarget.value)}>
             {channels.map((item) => (
               <option value={item} key={item}>
@@ -2666,23 +2671,21 @@ function AuditPanel({ audit }) {
               </option>
             ))}
           </select>
-        </label>
-        <label>
-          <span>레벨</span>
+        </FormField>
+        <FormField label="레벨">
           <select value={level} onChange={(event) => setLevel(event.currentTarget.value)}>
             <option value="all">전체</option>
             <option value="INFO">INFO</option>
             <option value="WARN">WARN</option>
             <option value="ERROR">ERROR</option>
           </select>
-        </label>
-        <label>
-          <span>정렬</span>
+        </FormField>
+        <FormField label="정렬">
           <select value={sort} onChange={(event) => setSort(event.currentTarget.value)}>
             <option value="latest">최신순</option>
             <option value="oldest">오래된순</option>
           </select>
-        </label>
+        </FormField>
       </div>
       <div className="execution-log-list">
         {visibleRows.length ? (
