@@ -1185,16 +1185,6 @@ function App() {
 
         <MarketStrip sessions={snapshot.sessions} />
 
-        {(error || snapshot.summary.blocker_count > 0) && (
-          <section className="alert-band" aria-live="polite">
-            <ShieldAlert size={20} />
-            <div>
-              <strong>실거래 주문 차단 상태</strong>
-              <span>{error || `readiness blocker ${snapshot.summary.blocker_count}개가 남아 있습니다. API 키, 주문 어댑터, live_allowed 권한을 확인하세요.`}</span>
-            </div>
-          </section>
-        )}
-
         <WorkspaceContent
           selectedNav={selectedNav}
           onNavigate={navigateWorkspace}

@@ -2645,11 +2645,6 @@ body {
   background: var(--button-hover);
 }
 
-.doctor-card.selected {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 2px var(--primary-soft);
-}
-
 .doctor-step {
   display: inline-grid;
   width: 30px;
@@ -2682,15 +2677,17 @@ body {
 }
 
 .doctor-card.success {
-  border-color: var(--success-border);
+  border-color: var(--border);
 }
 
 .doctor-card.warning {
-  border-color: var(--warning-border);
+  background: var(--status-pill-warning-background, #fef3c7);
+  border-color: var(--border);
 }
 
 .doctor-card.danger {
-  border-color: var(--danger-border);
+  background: var(--status-pill-danger-background, #fee2e2);
+  border-color: var(--border);
 }
 
 .doctor-card.success .doctor-status {
@@ -2698,11 +2695,23 @@ body {
 }
 
 .doctor-card.warning .doctor-status {
-  color: var(--warning-text);
+  color: #0f172a;
 }
 
 .doctor-card.danger .doctor-status {
-  color: var(--danger-soft-text);
+  color: #0f172a;
+}
+
+.doctor-card.warning strong,
+.doctor-card.warning div span,
+.doctor-card.danger strong,
+.doctor-card.danger div span {
+  color: #0f172a;
+}
+
+.doctor-card.selected {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-soft);
 }
 
 .doctor-detail-panel {
@@ -2772,15 +2781,24 @@ body {
 }
 
 .doctor-detail-row.success {
-  border-color: var(--success-border);
+  border-color: var(--border);
 }
 
 .doctor-detail-row.warning {
-  border-color: var(--warning-border);
+  background: var(--status-pill-warning-background, #fef3c7);
+  border-color: var(--border);
 }
 
 .doctor-detail-row.danger {
-  border-color: var(--danger-border);
+  background: var(--status-pill-danger-background, #fee2e2);
+  border-color: var(--border);
+}
+
+.doctor-detail-row.warning strong,
+.doctor-detail-row.warning span,
+.doctor-detail-row.danger strong,
+.doctor-detail-row.danger span {
+  color: #0f172a;
 }
 
 .alert-band {
