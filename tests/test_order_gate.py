@@ -101,6 +101,30 @@ class OrderGateTest(unittest.TestCase):
         self.assertIn("일일 손실 한도", reason)
         self.assertFalse(report.can_submit)
 
+    def test_pre_trade_risk_gate_toggle_fails_closed(self) -> None:
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["pre_trade_risk_gate_enabled"] = False
+        state.STATE["risk_settings"]["daily_loss_limit_pct"] = -2.0
+
+        ok, order_state, queue_state, reason, report = state.evaluate_order_gate_with_report(
+            {"summary": {"blocker_count": 0}},
+            "BUY",
+            dry_run=True,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(order_state, "risk_blocked")
+        self.assertEqual(queue_state, "blocked")
+        self.assertIn("공통 주문 리스크 게이트", reason)
+        self.assertFalse(report.can_submit)
+
+    def test_pre_trade_risk_gate_toggle_is_exposed_in_snapshot(self) -> None:
+        result = state.set_flag("pre_trade_risk_gate_enabled", False)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(state.STATE["pre_trade_risk_gate_enabled"])
+        self.assertFalse(result["snapshot"]["pre_trade_risk_gate_enabled"])
+
     def test_kill_switch_forces_monitor_mode_and_blocks_new_entries(self) -> None:
         state.STATE["mode"] = "SMALL_LIVE"
         state.STATE["new_entries_blocked"] = False

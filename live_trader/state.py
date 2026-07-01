@@ -12,7 +12,7 @@ from .brokers import broker_adapter_contract, broker_diagnostics, broker_readine
 from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts, strategy_plugin_status
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 from .order_management import OrderIntent, OrderSide
-from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder
+from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
@@ -232,6 +232,7 @@ STATE: dict[str, Any] = {
     "kill_switch": False,
     "new_entries_blocked": True,
     "operator_confirmed": False,
+    "pre_trade_risk_gate_enabled": True,
     "risk_settings": dict(DEFAULT_RISK_SETTINGS),
     "checklist": {str(item["key"]): False for item in CHECKLIST_ITEMS},
     "retry_policy": dict(DEFAULT_RETRY_POLICY),
@@ -852,6 +853,7 @@ def snapshot() -> dict[str, Any]:
         "kill_switch": STATE["kill_switch"],
         "new_entries_blocked": STATE["new_entries_blocked"],
         "operator_confirmed": STATE["operator_confirmed"],
+        "pre_trade_risk_gate_enabled": STATE["pre_trade_risk_gate_enabled"],
         "summary": {
             "status": "blocked" if blockers else ("watch" if warnings else "ready"),
             "blocker_count": len(blockers),
@@ -912,7 +914,7 @@ def set_mode(mode: str) -> dict[str, Any]:
 
 
 def set_flag(name: str, value: bool) -> dict[str, Any]:
-    if name not in {"kill_switch", "new_entries_blocked", "operator_confirmed", "dry_run"}:
+    if name not in {"kill_switch", "new_entries_blocked", "operator_confirmed", "dry_run", "pre_trade_risk_gate_enabled"}:
         return {"ok": False, "reason": "unknown flag", "snapshot": snapshot()}
     STATE[name] = bool(value)
     label = {
@@ -920,8 +922,9 @@ def set_flag(name: str, value: bool) -> dict[str, Any]:
         "new_entries_blocked": "신규 진입 차단",
         "operator_confirmed": "운용자 확인",
         "dry_run": "Dry Run 보호",
+        "pre_trade_risk_gate_enabled": "공통 주문 리스크 게이트",
     }[name]
-    level = "info" if name == "dry_run" and value else ("warn" if value else "info")
+    level = "info" if (name == "dry_run" and value) or (name == "pre_trade_risk_gate_enabled" and value) else ("warn" if value or name == "pre_trade_risk_gate_enabled" else "info")
     append_audit(level, label, f"{label} 값이 {value}(으)로 변경되었습니다.")
     if name == "kill_switch" and value:
         STATE["mode"] = "MONITOR"
@@ -1143,7 +1146,11 @@ def evaluate_order_gate_with_report(
     intent: OrderIntent | None = None,
 ) -> tuple[bool, str, str, str, PreTradeRiskReport]:
     intent = intent or default_order_intent(checks, side)
-    report = PreTradeRiskGate().evaluate(intent, pre_trade_context(checks, intent, dry_run))
+    report = (
+        PreTradeRiskGate().evaluate(intent, pre_trade_context(checks, intent, dry_run))
+        if STATE.get("pre_trade_risk_gate_enabled", True)
+        else disabled_risk_gate_report()
+    )
     if report.can_submit:
         if dry_run:
             return True, "dry_run", "simulated", "Dry Run 보호가 켜져 있어 브로커 전송 없이 주문 의도를 감사 로그에만 기록했습니다.", report
@@ -1155,6 +1162,19 @@ def evaluate_order_gate_with_report(
         return False, "risk_blocked", "blocked", report.summary, report
     adapter_blocker = next((check for check in report.blockers if check.label == "실주문 어댑터"), report.blockers[0])
     return False, "adapter_blocked", "held", adapter_blocker.detail, report
+
+
+def disabled_risk_gate_report() -> PreTradeRiskReport:
+    return PreTradeRiskReport(
+        datetime.now(),
+        (
+            RiskCheck(
+                "공통 주문 리스크 게이트",
+                "fail",
+                "설정에서 공통 주문 리스크 게이트가 OFF입니다. 안전을 위해 모든 주문 의도를 차단합니다.",
+            ),
+        ),
+    )
 
 
 def default_order_intent(checks: dict[str, Any], side: str) -> OrderIntent:

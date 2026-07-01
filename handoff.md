@@ -273,6 +273,8 @@ As of 2026-07-02, live order test/retry paths no longer use only a simple readin
 - `live_trader\order_management.py` and `live_trader\risk_engine.py` are local compatibility wrappers so existing imports remain stable.
 - `live_trader\state.py` converts a strategy/test order into `OrderIntent`, builds `PreTradeContext` from current mode, dry-run, kill switch, readiness, reconciliation, broker readiness, and risk settings, then evaluates the intent through `PreTradeRiskGate`.
 - Orders now keep a `risk_report` payload so the UI/log layer can later explain exactly which checks passed, warned, or blocked the order.
+- Settings now expose `공통 주문 리스크 게이트` as `pre_trade_risk_gate_enabled`.
+- This toggle is fail-closed: when OFF, the app does not bypass risk checks; it blocks all order intents with a `risk_blocked` report until the gate is turned back ON.
 - Non-dry-run broker transmission still remains blocked until the real send layer and adapter verification are intentionally enabled.
 
 ## Strategy Artifacts
@@ -342,6 +344,7 @@ Known safety flags in state:
 - `new_entries_blocked`
 - `kill_switch`
 - `operator_confirmed`
+- `pre_trade_risk_gate_enabled`
 - `mode`
 
 Important nuance:
@@ -349,6 +352,7 @@ Important nuance:
 - `Dry Run` means generated order intents must not be sent to broker.
 - `신규 진입 차단` blocks new entry/buy orders.
 - `Kill Switch` is a hard stop.
+- `pre_trade_risk_gate_enabled=false` is a pause/lock for the order-intent path, not a permission to skip the shared risk gate.
 
 ## Automation Model
 
@@ -398,7 +402,7 @@ Notes from recent builds:
 
 - Build succeeded after the latest UI changes.
 - PyInstaller may warn about Android/webview or pycparser hidden imports; these were non-blocking in recent runs.
-- Current output EXE was rebuilt after commit `69a1316`.
+- Current output EXE was rebuilt on 2026-07-02 after adding the fail-closed common order risk gate toggle.
 
 User preference:
 
@@ -418,7 +422,7 @@ npm run build
 Results:
 
 - `npm run build`: passed.
-- `python -m unittest discover -s tests`: passed.
+- `python -m unittest discover -s tests`: passed. Latest run: 22 tests.
 - `pytest`: not installed in the current venv, so use `unittest` unless adding pytest intentionally.
 - EXE build: passed.
 
