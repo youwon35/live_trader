@@ -271,7 +271,7 @@ Artifact search order:
 
 1. `LIVE_TRADER_STRATEGY_ARTIFACT_DIR`
 2. `TRADER_STRATEGY_ARTIFACT_DIR`
-3. `F:\stock_market_data\strategies`
+3. `trading-system\packages\strategy-core`
 4. `%APPDATA%\trading_programs\strategies`
 
 Strategy plugin folders:

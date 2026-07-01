@@ -53,7 +53,7 @@ Current implementation includes broker readiness checks and blocked adapter stub
 
 ## Compatibility Notes
 
-- Strategy artifacts are read from `LIVE_TRADER_STRATEGY_ARTIFACT_DIR` or `TRADER_STRATEGY_ARTIFACT_DIR` first, then `F:\stock_market_data\strategies`, then `%APPDATA%\trading_programs\strategies`.
+- Strategy artifacts are read from `LIVE_TRADER_STRATEGY_ARTIFACT_DIR` or `TRADER_STRATEGY_ARTIFACT_DIR` first, then `trading-system\packages\strategy-core`, then `%APPDATA%\trading_programs\strategies`.
 - Strategy plugin folders are read from `LIVE_TRADER_STRATEGY_PLUGIN_DIR` or `TRADER_STRATEGY_PLUGIN_DIR`; when unset, each artifact folder's `plugins` subfolder is used.
 - Shared live permission checks mirror `packages/trading-contracts`.
 - The React UI imports `../../../packages/design/design-tokens.css`.

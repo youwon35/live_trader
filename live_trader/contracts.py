@@ -27,7 +27,8 @@ PLUGIN_LABELS = {
     "threshold_momentum": "Threshold Momentum",
 }
 
-PRIMARY_STRATEGY_ARTIFACT_DIR = Path("F:/stock_market_data/strategies")
+TRADING_SYSTEM_ROOT = Path(__file__).resolve().parents[3]
+PRIMARY_STRATEGY_ARTIFACT_DIR = TRADING_SYSTEM_ROOT / "packages" / "strategy-core"
 
 
 def _dict_value(value: Any) -> dict[str, Any]:

@@ -518,7 +518,7 @@ button {
   padding: 10px 12px;
   color: var(--danger-soft-text);
   background: var(--danger-surface);
-  border: 1px solid var(--danger-border);
+  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
 }
 
@@ -835,18 +835,17 @@ button {
   place-items: center;
   min-height: 26px;
   padding: 0 8px 1px;
-  color: var(--success-soft-text);
-  background: var(--success-surface);
-  border: 1px solid var(--success-border);
+  color: var(--success-text);
+  background: var(--status-pill-success-background, #dcfce7);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-caption);
   font-weight: var(--font-weight-bold);
 }
 
 .env-list span.missing {
-  color: var(--danger-soft-text);
-  background: var(--danger-surface);
-  border-color: var(--danger-border);
+  color: var(--status-pill-text, #0f172a);
+  background: var(--status-pill-danger-background, #fee2e2);
 }
 
 .wizard-list,
@@ -914,8 +913,9 @@ button {
 }
 
 .automation-card.running {
-  border-color: var(--success-border);
-  box-shadow: 0 0 0 1px var(--success-border);
+  background: var(--success-surface);
+  border-color: var(--border);
+  box-shadow: none;
 }
 
 .automation-panel {
@@ -1186,11 +1186,13 @@ button {
 }
 
 .env-check.present {
-  border-color: var(--success-border);
+  background: var(--status-pill-success-background, #dcfce7);
+  border-color: var(--border);
 }
 
 .env-check.missing {
-  border-color: var(--danger-border);
+  background: var(--status-pill-danger-background, #fee2e2);
+  border-color: var(--border);
 }
 
 .env-check strong,
@@ -1217,7 +1219,7 @@ button {
 }
 
 .env-check.missing span {
-  color: var(--danger-soft-text);
+  color: var(--status-pill-text, #0f172a);
 }
 
 .next-actions {
@@ -1254,11 +1256,19 @@ button {
 }
 
 .capability-item.pass {
-  border-color: var(--success-border);
+  background: var(--status-pill-success-background, #dcfce7);
+  border-color: var(--border);
 }
 
 .capability-item.fail {
-  border-color: var(--danger-border);
+  background: var(--status-pill-danger-background, #fee2e2);
+  border-color: var(--border);
+}
+
+.capability-item.warn,
+.capability-item.warning {
+  background: var(--status-pill-warning-background, #fef3c7);
+  border-color: var(--border);
 }
 
 .capability-item strong,
@@ -1280,6 +1290,20 @@ button {
   line-height: 1.35;
 }
 
+.capability-item.pass strong,
+.capability-item.pass span {
+  color: var(--success-text);
+}
+
+.capability-item.fail strong,
+.capability-item.fail span,
+.capability-item.warn strong,
+.capability-item.warn span,
+.capability-item.warning strong,
+.capability-item.warning span {
+  color: var(--status-pill-text, #0f172a);
+}
+
 .checklist-row {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr) auto;
@@ -1293,7 +1317,8 @@ button {
 }
 
 .checklist-row.checked {
-  border-color: var(--success-border);
+  background: var(--success-surface);
+  border-color: var(--border);
 }
 
 .checklist-row input {
@@ -1677,7 +1702,7 @@ button {
   padding: 9px 10px;
   color: var(--danger-soft-text);
   background: var(--danger-surface);
-  border: 1px solid var(--danger-border);
+  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
 }
 
@@ -1889,7 +1914,7 @@ button {
   padding: 0 7px;
   color: var(--status-pill-text, #0f172a);
   background: #d7ebff;
-  border: 1px solid #8bbbe9;
+  border: 1px solid transparent;
   border-radius: 6px;
   font-family: Consolas, "SFMono-Regular", monospace;
   font-size: 12px;
@@ -1897,26 +1922,26 @@ button {
 }
 
 .scope-system {
-  border-color: #8bbbe9;
+  border-color: transparent;
   background: #d7ebff;
   color: #12345a;
 }
 
 .scope-order {
-  border-color: #d99b3f;
+  border-color: transparent;
   background: #fff0ca;
   color: #5f380d;
 }
 
 .scope-paper,
 .scope-strategy {
-  border-color: #81c784;
+  border-color: transparent;
   background: #dcfce7;
   color: #14532d;
 }
 
 .scope-api {
-  border-color: #5fb5b0;
+  border-color: transparent;
   background: #ccfbf1;
   color: #134e4a;
 }
@@ -1924,20 +1949,20 @@ button {
 .scope-risk,
 .level-error,
 .level-danger {
-  border-color: #ef9a9a;
+  border-color: transparent;
   background: #fee2e2;
   color: #7f1d1d;
 }
 
 .level-warn,
 .level-warning {
-  border-color: #d99b3f;
+  border-color: transparent;
   background: #fef3c7;
   color: #5f380d;
 }
 
 .level-info {
-  border-color: #8bbbe9;
+  border-color: transparent;
   background: #d7ebff;
   color: #0f3f68;
 }
@@ -2187,7 +2212,7 @@ button {
   padding: 8px 10px;
   color: var(--success-text);
   background: var(--success-surface);
-  border: 1px solid var(--success-border);
+  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   font-size: var(--font-size-small);
   font-weight: var(--font-weight-strong);
@@ -3461,7 +3486,7 @@ body {
 :root[data-ui-theme='light'] .alert-band {
   color: #7f1d1d;
   background: #fff1f2;
-  border-color: #ef4444;
+  border-color: var(--border);
 }
 
 :root[data-ui-theme='light'] .alert-band strong,
