@@ -48,9 +48,11 @@ import {
   submitTestIntent,
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
+import { createStatusPill } from "../../../packages/design/status-pill.js";
 import designTokens from "../../../packages/design/design_tokens.json";
 
 const ActionButton = createActionButton(React);
+const StatusPill = createStatusPill(React);
 
 const navItems = [
   { id: "overview", label: "사전점검", icon: LayoutDashboard },
@@ -1736,25 +1738,6 @@ function NotificationPanel({ items, onNavigate }) {
       </div>
     </section>
   );
-}
-
-function StatusPill({ children, tone = "neutral" }) {
-  const resolvedTone = statusToneFromLabel(children) ?? tone;
-  return (
-    <span className={`status-pill ${resolvedTone}`}>
-      <span className="status-pill-text">{children}</span>
-    </span>
-  );
-}
-
-function statusToneFromLabel(value) {
-  const normalized = String(value ?? "").toUpperCase();
-  if (/\b(BLOCK|BLOCKED|FAIL|FAILED|DANGER|KILLED|ISSUE|ERROR|MISMATCH)\b/.test(normalized)) return "danger";
-  if (/\b(CHECK|WATCH|WARN|WARNING|ATTENTION|CLOSED|FALLBACK|QUEUED)\b/.test(normalized)) return "warning";
-  if (/\b(DONE|READY|PASS|VALID|OK|ALLOWED|CLEAN|MATCH|CONNECTED|ORDERABLE|LOADED|ACTIVE|ON)\b/.test(normalized)) return "success";
-  if (/\b(COMMAND|EXPORT|MONITOR|SHADOW|PAPER|OBSERVE)\b/.test(normalized)) return "info";
-  if (/\b(WAIT|EMPTY|OFF|NO LOG|NO STORE)\b/.test(normalized)) return "neutral";
-  return null;
 }
 
 function verificationTone(status) {
