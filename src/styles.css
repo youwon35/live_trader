@@ -3843,3 +3843,227 @@ body {
 .panel-action-line {
   align-content: center;
 }
+
+/* Match the stock_data_scraper log table rhythm and badge palette. */
+.audit-panel,
+.logs-panel.logs-page-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  min-height: 0;
+  padding: 10px;
+}
+
+.audit-panel .logs-toolbar,
+.logs-panel.logs-page-panel .logs-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(120px, 150px) minmax(110px, 140px) minmax(120px, 150px) auto auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.audit-panel .logs-toolbar .search-box,
+.logs-panel.logs-page-panel .logs-toolbar .search-box {
+  width: 100%;
+  min-height: 36px;
+  margin: 0;
+  border-radius: 8px;
+}
+
+.audit-panel .logs-toolbar select,
+.logs-panel.logs-page-panel .logs-toolbar select {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.audit-panel .logs-export-button,
+.logs-panel.logs-page-panel .logs-export-button {
+  min-height: 36px;
+  margin: 0;
+  padding: 0 12px;
+  white-space: nowrap;
+}
+
+.audit-panel .logs-toolbar > span,
+.logs-panel.logs-page-panel .logs-toolbar > span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.audit-panel .logs-table,
+.logs-panel.logs-page-panel .logs-table {
+  height: auto;
+  min-height: 520px;
+  max-height: none;
+  resize: vertical;
+  overflow: auto;
+}
+
+.audit-panel .logs-table table,
+.logs-panel.logs-page-panel .logs-table table {
+  width: max-content;
+  min-width: 1166px;
+  table-layout: auto;
+}
+
+.audit-panel .logs-table th,
+.audit-panel .logs-table td,
+.logs-panel.logs-page-panel .logs-table th,
+.logs-panel.logs-page-panel .logs-table td {
+  padding: 7px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.audit-panel .logs-table th,
+.logs-panel.logs-page-panel .logs-table th {
+  height: 38px;
+  font-weight: 800;
+}
+
+.audit-panel .logs-table th:nth-child(1),
+.audit-panel .logs-table td:nth-child(1),
+.logs-panel.logs-page-panel .logs-table th:nth-child(1),
+.logs-panel.logs-page-panel .logs-table td:nth-child(1) {
+  width: 170px;
+}
+
+.audit-panel .logs-table th:nth-child(2),
+.audit-panel .logs-table td:nth-child(2),
+.logs-panel.logs-page-panel .logs-table th:nth-child(2),
+.logs-panel.logs-page-panel .logs-table td:nth-child(2) {
+  width: 132px;
+}
+
+.audit-panel .logs-table th:nth-child(3),
+.audit-panel .logs-table td:nth-child(3),
+.logs-panel.logs-page-panel .logs-table th:nth-child(3),
+.logs-panel.logs-page-panel .logs-table td:nth-child(3) {
+  width: 94px;
+}
+
+.audit-panel .logs-table th:nth-child(4),
+.audit-panel .logs-table td:nth-child(4),
+.logs-panel.logs-page-panel .logs-table th:nth-child(4),
+.logs-panel.logs-page-panel .logs-table td:nth-child(4) {
+  width: 150px;
+}
+
+.audit-panel .logs-table th:nth-child(5),
+.audit-panel .logs-table td:nth-child(5),
+.logs-panel.logs-page-panel .logs-table th:nth-child(5),
+.logs-panel.logs-page-panel .logs-table td:nth-child(5) {
+  width: 620px;
+}
+
+.audit-panel .log-message-cell,
+.audit-panel .compact-table td.log-message-cell,
+.logs-panel.logs-page-panel .log-message-cell,
+.logs-panel.logs-page-panel .compact-table td.log-message-cell {
+  max-width: 760px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: normal;
+}
+
+.audit-panel .scope-pill,
+.audit-panel .level-pill,
+.logs-panel.logs-page-panel .scope-pill,
+.logs-panel.logs-page-panel .level-pill {
+  min-height: 22px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0 7px;
+  color: #0f172a;
+  box-shadow: none;
+}
+
+.audit-panel .scope-system,
+.logs-panel.logs-page-panel .scope-system {
+  color: #27376b;
+  background: #e0e7ff;
+}
+
+.audit-panel .scope-order,
+.logs-panel.logs-page-panel .scope-order {
+  color: #5f380d;
+  background: #fef3c7;
+}
+
+.audit-panel .scope-paper,
+.audit-panel .scope-strategy,
+.logs-panel.logs-page-panel .scope-paper,
+.logs-panel.logs-page-panel .scope-strategy {
+  color: #14532d;
+  background: #dcfce7;
+}
+
+.audit-panel .scope-api,
+.logs-panel.logs-page-panel .scope-api {
+  color: #0f4a46;
+  background: #ccfbf1;
+}
+
+.audit-panel .scope-risk,
+.logs-panel.logs-page-panel .scope-risk {
+  color: #7f1d1d;
+  background: #fee2e2;
+}
+
+.audit-panel .level-info,
+.logs-panel.logs-page-panel .level-info {
+  color: #0f3f68;
+  background: #d7ebff;
+}
+
+.audit-panel .level-warn,
+.audit-panel .level-warning,
+.logs-panel.logs-page-panel .level-warn,
+.logs-panel.logs-page-panel .level-warning {
+  color: #5f380d;
+  background: #fef3c7;
+}
+
+.audit-panel .level-error,
+.audit-panel .level-danger,
+.audit-panel .level-critical,
+.audit-panel .level-failed,
+.logs-panel.logs-page-panel .level-error,
+.logs-panel.logs-page-panel .level-danger,
+.logs-panel.logs-page-panel .level-critical,
+.logs-panel.logs-page-panel .level-failed {
+  color: #7f1d1d;
+  background: #fee2e2;
+}
+
+.audit-panel .level-debug,
+.audit-panel .level-trace,
+.logs-panel.logs-page-panel .level-debug,
+.logs-panel.logs-page-panel .level-trace {
+  color: #334155;
+  background: #e2e8f0;
+}
+
+.audit-panel .level-success,
+.audit-panel .level-ok,
+.logs-panel.logs-page-panel .level-success,
+.logs-panel.logs-page-panel .level-ok {
+  color: #14532d;
+  background: #dcfce7;
+}
+
+.audit-panel .level-running,
+.logs-panel.logs-page-panel .level-running {
+  color: #155e75;
+  background: #cffafe;
+}
