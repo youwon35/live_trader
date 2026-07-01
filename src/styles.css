@@ -133,7 +133,7 @@ button {
 }
 
 .nav-item.active {
-  color: #ffffff;
+  color: var(--status-pill-text, #0f172a);
   background: var(--primary);
   border-color: var(--primary-border);
 }
@@ -2348,7 +2348,7 @@ body {
 }
 
 .nav-item.active {
-  color: #ffffff;
+  color: var(--status-pill-text, #0f172a);
   background: var(--primary);
   border-color: var(--primary-border);
   box-shadow: none;
@@ -3316,7 +3316,7 @@ body {
 .theme-mode-button.selected,
 .accent-swatch.selected {
   color: var(--text);
-  background: rgba(47, 128, 237, 0.18);
+  background: color-mix(in srgb, var(--primary) 18%, var(--panel-raised, var(--button)));
   border-color: var(--primary-border);
   box-shadow: var(--focus-primary, 0 0 0 3px rgba(47, 128, 237, 0.18));
 }
@@ -3349,7 +3349,7 @@ body {
 
 .custom-accent-picker.selected {
   color: var(--text);
-  background: rgba(47, 128, 237, 0.18);
+  background: color-mix(in srgb, var(--primary) 18%, var(--panel-raised, var(--button)));
   border-color: var(--primary-border);
   box-shadow: var(--focus-primary, 0 0 0 3px rgba(47, 128, 237, 0.18));
 }
@@ -3547,7 +3547,7 @@ body {
 }
 
 :root[data-ui-theme='light'] .nav-item.active {
-  color: #ffffff;
+  color: var(--status-pill-text, #0f172a);
   background: var(--primary);
   border-color: var(--primary-border);
 }
