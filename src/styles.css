@@ -1889,36 +1889,57 @@ button {
   padding: 0 7px;
   color: var(--status-pill-text, #0f172a);
   background: #d7ebff;
+  border: 1px solid #8bbbe9;
   border-radius: 6px;
   font-family: Consolas, "SFMono-Regular", monospace;
   font-size: 12px;
   font-weight: var(--font-weight-bold);
 }
 
-.scope-order,
-.scope-paper,
-.scope-strategy,
 .scope-system {
+  border-color: #8bbbe9;
   background: #d7ebff;
+  color: #12345a;
+}
+
+.scope-order {
+  border-color: #d99b3f;
+  background: #fff0ca;
+  color: #5f380d;
+}
+
+.scope-paper,
+.scope-strategy {
+  border-color: #81c784;
+  background: #dcfce7;
+  color: #14532d;
 }
 
 .scope-api {
+  border-color: #5fb5b0;
   background: #ccfbf1;
+  color: #134e4a;
 }
 
 .scope-risk,
 .level-error,
 .level-danger {
+  border-color: #ef9a9a;
   background: #fee2e2;
+  color: #7f1d1d;
 }
 
 .level-warn,
 .level-warning {
+  border-color: #d99b3f;
   background: #fef3c7;
+  color: #5f380d;
 }
 
 .level-info {
+  border-color: #8bbbe9;
   background: #d7ebff;
+  color: #0f3f68;
 }
 
 .log-message-cell {

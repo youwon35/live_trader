@@ -13,6 +13,7 @@ class StateMemoryTest(unittest.TestCase):
 
             self.assertEqual(state.AUDIT_LOG_LIMIT, len(state.STATE["audit"]))
             self.assertEqual("event 25", state.STATE["audit"][0]["detail"])
+            self.assertRegex(state.STATE["audit"][0]["timestamp"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
         finally:
             state.STATE["audit"] = original_audit
 

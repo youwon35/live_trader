@@ -1219,6 +1219,25 @@ function dateStamp(date = new Date()) {
   return date.toISOString().replace(/[-:]/g, "").slice(0, 15);
 }
 
+function formatAuditTime(item = {}) {
+  const value = item.timestamp || item.datetime || item.createdAt || item.time || "";
+  const text = String(value || "").trim();
+  const fullMatch = text.match(/(\d{4})[-.](\d{2})[-.](\d{2})[T\s]+(\d{2}:\d{2}:\d{2})/);
+  if (fullMatch) return `${fullMatch[1]}-${fullMatch[2]}-${fullMatch[3]} ${fullMatch[4]}`;
+  const parsed = new Date(text);
+  if (!Number.isNaN(parsed.getTime())) {
+    const pad = (number) => String(number).padStart(2, "0");
+    return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`;
+  }
+  const timeMatch = text.match(/(\d{2}:\d{2}:\d{2})/);
+  if (timeMatch) {
+    const now = new Date();
+    const pad = (number) => String(number).padStart(2, "0");
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${timeMatch[1]}`;
+  }
+  return text || "-";
+}
+
 function csvCell(value) {
   if (value === null || value === undefined) return "";
   const text = String(value).replaceAll('"', '""');
@@ -2630,16 +2649,17 @@ function AuditPanel({ audit }) {
   const rows = audit.map((item, index) => {
     const logChannel = inferLogChannel(item);
     const normalizedLevel = item.level === "danger" ? "ERROR" : item.level === "warn" ? "WARN" : "INFO";
+    const displayTime = formatAuditTime(item);
     return {
-      id: `${item.time}-${index}`,
-      time: item.time,
+      id: `${item.timestamp || item.time}-${index}`,
+      time: displayTime,
       level: normalizedLevel,
       channel: logChannel,
       scope: logChannel,
       module: item.event,
       source: item.event,
       message: item.detail,
-      raw: `${item.time} ${normalizedLevel} ${logChannel} ${item.event} ${item.detail}`.toLowerCase(),
+      raw: `${displayTime} ${normalizedLevel} ${logChannel} ${item.event} ${item.detail}`.toLowerCase(),
     };
   });
   const visibleRows = rows

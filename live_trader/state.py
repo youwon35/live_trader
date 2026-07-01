@@ -883,7 +883,13 @@ def snapshot() -> dict[str, Any]:
 
 
 def append_audit(level: str, event: str, detail: str) -> None:
-    STATE["audit"].append({"time": now_text(), "level": level, "event": event, "detail": detail})
+    STATE["audit"].append({
+        "time": now_text(),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "level": level,
+        "event": event,
+        "detail": detail,
+    })
     if len(STATE["audit"]) > AUDIT_LOG_LIMIT:
         del STATE["audit"][: len(STATE["audit"]) - AUDIT_LOG_LIMIT]
 
