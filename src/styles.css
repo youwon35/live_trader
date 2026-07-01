@@ -555,10 +555,13 @@ button {
   display: grid;
   gap: 10px;
   min-width: 0;
+  max-width: 100%;
 }
 
 .panel {
+  box-sizing: border-box;
   min-width: 0;
+  max-width: 100%;
   padding: 12px;
   background: var(--panel);
   border: 1px solid var(--border);
@@ -2932,11 +2935,16 @@ body {
 
 .content-column {
   gap: 10px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .panel {
   position: relative;
+  box-sizing: border-box;
   min-height: 150px;
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   padding: 10px;
   background: var(--panel);
@@ -3029,6 +3037,7 @@ body {
 
 .resizable-panel {
   min-width: 260px;
+  max-width: 100%;
   min-height: 150px;
   resize: none;
 }
@@ -3536,7 +3545,20 @@ body {
 @media (max-width: 1260px) {
   .command-grid,
   .content-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+    overflow: visible;
+  }
+
+  .page-view > .content-grid {
+    overflow: visible;
+  }
+
+  .command-grid .resizable-panel,
+  .content-grid .resizable-panel {
+    width: 100% !important;
+    max-width: 100%;
+    margin-left: 0 !important;
+    margin-top: 0 !important;
   }
 
   .summary-grid,
