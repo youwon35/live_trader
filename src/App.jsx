@@ -1,3 +1,4 @@
+import * as React from "react";
 import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
@@ -46,7 +47,10 @@ import {
   saveUiSettings,
   submitTestIntent,
 } from "./api";
+import { createActionButton } from "../../../packages/design/action-button.js";
 import designTokens from "../../../packages/design/design_tokens.json";
+
+const ActionButton = createActionButton(React);
 
 const navItems = [
   { id: "overview", label: "사전점검", icon: LayoutDashboard },
@@ -1455,10 +1459,17 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight })
           <strong>{hasRun ? (problemCount ? "조치 필요" : "통과") : "대기"}</strong>
           <p>{hasRun ? `hard stop ${failCount}개, warning ${warnCount}개를 확인했습니다.` : "점검 실행 버튼을 눌러 API, 리스크, 체크리스트, 대조 상태를 검사하세요."}</p>
         </div>
-        <button className="primary-button doctor-run-button ts-action-button" data-action-status={running ? "pending" : hasRun ? (problemCount ? "error" : "success") : undefined} type="button" onClick={runDoctor} disabled={running}>
-          <Play size={16} />
-          {running ? "점검 중" : "점검 실행"}
-        </button>
+        <ActionButton
+          className="primary-button doctor-run-button"
+          disabled={running}
+          icon={<Play size={16} />}
+          label="점검 실행"
+          onClick={runDoctor}
+          pending={running}
+          pendingLabel="점검 중"
+          status={running ? "pending" : hasRun ? (problemCount ? "error" : "success") : undefined}
+          variant="primary"
+        />
       </div>
       <div className="doctor-grid">
         {items.map((item) => (
