@@ -489,29 +489,43 @@ UI gaps to watch:
 - Keep white mode text high-contrast.
 - Keep selected nav using user accent color where applicable.
 
-## Best Next Engineering Steps
+## Selected Roadmap
 
-1. Implement real strategy plugin runner boundary:
+The user selected this order on 2026-07-02:
+
+1. Strengthen real-time order/risk audit logs:
+   - every submitted, blocked, or retried order should leave the risk gate result in the audit log
+   - CSV/HTML exports should contain the same reason trail
+2. Share the strategy plugin runner boundary:
    - load approved Backtester/Paper artifact
    - normalize signal into `OrderIntent`
-   - route to KIS/Binance/Upbit adapter
-   - always pass through risk gate before broker call
-2. Add real account/position read APIs:
-   - KIS balance/positions
-   - Binance account/balances
-   - Upbit accounts
-3. Add order adapter send layer behind explicit safety flag:
-   - request preview first
-   - signed request second
-   - tiny live test only after operator approval
-4. Add persistent order/audit storage:
-   - SQLite or local append-only JSONL
-   - exportable logs
-5. Add Playwright/Electron-style UI smoke sweep:
-   - each tab renders
-   - no blank screen
-   - no major overlap
-   - white/dark mode readable
+   - pass through `PreTradeRiskGate`
+   - only then send to adapter or dry-run ledger
+3. Implement a Live Trader watchdog:
+   - monitor heartbeat, stale data, broker/API health, and runaway order conditions
+   - fail closed to MONITOR or new-entry block when critical checks fail
+4. Implement real account/position reconciliation:
+   - KIS balance/holdings
+   - Binance account/order status
+   - Upbit balances
+   - feed reconciliation dashboard from real snapshots
+
+Lower-priority follow-up:
+
+- Add real order adapter send layer only after explicit approval and adapter fixtures.
+- Add persistent order/audit storage after the in-memory flow is stable.
+- Add Playwright/Electron-style UI smoke sweep for labels, themes, and exports.
+
+## Best Next Engineering Steps
+
+1. Finish the selected roadmap in order:
+   - order/risk audit log strengthening
+   - shared strategy plugin runner boundary
+   - Live Trader watchdog
+   - real account/position reconciliation
+2. Keep the live path fixed as:
+   - `OrderIntent -> PreTradeRiskGate -> adapter/dry-run boundary`
+   - no strategy, retry, or test order route should bypass this gate
 
 ## Files Most Likely To Touch Next
 

@@ -132,6 +132,7 @@ class OrderGateTest(unittest.TestCase):
 
     def test_submit_test_intent_creates_dry_run_order_when_gate_passes(self) -> None:
         state.STATE["orders"] = []
+        state.STATE["audit"] = []
         state.STATE["dry_run"] = True
         state.STATE["new_entries_blocked"] = False
         fake_snapshot = {
@@ -152,9 +153,40 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(order["strategy_id"], "LIVE-OK")
         self.assertIn("risk_report", order)
         self.assertTrue(order["risk_report"]["can_submit"])
+        audit_detail = state.STATE["audit"][-1]["detail"]
+        self.assertIn("LIVE-DRY-0001", audit_detail)
+        self.assertIn("BTCUSDT BUY dry_run/simulated", audit_detail)
+        self.assertIn("risk pass", audit_detail)
+        self.assertIn("제출 허용", audit_detail)
+
+    def test_submit_test_intent_audit_records_blocking_risk_reason(self) -> None:
+        state.STATE["orders"] = []
+        state.STATE["audit"] = []
+        state.STATE["dry_run"] = True
+        state.STATE["new_entries_blocked"] = True
+        fake_snapshot = {
+            "summary": {"blocker_count": 0},
+            "strategies": [{"strategy_id": "LIVE-BLOCKED", "symbol": "BTCUSDT", "live_allowed": True}],
+        }
+
+        with patch("live_trader.state.snapshot", return_value=fake_snapshot):
+            result = state.submit_test_intent()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(state.STATE["orders"]), 1)
+        order = state.STATE["orders"][0]
+        self.assertEqual(order["state"], "risk_blocked")
+        self.assertFalse(order["risk_report"]["can_submit"])
+        audit_detail = state.STATE["audit"][-1]["detail"]
+        self.assertIn("BTCUSDT BUY risk_blocked/blocked", audit_detail)
+        self.assertIn("risk pass", audit_detail)
+        self.assertIn("fail", audit_detail)
+        self.assertIn("제출 차단", audit_detail)
+        self.assertIn("신규 진입 차단", audit_detail)
 
     def test_submit_test_intent_holds_non_dry_run_order_even_without_blockers(self) -> None:
         state.STATE["orders"] = []
+        state.STATE["audit"] = []
         state.STATE["dry_run"] = False
         state.STATE["new_entries_blocked"] = False
         fake_snapshot = {
@@ -172,6 +204,11 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(order["state"], "adapter_blocked")
         self.assertEqual(order["queue_state"], "held")
         self.assertFalse(order["dry_run"])
+        audit_detail = state.STATE["audit"][-1]["detail"]
+        self.assertIn("LIVE-BLOCK-0001", audit_detail)
+        self.assertIn("adapter_blocked/held", audit_detail)
+        self.assertIn("risk pass", audit_detail)
+        self.assertIn("제출 차단", audit_detail)
 
 
 if __name__ == "__main__":

@@ -896,6 +896,51 @@ def append_audit(level: str, event: str, detail: str) -> None:
         del STATE["audit"][: len(STATE["audit"]) - AUDIT_LOG_LIMIT]
 
 
+def audit_clip(text: object, limit: int = 160) -> str:
+    cleaned = " ".join(str(text).split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: max(0, limit - 3)].rstrip()}..."
+
+
+def risk_report_audit_summary(report: PreTradeRiskReport) -> str:
+    counts = {"pass": 0, "warn": 0, "fail": 0}
+    for check in report.checks:
+        status = str(check.status)
+        if status in counts:
+            counts[status] += 1
+
+    important_checks = list(report.blockers)
+    if not important_checks:
+        important_checks = [check for check in report.checks if check.status == "warn"]
+
+    parts = [
+        f"risk pass {counts['pass']} / warn {counts['warn']} / fail {counts['fail']}",
+        "제출 허용" if report.can_submit else "제출 차단",
+    ]
+    if important_checks:
+        checks_text = "; ".join(
+            f"{check.label}: {audit_clip(check.detail, 90)}"
+            for check in important_checks[:3]
+        )
+        parts.append(f"핵심 체크 {checks_text}")
+    else:
+        parts.append(f"요약 {audit_clip(report.summary, 120)}")
+    return " | ".join(parts)
+
+
+def order_gate_audit_detail(order: dict[str, Any], reason: str, report: PreTradeRiskReport) -> str:
+    order_id = str(order.get("order_id", "-"))
+    symbol = str(order.get("symbol", "-"))
+    side = str(order.get("side", "-"))
+    state_name = str(order.get("state", "-"))
+    queue_state = str(order.get("queue_state", "-"))
+    return (
+        f"{order_id} {symbol} {side} {state_name}/{queue_state}: "
+        f"{audit_clip(reason)} | {risk_report_audit_summary(report)}"
+    )
+
+
 def set_mode(mode: str) -> dict[str, Any]:
     data = snapshot()
     blockers = data["summary"]["blocker_count"]
@@ -1313,7 +1358,7 @@ def submit_test_intent() -> dict[str, Any]:
     }
     STATE["orders"].insert(0, order)
     STATE["orders"] = STATE["orders"][:50]
-    append_audit("info" if ok else "danger", "주문 게이트", f"{order['symbol']} {side}: {reason}")
+    append_audit("info" if ok else "danger", "주문 게이트", order_gate_audit_detail(order, reason, risk_report))
     return {"ok": ok, "reason": reason, "snapshot": snapshot()}
 
 
@@ -1358,7 +1403,7 @@ def retry_order(order_id: str) -> dict[str, Any]:
     order["reason"] = reason
     order["risk_report"] = risk_report.to_dict()
     order["next_retry_at"] = future_text(float(STATE["retry_policy"]["backoff_sec"])) if can_retry_order(order) else "-"
-    append_audit("info" if ok else "warn", "주문 재시도", f"{order_id}: {reason}")
+    append_audit("info" if ok else "warn", "주문 재시도", order_gate_audit_detail(order, reason, risk_report))
     return {"ok": ok, "reason": reason, "snapshot": snapshot()}
 
 
