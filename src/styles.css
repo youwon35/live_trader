@@ -1790,6 +1790,143 @@ button {
   margin-top: 0;
 }
 
+.audit-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  min-height: 0;
+  padding: 10px;
+}
+
+.logs-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(120px, 150px) minmax(110px, 140px) minmax(120px, 150px) auto auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.logs-toolbar .search-box {
+  width: 100%;
+  margin: 0;
+  border-radius: var(--radius-sm);
+}
+
+.logs-toolbar select {
+  width: 100%;
+  min-width: 0;
+  min-height: 35px;
+  color: var(--text);
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-bold);
+}
+
+.logs-toolbar > span {
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-bold);
+  white-space: nowrap;
+}
+
+.logs-export-button {
+  min-height: 35px;
+  margin: 0;
+  padding: 0 12px;
+  white-space: nowrap;
+}
+
+.table-scroll {
+  min-width: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--panel-raised);
+}
+
+.compact-table table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.compact-table th,
+.compact-table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-bold);
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.compact-table th {
+  color: var(--text);
+  background: var(--panel-muted);
+  font-weight: var(--font-weight-strong);
+}
+
+.logs-table {
+  min-height: 520px;
+}
+
+.logs-table table {
+  width: max-content;
+  min-width: 1166px;
+}
+
+.scope-pill,
+.level-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 7px;
+  color: var(--status-pill-text, #0f172a);
+  background: #d7ebff;
+  border-radius: 6px;
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 12px;
+  font-weight: var(--font-weight-bold);
+}
+
+.scope-order,
+.scope-paper,
+.scope-strategy,
+.scope-system {
+  background: #d7ebff;
+}
+
+.scope-api {
+  background: #ccfbf1;
+}
+
+.scope-risk,
+.level-error,
+.level-danger {
+  background: #fee2e2;
+}
+
+.level-warn,
+.level-warning {
+  background: #fef3c7;
+}
+
+.level-info {
+  background: #d7ebff;
+}
+
+.log-message-cell {
+  max-width: 760px;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: break-word;
+}
+
 .execution-log-toolbar {
   display: grid;
   grid-template-columns: minmax(220px, 1fr) 150px 150px 150px;
@@ -3556,4 +3693,35 @@ body {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* Shared button containment pass: keep action rows inside their panels and remove primary outlines. */
+.primary-button {
+  color: #ffffff !important;
+  background-color: var(--primary, #2f80ed) !important;
+  background-image: none !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+.primary-button:hover:not(:disabled) {
+  background-color: var(--primary-hover, #1d65d8) !important;
+  background-image: none !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+:is(.primary-button, .secondary-button, .danger-button, .ghost-button, .icon-button, .layout-mode-button, .layout-reset-button) {
+  box-sizing: border-box;
+  max-width: 100%;
+  min-width: 0;
+}
+
+:is(.topbar-actions, .operator-actions, .panel-action-line, .mode-selector) {
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.panel-action-line {
+  align-content: center;
 }

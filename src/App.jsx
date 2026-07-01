@@ -34,7 +34,6 @@ import {
 } from "lucide-react";
 import {
   cancelOrder,
-  exportAudit,
   getSnapshot,
   getUiSettings,
   runFinalPreflight,
@@ -58,7 +57,6 @@ import {
   createMetricGrid,
   createPageHeader,
   createPanelHeader,
-  createSearchField,
   createSegmentedControl,
   createToggleSwitch,
 } from "../../../packages/design/ui-primitives.js";
@@ -73,7 +71,6 @@ const MetricCard = createMetricCard(React);
 const MetricGrid = createMetricGrid(React);
 const PageHeader = createPageHeader(React);
 const PanelHeader = createPanelHeader(React);
-const SearchField = createSearchField(React);
 const SegmentedControl = createSegmentedControl(React);
 const ToggleSwitch = createToggleSwitch(React);
 
@@ -957,7 +954,6 @@ function App() {
   const [appearance, setAppearance] = useState(readAppearance);
   const [layoutMode, setLayoutMode] = useState(readLayoutMode);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
-  const [exportResult, setExportResult] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [acknowledgedNotifications, setAcknowledgedNotifications] = useState(() => readStoredValue(NOTIFICATION_ACK_STORAGE_KEY, ""));
@@ -1037,23 +1033,6 @@ function App() {
       const reason = err instanceof Error ? err.message : "요청 실패";
       setError(reason);
       return { ok: false, reason };
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function runAuditExport(format) {
-    setLoading(true);
-    try {
-      const result = await exportAudit(format);
-      if (result.snapshot) setSnapshot(result.snapshot);
-      setExportResult(result);
-      setError(result.ok === false ? result.reason : "");
-      if (result.ok !== false && result.content) {
-        downloadExport(result);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "내보내기 실패");
     } finally {
       setLoading(false);
     }
@@ -1235,8 +1214,6 @@ function App() {
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
           onReconcile={() => runAction(runReconciliation)}
           onPreflight={() => runAction(runFinalPreflight)}
-          onAuditExport={runAuditExport}
-          exportResult={exportResult}
           appearance={appearance}
           updateAppearance={updateAppearance}
           layoutMode={layoutMode}
@@ -1248,12 +1225,23 @@ function App() {
   );
 }
 
-function downloadExport(result) {
-  const blob = new Blob([result.content], { type: result.mime || "text/plain;charset=utf-8" });
+function dateStamp(date = new Date()) {
+  return date.toISOString().replace(/[-:]/g, "").slice(0, 15);
+}
+
+function csvCell(value) {
+  if (value === null || value === undefined) return "";
+  const text = String(value).replaceAll('"', '""');
+  return /[",\n]/.test(text) ? `"${text}"` : text;
+}
+
+function downloadCsv(columns, rows, filename) {
+  const csv = [columns.join(","), ...rows.map((row) => columns.map((column) => csvCell(row[column])).join(","))].join("\n");
+  const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
   const url = window.URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = result.filename || `live-trader-audit.${result.format || "txt"}`;
+  link.download = filename;
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -1279,8 +1267,6 @@ function WorkspaceContent({
   onCancelOrder,
   onReconcile,
   onPreflight,
-  onAuditExport,
-  exportResult,
   appearance,
   updateAppearance,
   layoutMode,
@@ -1354,7 +1340,6 @@ function WorkspaceContent({
   if (selectedNav === "audit") {
     return renderPage(
       <section className="audit-page-layout">
-        <AuditExportPanel onExport={onAuditExport} exportResult={exportResult} />
         <AuditPanel audit={snapshot.audit} />
       </section>,
     );
@@ -2385,33 +2370,6 @@ function BrokerRequirementsPanel({ brokers }) {
   );
 }
 
-function AuditExportPanel({ onExport, exportResult }) {
-  return (
-    <section className="mini-export-panel" aria-label="로그 내보내기">
-      <div>
-        <strong>내보내기</strong>
-        <span>운영 이벤트 원장 저장</span>
-      </div>
-      <div className="export-actions">
-        <button className="mini-button" type="button" onClick={() => onExport("csv")}>
-          <Download size={14} />
-          CSV
-        </button>
-        <button className="mini-button" type="button" onClick={() => onExport("html")}>
-          <Download size={14} />
-          HTML
-        </button>
-      </div>
-      {exportResult?.ok !== false && exportResult?.filename && (
-        <div className="export-result">
-          <Download size={15} />
-          <span>{exportResult.filename} 생성 완료</span>
-        </div>
-      )}
-    </section>
-  );
-}
-
 function ReconciliationSummaryPanel({ reconciliation, onReconcile }) {
   const summary = reconciliation?.summary ?? fallbackSnapshot.reconciliation.summary;
   const actions = reconciliation?.next_actions ?? [];
@@ -2687,7 +2645,9 @@ function AuditPanel({ audit }) {
       time: item.time,
       level: normalizedLevel,
       channel: logChannel,
+      scope: logChannel,
       module: item.event,
+      source: item.event,
       message: item.detail,
       raw: `${item.time} ${normalizedLevel} ${logChannel} ${item.event} ${item.detail}`.toLowerCase(),
     };
@@ -2698,59 +2658,85 @@ function AuditPanel({ audit }) {
     .filter((row) => !query.trim() || row.raw.includes(query.trim().toLowerCase()))
     .sort((a, b) => (sort === "latest" ? rows.indexOf(a) - rows.indexOf(b) : rows.indexOf(b) - rows.indexOf(a)));
   const channels = ["all", ...Array.from(new Set(rows.map((row) => row.channel)))];
+  const handleExportLogs = () => {
+    const exportRows = visibleRows.map((row) => ({
+      time: row.time || "",
+      scope: row.scope || "",
+      level: row.level || "",
+      source: row.source || "",
+      message: row.message || "",
+    }));
+    downloadCsv(["time", "scope", "level", "source", "message"], exportRows, `live-trader-logs-${dateStamp()}.csv`);
+  };
 
   return (
     <section className="panel audit-panel">
-      <PanelHeader title="실행 로그" subtitle="시간, 채널, 모듈, 메시지를 기준으로 실행 이력을 확인합니다." />
-      <div className="execution-log-toolbar">
-        <SearchField
-          ariaLabel="실행 로그 검색"
-          icon={<Search size={15} />}
-          onChange={(event) => setQuery(event.currentTarget.value)}
-          placeholder="시간, 채널, 모듈, 메시지 검색"
-          value={query}
-        />
-        <FormField label="채널">
-          <select value={channel} onChange={(event) => setChannel(event.currentTarget.value)}>
-            {channels.map((item) => (
-              <option value={item} key={item}>
-                {item === "all" ? "전체" : item}
-              </option>
-            ))}
-          </select>
-        </FormField>
-        <FormField label="레벨">
-          <select value={level} onChange={(event) => setLevel(event.currentTarget.value)}>
-            <option value="all">전체</option>
-            <option value="INFO">INFO</option>
-            <option value="WARN">WARN</option>
-            <option value="ERROR">ERROR</option>
-          </select>
-        </FormField>
-        <FormField label="정렬">
-          <select value={sort} onChange={(event) => setSort(event.currentTarget.value)}>
-            <option value="latest">최신순</option>
-            <option value="oldest">오래된순</option>
-          </select>
-        </FormField>
+      <div className="logs-toolbar">
+        <label className="search-box logs-search">
+          <input value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="메시지, scope, 작업명 검색" />
+          <Search size={18} />
+        </label>
+        <select value={channel} onChange={(event) => setChannel(event.currentTarget.value)}>
+          {channels.map((item) => (
+            <option value={item} key={item}>
+              {item === "all" ? "전체" : item}
+            </option>
+          ))}
+        </select>
+        <select value={level} onChange={(event) => setLevel(event.currentTarget.value)}>
+          <option value="all">전체</option>
+          <option value="INFO">INFO</option>
+          <option value="WARN">WARN</option>
+          <option value="ERROR">ERROR</option>
+        </select>
+        <select value={sort} onChange={(event) => setSort(event.currentTarget.value)}>
+          <option value="latest">최신순</option>
+          <option value="oldest">오래된순</option>
+        </select>
+        <button className="logs-export-button" type="button" onClick={handleExportLogs} disabled={!visibleRows.length}>
+          <Download size={16} />
+          CSV
+        </button>
+        <span>{visibleRows.length.toLocaleString()} / {rows.length.toLocaleString()}개</span>
       </div>
-      <div className="execution-log-list">
-        {visibleRows.length ? (
-          visibleRows.map((row) => (
-            <div className={`execution-log-row ${row.level.toLowerCase()}`} key={row.id}>
-              <span className="log-time">{row.time}</span>
-              <strong className="log-level">{row.level}</strong>
-              <span className="log-channel">{row.channel}</span>
-              <span className="log-module">[{row.module}]</span>
-              <span className="log-message">{row.message}</span>
-            </div>
-          ))
-        ) : (
-          <EmptyRow text="검색 조건에 맞는 로그가 없습니다." />
-        )}
+      <div className="table-scroll compact-table logs-table">
+        <table>
+          <thead>
+            <tr>
+              <th>시간</th>
+              <th>Scope</th>
+              <th>Level</th>
+              <th>Source</th>
+              <th>메시지</th>
+            </tr>
+          </thead>
+          <tbody>
+            {visibleRows.length ? (
+              visibleRows.map((row) => (
+                <tr key={row.id}>
+                  <td>{row.time}</td>
+                  <td><span className={`scope-pill scope-${logToken(row.scope)}`}>{row.scope}</span></td>
+                  <td><span className={`level-pill level-${logToken(row.level)}`}>{row.level}</span></td>
+                  <td>{row.source}</td>
+                  <td className="log-message-cell" title={row.message}>{row.message}</td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan={5}>
+                  <EmptyRow text="검색 조건에 맞는 로그가 없습니다." />
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </section>
   );
+}
+
+function logToken(value = "") {
+  return String(value || "unknown").trim().toLowerCase().replace(/[^a-z0-9가-힣]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
 }
 
 function inferLogChannel(item) {
