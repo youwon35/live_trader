@@ -69,6 +69,33 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(queue_state, "held")
         self.assertIn("실제 주문 어댑터 안전 검증 전", reason)
 
+    def test_order_gate_uses_pre_trade_risk_engine_for_daily_loss(self) -> None:
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["risk_settings"]["daily_loss_limit_pct"] = -2.0
+
+        ok, order_state, queue_state, reason, report = state.evaluate_order_gate_with_report(
+            {"summary": {"blocker_count": 0}},
+            "BUY",
+            dry_run=True,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(order_state, "dry_run")
+        self.assertTrue(report.can_submit)
+
+        state.STATE["risk_settings"]["daily_loss_limit_pct"] = 0.5
+        ok, order_state, queue_state, reason, report = state.evaluate_order_gate_with_report(
+            {"summary": {"blocker_count": 0}},
+            "BUY",
+            dry_run=True,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(order_state, "risk_blocked")
+        self.assertEqual(queue_state, "blocked")
+        self.assertIn("일일 손실 한도", reason)
+        self.assertFalse(report.can_submit)
+
     def test_kill_switch_forces_monitor_mode_and_blocks_new_entries(self) -> None:
         state.STATE["mode"] = "SMALL_LIVE"
         state.STATE["new_entries_blocked"] = False
@@ -118,6 +145,8 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(order["queue_state"], "simulated")
         self.assertTrue(order["dry_run"])
         self.assertEqual(order["strategy_id"], "LIVE-OK")
+        self.assertIn("risk_report", order)
+        self.assertTrue(order["risk_report"]["can_submit"])
 
     def test_submit_test_intent_holds_non_dry_run_order_even_without_blockers(self) -> None:
         state.STATE["orders"] = []

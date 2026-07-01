@@ -11,6 +11,8 @@ from typing import Any, Literal
 from .brokers import broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts, strategy_plugin_status
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
+from .order_management import OrderIntent, OrderSide
+from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder
 
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
@@ -1130,14 +1132,144 @@ def export_audit(format_name: str) -> dict[str, Any]:
 
 
 def evaluate_order_gate(checks: dict[str, Any], side: str, dry_run: bool) -> tuple[bool, str, str, str]:
-    blocker_count = int(checks["summary"]["blocker_count"])
-    if STATE["new_entries_blocked"] and side == "BUY":
-        return False, "risk_blocked", "blocked", "신규 진입 차단이 켜져 있어 BUY 주문을 차단했습니다."
-    if blocker_count:
-        return False, "risk_blocked", "blocked", f"readiness blocker {blocker_count}개가 남아 있어 실거래 주문을 제출하지 않았습니다."
-    if dry_run:
-        return True, "dry_run", "simulated", "Dry Run 보호가 켜져 있어 브로커 전송 없이 주문 의도를 감사 로그에만 기록했습니다."
-    return False, "adapter_blocked", "held", "실제 주문 어댑터 안전 검증 전이므로 브로커 전송을 차단했습니다."
+    ok, state_name, queue_state, reason, _report = evaluate_order_gate_with_report(checks, side, dry_run)
+    return ok, state_name, queue_state, reason
+
+
+def evaluate_order_gate_with_report(
+    checks: dict[str, Any],
+    side: str,
+    dry_run: bool,
+    intent: OrderIntent | None = None,
+) -> tuple[bool, str, str, str, PreTradeRiskReport]:
+    intent = intent or default_order_intent(checks, side)
+    report = PreTradeRiskGate().evaluate(intent, pre_trade_context(checks, intent, dry_run))
+    if report.can_submit:
+        if dry_run:
+            return True, "dry_run", "simulated", "Dry Run 보호가 켜져 있어 브로커 전송 없이 주문 의도를 감사 로그에만 기록했습니다.", report
+        return False, "adapter_blocked", "held", "실제 주문 전송 레이어가 아직 안전 검증 전이므로 브로커 전송을 차단했습니다.", report
+
+    adapter_labels = {"운용 모드", "실거래 환경 변수", "실주문 어댑터"}
+    non_adapter_blockers = [check for check in report.blockers if check.label not in adapter_labels]
+    if non_adapter_blockers:
+        return False, "risk_blocked", "blocked", report.summary, report
+    adapter_blocker = next((check for check in report.blockers if check.label == "실주문 어댑터"), report.blockers[0])
+    return False, "adapter_blocked", "held", adapter_blocker.detail, report
+
+
+def default_order_intent(checks: dict[str, Any], side: str) -> OrderIntent:
+    strategies = checks.get("strategies", [])
+    strategy = next((item for item in strategies if item.get("live_allowed")), strategies[0] if strategies else {})
+    normalized_side: OrderSide = "SELL" if str(side).upper() == "SELL" else "BUY"
+    symbol = str(strategy.get("symbol") or "TEST")
+    asset = str(strategy.get("asset") or asset_from_symbol(symbol))
+    return OrderIntent(
+        strategy_id=str(strategy.get("strategy_id") or "manual-test"),
+        asset=asset,
+        symbol=symbol,
+        side=normalized_side,
+        quantity=1.0,
+        reference_price=1000.0,
+        mode=current_mode(),
+        reason="live test intent",
+        metadata={"broker_id": strategy_broker_id(strategy) if strategy else broker_id_from_symbol(symbol, asset)},
+    )
+
+
+def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool) -> PreTradeContext:
+    settings = STATE["risk_settings"]
+    reconciliation = checks.get("reconciliation") if isinstance(checks.get("reconciliation"), dict) else {}
+    reconciliation_summary = reconciliation.get("summary") if isinstance(reconciliation.get("summary"), dict) else {}
+    positions_matched = str(reconciliation_summary.get("status", "pass")) == "pass"
+    return PreTradeContext(
+        mode=current_mode(),
+        dry_run=dry_run,
+        halted=bool(STATE["kill_switch"]),
+        new_entries_blocked=bool(STATE["new_entries_blocked"]),
+        readiness_blockers=int(checks.get("summary", {}).get("blocker_count", 0)),
+        readiness_warnings=int(checks.get("summary", {}).get("warning_count", 0)),
+        real_orders_enabled=real_orders_enabled(),
+        live_order_adapter_verified=broker_ready_for_intent(checks, intent),
+        max_order_value=float(settings["strategy_capital_limit_krw"]),
+        cooldown_seconds=int(float(settings["duplicate_order_cooldown_sec"])),
+        max_symbol_weight_pct=float(settings["max_symbol_exposure_pct"]),
+        daily_loss_limit_pct=float(settings["daily_loss_limit_pct"]),
+        strategy_capital_limit=float(settings["strategy_capital_limit_krw"]),
+        max_slippage_bps=float(settings["max_slippage_bps"]),
+        max_open_orders=int(float(settings["max_open_orders"])),
+        open_order_count=open_order_count(),
+        positions_matched=positions_matched,
+        recent_orders=recent_orders_for_risk(),
+    )
+
+
+def current_mode() -> Mode:
+    value = str(STATE.get("mode", "MONITOR")).upper()
+    if value in {"MONITOR", "SMALL_LIVE", "FULL_LIVE"}:
+        return value  # type: ignore[return-value]
+    return "MONITOR"
+
+
+def asset_from_symbol(symbol: str) -> str:
+    text = symbol.upper()
+    if any(token in text for token in ("BTC", "ETH", "USDT", "KRW-")):
+        return "코인"
+    if text.endswith(".KS") or text.isdigit():
+        return "한국주식"
+    return "미국주식"
+
+
+def broker_id_from_symbol(symbol: str, asset: str) -> str:
+    text = f"{symbol} {asset}".lower()
+    if "krw-" in text or "upbit" in text:
+        return "upbit"
+    if any(token in text for token in ("btc", "eth", "usdt", "코인", "crypto")):
+        return "binance"
+    return "kis"
+
+
+def broker_ready_for_intent(checks: dict[str, Any], intent: OrderIntent) -> bool:
+    broker_id = str(intent.metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset))
+    for broker in checks.get("brokers", []):
+        if str(broker.get("broker_id")) == broker_id:
+            return bool(broker.get("order_ready"))
+    return False
+
+
+def open_order_count() -> int:
+    return sum(1 for order in STATE["orders"] if order.get("state") not in FINAL_ORDER_STATES and order.get("queue_state") != "canceled")
+
+
+def recent_orders_for_risk() -> tuple[RecentOrder, ...]:
+    rows: list[RecentOrder] = []
+    for order in STATE["orders"][:50]:
+        occurred_at = parse_order_time(str(order.get("created_at") or order.get("time") or ""))
+        if occurred_at is None:
+            continue
+        side: OrderSide = "SELL" if str(order.get("side", "")).upper() == "SELL" else "BUY"
+        rows.append(
+            RecentOrder(
+                strategy_id=str(order.get("strategy_id", "")),
+                symbol=str(order.get("symbol", "")),
+                side=side,
+                occurred_at=occurred_at,
+                state=str(order.get("state", "")),
+            )
+        )
+    return tuple(rows)
+
+
+def parse_order_time(value: str) -> datetime | None:
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%H:%M:%S"):
+        try:
+            parsed = datetime.strptime(value, fmt)
+            if fmt == "%H:%M:%S":
+                now = datetime.now()
+                parsed = parsed.replace(year=now.year, month=now.month, day=now.day)
+            return parsed
+        except ValueError:
+            continue
+    return None
 
 
 def next_order_id(state_name: str, dry_run: bool) -> str:
@@ -1155,7 +1287,8 @@ def submit_test_intent() -> dict[str, Any]:
     strategy = next((item for item in checks["strategies"] if item["live_allowed"]), checks["strategies"][0])
     side = "BUY"
     dry_run = bool(STATE["dry_run"])
-    ok, order_state, queue_state, reason = evaluate_order_gate(checks, side, dry_run)
+    intent = default_order_intent(checks, side)
+    ok, order_state, queue_state, reason, risk_report = evaluate_order_gate_with_report(checks, side, dry_run, intent)
     retry_backoff = float(STATE["retry_policy"]["backoff_sec"])
     order = {
         "time": now_text(),
@@ -1164,9 +1297,11 @@ def submit_test_intent() -> dict[str, Any]:
         "order_id": next_order_id(order_state, dry_run),
         "strategy_id": strategy["strategy_id"],
         "symbol": strategy["symbol"],
+        "asset": intent.asset,
         "side": side,
-        "qty": "1",
-        "notional": "테스트",
+        "qty": f"{intent.quantity:g}",
+        "reference_price": f"{intent.reference_price:g}",
+        "notional": f"{intent.notional:,.0f}",
         "state": order_state,
         "queue_state": queue_state,
         "attempts": 1,
@@ -1174,6 +1309,7 @@ def submit_test_intent() -> dict[str, Any]:
         "broker_order_id": "-",
         "dry_run": dry_run,
         "reason": reason,
+        "risk_report": risk_report.to_dict(),
     }
     STATE["orders"].insert(0, order)
     STATE["orders"] = STATE["orders"][:50]
@@ -1196,7 +1332,23 @@ def retry_order(order_id: str) -> dict[str, Any]:
     order["attempts"] = int(order.get("attempts", 0)) + 1
     order["updated_at"] = now_text()
     checks = snapshot()
-    ok, state_name, queue_state, reason = evaluate_order_gate(checks, str(order.get("side", "BUY")), bool(order.get("dry_run", STATE["dry_run"])))
+    retry_intent = OrderIntent(
+        strategy_id=str(order.get("strategy_id", "manual-retry")),
+        asset=str(order.get("asset") or asset_from_symbol(str(order.get("symbol", "")))),
+        symbol=str(order.get("symbol", "")),
+        side="SELL" if str(order.get("side", "")).upper() == "SELL" else "BUY",
+        quantity=float(order.get("qty", 1) or 1),
+        reference_price=float(order.get("reference_price", 1000) or 1000),
+        mode=current_mode(),
+        reason=f"{order_id} retry",
+        metadata={"broker_id": broker_id_from_symbol(str(order.get("symbol", "")), str(order.get("asset", "")))},
+    )
+    ok, state_name, queue_state, reason, risk_report = evaluate_order_gate_with_report(
+        checks,
+        str(order.get("side", "BUY")),
+        bool(order.get("dry_run", STATE["dry_run"])),
+        retry_intent,
+    )
     if not ok and order["attempts"] >= int(float(STATE["retry_policy"]["max_attempts"])):
         state_name = "retry_exhausted"
         queue_state = "failed"
@@ -1204,6 +1356,7 @@ def retry_order(order_id: str) -> dict[str, Any]:
     order["state"] = state_name
     order["queue_state"] = queue_state
     order["reason"] = reason
+    order["risk_report"] = risk_report.to_dict()
     order["next_retry_at"] = future_text(float(STATE["retry_policy"]["backoff_sec"])) if can_retry_order(order) else "-"
     append_audit("info" if ok else "warn", "주문 재시도", f"{order_id}: {reason}")
     return {"ok": ok, "reason": reason, "snapshot": snapshot()}

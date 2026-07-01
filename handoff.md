@@ -1,6 +1,6 @@
 # Live Trader Handoff
 
-Last updated: 2026-07-01 KST
+Last updated: 2026-07-02 KST
 Project path: `D:\github\PROGRAM\trading-system\apps\live_trader`
 Branch: `develop`
 Latest pushed commit before this handoff: `69a1316654f40cc7137c2e27806e2315174d5549`
@@ -231,6 +231,8 @@ Main backend files:
 
 - `live_trader\server.py`
 - `live_trader\state.py`
+- `live_trader\order_management.py`
+- `live_trader\risk_engine.py`
 - `live_trader\brokers.py`
 - `live_trader\contracts.py`
 - `live_trader\live_adapters.py`
@@ -262,6 +264,16 @@ Important endpoints:
 - `POST /api/preflight`
 - `POST /api/audit-export`
 - `POST /api/test-intent`
+
+### Order Intent And Risk Gate
+
+As of 2026-07-02, live order test/retry paths no longer use only a simple readiness/dry-run check.
+
+- `live_trader\order_management.py` defines the live `OrderIntent` contract.
+- `live_trader\risk_engine.py` defines `PreTradeRiskGate`, `PreTradeContext`, and `PreTradeRiskReport`.
+- `live_trader\state.py` converts a strategy/test order into `OrderIntent`, builds `PreTradeContext` from current mode, dry-run, kill switch, readiness, reconciliation, broker readiness, and risk settings, then evaluates the intent through `PreTradeRiskGate`.
+- Orders now keep a `risk_report` payload so the UI/log layer can later explain exactly which checks passed, warned, or blocked the order.
+- Non-dry-run broker transmission still remains blocked until the real send layer and adapter verification are intentionally enabled.
 
 ## Strategy Artifacts
 
@@ -465,7 +477,7 @@ Critical gaps before real money should be enabled:
 - Upbit account/balance/cancel APIs still need real implementation.
 - Real broker submission must be audited with sandbox or tiny live orders before enabling.
 - Strategy plugin execution pipeline from Backtester artifacts to live signals still needs production-grade implementation.
-- Risk engine should eventually run per-order before broker transmission, not only as UI/settings state.
+- Risk engine now runs for live test/retry order intents, but the future continuous automation engine must use the same `OrderIntent -> PreTradeRiskGate -> adapter` boundary before any broker transmission.
 - Logs are currently derived from audit events, not yet a true streaming engine log source.
 
 UI gaps to watch:
@@ -511,6 +523,8 @@ Frontend:
 Backend:
 
 - `live_trader\state.py`
+- `live_trader\order_management.py`
+- `live_trader\risk_engine.py`
 - `live_trader\brokers.py`
 - `live_trader\live_adapters.py`
 - `live_trader\contracts.py`
