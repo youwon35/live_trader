@@ -1292,7 +1292,7 @@ button {
 
 .capability-item.pass strong,
 .capability-item.pass span {
-  color: var(--success-text);
+  color: var(--status-pill-text, #0f172a);
 }
 
 .capability-item.fail strong,
@@ -3484,10 +3484,13 @@ body {
 }
 
 :root[data-ui-theme='light'] .env-list span,
-:root[data-ui-theme='light'] .env-check.present span,
+:root[data-ui-theme='light'] .env-check.present span {
+  color: var(--success-text);
+}
+
 :root[data-ui-theme='light'] .capability-item.pass strong,
 :root[data-ui-theme='light'] .capability-item.pass span {
-  color: var(--success-text);
+  color: var(--status-pill-text, #0f172a);
 }
 
 :root[data-ui-theme='light'] .env-list span.missing,
