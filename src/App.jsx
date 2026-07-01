@@ -49,10 +49,13 @@ import {
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
+import { createEmptyState, createPanelHeader } from "../../../packages/design/ui-primitives.js";
 import designTokens from "../../../packages/design/design_tokens.json";
 
 const ActionButton = createActionButton(React);
 const StatusPill = createStatusPill(React);
+const EmptyState = createEmptyState(React);
+const PanelHeader = createPanelHeader(React);
 
 const navItems = [
   { id: "overview", label: "사전점검", icon: LayoutDashboard },
@@ -2713,21 +2716,7 @@ function StatusRow({ label, status, detail }) {
 
 function EmptyRow({ text }) {
   return (
-    <div className="empty-row">
-      <TerminalSquare size={16} />
-      <span>{text}</span>
-    </div>
-  );
-}
-
-function PanelHeader({ title, subtitle }) {
-  return (
-    <div className="panel-header">
-      <div>
-        <h2>{title}</h2>
-        <p>{subtitle}</p>
-      </div>
-    </div>
+    <EmptyState className="empty-row" icon={<TerminalSquare size={16} />} message={text} />
   );
 }
 
