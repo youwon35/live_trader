@@ -38,6 +38,7 @@ import {
   getUiSettings,
   runFinalPreflight,
   runReconciliation,
+  runStrategyCycle,
   retryOrder,
   setFlag,
   setAutomationProfile,
@@ -1223,6 +1224,7 @@ function App() {
           onDryRun={() => runAction(() => setFlag("dry_run", !snapshot.dry_run))}
           onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
+          onStrategyCycle={(profileId) => runAction(() => runStrategyCycle(profileId))}
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
           onRetryPolicy={(name, value) => runAction(() => setRetryPolicy(name, value))}
@@ -1295,6 +1297,7 @@ function WorkspaceContent({
   onDryRun,
   onEntryBlock,
   onAutomation,
+  onStrategyCycle,
   onTestIntent,
   onRiskSetting,
   onRetryPolicy,
@@ -1333,7 +1336,13 @@ function WorkspaceContent({
     return renderPage(
       <section className="content-grid">
         <div className="content-column">
-          <AutomationLauncherPanel profiles={snapshot.automation_profiles} strategies={snapshot.strategies} onAutomation={onAutomation} />
+          <AutomationLauncherPanel
+            profiles={snapshot.automation_profiles}
+            strategies={snapshot.strategies}
+            runnerState={snapshot.strategy_runner}
+            onAutomation={onAutomation}
+            onStrategyCycle={onStrategyCycle}
+          />
         </div>
         <div className="content-column">
           <OrderQueueSummaryPanel summary={snapshot.order_queue} />
@@ -2043,7 +2052,7 @@ function BrokerPanel({ brokers }) {
   );
 }
 
-function AutomationLauncherPanel({ profiles, strategies, onAutomation }) {
+function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomation, onStrategyCycle }) {
   const rows = profiles?.length ? profiles : fallbackSnapshot.automation_profiles;
   const [assetTab, setAssetTab] = useState(rows[0]?.id ?? "stock");
   const activeProfile = rows.find((profile) => profile.id === assetTab) ?? rows[0];
@@ -2068,6 +2077,7 @@ function AutomationLauncherPanel({ profiles, strategies, onAutomation }) {
   }
 
   const routeStrategies = strategies.filter((strategy) => (activeProfile.id === "stock" ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy)));
+  const runnerText = runnerState?.last_profile === activeProfile.id ? runnerState.last_action : activeProfile.last_action;
 
   return (
     <section className="panel automation-panel">
@@ -2161,7 +2171,15 @@ function AutomationLauncherPanel({ profiles, strategies, onAutomation }) {
           {!routeStrategies.length && <span>연결 가능한 전략 artifact가 없습니다.</span>}
         </div>
         <div className="automation-actions">
-          <span>{activeProfile.last_action}</span>
+          <span>{runnerText}</span>
+          <button
+            className="ts-action-button"
+            type="button"
+            onClick={() => onStrategyCycle(activeProfile.id)}
+          >
+            <Play size={16} />
+            <span>전략 사이클 점검</span>
+          </button>
         </div>
       </div>
     </section>

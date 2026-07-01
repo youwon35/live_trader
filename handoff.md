@@ -264,6 +264,7 @@ Important endpoints:
 - `POST /api/preflight`
 - `POST /api/audit-export`
 - `POST /api/test-intent`
+- `POST /api/strategy-cycle`
 
 ### Order Intent And Risk Gate
 
@@ -274,6 +275,14 @@ As of 2026-07-02, live order test/retry paths no longer use only a simple readin
 - `live_trader\state.py` converts a strategy/test order into `OrderIntent`, builds `PreTradeContext` from current mode, dry-run, kill switch, readiness, reconciliation, broker readiness, and risk settings, then evaluates the intent through `PreTradeRiskGate`.
 - Orders now keep a `risk_report` payload so the UI/log layer can later explain exactly which checks passed, warned, or blocked the order.
 - Non-dry-run broker transmission still remains blocked until the real send layer and adapter verification are intentionally enabled.
+
+As of 2026-07-02, Paper Trader and Live Trader also share the strategy signal boundary in `trading-system\packages\trading_runtime\trading_runtime\strategy_runner.py`.
+
+- `StrategyExecutionRunner` resolves a strategy signal provider, normalizes `BUY`/`SELL` into the shared `OrderIntent` contract, and returns a serializable runner report.
+- Paper Trader's `PaperTradingEngine` uses this runner before its paper risk gate and broker ledger.
+- Live Trader exposes `/api/strategy-cycle` and the automation panel's `전략 사이클 점검` button to run a dry-run strategy cycle from approved artifacts.
+- Live strategy-cycle orders call `submit_order_intent()`, which routes every generated intent through `evaluate_order_gate_with_report()` and `PreTradeRiskGate`; no strategy signal path is allowed to bypass the gate.
+- This is the shared boundary foundation, not the complete continuous automation engine yet.
 
 ## Strategy Artifacts
 
@@ -472,13 +481,13 @@ Use the Notion update tool when available.
 
 Critical gaps before real money should be enabled:
 
-- No complete continuous automation engine yet.
+- No complete continuous automation engine yet; the shared `StrategyExecutionRunner -> OrderIntent -> PreTradeRiskGate` boundary is in place for test strategy cycles.
 - KIS account/position reconciliation APIs still need real implementation.
 - Binance account/balance/user stream/cancel APIs still need real implementation.
 - Upbit account/balance/cancel APIs still need real implementation.
 - Real broker submission must be audited with sandbox or tiny live orders before enabling.
-- Strategy plugin execution pipeline from Backtester artifacts to live signals still needs production-grade implementation.
-- Shared risk engine now runs for live test/retry order intents, but the future continuous automation engine must use the same `OrderIntent -> PreTradeRiskGate -> adapter` boundary before any broker transmission.
+- Strategy plugin execution from Backtester/Paper artifacts to live market signals still needs production-grade market data wiring, plugin loading, and scheduling.
+- Shared risk engine now runs for live test/retry/strategy-cycle order intents, but the future continuous automation engine must keep using the same `OrderIntent -> PreTradeRiskGate -> adapter` boundary before any broker transmission.
 - Logs are currently derived from audit events, not yet a true streaming engine log source.
 
 UI gaps to watch:
@@ -501,6 +510,7 @@ The user selected this order on 2026-07-02:
    - normalize signal into `OrderIntent`
    - pass through `PreTradeRiskGate`
    - only then send to adapter or dry-run ledger
+   - 2026-07-02 foundation implemented with `trading_runtime.strategy_runner`, Paper integration, and Live `/api/strategy-cycle`
 3. Implement a Live Trader watchdog:
    - monitor heartbeat, stale data, broker/API health, and runaway order conditions
    - fail closed to MONITOR or new-entry block when critical checks fail

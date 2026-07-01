@@ -13,6 +13,7 @@ from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_st
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder
+from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
 
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
@@ -238,6 +239,13 @@ STATE: dict[str, Any] = {
     "automation": {
         "stock": {"enabled": False, "provider": "kis", "mode": "MONITOR", "last_action": "대기"},
         "crypto": {"enabled": False, "provider": "binance", "mode": "MONITOR", "last_action": "대기"},
+    },
+    "strategy_runner": {
+        "last_run": "미실행",
+        "last_profile": "-",
+        "last_strategy": "-",
+        "last_signal": "-",
+        "last_action": "대기",
     },
     "reconciliation_last_run": None,
     "preflight_last_run": None,
@@ -870,6 +878,7 @@ def snapshot() -> dict[str, Any]:
         "broker_diagnostics": broker_diagnostics(),
         "broker_adapter_contract": broker_adapter_contract(),
         "automation_profiles": automations,
+        "strategy_runner": dict(STATE["strategy_runner"]),
         "strategies": strategies,
         "strategy_plugin_sources": strategy_plugin_status(),
         "orders": order_rows(),
@@ -1202,6 +1211,107 @@ def evaluate_order_gate_with_report(
     return False, "adapter_blocked", "held", adapter_blocker.detail, report
 
 
+class LiveArtifactSignalProvider:
+    plugin_id = "live_artifact_signal"
+    label = "Live Artifact Signal"
+
+    def signal_for_price(
+        self,
+        *,
+        artifact: Any,
+        price: float,
+        context: Any,
+    ) -> OrderSide | None:
+        _ = price, context
+        return explicit_artifact_signal(artifact)
+
+    def signal_for_market(
+        self,
+        *,
+        artifact: Any,
+        market_data: StrategyMarketData,
+        context: Any,
+    ) -> OrderSide | None:
+        _ = market_data, context
+        return explicit_artifact_signal(artifact)
+
+
+def explicit_artifact_signal(artifact: Any) -> OrderSide | None:
+    values: list[Any] = []
+    if isinstance(artifact, dict):
+        values.extend(
+            artifact.get(key)
+            for key in ("signal", "last_signal", "test_signal", "manual_signal", "side", "order_side")
+        )
+        signals = artifact.get("signals")
+        if isinstance(signals, dict):
+            values.extend(signals.get(key) for key in ("current", "latest", "last", "signal"))
+    for value in values:
+        normalized = str(value or "").strip().upper()
+        if normalized in {"BUY", "SELL"}:
+            return normalized  # type: ignore[return-value]
+    return None
+
+
+def strategy_market_data(strategy: dict[str, Any]) -> StrategyMarketData:
+    price = strategy_float(
+        strategy,
+        "reference_price",
+        "last_price",
+        "price",
+        "close",
+        "close_price",
+        default=1.0 if strategy_broker_id(strategy) == "binance" else 1000.0,
+    )
+    return StrategyMarketData(price=price, close_price=price)
+
+
+def strategy_float(strategy: dict[str, Any], *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        value = strategy.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return float(default)
+
+
+def select_strategy_for_profile(checks: dict[str, Any], profile_id: str) -> dict[str, Any] | None:
+    normalized_profile = "stock" if profile_id == "stock" else "crypto"
+    provider = str(STATE["automation"][normalized_profile].get("provider") or ("kis" if normalized_profile == "stock" else "binance"))
+    strategies = [strategy for strategy in checks.get("strategies", []) if strategy.get("live_allowed")]
+    if normalized_profile == "stock":
+        return next((strategy for strategy in strategies if strategy_broker_id(strategy) == "kis"), None)
+    return next((strategy for strategy in strategies if strategy_broker_id(strategy) == provider), None) or next(
+        (strategy for strategy in strategies if strategy_broker_id(strategy) in {"binance", "upbit"}),
+        None,
+    )
+
+
+def strategy_execution_for_profile(checks: dict[str, Any], profile_id: str) -> StrategyExecutionResult | None:
+    strategy = select_strategy_for_profile(checks, profile_id)
+    if not strategy:
+        return None
+    normalized_profile = "stock" if profile_id == "stock" else "crypto"
+    broker_id = strategy_broker_id(strategy)
+    runner = StrategyExecutionRunner(lambda _plugin_id: LiveArtifactSignalProvider())
+    return runner.run(
+        artifact=strategy,
+        market_data=strategy_market_data(strategy),
+        mode=current_mode(),
+        stream_id=f"live:{normalized_profile}:{strategy.get('strategy_id', 'unknown')}",
+        quantity=strategy_float(strategy, "order_quantity", "quantity", default=1.0),
+        metadata={
+            "broker_id": broker_id,
+            "profile_id": normalized_profile,
+            "runner": "StrategyExecutionRunner",
+        },
+        reason_prefix=f"{strategy.get('name') or strategy.get('strategy_id') or '전략'} live runner signal",
+    )
+
+
 def default_order_intent(checks: dict[str, Any], side: str) -> OrderIntent:
     strategies = checks.get("strategies", [])
     strategy = next((item for item in strategies if item.get("live_allowed")), strategies[0] if strategies else {})
@@ -1327,23 +1437,25 @@ def next_order_id(state_name: str, dry_run: bool) -> str:
     return f"{prefix}-{len(STATE['orders']) + 1:04d}"
 
 
-def submit_test_intent() -> dict[str, Any]:
-    checks = snapshot()
-    strategy = next((item for item in checks["strategies"] if item["live_allowed"]), checks["strategies"][0])
-    side = "BUY"
-    dry_run = bool(STATE["dry_run"])
-    intent = default_order_intent(checks, side)
-    ok, order_state, queue_state, reason, risk_report = evaluate_order_gate_with_report(checks, side, dry_run, intent)
+def submit_order_intent(
+    checks: dict[str, Any],
+    intent: OrderIntent,
+    *,
+    dry_run: bool,
+    audit_event: str,
+    runner_report: StrategyExecutionResult | None = None,
+) -> dict[str, Any]:
+    ok, order_state, queue_state, reason, risk_report = evaluate_order_gate_with_report(checks, intent.side, dry_run, intent)
     retry_backoff = float(STATE["retry_policy"]["backoff_sec"])
     order = {
         "time": now_text(),
         "created_at": now_text(),
         "updated_at": now_text(),
         "order_id": next_order_id(order_state, dry_run),
-        "strategy_id": strategy["strategy_id"],
-        "symbol": strategy["symbol"],
+        "strategy_id": intent.strategy_id,
+        "symbol": intent.symbol,
         "asset": intent.asset,
-        "side": side,
+        "side": intent.side,
         "qty": f"{intent.quantity:g}",
         "reference_price": f"{intent.reference_price:g}",
         "notional": f"{intent.notional:,.0f}",
@@ -1356,10 +1468,57 @@ def submit_test_intent() -> dict[str, Any]:
         "reason": reason,
         "risk_report": risk_report.to_dict(),
     }
+    if runner_report is not None:
+        order["runner_report"] = runner_report.to_dict()
     STATE["orders"].insert(0, order)
     STATE["orders"] = STATE["orders"][:50]
-    append_audit("info" if ok else "danger", "주문 게이트", order_gate_audit_detail(order, reason, risk_report))
-    return {"ok": ok, "reason": reason, "snapshot": snapshot()}
+    append_audit("info" if ok else "danger", audit_event, order_gate_audit_detail(order, reason, risk_report))
+    return {"ok": ok, "reason": reason, "order": order, "snapshot": snapshot()}
+
+
+def submit_test_intent() -> dict[str, Any]:
+    checks = snapshot()
+    intent = default_order_intent(checks, "BUY")
+    return submit_order_intent(checks, intent, dry_run=bool(STATE["dry_run"]), audit_event="주문 게이트")
+
+
+def run_strategy_cycle(profile_id: str) -> dict[str, Any]:
+    checks = snapshot()
+    normalized_profile = "stock" if profile_id == "stock" else "crypto"
+    execution = strategy_execution_for_profile(checks, normalized_profile)
+    if execution is None:
+        reason = f"{normalized_profile} 프로필에 live_allowed=true 전략이 없습니다."
+        STATE["strategy_runner"].update({
+            "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "last_profile": normalized_profile,
+            "last_strategy": "-",
+            "last_signal": "-",
+            "last_action": reason,
+        })
+        append_audit("warn", "전략 Runner", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    STATE["strategy_runner"].update({
+        "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_profile": normalized_profile,
+        "last_strategy": execution.artifact_id,
+        "last_signal": execution.signal or "-",
+        "last_action": execution.reason,
+    })
+    if execution.intent is None:
+        append_audit("info", "전략 Runner", f"{execution.artifact_id}: {execution.reason}")
+        return {"ok": True, "reason": execution.reason, "runner_report": execution.to_dict(), "snapshot": snapshot()}
+
+    result = submit_order_intent(
+        checks,
+        execution.intent,
+        dry_run=bool(STATE["dry_run"]),
+        audit_event="전략 Runner",
+        runner_report=execution,
+    )
+    STATE["strategy_runner"]["last_action"] = f"{execution.signal} -> {result['reason']}"
+    result["runner_report"] = execution.to_dict()
+    return result
 
 
 def find_order(order_id: str) -> dict[str, Any] | None:

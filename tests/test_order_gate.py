@@ -17,6 +17,7 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(state.OrderIntent.__module__, "trading_runtime.order_management")
         self.assertEqual(state.PreTradeRiskGate.__module__, "trading_runtime.risk_engine")
         self.assertEqual(state.PreTradeContext.__module__, "trading_runtime.risk_engine")
+        self.assertEqual(state.StrategyExecutionRunner.__module__, "trading_runtime.strategy_runner")
 
     def test_order_gate_blocks_buy_when_new_entries_are_blocked(self) -> None:
         state.STATE["new_entries_blocked"] = True
@@ -209,6 +210,69 @@ class OrderGateTest(unittest.TestCase):
         self.assertIn("adapter_blocked/held", audit_detail)
         self.assertIn("risk pass", audit_detail)
         self.assertIn("제출 차단", audit_detail)
+
+    def test_strategy_cycle_without_signal_records_no_order(self) -> None:
+        state.STATE["orders"] = []
+        state.STATE["audit"] = []
+        state.STATE["dry_run"] = True
+        state.STATE["new_entries_blocked"] = False
+        fake_snapshot = {
+            "summary": {"blocker_count": 0, "warning_count": 0},
+            "strategies": [
+                {
+                    "strategy_id": "LIVE-NO-SIGNAL",
+                    "name": "No Signal",
+                    "symbol": "BTCUSDT",
+                    "asset": "코인",
+                    "live_allowed": True,
+                }
+            ],
+        }
+
+        with patch("live_trader.state.snapshot", return_value=fake_snapshot):
+            result = state.run_strategy_cycle("crypto")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(state.STATE["orders"]), 0)
+        self.assertEqual(state.STATE["strategy_runner"]["last_strategy"], "LIVE-NO-SIGNAL")
+        self.assertEqual(state.STATE["strategy_runner"]["last_signal"], "-")
+        self.assertIn("전략 신호 없음", state.STATE["audit"][-1]["detail"])
+
+    def test_strategy_cycle_signal_routes_through_pre_trade_gate(self) -> None:
+        state.STATE["orders"] = []
+        state.STATE["audit"] = []
+        state.STATE["dry_run"] = True
+        state.STATE["new_entries_blocked"] = False
+        fake_snapshot = {
+            "summary": {"blocker_count": 0, "warning_count": 0},
+            "strategies": [
+                {
+                    "strategy_id": "LIVE-RUNNER-BUY",
+                    "name": "Runner Buy",
+                    "symbol": "BTCUSDT",
+                    "asset": "코인",
+                    "plugin": "breakout",
+                    "live_allowed": True,
+                    "signal": "BUY",
+                    "reference_price": 65000,
+                    "quantity": 0.01,
+                }
+            ],
+        }
+
+        with patch("live_trader.state.snapshot", return_value=fake_snapshot):
+            result = state.run_strategy_cycle("crypto")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(state.STATE["orders"]), 1)
+        order = state.STATE["orders"][0]
+        self.assertEqual(order["strategy_id"], "LIVE-RUNNER-BUY")
+        self.assertEqual(order["state"], "dry_run")
+        self.assertEqual(order["runner_report"]["signal"], "BUY")
+        self.assertTrue(order["risk_report"]["can_submit"])
+        self.assertEqual(result["runner_report"]["intent"]["metadata"]["runner"], "StrategyExecutionRunner")
+        self.assertEqual(state.STATE["audit"][-1]["event"], "전략 Runner")
+        self.assertIn("risk pass", state.STATE["audit"][-1]["detail"])
 
 
 if __name__ == "__main__":
