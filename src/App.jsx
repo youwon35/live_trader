@@ -49,12 +49,13 @@ import {
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
-import { createEmptyState, createPanelHeader } from "../../../packages/design/ui-primitives.js";
+import { createEmptyState, createPageHeader, createPanelHeader } from "../../../packages/design/ui-primitives.js";
 import designTokens from "../../../packages/design/design_tokens.json";
 
 const ActionButton = createActionButton(React);
 const StatusPill = createStatusPill(React);
 const EmptyState = createEmptyState(React);
+const PageHeader = createPageHeader(React);
 const PanelHeader = createPanelHeader(React);
 
 const navItems = [
@@ -1664,16 +1665,16 @@ function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) 
 
   return (
     <section className={`page-view ${selectedNav}-view`}>
-      <div className="page-heading">
-        <div>
-          <span>{profile.eyebrow}</span>
-          <h1>{profile.title}</h1>
-          <p>{profile.summary}</p>
-        </div>
+      <PageHeader
+        eyebrow={profile.eyebrow}
+        title={profile.title}
+        subtitle={profile.summary}
+        actions={(
         <div className="page-heading-actions">
           <span>{snapshot.generated_at}</span>
         </div>
-      </div>
+        )}
+      />
 
       <SearchResultsPanel query={searchQuery} results={searchResults} onNavigate={onNavigate} />
 
