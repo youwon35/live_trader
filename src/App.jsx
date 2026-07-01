@@ -1032,8 +1032,11 @@ function App() {
       const result = await action();
       setSnapshot(result.snapshot ?? result);
       setError(result.ok === false ? result.reason : "");
+      return result;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "요청 실패");
+      const reason = err instanceof Error ? err.message : "요청 실패";
+      setError(reason);
+      return { ok: false, reason };
     } finally {
       setLoading(false);
     }
@@ -1436,18 +1439,29 @@ function OperationalSafeguardsPanel({ dryRun, newEntriesBlocked, killSwitch, onD
     <section className="panel operational-safeguards-panel">
       <PanelHeader title="운영 차단 설정" subtitle="자동화 모드 전환 전에 공통 보호 장치를 확인합니다." />
       <div className="operator-actions">
-        <button className={`secondary-button ts-action-button ${dryRun ? "safe-active" : "danger-active"}`} data-action-status={dryRun ? "success" : "error"} type="button" onClick={onDryRun}>
-          <ShieldCheck size={16} />
-          Dry Run
-        </button>
-        <button className={`secondary-button ts-action-button ${newEntriesBlocked ? "active" : ""}`} data-action-status={newEntriesBlocked ? "success" : undefined} type="button" onClick={onEntryBlock}>
-          <ShieldCheck size={16} />
-          신규 진입 차단
-        </button>
-        <button className="primary-button ts-action-button" type="button" onClick={onTestIntent}>
-          <TerminalSquare size={16} />
-          테스트 주문 게이트
-        </button>
+        <ActionButton
+          className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`}
+          icon={<ShieldCheck size={16} />}
+          label="Dry Run"
+          onClick={onDryRun}
+          status={dryRun ? "success" : "error"}
+        />
+        <ActionButton
+          active={newEntriesBlocked}
+          className="secondary-button"
+          icon={<ShieldCheck size={16} />}
+          label="신규 진입 차단"
+          onClick={onEntryBlock}
+          status={newEntriesBlocked ? "success" : undefined}
+        />
+        <ActionButton
+          className="primary-button"
+          icon={<TerminalSquare size={16} />}
+          label="테스트 주문 게이트"
+          onClick={onTestIntent}
+          pendingLabel="확인 중"
+          variant="primary"
+        />
         <span className={`inline-state ${killSwitch ? "danger" : "success"}`}>{killSwitch ? "긴급 차단 켜짐" : "긴급 차단 꺼짐"}</span>
       </div>
     </section>
@@ -1944,22 +1958,37 @@ function ModeConsole({
         })}
       </div>
       <div className="operator-actions">
-        <button className={`secondary-button ts-action-button ${operatorConfirmed ? "active" : ""}`} data-action-status={operatorConfirmed ? "success" : undefined} type="button" onClick={onConfirm}>
-          <BadgeCheck size={16} />
-          운용자 확인
-        </button>
-        <button className={`secondary-button ts-action-button ${dryRun ? "safe-active" : "danger-active"}`} data-action-status={dryRun ? "success" : "error"} type="button" onClick={onDryRun}>
-          <ShieldCheck size={16} />
-          Dry Run
-        </button>
-        <button className={`secondary-button ts-action-button ${newEntriesBlocked ? "active" : ""}`} data-action-status={newEntriesBlocked ? "success" : undefined} type="button" onClick={onEntryBlock}>
-          <ShieldCheck size={16} />
-          신규 진입 차단
-        </button>
-        <button className="primary-button ts-action-button" type="button" onClick={onTestIntent}>
-          <TerminalSquare size={16} />
-          테스트 주문 게이트
-        </button>
+        <ActionButton
+          active={operatorConfirmed}
+          className="secondary-button"
+          icon={<BadgeCheck size={16} />}
+          label="운용자 확인"
+          onClick={onConfirm}
+          status={operatorConfirmed ? "success" : undefined}
+        />
+        <ActionButton
+          className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`}
+          icon={<ShieldCheck size={16} />}
+          label="Dry Run"
+          onClick={onDryRun}
+          status={dryRun ? "success" : "error"}
+        />
+        <ActionButton
+          active={newEntriesBlocked}
+          className="secondary-button"
+          icon={<ShieldCheck size={16} />}
+          label="신규 진입 차단"
+          onClick={onEntryBlock}
+          status={newEntriesBlocked ? "success" : undefined}
+        />
+        <ActionButton
+          className="primary-button"
+          icon={<TerminalSquare size={16} />}
+          label="테스트 주문 게이트"
+          onClick={onTestIntent}
+          pendingLabel="확인 중"
+          variant="primary"
+        />
       </div>
     </section>
   );
@@ -2233,18 +2262,29 @@ function OrderCommandPanel({ newEntriesBlocked, dryRun, killSwitch, onDryRun, on
     <section className="panel">
       <PanelHeader title="주문 제어" subtitle="실주문 전송 전 차단 상태와 테스트 게이트를 관리합니다." />
       <div className="operator-actions">
-        <button className={`secondary-button ts-action-button ${dryRun ? "safe-active" : "danger-active"}`} data-action-status={dryRun ? "success" : "error"} type="button" onClick={onDryRun}>
-          <ShieldCheck size={16} />
-          Dry Run
-        </button>
-        <button className={`secondary-button ts-action-button ${newEntriesBlocked ? "active" : ""}`} data-action-status={newEntriesBlocked ? "success" : undefined} type="button" onClick={onEntryBlock}>
-          <ShieldCheck size={16} />
-          신규 진입 차단
-        </button>
-        <button className="primary-button ts-action-button" type="button" onClick={onTestIntent}>
-          <TerminalSquare size={16} />
-          테스트 주문 게이트
-        </button>
+        <ActionButton
+          className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`}
+          icon={<ShieldCheck size={16} />}
+          label="Dry Run"
+          onClick={onDryRun}
+          status={dryRun ? "success" : "error"}
+        />
+        <ActionButton
+          active={newEntriesBlocked}
+          className="secondary-button"
+          icon={<ShieldCheck size={16} />}
+          label="신규 진입 차단"
+          onClick={onEntryBlock}
+          status={newEntriesBlocked ? "success" : undefined}
+        />
+        <ActionButton
+          className="primary-button"
+          icon={<TerminalSquare size={16} />}
+          label="테스트 주문 게이트"
+          onClick={onTestIntent}
+          pendingLabel="확인 중"
+          variant="primary"
+        />
         <span className={`inline-state ${killSwitch ? "danger" : "success"}`}>{killSwitch ? "긴급 차단 켜짐" : "긴급 차단 꺼짐"}</span>
       </div>
     </section>
