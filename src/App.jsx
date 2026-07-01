@@ -2585,26 +2585,24 @@ function OrderPanel({ orders, onRetryOrder, onCancelOrder }) {
               <div className="order-ledger-foot">
                 <em>{order.reason}</em>
                 <div className="order-actions">
-                  <button
+                  <IconButton
                     className="mini-icon-button"
-                    type="button"
                     title="재시도"
                     aria-label={`${order.order_id} 재시도`}
                     disabled={!order.retryable}
                     onClick={() => onRetryOrder(order.order_id)}
                   >
                     <RotateCcw size={13} />
-                  </button>
-                  <button
+                  </IconButton>
+                  <IconButton
                     className="mini-icon-button"
-                    type="button"
                     title="취소"
                     aria-label={`${order.order_id} 취소`}
                     disabled={order.state === "canceled"}
                     onClick={() => onCancelOrder(order.order_id)}
                   >
                     <CircleStop size={13} />
-                  </button>
+                  </IconButton>
                 </div>
               </div>
             </div>
