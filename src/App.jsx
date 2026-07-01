@@ -49,12 +49,14 @@ import {
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
-import { createEmptyState, createPageHeader, createPanelHeader } from "../../../packages/design/ui-primitives.js";
+import { createEmptyState, createMetricCard, createMetricGrid, createPageHeader, createPanelHeader } from "../../../packages/design/ui-primitives.js";
 import designTokens from "../../../packages/design/design_tokens.json";
 
 const ActionButton = createActionButton(React);
 const StatusPill = createStatusPill(React);
 const EmptyState = createEmptyState(React);
+const MetricCard = createMetricCard(React);
+const MetricGrid = createMetricGrid(React);
 const PageHeader = createPageHeader(React);
 const PanelHeader = createPanelHeader(React);
 
@@ -2376,15 +2378,19 @@ function ReconciliationSummaryPanel({ reconciliation, onReconcile }) {
           대조 실행
         </button>
       </div>
-      <div className="metric-grid">
+      <MetricGrid className="metric-grid">
         {items.map((item) => (
-          <div className="metric-card" key={item.label}>
-            <span>{item.label}</span>
-            <strong>{item.value}</strong>
-            <span className={`summary-state ${item.tone}`}>{item.tone === "success" ? "정상" : "확인"}</span>
-          </div>
+          <MetricCard
+            className="metric-card"
+            detail={item.tone === "success" ? "정상" : "확인"}
+            detailClassName={`summary-state ${item.tone}`}
+            key={item.label}
+            label={item.label}
+            tone={item.tone}
+            value={item.value}
+          />
         ))}
-      </div>
+      </MetricGrid>
       <div className="next-actions">
         {actions.map((action) => (
           <span key={action}>{action}</span>
@@ -2473,15 +2479,19 @@ function LaunchReportPanel({ report }) {
           <span>실제 주문 전송은 모든 hard stop과 warning 해소 후에만 검토합니다.</span>
         </div>
       </div>
-      <div className="metric-grid">
+      <MetricGrid className="metric-grid">
         {items.map((item) => (
-          <div className="metric-card" key={item.label}>
-            <span>{item.label}</span>
-            <strong>{item.value}</strong>
-            <span className={`summary-state ${item.tone}`}>{item.tone === "success" ? "해제 가능" : "차단"}</span>
-          </div>
+          <MetricCard
+            className="metric-card"
+            detail={item.tone === "success" ? "해제 가능" : "차단"}
+            detailClassName={`summary-state ${item.tone}`}
+            key={item.label}
+            label={item.label}
+            tone={item.tone}
+            value={item.value}
+          />
         ))}
-      </div>
+      </MetricGrid>
       <div className="next-actions">
         {report.next_actions.map((action) => (
           <span key={action}>{action}</span>
