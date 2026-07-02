@@ -59,6 +59,8 @@ import {
   createPageHeader,
   createPanelHeader,
   createSegmentedControl,
+  createStatusCard,
+  createStatusRow,
   createToggleSwitch,
 } from "../../../packages/design/ui-primitives.js";
 import designTokens from "../../../packages/design/design_tokens.json";
@@ -73,6 +75,8 @@ const MetricGrid = createMetricGrid(React);
 const PageHeader = createPageHeader(React);
 const PanelHeader = createPanelHeader(React);
 const SegmentedControl = createSegmentedControl(React);
+const StatusCard = createStatusCard(React);
+const SharedStatusRow = createStatusRow(React);
 const ToggleSwitch = createToggleSwitch(React);
 
 const navItems = [
@@ -1592,19 +1596,18 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, o
       </div>
       <div className="doctor-grid">
         {items.map((item) => (
-          <button
+          <StatusCard
             className={`doctor-card ${item.tone} ${selectedItem?.id === item.id ? "selected" : ""}`}
-            type="button"
             key={item.id}
+            type="button"
+            as="button"
+            tone={item.tone}
+            leading={<span className="doctor-step">{item.index}</span>}
+            title={item.title}
+            detail={item.detail}
+            badge={<span className="doctor-status">{item.status}</span>}
             onClick={() => setSelectedDoctorId(item.id)}
-          >
-            <span className="doctor-step">{item.index}</span>
-            <div>
-              <strong>{item.title}</strong>
-              <span>{item.detail}</span>
-            </div>
-            <span className="doctor-status">{item.status}</span>
-          </button>
+          />
         ))}
       </div>
       {selectedItem && (
@@ -1620,13 +1623,14 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, o
           </div>
           <div className="doctor-detail-list">
             {selectedItem.details.map((detail) => (
-              <div className={`doctor-detail-row ${detail.tone}`} key={`${selectedItem.id}-${detail.label}-${detail.value}`}>
-                <StatusPill tone={detail.tone}>{detail.status}</StatusPill>
-                <div>
-                  <strong>{detail.label}</strong>
-                  <span>{detail.value}</span>
-                </div>
-              </div>
+              <SharedStatusRow
+                className={`doctor-detail-row ${detail.tone}`}
+                tone={detail.tone}
+                key={`${selectedItem.id}-${detail.label}-${detail.value}`}
+                leading={<StatusPill tone={detail.tone}>{detail.status}</StatusPill>}
+                title={detail.label}
+                detail={detail.value}
+              />
             ))}
           </div>
         </div>
@@ -2310,13 +2314,14 @@ function RiskPanel({ checks }) {
       <PanelHeader title="Pre-Trade Risk Gate" subtitle="주문 전 차단 규칙은 항상 브로커 전송보다 먼저 실행됩니다." />
       <div className="risk-grid">
         {checks.map((check) => (
-          <div className={`risk-rule ${check.status}`} key={check.label}>
-            <div>
-              <strong>{check.label}</strong>
-              <span>{check.detail}</span>
-            </div>
-            <em>{check.value}</em>
-          </div>
+          <SharedStatusRow
+            className={`risk-rule ${check.status}`}
+            tone={statusTone(check.status)}
+            key={check.label}
+            title={check.label}
+            detail={check.detail}
+            value={check.value}
+          />
         ))}
       </div>
     </section>
@@ -2437,13 +2442,14 @@ function WatchdogPanel({ watchdog, onWatchdog }) {
       </div>
       <div className="risk-grid watchdog-grid">
         {checks.map((check) => (
-          <div className={`risk-rule ${check.status}`} key={check.label}>
-            <div>
-              <strong>{check.label}</strong>
-              <span>{check.detail}</span>
-            </div>
-            <em>{check.value}</em>
-          </div>
+          <SharedStatusRow
+            className={`risk-rule ${check.status}`}
+            tone={statusTone(check.status)}
+            key={check.label}
+            title={check.label}
+            detail={check.detail}
+            value={check.value}
+          />
         ))}
         {!checks.length && <EmptyRow text="아직 Watchdog 점검 결과가 없습니다." />}
       </div>
@@ -2926,14 +2932,16 @@ function inferLogChannel(item) {
 }
 
 function StatusRow({ label, status, detail }) {
+  const tone = statusTone(status);
+  const statusLabel = status === "pass" ? "통과" : status === "warn" ? "주의" : status === "fail" ? "조치" : status;
   return (
-    <div className={`status-row ${status}`}>
-      <div>
-        <strong>{label}</strong>
-        <span>{detail}</span>
-      </div>
-      <span className="status-row-state">{status === "pass" ? "통과" : status === "warn" ? "주의" : status === "fail" ? "조치" : status}</span>
-    </div>
+    <SharedStatusRow
+      className={`status-row ${status}`}
+      tone={tone}
+      title={label}
+      detail={detail}
+      badge={<span className="status-row-state">{statusLabel}</span>}
+    />
   );
 }
 

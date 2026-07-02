@@ -2769,6 +2769,17 @@ body {
   white-space: normal;
 }
 
+.doctor-card .ts-status-card__body {
+  gap: 5px;
+}
+
+.doctor-card .ts-status-card__detail {
+  display: block;
+  margin-top: 0;
+  line-height: 1.4;
+  white-space: normal;
+}
+
 .doctor-status {
   color: var(--text);
   font-weight: 900;
