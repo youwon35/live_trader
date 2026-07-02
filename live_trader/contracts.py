@@ -29,6 +29,7 @@ PLUGIN_LABELS = {
 
 TRADING_SYSTEM_ROOT = Path(__file__).resolve().parents[3]
 PRIMARY_STRATEGY_ARTIFACT_DIR = TRADING_SYSTEM_ROOT / "packages" / "strategy-core"
+IGNORED_STRATEGY_FILE_NAMES = {"package.json", "package-lock.json"}
 
 
 def _dict_value(value: Any) -> dict[str, Any]:
@@ -187,6 +188,8 @@ def load_strategy_artifacts(limit: int = 16) -> list[dict[str, Any]]:
         if not folder.exists():
             continue
         for path in sorted(folder.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            if path.name in IGNORED_STRATEGY_FILE_NAMES:
+                continue
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -201,6 +204,8 @@ def load_strategy_artifacts(limit: int = 16) -> list[dict[str, Any]]:
 def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     dataset = _dict_value(artifact.get("dataset"))
     data_artifact = _dict_value(artifact.get("dataArtifact") or artifact.get("data_artifact"))
+    parameters = _dict_value(artifact.get("parameters"))
+    settings = _dict_value(artifact.get("settings"))
     lifecycle = _dict_value(artifact.get("lifecycle"))
     final_test = _dict_value(artifact.get("finalTest") or artifact.get("final_test"))
     strategy_contract = _dict_value(artifact.get("strategy_contract") or artifact.get("strategyContract"))
@@ -253,6 +258,13 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "lifecycle_status": lifecycle_status,
         "final_test_status": final_test_status,
         "score": artifact.get("score") or artifact.get("qualityScore") or "-",
+        "parameters": parameters,
+        "settings": settings,
+        "order_quantity": artifact.get("order_quantity") or artifact.get("orderQuantity") or parameters.get("positionSize") or settings.get("positionSize") or 1,
+        "reference_price": artifact.get("reference_price") or artifact.get("referencePrice") or artifact.get("last_price") or artifact.get("price") or artifact.get("close_price"),
+        "last_price": artifact.get("last_price") or artifact.get("reference_price") or artifact.get("price") or artifact.get("close_price"),
+        "test_signal": str(artifact.get("test_signal") or artifact.get("manual_signal") or artifact.get("last_signal") or ""),
+        "signals": _dict_value(artifact.get("signals")),
         "permissions": normalized_permissions,
         "verification": verification,
         "backtester_verified": verification["backtester"]["status"] == "pass",
