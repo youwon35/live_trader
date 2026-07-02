@@ -43,8 +43,8 @@ body {
   --table-border: #dbe4ef;
   --panel-shadow: 0 14px 32px rgba(31, 51, 77, 0.08);
   --text: #0f172a;
-  --text-soft: #0f172a;
-  --text-muted: #0f172a;
+  --text-soft: #334155;
+  --text-muted: #64748b;
   --primary-gradient: var(--primary);
   --progress-gradient: var(--primary);
 }
