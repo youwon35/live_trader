@@ -66,6 +66,10 @@ export async function runStrategyCycle(profileId) {
   return request("/api/strategy-cycle", { method: "POST", body: { profile_id: profileId } });
 }
 
+export async function runWatchdog() {
+  return request("/api/watchdog", { method: "POST", body: {} });
+}
+
 async function request(path, options = {}) {
   const response = await fetch(path, {
     method: options.method ?? "GET",

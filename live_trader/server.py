@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -102,6 +103,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/strategy-cycle":
             self.send_json(state.run_strategy_cycle(str(payload.get("profile_id", "stock"))))
             return
+        if parsed.path == "/api/watchdog":
+            self.send_json(state.run_watchdog())
+            return
         if parsed.path == "/api/ui-settings":
             self.send_json({"ok": True, "settings": write_ui_settings(payload)})
             return
@@ -168,10 +172,26 @@ def create_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> Threadi
     return ThreadingHTTPServer((host, port), LiveTraderHandler)
 
 
+def watchdog_worker(interval_seconds: float = 15.0) -> None:
+    while True:
+        try:
+            state.run_watchdog(include_snapshot=False)
+        except Exception as exc:  # pragma: no cover - defensive desktop loop
+            state.append_audit("danger", "Watchdog 오류", f"백그라운드 Watchdog 실행 실패: {exc}")
+        time.sleep(max(5.0, interval_seconds))
+
+
+def start_watchdog_thread() -> threading.Thread:
+    thread = threading.Thread(target=watchdog_worker, daemon=True)
+    thread.start()
+    return thread
+
+
 def start_in_thread(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tuple[ThreadingHTTPServer, str]:
     server = create_server(host, port)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    start_watchdog_thread()
     return server, f"http://{host}:{server.server_port}"
 
 
@@ -181,6 +201,7 @@ def main() -> None:
     parser.add_argument("--port", default=DEFAULT_PORT, type=int)
     args = parser.parse_args()
     server = create_server(args.host, args.port)
+    start_watchdog_thread()
     print(f"Live Trader server listening on http://{args.host}:{server.server_port}")
     try:
         server.serve_forever()

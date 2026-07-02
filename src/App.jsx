@@ -39,6 +39,7 @@ import {
   runFinalPreflight,
   runReconciliation,
   runStrategyCycle,
+  runWatchdog,
   retryOrder,
   setFlag,
   setAutomationProfile,
@@ -132,6 +133,20 @@ const fallbackSnapshot = {
   checklist: [],
   retry_policy: [],
   order_queue: { total: 0, blocked: 0, dry_run: 0, retryable: 0, canceled: 0 },
+  watchdog: {
+    last_run: "미실행",
+    status: "idle",
+    status_label: "대기",
+    last_action: "대기",
+    last_trip: "-",
+    trip_count: 0,
+    active_brokers: [],
+    active_live: false,
+    critical_count: 0,
+    warning_count: 0,
+    checks: [],
+    next_actions: [],
+  },
   dry_run_ledger: [],
   brokers: [],
   broker_diagnostics: [],
@@ -497,6 +512,18 @@ function buildSearchResults(snapshot, queryValue) {
     });
   });
 
+  (snapshot.watchdog?.checks ?? []).forEach((check) => {
+    addSearchResult(results, query, {
+      id: `watchdog-${check.label}`,
+      type: "Watchdog",
+      label: check.label,
+      detail: check.detail,
+      meta: [check.status, check.value].join(" "),
+      targetNav: "automation",
+      tone: statusTone(check.status),
+    });
+  });
+
   (snapshot.positions ?? []).forEach((position) => {
     addSearchResult(results, query, {
       id: `position-${position.symbol}`,
@@ -576,6 +603,23 @@ function buildNotificationItems(snapshot, error) {
       title: `Warning ${snapshot.summary.warning_count}개`,
       detail: "FULL LIVE 전환 전 수동 검토가 필요합니다.",
       targetNav: "gate",
+    });
+  }
+  if (snapshot.watchdog?.critical_count) {
+    push({
+      id: "watchdog-critical",
+      tone: "danger",
+      title: `Watchdog critical ${snapshot.watchdog.critical_count}개`,
+      detail: snapshot.watchdog.next_actions?.slice(0, 3).join(", ") || "Watchdog 차단 조건을 확인하세요.",
+      targetNav: "automation",
+    });
+  } else if (snapshot.watchdog?.warning_count) {
+    push({
+      id: "watchdog-warning",
+      tone: "warning",
+      title: `Watchdog warning ${snapshot.watchdog.warning_count}개`,
+      detail: snapshot.watchdog.next_actions?.slice(0, 3).join(", ") || "Watchdog 경고 조건을 확인하세요.",
+      targetNav: "automation",
     });
   }
 
@@ -1225,6 +1269,7 @@ function App() {
           onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
           onStrategyCycle={(profileId) => runAction(() => runStrategyCycle(profileId))}
+          onWatchdog={() => runAction(runWatchdog)}
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
           onRetryPolicy={(name, value) => runAction(() => setRetryPolicy(name, value))}
@@ -1298,6 +1343,7 @@ function WorkspaceContent({
   onEntryBlock,
   onAutomation,
   onStrategyCycle,
+  onWatchdog,
   onTestIntent,
   onRiskSetting,
   onRetryPolicy,
@@ -1345,6 +1391,7 @@ function WorkspaceContent({
           />
         </div>
         <div className="content-column">
+          <WatchdogPanel watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
           <OrderQueueSummaryPanel summary={snapshot.order_queue} />
           <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
         </div>
@@ -1360,6 +1407,7 @@ function WorkspaceContent({
         onDryRun={onDryRun}
         onEntryBlock={onEntryBlock}
         onTestIntent={onTestIntent}
+        onWatchdog={onWatchdog}
         onRiskSetting={onRiskSetting}
         onRetryPolicy={onRetryPolicy}
         onRetryOrder={onRetryOrder}
@@ -1406,7 +1454,7 @@ function WorkspaceContent({
   }
 
   return renderPage(
-    <PreTradeDoctorPanel snapshot={snapshot} onNavigate={onNavigate} onReconcile={onReconcile} onPreflight={onPreflight} />,
+    <PreTradeDoctorPanel snapshot={snapshot} onNavigate={onNavigate} onReconcile={onReconcile} onPreflight={onPreflight} onWatchdog={onWatchdog} />,
   );
 }
 
@@ -1416,6 +1464,7 @@ function LivePreparationPanel({
   onDryRun,
   onEntryBlock,
   onTestIntent,
+  onWatchdog,
   onRiskSetting,
   onRetryPolicy,
 }) {
@@ -1453,6 +1502,7 @@ function LivePreparationPanel({
             onEntryBlock={onEntryBlock}
             onTestIntent={onTestIntent}
           />
+          <WatchdogPanel watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
         </div>
         <div className="content-column">
           <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
@@ -1497,7 +1547,7 @@ function OperationalSafeguardsPanel({ dryRun, newEntriesBlocked, killSwitch, onD
   );
 }
 
-function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight }) {
+function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, onWatchdog }) {
   const [running, setRunning] = useState(false);
   const [hasRun, setHasRun] = useState(false);
   const [selectedDoctorId, setSelectedDoctorId] = useState(null);
@@ -1513,6 +1563,7 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight })
     try {
       await onReconcile();
       await onPreflight();
+      await onWatchdog();
     } finally {
       setRunning(false);
     }
@@ -1642,6 +1693,12 @@ function buildDoctorItems(snapshot) {
     ...(snapshot.positions ?? []).map((position) => makeDetail(position.symbol, `${position.broker_name} · ${position.status_label} · ${position.detail}`, position.status)),
     ...(snapshot.accounts ?? []).map((account) => makeDetail(account.account, `${account.broker_name} · ${account.currency} · ${account.detail}`, account.status)),
   ];
+  const watchdog = snapshot.watchdog ?? fallbackSnapshot.watchdog;
+  const watchdogDetails = [
+    makeDetail("Watchdog 상태", `${watchdog.status_label ?? watchdog.status} · 마지막 점검 ${watchdog.last_run ?? "-"}`, watchdog.status),
+    makeDetail("Fail-closed", `${watchdog.trip_count ?? 0}회 · 마지막 ${watchdog.last_trip ?? "-"}`, watchdog.trip_count ? "warn" : "pass"),
+    ...(watchdog.checks ?? []).map((check) => makeDetail(check.label, `${check.detail} · ${check.value}`, check.status)),
+  ];
   const finalDetails = [
     ...(snapshot.final_preflight ?? []).map((check) => makeDetail(check.label, check.detail, check.status)),
     ...((snapshot.launch_report?.hard_stops ?? []).map((item) => makeDetail(`Hard stop · ${item.label}`, item.detail, "fail"))),
@@ -1709,8 +1766,18 @@ function buildDoctorItems(snapshot) {
       details: reconciliationDetails,
     },
     {
-      id: "doctor-final",
+      id: "doctor-watchdog",
       index: 6,
+      title: "Live Watchdog",
+      detail: watchdog.critical_count ? `critical ${watchdog.critical_count}개로 자동화가 차단됩니다.` : watchdog.warning_count ? `warning ${watchdog.warning_count}개를 확인하세요.` : "Watchdog 감시 상태가 정상입니다.",
+      tone: watchdog.critical_count ? "danger" : watchdog.warning_count ? "warning" : "success",
+      status: watchdog.critical_count ? "차단" : watchdog.warning_count ? "주의" : "통과",
+      targetNav: "automation",
+      details: watchdogDetails,
+    },
+    {
+      id: "doctor-final",
+      index: 7,
       title: "최종 Preflight",
       detail: finalFailures.length ? `hard stop ${finalFailures.length}개가 남아 있습니다.` : finalWarnings.length ? `warning ${finalWarnings.length}개를 확인하세요.` : "최종 점검을 통과했습니다.",
       tone: finalFailures.length ? "danger" : finalWarnings.length ? "warning" : "success",
@@ -2324,6 +2391,60 @@ function OrderCommandPanel({ newEntriesBlocked, dryRun, killSwitch, onDryRun, on
           variant="primary"
         />
         <span className={`inline-state ${killSwitch ? "danger" : "success"}`}>{killSwitch ? "긴급 차단 켜짐" : "긴급 차단 꺼짐"}</span>
+      </div>
+    </section>
+  );
+}
+
+function WatchdogPanel({ watchdog, onWatchdog }) {
+  const data = watchdog ?? fallbackSnapshot.watchdog;
+  const tone = statusTone(data.status);
+  const statusText = data.status_label ?? data.status ?? "대기";
+  const checks = data.checks ?? [];
+  const metrics = [
+    { label: "상태", value: statusText, tone },
+    { label: "Critical", value: data.critical_count ?? 0, tone: data.critical_count ? "danger" : "success" },
+    { label: "Warning", value: data.warning_count ?? 0, tone: data.warning_count ? "warning" : "success" },
+    { label: "Fail-closed", value: data.trip_count ?? 0, tone: data.trip_count ? "warning" : "neutral" },
+  ];
+
+  return (
+    <section className="panel watchdog-panel">
+      <PanelHeader title="Live Watchdog" subtitle={`마지막 점검 ${data.last_run ?? "미실행"}`} />
+      <div className="panel-action-line">
+        <div>
+          <strong>{data.last_action ?? "대기"}</strong>
+          <span>{data.active_live ? `활성 브로커 ${data.active_brokers?.join(", ") || "-"}` : "자동화 라우트 비활성"}</span>
+        </div>
+        <ActionButton
+          className="secondary-button"
+          icon={<Radio size={16} />}
+          label="Watchdog 점검"
+          onClick={onWatchdog}
+          status={tone === "danger" ? "error" : tone === "success" ? "success" : undefined}
+        />
+      </div>
+      <div className="queue-grid watchdog-metrics">
+        {metrics.map((item) => (
+          <div className="queue-card" key={item.label}>
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+            <span className={`summary-state ${item.tone}`}>{item.tone === "success" ? "정상" : "확인"}</span>
+          </div>
+        ))}
+      </div>
+      <div className="risk-grid watchdog-grid">
+        {checks.map((check) => (
+          <div className={`risk-rule ${check.status}`} key={check.label}>
+            <ShieldAlert size={16} />
+            <div>
+              <strong>{check.label}</strong>
+              <span>{check.detail}</span>
+            </div>
+            <em>{check.value}</em>
+          </div>
+        ))}
+        {!checks.length && <EmptyRow text="아직 Watchdog 점검 결과가 없습니다." />}
       </div>
     </section>
   );

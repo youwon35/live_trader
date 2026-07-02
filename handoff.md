@@ -265,6 +265,7 @@ Important endpoints:
 - `POST /api/audit-export`
 - `POST /api/test-intent`
 - `POST /api/strategy-cycle`
+- `POST /api/watchdog`
 
 ### Order Intent And Risk Gate
 
@@ -283,6 +284,19 @@ As of 2026-07-02, Paper Trader and Live Trader also share the strategy signal bo
 - Live Trader exposes `/api/strategy-cycle` and the automation panel's `전략 사이클 점검` button to run a dry-run strategy cycle from approved artifacts.
 - Live strategy-cycle orders call `submit_order_intent()`, which routes every generated intent through `evaluate_order_gate_with_report()` and `PreTradeRiskGate`; no strategy signal path is allowed to bypass the gate.
 - This is the shared boundary foundation, not the complete continuous automation engine yet.
+
+### Live Watchdog
+
+As of 2026-07-02, Live Trader has a server-side Watchdog layer.
+
+- Main implementation: `live_trader\state.py`.
+- API: `POST /api/watchdog`.
+- Background loop: `live_trader\server.py` starts a daemon Watchdog worker every 15 seconds while the desktop server is running.
+- UI: `src\App.jsx` shows a `Live Watchdog` panel on automation and live-prep surfaces, includes a Doctor card, and exposes Watchdog critical/warning states in search and notifications.
+- The Watchdog checks heartbeat age, strategy/market-data freshness, active broker/API readiness, recent order burst count, retryable queue size, blocked-order accumulation, and account/position reconciliation state.
+- Critical Watchdog conditions fail closed by forcing `MONITOR`, turning on `new_entries_blocked`, and disabling active automation profiles.
+- `evaluate_order_gate_with_report()` appends a `Watchdog` fail check to `PreTradeRiskReport` when the current snapshot has Watchdog critical items, so order audit logs show the safety reason instead of hiding it behind a generic readiness blocker.
+- This is still a local/state watchdog. It does not yet consume true broker user streams, exchange heartbeats, or real market-data websocket latency.
 
 ## Strategy Artifacts
 
@@ -352,6 +366,7 @@ Known safety flags in state:
 - `kill_switch`
 - `operator_confirmed`
 - `mode`
+- `watchdog`
 
 Important nuance:
 
@@ -481,7 +496,7 @@ Use the Notion update tool when available.
 
 Critical gaps before real money should be enabled:
 
-- No complete continuous automation engine yet; the shared `StrategyExecutionRunner -> OrderIntent -> PreTradeRiskGate` boundary is in place for test strategy cycles.
+- No complete continuous automation engine yet; the shared `StrategyExecutionRunner -> OrderIntent -> PreTradeRiskGate` boundary and local Watchdog fail-closed layer are in place for test strategy cycles.
 - KIS account/position reconciliation APIs still need real implementation.
 - Binance account/balance/user stream/cancel APIs still need real implementation.
 - Upbit account/balance/cancel APIs still need real implementation.
@@ -514,6 +529,7 @@ The user selected this order on 2026-07-02:
 3. Implement a Live Trader watchdog:
    - monitor heartbeat, stale data, broker/API health, and runaway order conditions
    - fail closed to MONITOR or new-entry block when critical checks fail
+   - 2026-07-02 implemented local Watchdog state, `/api/watchdog`, UI panel/Doctor card, background loop, and risk-report integration
 4. Implement real account/position reconciliation:
    - KIS balance/holdings
    - Binance account/order status
@@ -531,7 +547,6 @@ Lower-priority follow-up:
 1. Finish the selected roadmap in order:
    - order/risk audit log strengthening
    - shared strategy plugin runner boundary
-   - Live Trader watchdog
    - real account/position reconciliation
 2. Keep the live path fixed as:
    - `OrderIntent -> PreTradeRiskGate -> adapter/dry-run boundary`

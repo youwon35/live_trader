@@ -12,7 +12,7 @@ from .brokers import broker_adapter_contract, broker_diagnostics, broker_readine
 from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts, strategy_plugin_status
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 from .order_management import OrderIntent, OrderSide
-from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder
+from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
 
 
@@ -215,6 +215,13 @@ ACCOUNT_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
 
 FINAL_ORDER_STATES = {"dry_run", "sent", "filled", "canceled", "retry_exhausted"}
 AUDIT_LOG_LIMIT = 500
+DEFAULT_WATCHDOG_SETTINGS: dict[str, float] = {
+    "heartbeat_timeout_sec": 45.0,
+    "market_data_stale_sec": 90.0,
+    "max_recent_orders_per_min": 6.0,
+    "max_retryable_orders": 3.0,
+    "max_blocked_orders": 5.0,
+}
 
 
 @dataclass(frozen=True)
@@ -247,6 +254,16 @@ STATE: dict[str, Any] = {
         "last_signal": "-",
         "last_action": "대기",
     },
+    "watchdog": {
+        "last_run": "미실행",
+        "status": "idle",
+        "status_label": "대기",
+        "last_action": "대기",
+        "last_trip": "-",
+        "trip_count": 0,
+        "settings": dict(DEFAULT_WATCHDOG_SETTINGS),
+        "checks": [],
+    },
     "reconciliation_last_run": None,
     "preflight_last_run": None,
     "orders": [],
@@ -273,6 +290,29 @@ def now_text() -> str:
 
 def future_text(seconds: float) -> str:
     return (datetime.now() + timedelta(seconds=max(0.0, seconds))).strftime("%H:%M:%S")
+
+
+def parse_state_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text or text in {"-", "미실행", "대기"}:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            if fmt == "%H:%M:%S":
+                now = datetime.now()
+                parsed = parsed.replace(year=now.year, month=now.month, day=now.day)
+            return parsed
+        except ValueError:
+            continue
+    return None
+
+
+def seconds_since(value: object, now: datetime | None = None) -> int | None:
+    parsed = parse_state_datetime(value)
+    if parsed is None:
+        return None
+    return max(0, int(((now or datetime.now()) - parsed).total_seconds()))
 
 
 def env_enabled(name: str, default: bool = False) -> bool:
@@ -709,15 +749,245 @@ def order_queue_summary() -> dict[str, int]:
     }
 
 
+def active_watchdog_broker_ids() -> set[str]:
+    broker_ids: set[str] = set()
+    stock = STATE["automation"]["stock"]
+    crypto = STATE["automation"]["crypto"]
+    if stock.get("enabled") or str(stock.get("mode", "MONITOR")).upper() != "MONITOR":
+        broker_ids.add("kis")
+    if crypto.get("enabled") or str(crypto.get("mode", "MONITOR")).upper() != "MONITOR":
+        broker_ids.add(str(crypto.get("provider") or "binance"))
+    if current_mode() != "MONITOR":
+        broker_ids.update({"kis", str(crypto.get("provider") or "binance")})
+    return {broker_id for broker_id in broker_ids if broker_id}
+
+
+def live_exposure_active() -> bool:
+    if current_mode() != "MONITOR":
+        return True
+    return any(
+        bool(profile.get("enabled")) or str(profile.get("mode", "MONITOR")).upper() != "MONITOR"
+        for profile in STATE["automation"].values()
+    )
+
+
+def recent_order_count(seconds: int, now: datetime | None = None) -> int:
+    current = now or datetime.now()
+    cutoff = current - timedelta(seconds=max(1, seconds))
+    count = 0
+    for order in STATE["orders"]:
+        occurred_at = parse_state_datetime(order.get("created_at") or order.get("time"))
+        if occurred_at and occurred_at >= cutoff:
+            count += 1
+    return count
+
+
+def watchdog_check(label: str, status: CheckStatus, detail: str, value: object = "-") -> dict[str, str]:
+    return {"label": label, "status": status, "detail": detail, "value": str(value)}
+
+
+def watchdog_snapshot(
+    brokers: list[dict[str, object]] | None = None,
+    reconciliation_summary: dict[str, Any] | None = None,
+    queue: dict[str, int] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current = now or datetime.now()
+    settings = STATE["watchdog"].get("settings", DEFAULT_WATCHDOG_SETTINGS)
+    brokers = brokers if brokers is not None else [broker.to_dict() for broker in broker_readiness()]
+    reconciliation_summary = reconciliation_summary if reconciliation_summary is not None else reconciliation_snapshot()["summary"]
+    queue = queue if queue is not None else order_queue_summary()
+    active_brokers = active_watchdog_broker_ids()
+    active_live = live_exposure_active()
+
+    checks: list[dict[str, str]] = []
+    heartbeat_timeout = int(float(settings.get("heartbeat_timeout_sec", DEFAULT_WATCHDOG_SETTINGS["heartbeat_timeout_sec"])))
+    heartbeat_age = seconds_since(STATE["watchdog"].get("last_run"), current)
+    if heartbeat_age is None:
+        heartbeat_status: CheckStatus = "fail" if active_live else "warn"
+        heartbeat_detail = "Watchdog 점검 이력이 없습니다. 자동화 전 첫 점검이 필요합니다."
+        heartbeat_value = "미실행"
+    elif heartbeat_age > heartbeat_timeout:
+        heartbeat_status = "fail" if active_live else "warn"
+        heartbeat_detail = f"마지막 Watchdog 점검이 {heartbeat_age}초 전입니다. 허용 {heartbeat_timeout}초를 넘었습니다."
+        heartbeat_value = f"{heartbeat_age}초"
+    else:
+        heartbeat_status = "pass"
+        heartbeat_detail = f"Watchdog heartbeat가 {heartbeat_timeout}초 한도 안에 있습니다."
+        heartbeat_value = f"{heartbeat_age}초"
+    checks.append(watchdog_check("Watchdog heartbeat", heartbeat_status, heartbeat_detail, heartbeat_value))
+
+    stale_limit = int(float(settings.get("market_data_stale_sec", DEFAULT_WATCHDOG_SETTINGS["market_data_stale_sec"])))
+    runner_age = seconds_since(STATE["strategy_runner"].get("last_run"), current)
+    if active_live and runner_age is None:
+        data_status: CheckStatus = "fail"
+        data_detail = "자동화가 활성화됐지만 최근 전략/시장 데이터 점검 시간이 없습니다."
+        data_value = "미실행"
+    elif active_live and runner_age is not None and runner_age > stale_limit:
+        data_status = "fail"
+        data_detail = f"최근 전략/시장 데이터가 {runner_age}초 전입니다. 허용 {stale_limit}초를 넘었습니다."
+        data_value = f"{runner_age}초"
+    elif runner_age is None:
+        data_status = "warn"
+        data_detail = "아직 전략 사이클이 실행되지 않았습니다. 자동화 전 신호 경로를 점검하세요."
+        data_value = "미실행"
+    else:
+        data_status = "pass"
+        data_detail = "최근 전략/시장 데이터 점검 시간이 허용 범위 안에 있습니다."
+        data_value = f"{runner_age}초"
+    checks.append(watchdog_check("시장 데이터 신선도", data_status, data_detail, data_value))
+
+    broker_map = {str(broker.get("broker_id")): broker for broker in brokers}
+    if active_brokers:
+        blocked = [broker_map.get(broker_id, {"broker_id": broker_id, "order_ready": False}) for broker_id in sorted(active_brokers)]
+        unavailable = [broker for broker in blocked if not broker.get("order_ready")]
+        broker_status: CheckStatus = "fail" if unavailable else "pass"
+        broker_detail = (
+            f"활성 라우트 브로커 준비 실패: {', '.join(str(broker.get('broker_id')) for broker in unavailable)}"
+            if unavailable
+            else "활성 자동화 브로커가 주문 게이트 기준으로 준비되어 있습니다."
+        )
+        broker_value = f"{len(blocked) - len(unavailable)}/{len(blocked)}"
+    else:
+        unavailable = [broker for broker in brokers if not broker.get("order_ready")]
+        broker_status = "warn" if unavailable else "pass"
+        broker_detail = "활성 자동화 라우트는 없지만 준비되지 않은 브로커가 있습니다." if unavailable else "비활성 상태이며 브로커 준비 경고가 없습니다."
+        broker_value = "비활성"
+    checks.append(watchdog_check("브로커/API 상태", broker_status, broker_detail, broker_value))
+
+    recent_limit = int(float(settings.get("max_recent_orders_per_min", DEFAULT_WATCHDOG_SETTINGS["max_recent_orders_per_min"])))
+    recent_count = recent_order_count(60, current)
+    recent_status: CheckStatus = "fail" if recent_count > recent_limit else "pass"
+    recent_detail = (
+        f"최근 60초 주문 의도 {recent_count}건이 한도 {recent_limit}건을 초과했습니다."
+        if recent_status == "fail"
+        else f"최근 60초 주문 의도 {recent_count}건이 한도 안에 있습니다."
+    )
+    checks.append(watchdog_check("과도 주문 감시", recent_status, recent_detail, f"{recent_count}/{recent_limit}"))
+
+    retry_limit = int(float(settings.get("max_retryable_orders", DEFAULT_WATCHDOG_SETTINGS["max_retryable_orders"])))
+    retryable = int(queue.get("retryable", 0))
+    retry_status: CheckStatus = "fail" if retryable > retry_limit else "warn" if retryable else "pass"
+    retry_detail = (
+        f"재시도 가능 주문 {retryable}건이 한도 {retry_limit}건을 초과했습니다."
+        if retry_status == "fail"
+        else f"재시도 가능 주문 {retryable}건입니다."
+    )
+    checks.append(watchdog_check("재시도 큐", retry_status, retry_detail, f"{retryable}/{retry_limit}"))
+
+    blocked_limit = int(float(settings.get("max_blocked_orders", DEFAULT_WATCHDOG_SETTINGS["max_blocked_orders"])))
+    blocked = int(queue.get("blocked", 0))
+    blocked_status: CheckStatus = "fail" if blocked > blocked_limit else "warn" if blocked else "pass"
+    blocked_detail = (
+        f"차단 주문 {blocked}건이 한도 {blocked_limit}건을 초과했습니다."
+        if blocked_status == "fail"
+        else f"차단 주문 {blocked}건입니다."
+    )
+    checks.append(watchdog_check("차단 주문 누적", blocked_status, blocked_detail, f"{blocked}/{blocked_limit}"))
+
+    reconcile_status = str(reconciliation_summary.get("status", "warn"))
+    if reconcile_status == "pass":
+        reconcile_check_status: CheckStatus = "pass"
+    elif reconcile_status == "fail":
+        reconcile_check_status = "fail"
+    else:
+        reconcile_check_status = "warn"
+    checks.append(
+        watchdog_check(
+            "포지션·계좌 대조",
+            reconcile_check_status,
+            f"대조 상태는 {reconciliation_summary.get('status_label', '확인 필요')}입니다.",
+            reconciliation_summary.get("last_run", "미실행"),
+        )
+    )
+
+    critical = [check for check in checks if check["status"] == "fail"]
+    warnings = [check for check in checks if check["status"] == "warn"]
+    status: CheckStatus = "fail" if critical else "warn" if warnings else "pass"
+    status_label = "차단" if status == "fail" else "주의" if status == "warn" else "정상"
+    next_actions = [check["label"] for check in critical[:5]] or [check["label"] for check in warnings[:5]] or ["Watchdog 정상"]
+    return {
+        "last_run": STATE["watchdog"].get("last_run", "미실행"),
+        "status": status,
+        "status_label": status_label,
+        "last_action": STATE["watchdog"].get("last_action", "대기"),
+        "last_trip": STATE["watchdog"].get("last_trip", "-"),
+        "trip_count": int(STATE["watchdog"].get("trip_count", 0)),
+        "active_brokers": sorted(active_brokers),
+        "active_live": active_live,
+        "critical_count": len(critical),
+        "warning_count": len(warnings),
+        "checks": checks,
+        "next_actions": next_actions,
+    }
+
+
+def apply_watchdog_fail_closed(report: dict[str, Any]) -> bool:
+    if int(report.get("critical_count", 0)) <= 0:
+        return False
+
+    changed = False
+    if STATE["new_entries_blocked"] is not True:
+        STATE["new_entries_blocked"] = True
+        changed = True
+    if current_mode() != "MONITOR":
+        STATE["mode"] = "MONITOR"
+        changed = True
+    for profile_id, profile in STATE["automation"].items():
+        if profile.get("enabled") or str(profile.get("mode", "MONITOR")).upper() != "MONITOR":
+            profile["enabled"] = False
+            profile["mode"] = "MONITOR"
+            profile["last_action"] = "Watchdog fail-closed로 MONITOR 전환"
+            changed = True
+
+    if changed:
+        STATE["watchdog"]["trip_count"] = int(STATE["watchdog"].get("trip_count", 0)) + 1
+        STATE["watchdog"]["last_trip"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        append_audit(
+            "danger",
+            "Watchdog Fail Closed",
+            f"critical {report['critical_count']}개: {', '.join(report['next_actions'][:4])}. MONITOR와 신규 진입 차단을 적용했습니다.",
+        )
+    return changed
+
+
+def run_watchdog(include_snapshot: bool = True) -> dict[str, Any]:
+    brokers = [broker.to_dict() for broker in broker_readiness()]
+    reconciliation = reconciliation_snapshot()
+    queue = order_queue_summary()
+    previous_status = str(STATE["watchdog"].get("status", "idle"))
+    now = datetime.now()
+    STATE["watchdog"]["last_run"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    report = watchdog_snapshot(brokers, reconciliation["summary"], queue, now=now)
+    STATE["watchdog"]["status"] = report["status"]
+    STATE["watchdog"]["status_label"] = report["status_label"]
+    STATE["watchdog"]["checks"] = report["checks"]
+    STATE["watchdog"]["last_action"] = (
+        f"critical {report['critical_count']} / warning {report['warning_count']}"
+        if report["critical_count"] or report["warning_count"]
+        else "정상"
+    )
+    changed = apply_watchdog_fail_closed(report)
+    if previous_status != report["status"] and not changed:
+        level = "danger" if report["status"] == "fail" else "warn" if report["status"] == "warn" else "info"
+        append_audit(level, "Watchdog", f"{report['status_label']}: {STATE['watchdog']['last_action']}")
+    payload = {"ok": report["critical_count"] == 0, "watchdog": watchdog_snapshot(brokers, reconciliation["summary"], queue)}
+    if include_snapshot:
+        payload["snapshot"] = snapshot()
+    return payload
+
+
 def operation_report(
     reconciliation: dict[str, Any],
     checks: list[Check],
     preflight: list[dict[str, str]],
+    watchdog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     blocker_count = sum(1 for check in checks if check.status == "fail")
     warning_count = sum(1 for check in checks if check.status == "warn")
     hard_stop_count = sum(1 for check in preflight if check["status"] == "fail")
     queue = order_queue_summary()
+    watchdog = watchdog or watchdog_snapshot(queue=queue, reconciliation_summary=reconciliation["summary"])
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "sections": [
@@ -744,6 +1014,12 @@ def operation_report(
                 "status": "fail" if hard_stop_count else "pass",
                 "value": f"hard stop {hard_stop_count}",
                 "detail": "실제 브로커 어댑터 연결 전 최종 승인 패키지입니다.",
+            },
+            {
+                "label": "Watchdog",
+                "status": str(watchdog["status"]),
+                "value": f"critical {watchdog['critical_count']} / warn {watchdog['warning_count']}",
+                "detail": str(watchdog["last_action"]),
             },
         ],
     }
@@ -847,12 +1123,16 @@ def snapshot() -> dict[str, Any]:
     strategies = strategy_rows()
     automations = automation_profiles(strategies, brokers)
     reconciliation = reconciliation_snapshot()
+    queue = order_queue_summary()
+    watchdog = watchdog_snapshot(brokers, reconciliation["summary"], queue)
     checks = readiness_checks(strategies, brokers, reconciliation["summary"])
     preflight = final_preflight_checks(strategies, brokers, reconciliation)
-    report = operation_report(reconciliation, checks, preflight)
+    report = operation_report(reconciliation, checks, preflight, watchdog)
     launch = launch_report(preflight)
     blockers = [check for check in checks if check.status == "fail"]
     warnings = [check for check in checks if check.status == "warn"]
+    blocker_count = len(blockers) + int(watchdog["critical_count"])
+    warning_count = len(warnings) + int(watchdog["warning_count"])
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode": STATE["mode"],
@@ -861,19 +1141,20 @@ def snapshot() -> dict[str, Any]:
         "new_entries_blocked": STATE["new_entries_blocked"],
         "operator_confirmed": STATE["operator_confirmed"],
         "summary": {
-            "status": "blocked" if blockers else ("watch" if warnings else "ready"),
-            "blocker_count": len(blockers),
-            "warning_count": len(warnings),
+            "status": "blocked" if blocker_count else ("watch" if warning_count else "ready"),
+            "blocker_count": blocker_count,
+            "warning_count": warning_count,
             "live_strategy_count": sum(1 for strategy in strategies if strategy["live_allowed"]),
             "broker_ready_count": sum(1 for broker in brokers if broker["order_ready"]),
         },
         "sessions": market_sessions(),
         "readiness": [check.to_dict() for check in checks],
+        "watchdog": watchdog,
         "risk_checks": risk_checks(reconciliation["summary"]),
         "risk_settings": risk_setting_rows(),
         "checklist": checklist_rows(),
         "retry_policy": retry_policy_rows(),
-        "order_queue": order_queue_summary(),
+        "order_queue": queue,
         "brokers": brokers,
         "broker_diagnostics": broker_diagnostics(),
         "broker_adapter_contract": broker_adapter_contract(),
@@ -953,7 +1234,12 @@ def order_gate_audit_detail(order: dict[str, Any], reason: str, report: PreTrade
 def set_mode(mode: str) -> dict[str, Any]:
     data = snapshot()
     blockers = data["summary"]["blocker_count"]
+    watchdog_critical = int(data.get("watchdog", {}).get("critical_count", 0))
     normalized = mode if mode in {"MONITOR", "SMALL_LIVE", "FULL_LIVE"} else "MONITOR"
+    if normalized != "MONITOR" and watchdog_critical:
+        reason = f"Watchdog critical {watchdog_critical}개 때문에 {normalized} 전환이 차단되었습니다."
+        append_audit("danger", "모드 전환 차단", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
     if normalized != "MONITOR" and blockers:
         append_audit("danger", "모드 전환 차단", f"{normalized} 전환은 readiness blocker {blockers}개 때문에 차단되었습니다.")
         return {"ok": False, "reason": f"readiness blocker {blockers}개가 남아 있습니다.", "snapshot": snapshot()}
@@ -1005,6 +1291,12 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
     if not profile:
         return {"ok": False, "reason": "automation profile not found", "snapshot": snapshot()}
     if next_mode != "MONITOR":
+        watchdog_critical = int(data.get("watchdog", {}).get("critical_count", 0))
+        if watchdog_critical:
+            reason = f"Watchdog critical {watchdog_critical}개 때문에 {next_mode} 전환이 차단되었습니다."
+            STATE["automation"][profile_id]["last_action"] = reason
+            append_audit("danger", "자동화 시작 차단", f"{profile['title']}: {reason}")
+            return {"ok": False, "reason": reason, "snapshot": snapshot()}
         if data["summary"]["blocker_count"]:
             reason = f"readiness blocker {data['summary']['blocker_count']}개 때문에 {next_mode} 전환이 차단되었습니다."
             STATE["automation"][profile_id]["last_action"] = reason
@@ -1198,6 +1490,11 @@ def evaluate_order_gate_with_report(
 ) -> tuple[bool, str, str, str, PreTradeRiskReport]:
     intent = intent or default_order_intent(checks, side)
     report = PreTradeRiskGate().evaluate(intent, pre_trade_context(checks, intent, dry_run))
+    watchdog = checks.get("watchdog") if isinstance(checks.get("watchdog"), dict) else {}
+    watchdog_critical = int(watchdog.get("critical_count", 0) or 0)
+    if watchdog_critical:
+        detail = f"Watchdog critical {watchdog_critical}개: {', '.join(watchdog.get('next_actions', [])[:4])}"
+        report = PreTradeRiskReport(report.checked_at, (*report.checks, RiskCheck("Watchdog", "fail", detail)))
     if report.can_submit:
         if dry_run:
             return True, "dry_run", "simulated", "Dry Run 보호가 켜져 있어 브로커 전송 없이 주문 의도를 감사 로그에만 기록했습니다.", report

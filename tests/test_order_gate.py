@@ -1,5 +1,6 @@
 import copy
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 from live_trader import state
@@ -273,6 +274,71 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(result["runner_report"]["intent"]["metadata"]["runner"], "StrategyExecutionRunner")
         self.assertEqual(state.STATE["audit"][-1]["event"], "전략 Runner")
         self.assertIn("risk pass", state.STATE["audit"][-1]["detail"])
+
+    def test_order_gate_adds_watchdog_blocker_to_risk_report(self) -> None:
+        state.STATE["new_entries_blocked"] = False
+        checks = {
+            "summary": {"blocker_count": 0, "warning_count": 0},
+            "watchdog": {"critical_count": 1, "next_actions": ["과도 주문 감시"]},
+        }
+
+        ok, order_state, queue_state, reason, report = state.evaluate_order_gate_with_report(
+            checks,
+            "BUY",
+            dry_run=True,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(order_state, "risk_blocked")
+        self.assertEqual(queue_state, "blocked")
+        self.assertIn("Watchdog", reason)
+        self.assertTrue(any(check.label == "Watchdog" and check.status == "fail" for check in report.blockers))
+
+    def test_watchdog_fail_closed_blocks_entries_and_monitor_mode(self) -> None:
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["automation"]["crypto"]["enabled"] = True
+        state.STATE["automation"]["crypto"]["mode"] = "SMALL_LIVE"
+        state.STATE["watchdog"]["settings"]["max_recent_orders_per_min"] = 1.0
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        state.STATE["orders"] = [
+            {
+                "order_id": f"LIVE-DRY-{index:04d}",
+                "created_at": now,
+                "time": now,
+                "state": "dry_run",
+                "queue_state": "simulated",
+                "attempts": 1,
+            }
+            for index in range(1, 4)
+        ]
+        state.STATE["audit"] = []
+
+        result = state.run_watchdog(include_snapshot=False)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(state.STATE["mode"], "MONITOR")
+        self.assertTrue(state.STATE["new_entries_blocked"])
+        self.assertFalse(state.STATE["automation"]["crypto"]["enabled"])
+        self.assertEqual(state.STATE["automation"]["crypto"]["mode"], "MONITOR")
+        self.assertEqual(state.STATE["watchdog"]["trip_count"], 1)
+        self.assertEqual(state.STATE["audit"][-1]["event"], "Watchdog Fail Closed")
+
+    def test_automation_start_is_blocked_by_watchdog_critical(self) -> None:
+        fake_snapshot = {
+            "summary": {"blocker_count": 0, "warning_count": 0},
+            "watchdog": {"critical_count": 1},
+            "automation_profiles": [
+                {"id": "crypto", "title": "코인 자동화", "live_strategy_count": 1}
+            ],
+        }
+
+        with patch("live_trader.state.snapshot", return_value=fake_snapshot):
+            result = state.set_automation_profile("crypto", True, provider="binance", mode="SMALL_LIVE")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Watchdog critical", result["reason"])
+        self.assertFalse(state.STATE["automation"]["crypto"]["enabled"])
 
 
 if __name__ == "__main__":
