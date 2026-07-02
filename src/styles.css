@@ -1373,6 +1373,7 @@ button {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) minmax(120px, auto);
   align-items: center;
+  position: relative;
   gap: 9px;
   min-height: 58px;
   padding: 8px 10px;
@@ -1411,15 +1412,9 @@ button {
 }
 
 .setting-row .switch-label {
-  grid-template-columns: auto minmax(34px, auto);
-  justify-content: end;
-}
-
-.switch-label input {
-  width: 16px;
-  height: 16px;
-  min-height: 16px;
-  accent-color: var(--primary);
+  position: absolute;
+  top: 10px;
+  right: 10px;
 }
 
 .setting-row input[type="number"] {
@@ -3511,12 +3506,26 @@ body {
   display: grid;
   grid-template-columns: minmax(170px, 0.95fr) minmax(170px, 1fr) auto;
   align-items: center;
+  position: relative;
   gap: 10px;
   min-height: 68px;
   padding: 10px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
+}
+
+.live-assistant-field.bool {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-content: start;
+  min-height: 78px;
+  padding-right: 84px;
+}
+
+.live-assistant-field.bool .ts-toggle-switch {
+  position: absolute;
+  top: 10px;
+  right: 10px;
 }
 
 .live-assistant-field div {
