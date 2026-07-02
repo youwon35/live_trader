@@ -3,12 +3,18 @@ import unittest
 from unittest.mock import patch
 
 from live_trader.live_adapters import (
+    BINANCE_ACCOUNT_ENDPOINT,
     BINANCE_TEST_ORDER_ENDPOINT,
+    KIS_DOMESTIC_BALANCE_ENDPOINT,
     KIS_DOMESTIC_ORDER_ENDPOINT,
     KIS_OVERSEAS_ORDER_ENDPOINT,
+    UPBIT_ACCOUNTS_ENDPOINT,
     UPBIT_ORDER_ENDPOINT,
+    build_binance_account_request,
     build_binance_spot_order_request,
+    build_kis_domestic_balance_request,
     build_kis_live_order_request,
+    build_upbit_accounts_request,
     build_upbit_order_request,
     sign_binance_query,
 )
@@ -183,10 +189,53 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertEqual(prepared.body["volume"], "0.01")
         self.assertEqual(prepared.body["price"], "50000000")
 
+    def test_account_snapshot_requests_are_read_only_and_signed(self) -> None:
+        os.environ.update(
+            {
+                "KIS_APP_KEY": "kis-app-key",
+                "KIS_APP_SECRET": "kis-app-secret",
+                "KIS_ACCOUNT_NO": "12345678-01",
+                "KIS_ACCOUNT_PRODUCT_CODE": "01",
+                "KIS_BASE_URL": "https://kis.example.test",
+                "BINANCE_API_KEY": "binance-key",
+                "BINANCE_API_SECRET": "binance-secret",
+                "BINANCE_BASE_URL": "https://binance.example.test",
+                "UPBIT_ACCESS_KEY": "upbit-access",
+                "UPBIT_SECRET_KEY": "upbit-secret",
+                "UPBIT_BASE_URL": "https://upbit.example.test",
+            }
+        )
+
+        with patch("live_trader.live_adapters.time.time", return_value=1700000000.123):
+            kis = build_kis_domestic_balance_request(access_token="token-123")
+            binance = build_binance_account_request()
+            upbit = build_upbit_accounts_request()
+
+        self.assertTrue(kis.can_send)
+        self.assertEqual(kis.method, "GET")
+        self.assertEqual(kis.endpoint, KIS_DOMESTIC_BALANCE_ENDPOINT)
+        self.assertIn("CANO=12345678", kis.url)
+        self.assertEqual(kis.safe_headers["authorization_configured"], True)
+
+        self.assertTrue(binance.can_send)
+        self.assertEqual(binance.method, "GET")
+        self.assertEqual(binance.endpoint, BINANCE_ACCOUNT_ENDPOINT)
+        self.assertIn("timestamp=1700000000123", binance.url)
+        self.assertEqual(binance.preview()["query"]["signature"], "***")
+
+        self.assertTrue(upbit.can_send)
+        self.assertEqual(upbit.method, "GET")
+        self.assertEqual(upbit.endpoint, UPBIT_ACCOUNTS_ENDPOINT)
+        self.assertTrue(upbit.headers["Authorization"].startswith("Bearer "))
+        self.assertEqual(upbit.safe_headers["authorization_configured"], True)
+
     def test_missing_settings_and_invalid_intent_are_reported_as_blocked_reasons(self) -> None:
         kis = build_kis_live_order_request({"symbol": "", "side": "BUY", "quantity": 0, "price": 0})
         binance = build_binance_spot_order_request({"symbol": "", "side": "BUY", "quantity": 0})
         upbit = build_upbit_order_request({"market": "", "side": "SELL", "quantity": 0})
+        kis_balance = build_kis_domestic_balance_request()
+        binance_account = build_binance_account_request()
+        upbit_accounts = build_upbit_accounts_request()
 
         self.assertFalse(kis.can_send)
         self.assertIn("KIS_APP_KEY", kis.blocked_reasons)
@@ -206,6 +255,13 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertIn("UPBIT_ACCESS_KEY", upbit.blocked_reasons)
         self.assertIn("UPBIT_SECRET_KEY", upbit.blocked_reasons)
         self.assertIn("market", upbit.blocked_reasons)
+
+        self.assertFalse(kis_balance.can_send)
+        self.assertIn("access_token", kis_balance.blocked_reasons)
+        self.assertFalse(binance_account.can_send)
+        self.assertIn("BINANCE_API_KEY", binance_account.blocked_reasons)
+        self.assertFalse(upbit_accounts.can_send)
+        self.assertIn("UPBIT_ACCESS_KEY", upbit_accounts.blocked_reasons)
 
 
 if __name__ == "__main__":

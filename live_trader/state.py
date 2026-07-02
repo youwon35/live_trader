@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from io import StringIO
 from typing import Any, Literal
 
-from .brokers import broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
+from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts, strategy_plugin_status
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 from .order_management import OrderIntent, OrderSide
@@ -211,6 +211,15 @@ ACCOUNT_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
         "broker_cash": None,
         "detail": "Binance signed account endpoint가 연결되어야 현금성 잔고를 대조합니다.",
     },
+    {
+        "broker_id": "upbit",
+        "broker_name": "Upbit",
+        "account": "Upbit KRW",
+        "currency": "KRW",
+        "program_cash": None,
+        "broker_cash": None,
+        "detail": "Upbit 전체 계좌 조회 API가 연결되어야 원화 잔고를 대조합니다.",
+    },
 )
 
 FINAL_ORDER_STATES = {"dry_run", "sent", "filled", "canceled", "retry_exhausted"}
@@ -263,6 +272,12 @@ STATE: dict[str, Any] = {
         "trip_count": 0,
         "settings": dict(DEFAULT_WATCHDOG_SETTINGS),
         "checks": [],
+    },
+    "broker_reconciliation": {
+        "fetched_at": None,
+        "accounts": [],
+        "positions": [],
+        "errors": [],
     },
     "reconciliation_last_run": None,
     "preflight_last_run": None,
@@ -552,17 +567,46 @@ def risk_checks(reconciliation_summary: dict[str, Any] | None = None) -> list[di
     ]
 
 
+def broker_reconciliation_errors() -> dict[str, str]:
+    errors = STATE.get("broker_reconciliation", {}).get("errors", [])
+    if not isinstance(errors, list):
+        return {}
+    return {str(item.get("broker_id")): str(item.get("detail")) for item in errors if isinstance(item, dict)}
+
+
+def live_account_rows() -> dict[str, dict[str, object]]:
+    rows = STATE.get("broker_reconciliation", {}).get("accounts", [])
+    if not isinstance(rows, list):
+        return {}
+    return {str(item.get("broker_id")): item for item in rows if isinstance(item, dict)}
+
+
+def live_position_rows() -> dict[tuple[str, str], dict[str, object]]:
+    rows = STATE.get("broker_reconciliation", {}).get("positions", [])
+    if not isinstance(rows, list):
+        return {}
+    return {
+        (str(item.get("broker_id")), str(item.get("symbol"))): item
+        for item in rows
+        if isinstance(item, dict) and item.get("broker_id") and item.get("symbol")
+    }
+
+
 def positions() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
+    broker_rows = live_position_rows()
+    errors = broker_reconciliation_errors()
     for item in POSITION_RECONCILIATION_BOOK:
-        broker_qty = item["broker_qty"]
+        key = (str(item["broker_id"]), str(item["symbol"]))
+        broker_row = broker_rows.pop(key, None)
+        broker_qty = broker_row.get("broker_qty") if broker_row else item["broker_qty"]
         program_qty = float(item["program_qty"])
         tolerance_qty = float(item["tolerance_qty"])
         if broker_qty is None:
             status = "api_required"
             status_label = "API 필요"
             delta_qty = "-"
-            detail = "브로커 포지션 조회 어댑터가 아직 연결되지 않았습니다."
+            detail = errors.get(str(item["broker_id"]), "브로커 포지션 조회 결과가 아직 없습니다.")
         else:
             numeric_broker_qty = float(broker_qty)
             delta = program_qty - numeric_broker_qty
@@ -590,37 +634,67 @@ def positions() -> list[dict[str, str]]:
                 "detail": detail,
             }
         )
+    for (_, _), broker_row in sorted(broker_rows.items()):
+        broker_qty = float(broker_row.get("broker_qty") or 0.0)
+        if broker_qty <= 0:
+            continue
+        rows.append(
+            {
+                "symbol": str(broker_row.get("symbol")),
+                "asset": str(broker_row.get("asset") or ""),
+                "broker_id": str(broker_row.get("broker_id")),
+                "broker_name": str(broker_row.get("broker_name") or broker_row.get("broker_id")),
+                "currency": str(broker_row.get("currency") or ""),
+                "program_qty": "0",
+                "broker_qty": format_quantity(broker_qty),
+                "delta_qty": format_quantity(-broker_qty),
+                "status": "mismatch",
+                "status_label": "불일치",
+                "detail": f"브로커에는 보유 수량이 있지만 프로그램 포지션 원장에는 없습니다. {broker_row.get('detail', '')}".strip(),
+            }
+        )
     return rows
 
 
 def account_reconciliation_rows() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
+    live_accounts = live_account_rows()
+    errors = broker_reconciliation_errors()
     for item in ACCOUNT_RECONCILIATION_BOOK:
-        broker_cash = item["broker_cash"]
+        live_account = live_accounts.get(str(item["broker_id"]), {})
+        broker_cash = live_account.get("broker_cash", item["broker_cash"])
         program_cash = item["program_cash"]
-        if broker_cash is None or program_cash is None:
+        currency = str(live_account.get("currency") or item["currency"])
+        if broker_cash is None:
             status = "api_required"
             status_label = "API 필요"
             delta_cash = "-"
+            detail = errors.get(str(item["broker_id"]), str(item["detail"]))
+        elif program_cash is None:
+            status = "api_required"
+            status_label = "원장 필요"
+            delta_cash = "-"
+            detail = "브로커 현금성 잔고는 조회됐지만 프로그램 현금 원장이 아직 없어 대조를 완료할 수 없습니다."
         else:
             numeric_program_cash = float(program_cash)
             numeric_broker_cash = float(broker_cash)
             delta = numeric_program_cash - numeric_broker_cash
-            delta_cash = format_money(delta, str(item["currency"]))
+            delta_cash = format_money(delta, currency)
             status = "pass" if abs(delta) <= 1.0 else "mismatch"
             status_label = "일치" if status == "pass" else "불일치"
+            detail = str(live_account.get("detail") or item["detail"])
         rows.append(
             {
                 "broker_id": str(item["broker_id"]),
-                "broker_name": str(item["broker_name"]),
-                "account": str(item["account"]),
-                "currency": str(item["currency"]),
-                "program_cash": format_money(program_cash, str(item["currency"])) if program_cash is not None else "대조 대기",
-                "broker_cash": format_money(broker_cash, str(item["currency"])) if broker_cash is not None else "API 필요",
+                "broker_name": str(live_account.get("broker_name") or item["broker_name"]),
+                "account": str(live_account.get("account") or item["account"]),
+                "currency": currency,
+                "program_cash": format_money(program_cash, currency) if program_cash is not None else "대조 대기",
+                "broker_cash": format_money(broker_cash, currency) if broker_cash is not None else "API 필요",
                 "delta_cash": delta_cash,
                 "status": status,
                 "status_label": status_label,
-                "detail": str(item["detail"]),
+                "detail": detail,
             }
         )
     return rows
@@ -629,6 +703,8 @@ def account_reconciliation_rows() -> list[dict[str, str]]:
 def reconciliation_snapshot() -> dict[str, Any]:
     position_rows = positions()
     account_rows = account_reconciliation_rows()
+    errors = STATE.get("broker_reconciliation", {}).get("errors", [])
+    errors = errors if isinstance(errors, list) else []
     api_required_count = sum(1 for item in position_rows + account_rows if item["status"] == "api_required")
     mismatch_count = sum(1 for item in position_rows + account_rows if item["status"] == "mismatch")
     pass_count = sum(1 for item in position_rows + account_rows if item["status"] == "pass")
@@ -644,9 +720,11 @@ def reconciliation_snapshot() -> dict[str, Any]:
             "api_required_count": api_required_count,
             "mismatch_count": mismatch_count,
             "pass_count": pass_count,
+            "error_count": len(errors),
         },
         "positions": position_rows,
         "accounts": account_rows,
+        "errors": errors,
         "next_actions": reconciliation_next_actions(api_required_count, mismatch_count),
     }
 
@@ -654,7 +732,7 @@ def reconciliation_snapshot() -> dict[str, Any]:
 def reconciliation_next_actions(api_required_count: int, mismatch_count: int) -> list[str]:
     actions: list[str] = []
     if api_required_count:
-        actions.append("KIS/Binance 계좌·포지션 조회 어댑터 연결")
+        actions.append("브로커 계좌·포지션 조회 또는 프로그램 현금 원장 연결")
     if mismatch_count:
         actions.append("불일치 포지션 수동 확인 후 주문 잠금 유지")
     actions.append("대조 결과가 정상일 때만 SMALL_LIVE 승인 검토")
@@ -1388,15 +1466,43 @@ def run_broker_check(broker_id: str) -> dict[str, Any]:
     }
 
 
+def refresh_broker_reconciliation() -> dict[str, Any]:
+    router = LiveBrokerRouter()
+    data: dict[str, Any] = {
+        "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "accounts": [],
+        "positions": [],
+        "errors": [],
+    }
+    for broker_id in ("kis", "binance", "upbit"):
+        try:
+            account_snapshot = router.get_account_snapshot(broker_id)
+            accounts = account_snapshot.get("accounts", []) if isinstance(account_snapshot, dict) else []
+            if isinstance(accounts, list):
+                data["accounts"].extend(accounts)
+        except (BrokerNotReadyError, RuntimeError) as exc:
+            data["errors"].append({"broker_id": broker_id, "scope": "account", "detail": str(exc)})
+
+        try:
+            positions_snapshot = router.list_positions(broker_id)
+            if isinstance(positions_snapshot, list):
+                data["positions"].extend(positions_snapshot)
+        except (BrokerNotReadyError, RuntimeError) as exc:
+            data["errors"].append({"broker_id": broker_id, "scope": "positions", "detail": str(exc)})
+    STATE["broker_reconciliation"] = data
+    return data
+
+
 def run_reconciliation() -> dict[str, Any]:
     STATE["reconciliation_last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    broker_data = refresh_broker_reconciliation()
     reconciliation = reconciliation_snapshot()
     summary = reconciliation["summary"]
     blocking_count = int(summary["api_required_count"]) + int(summary["mismatch_count"])
     append_audit(
         "danger" if blocking_count else "info",
         "포지션/계좌 대조",
-        f"{summary['status_label']}: API 필요 {summary['api_required_count']}개, 불일치 {summary['mismatch_count']}개",
+        f"{summary['status_label']}: API/원장 필요 {summary['api_required_count']}개, 불일치 {summary['mismatch_count']}개, 조회 오류 {len(broker_data['errors'])}개",
     )
     return {
         "ok": True,

@@ -166,6 +166,7 @@ const fallbackSnapshot = {
       api_required_count: 0,
       mismatch_count: 0,
       pass_count: 0,
+      error_count: 0,
     },
     positions: [],
     accounts: [],
@@ -2553,6 +2554,7 @@ function ReconciliationSummaryPanel({ reconciliation, onReconcile }) {
     { label: "계좌", value: summary.account_count, tone: "info" },
     { label: "API 필요", value: summary.api_required_count, tone: summary.api_required_count ? "warning" : "success" },
     { label: "불일치", value: summary.mismatch_count, tone: summary.mismatch_count ? "danger" : "success" },
+    { label: "조회 오류", value: summary.error_count ?? 0, tone: summary.error_count ? "danger" : "success" },
   ];
   return (
     <section className="panel reconciliation-panel">

@@ -6,8 +6,11 @@ from datetime import datetime
 from typing import Any, Literal
 
 from .live_adapters import (
+    build_binance_account_request,
     build_binance_spot_order_request,
+    build_kis_domestic_balance_request,
     build_kis_live_order_request,
+    build_upbit_accounts_request,
     build_upbit_order_request,
     issue_kis_access_token,
     send_prepared_request,
@@ -56,8 +59,8 @@ BROKER_SPECS = (
         "docs": "KIS Open API 실전/모의투자 REST",
         "capabilities": (
             ("auth_token", "접근 토큰 발급", True, "KIS OAuth token 발급 요청 구현됨"),
-            ("account_balance", "계좌 잔고 조회", False, "계좌 상품코드별 잔고 조회 API 연결 필요"),
-            ("positions", "보유/체결 조회", False, "국내/해외 주식 포지션 대조 API 연결 필요"),
+            ("account_balance", "계좌 잔고 조회", True, "국내 주식 잔고 조회 요청 구현됨"),
+            ("positions", "보유/체결 조회", True, "국내 주식 보유 잔고 조회 요청 구현됨"),
             ("place_order", "현금 주문 전송", True, "국내/해외 주식 실계좌 주문 요청 생성 구현됨"),
             ("cancel_order", "주문 취소/정정", False, "원주문번호 기반 취소/정정 API 구현 필요"),
         ),
@@ -72,8 +75,8 @@ BROKER_SPECS = (
         "base_urls": ("https://api.binance.com", "wss://stream.binance.com:9443"),
         "docs": "Binance Spot REST/User Data Stream",
         "capabilities": (
-            ("account_balance", "계좌 잔고 조회", False, "signed account endpoint 구현 필요"),
-            ("positions", "보유 자산 조회", False, "spot asset balance 대조 구현 필요"),
+            ("account_balance", "계좌 잔고 조회", True, "signed account endpoint 조회 구현됨"),
+            ("positions", "보유 자산 조회", True, "spot asset balance 대조 구현됨"),
             ("place_order", "현물 주문 전송", True, "POST /api/v3/order signed 요청 생성 구현됨"),
             ("cancel_order", "주문 취소", False, "orderId/clientOrderId 취소 구현 필요"),
             ("user_stream", "체결 스트림", False, "listenKey 발급과 WebSocket 수신 구현 필요"),
@@ -89,8 +92,8 @@ BROKER_SPECS = (
         "base_urls": ("https://api.upbit.com",),
         "docs": "Upbit REST API Orders",
         "capabilities": (
-            ("account_balance", "계좌 잔고 조회", False, "전체 계좌 조회 API 연결 필요"),
-            ("positions", "보유 자산 조회", False, "원화/코인 잔고 대조 구현 필요"),
+            ("account_balance", "계좌 잔고 조회", True, "전체 계좌 조회 API 연결 구현됨"),
+            ("positions", "보유 자산 조회", True, "원화/코인 잔고 대조 구현됨"),
             ("place_order", "코인 주문 전송", True, "POST /v1/orders JWT 서명 요청 생성 구현됨"),
             ("cancel_order", "주문 취소", False, "uuid 기반 주문 취소 API 구현 필요"),
         ),
@@ -254,6 +257,191 @@ class BrokerNotReadyError(RuntimeError):
     pass
 
 
+def numeric_value(value: object, default: float = 0.0) -> float:
+    try:
+        return float(str(value or "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def first_numeric(row: dict[str, object], *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        if key in row and row[key] not in (None, ""):
+            return numeric_value(row[key], default)
+    return default
+
+
+def first_text(row: dict[str, object], *keys: str, default: str = "") -> str:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return default
+
+
+def ensure_response_ok(broker_id: str, response: dict[str, object]) -> object:
+    if bool(response.get("ok")):
+        return response.get("json")
+    preview = response.get("preview")
+    if isinstance(preview, dict):
+        reasons = preview.get("blocked_reasons")
+        if isinstance(reasons, list) and reasons:
+            raise BrokerNotReadyError(f"{broker_id} 조회 차단: {', '.join(str(item) for item in reasons)}")
+    status = response.get("statusCode") or response.get("status") or "unknown"
+    text = str(response.get("text") or "")[:240]
+    raise BrokerNotReadyError(f"{broker_id} 조회 실패 ({status}): {text}")
+
+
+def kis_symbol(pdno: str) -> str:
+    text = pdno.strip().upper()
+    if text.isdigit() and len(text) == 6:
+        return f"{text}.KS"
+    return text
+
+
+def parse_kis_accounts(payload: object) -> list[dict[str, object]]:
+    data = payload if isinstance(payload, dict) else {}
+    output2 = data.get("output2")
+    rows = output2 if isinstance(output2, list) else [output2] if isinstance(output2, dict) else []
+    row = rows[0] if rows else {}
+    cash = first_numeric(
+        row,
+        "dnca_tot_amt",
+        "dnca_tot_amt2",
+        "nxdy_excc_amt",
+        "tot_evlu_amt",
+        "nass_amt",
+        default=0.0,
+    )
+    return [
+        {
+            "broker_id": "kis",
+            "broker_name": "한국투자증권 Open API",
+            "account": "KIS 실계좌",
+            "currency": "KRW",
+            "broker_cash": cash,
+            "detail": "KIS 국내 주식 잔고 조회 결과입니다.",
+        }
+    ]
+
+
+def parse_kis_positions(payload: object) -> list[dict[str, object]]:
+    data = payload if isinstance(payload, dict) else {}
+    output1 = data.get("output1")
+    rows = output1 if isinstance(output1, list) else []
+    positions: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        qty = first_numeric(row, "hldg_qty", "ord_psbl_qty", "qty")
+        if qty <= 0:
+            continue
+        pdno = first_text(row, "pdno", "PDNO", "prdt_code", default="")
+        if not pdno:
+            continue
+        positions.append(
+            {
+                "symbol": kis_symbol(pdno),
+                "asset": "한국주식",
+                "broker_id": "kis",
+                "broker_name": "한국투자증권 Open API",
+                "currency": "KRW",
+                "broker_qty": qty,
+                "broker_value": first_numeric(row, "evlu_amt", "pchs_amt", "pchs_avg_pric", default=0.0),
+                "detail": first_text(row, "prdt_name", "prdt_name1", default="KIS 보유 종목"),
+            }
+        )
+    return positions
+
+
+def parse_binance_accounts(payload: object) -> list[dict[str, object]]:
+    data = payload if isinstance(payload, dict) else {}
+    balances = data.get("balances")
+    rows = balances if isinstance(balances, list) else []
+    usdt = next((row for row in rows if isinstance(row, dict) and str(row.get("asset", "")).upper() == "USDT"), {})
+    cash = first_numeric(usdt, "free") + first_numeric(usdt, "locked")
+    return [
+        {
+            "broker_id": "binance",
+            "broker_name": "Binance API",
+            "account": "Binance Spot",
+            "currency": "USDT",
+            "broker_cash": cash,
+            "detail": "Binance signed account endpoint 조회 결과입니다.",
+        }
+    ]
+
+
+def parse_binance_positions(payload: object) -> list[dict[str, object]]:
+    data = payload if isinstance(payload, dict) else {}
+    balances = data.get("balances")
+    rows = balances if isinstance(balances, list) else []
+    cash_assets = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD"}
+    positions: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        asset = str(row.get("asset") or "").upper()
+        qty = first_numeric(row, "free") + first_numeric(row, "locked")
+        if not asset or asset in cash_assets or qty <= 0:
+            continue
+        positions.append(
+            {
+                "symbol": asset,
+                "asset": "코인",
+                "broker_id": "binance",
+                "broker_name": "Binance API",
+                "currency": asset,
+                "broker_qty": qty,
+                "broker_value": 0.0,
+                "detail": "Binance spot balance입니다.",
+            }
+        )
+    return positions
+
+
+def parse_upbit_accounts(payload: object) -> list[dict[str, object]]:
+    rows = payload if isinstance(payload, list) else []
+    krw = next((row for row in rows if isinstance(row, dict) and str(row.get("currency", "")).upper() == "KRW"), {})
+    cash = first_numeric(krw, "balance") + first_numeric(krw, "locked")
+    return [
+        {
+            "broker_id": "upbit",
+            "broker_name": "Upbit API",
+            "account": "Upbit KRW",
+            "currency": "KRW",
+            "broker_cash": cash,
+            "detail": "Upbit 전체 계좌 조회 결과입니다.",
+        }
+    ]
+
+
+def parse_upbit_positions(payload: object) -> list[dict[str, object]]:
+    rows = payload if isinstance(payload, list) else []
+    positions: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        currency = str(row.get("currency") or "").upper()
+        qty = first_numeric(row, "balance") + first_numeric(row, "locked")
+        if not currency or currency == "KRW" or qty <= 0:
+            continue
+        unit = str(row.get("unit_currency") or "KRW").upper()
+        positions.append(
+            {
+                "symbol": f"{unit}-{currency}" if unit else currency,
+                "asset": "코인",
+                "broker_id": "upbit",
+                "broker_name": "Upbit API",
+                "currency": currency,
+                "broker_qty": qty,
+                "broker_value": first_numeric(row, "avg_buy_price") * qty,
+                "detail": "Upbit 보유 자산입니다.",
+            }
+        )
+    return positions
+
+
 class LiveBrokerRouter:
     """Provider-specific live broker boundary.
 
@@ -265,12 +453,32 @@ class LiveBrokerRouter:
         return {"broker_id": broker_id, "diagnostics": broker_diagnostics(broker_id)}
 
     def get_account_snapshot(self, broker_id: str) -> dict[str, object]:
-        _ = broker_id
-        raise BrokerNotReadyError("Broker account snapshot adapters are not implemented yet.")
+        broker_id = broker_id.lower().strip()
+        if broker_id == "kis":
+            token = issue_kis_access_token()
+            payload = ensure_response_ok("kis", send_prepared_request(build_kis_domestic_balance_request(access_token=token)))
+            return {"broker_id": "kis", "accounts": parse_kis_accounts(payload)}
+        if broker_id == "binance":
+            payload = ensure_response_ok("binance", send_prepared_request(build_binance_account_request()))
+            return {"broker_id": "binance", "accounts": parse_binance_accounts(payload)}
+        if broker_id == "upbit":
+            payload = ensure_response_ok("upbit", send_prepared_request(build_upbit_accounts_request()))
+            return {"broker_id": "upbit", "accounts": parse_upbit_accounts(payload)}
+        raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
 
     def list_positions(self, broker_id: str) -> list[dict[str, object]]:
-        _ = broker_id
-        raise BrokerNotReadyError("Broker position adapters are not implemented yet.")
+        broker_id = broker_id.lower().strip()
+        if broker_id == "kis":
+            token = issue_kis_access_token()
+            payload = ensure_response_ok("kis", send_prepared_request(build_kis_domestic_balance_request(access_token=token)))
+            return parse_kis_positions(payload)
+        if broker_id == "binance":
+            payload = ensure_response_ok("binance", send_prepared_request(build_binance_account_request()))
+            return parse_binance_positions(payload)
+        if broker_id == "upbit":
+            payload = ensure_response_ok("upbit", send_prepared_request(build_upbit_accounts_request()))
+            return parse_upbit_positions(payload)
+        raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
 
     def place_order(self, intent: dict[str, object]) -> dict[str, object]:
         if not real_orders_enabled():

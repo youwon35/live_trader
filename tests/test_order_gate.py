@@ -340,6 +340,99 @@ class OrderGateTest(unittest.TestCase):
         self.assertIn("Watchdog critical", result["reason"])
         self.assertFalse(state.STATE["automation"]["crypto"]["enabled"])
 
+    def test_reconciliation_refreshes_read_only_broker_snapshots(self) -> None:
+        class FakeRouter:
+            def get_account_snapshot(self, broker_id):
+                rows = {
+                    "kis": [
+                        {
+                            "broker_id": "kis",
+                            "broker_name": "한국투자증권 Open API",
+                            "account": "KIS 실계좌",
+                            "currency": "KRW",
+                            "broker_cash": 100000.0,
+                            "detail": "fake kis account",
+                        }
+                    ],
+                    "binance": [
+                        {
+                            "broker_id": "binance",
+                            "broker_name": "Binance API",
+                            "account": "Binance Spot",
+                            "currency": "USDT",
+                            "broker_cash": 25.0,
+                            "detail": "fake binance account",
+                        }
+                    ],
+                    "upbit": [
+                        {
+                            "broker_id": "upbit",
+                            "broker_name": "Upbit API",
+                            "account": "Upbit KRW",
+                            "currency": "KRW",
+                            "broker_cash": 50000.0,
+                            "detail": "fake upbit account",
+                        }
+                    ],
+                }
+                return {"broker_id": broker_id, "accounts": rows[broker_id]}
+
+            def list_positions(self, broker_id):
+                rows = {
+                    "kis": [
+                        {
+                            "symbol": "069500.KS",
+                            "asset": "한국주식",
+                            "broker_id": "kis",
+                            "broker_name": "한국투자증권 Open API",
+                            "currency": "KRW",
+                            "broker_qty": 0.0,
+                            "broker_value": 0.0,
+                            "detail": "fake kis position",
+                        }
+                    ],
+                    "binance": [
+                        {
+                            "symbol": "BTC",
+                            "asset": "코인",
+                            "broker_id": "binance",
+                            "broker_name": "Binance API",
+                            "currency": "BTC",
+                            "broker_qty": 0.1,
+                            "broker_value": 0.0,
+                            "detail": "fake binance position",
+                        }
+                    ],
+                    "upbit": [],
+                }
+                return rows[broker_id]
+
+        with patch("live_trader.state.LiveBrokerRouter", return_value=FakeRouter()):
+            result = state.run_reconciliation()
+
+        self.assertTrue(result["ok"])
+        broker_data = state.STATE["broker_reconciliation"]
+        self.assertEqual(len(broker_data["accounts"]), 3)
+        self.assertEqual(len(broker_data["positions"]), 2)
+        self.assertEqual(len(broker_data["errors"]), 0)
+        self.assertEqual(result["reconciliation"]["summary"]["error_count"], 0)
+        self.assertGreaterEqual(result["reconciliation"]["summary"]["mismatch_count"], 1)
+        self.assertTrue(
+            any(
+                row["broker_id"] == "kis"
+                and row["currency"] == "KRW"
+                and row["broker_cash"].startswith("100,000")
+                and row["status"] == "api_required"
+                for row in result["reconciliation"]["accounts"]
+            )
+        )
+        self.assertTrue(
+            any(
+                row["broker_id"] == "binance" and row["symbol"] == "BTC" and row["status"] == "mismatch"
+                for row in result["reconciliation"]["positions"]
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

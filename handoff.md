@@ -3,7 +3,7 @@
 Last updated: 2026-07-02 KST
 Project path: `D:\github\PROGRAM\trading-system\apps\live_trader`
 Branch: `develop`
-Latest pushed commit before this handoff: `69a1316654f40cc7137c2e27806e2315174d5549`
+Latest pushed commit before this handoff: `d2a1adb993d2ac9c97cf47ff90be00073eb300dd`
 Remote: `https://github.com/youwon35/live_trader.git`
 
 ## One Sentence Summary
@@ -191,15 +191,18 @@ Current broker specs:
   - env: `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO`, `KIS_ACCOUNT_PRODUCT_CODE`
   - order request building implemented
   - auth token request implemented
-  - account/positions/cancel still need real API integration
+  - domestic balance/holding snapshot request implemented through `inquire-balance`
+  - overseas holding/cancel still need real API integration
 - Binance:
   - env: `BINANCE_API_KEY`, `BINANCE_API_SECRET`
   - signed spot order request building implemented
-  - balances/positions/cancel/user stream still need integration
+  - signed `/api/v3/account` balance snapshot implemented
+  - cancel/user stream still need integration
 - Upbit:
   - env: `UPBIT_ACCESS_KEY`, `UPBIT_SECRET_KEY`
   - JWT order request building implemented
-  - balances/positions/cancel still need integration
+  - `/v1/accounts` balance snapshot implemented
+  - cancel still needs integration
 
 Important:
 
@@ -297,6 +300,28 @@ As of 2026-07-02, Live Trader has a server-side Watchdog layer.
 - Critical Watchdog conditions fail closed by forcing `MONITOR`, turning on `new_entries_blocked`, and disabling active automation profiles.
 - `evaluate_order_gate_with_report()` appends a `Watchdog` fail check to `PreTradeRiskReport` when the current snapshot has Watchdog critical items, so order audit logs show the safety reason instead of hiding it behind a generic readiness blocker.
 - This is still a local/state watchdog. It does not yet consume true broker user streams, exchange heartbeats, or real market-data websocket latency.
+
+### Account And Position Reconciliation
+
+As of 2026-07-02, the reconciliation button no longer uses only static placeholder broker quantities.
+
+- `live_trader\live_adapters.py` builds read-only account snapshot requests for:
+  - KIS domestic stock balance: `GET /uapi/domestic-stock/v1/trading/inquire-balance`
+  - Binance Spot account: `GET /api/v3/account`
+  - Upbit accounts: `GET /v1/accounts`
+- `live_trader\brokers.py` parses those responses into normalized account and position rows.
+- `live_trader\state.py` stores the latest result under `STATE["broker_reconciliation"]` with `accounts`, `positions`, `errors`, and `fetched_at`.
+- `run_reconciliation()` refreshes broker snapshots first, then builds the UI reconciliation summary.
+- The UI now shows a `조회 오류` metric in the reconciliation summary.
+- If broker cash is fetched but the program-side cash ledger is missing, the row stays blocked as `원장 필요`. This is intentional: live trading should not treat broker balance alone as a complete pass.
+- Unknown broker positions that are not present in the program position book are surfaced as `불일치`.
+- This implementation is read-only and does not enable real orders.
+
+Known reconciliation limits:
+
+- KIS currently uses the domestic stock balance endpoint only; overseas stock/ETF holdings still need official endpoint wiring.
+- Binance and Upbit balances are account snapshots, not yet order-status/user-stream reconciliation.
+- Program cash ledger persistence is not implemented yet, so cash rows can remain `원장 필요` even when broker balances are successfully fetched.
 
 ## Strategy Artifacts
 
@@ -422,7 +447,7 @@ Notes from recent builds:
 
 - Build succeeded after the latest UI changes.
 - PyInstaller may warn about Android/webview or pycparser hidden imports; these were non-blocking in recent runs.
-- Current output EXE was rebuilt on 2026-07-02 after removing the risk-gate settings toggle and returning to an always-on shared risk gate.
+- Current output EXE was rebuilt on 2026-07-02 after adding read-only broker reconciliation snapshots.
 
 User preference:
 
@@ -463,7 +488,7 @@ develop
 Recent commit:
 
 ```text
-69a1316 Refine automation and log workspace
+d2a1adb Add live trading watchdog fail closed gate
 ```
 
 User wants changes committed and pushed to `develop`.
@@ -497,9 +522,10 @@ Use the Notion update tool when available.
 Critical gaps before real money should be enabled:
 
 - No complete continuous automation engine yet; the shared `StrategyExecutionRunner -> OrderIntent -> PreTradeRiskGate` boundary and local Watchdog fail-closed layer are in place for test strategy cycles.
-- KIS account/position reconciliation APIs still need real implementation.
-- Binance account/balance/user stream/cancel APIs still need real implementation.
-- Upbit account/balance/cancel APIs still need real implementation.
+- KIS domestic account/position snapshot is implemented, but overseas stock/ETF reconciliation still needs real API integration.
+- Binance account/balance snapshot is implemented, but order status, cancel, and user stream still need integration.
+- Upbit account/balance snapshot is implemented, but order status and cancel still need integration.
+- Program-side cash ledger persistence is still missing, so cash reconciliation cannot fully pass yet.
 - Real broker submission must be audited with sandbox or tiny live orders before enabling.
 - Strategy plugin execution from Backtester/Paper artifacts to live market signals still needs production-grade market data wiring, plugin loading, and scheduling.
 - Shared risk engine now runs for live test/retry/strategy-cycle order intents, but the future continuous automation engine must keep using the same `OrderIntent -> PreTradeRiskGate -> adapter` boundary before any broker transmission.
@@ -535,6 +561,7 @@ The user selected this order on 2026-07-02:
    - Binance account/order status
    - Upbit balances
    - feed reconciliation dashboard from real snapshots
+   - 2026-07-02 foundation implemented with read-only KIS domestic balance, Binance account, Upbit account snapshots, normalized account/position rows, and UI error-count summary
 
 Lower-priority follow-up:
 
@@ -545,9 +572,8 @@ Lower-priority follow-up:
 ## Best Next Engineering Steps
 
 1. Finish the selected roadmap in order:
-   - order/risk audit log strengthening
-   - shared strategy plugin runner boundary
-   - real account/position reconciliation
+   - extend reconciliation to order status/user stream and program cash ledger
+   - then implement persistent order/audit storage
 2. Keep the live path fixed as:
    - `OrderIntent -> PreTradeRiskGate -> adapter/dry-run boundary`
    - no strategy, retry, or test order route should bypass this gate

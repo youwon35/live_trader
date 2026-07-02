@@ -19,15 +19,19 @@ KIS_LIVE_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_TOKEN_ENDPOINT = "/oauth2/tokenP"
 KIS_DOMESTIC_ORDER_ENDPOINT = "/uapi/domestic-stock/v1/trading/order-cash"
 KIS_OVERSEAS_ORDER_ENDPOINT = "/uapi/overseas-stock/v1/trading/order"
+KIS_DOMESTIC_BALANCE_ENDPOINT = "/uapi/domestic-stock/v1/trading/inquire-balance"
 KIS_DOMESTIC_TR_IDS = {"BUY": "TTTC0012U", "SELL": "TTTC0011U"}
 KIS_OVERSEAS_TR_IDS = {"BUY": "TTTT1002U", "SELL": "TTTT1006U"}
+KIS_DOMESTIC_BALANCE_TR_ID = "TTTC8434R"
 
 BINANCE_BASE_URL = "https://api.binance.com"
 BINANCE_ORDER_ENDPOINT = "/api/v3/order"
 BINANCE_TEST_ORDER_ENDPOINT = "/api/v3/order/test"
+BINANCE_ACCOUNT_ENDPOINT = "/api/v3/account"
 
 UPBIT_BASE_URL = "https://api.upbit.com"
 UPBIT_ORDER_ENDPOINT = "/v1/orders"
+UPBIT_ACCOUNTS_ENDPOINT = "/v1/accounts"
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,98 @@ def build_kis_live_order_request(intent: dict[str, object], *, access_token: str
             "custtype": "P",
         },
         body=body,
+        query=None,
+        blocked_reasons=blocked,
+    )
+
+
+def build_kis_domestic_balance_request(*, access_token: str = "") -> PreparedRequest:
+    required = ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE")
+    blocked = missing_env(*required)
+    app_key = env_value("KIS_APP_KEY")
+    app_secret = env_value("KIS_APP_SECRET")
+    account_no = env_value("KIS_ACCOUNT_NO")
+    product_code = env_value("KIS_ACCOUNT_PRODUCT_CODE")
+    base_url = env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL
+    cano, acnt_prdt_cd = split_kis_account(account_no, product_code)
+    if not access_token:
+        blocked.append("access_token")
+    query: dict[str, object] = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": acnt_prdt_cd,
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "INQR_DVSN": "02",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "N",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN": "00",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {access_token}" if access_token else "",
+        "appkey": app_key,
+        "appsecret": app_secret,
+        "tr_id": KIS_DOMESTIC_BALANCE_TR_ID,
+        "custtype": "P",
+    }
+    encoded = urllib.parse.urlencode(query)
+    return PreparedRequest(
+        provider="kis",
+        method="GET",
+        url=f"{base_url.rstrip('/')}{KIS_DOMESTIC_BALANCE_ENDPOINT}?{encoded}",
+        endpoint=KIS_DOMESTIC_BALANCE_ENDPOINT,
+        headers=headers,
+        safe_headers={
+            "content-type": headers["content-type"],
+            "authorization_configured": bool(access_token),
+            "appkey_configured": bool(app_key),
+            "appsecret_configured": bool(app_secret),
+            "tr_id": KIS_DOMESTIC_BALANCE_TR_ID,
+            "custtype": "P",
+        },
+        body=None,
+        query=query,
+        blocked_reasons=blocked,
+    )
+
+
+def build_binance_account_request() -> PreparedRequest:
+    blocked = missing_env("BINANCE_API_KEY", "BINANCE_API_SECRET")
+    api_key = env_value("BINANCE_API_KEY")
+    api_secret = env_value("BINANCE_API_SECRET")
+    base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
+    query: dict[str, object] = {"timestamp": int(time.time() * 1000)}
+    signed_query = sign_binance_query(query, api_secret) if api_secret else urllib.parse.urlencode(query)
+    return PreparedRequest(
+        provider="binance",
+        method="GET",
+        url=f"{base_url.rstrip('/')}{BINANCE_ACCOUNT_ENDPOINT}?{signed_query}",
+        endpoint=BINANCE_ACCOUNT_ENDPOINT,
+        headers={"X-MBX-APIKEY": api_key},
+        safe_headers={"X-MBX-APIKEY_configured": bool(api_key)},
+        body=None,
+        query={**query, "signature": "***" if api_secret else ""},
+        blocked_reasons=blocked,
+    )
+
+
+def build_upbit_accounts_request() -> PreparedRequest:
+    blocked = missing_env("UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY")
+    access_key = env_value("UPBIT_ACCESS_KEY")
+    secret_key = env_value("UPBIT_SECRET_KEY")
+    base_url = env_value("UPBIT_BASE_URL") or UPBIT_BASE_URL
+    authorization = build_upbit_authorization(access_key, secret_key, {}) if access_key and secret_key else ""
+    return PreparedRequest(
+        provider="upbit",
+        method="GET",
+        url=base_url.rstrip("/") + UPBIT_ACCOUNTS_ENDPOINT,
+        endpoint=UPBIT_ACCOUNTS_ENDPOINT,
+        headers={"Authorization": authorization},
+        safe_headers={"authorization_configured": bool(authorization)},
+        body=None,
         query=None,
         blocked_reasons=blocked,
     )
@@ -323,14 +419,14 @@ def sign_binance_query(query: dict[str, object], secret: str) -> str:
 
 
 def build_upbit_authorization(access_key: str, secret_key: str, body: dict[str, object]) -> str:
-    query = urllib.parse.urlencode(body).encode("utf-8")
-    query_hash = hashlib.sha512(query).hexdigest()
     payload = {
         "access_key": access_key,
         "nonce": str(uuid.uuid4()),
-        "query_hash": query_hash,
-        "query_hash_alg": "SHA512",
     }
+    if body:
+        query = urllib.parse.urlencode(body).encode("utf-8")
+        payload["query_hash"] = hashlib.sha512(query).hexdigest()
+        payload["query_hash_alg"] = "SHA512"
     header = _b64url_json({"alg": "HS256", "typ": "JWT"})
     claims = _b64url_json(payload)
     signing_input = f"{header}.{claims}"
