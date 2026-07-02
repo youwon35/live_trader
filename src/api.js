@@ -10,6 +10,14 @@ export async function saveUiSettings(settings) {
   return request("/api/ui-settings", { method: "POST", body: settings });
 }
 
+export async function getEnvSettings() {
+  return request("/api/env-settings");
+}
+
+export async function saveEnvSettings(values) {
+  return request("/api/env-settings", { method: "POST", body: { values } });
+}
+
 export async function setMode(mode) {
   return request("/api/mode", { method: "POST", body: { mode } });
 }

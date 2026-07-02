@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import state
+from . import env_settings, state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +48,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/ui-settings":
             self.send_json({"ok": True, "settings": read_ui_settings()})
+            return
+        if parsed.path == "/api/env-settings":
+            self.send_json({"ok": True, "settings": env_settings.env_settings_snapshot()})
             return
         self.serve_static(parsed.path)
 
@@ -108,6 +111,10 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/ui-settings":
             self.send_json({"ok": True, "settings": write_ui_settings(payload)})
+            return
+        if parsed.path == "/api/env-settings":
+            settings = env_settings.save_env_settings(payload.get("values", {}) if isinstance(payload.get("values"), dict) else payload)
+            self.send_json({"ok": True, "settings": settings, "snapshot": state.snapshot()})
             return
         self.send_error(404, "Unknown API endpoint")
 

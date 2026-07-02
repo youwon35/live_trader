@@ -21,6 +21,7 @@ import {
   Radio,
   RefreshCcw,
   RotateCcw,
+  Save,
   Search,
   Settings,
   ShieldAlert,
@@ -33,6 +34,7 @@ import {
 } from "lucide-react";
 import {
   cancelOrder,
+  getEnvSettings,
   getSnapshot,
   getUiSettings,
   runFinalPreflight,
@@ -46,6 +48,7 @@ import {
   setRetryPolicy,
   setRiskSetting,
   saveUiSettings,
+  saveEnvSettings,
   submitTestIntent,
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
@@ -1282,6 +1285,7 @@ function App() {
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
           onReconcile={() => runAction(runReconciliation)}
           onPreflight={() => runAction(runFinalPreflight)}
+          onEnvSettings={(values) => runAction(() => saveEnvSettings(values))}
           appearance={appearance}
           updateAppearance={updateAppearance}
           layoutMode={layoutMode}
@@ -1356,6 +1360,7 @@ function WorkspaceContent({
   onCancelOrder,
   onReconcile,
   onPreflight,
+  onEnvSettings,
   appearance,
   updateAppearance,
   layoutMode,
@@ -1453,6 +1458,7 @@ function WorkspaceContent({
             changeLayoutMode={changeLayoutMode}
             resetWorkspaceLayout={resetWorkspaceLayout}
           />
+          <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} onSave={onEnvSettings} />
         </div>
       </section>,
     );
@@ -1987,6 +1993,168 @@ function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, chan
       </div>
     </section>
   );
+}
+
+function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
+  const [settings, setSettings] = useState(null);
+  const [activeGroup, setActiveGroup] = useState("kis");
+  const [draft, setDraft] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    getEnvSettings()
+      .then((result) => {
+        if (!cancelled) setSettings(result.settings ?? null);
+      })
+      .catch((error) => {
+        if (!cancelled) setMessage(error instanceof Error ? error.message : "env 설정을 읽지 못했습니다.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!settings?.fields) return;
+    setDraft((current) => {
+      const next = { ...current };
+      settings.fields.forEach((field) => {
+        if (next[field.key] !== undefined) return;
+        next[field.key] = field.kind === "secret" ? "" : field.value ?? field.default ?? "";
+      });
+      return next;
+    });
+  }, [settings]);
+
+  const groups = settings?.groups?.length ? settings.groups : [
+    { id: "kis", label: "주식/ETF", detail: "한국투자증권 Open API" },
+    { id: "binance", label: "Binance", detail: "코인 현물" },
+    { id: "upbit", label: "Upbit", detail: "KRW 코인" },
+    { id: "live-lock", label: "실거래 잠금", detail: "실전 주문 라우트" },
+  ];
+  const fields = settings?.fields ?? [];
+  const visibleFields = fields.filter((field) => field.group === activeGroup);
+  const broker = brokers.find((item) => item.broker_id === activeGroup);
+  const diagnostic = diagnostics.find((item) => item.broker_id === activeGroup);
+  const checkCount = visibleFields.filter((field) => assistantFieldStatus(field, draft[field.key]) !== "done").length;
+
+  function updateDraft(key, value) {
+    setDraft((current) => ({ ...current, [key]: value }));
+  }
+
+  async function handleSave() {
+    const values = {};
+    visibleFields.forEach((field) => {
+      const value = draft[field.key];
+      if (field.kind === "secret" && !String(value || "").trim()) return;
+      values[field.key] = value ?? "";
+    });
+    if (!Object.keys(values).length) return;
+    setSaving(true);
+    setMessage("");
+    const result = await onSave(values);
+    if (result?.settings) setSettings(result.settings);
+    setDraft((current) => clearSecretDrafts(visibleFields, current));
+    setMessage(result?.ok === false ? result.reason || "저장 실패" : `${Object.keys(values).length}개 설정을 저장했습니다.`);
+    setSaving(false);
+  }
+
+  return (
+    <section className="panel live-connection-assistant-panel">
+      <PanelHeader
+        title="연결 설정 Assistant"
+        subtitle=".env에 저장되는 실거래 브로커 설정을 탭별로 점검합니다."
+        suffix={<StatusPill tone={checkCount ? "warning" : "success"}>{checkCount ? `${checkCount} CHECK` : "READY"}</StatusPill>}
+      />
+      <div className="internal-tabs live-assistant-tabs" role="tablist" aria-label="실거래 연결 설정">
+        {groups.map((group) => (
+          <button
+            aria-selected={activeGroup === group.id}
+            className={activeGroup === group.id ? "active" : ""}
+            key={group.id}
+            onClick={() => setActiveGroup(group.id)}
+            role="tab"
+            type="button"
+          >
+            <strong>{group.label}</strong>
+            <span>{group.detail}</span>
+          </button>
+        ))}
+      </div>
+      {broker && (
+        <div className="live-assistant-summary">
+          <strong>{broker.name}</strong>
+          <span>{broker.detail}</span>
+          <StatusPill tone={broker.order_ready ? "success" : broker.status === "missing_credentials" ? "danger" : "warning"}>{broker.order_ready ? "READY" : broker.status}</StatusPill>
+        </div>
+      )}
+      {diagnostic && (
+        <div className="live-assistant-steps">
+          {(diagnostic.steps ?? []).map((step) => (
+            <span className={step.status} key={step.key}>{step.label}</span>
+          ))}
+        </div>
+      )}
+      <div className="live-assistant-field-grid">
+        {visibleFields.map((field) => {
+          const value = draft[field.key] ?? "";
+          const status = assistantFieldStatus(field, value);
+          return (
+            <label className={`live-assistant-field ${field.kind}`} key={field.key}>
+              <div>
+                <strong>{field.label}</strong>
+                <span>{field.detail}</span>
+                <em>{field.key}</em>
+              </div>
+              {field.kind === "bool" ? (
+                <ToggleSwitch
+                  checked={String(value).toLowerCase() === "true" || value === true}
+                  label={field.label}
+                  onChange={(checked) => updateDraft(field.key, checked ? "true" : "false")}
+                />
+              ) : (
+                <input
+                  autoComplete={field.kind === "secret" ? "new-password" : undefined}
+                  onChange={(event) => updateDraft(field.key, event.target.value)}
+                  placeholder={field.kind === "secret" && field.configured ? "저장됨 · 새 값 입력 시 교체" : field.default || field.key}
+                  type={field.kind === "secret" ? "password" : "text"}
+                  value={String(value)}
+                />
+              )}
+              <StatusPill tone={status === "done" ? "success" : status === "block" ? "danger" : "info"}>{status === "done" ? "DONE" : status === "block" ? "BLOCK" : "WAIT"}</StatusPill>
+            </label>
+          );
+        })}
+      </div>
+      <div className="live-assistant-save-row">
+        <span>{settings?.envPath || ".env"} · secret은 저장 후 화면에 다시 표시하지 않습니다.</span>
+        {message && <em>{message}</em>}
+        <button className="primary-button compact-button" disabled={saving || !visibleFields.length} onClick={handleSave} type="button">
+          <Save size={16} />
+          연결 설정 저장
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function assistantFieldStatus(field, value) {
+  const hasDraftValue = String(value ?? "").trim().length > 0;
+  const configured = field.kind === "secret" ? Boolean(field.configured || hasDraftValue) : hasDraftValue;
+  if (field.key === "LIVE_TRADER_ENABLE_REAL_ORDERS" && String(value).toLowerCase() !== "true") return "wait";
+  if (field.required && !configured) return "block";
+  if (!configured) return "wait";
+  return "done";
+}
+
+function clearSecretDrafts(fields, draft) {
+  const next = { ...draft };
+  fields.forEach((field) => {
+    if (field.kind === "secret") next[field.key] = "";
+  });
+  return next;
 }
 
 function ModeConsole({

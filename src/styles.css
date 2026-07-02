@@ -936,29 +936,38 @@ button {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
-  padding: 8px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  margin: 0 0 12px;
+  padding: 0 0 12px;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid color-mix(in srgb, var(--primary) 42%, var(--border));
+  border-radius: 0;
 }
 
 .internal-tabs button {
   display: grid;
-  gap: 3px;
-  min-height: 58px;
-  padding: 10px 12px;
-  text-align: left;
-  color: var(--text-muted);
-  background: var(--panel-raised);
+  place-items: center;
+  gap: 6px;
+  min-height: 78px;
+  padding: 12px 14px;
+  text-align: center;
+  color: var(--text);
+  background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   cursor: pointer;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    color 0.16s ease;
 }
 
 .internal-tabs button.active {
-  color: #ffffff;
-  background: var(--primary);
-  border-color: var(--primary-border);
+  color: var(--text);
+  background: color-mix(in srgb, var(--primary) 11%, var(--panel));
+  border-color: color-mix(in srgb, var(--primary) 62%, var(--border));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 18%, transparent);
 }
 
 .internal-tabs strong,
@@ -1046,28 +1055,32 @@ button {
 }
 
 .provider-toggle {
-  display: inline-flex;
-  width: fit-content;
-  padding: 3px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+  padding: 0 0 10px;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid color-mix(in srgb, var(--primary) 34%, var(--border));
+  border-radius: 0;
 }
 
 .provider-toggle button {
-  min-height: 30px;
+  min-height: 42px;
   padding: 0 12px;
-  color: var(--text-muted);
-  background: transparent;
-  border: 0;
-  border-radius: var(--radius-sm);
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   font-weight: var(--font-weight-bold);
   cursor: pointer;
 }
 
 .provider-toggle button.active {
-  color: #ffffff;
-  background: var(--primary);
+  color: var(--text);
+  background: color-mix(in srgb, var(--primary) 11%, var(--panel));
+  border-color: color-mix(in srgb, var(--primary) 62%, var(--border));
 }
 
 .automation-metrics {
@@ -3315,6 +3328,173 @@ body {
   box-shadow: 0 0 0 2px rgba(5, 11, 18, 0.28);
 }
 
+.live-connection-assistant-panel {
+  min-height: 0;
+}
+
+.live-assistant-tabs {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.live-assistant-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 0.75fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  margin-bottom: 10px;
+  padding: 9px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.live-assistant-summary strong,
+.live-assistant-summary span,
+.live-assistant-save-row span,
+.live-assistant-save-row em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-assistant-summary strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--font-weight-strong);
+}
+
+.live-assistant-summary span,
+.live-assistant-save-row span {
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-bold);
+}
+
+.live-assistant-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.live-assistant-steps span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  color: var(--text-muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-bold);
+}
+
+.live-assistant-steps span.pass {
+  color: #0f5132;
+  background: var(--success-bg, #d8f8e5);
+  border-color: transparent;
+}
+
+.live-assistant-steps span.fail {
+  color: #7a1720;
+  background: var(--danger-bg, #ffe0e4);
+  border-color: transparent;
+}
+
+.live-assistant-steps span.warn {
+  color: #7a4d00;
+  background: var(--warning-bg, #fff1c2);
+  border-color: transparent;
+}
+
+.live-assistant-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.live-assistant-field {
+  display: grid;
+  grid-template-columns: minmax(170px, 0.95fr) minmax(170px, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 68px;
+  padding: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.live-assistant-field div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.live-assistant-field strong,
+.live-assistant-field span,
+.live-assistant-field em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.live-assistant-field strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--font-weight-strong);
+}
+
+.live-assistant-field span {
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-bold);
+  line-height: 1.35;
+}
+
+.live-assistant-field em {
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  font-style: normal;
+  font-weight: var(--font-weight-bold);
+  white-space: nowrap;
+}
+
+.live-assistant-field input {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 10px;
+  color: var(--text);
+  background: var(--input-bg, var(--panel-raised));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-weight: var(--font-weight-bold);
+}
+
+.live-assistant-field input::placeholder {
+  color: var(--text-muted);
+}
+
+.live-assistant-save-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.live-assistant-save-row em {
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  font-style: normal;
+  font-weight: var(--font-weight-bold);
+}
+
 .custom-accent-label {
   display: grid;
   gap: 2px;
@@ -3604,6 +3784,17 @@ body {
   .risk-grid,
   .workflow-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .live-assistant-tabs,
+  .live-assistant-field-grid,
+  .live-assistant-summary,
+  .live-assistant-save-row {
+    grid-template-columns: 1fr;
+  }
+
+  .live-assistant-field {
+    grid-template-columns: 1fr;
   }
 }
 
