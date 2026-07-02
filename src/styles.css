@@ -735,6 +735,10 @@ button {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.watchdog-grid {
+  margin-top: 14px;
+}
+
 .watchdog-grid .empty-row {
   grid-column: 1 / -1;
 }
@@ -752,7 +756,7 @@ button {
 
 .status-row {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 9px;
   min-height: 50px;
@@ -762,16 +766,28 @@ button {
   border-radius: var(--radius-lg);
 }
 
-.status-row.pass svg {
-  color: var(--success-text);
+.status-row.pass {
+  background: var(--status-pill-success-background, #dcfce7);
+  border-color: var(--success-border);
 }
 
-.status-row.warn svg {
-  color: var(--warning-text);
+.status-row.warn {
+  background: var(--status-pill-warning-background, #fef3c7);
+  border-color: var(--warning-border);
 }
 
-.status-row.fail svg {
-  color: var(--danger-text);
+.status-row.fail {
+  background: var(--status-pill-danger-background, #fee2e2);
+  border-color: var(--danger-border);
+}
+
+.status-row.pass strong,
+.status-row.pass span,
+.status-row.warn strong,
+.status-row.warn span,
+.status-row.fail strong,
+.status-row.fail span {
+  color: #0f172a;
 }
 
 .status-row strong,
@@ -791,6 +807,14 @@ button {
   margin-top: 2px;
   color: var(--text-muted);
   font-size: var(--font-size-small);
+}
+
+.status-row-state {
+  justify-self: end;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--font-weight-strong);
+  white-space: nowrap;
 }
 
 .broker-row {
@@ -1444,7 +1468,7 @@ button {
 
 .risk-rule {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 9px;
   min-height: 62px;
@@ -1454,16 +1478,31 @@ button {
   border-radius: var(--radius-lg);
 }
 
-.risk-rule.pass svg {
-  color: var(--success-text);
+.risk-rule.pass {
+  background: var(--status-pill-success-background, #dcfce7);
+  border-color: var(--success-border);
 }
 
-.risk-rule.warn svg {
-  color: var(--warning-text);
+.risk-rule.warn {
+  background: var(--status-pill-warning-background, #fef3c7);
+  border-color: var(--warning-border);
 }
 
-.risk-rule.fail svg {
-  color: var(--danger-text);
+.risk-rule.fail {
+  background: var(--status-pill-danger-background, #fee2e2);
+  border-color: var(--danger-border);
+}
+
+.risk-rule.pass strong,
+.risk-rule.pass span,
+.risk-rule.pass em,
+.risk-rule.warn strong,
+.risk-rule.warn span,
+.risk-rule.warn em,
+.risk-rule.fail strong,
+.risk-rule.fail span,
+.risk-rule.fail em {
+  color: #0f172a;
 }
 
 .risk-rule strong,
@@ -2736,7 +2775,8 @@ body {
 }
 
 .doctor-card.success {
-  border-color: var(--border);
+  background: var(--status-pill-success-background, #dcfce7);
+  border-color: var(--success-border);
 }
 
 .doctor-card.warning {
@@ -2749,10 +2789,7 @@ body {
   border-color: var(--border);
 }
 
-.doctor-card.success .doctor-status {
-  color: var(--success-text);
-}
-
+.doctor-card.success .doctor-status,
 .doctor-card.warning .doctor-status {
   color: #0f172a;
 }
@@ -2761,6 +2798,8 @@ body {
   color: #0f172a;
 }
 
+.doctor-card.success strong,
+.doctor-card.success div span,
 .doctor-card.warning strong,
 .doctor-card.warning div span,
 .doctor-card.danger strong,
@@ -2840,7 +2879,8 @@ body {
 }
 
 .doctor-detail-row.success {
-  border-color: var(--border);
+  background: var(--status-pill-success-background, #dcfce7);
+  border-color: var(--success-border);
 }
 
 .doctor-detail-row.warning {
@@ -2853,6 +2893,8 @@ body {
   border-color: var(--border);
 }
 
+.doctor-detail-row.success strong,
+.doctor-detail-row.success span,
 .doctor-detail-row.warning strong,
 .doctor-detail-row.warning span,
 .doctor-detail-row.danger strong,

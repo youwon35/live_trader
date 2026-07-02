@@ -1,7 +1,6 @@
 import * as React from "react";
 import { useEffect, useRef, useState } from "react";
 import {
-  AlertTriangle,
   BadgeCheck,
   Bell,
   CircleStop,
@@ -1255,7 +1254,7 @@ function App() {
           </div>
         </header>
 
-        <MarketStrip sessions={snapshot.sessions} />
+        {selectedNav !== "automation" && <MarketStrip sessions={snapshot.sessions} />}
 
         <WorkspaceContent
           selectedNav={selectedNav}
@@ -1792,19 +1791,22 @@ function buildDoctorItems(snapshot) {
 function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) {
   const profile = pageProfiles[selectedNav] ?? pageProfiles.overview;
   const searchResults = buildSearchResults(snapshot, searchQuery);
+  const showPageHeader = selectedNav !== "automation";
 
   return (
     <section className={`page-view ${selectedNav}-view`}>
-      <PageHeader
-        eyebrow={profile.eyebrow}
-        title={profile.title}
-        subtitle={profile.summary}
-        actions={(
-        <div className="page-heading-actions">
-          <span>{snapshot.generated_at}</span>
-        </div>
-        )}
-      />
+      {showPageHeader && (
+        <PageHeader
+          eyebrow={profile.eyebrow}
+          title={profile.title}
+          subtitle={profile.summary}
+          actions={(
+          <div className="page-heading-actions">
+            <span>{snapshot.generated_at}</span>
+          </div>
+          )}
+        />
+      )}
 
       <SearchResultsPanel query={searchQuery} results={searchResults} onNavigate={onNavigate} />
 
@@ -2309,7 +2311,6 @@ function RiskPanel({ checks }) {
       <div className="risk-grid">
         {checks.map((check) => (
           <div className={`risk-rule ${check.status}`} key={check.label}>
-            <AlertTriangle size={16} />
             <div>
               <strong>{check.label}</strong>
               <span>{check.detail}</span>
@@ -2437,7 +2438,6 @@ function WatchdogPanel({ watchdog, onWatchdog }) {
       <div className="risk-grid watchdog-grid">
         {checks.map((check) => (
           <div className={`risk-rule ${check.status}`} key={check.label}>
-            <ShieldAlert size={16} />
             <div>
               <strong>{check.label}</strong>
               <span>{check.detail}</span>
@@ -2928,12 +2928,11 @@ function inferLogChannel(item) {
 function StatusRow({ label, status, detail }) {
   return (
     <div className={`status-row ${status}`}>
-      {status === "pass" ? <ShieldCheck size={16} /> : <ShieldAlert size={16} />}
       <div>
         <strong>{label}</strong>
         <span>{detail}</span>
       </div>
-      <StatusPill tone={statusTone(status)}>{status}</StatusPill>
+      <span className="status-row-state">{status === "pass" ? "통과" : status === "warn" ? "주의" : status === "fail" ? "조치" : status}</span>
     </div>
   );
 }
