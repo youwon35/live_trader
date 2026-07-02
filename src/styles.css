@@ -2,6 +2,9 @@
 
 :root {
   --accent-contrast-text: #ffffff;
+  --placeholder-text: #94a3b8;
+  --placeholder-font-size: 0.88em;
+  --placeholder-font-weight: 620;
 }
 
 * {
@@ -44,6 +47,14 @@ body {
 button,
 input {
   font: inherit;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--placeholder-text);
+  font-size: var(--placeholder-font-size);
+  font-weight: var(--placeholder-font-weight);
+  opacity: 1;
 }
 
 button {
@@ -3576,7 +3587,10 @@ body {
 }
 
 .live-assistant-field input::placeholder {
-  color: var(--text-muted);
+  color: var(--placeholder-text);
+  font-size: var(--placeholder-font-size);
+  font-weight: var(--placeholder-font-weight);
+  opacity: 1;
 }
 
 .live-assistant-save-row {

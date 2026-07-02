@@ -66,7 +66,10 @@ def env_settings_snapshot() -> dict[str, Any]:
     file_values = read_env_file()
     fields: list[dict[str, Any]] = []
     for field in ENV_SETTING_FIELDS:
-        value = file_values.get(field.key, os.getenv(field.key, field.default))
+        if field.key in file_values:
+            value = file_values[field.key]
+        else:
+            value = os.getenv(field.key, "")
         configured = bool(str(value).strip())
         fields.append(
             {
