@@ -1795,22 +1795,20 @@ function buildDoctorItems(snapshot) {
 function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) {
   const profile = pageProfiles[selectedNav] ?? pageProfiles.overview;
   const searchResults = buildSearchResults(snapshot, searchQuery);
-  const showPageHeader = selectedNav !== "automation";
 
   return (
     <section className={`page-view ${selectedNav}-view`}>
-      {showPageHeader && (
-        <PageHeader
-          eyebrow={profile.eyebrow}
-          title={profile.title}
-          subtitle={profile.summary}
-          actions={(
+      <PageHeader
+        hidden={selectedNav === "automation"}
+        eyebrow={profile.eyebrow}
+        title={profile.title}
+        subtitle={profile.summary}
+        actions={(
           <div className="page-heading-actions">
             <span>{snapshot.generated_at}</span>
           </div>
-          )}
-        />
-      )}
+        )}
+      />
 
       <SearchResultsPanel query={searchQuery} results={searchResults} onNavigate={onNavigate} />
 
