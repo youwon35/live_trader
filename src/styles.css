@@ -616,7 +616,7 @@ button {
 }
 
 .mode-button.active {
-  color: var(--text-inverse);
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border-color: var(--primary-border);
 }
@@ -696,8 +696,9 @@ button {
 .metric-card strong {
   overflow: hidden;
   color: var(--text);
-  font-size: 18px;
+  font-size: 16px;
   font-weight: var(--font-weight-strong);
+  line-height: 1.12;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2251,7 +2252,7 @@ button {
   place-items: center;
   width: 26px;
   height: 26px;
-  color: var(--text-inverse);
+  color: var(--accent-contrast-text, #ffffff);
   background: var(--primary);
   border-radius: var(--radius-pill);
   font-size: var(--font-size-small);
@@ -3113,8 +3114,9 @@ body {
 .metric-card strong {
   font-size: 16px;
   line-height: 1.15;
-  overflow-wrap: anywhere;
-  white-space: normal;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .resizable-panel {
