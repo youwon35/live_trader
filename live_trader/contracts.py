@@ -29,7 +29,12 @@ PLUGIN_LABELS = {
 
 TRADING_SYSTEM_ROOT = Path(__file__).resolve().parents[3]
 PRIMARY_STRATEGY_ARTIFACT_DIR = TRADING_SYSTEM_ROOT / "packages" / "strategy-core"
-IGNORED_STRATEGY_FILE_NAMES = {"package.json", "package-lock.json"}
+IGNORED_STRATEGY_FILE_NAMES = {
+    "package.json",
+    "package-lock.json",
+    "strategy-registry.json",
+    "promotion-log.jsonl",
+}
 
 
 def _dict_value(value: Any) -> dict[str, Any]:
@@ -121,6 +126,53 @@ def _live_verification_badge(permissions: dict[str, Any]) -> dict[str, str]:
     fail_reasons = _reason_list(permissions.get("fail_reasons"))
     detail = "; ".join(str(reason) for reason in fail_reasons) if fail_reasons else "live_allowed 권한이 없습니다."
     return _verification_badge("fail", "Live 차단", detail)
+
+
+def _promotion_snapshot(artifact: dict[str, Any], permissions: dict[str, Any], lifecycle_status: str) -> dict[str, Any]:
+    promotion = _dict_value(artifact.get("promotion"))
+    release = _dict_value(artifact.get("release"))
+    stage = str(
+        promotion.get("stage")
+        or artifact.get("promotionStage")
+        or release.get("stage")
+        or artifact.get("stage")
+        or lifecycle_status
+        or "unknown"
+    ).strip().lower()
+    return {
+        "stage": stage or "unknown",
+        "stage_label": str(promotion.get("stageLabel") or _promotion_stage_label(stage)),
+        "parameter_summary": str(promotion.get("parameterSummary") or artifact.get("parameterSummary") or ""),
+        "promoted_at": str(promotion.get("promotedAt") or artifact.get("updatedAt") or artifact.get("createdAt") or ""),
+        "promoted_by": str(promotion.get("promotedBy") or artifact.get("savedBy") or ""),
+        "paper_eligible": stage in {"paper_candidate", "live_candidate", "live_canary", "live_active"} or permissions.get("trader_export_allowed") is True,
+        "live_candidate": stage in {"live_candidate", "live_canary", "live_active"} or permissions.get("live_allowed") is True,
+    }
+
+
+def _release_snapshot(artifact: dict[str, Any]) -> dict[str, Any]:
+    release = _dict_value(artifact.get("release"))
+    return {
+        "release_id": str(release.get("releaseId") or artifact.get("releaseId") or artifact.get("id") or artifact.get("strategy_id") or ""),
+        "version_label": str(release.get("versionLabel") or artifact.get("name") or ""),
+        "parameter_hash": str(release.get("parameterHash") or ""),
+        "validation_hash": str(release.get("validationHash") or ""),
+        "immutable": bool(release.get("immutable", bool(release))),
+        "source_app": str(release.get("sourceApp") or artifact.get("savedBy") or ""),
+    }
+
+
+def _promotion_stage_label(stage: str) -> str:
+    labels = {
+        "final_tested": "Final Tested",
+        "paper_candidate": "Paper Candidate",
+        "live_candidate": "Live Candidate",
+        "live_canary": "Live Canary",
+        "live_active": "Live Active",
+        "approved": "Approved",
+        "paper": "Paper",
+    }
+    return labels.get(str(stage or "").lower(), str(stage or "unknown"))
 
 
 def _appdata_strategy_artifact_dir() -> Path:
@@ -242,6 +294,8 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "paper_trader": _paper_verification_badge(artifact, normalized_permissions, lifecycle_status),
         "live": _live_verification_badge(normalized_permissions),
     }
+    promotion = _promotion_snapshot(artifact, normalized_permissions, lifecycle_status)
+    release = _release_snapshot(artifact)
 
     return {
         "strategy_id": strategy_id,
@@ -260,6 +314,10 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "score": artifact.get("score") or artifact.get("qualityScore") or "-",
         "parameters": parameters,
         "settings": settings,
+        "promotion": promotion,
+        "release": release,
+        "promotion_stage": promotion["stage"],
+        "release_id": release["release_id"],
         "order_quantity": artifact.get("order_quantity") or artifact.get("orderQuantity") or parameters.get("positionSize") or settings.get("positionSize") or 1,
         "reference_price": artifact.get("reference_price") or artifact.get("referencePrice") or artifact.get("last_price") or artifact.get("price") or artifact.get("close_price"),
         "last_price": artifact.get("last_price") or artifact.get("reference_price") or artifact.get("price") or artifact.get("close_price"),

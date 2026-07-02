@@ -1480,12 +1480,22 @@ function LivePreparationPanel({
   onRetryPolicy,
 }) {
   const [assetTab, setAssetTab] = useState("stock");
+  const [selectedStrategyId, setSelectedStrategyId] = useState("");
   const isStock = assetTab === "stock";
   const filteredStrategies = (snapshot.strategies ?? []).filter((strategy) => (isStock ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy)));
+  const selectedStrategy = filteredStrategies.find((strategy) => strategy.strategy_id === selectedStrategyId) ?? filteredStrategies[0] ?? null;
   const tabItems = [
     { id: "stock", label: "주식/ETF", detail: "한국투자증권 KIS", count: (snapshot.strategies ?? []).filter((strategy) => !isCryptoStrategy(strategy)).length },
     { id: "crypto", label: "코인", detail: "Binance / Upbit", count: (snapshot.strategies ?? []).filter(isCryptoStrategy).length },
   ];
+
+  useEffect(() => {
+    const firstId = filteredStrategies[0]?.strategy_id ?? "";
+    const stillVisible = filteredStrategies.some((strategy) => strategy.strategy_id === selectedStrategyId);
+    if (!stillVisible && selectedStrategyId !== firstId) {
+      setSelectedStrategyId(firstId);
+    }
+  }, [filteredStrategies, selectedStrategyId]);
 
   return (
     <section className="live-prep-shell">
@@ -1504,7 +1514,8 @@ function LivePreparationPanel({
       </div>
       <section className="content-grid">
         <div className="content-column">
-          <StrategyPanel strategies={filteredStrategies} />
+          <LiveStrategySelectorPanel strategies={filteredStrategies} selectedStrategy={selectedStrategy} onSelect={setSelectedStrategyId} />
+          <StrategyPanel strategies={filteredStrategies} selectedStrategyId={selectedStrategy?.strategy_id} onSelect={setSelectedStrategyId} />
           <OperationalSafeguardsPanel
             dryRun={snapshot.dry_run}
             newEntriesBlocked={snapshot.new_entries_blocked}
@@ -1879,6 +1890,36 @@ function verificationTone(status) {
   if (["watch", "warn", "warning", "unknown"].includes(normalized)) return "warning";
   if (["wait", "empty", "missing"].includes(normalized)) return "neutral";
   return "info";
+}
+
+function promotionLabel(stage = "") {
+  const normalized = String(stage || "").toLowerCase();
+  const labels = {
+    final_tested: "Final Tested",
+    paper_candidate: "Paper Candidate",
+    live_candidate: "Live Candidate",
+    live_canary: "Live Canary",
+    live_active: "Live Active",
+    paper: "Paper",
+    approved: "Approved",
+  };
+  return labels[normalized] || (normalized ? normalized.toUpperCase() : "UNKNOWN");
+}
+
+function promotionTone(stage = "") {
+  const normalized = String(stage || "").toLowerCase();
+  if (["live_active", "live_canary"].includes(normalized)) return "success";
+  if (["live_candidate", "paper_candidate", "paper"].includes(normalized)) return "info";
+  if (["approved", "final_tested"].includes(normalized)) return "warning";
+  if (["retired", "rejected"].includes(normalized)) return "danger";
+  return "neutral";
+}
+
+function formatKeyValueMap(values = {}) {
+  if (!values || !Object.keys(values).length) return "";
+  return Object.entries(values)
+    .map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`)
+    .join("\n");
 }
 
 function statusTone(status) {
@@ -2829,7 +2870,55 @@ function LaunchReportPanel({ report }) {
   );
 }
 
-function StrategyPanel({ strategies }) {
+function LiveStrategySelectorPanel({ strategies, selectedStrategy, onSelect }) {
+  const parametersText = formatKeyValueMap(selectedStrategy?.parameters);
+  const promotionStage = selectedStrategy?.promotion?.stage || selectedStrategy?.promotion_stage || selectedStrategy?.lifecycle_status || "unknown";
+  return (
+    <section className="panel live-strategy-selector-panel">
+      <PanelHeader title="활성 전략 선택" subtitle="Backtester/Paper Trader에서 검증된 artifact를 읽기 전용으로 확인합니다." />
+      <div className="live-strategy-selector-grid">
+        <label>
+          <span>전략 artifact</span>
+          <select value={selectedStrategy?.strategy_id || ""} onChange={(event) => onSelect(event.target.value)} disabled={!strategies.length}>
+            {!strategies.length && <option value="">전략 없음</option>}
+            {strategies.map((strategy) => (
+              <option key={strategy.strategy_id} value={strategy.strategy_id}>
+                {strategy.name} / {strategy.symbol} / {strategy.timeframe}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="live-strategy-status-strip">
+          <StatusPill tone={promotionTone(promotionStage)}>{promotionLabel(promotionStage)}</StatusPill>
+          <StatusPill tone={selectedStrategy?.live_allowed ? "success" : "danger"}>{selectedStrategy?.permission_label || "WAIT"}</StatusPill>
+          <StatusPill tone="info">READ ONLY</StatusPill>
+        </div>
+      </div>
+      {selectedStrategy ? (
+        <>
+          <div className="live-strategy-summary-grid">
+            <MetricCard className="metric-card" label="전략" value={selectedStrategy.plugin_label || selectedStrategy.plugin} detail={selectedStrategy.strategy_id} />
+            <MetricCard className="metric-card" label="대상" value={`${selectedStrategy.symbol} · ${selectedStrategy.timeframe}`} detail={selectedStrategy.asset} />
+            <MetricCard className="metric-card" label="Release" value={selectedStrategy.release?.release_id || selectedStrategy.release_id || "-"} detail={selectedStrategy.release?.parameter_hash || "parameter hash 없음"} />
+            <MetricCard className="metric-card" label="검증" value={selectedStrategy.verification?.paper_trader?.label || "Paper 상태 없음"} detail={selectedStrategy.promotion?.promoted_at || "승급 시간 없음"} />
+          </div>
+          <div className="live-strategy-readonly-note">
+            <strong>이 전략은 Backtester/Paper Trader에서 저장된 검증본입니다.</strong>
+            <span>Live Trader에서는 파라미터를 직접 수정하지 않고, 새 파라미터는 Backtester에서 새 release로 다시 승급합니다.</span>
+          </div>
+          <div className="live-strategy-parameter-panel">
+            <strong>Parameters</strong>
+            <pre>{parametersText || "-"}</pre>
+          </div>
+        </>
+      ) : (
+        <EmptyRow text="이 자산군에 표시할 전략 artifact가 없습니다." />
+      )}
+    </section>
+  );
+}
+
+function StrategyPanel({ strategies, selectedStrategyId, onSelect }) {
   return (
     <section className="panel strategy-panel">
       <PanelHeader title="전략 Artifact" subtitle="Backtester/Paper 승인 결과와 live_allowed 계약을 확인합니다." />
@@ -2853,7 +2942,19 @@ function StrategyPanel({ strategies }) {
             status: strategy.paper_trader_verified ? "pass" : "wait",
           };
           return (
-            <div className="table-row" key={strategy.strategy_id}>
+            <div
+              className={`table-row ${strategy.strategy_id === selectedStrategyId ? "selected" : ""}`}
+              key={strategy.strategy_id}
+              onClick={() => onSelect(strategy.strategy_id)}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onSelect(strategy.strategy_id);
+                }
+              }}
+            >
               <strong>{strategy.name}</strong>
               <span>{strategy.symbol}</span>
               <span>{strategy.lifecycle_status}</span>

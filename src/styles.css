@@ -1540,6 +1540,83 @@ button {
   min-width: 0;
 }
 
+.live-strategy-selector-panel {
+  gap: 14px;
+}
+
+.live-strategy-selector-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.live-strategy-selector-grid label {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.live-strategy-selector-grid label span,
+.live-strategy-readonly-note span {
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-strong);
+}
+
+.live-strategy-selector-grid select {
+  min-height: 40px;
+  padding: 0 12px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-weight: var(--font-weight-strong);
+}
+
+.live-strategy-status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.live-strategy-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.live-strategy-readonly-note,
+.live-strategy-parameter-panel {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.live-strategy-readonly-note strong,
+.live-strategy-parameter-panel strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--font-weight-bold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-strategy-parameter-panel pre {
+  overflow: auto;
+  max-height: 170px;
+  margin: 0;
+  color: var(--text-soft);
+  font-size: var(--font-size-small);
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .order-table .table-head,
 .order-table .table-row {
   grid-template-columns: 66px 132px minmax(160px, 1fr) 96px 56px 112px 76px 58px 64px minmax(280px, 1.3fr) 74px;
@@ -1560,6 +1637,21 @@ button {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   font-size: var(--font-size-small);
+}
+
+.strategy-table .table-row {
+  cursor: pointer;
+}
+
+.strategy-table .table-row:hover,
+.strategy-table .table-row.selected {
+  border-color: color-mix(in srgb, var(--primary) 58%, var(--border));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 18%, transparent);
+}
+
+.strategy-table .table-row:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--primary) 28%, transparent);
+  outline-offset: 2px;
 }
 
 .table-row strong,
