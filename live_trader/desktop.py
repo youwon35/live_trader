@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import json
+import os
+import sys
 import time
 import webbrowser
+from pathlib import Path
 
 from .server import start_in_thread
+
+DEFAULT_WINDOW_WIDTH = 1480
+DEFAULT_WINDOW_HEIGHT = 980
+MIN_WINDOW_WIDTH = 1180
+MIN_WINDOW_HEIGHT = 760
 
 
 def main() -> None:
@@ -11,8 +20,24 @@ def main() -> None:
     try:
         import webview
 
-        webview.create_window("Live Trader", url, width=1480, height=980, min_size=(1180, 760))
+        window_state = _load_window_state()
+        window = webview.create_window(
+            "Live Trader",
+            url,
+            width=window_state["width"],
+            height=window_state["height"],
+            min_size=(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT),
+        )
+
+        def remember_window_state(*_args: object) -> None:
+            _save_window_state(window)
+
+        try:
+            window.events.closing += remember_window_state
+        except Exception:
+            pass
         webview.start()
+        _save_window_state(window)
     except Exception as exc:
         print(f"WebView unavailable ({exc}). Opening browser at {url}")
         webbrowser.open(url)
@@ -23,3 +48,62 @@ def main() -> None:
             pass
     finally:
         server.shutdown()
+
+
+def _app_data_root() -> Path:
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return Path(base) / "live_trader"
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "app_data"
+    return Path.home() / ".live_trader"
+
+
+def _window_state_path() -> Path:
+    return _app_data_root() / "window_state.json"
+
+
+def _load_window_state() -> dict[str, int]:
+    defaults = {"width": DEFAULT_WINDOW_WIDTH, "height": DEFAULT_WINDOW_HEIGHT}
+    try:
+        data = json.loads(_window_state_path().read_text(encoding="utf-8"))
+    except Exception:
+        return defaults
+    return {
+        "width": _clamp_int(data.get("width"), DEFAULT_WINDOW_WIDTH, MIN_WINDOW_WIDTH, 7680),
+        "height": _clamp_int(data.get("height"), DEFAULT_WINDOW_HEIGHT, MIN_WINDOW_HEIGHT, 4320),
+    }
+
+
+def _save_window_state(window: object | None) -> None:
+    if window is None:
+        return
+    width = _read_window_dimension(window, "width", MIN_WINDOW_WIDTH, 7680)
+    height = _read_window_dimension(window, "height", MIN_WINDOW_HEIGHT, 4320)
+    try:
+        root = _app_data_root()
+        root.mkdir(parents=True, exist_ok=True)
+        _window_state_path().write_text(
+            json.dumps({"width": width, "height": height}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _read_window_dimension(window: object, name: str, minimum: int, maximum: int) -> int:
+    value = getattr(window, name, None)
+    if callable(value):
+        try:
+            value = value()
+        except Exception:
+            value = None
+    return _clamp_int(value, DEFAULT_WINDOW_WIDTH if name == "width" else DEFAULT_WINDOW_HEIGHT, minimum, maximum)
+
+
+def _clamp_int(value: object, fallback: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return min(maximum, max(minimum, number))
