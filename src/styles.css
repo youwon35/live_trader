@@ -5,6 +5,11 @@
   --placeholder-text: #94a3b8;
   --placeholder-font-size: 0.88em;
   --placeholder-font-weight: 620;
+  --status-card-success-border: var(--border);
+  --status-card-warning-border: var(--border);
+  --status-card-danger-border: var(--border);
+  --status-card-info-border: var(--border);
+  --status-card-neutral-border: var(--border);
 }
 
 * {
@@ -729,8 +734,8 @@ button {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 9px;
-  min-height: 50px;
-  padding: 9px 10px;
+  min-height: 46px;
+  padding: 8px 10px;
   background: var(--panel-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -738,17 +743,17 @@ button {
 
 .status-row.pass {
   background: var(--status-pill-success-background, #dcfce7);
-  border-color: var(--success-border);
+  border-color: var(--border);
 }
 
 .status-row.warn {
   background: var(--status-pill-warning-background, #fef3c7);
-  border-color: var(--warning-border);
+  border-color: var(--border);
 }
 
 .status-row.fail {
   background: var(--status-pill-danger-background, #fee2e2);
-  border-color: var(--danger-border);
+  border-color: var(--border);
 }
 
 .status-row.pass strong,
@@ -1272,13 +1277,15 @@ button {
 
 .capability-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .capability-item {
-  display: grid;
-  gap: 5px;
-  min-height: 88px;
-  padding: 9px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 43px;
+  padding: 7px 10px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -1307,6 +1314,8 @@ button {
 }
 
 .capability-item strong {
+  flex: 0 1 auto;
+  max-width: 45%;
   color: var(--text);
   font-size: 13px;
   font-weight: var(--font-weight-bold);
@@ -1314,9 +1323,11 @@ button {
 }
 
 .capability-item span {
+  min-width: 0;
   color: var(--text-muted);
   font-size: var(--font-size-small);
-  line-height: 1.35;
+  line-height: 1.2;
+  white-space: nowrap;
 }
 
 .capability-item.pass strong,
@@ -1547,7 +1558,13 @@ button {
 }
 
 .live-strategy-selector-panel {
-  gap: 14px;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.live-strategy-selector-panel .panel-header {
+  margin-bottom: 0;
 }
 
 .live-strategy-selector-grid {
@@ -1590,7 +1607,7 @@ button {
 .live-strategy-summary-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
+  gap: 10px;
 }
 
 .live-strategy-readonly-note,
@@ -1601,6 +1618,11 @@ button {
   background: var(--panel-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
+}
+
+.live-strategy-summary-grid + .live-strategy-readonly-note,
+.live-strategy-readonly-note + .live-strategy-parameter-panel {
+  margin-top: 4px;
 }
 
 .live-strategy-readonly-note strong,
@@ -2421,6 +2443,7 @@ body {
 .brand-block {
   display: grid;
   grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
   gap: 12px;
   min-height: 44px;
   padding: 0 0 16px;
@@ -2763,22 +2786,30 @@ body {
 
 .doctor-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 360px));
+  gap: 8px;
+  justify-content: start;
   margin-top: 10px;
 }
 
 .doctor-card {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
-  gap: 10px;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  gap: 8px;
   align-items: center;
-  min-height: 96px;
-  padding: 12px;
+  min-height: 72px;
+  padding: 9px 10px;
   text-align: left;
   background: var(--panel-raised);
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+
+.doctor-card.ts-status-card {
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 9px 10px;
+  border-color: var(--border);
 }
 
 .doctor-card:hover {
@@ -2788,8 +2819,8 @@ body {
 
 .doctor-step {
   display: inline-grid;
-  width: 30px;
-  height: 30px;
+  width: 26px;
+  height: 26px;
   place-items: center;
   color: var(--text);
   background: var(--button);
@@ -2800,15 +2831,15 @@ body {
 .doctor-card strong {
   display: block;
   color: var(--text);
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 900;
   line-height: 1.2;
 }
 
 .doctor-card div span {
   display: block;
-  margin-top: 5px;
-  line-height: 1.4;
+  margin-top: 3px;
+  line-height: 1.3;
   white-space: normal;
 }
 
@@ -2819,7 +2850,7 @@ body {
 .doctor-card .ts-status-card__detail {
   display: block;
   margin-top: 0;
-  line-height: 1.4;
+  line-height: 1.3;
   white-space: normal;
 }
 
@@ -2830,7 +2861,7 @@ body {
 
 .doctor-card.success {
   background: var(--status-pill-success-background, #dcfce7);
-  border-color: var(--success-border);
+  border-color: var(--border);
 }
 
 .doctor-card.warning {
@@ -2900,20 +2931,28 @@ body {
 
 .doctor-detail-list {
   display: grid;
-  gap: 8px;
+  gap: 7px;
   margin-top: 10px;
 }
 
 .doctor-detail-row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: 10px;
+  gap: 8px;
   align-items: center;
-  min-height: 48px;
-  padding: 9px 10px;
+  width: min(100%, 680px);
+  min-height: 42px;
+  padding: 7px 9px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+
+.doctor-detail-row.ts-status-row {
+  gap: 8px;
+  min-height: 42px;
+  padding: 7px 9px;
+  border-color: var(--border);
 }
 
 .doctor-detail-row strong {
@@ -2934,7 +2973,7 @@ body {
 
 .doctor-detail-row.success {
   background: var(--status-pill-success-background, #dcfce7);
-  border-color: var(--success-border);
+  border-color: var(--border);
 }
 
 .doctor-detail-row.warning {

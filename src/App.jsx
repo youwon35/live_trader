@@ -1182,8 +1182,7 @@ function App() {
             <Radio size={19} />
           </div>
           <div>
-            <strong>실거래 콘솔</strong>
-            <span>주문 운영 데스크</span>
+            <strong>실시간거래소</strong>
           </div>
         </div>
         <nav className="nav-list" aria-label="주요 메뉴">
