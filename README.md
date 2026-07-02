@@ -37,6 +37,8 @@ release\LiveTrader.exe
 ## Required Broker/API Settings
 
 Create `.env` next to this README. Do not commit real secrets.
+The desktop app loads this file automatically on startup, without overriding OS-level environment variables.
+Use the in-app settings for UI/risk controls only; broker secrets such as `KIS_APP_SECRET` should stay in `.env` or a safer OS secret store.
 
 ```text
 LIVE_TRADER_ENABLE_REAL_ORDERS=false

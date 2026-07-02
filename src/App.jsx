@@ -56,7 +56,6 @@ import {
   createIconButton,
   createMetricCard,
   createMetricGrid,
-  createPageHeader,
   createPanelHeader,
   createSegmentedControl,
   createStatusCard,
@@ -72,7 +71,6 @@ const FormField = createFormField(React);
 const IconButton = createIconButton(React);
 const MetricCard = createMetricCard(React);
 const MetricGrid = createMetricGrid(React);
-const PageHeader = createPageHeader(React);
 const PanelHeader = createPanelHeader(React);
 const SegmentedControl = createSegmentedControl(React);
 const StatusCard = createStatusCard(React);
@@ -818,6 +816,11 @@ function ensurePanelHandles(panel) {
     panel.style.height = `${snapLayoutDimension(size.height, "height")}px`;
   }
   applyPanelOffset(panel, position);
+  window.requestAnimationFrame(() => {
+    if (!panel.isConnected || !panelOverlapsPeers(panel)) return;
+    panel.style.removeProperty("width");
+    clearPanelOffset(panel);
+  });
 
   if (panel.querySelector(":scope > .panel-resize-north-west")) return;
   panel.querySelectorAll(":scope > .panel-resize-edge, :scope > .panel-resize-corner").forEach((handle) => handle.remove());
@@ -1257,8 +1260,6 @@ function App() {
             </button>
           </div>
         </header>
-
-        {selectedNav !== "automation" && <MarketStrip sessions={snapshot.sessions} />}
 
         <WorkspaceContent
           selectedNav={selectedNav}
@@ -1793,23 +1794,10 @@ function buildDoctorItems(snapshot) {
 }
 
 function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) {
-  const profile = pageProfiles[selectedNav] ?? pageProfiles.overview;
   const searchResults = buildSearchResults(snapshot, searchQuery);
 
   return (
     <section className={`page-view ${selectedNav}-view`}>
-      <PageHeader
-        hidden={selectedNav === "automation"}
-        eyebrow={profile.eyebrow}
-        title={profile.title}
-        subtitle={profile.summary}
-        actions={(
-          <div className="page-heading-actions">
-            <span>{snapshot.generated_at}</span>
-          </div>
-        )}
-      />
-
       <SearchResultsPanel query={searchQuery} results={searchResults} onNavigate={onNavigate} />
 
       {children}
@@ -1997,23 +1985,6 @@ function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, chan
           </button>
         </div>
       </div>
-    </section>
-  );
-}
-
-function MarketStrip({ sessions }) {
-  return (
-    <section className="market-strip">
-      {sessions.map((session) => (
-        <div className="market-item" key={session.label}>
-          <Radio size={16} />
-          <div>
-            <strong>{session.label}</strong>
-            <span>{session.detail}</span>
-          </div>
-          <span className={`market-time ${statusTone(session.state)}`}>{session.time}</span>
-        </div>
-      ))}
     </section>
   );
 }
@@ -2501,12 +2472,9 @@ function RetryPolicyPanel({ policy, onRetryPolicy }) {
             {setting.type === "boolean" ? (
               <ToggleSwitch
                 checked={Boolean(setting.value)}
-                checkedLabel="ON"
                 className="switch-label"
                 label={setting.label}
                 onChange={(checked) => onRetryPolicy(setting.key, checked)}
-                showState
-                uncheckedLabel="OFF"
               />
             ) : (
               <label>

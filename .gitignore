@@ -9,4 +9,7 @@ __pycache__/
 live_trader/__pycache__/
 .server.pid
 .venv/
+.env
+.env.*
+!.env.example
 *.log
