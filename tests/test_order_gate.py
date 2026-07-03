@@ -631,6 +631,65 @@ class OrderGateTest(unittest.TestCase):
             )
         )
 
+    def test_binance_poll_execution_events_returns_balance_snapshot_events(self) -> None:
+        payload = {
+            "balances": [
+                {"asset": "USDT", "free": "10.5", "locked": "1.5"},
+                {"asset": "BTC", "free": "0.25", "locked": "0.05"},
+            ]
+        }
+
+        with patch(
+            "live_trader.brokers.send_prepared_request",
+            return_value={"ok": True, "json": payload},
+        ):
+            result = LiveBrokerRouter().poll_execution_events("binance")
+
+        self.assertEqual(result["broker_id"], "binance")
+        self.assertEqual(result["accounts"][0]["broker_cash"], 12.0)
+        self.assertEqual(result["positions"][0]["symbol"], "BTC")
+        self.assertTrue(any(event["state"] == "account_snapshot" for event in result["events"]))
+        self.assertTrue(
+            any(
+                event["state"] == "position_snapshot" and event["symbol"] == "BTC"
+                for event in result["events"]
+            )
+        )
+
+    def test_upbit_poll_execution_events_returns_balance_snapshot_events(self) -> None:
+        payload = [
+            {
+                "currency": "KRW",
+                "balance": "100000",
+                "locked": "5000",
+            },
+            {
+                "currency": "BTC",
+                "unit_currency": "KRW",
+                "balance": "0.01",
+                "locked": "0.002",
+                "avg_buy_price": "80000000",
+            },
+        ]
+
+        with patch(
+            "live_trader.brokers.send_prepared_request",
+            return_value={"ok": True, "json": payload},
+        ):
+            result = LiveBrokerRouter().poll_execution_events("upbit")
+
+        self.assertEqual(result["broker_id"], "upbit")
+        self.assertEqual(result["accounts"][0]["broker_cash"], 105000.0)
+        self.assertEqual(result["positions"][0]["symbol"], "KRW-BTC")
+        self.assertEqual(result["positions"][0]["broker_value"], 960000.0)
+        self.assertTrue(any(event["state"] == "account_snapshot" for event in result["events"]))
+        self.assertTrue(
+            any(
+                event["state"] == "position_snapshot" and event["symbol"] == "KRW-BTC"
+                for event in result["events"]
+            )
+        )
+
     def test_execution_event_poll_reports_adapter_stub_errors(self) -> None:
         class FakeRouter:
             def poll_execution_events(self, broker_id):

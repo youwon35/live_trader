@@ -254,7 +254,7 @@ def broker_adapter_contract() -> list[dict[str, str]]:
         {"method": "place_order", "purpose": "서명된 실주문 요청 생성/전송", "status": "interface_ready"},
         {"method": "cancel_order", "purpose": "주문 취소/정정", "status": "blocked_stub"},
         {"method": "stream_executions", "purpose": "체결/계좌 이벤트 스트림", "status": "blocked_stub"},
-        {"method": "poll_execution_events", "purpose": "체결/계좌 이벤트 폴링", "status": "kis_balance_poll_ready"},
+        {"method": "poll_execution_events", "purpose": "체결/계좌 이벤트 폴링", "status": "account_poll_ready"},
     ]
 
 
@@ -359,7 +359,7 @@ def parse_kis_positions(payload: object) -> list[dict[str, object]]:
     return positions
 
 
-def kis_snapshot_events(accounts: list[dict[str, object]], positions: list[dict[str, object]]) -> list[dict[str, object]]:
+def broker_snapshot_events(accounts: list[dict[str, object]], positions: list[dict[str, object]]) -> list[dict[str, object]]:
     occurred_at = now_datetime_text()
     events: list[dict[str, object]] = []
     for account in accounts:
@@ -569,7 +569,29 @@ class LiveBrokerRouter:
                 "broker_id": "kis",
                 "accounts": accounts,
                 "positions": positions,
-                "events": kis_snapshot_events(accounts, positions),
+                "events": broker_snapshot_events(accounts, positions),
                 "source": "kis_balance_poll",
             }
-        raise BrokerNotReadyError("Broker execution-event polling adapters are not implemented yet.")
+        if broker_id == "binance":
+            payload = ensure_response_ok("binance", send_prepared_request(build_binance_account_request()))
+            accounts = parse_binance_accounts(payload)
+            positions = parse_binance_positions(payload)
+            return {
+                "broker_id": "binance",
+                "accounts": accounts,
+                "positions": positions,
+                "events": broker_snapshot_events(accounts, positions),
+                "source": "binance_account_poll",
+            }
+        if broker_id == "upbit":
+            payload = ensure_response_ok("upbit", send_prepared_request(build_upbit_accounts_request()))
+            accounts = parse_upbit_accounts(payload)
+            positions = parse_upbit_positions(payload)
+            return {
+                "broker_id": "upbit",
+                "accounts": accounts,
+                "positions": positions,
+                "events": broker_snapshot_events(accounts, positions),
+                "source": "upbit_accounts_poll",
+            }
+        raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
