@@ -6,10 +6,13 @@ import html
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from io import StringIO
+from pathlib import Path
 from typing import Any, Literal
 
+from trading_runtime import AuditEvent, audit_event_from_order_gate, build_audit_event
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts, strategy_plugin_status
+from .audit_store import SQLiteAuditEventStore
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
@@ -224,6 +227,9 @@ ACCOUNT_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
 
 FINAL_ORDER_STATES = {"dry_run", "sent", "filled", "canceled", "retry_exhausted"}
 AUDIT_LOG_LIMIT = 500
+APP_ROOT = Path(__file__).resolve().parents[1]
+AUDIT_DB_PATH = Path(os.environ.get("LIVE_TRADER_AUDIT_DB") or APP_ROOT / "logs" / "live_trader_audit.sqlite3")
+AUDIT_STORE = SQLiteAuditEventStore(AUDIT_DB_PATH)
 DEFAULT_WATCHDOG_SETTINGS: dict[str, float] = {
     "heartbeat_timeout_sec": 45.0,
     "market_data_stale_sec": 90.0,
@@ -1252,16 +1258,65 @@ def snapshot() -> dict[str, Any]:
     }
 
 
-def append_audit(level: str, event: str, detail: str) -> None:
+def audit_level_for_common_event(level: str) -> str:
+    normalized = str(level or "info").strip().lower()
+    if normalized in {"danger", "error", "fail", "failed"}:
+        return "ERROR"
+    if normalized in {"warn", "warning"}:
+        return "WARN"
+    if normalized in {"critical"}:
+        return "CRITICAL"
+    if normalized in {"debug"}:
+        return "DEBUG"
+    return "INFO"
+
+
+def audit_category_for_event(event: str) -> str:
+    text = str(event or "")
+    if any(token in text for token in ("주문", "Order", "order")):
+        return "ORDER"
+    if any(token in text for token in ("리스크", "Risk", "risk", "Watchdog")):
+        return "RISK"
+    if any(token in text for token in ("전략", "자동화", "Runner", "Strategy")):
+        return "STRATEGY"
+    if any(token in text for token in ("설정", "정책", "한도", "체크리스트")):
+        return "SETTINGS"
+    return "SYSTEM"
+
+
+def persist_audit_event(record: AuditEvent) -> None:
+    try:
+        AUDIT_STORE.append(record)
+    except Exception as exc:  # pragma: no cover - persistence must never block trading.
+        errors = STATE.setdefault("audit_persist_errors", [])
+        errors.append(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {type(exc).__name__}: {exc}")
+        if len(errors) > 10:
+            del errors[: len(errors) - 10]
+
+
+def append_audit(level: str, event: str, detail: str, *, audit_record: AuditEvent | None = None) -> None:
+    now = datetime.now()
     STATE["audit"].append({
-        "time": now_text(),
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "time": now.strftime("%H:%M:%S"),
+        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
         "level": level,
         "event": event,
         "detail": detail,
     })
     if len(STATE["audit"]) > AUDIT_LOG_LIMIT:
         del STATE["audit"][: len(STATE["audit"]) - AUDIT_LOG_LIMIT]
+    persist_audit_event(
+        audit_record
+        or build_audit_event(
+            app="live_trader",
+            category=audit_category_for_event(event),  # type: ignore[arg-type]
+            level=audit_level_for_common_event(level),  # type: ignore[arg-type]
+            source=event,
+            message=detail,
+            occurred_at=now,
+            scope=current_mode(),
+        )
+    )
 
 
 def audit_clip(text: object, limit: int = 160) -> str:
@@ -1840,6 +1895,34 @@ def next_order_id(state_name: str, dry_run: bool) -> str:
     return f"{prefix}-{len(STATE['orders']) + 1:04d}"
 
 
+def order_gate_audit_record(
+    *,
+    source: str,
+    intent: OrderIntent,
+    order: dict[str, Any],
+    risk_report: PreTradeRiskReport,
+    runner_report: StrategyExecutionResult | None = None,
+    retry: bool = False,
+) -> AuditEvent:
+    payload: dict[str, Any] = {
+        "order": dict(order),
+        "queue_state": str(order.get("queue_state", "")),
+        "dry_run": bool(order.get("dry_run", False)),
+        "retry": retry,
+    }
+    if runner_report is not None:
+        payload["runner_report"] = runner_report.to_dict()
+    return audit_event_from_order_gate(
+        app="live_trader",
+        intent=intent,
+        report=risk_report,
+        order_id=str(order.get("order_id", "")),
+        state=str(order.get("state", "")),
+        source=source,
+        payload=payload,
+    )
+
+
 def submit_order_intent(
     checks: dict[str, Any],
     intent: OrderIntent,
@@ -1875,7 +1958,18 @@ def submit_order_intent(
         order["runner_report"] = runner_report.to_dict()
     STATE["orders"].insert(0, order)
     STATE["orders"] = STATE["orders"][:50]
-    append_audit("info" if ok else "danger", audit_event, order_gate_audit_detail(order, reason, risk_report))
+    append_audit(
+        "info" if ok else "danger",
+        audit_event,
+        order_gate_audit_detail(order, reason, risk_report),
+        audit_record=order_gate_audit_record(
+            source=audit_event,
+            intent=intent,
+            order=order,
+            risk_report=risk_report,
+            runner_report=runner_report,
+        ),
+    )
     return {"ok": ok, "reason": reason, "order": order, "snapshot": snapshot()}
 
 
@@ -1965,7 +2059,18 @@ def retry_order(order_id: str) -> dict[str, Any]:
     order["reason"] = reason
     order["risk_report"] = risk_report.to_dict()
     order["next_retry_at"] = future_text(float(STATE["retry_policy"]["backoff_sec"])) if can_retry_order(order) else "-"
-    append_audit("info" if ok else "warn", "주문 재시도", order_gate_audit_detail(order, reason, risk_report))
+    append_audit(
+        "info" if ok else "warn",
+        "주문 재시도",
+        order_gate_audit_detail(order, reason, risk_report),
+        audit_record=order_gate_audit_record(
+            source="주문 재시도",
+            intent=retry_intent,
+            order=order,
+            risk_report=risk_report,
+            retry=True,
+        ),
+    )
     return {"ok": ok, "reason": reason, "snapshot": snapshot()}
 
 

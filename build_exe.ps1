@@ -36,6 +36,7 @@ if (-not (Test-Path -LiteralPath $sharedRuntime)) {
   --add-data "$root\dist;dist" `
   --paths "$sharedRuntime" `
   --hidden-import trading_runtime.order_management `
+  --hidden-import trading_runtime.audit_events `
   --hidden-import trading_runtime.risk_engine `
   --hidden-import trading_runtime.strategy_runner `
   --collect-submodules webview `

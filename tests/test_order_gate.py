@@ -1,9 +1,12 @@
 import copy
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 from live_trader import state
+from live_trader.audit_store import SQLiteAuditEventStore
 
 
 class OrderGateTest(unittest.TestCase):
@@ -160,6 +163,42 @@ class OrderGateTest(unittest.TestCase):
         self.assertIn("BTCUSDT BUY dry_run/simulated", audit_detail)
         self.assertIn("risk pass", audit_detail)
         self.assertIn("제출 허용", audit_detail)
+
+    def test_submit_test_intent_persists_common_audit_event(self) -> None:
+        original_store = state.AUDIT_STORE
+        state.STATE["orders"] = []
+        state.STATE["audit"] = []
+        state.STATE["dry_run"] = True
+        state.STATE["new_entries_blocked"] = False
+        fake_snapshot = {
+            "summary": {"blocker_count": 0},
+            "strategies": [{"strategy_id": "LIVE-AUDIT", "symbol": "BTCUSDT", "live_allowed": True}],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteAuditEventStore(Path(temp_dir) / "live_trader_audit.sqlite3")
+            state.AUDIT_STORE = store
+            try:
+                with patch("live_trader.state.snapshot", return_value=fake_snapshot):
+                    result = state.submit_test_intent()
+            finally:
+                state.AUDIT_STORE = original_store
+
+            self.assertTrue(result["ok"])
+            rows = store.list_events(newest_first=False)
+
+        self.assertEqual(1, len(rows))
+        event = rows[0]
+        self.assertEqual("live_trader", event["app"])
+        self.assertEqual("ORDER", event["category"])
+        self.assertEqual("주문 게이트", event["source"])
+        self.assertEqual("allow", event["decision"])
+        self.assertEqual("dry_run", event["state"])
+        self.assertEqual("LIVE-DRY-0001", event["order_id"])
+        self.assertEqual("LIVE-AUDIT", event["strategy_id"])
+        self.assertEqual("BTCUSDT", event["symbol"])
+        self.assertTrue(event["payload"]["risk_report"]["can_submit"])
+        self.assertEqual("simulated", event["payload"]["queue_state"])
 
     def test_submit_test_intent_audit_records_blocking_risk_reason(self) -> None:
         state.STATE["orders"] = []
