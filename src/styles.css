@@ -1408,6 +1408,12 @@ button {
   color: var(--icon-blue);
 }
 
+.setting-row.active {
+  border-color: color-mix(in srgb, var(--primary) 56%, var(--border));
+  background: color-mix(in srgb, var(--primary) 14%, var(--panel-raised));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
 .setting-row strong,
 .setting-row span {
   display: block;
@@ -3570,6 +3576,12 @@ body {
   align-content: start;
   min-height: 78px;
   padding-right: 84px;
+}
+
+.live-assistant-field.bool.active {
+  border-color: color-mix(in srgb, var(--primary) 58%, var(--border));
+  background: color-mix(in srgb, var(--primary) 13%, var(--panel));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 
 .live-assistant-field.bool .ts-toggle-switch {

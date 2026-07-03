@@ -2141,8 +2141,9 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         {visibleFields.map((field) => {
           const value = draft[field.key] ?? "";
           const status = assistantFieldStatus(field, value);
+          const boolChecked = field.kind === "bool" && (String(value).toLowerCase() === "true" || value === true);
           return (
-            <label className={`live-assistant-field ${field.kind}`} key={field.key}>
+            <label className={`live-assistant-field ${field.kind} ${boolChecked ? "active" : ""}`} key={field.key}>
               <div>
                 <strong>{field.label}</strong>
                 <span>{field.detail}</span>
@@ -2150,7 +2151,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
               </div>
               {field.kind === "bool" ? (
                 <ToggleSwitch
-                  checked={String(value).toLowerCase() === "true" || value === true}
+                  checked={boolChecked}
                   label={field.label}
                   onChange={(checked) => updateDraft(field.key, checked ? "true" : "false")}
                 />
@@ -2671,7 +2672,7 @@ function RetryPolicyPanel({ policy, onRetryPolicy }) {
       <PanelHeader title="재시도 정책" subtitle="브로커 전송 전 단계에서 사용할 재시도 기준입니다." />
       <div className="settings-list">
         {policy.map((setting) => (
-          <div className="setting-row" key={setting.key}>
+          <div className={`setting-row ${setting.type === "boolean" && Boolean(setting.value) ? "active" : ""}`} key={setting.key}>
             <Clock3 size={16} />
             <div>
               <strong>{setting.label}</strong>
