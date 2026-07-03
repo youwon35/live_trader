@@ -156,6 +156,33 @@ class ProgramLedger:
             )
         return len(prepared)
 
+    def sync_cash_rows(self, rows: list[dict[str, Any]], broker_ids: list[str], source: str) -> int:
+        updated_at = now_text()
+        selected_brokers = [broker_id for broker_id in {str(item).strip() for item in broker_ids} if broker_id]
+        prepared: list[tuple[str, str, str, float, str, str]] = []
+        for row in rows:
+            broker_id = str(row.get("broker_id") or "").strip()
+            if not broker_id:
+                continue
+            account = str(row.get("account") or broker_id).strip()
+            currency = str(row.get("currency") or "").strip()
+            cash = numeric_value(row.get("broker_cash", row.get("cash", 0.0)))
+            prepared.append((broker_id, account, currency, cash, updated_at, source))
+
+        with self.connection() as conn:
+            if selected_brokers:
+                placeholders = ",".join("?" for _ in selected_brokers)
+                conn.execute(f"DELETE FROM cash_balances WHERE broker_id IN ({placeholders})", selected_brokers)
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO cash_balances
+                (broker_id, account, currency, cash, updated_at, source)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                prepared,
+            )
+        return len(prepared)
+
     def replace_position_rows(self, rows: list[dict[str, Any]], source: str) -> int:
         updated_at = now_text()
         prepared: list[tuple[str, str, str, str, float, float, str, str]] = []
@@ -187,6 +214,56 @@ class ProgramLedger:
                 prepared,
             )
         return len(prepared)
+
+    def sync_position_rows(self, rows: list[dict[str, Any]], broker_ids: list[str], source: str) -> int:
+        updated_at = now_text()
+        selected_brokers = [broker_id for broker_id in {str(item).strip() for item in broker_ids} if broker_id]
+        prepared: list[tuple[str, str, str, str, float, float, str, str]] = []
+        for row in rows:
+            broker_id = str(row.get("broker_id") or "").strip()
+            symbol = str(row.get("symbol") or "").strip()
+            if not broker_id or not symbol:
+                continue
+            prepared.append(
+                (
+                    broker_id,
+                    symbol,
+                    str(row.get("asset") or ""),
+                    str(row.get("currency") or ""),
+                    numeric_value(row.get("broker_qty", row.get("quantity", 0.0))),
+                    numeric_value(row.get("broker_value", row.get("value", 0.0))),
+                    updated_at,
+                    source,
+                )
+            )
+
+        with self.connection() as conn:
+            if selected_brokers:
+                placeholders = ",".join("?" for _ in selected_brokers)
+                conn.execute(f"DELETE FROM positions WHERE broker_id IN ({placeholders})", selected_brokers)
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO positions
+                (broker_id, symbol, asset, currency, quantity, value, updated_at, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                prepared,
+            )
+        return len(prepared)
+
+    def sync_broker_snapshot(
+        self,
+        accounts: list[dict[str, Any]],
+        positions: list[dict[str, Any]],
+        broker_ids: list[str],
+        source: str,
+    ) -> dict[str, Any]:
+        return {
+            "updated_at": now_text(),
+            "cash_count": self.sync_cash_rows(accounts, broker_ids, source),
+            "position_count": self.sync_position_rows(positions, broker_ids, source),
+            "source": source,
+        }
 
     def seed_from_broker_snapshot(
         self,

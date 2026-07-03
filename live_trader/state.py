@@ -298,6 +298,8 @@ STATE: dict[str, Any] = {
         "errors": [],
         "event_count": 0,
         "recorded_count": 0,
+        "synced_cash_count": 0,
+        "synced_position_count": 0,
     },
     "reconciliation_last_run": None,
     "preflight_last_run": None,
@@ -642,6 +644,8 @@ def execution_event_snapshot() -> dict[str, Any]:
         "errors": list(state.get("errors", [])),
         "event_count": int(state.get("event_count", 0)),
         "recorded_count": int(state.get("recorded_count", 0)),
+        "synced_cash_count": int(state.get("synced_cash_count", 0)),
+        "synced_position_count": int(state.get("synced_position_count", 0)),
         "recent": PROGRAM_LEDGER.execution_event_rows(20),
     }
 
@@ -1700,6 +1704,9 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
     router = LiveBrokerRouter()
     events: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    snapshot_accounts: list[dict[str, Any]] = []
+    snapshot_positions: list[dict[str, Any]] = []
+    successful_snapshot_brokers: set[str] = set()
     for selected_broker in broker_ids:
         try:
             result = router.poll_execution_events(selected_broker)
@@ -1708,16 +1715,50 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
                 for row in rows:
                     if isinstance(row, dict):
                         events.append({"broker_id": selected_broker, **row})
+            accounts = result.get("accounts", []) if isinstance(result, dict) else []
+            positions_data = result.get("positions", []) if isinstance(result, dict) else []
+            received_snapshot = False
+            if isinstance(accounts, list):
+                account_rows = [item for item in accounts if isinstance(item, dict)]
+                snapshot_accounts.extend(account_rows)
+                received_snapshot = received_snapshot or bool(account_rows)
+            if isinstance(positions_data, list):
+                position_rows = [item for item in positions_data if isinstance(item, dict)]
+                snapshot_positions.extend(position_rows)
+                received_snapshot = received_snapshot or bool(position_rows)
+            if received_snapshot:
+                successful_snapshot_brokers.add(selected_broker)
         except (BrokerNotReadyError, RuntimeError) as exc:
             errors.append({"broker_id": selected_broker, "detail": str(exc)})
     recorded = PROGRAM_LEDGER.record_execution_events(events)
+    synced = (
+        PROGRAM_LEDGER.sync_broker_snapshot(
+            snapshot_accounts,
+            snapshot_positions,
+            sorted(successful_snapshot_brokers),
+            source="event_poll",
+        )
+        if successful_snapshot_brokers
+        else {"cash_count": 0, "position_count": 0}
+    )
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    STATE["execution_events"] = {"last_poll": now, "errors": errors, "event_count": len(events), "recorded_count": recorded}
+    STATE["execution_events"] = {
+        "last_poll": now,
+        "errors": errors,
+        "event_count": len(events),
+        "recorded_count": recorded,
+        "synced_cash_count": int(synced.get("cash_count", 0)),
+        "synced_position_count": int(synced.get("position_count", 0)),
+    }
     STATE["program_ledger"]["last_event_sync"] = now
     append_audit(
         "warn" if errors else "info",
         "체결 이벤트 동기화",
-        f"체결/계좌 이벤트 {len(events)}건 수신, {recorded}건 저장, 오류 {len(errors)}건",
+        (
+            f"체결/계좌 이벤트 {len(events)}건 수신, {recorded}건 저장, "
+            f"원장 현금 {synced.get('cash_count', 0)}개/포지션 {synced.get('position_count', 0)}개 동기화, "
+            f"오류 {len(errors)}건"
+        ),
     )
     return {
         "ok": not errors,

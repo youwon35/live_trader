@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from live_trader import state
+from live_trader.brokers import LiveBrokerRouter
 from live_trader.audit_store import SQLiteAuditEventStore
 from live_trader.program_ledger import ProgramLedger
 
@@ -545,6 +546,90 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(result["execution_events"]["event_count"], 1)
         self.assertEqual(result["program_ledger"]["execution_event_count"], 1)
         self.assertEqual(result["program_ledger"]["execution_events"][0]["symbol"], "BTCUSDT")
+
+    def test_execution_event_poll_syncs_broker_snapshot_to_program_ledger(self) -> None:
+        class FakeRouter:
+            def poll_execution_events(self, broker_id):
+                return {
+                    "broker_id": broker_id,
+                    "accounts": [
+                        {
+                            "broker_id": "kis",
+                            "broker_name": "한국투자증권 Open API",
+                            "account": "KIS 실계좌",
+                            "currency": "KRW",
+                            "broker_cash": 123456.0,
+                            "detail": "fake account snapshot",
+                        }
+                    ],
+                    "positions": [
+                        {
+                            "symbol": "005930.KS",
+                            "asset": "한국주식",
+                            "broker_id": "kis",
+                            "broker_name": "한국투자증권 Open API",
+                            "currency": "KRW",
+                            "broker_qty": 3.0,
+                            "broker_value": 210000.0,
+                            "detail": "fake position snapshot",
+                        }
+                    ],
+                    "events": [
+                        {
+                            "event_id": "kis-account-event-1",
+                            "state": "account_snapshot",
+                            "occurred_at": "2026-07-04 11:00:00",
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.use_temp_program_ledger(temp_dir)
+            try:
+                with patch("live_trader.state.LiveBrokerRouter", return_value=FakeRouter()):
+                    result = state.poll_execution_events("kis")
+            finally:
+                self.restore_temp_program_ledger()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["program_ledger"]["cash_count"], 1)
+        self.assertEqual(result["program_ledger"]["position_count"], 1)
+        self.assertEqual(result["execution_events"]["synced_cash_count"], 1)
+        self.assertEqual(result["execution_events"]["synced_position_count"], 1)
+
+    def test_kis_poll_execution_events_returns_balance_snapshot_events(self) -> None:
+        payload = {
+            "output1": [
+                {
+                    "pdno": "005930",
+                    "prdt_name": "삼성전자",
+                    "hldg_qty": "5",
+                    "evlu_amt": "350000",
+                }
+            ],
+            "output2": [
+                {
+                    "dnca_tot_amt": "1000000",
+                }
+            ],
+        }
+
+        with patch("live_trader.brokers.issue_kis_access_token", return_value="token"), patch(
+            "live_trader.brokers.send_prepared_request",
+            return_value={"ok": True, "json": payload},
+        ):
+            result = LiveBrokerRouter().poll_execution_events("kis")
+
+        self.assertEqual(result["broker_id"], "kis")
+        self.assertEqual(len(result["accounts"]), 1)
+        self.assertEqual(len(result["positions"]), 1)
+        self.assertTrue(any(event["state"] == "account_snapshot" for event in result["events"]))
+        self.assertTrue(
+            any(
+                event["state"] == "position_snapshot" and event["symbol"] == "005930.KS"
+                for event in result["events"]
+            )
+        )
 
     def test_execution_event_poll_reports_adapter_stub_errors(self) -> None:
         class FakeRouter:

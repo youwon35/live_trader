@@ -107,6 +107,10 @@ def now_text() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+def now_datetime_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def real_orders_enabled() -> bool:
     return os.getenv("LIVE_TRADER_ENABLE_REAL_ORDERS", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -250,7 +254,7 @@ def broker_adapter_contract() -> list[dict[str, str]]:
         {"method": "place_order", "purpose": "서명된 실주문 요청 생성/전송", "status": "interface_ready"},
         {"method": "cancel_order", "purpose": "주문 취소/정정", "status": "blocked_stub"},
         {"method": "stream_executions", "purpose": "체결/계좌 이벤트 스트림", "status": "blocked_stub"},
-        {"method": "poll_execution_events", "purpose": "체결/계좌 이벤트 폴링", "status": "blocked_stub"},
+        {"method": "poll_execution_events", "purpose": "체결/계좌 이벤트 폴링", "status": "kis_balance_poll_ready"},
     ]
 
 
@@ -353,6 +357,58 @@ def parse_kis_positions(payload: object) -> list[dict[str, object]]:
             }
         )
     return positions
+
+
+def kis_snapshot_events(accounts: list[dict[str, object]], positions: list[dict[str, object]]) -> list[dict[str, object]]:
+    occurred_at = now_datetime_text()
+    events: list[dict[str, object]] = []
+    for account in accounts:
+        broker_id = str(account.get("broker_id") or "kis")
+        account_name = str(account.get("account") or broker_id)
+        currency = str(account.get("currency") or "KRW")
+        cash = numeric_value(account.get("broker_cash"), 0.0)
+        events.append(
+            {
+                "event_id": f"{broker_id}:account:{account_name}:{currency}:{occurred_at}",
+                "broker_id": broker_id,
+                "order_id": "",
+                "broker_order_id": "",
+                "symbol": "",
+                "side": "",
+                "quantity": 0.0,
+                "price": cash,
+                "state": "account_snapshot",
+                "occurred_at": occurred_at,
+                "account": account_name,
+                "currency": currency,
+                "cash": cash,
+                "detail": account.get("detail", ""),
+            }
+        )
+
+    for position in positions:
+        broker_id = str(position.get("broker_id") or "kis")
+        symbol = str(position.get("symbol") or "")
+        qty = numeric_value(position.get("broker_qty"), 0.0)
+        value = numeric_value(position.get("broker_value"), 0.0)
+        events.append(
+            {
+                "event_id": f"{broker_id}:position:{symbol}:{occurred_at}",
+                "broker_id": broker_id,
+                "order_id": "",
+                "broker_order_id": "",
+                "symbol": symbol,
+                "side": "",
+                "quantity": qty,
+                "price": value,
+                "state": "position_snapshot",
+                "occurred_at": occurred_at,
+                "asset": position.get("asset", ""),
+                "currency": position.get("currency", ""),
+                "detail": position.get("detail", ""),
+            }
+        )
+    return events
 
 
 def parse_binance_accounts(payload: object) -> list[dict[str, object]]:
@@ -503,5 +559,17 @@ class LiveBrokerRouter:
         raise BrokerNotReadyError("Broker execution stream adapters are not implemented yet.")
 
     def poll_execution_events(self, broker_id: str) -> dict[str, object]:
-        _ = broker_id
+        broker_id = broker_id.lower().strip()
+        if broker_id == "kis":
+            token = issue_kis_access_token()
+            payload = ensure_response_ok("kis", send_prepared_request(build_kis_domestic_balance_request(access_token=token)))
+            accounts = parse_kis_accounts(payload)
+            positions = parse_kis_positions(payload)
+            return {
+                "broker_id": "kis",
+                "accounts": accounts,
+                "positions": positions,
+                "events": kis_snapshot_events(accounts, positions),
+                "source": "kis_balance_poll",
+            }
         raise BrokerNotReadyError("Broker execution-event polling adapters are not implemented yet.")
