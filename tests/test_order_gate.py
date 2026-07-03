@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from live_trader import state
 from live_trader.audit_store import SQLiteAuditEventStore
+from live_trader.program_ledger import ProgramLedger
 
 
 class OrderGateTest(unittest.TestCase):
@@ -16,6 +17,16 @@ class OrderGateTest(unittest.TestCase):
     def tearDown(self) -> None:
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
+
+    def use_temp_program_ledger(self, temp_dir: str) -> ProgramLedger:
+        self.original_program_ledger = state.PROGRAM_LEDGER
+        ledger = ProgramLedger(Path(temp_dir) / "program_ledger.sqlite3")
+        state.PROGRAM_LEDGER = ledger
+        return ledger
+
+    def restore_temp_program_ledger(self) -> None:
+        if hasattr(self, "original_program_ledger"):
+            state.PROGRAM_LEDGER = self.original_program_ledger
 
     def test_order_and_risk_classes_come_from_shared_runtime(self) -> None:
         self.assertEqual(state.OrderIntent.__module__, "trading_runtime.order_management")
@@ -471,6 +482,86 @@ class OrderGateTest(unittest.TestCase):
                 for row in result["reconciliation"]["positions"]
             )
         )
+
+    def test_program_ledger_baseline_turns_broker_cash_into_reconciled_cash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.use_temp_program_ledger(temp_dir)
+            try:
+                state.STATE["broker_reconciliation"] = {
+                    "fetched_at": "2026-07-04 10:00:00",
+                    "accounts": [
+                        {
+                            "broker_id": "kis",
+                            "broker_name": "한국투자증권 Open API",
+                            "account": "KIS 실계좌",
+                            "currency": "KRW",
+                            "broker_cash": 100000.0,
+                            "detail": "fake kis account",
+                        }
+                    ],
+                    "positions": [],
+                    "errors": [],
+                }
+
+                result = state.seed_program_ledger_from_broker_snapshot(refresh_if_empty=False)
+            finally:
+                self.restore_temp_program_ledger()
+
+        self.assertTrue(result["ok"])
+        kis_account = next(row for row in result["reconciliation"]["accounts"] if row["broker_id"] == "kis")
+        self.assertEqual(kis_account["status"], "pass")
+        self.assertEqual(kis_account["status_label"], "일치")
+        self.assertEqual(kis_account["program_source"], "broker_snapshot")
+
+    def test_execution_event_poll_records_events_in_program_ledger(self) -> None:
+        class FakeRouter:
+            def poll_execution_events(self, broker_id):
+                return {
+                    "broker_id": broker_id,
+                    "events": [
+                        {
+                            "event_id": f"{broker_id}-fill-1",
+                            "order_id": "LIVE-ORDER-1",
+                            "broker_order_id": "BRK-1",
+                            "symbol": "BTCUSDT",
+                            "side": "BUY",
+                            "quantity": 0.01,
+                            "price": 65000.0,
+                            "state": "filled",
+                            "occurred_at": "2026-07-04 10:01:00",
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.use_temp_program_ledger(temp_dir)
+            try:
+                with patch("live_trader.state.LiveBrokerRouter", return_value=FakeRouter()):
+                    result = state.poll_execution_events("binance")
+            finally:
+                self.restore_temp_program_ledger()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["execution_events"]["event_count"], 1)
+        self.assertEqual(result["program_ledger"]["execution_event_count"], 1)
+        self.assertEqual(result["program_ledger"]["execution_events"][0]["symbol"], "BTCUSDT")
+
+    def test_execution_event_poll_reports_adapter_stub_errors(self) -> None:
+        class FakeRouter:
+            def poll_execution_events(self, broker_id):
+                raise state.BrokerNotReadyError(f"{broker_id} event adapter required")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.use_temp_program_ledger(temp_dir)
+            try:
+                with patch("live_trader.state.LiveBrokerRouter", return_value=FakeRouter()):
+                    result = state.poll_execution_events("kis")
+            finally:
+                self.restore_temp_program_ledger()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("event adapter required", result["errors"][0]["detail"])
 
 
 if __name__ == "__main__":

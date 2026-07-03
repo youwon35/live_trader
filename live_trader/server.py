@@ -94,6 +94,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/reconcile":
             self.send_json(state.run_reconciliation())
             return
+        if parsed.path == "/api/program-ledger-baseline":
+            self.send_json(state.seed_program_ledger_from_broker_snapshot())
+            return
+        if parsed.path == "/api/execution-events":
+            self.send_json(state.poll_execution_events(str(payload.get("broker_id", "all"))))
+            return
         if parsed.path == "/api/preflight":
             self.send_json(state.run_final_preflight())
             return

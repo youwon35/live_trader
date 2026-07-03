@@ -41,10 +41,12 @@ import {
   runReconciliation,
   runStrategyCycle,
   runWatchdog,
+  seedProgramLedgerBaseline,
   retryOrder,
   setFlag,
   setAutomationProfile,
   setMode,
+  syncExecutionEvents,
   setRetryPolicy,
   setRiskSetting,
   saveUiSettings,
@@ -176,6 +178,12 @@ const fallbackSnapshot = {
     accounts: [],
     next_actions: [],
   },
+  program_ledger: {
+    cash_count: 0,
+    position_count: 0,
+    execution_event_count: 0,
+  },
+  execution_events: { last_poll: null, errors: [], event_count: 0, recorded_count: 0, recent: [] },
   operation_report: { generated_at: "-", sections: [] },
   final_preflight: [],
   launch_report: {
@@ -1284,6 +1292,8 @@ function App() {
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
           onReconcile={() => runAction(runReconciliation)}
           onPreflight={() => runAction(runFinalPreflight)}
+          onProgramLedgerBaseline={() => runAction(seedProgramLedgerBaseline)}
+          onExecutionEvents={(brokerId) => runAction(() => syncExecutionEvents(brokerId))}
           onEnvSettings={(values) => runAction(() => saveEnvSettings(values))}
           appearance={appearance}
           updateAppearance={updateAppearance}
@@ -1359,6 +1369,8 @@ function WorkspaceContent({
   onCancelOrder,
   onReconcile,
   onPreflight,
+  onProgramLedgerBaseline,
+  onExecutionEvents,
   onEnvSettings,
   appearance,
   updateAppearance,
@@ -1464,7 +1476,28 @@ function WorkspaceContent({
   }
 
   return renderPage(
-    <PreTradeDoctorPanel snapshot={snapshot} onNavigate={onNavigate} onReconcile={onReconcile} onPreflight={onPreflight} onWatchdog={onWatchdog} />,
+    <section className="content-grid">
+      <div className="content-column">
+        <PreTradeDoctorPanel
+          snapshot={snapshot}
+          onNavigate={onNavigate}
+          onReconcile={onReconcile}
+          onPreflight={onPreflight}
+          onWatchdog={onWatchdog}
+        />
+      </div>
+      <div className="content-column">
+        <ReconciliationSummaryPanel
+          reconciliation={snapshot.reconciliation}
+          programLedger={snapshot.program_ledger}
+          executionEvents={snapshot.execution_events}
+          onReconcile={onReconcile}
+          onProgramLedgerBaseline={onProgramLedgerBaseline}
+          onExecutionEvents={onExecutionEvents}
+        />
+        <AccountReconciliationPanel accounts={snapshot.accounts ?? []} />
+      </div>
+    </section>,
   );
 }
 
@@ -2726,7 +2759,7 @@ function BrokerRequirementsPanel({ brokers }) {
   );
 }
 
-function ReconciliationSummaryPanel({ reconciliation, onReconcile }) {
+function ReconciliationSummaryPanel({ reconciliation, programLedger, executionEvents, onReconcile, onProgramLedgerBaseline, onExecutionEvents }) {
   const summary = reconciliation?.summary ?? fallbackSnapshot.reconciliation.summary;
   const actions = reconciliation?.next_actions ?? [];
   const items = [
@@ -2737,6 +2770,13 @@ function ReconciliationSummaryPanel({ reconciliation, onReconcile }) {
     { label: "불일치", value: summary.mismatch_count, tone: summary.mismatch_count ? "danger" : "success" },
     { label: "조회 오류", value: summary.error_count ?? 0, tone: summary.error_count ? "danger" : "success" },
   ];
+  const ledger = programLedger ?? fallbackSnapshot.program_ledger;
+  const events = executionEvents ?? fallbackSnapshot.execution_events;
+  const ledgerItems = [
+    { label: "원장 현금", value: ledger.cash_count ?? 0, tone: ledger.cash_count ? "success" : "warning" },
+    { label: "원장 포지션", value: ledger.position_count ?? 0, tone: ledger.position_count ? "success" : "warning" },
+    { label: "체결 이벤트", value: ledger.execution_event_count ?? 0, tone: events.errors?.length ? "warning" : "info" },
+  ];
   return (
     <section className="panel reconciliation-panel">
       <PanelHeader title="포지션·계좌 대조 요약" subtitle={`마지막 대조 ${summary.last_run}`} />
@@ -2746,9 +2786,17 @@ function ReconciliationSummaryPanel({ reconciliation, onReconcile }) {
           <RefreshCcw size={14} />
           대조 실행
         </button>
+        <button className="mini-button" type="button" onClick={onProgramLedgerBaseline}>
+          <DatabaseZap size={14} />
+          원장 기준 저장
+        </button>
+        <button className="mini-button" type="button" onClick={() => onExecutionEvents("all")}>
+          <FileClock size={14} />
+          체결 동기화
+        </button>
       </div>
       <MetricGrid className="metric-grid">
-        {items.map((item) => (
+        {[...items, ...ledgerItems].map((item) => (
           <MetricCard
             className="metric-card"
             detail={item.tone === "success" ? "정상" : "확인"}
@@ -2764,6 +2812,11 @@ function ReconciliationSummaryPanel({ reconciliation, onReconcile }) {
         {actions.map((action) => (
           <span key={action}>{action}</span>
         ))}
+      </div>
+      <div className="ledger-footnote">
+        <span>프로그램 원장: {ledger.path ?? "-"}</span>
+        <span>마지막 체결 동기화: {events.last_poll ?? "미실행"}</span>
+        {events.errors?.length ? <span>이벤트 어댑터 확인 필요 {events.errors.length}건</span> : null}
       </div>
     </section>
   );

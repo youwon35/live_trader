@@ -643,6 +643,19 @@ button {
   margin-bottom: 9px;
 }
 
+.ledger-footnote {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.ledger-footnote span {
+  min-width: 0;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));

@@ -58,6 +58,14 @@ export async function runReconciliation() {
   return request("/api/reconcile", { method: "POST", body: {} });
 }
 
+export async function seedProgramLedgerBaseline() {
+  return request("/api/program-ledger-baseline", { method: "POST", body: {} });
+}
+
+export async function syncExecutionEvents(brokerId = "all") {
+  return request("/api/execution-events", { method: "POST", body: { broker_id: brokerId } });
+}
+
 export async function runFinalPreflight() {
   return request("/api/preflight", { method: "POST", body: {} });
 }

@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from trading_runtime import AuditEvent, audit_event_from_order_gate, build_audit_event
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
+from .program_ledger import ProgramLedger
 from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts, strategy_plugin_status
 from .audit_store import SQLiteAuditEventStore
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
@@ -230,6 +231,8 @@ AUDIT_LOG_LIMIT = 500
 APP_ROOT = Path(__file__).resolve().parents[1]
 AUDIT_DB_PATH = Path(os.environ.get("LIVE_TRADER_AUDIT_DB") or APP_ROOT / "logs" / "live_trader_audit.sqlite3")
 AUDIT_STORE = SQLiteAuditEventStore(AUDIT_DB_PATH)
+PROGRAM_LEDGER_PATH = Path(os.environ.get("LIVE_TRADER_PROGRAM_LEDGER_DB") or APP_ROOT / "logs" / "live_trader_program_ledger.sqlite3")
+PROGRAM_LEDGER = ProgramLedger(PROGRAM_LEDGER_PATH)
 DEFAULT_WATCHDOG_SETTINGS: dict[str, float] = {
     "heartbeat_timeout_sec": 45.0,
     "market_data_stale_sec": 90.0,
@@ -284,6 +287,17 @@ STATE: dict[str, Any] = {
         "accounts": [],
         "positions": [],
         "errors": [],
+    },
+    "program_ledger": {
+        "last_baseline": None,
+        "last_baseline_source": "",
+        "last_event_sync": None,
+    },
+    "execution_events": {
+        "last_poll": None,
+        "errors": [],
+        "event_count": 0,
+        "recorded_count": 0,
     },
     "reconciliation_last_run": None,
     "preflight_last_run": None,
@@ -598,15 +612,51 @@ def live_position_rows() -> dict[tuple[str, str], dict[str, object]]:
     }
 
 
+def program_cash_rows() -> dict[str, dict[str, Any]]:
+    return {str(item.get("broker_id")): item for item in PROGRAM_LEDGER.cash_rows() if item.get("broker_id")}
+
+
+def program_position_rows() -> dict[tuple[str, str], dict[str, Any]]:
+    return {
+        (str(item.get("broker_id")), str(item.get("symbol"))): item
+        for item in PROGRAM_LEDGER.position_rows()
+        if item.get("broker_id") and item.get("symbol")
+    }
+
+
+def program_ledger_snapshot() -> dict[str, Any]:
+    summary = PROGRAM_LEDGER.summary()
+    return {
+        **summary,
+        "state": dict(STATE.get("program_ledger", {})),
+        "cash": PROGRAM_LEDGER.cash_rows(),
+        "positions": PROGRAM_LEDGER.position_rows(),
+        "execution_events": PROGRAM_LEDGER.execution_event_rows(20),
+    }
+
+
+def execution_event_snapshot() -> dict[str, Any]:
+    state = STATE.get("execution_events", {})
+    return {
+        "last_poll": state.get("last_poll"),
+        "errors": list(state.get("errors", [])),
+        "event_count": int(state.get("event_count", 0)),
+        "recorded_count": int(state.get("recorded_count", 0)),
+        "recent": PROGRAM_LEDGER.execution_event_rows(20),
+    }
+
+
 def positions() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     broker_rows = live_position_rows()
+    ledger_rows = program_position_rows()
     errors = broker_reconciliation_errors()
     for item in POSITION_RECONCILIATION_BOOK:
         key = (str(item["broker_id"]), str(item["symbol"]))
         broker_row = broker_rows.pop(key, None)
+        ledger_row = ledger_rows.pop(key, None)
         broker_qty = broker_row.get("broker_qty") if broker_row else item["broker_qty"]
-        program_qty = float(item["program_qty"])
+        program_qty = float(ledger_row["quantity"] if ledger_row else item["program_qty"])
         tolerance_qty = float(item["tolerance_qty"])
         if broker_qty is None:
             status = "api_required"
@@ -637,6 +687,39 @@ def positions() -> list[dict[str, str]]:
                 "delta_qty": delta_qty,
                 "status": status,
                 "status_label": status_label,
+                "program_source": str(ledger_row.get("source") if ledger_row else "sample"),
+                "detail": detail,
+            }
+        )
+    for key, ledger_row in sorted(ledger_rows.items()):
+        broker_row = broker_rows.pop(key, None)
+        broker_qty = broker_row.get("broker_qty") if broker_row else None
+        program_qty = float(ledger_row.get("quantity") or 0.0)
+        if broker_qty is None:
+            status = "api_required"
+            status_label = "API 필요"
+            delta_qty = "-"
+            detail = errors.get(str(ledger_row.get("broker_id")), "브로커 포지션 조회 결과가 아직 없습니다.")
+        else:
+            numeric_broker_qty = float(broker_qty)
+            delta = program_qty - numeric_broker_qty
+            delta_qty = format_quantity(delta)
+            status = "pass" if abs(delta) <= 0.000001 else "mismatch"
+            status_label = "일치" if status == "pass" else "불일치"
+            detail = "프로그램 원장 포지션과 브로커 포지션을 대조했습니다."
+        rows.append(
+            {
+                "symbol": str(ledger_row.get("symbol")),
+                "asset": str(ledger_row.get("asset") or ""),
+                "broker_id": str(ledger_row.get("broker_id")),
+                "broker_name": str(ledger_row.get("broker_id")),
+                "currency": str(ledger_row.get("currency") or ""),
+                "program_qty": format_quantity(program_qty),
+                "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "API 필요",
+                "delta_qty": delta_qty,
+                "status": status,
+                "status_label": status_label,
+                "program_source": str(ledger_row.get("source") or "program_ledger"),
                 "detail": detail,
             }
         )
@@ -656,6 +739,7 @@ def positions() -> list[dict[str, str]]:
                 "delta_qty": format_quantity(-broker_qty),
                 "status": "mismatch",
                 "status_label": "불일치",
+                "program_source": "missing",
                 "detail": f"브로커에는 보유 수량이 있지만 프로그램 포지션 원장에는 없습니다. {broker_row.get('detail', '')}".strip(),
             }
         )
@@ -666,10 +750,12 @@ def account_reconciliation_rows() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     live_accounts = live_account_rows()
     errors = broker_reconciliation_errors()
+    ledger_accounts = program_cash_rows()
     for item in ACCOUNT_RECONCILIATION_BOOK:
         live_account = live_accounts.get(str(item["broker_id"]), {})
+        ledger_account = ledger_accounts.get(str(item["broker_id"]))
         broker_cash = live_account.get("broker_cash", item["broker_cash"])
-        program_cash = item["program_cash"]
+        program_cash = ledger_account.get("cash") if ledger_account else item["program_cash"]
         currency = str(live_account.get("currency") or item["currency"])
         if broker_cash is None:
             status = "api_required"
@@ -700,6 +786,7 @@ def account_reconciliation_rows() -> list[dict[str, str]]:
                 "delta_cash": delta_cash,
                 "status": status,
                 "status_label": status_label,
+                "program_source": str(ledger_account.get("source") if ledger_account else "missing"),
                 "detail": detail,
             }
         )
@@ -985,6 +1072,27 @@ def watchdog_snapshot(
         )
     )
 
+    event_state = execution_event_snapshot()
+    event_age = seconds_since(event_state.get("last_poll"), current)
+    event_errors = event_state.get("errors", [])
+    if active_live and event_age is None:
+        event_status: CheckStatus = "fail"
+        event_detail = "자동화가 활성화됐지만 체결/계좌 이벤트 동기화 이력이 없습니다."
+        event_value = "미실행"
+    elif active_live and event_age is not None and event_age > heartbeat_timeout:
+        event_status = "fail"
+        event_detail = f"마지막 체결 이벤트 동기화가 {event_age}초 전입니다. 허용 {heartbeat_timeout}초를 넘었습니다."
+        event_value = f"{event_age}초"
+    elif event_errors:
+        event_status = "warn"
+        event_detail = f"체결 이벤트 어댑터 확인 필요 {len(event_errors)}건"
+        event_value = f"{len(event_errors)} 오류"
+    else:
+        event_status = "pass"
+        event_detail = "체결/계좌 이벤트 동기화 경계가 정상입니다."
+        event_value = f"{event_age}초" if event_age is not None else "대기"
+    checks.append(watchdog_check("체결 이벤트 동기화", event_status, event_detail, event_value))
+
     critical = [check for check in checks if check["status"] == "fail"]
     warnings = [check for check in checks if check["status"] == "warn"]
     status: CheckStatus = "fail" if critical else "warn" if warnings else "pass"
@@ -1249,6 +1357,8 @@ def snapshot() -> dict[str, Any]:
         "orders": order_rows(),
         "dry_run_ledger": dry_run_ledger_rows(),
         "reconciliation": reconciliation,
+        "program_ledger": program_ledger_snapshot(),
+        "execution_events": execution_event_snapshot(),
         "accounts": reconciliation["accounts"],
         "positions": reconciliation["positions"],
         "operation_report": report,
@@ -1546,6 +1656,77 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
             data["errors"].append({"broker_id": broker_id, "scope": "positions", "detail": str(exc)})
     STATE["broker_reconciliation"] = data
     return data
+
+
+def seed_program_ledger_from_broker_snapshot(refresh_if_empty: bool = True) -> dict[str, Any]:
+    broker_data = STATE.get("broker_reconciliation", {})
+    accounts = broker_data.get("accounts", []) if isinstance(broker_data, dict) else []
+    positions_data = broker_data.get("positions", []) if isinstance(broker_data, dict) else []
+    if refresh_if_empty and not accounts and not positions_data:
+        broker_data = refresh_broker_reconciliation()
+        accounts = broker_data.get("accounts", [])
+        positions_data = broker_data.get("positions", [])
+    if not isinstance(accounts, list):
+        accounts = []
+    if not isinstance(positions_data, list):
+        positions_data = []
+    if not accounts and not positions_data:
+        return {
+            "ok": False,
+            "reason": "브로커 스냅샷이 없어 프로그램 원장 기준을 만들 수 없습니다.",
+            "program_ledger": program_ledger_snapshot(),
+            "snapshot": snapshot(),
+        }
+    result = PROGRAM_LEDGER.seed_from_broker_snapshot(accounts, positions_data, source="broker_snapshot")
+    STATE["program_ledger"]["last_baseline"] = result["updated_at"]
+    STATE["program_ledger"]["last_baseline_source"] = "broker_snapshot"
+    reconciliation = reconciliation_snapshot()
+    append_audit(
+        "warn",
+        "프로그램 원장 기준 저장",
+        f"브로커 스냅샷 기준으로 현금 {result['cash_count']}개, 포지션 {result['position_count']}개를 원장에 저장했습니다.",
+    )
+    return {
+        "ok": True,
+        "reason": f"프로그램 원장 기준 저장 완료: 현금 {result['cash_count']}개, 포지션 {result['position_count']}개",
+        "program_ledger": program_ledger_snapshot(),
+        "reconciliation": reconciliation,
+        "snapshot": snapshot(),
+    }
+
+
+def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
+    broker_ids = ("kis", "binance", "upbit") if broker_id.strip().lower() in {"", "all"} else (broker_id.strip().lower(),)
+    router = LiveBrokerRouter()
+    events: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for selected_broker in broker_ids:
+        try:
+            result = router.poll_execution_events(selected_broker)
+            rows = result.get("events", []) if isinstance(result, dict) else result
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        events.append({"broker_id": selected_broker, **row})
+        except (BrokerNotReadyError, RuntimeError) as exc:
+            errors.append({"broker_id": selected_broker, "detail": str(exc)})
+    recorded = PROGRAM_LEDGER.record_execution_events(events)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    STATE["execution_events"] = {"last_poll": now, "errors": errors, "event_count": len(events), "recorded_count": recorded}
+    STATE["program_ledger"]["last_event_sync"] = now
+    append_audit(
+        "warn" if errors else "info",
+        "체결 이벤트 동기화",
+        f"체결/계좌 이벤트 {len(events)}건 수신, {recorded}건 저장, 오류 {len(errors)}건",
+    )
+    return {
+        "ok": not errors,
+        "reason": f"체결 이벤트 동기화: 저장 {recorded}건, 오류 {len(errors)}건",
+        "errors": errors,
+        "program_ledger": program_ledger_snapshot(),
+        "execution_events": execution_event_snapshot(),
+        "snapshot": snapshot(),
+    }
 
 
 def run_reconciliation() -> dict[str, Any]:

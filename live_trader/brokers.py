@@ -250,6 +250,7 @@ def broker_adapter_contract() -> list[dict[str, str]]:
         {"method": "place_order", "purpose": "서명된 실주문 요청 생성/전송", "status": "interface_ready"},
         {"method": "cancel_order", "purpose": "주문 취소/정정", "status": "blocked_stub"},
         {"method": "stream_executions", "purpose": "체결/계좌 이벤트 스트림", "status": "blocked_stub"},
+        {"method": "poll_execution_events", "purpose": "체결/계좌 이벤트 폴링", "status": "blocked_stub"},
     ]
 
 
@@ -500,3 +501,7 @@ class LiveBrokerRouter:
     def stream_executions(self, broker_id: str) -> None:
         _ = broker_id
         raise BrokerNotReadyError("Broker execution stream adapters are not implemented yet.")
+
+    def poll_execution_events(self, broker_id: str) -> dict[str, object]:
+        _ = broker_id
+        raise BrokerNotReadyError("Broker execution-event polling adapters are not implemented yet.")
