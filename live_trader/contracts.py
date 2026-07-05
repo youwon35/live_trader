@@ -35,10 +35,132 @@ IGNORED_STRATEGY_FILE_NAMES = {
     "strategy-registry.json",
     "promotion-log.jsonl",
 }
+LIFECYCLE_STAGE_ALIASES = {
+    "approved": "backtested",
+    "final_tested": "backtested",
+    "final-tested": "backtested",
+    "candidate": "backtested",
+    "shadow": "before-shadow",
+    "shadow_candidate": "before-shadow",
+    "shadow-candidate": "before-shadow",
+    "paper_candidate": "before-shadow",
+    "paper-candidate": "before-shadow",
+    "paper": "papered",
+    "live_candidate": "before-live-small",
+    "live-candidate": "before-live-small",
+    "live_canary": "live-small",
+    "live-canary": "live-small",
+    "live_active": "live",
+    "live-active": "live",
+    "production": "live",
+}
+LIFECYCLE_STAGE_ORDER = {
+    "draft": 0,
+    "backtested": 10,
+    "before-shadow": 20,
+    "shadowed": 30,
+    "papered": 40,
+    "before-live-small": 50,
+    "live-small": 60,
+    "live": 70,
+    "paused": 80,
+    "retired": 90,
+}
+LIFECYCLE_LABELS = {
+    "draft": "Draft",
+    "backtested": "Backtested",
+    "before-shadow": "Before Shadow",
+    "shadowed": "Shadowed",
+    "papered": "Papered",
+    "before-live-small": "Before Live-Small",
+    "live-small": "Live-Small",
+    "live": "Live",
+    "paused": "Paused",
+    "retired": "Retired",
+}
+NON_BLOCKING_CAPABILITY_REASONS = {"live-activation-required"}
 
 
 def _dict_value(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def normalize_lifecycle_status(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    return LIFECYCLE_STAGE_ALIASES.get(normalized, normalized or "draft")
+
+
+def lifecycle_rank(value: Any) -> int:
+    return LIFECYCLE_STAGE_ORDER.get(normalize_lifecycle_status(value), -1)
+
+
+def lifecycle_at_least(value: Any, minimum: str) -> bool:
+    return lifecycle_rank(value) >= lifecycle_rank(minimum)
+
+
+def _status_pass(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"pass", "passed", "ok", "success"}
+
+
+def _evidence_passed(evidence: dict[str, Any], key: str) -> bool:
+    item = evidence.get(key)
+    if not isinstance(item, dict):
+        return False
+    return item.get("passed") is True or _status_pass(item.get("status"))
+
+
+def _artifact_capabilities(
+    artifact: dict[str, Any],
+    permissions: dict[str, Any],
+    lifecycle_status: str,
+    final_test_status: str,
+) -> dict[str, Any]:
+    evidence = _dict_value(artifact.get("evidence"))
+    fail_reasons = _reason_list(permissions.get("fail_reasons") or artifact.get("fail_reasons"))
+    blocking_failures = [reason for reason in fail_reasons if str(reason) not in NON_BLOCKING_CAPABILITY_REASONS]
+    final_test = _dict_value(artifact.get("finalTest") or artifact.get("final_test"))
+    final_passed = (
+        _status_pass(final_test_status)
+        or _status_pass(final_test.get("status"))
+        or _evidence_passed(evidence, "finalTest")
+    )
+    paper_verified = (
+        permissions.get("paper_trader_verified") is True
+        or artifact.get("paper_trader_verified") is True
+        or _evidence_passed(evidence, "paper")
+        or lifecycle_at_least(lifecycle_status, "papered")
+    )
+    live_small_verified = _evidence_passed(evidence, "liveSmall") or lifecycle_at_least(lifecycle_status, "live")
+    paused_or_retired = lifecycle_status in {"paused", "retired"}
+    quality_ok = not blocking_failures
+    live_small_eligible = (
+        not paused_or_retired
+        and final_passed
+        and paper_verified
+        and quality_ok
+        and lifecycle_at_least(lifecycle_status, "before-live-small")
+    )
+    live_eligible = (
+        not paused_or_retired
+        and final_passed
+        and paper_verified
+        and live_small_verified
+        and quality_ok
+        and lifecycle_at_least(lifecycle_status, "live")
+    )
+    return {
+        "schemaVersion": "strategy-capabilities-v1",
+        "lifecycleStatus": lifecycle_status,
+        "finalTestPassed": final_passed,
+        "paperTraderVerified": paper_verified,
+        "liveSmallVerified": live_small_verified,
+        "traderExportAllowed": final_passed and quality_ok and lifecycle_at_least(lifecycle_status, "before-shadow"),
+        "liveSmallEligible": live_small_eligible,
+        "liveEligible": live_eligible,
+        "canSubmitOrder": False,
+        "failReasons": fail_reasons,
+        "blockingFailReasons": blocking_failures,
+    }
 
 
 def _normalize_plugin_id(plugin_id: Any) -> str:
@@ -70,8 +192,30 @@ def can_trader_use_artifact(artifact: dict[str, Any]) -> bool:
 
 
 def can_live_use_artifact(artifact: dict[str, Any]) -> bool:
+    capabilities = _dict_value(artifact.get("capabilities"))
     permissions = _dict_value(artifact.get("permissions"))
-    return permissions.get("live_allowed") is True or artifact.get("live_allowed") is True
+    return (
+        capabilities.get("liveEligible") is True
+        or permissions.get("live_eligible") is True
+        or permissions.get("live_allowed") is True
+        or artifact.get("live_eligible") is True
+        or artifact.get("live_allowed") is True
+    )
+
+
+def can_live_small_use_artifact(artifact: dict[str, Any]) -> bool:
+    capabilities = _dict_value(artifact.get("capabilities"))
+    permissions = _dict_value(artifact.get("permissions"))
+    return (
+        capabilities.get("liveSmallEligible") is True
+        or capabilities.get("liveEligible") is True
+        or permissions.get("live_small_eligible") is True
+        or permissions.get("live_eligible") is True
+        or permissions.get("live_allowed") is True
+        or artifact.get("live_small_eligible") is True
+        or artifact.get("live_eligible") is True
+        or artifact.get("live_allowed") is True
+    )
 
 
 def _verification_badge(status: str, label: str, detail: str) -> dict[str, str]:
@@ -107,46 +251,48 @@ def _paper_verification_badge(
     permissions: dict[str, Any],
     lifecycle_status: str,
 ) -> dict[str, str]:
-    normalized_status = lifecycle_status.lower()
+    normalized_status = normalize_lifecycle_status(lifecycle_status)
     paper_verified = (
         permissions.get("paper_trader_verified") is True
         or artifact.get("paper_trader_verified") is True
-        or normalized_status in {"paper", "paper-approved", "live-small", "live", "live-full", "production"}
+        or lifecycle_at_least(normalized_status, "papered")
     )
     if paper_verified:
         return _verification_badge("pass", "Paper 검증", f"lifecycle={lifecycle_status or 'paper'}")
-    if normalized_status == "shadow":
+    if normalized_status in {"before-shadow", "shadowed"}:
         return _verification_badge("watch", "Shadow 검증 중", "Paper Trader 승급 전 Shadow 검증 단계입니다.")
     return _verification_badge("wait", "Paper 미검증", "Paper Trader 승인/성과 검증 정보가 아직 없습니다.")
 
 
-def _live_verification_badge(permissions: dict[str, Any]) -> dict[str, str]:
-    if permissions.get("live_allowed") is True:
-        return _verification_badge("pass", "Live 허용", "live_allowed=true artifact입니다.")
-    fail_reasons = _reason_list(permissions.get("fail_reasons"))
-    detail = "; ".join(str(reason) for reason in fail_reasons) if fail_reasons else "live_allowed 권한이 없습니다."
+def _live_verification_badge(capabilities: dict[str, Any]) -> dict[str, str]:
+    if capabilities.get("liveEligible") is True:
+        return _verification_badge("pass", "정식 Live 가능", "lifecycle=live와 검증 evidence를 확인했습니다.")
+    if capabilities.get("liveSmallEligible") is True:
+        return _verification_badge("watch", "Live-Small 가능", "소액 실거래 준비 단계입니다. doctor 통과 후 제한 운용만 허용합니다.")
+    fail_reasons = _reason_list(capabilities.get("blockingFailReasons") or capabilities.get("failReasons"))
+    detail = "; ".join(str(reason) for reason in fail_reasons) if fail_reasons else "Live-Small/Live eligibility가 없습니다."
     return _verification_badge("fail", "Live 차단", detail)
 
 
 def _promotion_snapshot(artifact: dict[str, Any], permissions: dict[str, Any], lifecycle_status: str) -> dict[str, Any]:
     promotion = _dict_value(artifact.get("promotion"))
     release = _dict_value(artifact.get("release"))
-    stage = str(
-        promotion.get("stage")
+    stage = normalize_lifecycle_status(
+        lifecycle_status
+        or promotion.get("stage")
         or artifact.get("promotionStage")
         or release.get("stage")
         or artifact.get("stage")
-        or lifecycle_status
         or "unknown"
-    ).strip().lower()
+    )
     return {
         "stage": stage or "unknown",
         "stage_label": str(promotion.get("stageLabel") or _promotion_stage_label(stage)),
         "parameter_summary": str(promotion.get("parameterSummary") or artifact.get("parameterSummary") or ""),
         "promoted_at": str(promotion.get("promotedAt") or artifact.get("updatedAt") or artifact.get("createdAt") or ""),
         "promoted_by": str(promotion.get("promotedBy") or artifact.get("savedBy") or ""),
-        "paper_eligible": stage in {"paper_candidate", "live_candidate", "live_canary", "live_active"} or permissions.get("trader_export_allowed") is True,
-        "live_candidate": stage in {"live_candidate", "live_canary", "live_active"} or permissions.get("live_allowed") is True,
+        "paper_eligible": lifecycle_at_least(stage, "before-shadow") or permissions.get("trader_export_allowed") is True,
+        "live_candidate": lifecycle_at_least(stage, "before-live-small") or permissions.get("live_small_eligible") is True or permissions.get("live_allowed") is True,
     }
 
 
@@ -164,6 +310,14 @@ def _release_snapshot(artifact: dict[str, Any]) -> dict[str, Any]:
 
 def _promotion_stage_label(stage: str) -> str:
     labels = {
+        "draft": "Draft",
+        "backtested": "Backtested",
+        "before-shadow": "Before Shadow",
+        "shadowed": "Shadowed",
+        "papered": "Papered",
+        "before-live-small": "Before Live-Small",
+        "live-small": "Live-Small",
+        "live": "Live",
         "final_tested": "Final Tested",
         "paper_candidate": "Paper Candidate",
         "live_candidate": "Live Candidate",
@@ -279,20 +433,41 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     permissions = dict(artifact.get("permissions") or {})
     if "live_allowed" not in permissions and "live_allowed" in artifact:
         permissions["live_allowed"] = artifact.get("live_allowed") is True
+    if "live_small_eligible" not in permissions and "live_small_eligible" in artifact:
+        permissions["live_small_eligible"] = artifact.get("live_small_eligible") is True
+    if "live_eligible" not in permissions and "live_eligible" in artifact:
+        permissions["live_eligible"] = artifact.get("live_eligible") is True
     if "trader_export_allowed" not in permissions and "trader_export_allowed" in artifact:
         permissions["trader_export_allowed"] = artifact.get("trader_export_allowed") is True
-    lifecycle_status = str(artifact.get("lifecycleStatus") or lifecycle.get("status") or artifact.get("status") or artifact.get("stage") or "draft")
+    lifecycle_status = normalize_lifecycle_status(
+        lifecycle.get("status")
+        or artifact.get("lifecycleStatus")
+        or artifact.get("status")
+        or artifact.get("stage")
+        or _dict_value(artifact.get("promotion")).get("stage")
+        or artifact.get("promotionStage")
+        or "draft"
+    )
     final_test_status = str(artifact.get("finalTestStatus") or final_test.get("status") or artifact.get("test_status") or "")
     normalized_permissions = {
         "trader_export_allowed": permissions.get("trader_export_allowed") is True,
+        "live_small_eligible": permissions.get("live_small_eligible") is True,
+        "live_eligible": permissions.get("live_eligible") is True,
         "live_allowed": permissions.get("live_allowed") is True,
         "paper_trader_verified": permissions.get("paper_trader_verified") is True,
         "fail_reasons": _reason_list(permissions.get("fail_reasons") or artifact.get("fail_reasons")),
     }
+    capabilities = _artifact_capabilities(artifact, normalized_permissions, lifecycle_status, final_test_status)
+    raw_capabilities = _dict_value(artifact.get("capabilities"))
+    if raw_capabilities.get("liveSmallEligible") is True:
+        capabilities["liveSmallEligible"] = True
+    if raw_capabilities.get("liveEligible") is True:
+        capabilities["liveEligible"] = True
+        capabilities["liveSmallEligible"] = True
     verification = {
         "backtester": _backtester_verification_badge(normalized_permissions, final_test_status),
         "paper_trader": _paper_verification_badge(artifact, normalized_permissions, lifecycle_status),
-        "live": _live_verification_badge(normalized_permissions),
+        "live": _live_verification_badge(capabilities),
     }
     promotion = _promotion_snapshot(artifact, normalized_permissions, lifecycle_status)
     release = _release_snapshot(artifact)
@@ -324,6 +499,9 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "test_signal": str(artifact.get("test_signal") or artifact.get("manual_signal") or artifact.get("last_signal") or ""),
         "signals": _dict_value(artifact.get("signals")),
         "permissions": normalized_permissions,
+        "capabilities": capabilities,
+        "live_small_eligible": capabilities["liveSmallEligible"],
+        "live_eligible": capabilities["liveEligible"],
         "verification": verification,
         "backtester_verified": verification["backtester"]["status"] == "pass",
         "paper_trader_verified": verification["paper_trader"]["status"] == "pass",
@@ -348,13 +526,15 @@ def sample_strategy_artifacts() -> list[dict[str, Any]]:
             "symbol": "069500.KS",
             "asset": "kr-stock",
             "timeframe": "1d",
-            "lifecycle_status": "live-small",
+            "lifecycle_status": "before-live-small",
             "final_test_status": "pass",
             "score": 87,
             "permissions": {
                 "trader_export_allowed": True,
+                "live_small_eligible": True,
+                "live_eligible": False,
                 "live_allowed": False,
-                "fail_reasons": ["실계좌 API 키와 주문 어댑터 구현 전까지 live_allowed가 false입니다."],
+                "fail_reasons": ["실계좌 API 키와 주문 어댑터 구현 전까지 doctor/runtime 게이트가 필요합니다."],
             },
             "contract_version": TRADER_STRATEGY_CONTRACT_VERSION,
             "source_path": "sample",
@@ -365,13 +545,15 @@ def sample_strategy_artifacts() -> list[dict[str, Any]]:
             "symbol": "BTCUSDT",
             "asset": "crypto",
             "timeframe": "5m",
-            "lifecycle_status": "paper",
+            "lifecycle_status": "papered",
             "final_test_status": "pass",
             "score": 91,
             "permissions": {
                 "trader_export_allowed": True,
+                "live_small_eligible": False,
+                "live_eligible": False,
                 "live_allowed": False,
-                "fail_reasons": ["Paper 검증은 통과했지만 live-small 승격 증거가 없습니다."],
+                "fail_reasons": ["Paper 검증은 통과했지만 before-live-small 승급 증거가 없습니다."],
             },
             "contract_version": TRADER_STRATEGY_CONTRACT_VERSION,
             "source_path": "sample",

@@ -12,7 +12,7 @@ from typing import Any, Literal
 from trading_runtime import AuditEvent, audit_event_from_order_gate, build_audit_event
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .program_ledger import ProgramLedger
-from .contracts import can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts, strategy_plugin_status
+from .contracts import can_live_small_use_artifact, can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts, strategy_plugin_status
 from .audit_store import SQLiteAuditEventStore
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 from .order_management import OrderIntent, OrderSide
@@ -315,7 +315,7 @@ STATE: dict[str, Any] = {
             "time": "08:55:42",
             "level": "info",
             "event": "계약 로드",
-            "detail": "trading-contracts의 live_allowed 권한을 Python 게이트에서 미러링합니다.",
+            "detail": "strategy lifecycle/evidence 기반 live eligibility를 Python 게이트에서 미러링합니다.",
         },
     ],
 }
@@ -365,7 +365,9 @@ def strategy_rows() -> list[dict[str, Any]]:
         artifacts = sample_strategy_artifacts()
     rows = []
     for artifact in artifacts:
-        live_allowed = can_live_use_artifact(artifact)
+        live_eligible = can_live_use_artifact(artifact)
+        live_small_eligible = can_live_small_use_artifact(artifact)
+        live_allowed = live_eligible or live_small_eligible
         fail_reasons = artifact.get("permissions", {}).get("fail_reasons", [])
         verification = artifact.get("verification") if isinstance(artifact.get("verification"), dict) else {}
         backtester_verification = verification.get("backtester") if isinstance(verification.get("backtester"), dict) else {}
@@ -374,8 +376,10 @@ def strategy_rows() -> list[dict[str, Any]]:
             {
                 **artifact,
                 "live_allowed": live_allowed,
-                "permission_label": "LIVE OK" if live_allowed else "LIVE BLOCKED",
-                "block_reason": "; ".join(fail_reasons) if fail_reasons else ("실거래 허용" if live_allowed else "live_allowed 권한이 없습니다."),
+                "live_small_eligible": live_small_eligible,
+                "live_eligible": live_eligible,
+                "permission_label": "FULL LIVE OK" if live_eligible else "LIVE-SMALL OK" if live_small_eligible else "LIVE BLOCKED",
+                "block_reason": "; ".join(fail_reasons) if fail_reasons else ("정식 실거래 가능" if live_eligible else "소액 실거래 준비 가능" if live_small_eligible else "lifecycle/evidence 기준을 통과하지 못했습니다."),
                 "backtester_verified": backtester_verification.get("status") == "pass",
                 "paper_trader_verified": paper_verification.get("status") == "pass",
                 "backtester_label": str(backtester_verification.get("label", "Backtester 정보 없음")),
@@ -407,6 +411,7 @@ def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers:
             "ready": bool(broker_map.get("kis", {}).get("order_ready")),
             "strategy_count": len(stock_strategies),
             "live_strategy_count": sum(1 for strategy in stock_strategies if strategy.get("live_allowed")),
+            "full_live_strategy_count": sum(1 for strategy in stock_strategies if strategy.get("live_eligible")),
             "detail": "KIS 실계좌 API로 주식/ETF 주문을 라우팅합니다.",
             "sample_request": build_adapter_preview("kis", stock_strategies),
         },
@@ -423,6 +428,7 @@ def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers:
             "ready": bool(broker_map.get(crypto_provider, {}).get("order_ready")),
             "strategy_count": len(crypto_strategies),
             "live_strategy_count": sum(1 for strategy in crypto_strategies if strategy.get("live_allowed")),
+            "full_live_strategy_count": sum(1 for strategy in crypto_strategies if strategy.get("live_eligible")),
             "detail": "선택한 코인 거래소 API로 코인 주문을 라우팅합니다.",
             "sample_request": build_adapter_preview(crypto_provider, crypto_strategies),
         },
@@ -472,6 +478,8 @@ def readiness_checks(
     reconciliation_summary: dict[str, Any],
 ) -> list[Check]:
     live_ready_count = sum(1 for strategy in strategies if strategy.get("live_allowed") is True)
+    full_live_ready_count = sum(1 for strategy in strategies if strategy.get("live_eligible") is True)
+    full_live_ready_count = sum(1 for strategy in strategies if strategy.get("live_eligible") is True)
     missing_brokers = [broker for broker in brokers if broker["status"] == "missing_credentials"]
     adapter_blocked = [broker for broker in brokers if broker["live_order_adapter_ready"] is not True]
     checklist = checklist_rows()
@@ -504,9 +512,9 @@ def readiness_checks(
             "KIS/Binance 실주문 서명/전송 어댑터 구현 및 감사가 필요합니다." if adapter_blocked else "주문 어댑터가 준비되었습니다.",
         ),
         Check(
-            "전략 live_allowed",
+            "전략 lifecycle eligibility",
             "pass" if live_ready_count else "fail",
-            f"실거래 허용 전략 {live_ready_count}개" if live_ready_count else "Backtester/Paper 승인 artifact의 live_allowed=true가 필요합니다.",
+            f"Live-Small 이상 전략 {live_ready_count}개 · Full Live {full_live_ready_count}개" if live_ready_count else "before-live-small 이상 lifecycle과 검증 evidence가 필요합니다.",
         ),
         Check(
             "운용자 확인",
@@ -1257,7 +1265,7 @@ def final_preflight_checks(
         {
             "label": "전략 승인",
             "status": "pass" if live_ready_count else "fail",
-            "detail": f"live_allowed 전략 {live_ready_count}개",
+            "detail": f"Live-Small 이상 {live_ready_count}개 · Full Live {full_live_ready_count}개",
         },
         {
             "label": "필수 운영 체크리스트",
@@ -1341,6 +1349,7 @@ def snapshot() -> dict[str, Any]:
             "blocker_count": blocker_count,
             "warning_count": warning_count,
             "live_strategy_count": sum(1 for strategy in strategies if strategy["live_allowed"]),
+            "full_live_strategy_count": sum(1 for strategy in strategies if strategy.get("live_eligible")),
             "broker_ready_count": sum(1 for broker in brokers if broker["order_ready"]),
         },
         "sessions": market_sessions(),
@@ -1549,8 +1558,13 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
             STATE["automation"][profile_id]["last_action"] = reason
             append_audit("danger", "자동화 시작 차단", f"{profile['title']}: {reason}")
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
-        if profile["live_strategy_count"] <= 0:
-            reason = "live_allowed=true 전략이 없어 자동화 전환이 차단되었습니다."
+        required_count = profile["full_live_strategy_count"] if next_mode == "FULL_LIVE" else profile["live_strategy_count"]
+        if required_count <= 0:
+            reason = (
+                "live_eligible=true 전략이 없어 FULL_LIVE 전환이 차단되었습니다."
+                if next_mode == "FULL_LIVE"
+                else "live_small_eligible=true 전략이 없어 SMALL_LIVE 전환이 차단되었습니다."
+            )
             STATE["automation"][profile_id]["last_action"] = reason
             append_audit("danger", "자동화 시작 차단", f"{profile['title']}: {reason}")
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
@@ -1961,7 +1975,8 @@ def strategy_float(strategy: dict[str, Any], *keys: str, default: float = 0.0) -
 def select_strategy_for_profile(checks: dict[str, Any], profile_id: str) -> dict[str, Any] | None:
     normalized_profile = "stock" if profile_id == "stock" else "crypto"
     provider = str(STATE["automation"][normalized_profile].get("provider") or ("kis" if normalized_profile == "stock" else "binance"))
-    strategies = [strategy for strategy in checks.get("strategies", []) if strategy.get("live_allowed")]
+    eligibility_key = "live_eligible" if current_mode() == "FULL_LIVE" else "live_allowed"
+    strategies = [strategy for strategy in checks.get("strategies", []) if strategy.get(eligibility_key)]
     if normalized_profile == "stock":
         return next((strategy for strategy in strategies if strategy_broker_id(strategy) == "kis"), None)
     return next((strategy for strategy in strategies if strategy_broker_id(strategy) == provider), None) or next(
@@ -2206,7 +2221,7 @@ def run_strategy_cycle(profile_id: str) -> dict[str, Any]:
     normalized_profile = "stock" if profile_id == "stock" else "crypto"
     execution = strategy_execution_for_profile(checks, normalized_profile)
     if execution is None:
-        reason = f"{normalized_profile} 프로필에 live_allowed=true 전략이 없습니다."
+        reason = f"{normalized_profile} 프로필에 live_small_eligible/live_eligible 전략이 없습니다."
         STATE["strategy_runner"].update({
             "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "last_profile": normalized_profile,

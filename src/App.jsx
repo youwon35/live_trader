@@ -1802,8 +1802,8 @@ function buildDoctorItems(snapshot) {
     {
       id: "doctor-strategy",
       index: 4,
-      title: "전략 live_allowed",
-      detail: strategyBlocked.length ? `실거래 허용 전 전략 ${strategyBlocked.length}개를 검토해야 합니다.` : "실거래 허용 전략을 확인했습니다.",
+      title: "전략 lifecycle eligibility",
+      detail: strategyBlocked.length ? `Live-Small/Live 전 전략 ${strategyBlocked.length}개를 검토해야 합니다.` : "Live-Small 이상 전략을 확인했습니다.",
       tone: strategyBlocked.length ? "warning" : "success",
       status: strategyBlocked.length ? "검토" : "통과",
       targetNav: "strategies",
@@ -1927,6 +1927,13 @@ function verificationTone(status) {
 function promotionLabel(stage = "") {
   const normalized = String(stage || "").toLowerCase();
   const labels = {
+    backtested: "Backtested",
+    "before-shadow": "Before Shadow",
+    shadowed: "Shadowed",
+    papered: "Papered",
+    "before-live-small": "Before Live-Small",
+    "live-small": "Live-Small",
+    live: "Live",
     final_tested: "Final Tested",
     paper_candidate: "Paper Candidate",
     live_candidate: "Live Candidate",
@@ -1940,9 +1947,9 @@ function promotionLabel(stage = "") {
 
 function promotionTone(stage = "") {
   const normalized = String(stage || "").toLowerCase();
-  if (["live_active", "live_canary"].includes(normalized)) return "success";
-  if (["live_candidate", "paper_candidate", "paper"].includes(normalized)) return "info";
-  if (["approved", "final_tested"].includes(normalized)) return "warning";
+  if (["live", "live-small", "live_active", "live_canary"].includes(normalized)) return "success";
+  if (["before-live-small", "papered", "shadowed", "live_candidate", "paper_candidate", "paper"].includes(normalized)) return "info";
+  if (["backtested", "before-shadow", "approved", "final_tested"].includes(normalized)) return "warning";
   if (["retired", "rejected"].includes(normalized)) return "danger";
   return "neutral";
 }
@@ -2974,7 +2981,7 @@ function LiveStrategySelectorPanel({ strategies, selectedStrategy, onSelect }) {
 function StrategyPanel({ strategies, selectedStrategyId, onSelect }) {
   return (
     <section className="panel strategy-panel">
-      <PanelHeader title="전략 Artifact" subtitle="Backtester/Paper 승인 결과와 live_allowed 계약을 확인합니다." />
+      <PanelHeader title="전략 Artifact" subtitle="Backtester/Paper 승인 결과와 lifecycle/evidence 계약을 확인합니다." />
       <div className="data-table strategy-table">
         <div className="table-head">
           <span>전략</span>
