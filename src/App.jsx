@@ -41,6 +41,7 @@ import {
   runReconciliation,
   runStrategyCycle,
   runWatchdog,
+  promoteStrategyToLive,
   seedProgramLedgerBaseline,
   retryOrder,
   setFlag,
@@ -1284,6 +1285,7 @@ function App() {
           onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
           onStrategyCycle={(profileId) => runAction(() => runStrategyCycle(profileId))}
+          onPromoteLive={(strategyId) => runAction(() => promoteStrategyToLive(strategyId))}
           onWatchdog={() => runAction(runWatchdog)}
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
@@ -1361,6 +1363,7 @@ function WorkspaceContent({
   onEntryBlock,
   onAutomation,
   onStrategyCycle,
+  onPromoteLive,
   onWatchdog,
   onTestIntent,
   onRiskSetting,
@@ -1433,6 +1436,7 @@ function WorkspaceContent({
         onRetryPolicy={onRetryPolicy}
         onRetryOrder={onRetryOrder}
         onCancelOrder={onCancelOrder}
+        onPromoteLive={onPromoteLive}
       />,
     );
   }
@@ -1510,6 +1514,7 @@ function LivePreparationPanel({
   onWatchdog,
   onRiskSetting,
   onRetryPolicy,
+  onPromoteLive,
 }) {
   const [assetTab, setAssetTab] = useState("stock");
   const [selectedStrategyId, setSelectedStrategyId] = useState("");
@@ -1546,7 +1551,12 @@ function LivePreparationPanel({
       </div>
       <section className="content-grid">
         <div className="content-column">
-          <LiveStrategySelectorPanel strategies={filteredStrategies} selectedStrategy={selectedStrategy} onSelect={setSelectedStrategyId} />
+          <LiveStrategySelectorPanel
+            strategies={filteredStrategies}
+            selectedStrategy={selectedStrategy}
+            onSelect={setSelectedStrategyId}
+            onPromoteLive={onPromoteLive}
+          />
           <StrategyPanel strategies={filteredStrategies} selectedStrategyId={selectedStrategy?.strategy_id} onSelect={setSelectedStrategyId} />
           <OperationalSafeguardsPanel
             dryRun={snapshot.dry_run}
@@ -1924,21 +1934,28 @@ function verificationTone(status) {
   return "info";
 }
 
+function normalizePromotionStage(stage = "") {
+  const normalized = String(stage || "").toLowerCase().replaceAll("_", "-");
+  const aliases = {
+    "live-small": "before-live-small",
+    "live-canary": "before-live-small",
+    "live-candidate": "before-live-small",
+    "live-active": "live",
+    "paper-candidate": "paper",
+    "final-tested": "backtested",
+  };
+  return aliases[normalized] || normalized;
+}
+
 function promotionLabel(stage = "") {
-  const normalized = String(stage || "").toLowerCase();
+  const normalized = normalizePromotionStage(stage);
   const labels = {
     backtested: "Backtested",
     "before-shadow": "Before Shadow",
     shadowed: "Shadowed",
     papered: "Papered",
     "before-live-small": "Before Live-Small",
-    "live-small": "Live-Small",
     live: "Live",
-    final_tested: "Final Tested",
-    paper_candidate: "Paper Candidate",
-    live_candidate: "Live Candidate",
-    live_canary: "Live Canary",
-    live_active: "Live Active",
     paper: "Paper",
     approved: "Approved",
   };
@@ -1946,10 +1963,10 @@ function promotionLabel(stage = "") {
 }
 
 function promotionTone(stage = "") {
-  const normalized = String(stage || "").toLowerCase();
-  if (["live", "live-small", "live_active", "live_canary"].includes(normalized)) return "success";
-  if (["before-live-small", "papered", "shadowed", "live_candidate", "paper_candidate", "paper"].includes(normalized)) return "info";
-  if (["backtested", "before-shadow", "approved", "final_tested"].includes(normalized)) return "warning";
+  const normalized = normalizePromotionStage(stage);
+  if (normalized === "live") return "success";
+  if (["before-live-small", "papered", "shadowed", "paper"].includes(normalized)) return "info";
+  if (["backtested", "before-shadow", "approved"].includes(normalized)) return "warning";
   if (["retired", "rejected"].includes(normalized)) return "danger";
   return "neutral";
 }
@@ -2930,9 +2947,25 @@ function LaunchReportPanel({ report }) {
   );
 }
 
-function LiveStrategySelectorPanel({ strategies, selectedStrategy, onSelect }) {
+function LiveStrategySelectorPanel({ strategies, selectedStrategy, onSelect, onPromoteLive }) {
   const parametersText = formatKeyValueMap(selectedStrategy?.parameters);
   const promotionStage = selectedStrategy?.promotion?.stage || selectedStrategy?.promotion_stage || selectedStrategy?.lifecycle_status || "unknown";
+  const normalizedStage = normalizePromotionStage(promotionStage);
+  const canPromoteLive = Boolean(
+    selectedStrategy
+      && normalizedStage === "before-live-small"
+      && selectedStrategy.live_small_eligible
+      && onPromoteLive,
+  );
+  const livePromotionHint = !selectedStrategy
+    ? "전략을 먼저 선택하세요."
+    : normalizedStage === "live"
+      ? "이미 정식 Live 상태입니다."
+      : normalizedStage !== "before-live-small"
+        ? `현재 ${promotionLabel(normalizedStage)} 단계입니다. Paper Trader에서 before-live-small까지 승급한 뒤 진행합니다.`
+        : selectedStrategy.live_small_eligible
+          ? "SMALL_LIVE 성공 주문과 현재 운용 게이트를 다시 확인한 뒤 live로 고정합니다."
+          : "before-live-small 상태이지만 live_small_eligible 증거가 부족합니다.";
   return (
     <section className="panel live-strategy-selector-panel">
       <PanelHeader title="활성 전략 선택" subtitle="Backtester/Paper Trader에서 검증된 artifact를 읽기 전용으로 확인합니다." />
@@ -2965,6 +2998,17 @@ function LiveStrategySelectorPanel({ strategies, selectedStrategy, onSelect }) {
           <div className="live-strategy-readonly-note">
             <strong>이 전략은 Backtester/Paper Trader에서 저장된 검증본입니다.</strong>
             <span>Live Trader에서는 파라미터를 직접 수정하지 않고, 새 파라미터는 Backtester에서 새 release로 다시 승급합니다.</span>
+          </div>
+          <div className="live-strategy-promotion-line">
+            <ActionButton
+              className="secondary-button"
+              disabled={!canPromoteLive}
+              icon={<BadgeCheck size={16} />}
+              label="정식 Live 승급"
+              onClick={() => onPromoteLive?.(selectedStrategy.strategy_id)}
+              status={canPromoteLive ? "success" : undefined}
+            />
+            <span>{livePromotionHint}</span>
           </div>
           <div className="live-strategy-parameter-panel">
             <strong>Parameters</strong>

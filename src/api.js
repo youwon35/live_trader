@@ -82,6 +82,10 @@ export async function runStrategyCycle(profileId) {
   return request("/api/strategy-cycle", { method: "POST", body: { profile_id: profileId } });
 }
 
+export async function promoteStrategyToLive(strategyId) {
+  return request("/api/strategy-live-promotion", { method: "POST", body: { strategy_id: strategyId } });
+}
+
 export async function runWatchdog() {
   return request("/api/watchdog", { method: "POST", body: {} });
 }

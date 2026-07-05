@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import csv
 import html
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from io import StringIO
@@ -12,7 +13,17 @@ from typing import Any, Literal
 from trading_runtime import AuditEvent, audit_event_from_order_gate, build_audit_event
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .program_ledger import ProgramLedger
-from .contracts import can_live_small_use_artifact, can_live_use_artifact, load_strategy_artifacts, sample_strategy_artifacts, strategy_plugin_status
+from .contracts import (
+    IGNORED_STRATEGY_FILE_NAMES,
+    can_live_small_use_artifact,
+    can_live_use_artifact,
+    load_strategy_artifacts,
+    normalize_lifecycle_status,
+    normalize_strategy_artifact,
+    sample_strategy_artifacts,
+    strategy_artifact_dirs,
+    strategy_plugin_status,
+)
 from .audit_store import SQLiteAuditEventStore
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 from .order_management import OrderIntent, OrderSide
@@ -387,6 +398,121 @@ def strategy_rows() -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def find_strategy_artifact_payload(strategy_id: str) -> tuple[Path | None, Path | None, dict[str, Any] | None, dict[str, Any] | None]:
+    target = str(strategy_id or "").strip()
+    if not target:
+        return None, None, None, None
+    for folder in strategy_artifact_dirs():
+        if not folder.exists():
+            continue
+        for path in sorted(folder.glob("*.json")):
+            if path.name in IGNORED_STRATEGY_FILE_NAMES:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            try:
+                normalized = normalize_strategy_artifact(payload)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if str(normalized.get("strategy_id")) == target:
+                return folder, path, payload, normalized
+    return None, None, None, None
+
+
+def update_strategy_registry(strategy_dir: Path, payload: dict[str, Any], artifact_path: Path) -> None:
+    registry_path = strategy_dir / "strategy-registry.json"
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8")) if registry_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        registry = {}
+    if not isinstance(registry, dict):
+        registry = {}
+    entries = registry.get("entries") if isinstance(registry.get("entries"), dict) else {}
+    release = payload.get("release") if isinstance(payload.get("release"), dict) else {}
+    promotion = payload.get("promotion") if isinstance(payload.get("promotion"), dict) else {}
+    permissions = payload.get("permissions") if isinstance(payload.get("permissions"), dict) else {}
+    release_id = str(release.get("releaseId") or payload.get("releaseId") or payload.get("id") or payload.get("strategy_id"))
+    entries[release_id] = {
+        "releaseId": release_id,
+        "artifactId": payload.get("id") or payload.get("strategy_id"),
+        "strategyId": payload.get("strategyId") or payload.get("strategy_id") or payload.get("id"),
+        "name": payload.get("name"),
+        "symbol": payload.get("symbol") or ((payload.get("dataset") or {}).get("symbol") if isinstance(payload.get("dataset"), dict) else payload.get("symbol")),
+        "timeframe": payload.get("timeframe"),
+        "plugin": payload.get("plugin"),
+        "stage": (payload.get("lifecycle") if isinstance(payload.get("lifecycle"), dict) else {}).get("status")
+        or payload.get("lifecycleStatus")
+        or payload.get("status")
+        or promotion.get("stage")
+        or payload.get("promotionStage"),
+        "stageLabel": promotion.get("stageLabel"),
+        "lifecycleStatus": (payload.get("lifecycle") if isinstance(payload.get("lifecycle"), dict) else {}).get("status")
+        or payload.get("lifecycleStatus")
+        or payload.get("status"),
+        "parameterHash": release.get("parameterHash"),
+        "parameterSummary": payload.get("parameterSummary") or promotion.get("parameterSummary"),
+        "artifactPath": str(artifact_path),
+        "trader_export_allowed": permissions.get("trader_export_allowed", payload.get("trader_export_allowed")),
+        "paper_trader_verified": permissions.get("paper_trader_verified", payload.get("paper_trader_verified")),
+        "live_small_eligible": permissions.get("live_small_eligible", payload.get("live_small_eligible")),
+        "live_eligible": permissions.get("live_eligible", payload.get("live_eligible")),
+        "live_allowed": permissions.get("live_allowed", payload.get("live_allowed")),
+        "updatedAt": payload.get("updatedAt"),
+    }
+    registry.update(
+        {
+            "schemaVersion": "strategy-registry-v1",
+            "updatedAt": datetime.now().astimezone().replace(microsecond=0).isoformat(),
+            "entries": entries,
+        }
+    )
+    registry_path.write_text(json.dumps(registry, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def append_strategy_promotion_log(strategy_dir: Path, payload: dict[str, Any], artifact_path: Path, actor: str) -> None:
+    promotion = payload.get("promotion") if isinstance(payload.get("promotion"), dict) else {}
+    release = payload.get("release") if isinstance(payload.get("release"), dict) else {}
+    event = {
+        "schemaVersion": "promotion-event-v1",
+        "at": promotion.get("promotedAt") or payload.get("updatedAt"),
+        "releaseId": release.get("releaseId") or payload.get("releaseId") or payload.get("id"),
+        "artifactId": payload.get("id") or payload.get("strategy_id"),
+        "strategyId": payload.get("strategyId") or payload.get("strategy_id") or payload.get("id"),
+        "name": payload.get("name"),
+        "from": (promotion.get("history") or [{}])[-1].get("from") if isinstance(promotion.get("history"), list) else "",
+        "to": (payload.get("lifecycle") if isinstance(payload.get("lifecycle"), dict) else {}).get("status")
+        or payload.get("lifecycleStatus")
+        or payload.get("status")
+        or promotion.get("stage")
+        or payload.get("promotionStage"),
+        "by": actor,
+        "artifactPath": str(artifact_path),
+    }
+    with (strategy_dir / "promotion-log.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+
+
+def live_small_execution_summary(strategy_id: str) -> dict[str, int]:
+    successful = 0
+    blocked = 0
+    for order in STATE["orders"]:
+        if str(order.get("strategy_id")) != strategy_id:
+            continue
+        state_name = str(order.get("state", "")).lower()
+        queue_state = str(order.get("queue_state", "")).lower()
+        if bool(order.get("dry_run")):
+            continue
+        if state_name in {"sent", "filled"} or queue_state in {"sent", "filled"}:
+            successful += 1
+        if state_name in {"risk_blocked", "adapter_blocked", "failed", "rejected"} or queue_state in {"blocked", "risk_blocked", "failed", "rejected"}:
+            blocked += 1
+    return {"successful": successful, "blocked": blocked}
 
 
 def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers: list[dict[str, object]] | None = None) -> list[dict[str, Any]]:
@@ -1237,6 +1363,7 @@ def final_preflight_checks(
     checklist = checklist_rows()
     checklist_missing = [item for item in checklist if item["required"] and not item["checked"]]
     live_ready_count = sum(1 for strategy in strategies if strategy.get("live_allowed") is True)
+    full_live_ready_count = sum(1 for strategy in strategies if strategy.get("live_eligible") is True)
     adapter_blocked = [broker for broker in brokers if broker["live_order_adapter_ready"] is not True]
     missing_brokers = [broker for broker in brokers if broker["status"] == "missing_credentials"]
     reconcile_summary = reconciliation["summary"]
@@ -1523,6 +1650,137 @@ def set_flag(name: str, value: bool) -> dict[str, Any]:
         STATE["mode"] = "MONITOR"
         STATE["new_entries_blocked"] = True
     return {"ok": True, "reason": "flag changed", "snapshot": snapshot()}
+
+
+def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
+    strategy_id = str(strategy_id or "").strip()
+    if not strategy_id:
+        return {"ok": False, "reason": "strategy_id is required", "snapshot": snapshot()}
+
+    strategy_dir, artifact_path, payload, normalized = find_strategy_artifact_payload(strategy_id)
+    if strategy_dir is None or artifact_path is None or payload is None or normalized is None:
+        reason = f"전략 artifact를 찾을 수 없습니다: {strategy_id}"
+        append_audit("danger", "Live 승급 차단", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    current_status = normalize_lifecycle_status(
+        normalized.get("lifecycle_status")
+        or normalized.get("promotion_stage")
+        or payload.get("lifecycleStatus")
+        or payload.get("promotionStage")
+        or payload.get("status")
+    )
+    if current_status == "live":
+        return {"ok": True, "reason": "이미 live 상태입니다.", "snapshot": snapshot()}
+    if current_status != "before-live-small":
+        reason = f"before-live-small 상태에서만 live로 승급할 수 있습니다. 현재 상태: {current_status}"
+        append_audit("danger", "Live 승급 차단", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+    if normalized.get("live_small_eligible") is not True:
+        reason = "live_small_eligible=true 전략만 소액 실거래 후 live로 승급할 수 있습니다."
+        append_audit("danger", "Live 승급 차단", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    execution = live_small_execution_summary(strategy_id)
+    if execution["successful"] <= 0:
+        reason = "소액 실거래 성공 주문이 아직 없습니다. SMALL_LIVE에서 1건 이상 실제 전송/체결을 확인해야 합니다."
+        append_audit("warn", "Live 승급 대기", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+    if execution["blocked"] > 0:
+        reason = f"소액 실거래 중 차단/실패 주문 {execution['blocked']}건이 있어 live 승급을 막았습니다."
+        append_audit("danger", "Live 승급 차단", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    data = snapshot()
+    if not data.get("operator_confirmed"):
+        reason = "운용자 확인을 먼저 완료해야 live 승급이 가능합니다."
+        append_audit("warn", "Live 승급 대기", reason)
+        return {"ok": False, "reason": reason, "snapshot": data}
+    if int(data.get("summary", {}).get("blocker_count", 0) or 0) > 0:
+        reason = f"readiness blocker {data['summary']['blocker_count']}개가 남아 있어 live 승급을 차단했습니다."
+        append_audit("danger", "Live 승급 차단", reason)
+        return {"ok": False, "reason": reason, "snapshot": data}
+    now = datetime.now().astimezone().replace(microsecond=0).isoformat()
+    lifecycle = payload.get("lifecycle") if isinstance(payload.get("lifecycle"), dict) else {}
+    promotion = payload.get("promotion") if isinstance(payload.get("promotion"), dict) else {}
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    permissions = payload.get("permissions") if isinstance(payload.get("permissions"), dict) else {}
+    capabilities = payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {}
+
+    lifecycle_history = lifecycle.get("history") if isinstance(lifecycle.get("history"), list) else []
+    promotion_history = promotion.get("history") if isinstance(promotion.get("history"), list) else []
+    lifecycle_history.append({
+        "from": current_status,
+        "to": "live",
+        "at": now,
+        "by": "live_trader",
+        "reason": "SMALL_LIVE 성공 주문과 live readiness gate를 통과했습니다.",
+    })
+    promotion_history.append({
+        "from": current_status,
+        "to": "live",
+        "at": now,
+        "by": "live_trader",
+        "reason": "소액 실거래 검증 후 정식 live로 승급했습니다.",
+    })
+    lifecycle.update({"status": "live", "updatedAt": now, "history": lifecycle_history})
+    promotion.update({"stage": "live", "promotedAt": now, "updatedAt": now, "history": promotion_history})
+    evidence["liveSmall"] = {
+        "status": "pass",
+        "checkedAt": now,
+        "source": "live_trader",
+        "successfulOrders": execution["successful"],
+        "blockedOrders": execution["blocked"],
+    }
+
+    fail_reasons = [
+        reason
+        for reason in permissions.get("fail_reasons", payload.get("fail_reasons", [])) or []
+        if str(reason) not in {"live-activation-required", "before-live-small 승급 후 소액 실거래 확인이 필요합니다."}
+    ]
+    permissions.update({
+        "paper_trader_verified": True,
+        "live_small_eligible": True,
+        "live_eligible": True,
+        "live_allowed": True,
+        "fail_reasons": fail_reasons,
+    })
+    capabilities.update({
+        "lifecycleStatus": "live",
+        "paperTraderVerified": True,
+        "liveSmallVerified": True,
+        "liveSmallEligible": True,
+        "liveEligible": True,
+        "canSubmitOrder": False,
+        "failReasons": fail_reasons,
+        "blockingFailReasons": fail_reasons,
+    })
+    payload.update({
+        "status": "live",
+        "lifecycleStatus": "live",
+        "promotionStage": "live",
+        "lifecycle": lifecycle,
+        "promotion": promotion,
+        "evidence": evidence,
+        "permissions": permissions,
+        "capabilities": capabilities,
+        "paper_trader_verified": True,
+        "live_small_eligible": True,
+        "live_eligible": True,
+        "live_allowed": True,
+        "fail_reasons": fail_reasons,
+        "updatedAt": now,
+    })
+
+    artifact_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    update_strategy_registry(strategy_dir, payload, artifact_path)
+    append_strategy_promotion_log(strategy_dir, payload, artifact_path, "live_trader")
+    append_audit(
+        "warn",
+        "Live 승급",
+        f"{payload.get('name') or strategy_id} 전략을 live 상태로 승급했습니다. 성공 주문 {execution['successful']}건.",
+    )
+    return {"ok": True, "reason": "live 승급 완료", "snapshot": snapshot()}
 
 
 def set_automation_profile(profile_id: str, enabled: bool, provider: str | None = None, mode: str | None = None) -> dict[str, Any]:

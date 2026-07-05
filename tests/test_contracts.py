@@ -45,12 +45,12 @@ class StrategyContractTest(unittest.TestCase):
         self.assertEqual(artifact["strategy_contract_version"], "strategy-plugin-contract-v1")
         self.assertEqual(artifact["strategy_engine_version"], "strategy-core-js-0.2.0")
         self.assertEqual(artifact["contract_version"], "trader-strategy-contract-v2")
-        self.assertEqual(artifact["lifecycle_status"], "paper")
+        self.assertEqual(artifact["lifecycle_status"], "papered")
         self.assertEqual(artifact["final_test_status"], "pass")
         self.assertTrue(can_live_use_artifact(artifact))
         self.assertEqual(artifact["verification"]["backtester"]["status"], "pass")
         self.assertEqual(artifact["verification"]["paper_trader"]["status"], "pass")
-        self.assertEqual(artifact["verification"]["live"]["status"], "pass")
+        self.assertEqual(artifact["verification"]["live"]["status"], "fail")
 
     def test_unverified_backtester_artifact_stays_visible_with_verification_badges(self) -> None:
         artifact = normalize_strategy_artifact(

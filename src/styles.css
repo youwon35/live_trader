@@ -1630,6 +1630,7 @@ button {
 }
 
 .live-strategy-readonly-note,
+.live-strategy-promotion-line,
 .live-strategy-parameter-panel {
   display: grid;
   gap: 7px;
@@ -1640,8 +1641,20 @@ button {
 }
 
 .live-strategy-summary-grid + .live-strategy-readonly-note,
-.live-strategy-readonly-note + .live-strategy-parameter-panel {
+.live-strategy-readonly-note + .live-strategy-promotion-line,
+.live-strategy-promotion-line + .live-strategy-parameter-panel {
   margin-top: 4px;
+}
+
+.live-strategy-promotion-line {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+}
+
+.live-strategy-promotion-line span {
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-strong);
 }
 
 .live-strategy-readonly-note strong,
