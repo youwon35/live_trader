@@ -79,6 +79,57 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(queue_state, "simulated")
         self.assertIn("브로커 전송 없이", reason)
 
+    def test_order_gate_blocks_new_buy_when_strategy_revalidation_expired(self) -> None:
+        state.STATE["new_entries_blocked"] = False
+        checks = {
+            "summary": {"blocker_count": 0},
+            "strategies": [
+                {
+                    "strategy_id": "STALE-1",
+                    "symbol": "BTCUSDT",
+                    "asset": "crypto",
+                    "revalidation": {
+                        "required": True,
+                        "validatedUntil": "2000-01-01T00:00:00+00:00",
+                    },
+                }
+            ],
+        }
+        buy_intent = state.OrderIntent(
+            strategy_id="STALE-1",
+            asset="crypto",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity=1,
+            reference_price=100,
+            mode="MONITOR",
+            reason="unit",
+            metadata={"broker_id": "binance"},
+        )
+        sell_intent = state.OrderIntent(
+            strategy_id="STALE-1",
+            asset="crypto",
+            symbol="BTCUSDT",
+            side="SELL",
+            quantity=1,
+            reference_price=100,
+            mode="MONITOR",
+            reason="unit",
+            metadata={"broker_id": "binance"},
+        )
+
+        ok, order_state, queue_state, reason, report = state.evaluate_order_gate_with_report(checks, "BUY", True, buy_intent)
+        sell_ok, sell_order_state, sell_queue_state, sell_reason, _ = state.evaluate_order_gate_with_report(checks, "SELL", True, sell_intent)
+
+        self.assertFalse(ok)
+        self.assertEqual(order_state, "risk_blocked")
+        self.assertEqual(queue_state, "blocked")
+        self.assertIn("전략 재검증", reason)
+        self.assertFalse(report.can_submit)
+        self.assertTrue(sell_ok)
+        self.assertEqual(sell_order_state, "dry_run")
+        self.assertEqual(sell_queue_state, "simulated")
+
     def test_order_gate_holds_non_dry_run_until_adapter_is_verified(self) -> None:
         state.STATE["new_entries_blocked"] = False
 

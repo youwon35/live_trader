@@ -23,6 +23,7 @@ from .contracts import (
     sample_strategy_artifacts,
     strategy_artifact_dirs,
     strategy_plugin_status,
+    strategy_revalidation_status,
 )
 from .audit_store import SQLiteAuditEventStore
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
@@ -2251,6 +2252,11 @@ def evaluate_order_gate(checks: dict[str, Any], side: str, dry_run: bool) -> tup
     return ok, state_name, queue_state, reason
 
 
+def strategy_for_order_intent(checks: dict[str, Any], intent: OrderIntent) -> dict[str, Any]:
+    strategies = checks.get("strategies") if isinstance(checks.get("strategies"), list) else []
+    return next((strategy for strategy in strategies if str(strategy.get("strategy_id")) == intent.strategy_id), {})
+
+
 def evaluate_order_gate_with_report(
     checks: dict[str, Any],
     side: str,
@@ -2259,6 +2265,13 @@ def evaluate_order_gate_with_report(
 ) -> tuple[bool, str, str, str, PreTradeRiskReport]:
     intent = intent or default_order_intent(checks, side)
     report = PreTradeRiskGate().evaluate(intent, pre_trade_context(checks, intent, dry_run))
+    strategy = strategy_for_order_intent(checks, intent)
+    revalidation = strategy_revalidation_status(strategy, lifecycle_status=strategy.get("lifecycle_status")) if strategy else {}
+    if intent.side == "BUY" and revalidation.get("expired") is True:
+        report = PreTradeRiskReport(
+            report.checked_at,
+            (*report.checks, RiskCheck("전략 재검증", "fail", str(revalidation.get("detail")))),
+        )
     watchdog = checks.get("watchdog") if isinstance(checks.get("watchdog"), dict) else {}
     watchdog_critical = int(watchdog.get("critical_count", 0) or 0)
     if watchdog_critical:

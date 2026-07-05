@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,14 @@ LIFECYCLE_LABELS = {
     "retired": "Retired",
 }
 NON_BLOCKING_CAPABILITY_REASONS = {"live-activation-required"}
+ACTIVE_REVALIDATION_STAGES = {
+    "backtested",
+    "before-shadow",
+    "shadowed",
+    "papered",
+    "before-live-small",
+    "live",
+}
 
 
 def _dict_value(value: Any) -> dict[str, Any]:
@@ -192,6 +201,8 @@ def can_trader_use_artifact(artifact: dict[str, Any]) -> bool:
 
 
 def can_live_use_artifact(artifact: dict[str, Any]) -> bool:
+    if _dict_value(artifact.get("revalidation")).get("expired") is True or artifact.get("revalidation_expired") is True:
+        return False
     capabilities = _dict_value(artifact.get("capabilities"))
     permissions = _dict_value(artifact.get("permissions"))
     return (
@@ -204,6 +215,8 @@ def can_live_use_artifact(artifact: dict[str, Any]) -> bool:
 
 
 def can_live_small_use_artifact(artifact: dict[str, Any]) -> bool:
+    if _dict_value(artifact.get("revalidation")).get("expired") is True or artifact.get("revalidation_expired") is True:
+        return False
     capabilities = _dict_value(artifact.get("capabilities"))
     permissions = _dict_value(artifact.get("permissions"))
     return (
@@ -228,6 +241,58 @@ def _reason_list(value: Any) -> list[Any]:
     if value in (None, ""):
         return []
     return [value]
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def strategy_revalidation_status(artifact: dict[str, Any], *, lifecycle_status: str | None = None, now: datetime | None = None) -> dict[str, Any]:
+    revalidation = _dict_value(artifact.get("revalidation"))
+    status = normalize_lifecycle_status(
+        lifecycle_status
+        or _dict_value(artifact.get("lifecycle")).get("status")
+        or artifact.get("lifecycleStatus")
+        or artifact.get("status")
+        or _dict_value(artifact.get("promotion")).get("stage")
+        or artifact.get("promotionStage")
+    )
+    required = bool(revalidation.get("required")) if revalidation else False
+    if not revalidation and status in ACTIVE_REVALIDATION_STAGES and (artifact.get("validated_until") or artifact.get("validatedUntil")):
+        required = True
+    validated_until = str(revalidation.get("validatedUntil") or artifact.get("validated_until") or artifact.get("validatedUntil") or "")
+    last_revalidated_at = str(
+        revalidation.get("lastRevalidatedAt") or artifact.get("last_revalidated_at") or artifact.get("lastRevalidatedAt") or ""
+    )
+    expires_at = _parse_datetime(validated_until)
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    expired = bool(required and (expires_at is None or expires_at <= current))
+    detail = (
+        f"전략 재검증 기한이 만료되었습니다(validated_until={validated_until or 'missing'}). 신규 진입은 차단하고 기존 포지션 관리 주문만 허용합니다."
+        if expired
+        else f"전략 재검증 유효기간이 남아 있습니다(validated_until={validated_until or 'not-required'})."
+    )
+    return {
+        "schemaVersion": "strategy-revalidation-status-v1",
+        "required": required,
+        "expired": expired,
+        "status": "expired" if expired else "valid" if required else "not-required",
+        "validatedUntil": validated_until,
+        "lastRevalidatedAt": last_revalidated_at,
+        "reason": str(revalidation.get("reason") or artifact.get("revalidation_reason") or ""),
+        "detail": detail,
+    }
 
 
 def _backtester_verification_badge(
@@ -451,6 +516,7 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         or "draft"
     )
     final_test_status = str(artifact.get("finalTestStatus") or final_test.get("status") or artifact.get("test_status") or "")
+    revalidation = strategy_revalidation_status(artifact, lifecycle_status=lifecycle_status)
     normalized_permissions = {
         "trader_export_allowed": permissions.get("trader_export_allowed") is True,
         "live_small_eligible": permissions.get("live_small_eligible") is True,
@@ -466,6 +532,12 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     if raw_capabilities.get("liveEligible") is True:
         capabilities["liveEligible"] = True
         capabilities["liveSmallEligible"] = True
+    if revalidation["expired"]:
+        capabilities["liveSmallEligible"] = False
+        capabilities["liveEligible"] = False
+        capabilities["canSubmitOrder"] = False
+        capabilities["blockingFailReasons"] = list(dict.fromkeys([*capabilities.get("blockingFailReasons", []), "revalidation-expired"]))
+        capabilities["failReasons"] = list(dict.fromkeys([*capabilities.get("failReasons", []), "revalidation-expired"]))
     verification = {
         "backtester": _backtester_verification_badge(normalized_permissions, final_test_status),
         "paper_trader": _paper_verification_badge(artifact, normalized_permissions, lifecycle_status),
@@ -509,6 +581,10 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "signals": _dict_value(artifact.get("signals")),
         "permissions": normalized_permissions,
         "capabilities": capabilities,
+        "revalidation": revalidation,
+        "revalidation_expired": revalidation["expired"],
+        "validated_until": revalidation["validatedUntil"],
+        "last_revalidated_at": revalidation["lastRevalidatedAt"],
         "live_small_eligible": capabilities["liveSmallEligible"],
         "live_eligible": capabilities["liveEligible"],
         "verification": verification,
