@@ -16,6 +16,7 @@ import {
   Moon,
   Network,
   PanelLeft,
+  Pause,
   Play,
   Power,
   Radio,
@@ -29,6 +30,7 @@ import {
   SlidersHorizontal,
   Sun,
   TerminalSquare,
+  Trash2,
   Unlock,
   WalletCards,
 } from "lucide-react";
@@ -45,6 +47,7 @@ import {
   seedProgramLedgerBaseline,
   retryOrder,
   setFlag,
+  setStrategyLifecycle,
   setAutomationProfile,
   setMode,
   syncExecutionEvents,
@@ -1286,6 +1289,7 @@ function App() {
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
           onStrategyCycle={(profileId) => runAction(() => runStrategyCycle(profileId))}
           onPromoteLive={(strategyId) => runAction(() => promoteStrategyToLive(strategyId))}
+          onStrategyLifecycle={(strategyId, action) => runAction(() => setStrategyLifecycle(strategyId, action))}
           onWatchdog={() => runAction(runWatchdog)}
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
@@ -1364,6 +1368,7 @@ function WorkspaceContent({
   onAutomation,
   onStrategyCycle,
   onPromoteLive,
+  onStrategyLifecycle,
   onWatchdog,
   onTestIntent,
   onRiskSetting,
@@ -1437,6 +1442,7 @@ function WorkspaceContent({
         onRetryOrder={onRetryOrder}
         onCancelOrder={onCancelOrder}
         onPromoteLive={onPromoteLive}
+        onStrategyLifecycle={onStrategyLifecycle}
       />,
     );
   }
@@ -1515,6 +1521,7 @@ function LivePreparationPanel({
   onRiskSetting,
   onRetryPolicy,
   onPromoteLive,
+  onStrategyLifecycle,
 }) {
   const [assetTab, setAssetTab] = useState("stock");
   const [selectedStrategyId, setSelectedStrategyId] = useState("");
@@ -1556,6 +1563,10 @@ function LivePreparationPanel({
             selectedStrategy={selectedStrategy}
             onSelect={setSelectedStrategyId}
             onPromoteLive={onPromoteLive}
+            onStrategyLifecycle={onStrategyLifecycle}
+            orders={snapshot.orders ?? []}
+            summary={snapshot.summary ?? {}}
+            operatorConfirmed={Boolean(snapshot.operator_confirmed)}
           />
           <StrategyPanel strategies={filteredStrategies} selectedStrategyId={selectedStrategy?.strategy_id} onSelect={setSelectedStrategyId} />
           <OperationalSafeguardsPanel
@@ -1956,6 +1967,8 @@ function promotionLabel(stage = "") {
     papered: "Papered",
     "before-live-small": "Before Live-Small",
     live: "Live",
+    paused: "Paused",
+    retired: "Retired",
     paper: "Paper",
     approved: "Approved",
   };
@@ -1968,7 +1981,132 @@ function promotionTone(stage = "") {
   if (["before-live-small", "papered", "shadowed", "paper"].includes(normalized)) return "info";
   if (["backtested", "before-shadow", "approved"].includes(normalized)) return "warning";
   if (["retired", "rejected"].includes(normalized)) return "danger";
+  if (normalized === "paused") return "warning";
   return "neutral";
+}
+
+const STRATEGY_LIFECYCLE_STEPS = [
+  { id: "draft", label: "Draft" },
+  { id: "backtested", label: "Backtested" },
+  { id: "before-shadow", label: "Before Shadow" },
+  { id: "shadowed", label: "Shadowed" },
+  { id: "papered", label: "Papered" },
+  { id: "before-live-small", label: "Before Live-Small" },
+  { id: "live", label: "Live" },
+];
+
+function strategyLifecycleRank(stage = "") {
+  const normalized = normalizePromotionStage(stage);
+  return STRATEGY_LIFECYCLE_STEPS.findIndex((item) => item.id === normalized);
+}
+
+function buildLiveLifecycleTimeline(strategy) {
+  const rawStage = strategy?.lifecycle?.status || strategy?.promotion?.stage || strategy?.promotion_stage || strategy?.lifecycle_status || "draft";
+  const currentStage = normalizePromotionStage(rawStage);
+  const currentRank = strategyLifecycleRank(currentStage);
+  const pausedFromRank = strategyLifecycleRank(strategy?.lifecycle?.pausedFrom || strategy?.pausedFrom);
+  const effectiveRank = currentStage === "paused" || currentStage === "retired" ? Math.max(pausedFromRank, 0) : currentRank;
+  const history = [
+    ...(Array.isArray(strategy?.lifecycle?.history) ? strategy.lifecycle.history : []),
+    ...(Array.isArray(strategy?.promotion?.history) ? strategy.promotion.history : []),
+  ];
+  const base = STRATEGY_LIFECYCLE_STEPS.map((step, index) => {
+    const stepRank = strategyLifecycleRank(step.id);
+    const matchedEvent = [...history].reverse().find((event) => normalizePromotionStage(event?.to) === step.id);
+    const state = currentStage === "paused" || currentStage === "retired"
+      ? (stepRank <= effectiveRank ? "done" : "pending")
+      : stepRank < currentRank
+        ? "done"
+        : step.id === currentStage
+          ? "current"
+          : "pending";
+    return {
+      id: step.id,
+      index: index + 1,
+      label: step.label,
+      state,
+      statusLabel: state === "done" ? "완료" : state === "current" ? "현재 단계" : "대기",
+      time: formatShortTimelineTime(matchedEvent?.at),
+    };
+  });
+  if (currentStage === "paused" || currentStage === "retired") {
+    base.push({
+      id: currentStage,
+      index: base.length + 1,
+      label: promotionLabel(currentStage),
+      state: currentStage,
+      statusLabel: currentStage === "paused" ? "일시중지" : "폐기/보관",
+      time: formatShortTimelineTime(strategy?.lifecycle?.updatedAt || strategy?.promotion?.promotedAt),
+    });
+  }
+  return base;
+}
+
+function formatShortTimelineTime(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const date = new Date(text);
+  if (!Number.isNaN(date.getTime())) {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  }
+  return text.replace("T", " ").slice(0, 16);
+}
+
+function liveSmallExecutionSummaryForStrategy(strategyId, orders) {
+  let successful = 0;
+  let blocked = 0;
+  (orders || []).forEach((order) => {
+    if (!strategyId || String(order.strategy_id) !== String(strategyId)) return;
+    if (order.dry_run) return;
+    const state = String(order.state || "").toLowerCase();
+    const queueState = String(order.queue_state || "").toLowerCase();
+    if (["sent", "filled"].includes(state) || ["sent", "filled"].includes(queueState)) successful += 1;
+    if (["risk_blocked", "adapter_blocked", "failed", "rejected"].includes(state) || ["blocked", "risk_blocked", "failed", "rejected"].includes(queueState)) blocked += 1;
+  });
+  return { successful, blocked };
+}
+
+function buildLivePromotionChecklist(strategy, normalizedStage, execution, summary, operatorConfirmed) {
+  const blockerCount = Number(summary?.blocker_count || 0);
+  const liveSmallEligible = Boolean(strategy?.live_small_eligible);
+  return [
+    {
+      label: "승급 단계",
+      detail: normalizedStage === "before-live-small" ? "Paper Trader에서 Live-Small 전 단계까지 승급되었습니다." : `${promotionLabel(normalizedStage)} 단계입니다.`,
+      status: normalizedStage === "before-live-small" || normalizedStage === "live" ? "PASS" : "WAIT",
+      tone: normalizedStage === "before-live-small" || normalizedStage === "live" ? "success" : "warning",
+    },
+    {
+      label: "정적 권한",
+      detail: liveSmallEligible ? "live_small_eligible evidence가 있습니다." : "live_small_eligible evidence가 부족합니다.",
+      status: liveSmallEligible ? "PASS" : "WAIT",
+      tone: liveSmallEligible ? "success" : "warning",
+    },
+    {
+      label: "소액 실거래",
+      detail: execution.successful > 0 ? `실제 성공 주문 ${execution.successful}건을 확인했습니다.` : "SMALL_LIVE 실제 성공 주문 1건 이상이 필요합니다.",
+      status: execution.successful > 0 ? "PASS" : "WAIT",
+      tone: execution.successful > 0 ? "success" : "warning",
+    },
+    {
+      label: "차단 주문",
+      detail: execution.blocked === 0 ? "소액 실거래 중 차단/실패 주문이 없습니다." : `차단/실패 주문 ${execution.blocked}건이 있습니다.`,
+      status: execution.blocked === 0 ? "PASS" : "BLOCK",
+      tone: execution.blocked === 0 ? "success" : "danger",
+    },
+    {
+      label: "운용자 확인",
+      detail: operatorConfirmed ? "운용자 확인이 켜져 있습니다." : "실거래 전 운용자 확인이 필요합니다.",
+      status: operatorConfirmed ? "PASS" : "WAIT",
+      tone: operatorConfirmed ? "success" : "warning",
+    },
+    {
+      label: "Readiness blocker",
+      detail: blockerCount === 0 ? "현재 hard blocker가 없습니다." : `hard blocker ${blockerCount}개가 남아 있습니다.`,
+      status: blockerCount === 0 ? "PASS" : "BLOCK",
+      tone: blockerCount === 0 ? "success" : "danger",
+    },
+  ];
 }
 
 function formatKeyValueMap(values = {}) {
@@ -2947,16 +3085,34 @@ function LaunchReportPanel({ report }) {
   );
 }
 
-function LiveStrategySelectorPanel({ strategies, selectedStrategy, onSelect, onPromoteLive }) {
+function LiveStrategySelectorPanel({
+  strategies,
+  selectedStrategy,
+  onSelect,
+  onPromoteLive,
+  onStrategyLifecycle,
+  orders = [],
+  summary = {},
+  operatorConfirmed = false,
+}) {
   const parametersText = formatKeyValueMap(selectedStrategy?.parameters);
   const promotionStage = selectedStrategy?.promotion?.stage || selectedStrategy?.promotion_stage || selectedStrategy?.lifecycle_status || "unknown";
   const normalizedStage = normalizePromotionStage(promotionStage);
+  const execution = liveSmallExecutionSummaryForStrategy(selectedStrategy?.strategy_id, orders);
+  const checklist = buildLivePromotionChecklist(selectedStrategy, normalizedStage, execution, summary, operatorConfirmed);
+  const lifecycleTimeline = buildLiveLifecycleTimeline(selectedStrategy);
   const canPromoteLive = Boolean(
     selectedStrategy
       && normalizedStage === "before-live-small"
       && selectedStrategy.live_small_eligible
+      && execution.successful > 0
+      && execution.blocked === 0
+      && operatorConfirmed
+      && Number(summary?.blocker_count || 0) === 0
       && onPromoteLive,
   );
+  const isPaused = normalizedStage === "paused";
+  const isRetired = normalizedStage === "retired";
   const livePromotionHint = !selectedStrategy
     ? "전략을 먼저 선택하세요."
     : normalizedStage === "live"
@@ -3009,6 +3165,55 @@ function LiveStrategySelectorPanel({ strategies, selectedStrategy, onSelect, onP
               status={canPromoteLive ? "success" : undefined}
             />
             <span>{livePromotionHint}</span>
+          </div>
+          <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="전략 승급 타임라인">
+            {lifecycleTimeline.map((item) => (
+              <article className={item.state} key={item.id}>
+                <span>{item.index}</span>
+                <div>
+                  <strong>{item.label}</strong>
+                  <em>{item.time || item.statusLabel}</em>
+                </div>
+              </article>
+            ))}
+          </div>
+          <div className="promotion-checklist live-promotion-checklist">
+            {checklist.map((item) => (
+              <article className={item.tone} key={item.label}>
+                <StatusPill tone={item.tone}>{item.status}</StatusPill>
+                <div>
+                  <strong>{item.label}</strong>
+                  <span>{item.detail}</span>
+                </div>
+              </article>
+            ))}
+          </div>
+          <div className="live-strategy-control-line">
+            {isPaused ? (
+              <ActionButton
+                className="secondary-button"
+                disabled={!selectedStrategy || isRetired}
+                icon={<Play size={16} />}
+                label="재개"
+                onClick={() => onStrategyLifecycle?.(selectedStrategy.strategy_id, "resume")}
+              />
+            ) : (
+              <ActionButton
+                className="secondary-button"
+                disabled={!selectedStrategy || isRetired}
+                icon={<Pause size={16} />}
+                label="일시중지"
+                onClick={() => onStrategyLifecycle?.(selectedStrategy.strategy_id, "pause")}
+              />
+            )}
+            <ActionButton
+              className="danger-button"
+              disabled={!selectedStrategy || isRetired}
+              icon={<Trash2 size={16} />}
+              label="폐기/보관"
+              onClick={() => onStrategyLifecycle?.(selectedStrategy.strategy_id, "retire")}
+            />
+            <span>{isRetired ? "retired 상태라 신규 주문과 승급이 차단됩니다." : "상태 변경은 공유 전략 artifact lifecycle에 기록됩니다."}</span>
           </div>
           <div className="live-strategy-parameter-panel">
             <strong>Parameters</strong>

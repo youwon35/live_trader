@@ -1783,6 +1783,120 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
     return {"ok": True, "reason": "live 승급 완료", "snapshot": snapshot()}
 
 
+def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, Any]:
+    strategy_id = str(strategy_id or "").strip()
+    action = str(action or "").strip().lower()
+    if not strategy_id:
+        return {"ok": False, "reason": "strategy_id is required", "snapshot": snapshot()}
+    if action not in {"pause", "retire", "resume"}:
+        return {"ok": False, "reason": "action must be pause, retire, or resume", "snapshot": snapshot()}
+
+    strategy_dir, artifact_path, payload, normalized = find_strategy_artifact_payload(strategy_id)
+    if strategy_dir is None or artifact_path is None or payload is None or normalized is None:
+        reason = f"전략 artifact를 찾을 수 없습니다: {strategy_id}"
+        append_audit("danger", "전략 lifecycle 변경 차단", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    current_status = normalize_lifecycle_status(
+        normalized.get("lifecycle_status")
+        or normalized.get("promotion_stage")
+        or payload.get("lifecycleStatus")
+        or payload.get("promotionStage")
+        or payload.get("status")
+    )
+    lifecycle = payload.get("lifecycle") if isinstance(payload.get("lifecycle"), dict) else {}
+    promotion = payload.get("promotion") if isinstance(payload.get("promotion"), dict) else {}
+    permissions = payload.get("permissions") if isinstance(payload.get("permissions"), dict) else {}
+    capabilities = payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {}
+    now = datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+    if action == "resume":
+        if current_status != "paused":
+            return {"ok": False, "reason": "paused 상태에서만 재개할 수 있습니다.", "snapshot": snapshot()}
+        target_status = normalize_lifecycle_status(lifecycle.get("pausedFrom") or payload.get("pausedFrom") or "before-live-small")
+        if target_status in {"paused", "retired", "unknown"}:
+            target_status = "before-live-small"
+        restored_permissions = lifecycle.get("pausedPermissions") if isinstance(lifecycle.get("pausedPermissions"), dict) else {}
+        if restored_permissions:
+            permissions.update(restored_permissions)
+        permissions["fail_reasons"] = [
+            reason
+            for reason in permissions.get("fail_reasons", [])
+            if str(reason) not in {"lifecycle-paused", "lifecycle-retired"}
+        ]
+        audit_level = "info"
+        audit_label = "전략 재개"
+        audit_reason = f"{payload.get('name') or strategy_id} 전략을 {target_status} 단계로 재개했습니다."
+    else:
+        target_status = "paused" if action == "pause" else "retired"
+        if action == "pause":
+            lifecycle["pausedFrom"] = current_status
+            lifecycle["pausedPermissions"] = dict(permissions)
+        fail_reasons = list(permissions.get("fail_reasons", payload.get("fail_reasons", [])) or [])
+        fail_reasons.append(f"lifecycle-{target_status}")
+        fail_reasons = list(dict.fromkeys(str(reason) for reason in fail_reasons))
+        permissions.update({
+            "live_small_eligible": False,
+            "live_eligible": False,
+            "live_allowed": False,
+            "fail_reasons": fail_reasons,
+        })
+        capabilities.update({
+            "lifecycleStatus": target_status,
+            "liveSmallEligible": False,
+            "liveEligible": False,
+            "canSubmitOrder": False,
+            "failReasons": fail_reasons,
+            "blockingFailReasons": fail_reasons,
+        })
+        payload.update({
+            "live_small_eligible": False,
+            "live_eligible": False,
+            "live_allowed": False,
+            "fail_reasons": fail_reasons,
+        })
+        audit_level = "warn" if action == "pause" else "danger"
+        audit_label = "전략 일시중지" if action == "pause" else "전략 폐기/보관"
+        audit_reason = f"{payload.get('name') or strategy_id} 전략을 {target_status} 상태로 변경하고 실거래 권한을 차단했습니다."
+
+    lifecycle_history = lifecycle.get("history") if isinstance(lifecycle.get("history"), list) else []
+    promotion_history = promotion.get("history") if isinstance(promotion.get("history"), list) else []
+    lifecycle_history.append({"from": current_status, "to": target_status, "at": now, "by": "live_trader", "reason": audit_reason})
+    promotion_history.append({"from": current_status, "to": target_status, "at": now, "by": "live_trader", "reason": audit_reason})
+    lifecycle.update({
+        "schemaVersion": lifecycle.get("schemaVersion") or "strategy-lifecycle-v2",
+        "status": target_status,
+        "label": target_status,
+        "updatedAt": now,
+        "history": lifecycle_history,
+    })
+    promotion.update({
+        "schemaVersion": promotion.get("schemaVersion") or "strategy-promotion-v1",
+        "stage": target_status,
+        "stageLabel": target_status,
+        "promotedAt": now,
+        "updatedAt": now,
+        "promotedBy": "live_trader",
+        "history": promotion_history,
+    })
+    capabilities["lifecycleStatus"] = target_status
+    payload.update({
+        "status": target_status,
+        "lifecycleStatus": target_status,
+        "promotionStage": target_status,
+        "lifecycle": lifecycle,
+        "promotion": promotion,
+        "permissions": permissions,
+        "capabilities": capabilities,
+        "updatedAt": now,
+    })
+    artifact_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    update_strategy_registry(strategy_dir, payload, artifact_path)
+    append_strategy_promotion_log(strategy_dir, payload, artifact_path, "live_trader")
+    append_audit(audit_level, audit_label, audit_reason)
+    return {"ok": True, "reason": audit_reason, "snapshot": snapshot()}
+
+
 def set_automation_profile(profile_id: str, enabled: bool, provider: str | None = None, mode: str | None = None) -> dict[str, Any]:
     profile_id = profile_id if profile_id in {"stock", "crypto"} else ""
     if not profile_id:

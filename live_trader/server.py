@@ -115,6 +115,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/strategy-live-promotion":
             self.send_json(state.promote_strategy_to_live(str(payload.get("strategy_id", ""))))
             return
+        if parsed.path == "/api/strategy-lifecycle":
+            self.send_json(state.set_strategy_lifecycle_status(str(payload.get("strategy_id", "")), str(payload.get("action", ""))))
+            return
         if parsed.path == "/api/watchdog":
             self.send_json(state.run_watchdog())
             return

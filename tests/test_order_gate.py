@@ -1,4 +1,6 @@
 import copy
+import json
+import os
 import tempfile
 import unittest
 from datetime import datetime
@@ -146,6 +148,65 @@ class OrderGateTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(state.STATE["automation"]["stock"]["provider"], "kis")
         self.assertIn("kis만 허용", result["reason"])
+
+    def test_strategy_lifecycle_control_pauses_resumes_and_retires_artifact(self) -> None:
+        previous_artifact_dir = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_dir = Path(temp_dir)
+            os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
+            artifact_path = artifact_dir / "strategy.json"
+            artifact_payload = {
+                "strategy_id": "LIFE-1",
+                "name": "Lifecycle Test",
+                "symbol": "BTCUSDT",
+                "asset": "crypto",
+                "timeframe": "1h",
+                "plugin": "moving_average_cross",
+                "parameters": {"shortMa": 20, "longMa": 60},
+                "status": "before-live-small",
+                "lifecycleStatus": "before-live-small",
+                "promotionStage": "before-live-small",
+                "lifecycle": {"status": "before-live-small", "history": []},
+                "promotion": {"stage": "before-live-small", "history": []},
+                "permissions": {
+                    "paper_trader_verified": True,
+                    "live_small_eligible": True,
+                    "live_eligible": False,
+                    "live_allowed": False,
+                    "fail_reasons": [],
+                },
+                "capabilities": {
+                    "liveSmallEligible": True,
+                    "liveEligible": False,
+                    "canSubmitOrder": False,
+                    "failReasons": [],
+                    "blockingFailReasons": [],
+                },
+            }
+            artifact_path.write_text(json.dumps(artifact_payload, ensure_ascii=False), encoding="utf-8")
+            try:
+                pause = state.set_strategy_lifecycle_status("LIFE-1", "pause")
+                paused_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                resume = state.set_strategy_lifecycle_status("LIFE-1", "resume")
+                resumed_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                retire = state.set_strategy_lifecycle_status("LIFE-1", "retire")
+                retired_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+            finally:
+                if previous_artifact_dir is None:
+                    os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+                else:
+                    os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact_dir
+
+        self.assertTrue(pause["ok"])
+        self.assertEqual(paused_payload["promotionStage"], "paused")
+        self.assertFalse(paused_payload["permissions"]["live_small_eligible"])
+        self.assertEqual(paused_payload["lifecycle"]["pausedFrom"], "before-live-small")
+        self.assertTrue(resume["ok"])
+        self.assertEqual(resumed_payload["promotionStage"], "before-live-small")
+        self.assertTrue(resumed_payload["permissions"]["live_small_eligible"])
+        self.assertTrue(retire["ok"])
+        self.assertEqual(retired_payload["promotionStage"], "retired")
+        self.assertFalse(retired_payload["permissions"]["live_small_eligible"])
 
     def test_submit_test_intent_creates_dry_run_order_when_gate_passes(self) -> None:
         state.STATE["orders"] = []
