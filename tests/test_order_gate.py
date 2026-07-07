@@ -130,6 +130,94 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(sell_order_state, "dry_run")
         self.assertEqual(sell_queue_state, "simulated")
 
+    def test_portfolio_artifact_blocks_live_order_outside_universe(self) -> None:
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["new_entries_blocked"] = False
+        checks = {
+            "summary": {"blocker_count": 0, "warning_count": 0},
+            "strategies": [{"strategy_id": "STRAT-1", "symbol": "069500.KS", "asset": "kr-stock"}],
+            "portfolios": [
+                {
+                    "id": "portfolio-1",
+                    "name": "Portfolio 1",
+                    "lifecycle_status": "before-live-small",
+                    "permissions": {"live_small_allowed": True, "live_allowed": False},
+                    "strategy_instances": [{"strategyId": "OTHER", "symbol": "005930.KS"}],
+                    "target_portfolio": [{"strategyId": "OTHER", "symbol": "005930.KS", "targetWeight": 0.5}],
+                    "risk_policy": {"maxSingleSymbolWeight": 1.0, "maxStrategyWeight": 1.0},
+                    "risk_checks": [],
+                }
+            ],
+        }
+        intent = state.OrderIntent(
+            strategy_id="STRAT-1",
+            asset="kr-stock",
+            symbol="069500.KS",
+            side="BUY",
+            quantity=10,
+            reference_price=38900,
+            mode="SMALL_LIVE",
+            reason="unit",
+            metadata={"broker_id": "kis"},
+        )
+
+        ok, order_state, queue_state, reason, report = state.evaluate_order_gate_with_report(checks, "BUY", True, intent)
+
+        self.assertFalse(ok)
+        self.assertEqual(order_state, "risk_blocked")
+        self.assertEqual(queue_state, "blocked")
+        self.assertIn("Portfolio", reason)
+        self.assertTrue(any(check.label == "Portfolio Artifact" and check.status == "fail" for check in report.checks))
+
+    def test_portfolio_artifact_target_weight_limits_live_order(self) -> None:
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["risk_settings"]["strategy_capital_limit_krw"] = 20_000_000
+        checks = {
+            "summary": {"blocker_count": 0, "warning_count": 0},
+            "strategies": [{"strategy_id": "STRAT-1", "symbol": "069500.KS", "asset": "kr-stock"}],
+            "portfolios": [
+                {
+                    "id": "portfolio-1",
+                    "name": "Portfolio 1",
+                    "lifecycle_status": "before-live-small",
+                    "permissions": {"live_small_allowed": True, "live_allowed": False},
+                    "strategy_instances": [
+                        {
+                            "strategyId": "STRAT-1",
+                            "symbol": "069500.KS",
+                            "allocation": {"normalizedWeight": 0.001},
+                        }
+                    ],
+                    "target_portfolio": [{"strategyId": "STRAT-1", "symbol": "069500.KS", "targetWeight": 0.001}],
+                    "risk_policy": {"maxSingleSymbolWeight": 1.0, "maxStrategyWeight": 1.0},
+                    "risk_checks": [],
+                }
+            ],
+        }
+        intent = state.OrderIntent(
+            strategy_id="STRAT-1",
+            asset="kr-stock",
+            symbol="069500.KS",
+            side="BUY",
+            quantity=10,
+            reference_price=38900,
+            mode="SMALL_LIVE",
+            reason="unit",
+            metadata={"broker_id": "kis"},
+        )
+
+        ok, order_state, queue_state, reason, report = state.evaluate_order_gate_with_report(checks, "BUY", True, intent)
+
+        self.assertFalse(ok)
+        self.assertEqual(order_state, "risk_blocked")
+        self.assertEqual(queue_state, "blocked")
+        self.assertTrue(any(check.label == "Portfolio Artifact" and check.status == "pass" for check in report.checks))
+        self.assertTrue(
+            any(check.label in {"전략별 자본 한도", "종목별 최대 비중"} and check.status == "fail" for check in report.checks)
+        )
+        self.assertTrue("전략별 자본 한도" in reason or "종목별 최대 비중" in reason)
+
     def test_order_gate_holds_non_dry_run_until_adapter_is_verified(self) -> None:
         state.STATE["new_entries_blocked"] = False
 

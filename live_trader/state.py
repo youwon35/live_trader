@@ -4,7 +4,7 @@ import os
 import csv
 import html
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
@@ -17,6 +17,8 @@ from .contracts import (
     IGNORED_STRATEGY_FILE_NAMES,
     can_live_small_use_artifact,
     can_live_use_artifact,
+    lifecycle_rank,
+    load_portfolio_artifacts,
     load_strategy_artifacts,
     normalize_lifecycle_status,
     normalize_strategy_artifact,
@@ -371,16 +373,25 @@ def env_enabled(name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-def strategy_rows() -> list[dict[str, Any]]:
+def strategy_rows(portfolios: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     artifacts = load_strategy_artifacts()
     if not artifacts:
         artifacts = sample_strategy_artifacts()
+    portfolio_artifacts = portfolios if portfolios is not None else portfolio_rows()
     rows = []
     for artifact in artifacts:
         live_eligible = can_live_use_artifact(artifact)
         live_small_eligible = can_live_small_use_artifact(artifact)
         live_allowed = live_eligible or live_small_eligible
+        portfolio_gate = portfolio_gate_for_strategy(artifact, portfolio_artifacts, mode=current_mode())
+        if portfolio_gate.get("active") and portfolio_gate.get("allowed") is not True:
+            live_allowed = False
+            live_small_eligible = False
+            live_eligible = False
         fail_reasons = artifact.get("permissions", {}).get("fail_reasons", [])
+        block_reasons = list(fail_reasons)
+        if portfolio_gate.get("active") and portfolio_gate.get("allowed") is not True:
+            block_reasons.append(str(portfolio_gate.get("detail") or "Portfolio artifact gate blocked strategy."))
         verification = artifact.get("verification") if isinstance(artifact.get("verification"), dict) else {}
         backtester_verification = verification.get("backtester") if isinstance(verification.get("backtester"), dict) else {}
         paper_verification = verification.get("paper_trader") if isinstance(verification.get("paper_trader"), dict) else {}
@@ -391,14 +402,172 @@ def strategy_rows() -> list[dict[str, Any]]:
                 "live_small_eligible": live_small_eligible,
                 "live_eligible": live_eligible,
                 "permission_label": "FULL LIVE OK" if live_eligible else "LIVE-SMALL OK" if live_small_eligible else "LIVE BLOCKED",
-                "block_reason": "; ".join(fail_reasons) if fail_reasons else ("정식 실거래 가능" if live_eligible else "소액 실거래 준비 가능" if live_small_eligible else "lifecycle/evidence 기준을 통과하지 못했습니다."),
+                "block_reason": "; ".join(block_reasons) if block_reasons else ("정식 실거래 가능" if live_eligible else "소액 실거래 준비 가능" if live_small_eligible else "lifecycle/evidence 기준을 통과하지 못했습니다."),
                 "backtester_verified": backtester_verification.get("status") == "pass",
                 "paper_trader_verified": paper_verification.get("status") == "pass",
                 "backtester_label": str(backtester_verification.get("label", "Backtester 정보 없음")),
                 "paper_trader_label": str(paper_verification.get("label", "Paper 미검증")),
+                "portfolio_gate": portfolio_gate,
             }
         )
     return rows
+
+
+def portfolio_rows() -> list[dict[str, Any]]:
+    return load_portfolio_artifacts()
+
+
+def safe_float(value: Any, fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def normalize_weight_percent(value: Any, fallback: float) -> float:
+    number = safe_float(value, fallback)
+    if number <= 1.0:
+        return number * 100
+    return number
+
+
+def portfolio_strategy_value(item: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def portfolio_gate_for_strategy(
+    strategy: dict[str, Any],
+    portfolios: list[dict[str, Any]] | None = None,
+    *,
+    mode: Mode | None = None,
+) -> dict[str, Any]:
+    portfolio_artifacts = portfolios if portfolios is not None else portfolio_rows()
+    if not portfolio_artifacts:
+        return {"active": False, "allowed": True, "detail": "Portfolio artifact 저장소가 없어 단일 전략 기준으로 평가합니다."}
+
+    strategy_id = str(strategy.get("strategy_id") or "")
+    symbol = str(strategy.get("symbol") or "")
+    for portfolio in portfolio_artifacts:
+        match = portfolio_match_for_strategy(portfolio, strategy_id, symbol, mode=mode or current_mode())
+        if match is not None:
+            return match
+    return {
+        "active": True,
+        "allowed": False,
+        "detail": f"유효한 Portfolio artifact가 있지만 {strategy_id}/{symbol} 조합이 live universe에 없습니다.",
+        "portfolioCount": len(portfolio_artifacts),
+    }
+
+
+def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, symbol: str, *, mode: Mode) -> dict[str, Any] | None:
+    instances = portfolio.get("strategy_instances") if isinstance(portfolio.get("strategy_instances"), list) else []
+    targets = portfolio.get("target_portfolio") if isinstance(portfolio.get("target_portfolio"), list) else []
+    matching_instance = next(
+        (
+            item
+            for item in instances
+            if isinstance(item, dict)
+            and portfolio_strategy_value(item, "strategyId", "strategy_id") == strategy_id
+            and (not portfolio_strategy_value(item, "symbol") or portfolio_strategy_value(item, "symbol") == symbol)
+        ),
+        None,
+    )
+    matching_target = next(
+        (
+            item
+            for item in targets
+            if isinstance(item, dict)
+            and portfolio_strategy_value(item, "strategyId", "strategy_id") == strategy_id
+            and (not portfolio_strategy_value(item, "symbol") or portfolio_strategy_value(item, "symbol") == symbol)
+        ),
+        None,
+    )
+    if matching_instance is None and matching_target is None:
+        return None
+
+    allocation = matching_instance.get("allocation") if isinstance(matching_instance, dict) and isinstance(matching_instance.get("allocation"), dict) else {}
+    target_weight = safe_float(
+        (matching_target or {}).get("targetWeight") if isinstance(matching_target, dict) else None,
+        safe_float(allocation.get("scoreTargetWeight"), safe_float(allocation.get("normalizedWeight"), 0.0)),
+    )
+    risk_policy = portfolio.get("risk_policy") if isinstance(portfolio.get("risk_policy"), dict) else {}
+    max_symbol_weight = normalize_weight_percent(risk_policy.get("maxSingleSymbolWeight"), 100.0)
+    max_strategy_weight = normalize_weight_percent(risk_policy.get("maxStrategyWeight"), 100.0)
+    effective_symbol_limit = min(max_symbol_weight, target_weight * 100 if target_weight > 0 else max_symbol_weight)
+    permissions = portfolio.get("permissions") if isinstance(portfolio.get("permissions"), dict) else {}
+    lifecycle_status = normalize_lifecycle_status(portfolio.get("lifecycle_status"))
+    required_status = "live" if mode == "FULL_LIVE" else "before-live-small"
+    permission_ok = (
+        permissions.get("live_allowed") is True
+        or permissions.get("live_export_allowed") is True
+        or (mode != "FULL_LIVE" and permissions.get("live_small_allowed") is True)
+    )
+    blockers: list[str] = []
+    if lifecycle_status in {"paused", "retired"}:
+        blockers.append(f"lifecycle={lifecycle_status}")
+    if lifecycle_rank(lifecycle_status) < lifecycle_rank(required_status):
+        blockers.append(f"lifecycle={lifecycle_status}, required={required_status}")
+    if not permission_ok:
+        blockers.append("live_export_allowed=false")
+    failed_checks = [
+        str(check.get("label") or check.get("id") or "risk")
+        for check in portfolio.get("risk_checks", [])
+        if isinstance(check, dict) and str(check.get("status") or "").lower() == "fail"
+    ]
+    if failed_checks:
+        blockers.append("riskChecks=" + ", ".join(failed_checks[:3]))
+    if target_weight <= 0:
+        blockers.append("targetWeight=0")
+
+    return {
+        "active": True,
+        "allowed": not blockers,
+        "detail": "Portfolio hard gate 통과" if not blockers else "Portfolio hard gate 차단: " + "; ".join(blockers),
+        "portfolioId": str(portfolio.get("id") or ""),
+        "portfolioName": str(portfolio.get("name") or ""),
+        "portfolioPath": str(portfolio.get("source_path") or ""),
+        "lifecycleStatus": lifecycle_status,
+        "requiredLifecycleStatus": required_status,
+        "targetWeight": target_weight,
+        "maxSymbolWeightPct": effective_symbol_limit,
+        "maxStrategyWeightPct": max_strategy_weight,
+        "strategyCapitalRatio": min(target_weight, max_strategy_weight / 100 if max_strategy_weight > 0 else target_weight),
+        "instance": matching_instance or {},
+        "target": matching_target or {},
+    }
+
+
+def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> dict[str, Any]:
+    strategy = strategy_for_order_intent(checks, intent)
+    if strategy:
+        gate = strategy.get("portfolio_gate") if isinstance(strategy.get("portfolio_gate"), dict) else None
+        if gate is not None:
+            return gate
+    return portfolio_gate_for_strategy(
+        {"strategy_id": intent.strategy_id, "symbol": intent.symbol},
+        checks.get("portfolios") if isinstance(checks.get("portfolios"), list) else None,
+        mode=current_mode(),
+    )
+
+
+def apply_portfolio_gate_to_context(context: PreTradeContext, gate: dict[str, Any], intent: OrderIntent) -> PreTradeContext:
+    if not gate.get("active") or gate.get("allowed") is not True:
+        return context
+    base_equity = max(float(context.portfolio_equity or 0.0), context.strategy_capital_limit, intent.notional, 1.0)
+    target_weight = safe_float(gate.get("targetWeight"), 0.0)
+    strategy_ratio = safe_float(gate.get("strategyCapitalRatio"), target_weight)
+    max_symbol_weight_pct = safe_float(gate.get("maxSymbolWeightPct"), context.max_symbol_weight_pct)
+    strategy_capital_limit = base_equity * strategy_ratio if strategy_ratio > 0 else context.strategy_capital_limit
+    return replace(
+        context,
+        portfolio_equity=base_equity,
+        max_symbol_weight_pct=min(context.max_symbol_weight_pct, max_symbol_weight_pct),
+        strategy_capital_limit=min(context.strategy_capital_limit, strategy_capital_limit),
+    )
 
 
 def find_strategy_artifact_payload(strategy_id: str) -> tuple[Path | None, Path | None, dict[str, Any] | None, dict[str, Any] | None]:
@@ -1452,7 +1621,8 @@ def launch_report(preflight: list[dict[str, str]]) -> dict[str, Any]:
 
 def snapshot() -> dict[str, Any]:
     brokers = [broker.to_dict() for broker in broker_readiness()]
-    strategies = strategy_rows()
+    portfolios = portfolio_rows()
+    strategies = strategy_rows(portfolios)
     automations = automation_profiles(strategies, brokers)
     reconciliation = reconciliation_snapshot()
     queue = order_queue_summary()
@@ -1494,6 +1664,7 @@ def snapshot() -> dict[str, Any]:
         "automation_profiles": automations,
         "strategy_runner": dict(STATE["strategy_runner"]),
         "strategies": strategies,
+        "portfolios": portfolios,
         "strategy_plugin_sources": strategy_plugin_status(),
         "orders": order_rows(),
         "dry_run_ledger": dry_run_ledger_rows(),
@@ -2264,7 +2435,18 @@ def evaluate_order_gate_with_report(
     intent: OrderIntent | None = None,
 ) -> tuple[bool, str, str, str, PreTradeRiskReport]:
     intent = intent or default_order_intent(checks, side)
-    report = PreTradeRiskGate().evaluate(intent, pre_trade_context(checks, intent, dry_run))
+    portfolio_gate = portfolio_gate_for_intent(checks, intent)
+    context = apply_portfolio_gate_to_context(pre_trade_context(checks, intent, dry_run), portfolio_gate, intent)
+    report = PreTradeRiskGate().evaluate(intent, context)
+    if portfolio_gate.get("active"):
+        portfolio_status: CheckStatus = "pass" if portfolio_gate.get("allowed") is True else "fail"
+        report = PreTradeRiskReport(
+            report.checked_at,
+            (
+                RiskCheck("Portfolio Artifact", portfolio_status, str(portfolio_gate.get("detail") or "")),
+                *report.checks,
+            ),
+        )
     strategy = strategy_for_order_intent(checks, intent)
     revalidation = strategy_revalidation_status(strategy, lifecycle_status=strategy.get("lifecycle_status")) if strategy else {}
     if intent.side == "BUY" and revalidation.get("expired") is True:
@@ -2554,6 +2736,7 @@ def submit_order_intent(
     runner_report: StrategyExecutionResult | None = None,
 ) -> dict[str, Any]:
     ok, order_state, queue_state, reason, risk_report = evaluate_order_gate_with_report(checks, intent.side, dry_run, intent)
+    portfolio_gate = portfolio_gate_for_intent(checks, intent)
     retry_backoff = float(STATE["retry_policy"]["backoff_sec"])
     order = {
         "time": now_text(),
@@ -2575,6 +2758,7 @@ def submit_order_intent(
         "dry_run": dry_run,
         "reason": reason,
         "risk_report": risk_report.to_dict(),
+        "portfolio_gate": portfolio_gate if portfolio_gate.get("active") else {},
     }
     if runner_report is not None:
         order["runner_report"] = runner_report.to_dict()

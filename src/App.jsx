@@ -1578,6 +1578,7 @@ function LivePreparationPanel({
             summary={snapshot.summary ?? {}}
             operatorConfirmed={Boolean(snapshot.operator_confirmed)}
           />
+          <PortfolioArtifactPanel portfolios={snapshot.portfolios ?? []} selectedStrategy={selectedStrategy} />
           <StrategyPanel strategies={filteredStrategies} selectedStrategyId={selectedStrategy?.strategy_id} onSelect={setSelectedStrategyId} />
           <OperationalSafeguardsPanel
             dryRun={snapshot.dry_run}
@@ -1594,6 +1595,51 @@ function LivePreparationPanel({
           <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
         </div>
       </section>
+    </section>
+  );
+}
+
+function PortfolioArtifactPanel({ portfolios = [], selectedStrategy }) {
+  const gate = selectedStrategy?.portfolio_gate ?? {};
+  return (
+    <section className="panel portfolio-artifact-panel">
+      <PanelHeader title="포트폴리오 Artifact" subtitle="Live 주문은 선택 전략이 포함된 포트폴리오 universe와 target weight를 기준으로 제한됩니다." />
+      <div className="portfolio-gate-summary">
+        <div>
+          <span>선택 전략 Gate</span>
+          <strong>{gate.active ? gate.detail : "단일 전략 기준"}</strong>
+        </div>
+        <StatusPill tone={!gate.active ? "info" : gate.allowed ? "success" : "danger"}>
+          {!gate.active ? "LEGACY" : gate.allowed ? "PASS" : "BLOCK"}
+        </StatusPill>
+      </div>
+      {gate.active && (
+        <div className="portfolio-gate-metrics">
+          <MetricCard className="metric-card" label="Portfolio" value={gate.portfolioName || gate.portfolioId || "-"} detail={gate.lifecycleStatus || "-"} />
+          <MetricCard className="metric-card" label="Target Weight" value={`${formatPercentValue(gate.targetWeight)}%`} detail={`Symbol max ${formatPercentValue((gate.maxSymbolWeightPct || 0) / 100)}%`} />
+        </div>
+      )}
+      <div className="portfolio-artifact-list">
+        {portfolios.length ? (
+          portfolios.map((portfolio) => {
+            const permissions = portfolio.permissions ?? {};
+            const targetCount = portfolio.target_portfolio?.length ?? 0;
+            const strategyCount = portfolio.strategy_instances?.length ?? 0;
+            const liveReady = permissions.live_allowed || permissions.live_export_allowed || permissions.live_small_allowed;
+            return (
+              <article className="portfolio-artifact-item" key={portfolio.id || portfolio.source_path}>
+                <div>
+                  <strong>{portfolio.name || portfolio.id}</strong>
+                  <span>{strategyCount} 전략 · {targetCount} target · {portfolio.lifecycle_status}</span>
+                </div>
+                <StatusPill tone={liveReady ? "success" : "danger"}>{liveReady ? "LIVE READY" : "LIVE BLOCKED"}</StatusPill>
+              </article>
+            );
+          })
+        ) : (
+          <EmptyRow text="저장된 portfolio artifact가 없습니다. 없을 때는 기존 단일 전략 게이트를 사용합니다." />
+        )}
+      </div>
     </section>
   );
 }
@@ -2124,6 +2170,12 @@ function formatKeyValueMap(values = {}) {
   return Object.entries(values)
     .map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`)
     .join("\n");
+}
+
+function formatPercentValue(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "0.00";
+  return (numeric * 100).toFixed(2);
 }
 
 function statusTone(status) {

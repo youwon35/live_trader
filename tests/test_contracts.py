@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -5,6 +6,7 @@ from pathlib import Path
 
 from live_trader.contracts import (
     can_live_use_artifact,
+    load_portfolio_artifacts,
     normalize_strategy_artifact,
     strategy_artifact_dirs,
     strategy_plugin_dirs,
@@ -99,6 +101,56 @@ class StrategyContractTest(unittest.TestCase):
                 os.environ.pop("LIVE_TRADER_STRATEGY_PLUGIN_DIR", None)
             else:
                 os.environ["LIVE_TRADER_STRATEGY_PLUGIN_DIR"] = previous_plugin
+
+    def test_portfolio_artifacts_load_from_shared_strategy_directory(self) -> None:
+        previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                artifact_dir = Path(tmp)
+                portfolio_dir = artifact_dir / "portfolios"
+                portfolio_dir.mkdir()
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
+                (portfolio_dir / "portfolio.json").write_text(
+                    json.dumps(
+                        {
+                            "artifactType": "portfolio",
+                            "schemaVersion": "portfolio-artifact-v1",
+                            "id": "portfolio-live-1",
+                            "name": "Portfolio Live 1",
+                            "lifecycle": {"status": "before-live-small"},
+                            "permissions": {"live_small_allowed": True, "fail_reasons": []},
+                            "strategyInstances": [
+                                {
+                                    "strategyId": "STRAT-1",
+                                    "symbol": "069500.KS",
+                                    "allocation": {"normalizedWeight": 0.2},
+                                }
+                            ],
+                            "framework": {
+                                "targetPortfolio": [
+                                    {"strategyId": "STRAT-1", "symbol": "069500.KS", "targetWeight": 0.2}
+                                ],
+                                "riskChecks": [{"label": "unit", "status": "pass"}],
+                            },
+                            "riskPolicy": {"maxSingleSymbolWeight": 0.25, "maxStrategyWeight": 0.5},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+                portfolios = load_portfolio_artifacts()
+
+            self.assertEqual(len(portfolios), 1)
+            self.assertEqual(portfolios[0]["id"], "portfolio-live-1")
+            self.assertEqual(portfolios[0]["lifecycle_status"], "before-live-small")
+            self.assertTrue(portfolios[0]["permissions"]["live_small_allowed"])
+            self.assertEqual(portfolios[0]["target_portfolio"][0]["targetWeight"], 0.2)
+        finally:
+            if previous_artifact is None:
+                os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+            else:
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact
 
 
 if __name__ == "__main__":

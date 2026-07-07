@@ -36,6 +36,11 @@ IGNORED_STRATEGY_FILE_NAMES = {
     "strategy-registry.json",
     "promotion-log.jsonl",
 }
+IGNORED_PORTFOLIO_FILE_NAMES = {
+    "package.json",
+    "package-lock.json",
+    "portfolio-registry.json",
+}
 LIFECYCLE_STAGE_ALIASES = {
     "approved": "backtested",
     "final_tested": "backtested",
@@ -453,6 +458,74 @@ def strategy_plugin_status() -> list[dict[str, Any]]:
         }
         for folder in strategy_plugin_dirs()
     ]
+
+
+def portfolio_artifact_dirs() -> list[Path]:
+    return _dedupe_paths([folder / "portfolios" for folder in strategy_artifact_dirs()])
+
+
+def load_portfolio_artifacts(limit: int = 16) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    for folder in portfolio_artifact_dirs():
+        if not folder.exists():
+            continue
+        for path in sorted(folder.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            if path.name in IGNORED_PORTFOLIO_FILE_NAMES:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("artifactType") != "portfolio" and payload.get("schemaVersion") != "portfolio-artifact-v1":
+                continue
+            payload["_source_path"] = str(path)
+            artifacts.append(normalize_portfolio_artifact(payload))
+            if len(artifacts) >= limit:
+                return artifacts
+    return artifacts
+
+
+def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    lifecycle = _dict_value(artifact.get("lifecycle"))
+    framework = _dict_value(artifact.get("framework"))
+    permissions = _dict_value(artifact.get("permissions"))
+    strategy_instances = artifact.get("strategyInstances") if isinstance(artifact.get("strategyInstances"), list) else []
+    target_portfolio = framework.get("targetPortfolio") if isinstance(framework.get("targetPortfolio"), list) else []
+    risk_checks = framework.get("riskChecks") if isinstance(framework.get("riskChecks"), list) else []
+    lifecycle_status = normalize_lifecycle_status(
+        lifecycle.get("status")
+        or artifact.get("lifecycleStatus")
+        or artifact.get("status")
+        or _dict_value(artifact.get("promotion")).get("stage")
+        or artifact.get("promotionStage")
+        or "draft"
+    )
+    return {
+        "id": str(artifact.get("id") or artifact.get("portfolio_id") or artifact.get("_source_path") or "portfolio"),
+        "name": str(artifact.get("name") or artifact.get("portfolioName") or artifact.get("id") or "Portfolio Artifact"),
+        "schema_version": str(artifact.get("schemaVersion") or "portfolio-artifact-v1"),
+        "artifact_type": str(artifact.get("artifactType") or "portfolio"),
+        "lifecycle_status": lifecycle_status,
+        "lifecycle": {
+            "status": lifecycle_status,
+            "label": str(lifecycle.get("label") or _promotion_stage_label(lifecycle_status)),
+            "history": lifecycle.get("history") if isinstance(lifecycle.get("history"), list) else [],
+        },
+        "permissions": {
+            "paper_export_allowed": permissions.get("paper_export_allowed") is True,
+            "live_small_allowed": permissions.get("live_small_allowed") is True or permissions.get("live_small_eligible") is True,
+            "live_allowed": permissions.get("live_allowed") is True or permissions.get("live_export_allowed") is True,
+            "live_export_allowed": permissions.get("live_export_allowed") is True or permissions.get("live_allowed") is True,
+            "fail_reasons": _reason_list(permissions.get("fail_reasons") or artifact.get("fail_reasons")),
+        },
+        "strategy_instances": [item for item in strategy_instances if isinstance(item, dict)],
+        "target_portfolio": [item for item in target_portfolio if isinstance(item, dict)],
+        "risk_policy": _dict_value(artifact.get("riskPolicy") or artifact.get("risk_policy")),
+        "risk_checks": [item for item in risk_checks if isinstance(item, dict)],
+        "source_path": str(artifact.get("_source_path") or ""),
+    }
 
 
 def load_strategy_artifacts(limit: int = 16) -> list[dict[str, Any]]:

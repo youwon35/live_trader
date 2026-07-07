@@ -1694,6 +1694,58 @@ button {
   white-space: pre-wrap;
 }
 
+.portfolio-artifact-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.portfolio-artifact-panel .panel-header {
+  margin-bottom: 0;
+}
+
+.portfolio-gate-summary,
+.portfolio-artifact-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.portfolio-gate-summary span,
+.portfolio-artifact-item span {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-strong);
+}
+
+.portfolio-gate-summary strong,
+.portfolio-artifact-item strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 2px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: var(--font-weight-bold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.portfolio-gate-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.portfolio-artifact-list {
+  display: grid;
+  gap: 7px;
+}
+
 .strategy-lifecycle-timeline {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
