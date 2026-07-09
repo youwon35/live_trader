@@ -248,6 +248,39 @@ def _reason_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _safe_int(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _safe_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def normalize_paper_portfolio_evidence(artifact: dict[str, Any]) -> dict[str, Any]:
+    evidence = _dict_value(artifact.get("paperPortfolioEvidence") or artifact.get("paper_portfolio_evidence"))
+    if not evidence:
+        return {"required": False, "ready": True, "detail": "Portfolio paper evidence 없음"}
+    return {
+        "required": evidence.get("required") is True,
+        "ready": evidence.get("ready") is True,
+        "portfolioId": str(evidence.get("portfolioId") or evidence.get("portfolio_id") or ""),
+        "portfolioName": str(evidence.get("portfolioName") or evidence.get("portfolio_name") or ""),
+        "submittedAt": str(evidence.get("submittedAt") or evidence.get("submitted_at") or ""),
+        "status": str(evidence.get("status") or ""),
+        "orderCount": _safe_int(evidence.get("orderCount") or evidence.get("order_count")),
+        "filledCount": _safe_int(evidence.get("filledCount") or evidence.get("filled_count")),
+        "rejectedCount": _safe_int(evidence.get("rejectedCount") or evidence.get("rejected_count")),
+        "targetWeight": _safe_float(evidence.get("targetWeight") or evidence.get("target_weight")),
+        "detail": str(evidence.get("detail") or ""),
+    }
+
+
 def _parse_datetime(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -618,6 +651,7 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     }
     promotion = _promotion_snapshot(artifact, normalized_permissions, lifecycle_status)
     release = _release_snapshot(artifact)
+    paper_portfolio_evidence = normalize_paper_portfolio_evidence(artifact)
 
     return {
         "strategy_id": strategy_id,
@@ -661,6 +695,7 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "live_small_eligible": capabilities["liveSmallEligible"],
         "live_eligible": capabilities["liveEligible"],
         "verification": verification,
+        "paper_portfolio_evidence": paper_portfolio_evidence,
         "backtester_verified": verification["backtester"]["status"] == "pass",
         "paper_trader_verified": verification["paper_trader"]["status"] == "pass",
         "contract_version": str(

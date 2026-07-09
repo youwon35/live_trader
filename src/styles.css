@@ -1566,7 +1566,7 @@ button {
 
 .strategy-table .table-head,
 .strategy-table .table-row {
-  grid-template-columns: minmax(190px, 1.25fr) 110px 92px 62px minmax(200px, 1fr) 112px minmax(240px, 1.3fr);
+  grid-template-columns: minmax(190px, 1.25fr) 110px 92px 62px minmax(200px, 1fr) 112px 92px minmax(240px, 1.3fr);
 }
 
 .strategy-verification-pills {
@@ -1625,7 +1625,7 @@ button {
 
 .live-strategy-summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
 }
 

@@ -384,7 +384,12 @@ def strategy_rows(portfolios: list[dict[str, Any]] | None = None) -> list[dict[s
         live_small_eligible = can_live_small_use_artifact(artifact)
         live_allowed = live_eligible or live_small_eligible
         portfolio_gate = portfolio_gate_for_strategy(artifact, portfolio_artifacts, mode=current_mode())
+        paper_portfolio_evidence_gate = paper_portfolio_evidence_gate_for_strategy(artifact, portfolio_gate)
         if portfolio_gate.get("active") and portfolio_gate.get("allowed") is not True:
+            live_allowed = False
+            live_small_eligible = False
+            live_eligible = False
+        if paper_portfolio_evidence_gate.get("required") and paper_portfolio_evidence_gate.get("ready") is not True:
             live_allowed = False
             live_small_eligible = False
             live_eligible = False
@@ -392,6 +397,8 @@ def strategy_rows(portfolios: list[dict[str, Any]] | None = None) -> list[dict[s
         block_reasons = list(fail_reasons)
         if portfolio_gate.get("active") and portfolio_gate.get("allowed") is not True:
             block_reasons.append(str(portfolio_gate.get("detail") or "Portfolio artifact gate blocked strategy."))
+        if paper_portfolio_evidence_gate.get("required") and paper_portfolio_evidence_gate.get("ready") is not True:
+            block_reasons.append(str(paper_portfolio_evidence_gate.get("detail") or "Portfolio paper evidence gate blocked strategy."))
         verification = artifact.get("verification") if isinstance(artifact.get("verification"), dict) else {}
         backtester_verification = verification.get("backtester") if isinstance(verification.get("backtester"), dict) else {}
         paper_verification = verification.get("paper_trader") if isinstance(verification.get("paper_trader"), dict) else {}
@@ -408,9 +415,52 @@ def strategy_rows(portfolios: list[dict[str, Any]] | None = None) -> list[dict[s
                 "backtester_label": str(backtester_verification.get("label", "Backtester 정보 없음")),
                 "paper_trader_label": str(paper_verification.get("label", "Paper 미검증")),
                 "portfolio_gate": portfolio_gate,
+                "paper_portfolio_evidence_gate": paper_portfolio_evidence_gate,
             }
         )
     return rows
+
+
+def paper_portfolio_evidence_gate_for_strategy(strategy: dict[str, Any], portfolio_gate: dict[str, Any]) -> dict[str, Any]:
+    if not portfolio_gate.get("active"):
+        return {"required": False, "ready": True, "detail": "Portfolio artifact gate 비활성"}
+    if portfolio_gate.get("allowed") is not True:
+        return {"required": True, "ready": False, "detail": "Portfolio hard gate 통과 전 evidence 평가 보류"}
+    evidence = strategy.get("paper_portfolio_evidence") if isinstance(strategy.get("paper_portfolio_evidence"), dict) else {}
+    portfolio_id = str(portfolio_gate.get("portfolioId") or "")
+    if not evidence:
+        return {
+            "required": True,
+            "ready": False,
+            "portfolioId": portfolio_id,
+            "detail": f"{portfolio_id or '선택 Portfolio'} 기준 Paper portfolio evidence가 없습니다.",
+        }
+    if str(evidence.get("portfolioId") or "") != portfolio_id:
+        return {
+            "required": True,
+            "ready": False,
+            "portfolioId": portfolio_id,
+            "evidencePortfolioId": str(evidence.get("portfolioId") or ""),
+            "detail": "Paper portfolio evidence가 현재 Live portfolio artifact와 일치하지 않습니다.",
+        }
+    filled_count = int(safe_float(evidence.get("filledCount"), 0.0))
+    rejected_count = int(safe_float(evidence.get("rejectedCount"), 0.0))
+    ready = evidence.get("ready") is True and str(evidence.get("status") or "").lower() == "submitted" and filled_count > 0 and rejected_count == 0
+    return {
+        "required": True,
+        "ready": ready,
+        "portfolioId": portfolio_id,
+        "portfolioName": str(evidence.get("portfolioName") or portfolio_gate.get("portfolioName") or ""),
+        "status": str(evidence.get("status") or ""),
+        "filledCount": filled_count,
+        "rejectedCount": rejected_count,
+        "targetWeight": evidence.get("targetWeight"),
+        "detail": (
+            f"Portfolio paper evidence 통과: filled {filled_count}건"
+            if ready
+            else f"Portfolio paper evidence 차단: status={evidence.get('status') or '-'}, filled={filled_count}, rejected={rejected_count}"
+        ),
+    }
 
 
 def portfolio_rows() -> list[dict[str, Any]]:
@@ -2448,6 +2498,16 @@ def evaluate_order_gate_with_report(
             ),
         )
     strategy = strategy_for_order_intent(checks, intent)
+    paper_portfolio_evidence_gate = strategy.get("paper_portfolio_evidence_gate") if isinstance(strategy.get("paper_portfolio_evidence_gate"), dict) else {}
+    if paper_portfolio_evidence_gate.get("required"):
+        evidence_status: CheckStatus = "pass" if paper_portfolio_evidence_gate.get("ready") is True else "fail"
+        report = PreTradeRiskReport(
+            report.checked_at,
+            (
+                RiskCheck("Portfolio Paper Evidence", evidence_status, str(paper_portfolio_evidence_gate.get("detail") or "")),
+                *report.checks,
+            ),
+        )
     revalidation = strategy_revalidation_status(strategy, lifecycle_status=strategy.get("lifecycle_status")) if strategy else {}
     if intent.side == "BUY" and revalidation.get("expired") is True:
         report = PreTradeRiskReport(

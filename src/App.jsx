@@ -1601,6 +1601,7 @@ function LivePreparationPanel({
 
 function PortfolioArtifactPanel({ portfolios = [], selectedStrategy }) {
   const gate = selectedStrategy?.portfolio_gate ?? {};
+  const evidenceGate = selectedStrategy?.paper_portfolio_evidence_gate ?? {};
   return (
     <section className="panel portfolio-artifact-panel">
       <PanelHeader title="포트폴리오 Artifact" subtitle="Live 주문은 선택 전략이 포함된 포트폴리오 universe와 target weight를 기준으로 제한됩니다." />
@@ -1613,6 +1614,17 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy }) {
           {!gate.active ? "LEGACY" : gate.allowed ? "PASS" : "BLOCK"}
         </StatusPill>
       </div>
+      {evidenceGate.required && (
+        <div className="portfolio-gate-summary portfolio-evidence-summary">
+          <div>
+            <span>Paper Portfolio Evidence</span>
+            <strong>{evidenceGate.detail || "Paper Trader 리밸런싱 실행 증거를 확인합니다."}</strong>
+          </div>
+          <StatusPill tone={evidenceGate.ready ? "success" : "danger"}>
+            {evidenceGate.ready ? "PASS" : "BLOCK"}
+          </StatusPill>
+        </div>
+      )}
       {gate.active && (
         <div className="portfolio-gate-metrics">
           <MetricCard className="metric-card" label="Portfolio" value={gate.portfolioName || gate.portfolioId || "-"} detail={gate.lifecycleStatus || "-"} />
@@ -2125,6 +2137,15 @@ function liveSmallExecutionSummaryForStrategy(strategyId, orders) {
 function buildLivePromotionChecklist(strategy, normalizedStage, execution, summary, operatorConfirmed) {
   const blockerCount = Number(summary?.blocker_count || 0);
   const liveSmallEligible = Boolean(strategy?.live_small_eligible);
+  const evidenceGate = strategy?.paper_portfolio_evidence_gate ?? {};
+  const evidenceItem = evidenceGate.required
+    ? [{
+      label: "Portfolio evidence",
+      detail: evidenceGate.detail || "Paper Trader의 portfolio rebalance 실행 evidence가 필요합니다.",
+      status: evidenceGate.ready ? "PASS" : "BLOCK",
+      tone: evidenceGate.ready ? "success" : "danger",
+    }]
+    : [];
   return [
     {
       label: "승급 단계",
@@ -2138,6 +2159,7 @@ function buildLivePromotionChecklist(strategy, normalizedStage, execution, summa
       status: liveSmallEligible ? "PASS" : "WAIT",
       tone: liveSmallEligible ? "success" : "warning",
     },
+    ...evidenceItem,
     {
       label: "소액 실거래",
       detail: execution.successful > 0 ? `실제 성공 주문 ${execution.successful}건을 확인했습니다.` : "SMALL_LIVE 실제 성공 주문 1건 이상이 필요합니다.",
@@ -2176,6 +2198,16 @@ function formatPercentValue(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return "0.00";
   return (numeric * 100).toFixed(2);
+}
+
+function portfolioEvidenceLabel(gate = {}) {
+  if (!gate.required) return "LEGACY";
+  return gate.ready ? "PASS" : "BLOCK";
+}
+
+function portfolioEvidenceTone(gate = {}) {
+  if (!gate.required) return "info";
+  return gate.ready ? "success" : "danger";
 }
 
 function statusTone(status) {
@@ -3163,6 +3195,7 @@ function LiveStrategySelectorPanel({
   const execution = liveSmallExecutionSummaryForStrategy(selectedStrategy?.strategy_id, orders);
   const checklist = buildLivePromotionChecklist(selectedStrategy, normalizedStage, execution, summary, operatorConfirmed);
   const lifecycleTimeline = buildLiveLifecycleTimeline(selectedStrategy);
+  const evidenceGate = selectedStrategy?.paper_portfolio_evidence_gate ?? {};
   const canPromoteLive = Boolean(
     selectedStrategy
       && normalizedStage === "before-live-small"
@@ -3202,6 +3235,7 @@ function LiveStrategySelectorPanel({
         <div className="live-strategy-status-strip">
           <StatusPill tone={promotionTone(promotionStage)}>{promotionLabel(promotionStage)}</StatusPill>
           <StatusPill tone={selectedStrategy?.live_allowed ? "success" : "danger"}>{selectedStrategy?.permission_label || "WAIT"}</StatusPill>
+          <StatusPill tone={portfolioEvidenceTone(evidenceGate)}>PORT {portfolioEvidenceLabel(evidenceGate)}</StatusPill>
           <StatusPill tone="info">READ ONLY</StatusPill>
         </div>
       </div>
@@ -3212,6 +3246,12 @@ function LiveStrategySelectorPanel({
             <MetricCard className="metric-card" label="대상" value={`${selectedStrategy.symbol} · ${selectedStrategy.timeframe}`} detail={selectedStrategy.asset} />
             <MetricCard className="metric-card" label="Release" value={selectedStrategy.release?.release_id || selectedStrategy.release_id || "-"} detail={selectedStrategy.release?.parameter_hash || "parameter hash 없음"} />
             <MetricCard className="metric-card" label="검증" value={selectedStrategy.verification?.paper_trader?.label || "Paper 상태 없음"} detail={selectedStrategy.promotion?.promoted_at || "승급 시간 없음"} />
+            <MetricCard
+              className="metric-card"
+              label="Portfolio Evidence"
+              value={portfolioEvidenceLabel(evidenceGate)}
+              detail={evidenceGate.required ? evidenceGate.detail : "단일 전략 모드"}
+            />
           </div>
           <div className="live-strategy-readonly-note">
             <strong>이 전략은 Backtester/Paper Trader에서 저장된 검증본입니다.</strong>
@@ -3301,6 +3341,7 @@ function StrategyPanel({ strategies, selectedStrategyId, onSelect }) {
           <span>Score</span>
           <span>검증</span>
           <span>권한</span>
+          <span>Evidence</span>
           <span>차단 사유</span>
         </div>
         {strategies.map((strategy) => {
@@ -3335,6 +3376,9 @@ function StrategyPanel({ strategies, selectedStrategyId, onSelect }) {
                 <StatusPill tone={verificationTone(paper.status)}>{paper.label}</StatusPill>
               </span>
               <StatusPill tone={strategy.live_allowed ? "success" : "danger"}>{strategy.permission_label}</StatusPill>
+              <StatusPill tone={portfolioEvidenceTone(strategy.paper_portfolio_evidence_gate)}>
+                {portfolioEvidenceLabel(strategy.paper_portfolio_evidence_gate)}
+              </StatusPill>
               <em>{strategy.block_reason}</em>
             </div>
           );

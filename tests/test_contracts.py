@@ -77,6 +77,39 @@ class StrategyContractTest(unittest.TestCase):
         self.assertEqual(artifact["verification"]["live"]["status"], "fail")
         self.assertIn("최종 검증 미통과", artifact["verification"]["backtester"]["detail"])
 
+    def test_strategy_artifact_exposes_paper_portfolio_evidence(self) -> None:
+        artifact = normalize_strategy_artifact(
+            {
+                "id": "PORT-EVIDENCE-1",
+                "strategy_id": "STRAT-1",
+                "dataset": {"symbol": "069500.KS", "assetClass": "KR-STOCK", "interval": "1d"},
+                "plugin": "moving_average_cross",
+                "lifecycle": {"status": "before-live-small"},
+                "finalTest": {"status": "pass"},
+                "permissions": {
+                    "paper_trader_verified": True,
+                    "live_small_eligible": True,
+                    "fail_reasons": [],
+                },
+                "paperPortfolioEvidence": {
+                    "required": True,
+                    "ready": True,
+                    "portfolioId": "portfolio-1",
+                    "portfolioName": "Portfolio 1",
+                    "status": "submitted",
+                    "filledCount": 1,
+                    "rejectedCount": 0,
+                    "targetWeight": 0.25,
+                },
+            }
+        )
+
+        evidence = artifact["paper_portfolio_evidence"]
+        self.assertTrue(evidence["required"])
+        self.assertTrue(evidence["ready"])
+        self.assertEqual(evidence["portfolioId"], "portfolio-1")
+        self.assertEqual(evidence["filledCount"], 1)
+
     def test_strategy_paths_can_be_configured_from_shared_environment(self) -> None:
         previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
         previous_plugin = os.environ.get("LIVE_TRADER_STRATEGY_PLUGIN_DIR")
