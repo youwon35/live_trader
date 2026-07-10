@@ -1,64 +1,81 @@
 # Live Trader Handoff
 
-Last updated: 2026-07-02 KST
+Last updated: 2026-07-11 KST
 Project path: `D:\github\PROGRAM\trading-system\apps\live_trader`
-Branch: `develop`
-Latest pushed commit before this handoff: `d2a1adb993d2ac9c97cf47ff90be00073eb300dd`
-Remote: `https://github.com/youwon35/live_trader.git`
+Repository: `https://github.com/youwon35/live_trader.git`
+Primary branch: `develop`
+Latest known pushed code commit before this rewrite: `25d2bd33fdbffaab92428bd24e428d844ad6543e`
 
 ## One Sentence Summary
 
-`live_trader` is the real-money execution console for the `trading-system` workspace, but it is still intentionally gated: it can prepare, inspect, simulate, route, and build official broker API requests, while actual real-money order sending must remain blocked until credentials, adapter verification, account/position APIs, operator approval, and live strategy permissions are fully satisfied.
+`live_trader` is the real-money execution console in the `trading-system` workspace. It prepares broker/API connections, reads approved strategy artifacts, checks account/risk state, runs dry-run/test order gates, and packages as a desktop EXE, but actual real-money broker order sending must remain blocked until every live safety condition is explicitly satisfied and tested.
 
-## Product Direction
+## Workspace Relationship
 
-The user wants the app to behave like a real desktop trading application:
+The broader workspace is `D:\github\PROGRAM\trading-system`.
 
-- Python local server
-- React frontend
-- PyWebView desktop wrapper
-- PyInstaller EXE
-- Backtester-like UI design
-- Real-money workflow, not a mock trading toy
+The four user-facing programs are expected to work as one trading pipeline:
 
-The app should eventually trade:
+1. `stock_data_scraper`
+   - Collects and prepares market data.
+   - It is upstream of research/backtest workflows.
+   - Its layout-editing behavior has been used as a reference for resizable panels.
+2. `backtester`
+   - Researches and validates strategy ideas on historical data.
+   - Exports strategy artifacts into the shared strategy area.
+   - UI styling is a key design reference for Live Trader and Paper Trader.
+3. `paper_trader`
+   - Runs approved strategies in paper/shadow mode.
+   - Shares the same core order intent and risk gate runtime with Live Trader.
+   - Its job is to prove execution logic before any real-money route is enabled.
+4. `live_trader`
+   - Consumes approved artifacts and manages live-readiness, broker capability checks, account/position reconciliation, Watchdog, order gates, and audit logs.
+   - It is the final real-money console, so it must be conservative and fail closed.
 
-- Korean stocks, US stocks, gold ETF, oil ETF through Korea Investment Securities Open API.
-- Crypto through Binance and/or Upbit.
+Important shared packages:
 
-Important architectural decision:
+- `packages\design`
+  - Shared design tokens and UI primitives.
+  - Live Trader imports `../../../packages/design/design_tokens.json` and CSS tokens from `../../../packages/design/design-tokens.css`.
+- `packages\trading_runtime`
+  - Shared order/risk/strategy runner runtime.
+  - Paper Trader and Live Trader both depend on this package for core trading contracts.
+- `packages\strategy-core`
+  - Shared strategy artifact and plugin area.
+  - Live Trader can scan this folder for strategy artifacts unless overridden by env vars.
 
-- Do not use one global "start everything" button.
-- Split real automation by asset route:
-  - Stock/ETF automation: KIS route.
-  - Crypto automation: Binance or Upbit route.
-- Each route has its own mode:
+## Current Product Direction
+
+The user wants a real desktop trading application, not a browser-only mock.
+
+Key expectations:
+
+- Python local server.
+- React frontend.
+- PyWebView desktop wrapper.
+- PyInstaller EXE.
+- Backtester/Paper-like dense professional UI.
+- Real trading readiness with safety gates before broker orders.
+
+Supported or planned broker routes:
+
+- KIS / Korea Investment Securities Open API for Korean stocks, US stocks, ETFs, gold/oil ETFs.
+- Binance and/or Upbit for crypto.
+
+Important product rule:
+
+- Do not build one global "start everything" button.
+- Live automation must be route-separated:
+  - `stock`: KIS stock/ETF route.
+  - `crypto`: Binance or Upbit crypto route.
+- Each route supports:
   - `MONITOR`: observe only.
   - `SMALL_LIVE`: small live mode after gates pass.
   - `FULL_LIVE`: full live mode only after stricter gates pass.
 
-## Relationship To Other Apps
+## Current UI Structure
 
-The surrounding workspace is `D:\github\PROGRAM\trading-system`.
-
-Expected workflow:
-
-1. `stock_data_scraper`: collects and prepares market data.
-2. `backtester`: researches strategies and exports strategy artifacts.
-3. `paper_trader`: validates strategies in paper/shadow mode.
-4. `live_trader`: consumes approved artifacts and manages real-money execution readiness.
-
-Design references:
-
-- Main UI should continue following `apps\backtester`.
-- Layout editing behavior should continue moving toward `apps\stock_data_scraper`.
-- Shared design assets live under `packages\design`.
-- React imports `../../../packages/design/design_tokens.json`.
-- CSS imports `../../../packages/design/design-tokens.css`.
-
-## Current Navigation
-
-Current left navigation order:
+Left navigation:
 
 1. `사전점검`
 2. `실거래 준비`
@@ -67,104 +84,128 @@ Current left navigation order:
 5. `API`
 6. `설정`
 
-Removed/merged concepts:
+Recently removed or merged:
 
-- Old `대시보드` was renamed/reworked into `사전점검`.
-- `최종점검` was removed because Doctor covers that role.
-- `전략` standalone tab was removed; strategy artifact checks now belong under `실거래 준비`.
-- `주문` standalone tab was merged into execution/preparation flows.
-- `Live Readiness`, `운용 요약`, and broad duplicate check panels were removed from most tabs.
+- The old dashboard became `사전점검`.
+- A separate `최종점검` tab was removed because Doctor covers it.
+- A standalone `전략` tab was merged into `실거래 준비`.
+- A standalone `주문` tab was merged into execution/preparation surfaces.
+- Repeated top title/description headers were removed from tabs to reduce wasted vertical space.
+- The top KRX/NYSE/Binance/Risk Engine status strip was removed from all tabs.
 
-## Current UI Responsibilities
+Current sidebar branding:
+
+- Title: `실시간거래소`
+- Subtitle `주문 운영 데스크` was removed.
+
+## Tab Responsibilities
 
 ### 사전점검
 
-File area: `src\App.jsx`, `PreTradeDoctorPanel`, `buildDoctorItems`.
+Main frontend pieces:
+
+- `PreTradeDoctorPanel`
+- `buildDoctorItems`
+- `Doctor` detail rows in `src\App.jsx`
 
 Purpose:
 
-- Acts like a Doctor / quick tester.
-- User clicks `점검 실행`.
-- It runs reconciliation and final preflight.
-- It shows compact cards for API/broker, checklist, risk, strategy permission, reconciliation, and preflight.
-- Clicking a card shows detail rows and has a button to open the related tab.
+- One-click preflight surface.
+- Runs reconciliation/final preflight.
+- Shows compact status cards for:
+  - API/broker connection.
+  - checklist.
+  - risk limits.
+  - strategy live permission.
+  - reconciliation.
+  - Live Watchdog.
+  - final preflight.
+- Clicking a card shows detailed rows and a related-tab shortcut.
 
-Known UI requirement:
+Recent UI requirements:
 
-- This page must remain scrollable so lower detail rows are visible.
-- Top global status pills were intentionally removed from several pages where they duplicated Doctor.
+- The tab must be scrollable so lower detail rows are not clipped.
+- Doctor cards are compact: roughly 360px wide and 72px high at desktop width.
+- Success/warning/danger cards use light green/yellow/red backgrounds with weak gray borders, not saturated colored outlines.
+- Detail rows are capped narrower than the full page when possible, currently around 680px.
 
 ### 실거래 준비
 
-File area: `src\App.jsx`, `LivePreparationPanel`.
+Main frontend pieces:
 
-Purpose:
-
-- Prepare each asset route before automation.
-- Has internal tabs: `주식/ETF`, `코인`.
-- Contains route-specific strategy artifacts, risk settings, retry policy, and operational safeguards.
-
-Recently removed from this tab:
-
-- Preparation summary cards such as current mode / broker / live strategy count.
-- `주문 큐 요약`.
-- `주문 기록`.
-- `운용자 확인` button.
-
-Current main panels:
-
+- `LivePreparationPanel`
 - `StrategyPanel`
+- `LiveStrategySelectorPanel`
 - `OperationalSafeguardsPanel`
 - `RiskSettingsPanel`
 - `RetryPolicyPanel`
+- `WatchdogPanel`
 
-Operational safeguards currently include:
+Purpose:
+
+- Prepare route-level live trading for `주식/ETF` and `코인`.
+- Review strategy artifacts, risk settings, retry policy, operational safeguards, and Watchdog state.
+
+Current internal tabs:
+
+- `주식/ETF`
+- `코인`
+
+Current operational safeguards:
 
 - `Dry Run`
 - `신규 진입 차단`
 - `테스트 주문 게이트`
-- inline kill switch status
+- inline emergency/kill switch state
+
+Recent UI changes:
+
+- The right-side risk/retry panel stacks below the main content at narrower desktop widths to avoid overlap.
+- Global tab title/description headers were removed.
+- Strategy artifact panel spacing was improved so select/status/metric/note/parameter boxes no longer look glued together.
 
 ### 자동화
 
-File area: `src\App.jsx`, `AutomationLauncherPanel`.
+Main frontend pieces:
+
+- `AutomationLauncherPanel`
+- route automation cards
+- provider selector for crypto
 
 Purpose:
 
-- Start/stop route-level automation.
-- Has internal tabs: `주식/ETF`, `코인`.
-- Each tab shows a route-specific automation card.
-- Crypto tab can switch provider between Binance and Upbit.
-- Each automation card has mode buttons: `MONITOR`, `SMALL LIVE`, `FULL LIVE`.
+- Start/stop route-level automation profiles.
+- Show mode controls for each route.
 
-Recently changed:
+Current automation profiles:
 
-- Old explanatory `자동거래 흐름` panel was removed.
-- The right side now shows `주문 큐 요약` and `주문 기록`.
-- `Order Blotter` text was renamed to Korean `주문 기록`.
+- `stock`
+  - provider: `kis`
+  - assets: Korean stocks, US stocks, ETFs.
+- `crypto`
+  - provider: `binance` or `upbit`
+  - assets: spot crypto routes.
 
 Important behavior:
 
-- Automation mode buttons currently update app state and create audit entries.
-- They do not yet run a continuous production trading engine.
-- Real broker sending remains gated by backend readiness and adapter status.
+- Mode buttons currently update local state and create audit entries.
+- They do not yet run a complete long-lived production automation engine.
+- Real broker sending remains blocked by backend readiness, broker adapter status, risk gate, strategy permission, and operational flags.
 
 ### 로그
 
-File area: `src\App.jsx`, `AuditPanel`, `AuditExportPanel`.
+Main frontend pieces:
+
+- `AuditPanel`
+- `AuditExportPanel`
+- `inferLogChannel`
 
 Purpose:
 
-- Show execution/audit logs in a compact log-console style similar to backtester.
+- Compact trading-console log view.
+- Shows audit events, filters, search, sort, and export controls.
 
-Recently changed:
-
-- Removed right-side `운용 리포트` and risk panels.
-- Removed large export card.
-- Export is now a small action panel with CSV/HTML buttons.
-- Log table now has search input, channel filter, level filter, sort dropdown, and dense rows.
-
-Current log channels are inferred in frontend by `inferLogChannel`:
+Current inferred channels:
 
 - `ORDER`
 - `API`
@@ -172,73 +213,117 @@ Current log channels are inferred in frontend by `inferLogChannel`:
 - `RISK`
 - `SYSTEM`
 
+Exports:
+
+- CSV
+- HTML
+
+Important:
+
+- The audit log is currently app-state/SQLite backed, not yet a true streaming engine log from a production order runner.
+
 ### API
 
-File area:
+Main frontend/backend areas:
 
 - `src\App.jsx`
 - `live_trader\brokers.py`
 - `live_trader\live_adapters.py`
+- `live_trader\env_settings.py`
 
 Purpose:
 
-- Manage/check broker API readiness and adapter capabilities.
-- Shows KIS, Binance, and Upbit readiness.
+- Check broker connection readiness.
+- Show broker capability matrix.
+- Manage or inspect KIS/Binance/Upbit real-account env fields.
 
-Current broker specs:
+Recent UI changes:
+
+- Broker capability cards are compact one-line cards.
+- Card title and detail are on the same line.
+- Capability card height is about 43px.
+- Success/failure/warning backgrounds remain light green/red/yellow with weak gray borders.
+- Placeholder/example text in settings/API fields is intentionally pale and slightly smaller so it is not confused with real user input.
+
+Broker env fields:
 
 - KIS:
-  - env: `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO`, `KIS_ACCOUNT_PRODUCT_CODE`
-  - order request building implemented
-  - auth token request implemented
-  - domestic balance/holding snapshot request implemented through `inquire-balance`
-  - overseas holding/cancel still need real API integration
+  - `KIS_APP_KEY`
+  - `KIS_APP_SECRET`
+  - `KIS_ACCOUNT_NO`
+  - `KIS_ACCOUNT_PRODUCT_CODE`
+  - optional/used fields include `KIS_BASE_URL`, `KIS_HTS_ID`
 - Binance:
-  - env: `BINANCE_API_KEY`, `BINANCE_API_SECRET`
-  - signed spot order request building implemented
-  - signed `/api/v3/account` balance snapshot implemented
-  - cancel/user stream still need integration
+  - `BINANCE_API_KEY`
+  - `BINANCE_API_SECRET`
 - Upbit:
-  - env: `UPBIT_ACCESS_KEY`, `UPBIT_SECRET_KEY`
-  - JWT order request building implemented
-  - `/v1/accounts` balance snapshot implemented
-  - cancel still needs integration
+  - `UPBIT_ACCESS_KEY`
+  - `UPBIT_SECRET_KEY`
+
+Current broker capability state:
+
+- KIS:
+  - OAuth token request implemented.
+  - domestic balance/holding snapshot request implemented.
+  - cash order request builder implemented.
+  - cancel/correction and overseas holdings still need official integration.
+- Binance:
+  - signed spot order request builder implemented.
+  - signed `/api/v3/account` balance snapshot implemented.
+  - cancel and user stream still need integration.
+- Upbit:
+  - JWT order request builder implemented.
+  - `/v1/accounts` snapshot implemented.
+  - cancel/status still need integration.
 
 Important:
 
-- The app should not display fake real account data.
-- If an API is not implemented or credentials are missing, show that it is required/missing.
+- Never show fake account data as if it were real.
+- Missing credentials or unimplemented broker actions should stay visibly missing/blocked.
 
 ### 설정
 
 Purpose:
 
-- Theme and layout controls.
-- User wanted white mode to persist after app restart.
-- UI settings are persisted by the Python server.
+- Theme controls.
+- Layout lock/edit/reset controls.
+- `.env` connection assistant.
 
-Persistence file:
+Persistence:
 
 ```text
 %APPDATA%\LiveTrader\ui-settings.json
 ```
 
-API endpoints:
+UI settings endpoints:
 
 - `GET /api/ui-settings`
 - `POST /api/ui-settings`
 
-## Current Backend Structure
+Env workflow:
+
+- `.env` is ignored by git.
+- `.env.example` is allowed in git.
+- App loads `.env` through `live_trader\env_loader.py`.
+- Existing OS environment variables win over `.env`.
+- Empty `.env` values are ignored.
+- Real secrets should be stored in `.env` or OS env, not committed.
+
+## Backend Structure
 
 Main backend files:
 
 - `live_trader\server.py`
 - `live_trader\state.py`
-- `live_trader\order_management.py`: compatibility wrapper; actual `OrderIntent` comes from shared `packages\trading_runtime`.
-- `live_trader\risk_engine.py`: compatibility wrapper; actual `PreTradeContext`, `PreTradeRiskGate`, and report classes come from shared `packages\trading_runtime`.
+- `live_trader\order_management.py`
+- `live_trader\risk_engine.py`
 - `live_trader\brokers.py`
 - `live_trader\contracts.py`
 - `live_trader\live_adapters.py`
+- `live_trader\env_loader.py`
+- `live_trader\env_settings.py`
+- `live_trader\audit_store.py`
+- `live_trader\program_ledger.py`
 - `live_trader\desktop.py`
 - `live_trader\__main__.py`
 
@@ -255,6 +340,8 @@ Important endpoints:
 - `GET /api/snapshot`
 - `GET /api/ui-settings`
 - `POST /api/ui-settings`
+- `GET /api/env-settings`
+- `POST /api/env-settings`
 - `POST /api/mode`
 - `POST /api/flag`
 - `POST /api/automation`
@@ -270,62 +357,46 @@ Important endpoints:
 - `POST /api/strategy-cycle`
 - `POST /api/watchdog`
 
-### Order Intent And Risk Gate
+## Shared Runtime Boundary
 
-As of 2026-07-02, live order test/retry paths no longer use only a simple readiness/dry-run check.
+Paper Trader and Live Trader must keep using the same core boundary:
 
-- Paper Trader and Live Trader share the real order/risk implementation in `trading-system\packages\trading_runtime`.
-- `live_trader\order_management.py` and `live_trader\risk_engine.py` are local compatibility wrappers so existing imports remain stable.
-- `live_trader\state.py` converts a strategy/test order into `OrderIntent`, builds `PreTradeContext` from current mode, dry-run, kill switch, readiness, reconciliation, broker readiness, and risk settings, then evaluates the intent through `PreTradeRiskGate`.
-- Orders now keep a `risk_report` payload so the UI/log layer can later explain exactly which checks passed, warned, or blocked the order.
-- Non-dry-run broker transmission still remains blocked until the real send layer and adapter verification are intentionally enabled.
+```text
+strategy signal -> OrderIntent -> PreTradeRiskGate -> adapter or dry-run ledger
+```
 
-As of 2026-07-02, Paper Trader and Live Trader also share the strategy signal boundary in `trading-system\packages\trading_runtime\trading_runtime\strategy_runner.py`.
+Implemented shared runtime:
 
-- `StrategyExecutionRunner` resolves a strategy signal provider, normalizes `BUY`/`SELL` into the shared `OrderIntent` contract, and returns a serializable runner report.
-- Paper Trader's `PaperTradingEngine` uses this runner before its paper risk gate and broker ledger.
-- Live Trader exposes `/api/strategy-cycle` and the automation panel's `전략 사이클 점검` button to run a dry-run strategy cycle from approved artifacts.
-- Live strategy-cycle orders call `submit_order_intent()`, which routes every generated intent through `evaluate_order_gate_with_report()` and `PreTradeRiskGate`; no strategy signal path is allowed to bypass the gate.
-- This is the shared boundary foundation, not the complete continuous automation engine yet.
+- `packages\trading_runtime\trading_runtime\order_management.py`
+- `packages\trading_runtime\trading_runtime\risk_engine.py`
+- `packages\trading_runtime\trading_runtime\strategy_runner.py`
 
-### Live Watchdog
+Live Trader local wrappers:
 
-As of 2026-07-02, Live Trader has a server-side Watchdog layer.
+- `live_trader\order_management.py`
+- `live_trader\risk_engine.py`
 
-- Main implementation: `live_trader\state.py`.
-- API: `POST /api/watchdog`.
-- Background loop: `live_trader\server.py` starts a daemon Watchdog worker every 15 seconds while the desktop server is running.
-- UI: `src\App.jsx` shows a `Live Watchdog` panel on automation and live-prep surfaces, includes a Doctor card, and exposes Watchdog critical/warning states in search and notifications.
-- The Watchdog checks heartbeat age, strategy/market-data freshness, active broker/API readiness, recent order burst count, retryable queue size, blocked-order accumulation, and account/position reconciliation state.
-- Critical Watchdog conditions fail closed by forcing `MONITOR`, turning on `new_entries_blocked`, and disabling active automation profiles.
-- `evaluate_order_gate_with_report()` appends a `Watchdog` fail check to `PreTradeRiskReport` when the current snapshot has Watchdog critical items, so order audit logs show the safety reason instead of hiding it behind a generic readiness blocker.
-- This is still a local/state watchdog. It does not yet consume true broker user streams, exchange heartbeats, or real market-data websocket latency.
+Reason for wrappers:
 
-### Account And Position Reconciliation
+- Preserve local imports while sharing real implementation with Paper Trader.
 
-As of 2026-07-02, the reconciliation button no longer uses only static placeholder broker quantities.
+Current risk gate behavior:
 
-- `live_trader\live_adapters.py` builds read-only account snapshot requests for:
-  - KIS domestic stock balance: `GET /uapi/domestic-stock/v1/trading/inquire-balance`
-  - Binance Spot account: `GET /api/v3/account`
-  - Upbit accounts: `GET /v1/accounts`
-- `live_trader\brokers.py` parses those responses into normalized account and position rows.
-- `live_trader\state.py` stores the latest result under `STATE["broker_reconciliation"]` with `accounts`, `positions`, `errors`, and `fetched_at`.
-- `run_reconciliation()` refreshes broker snapshots first, then builds the UI reconciliation summary.
-- The UI now shows a `조회 오류` metric in the reconciliation summary.
-- If broker cash is fetched but the program-side cash ledger is missing, the row stays blocked as `원장 필요`. This is intentional: live trading should not treat broker balance alone as a complete pass.
-- Unknown broker positions that are not present in the program position book are surfaced as `불일치`.
-- This implementation is read-only and does not enable real orders.
+- `live_trader\state.py` converts test/strategy/retry orders into `OrderIntent`.
+- It builds `PreTradeContext` from current mode, dry-run, kill switch, readiness, reconciliation, broker readiness, Watchdog, and risk settings.
+- It evaluates through `PreTradeRiskGate`.
+- Orders keep a serializable `risk_report`.
+- Non-dry-run broker transmission remains blocked until explicitly implemented and verified.
 
-Known reconciliation limits:
+Important safety invariant:
 
-- KIS currently uses the domestic stock balance endpoint only; overseas stock/ETF holdings still need official endpoint wiring.
-- Binance and Upbit balances are account snapshots, not yet order-status/user-stream reconciliation.
-- Program cash ledger persistence is not implemented yet, so cash rows can remain `원장 필요` even when broker balances are successfully fetched.
+- No test order, retry order, strategy-cycle order, or future automation order should bypass `OrderIntent -> PreTradeRiskGate`.
 
 ## Strategy Artifacts
 
-Main file: `live_trader\contracts.py`.
+Main file:
+
+- `live_trader\contracts.py`
 
 Artifact search order:
 
@@ -334,13 +405,13 @@ Artifact search order:
 3. `trading-system\packages\strategy-core`
 4. `%APPDATA%\trading_programs\strategies`
 
-Strategy plugin folders:
+Plugin search order:
 
 1. `LIVE_TRADER_STRATEGY_PLUGIN_DIR`
 2. `TRADER_STRATEGY_PLUGIN_DIR`
 3. each artifact folder's `plugins` subfolder
 
-Current artifact normalization produces:
+Normalized artifact fields include:
 
 - `strategy_id`
 - `name`
@@ -355,36 +426,111 @@ Current artifact normalization produces:
 - `backtester_verified`
 - `paper_trader_verified`
 
-Verification badges:
-
-- Backtester badge
-- Paper Trader badge
-- Live permission badge
-
 Live permission logic:
 
 - `permissions.live_allowed === true`
 - or top-level `live_allowed === true`
 
-The UI shows strategy rows with Backtester/Paper verification pills and live permission.
+Frontend shows:
+
+- Backtester verification badge.
+- Paper Trader verification badge.
+- Live permission/read-only/live-blocked badges.
+
+## Live Watchdog
+
+Main implementation:
+
+- `live_trader\state.py`
+
+API:
+
+- `POST /api/watchdog`
+
+Server loop:
+
+- `live_trader\server.py` starts a daemon Watchdog worker while the desktop server runs.
+
+Watchdog checks:
+
+- heartbeat age.
+- strategy/market data freshness.
+- active broker/API readiness.
+- recent order burst count.
+- retry queue size.
+- blocked order accumulation.
+- account/position reconciliation state.
+
+Fail-closed behavior:
+
+- Critical Watchdog conditions force `MONITOR`.
+- They turn on `new_entries_blocked`.
+- They disable active automation profiles.
+- They are appended to `PreTradeRiskReport` so order audit logs show the safety reason.
+
+Current limitation:
+
+- Watchdog is local/state based.
+- It does not yet consume broker user streams, exchange websocket heartbeats, or true market-data latency feeds.
+
+## Account And Position Reconciliation
+
+Main files:
+
+- `live_trader\live_adapters.py`
+- `live_trader\brokers.py`
+- `live_trader\state.py`
+- `live_trader\program_ledger.py`
+
+Read-only broker snapshot requests:
+
+- KIS domestic stock balance:
+  - `GET /uapi/domestic-stock/v1/trading/inquire-balance`
+- Binance Spot account:
+  - `GET /api/v3/account`
+- Upbit accounts:
+  - `GET /v1/accounts`
+
+State storage:
+
+- `STATE["broker_reconciliation"]`
+  - `accounts`
+  - `positions`
+  - `errors`
+  - `fetched_at`
+
+Behavior:
+
+- `run_reconciliation()` refreshes broker snapshots first.
+- It then compares broker-side rows with the program ledger.
+- Unknown broker positions are surfaced as `불일치`.
+- Broker cash with missing program cash ledger remains blocked as `원장 필요`.
+- UI shows a `조회 오류` metric.
+
+Current limits:
+
+- KIS overseas stock/ETF reconciliation is not fully wired.
+- Binance/Upbit order status and cancel/user-stream reconciliation are not done.
+- Program cash ledger persistence is started but not yet enough to make all cash rows fully pass.
 
 ## Real Trading Safety State
 
 The app is intentionally conservative.
 
-Real order submission must remain blocked unless:
+Real order submission must remain blocked unless all relevant conditions pass:
 
-- `LIVE_TRADER_ENABLE_REAL_ORDERS=true`
-- broker env credentials exist
-- signed order adapter is enabled/verified
-- strategy artifact has `live_allowed=true`
-- operational checklist is done
-- reconciliation blockers are resolved
-- kill switch is off
-- required mode gates pass
-- `FULL_LIVE` has zero warnings
+- `LIVE_TRADER_ENABLE_REAL_ORDERS=true`.
+- broker env credentials exist.
+- signed broker adapter is implemented and verified.
+- strategy artifact has `live_allowed=true`.
+- operational checklist is complete.
+- reconciliation blockers are resolved.
+- kill switch is off.
+- route mode gates pass.
+- Watchdog has no critical items.
+- `FULL_LIVE` has zero warnings.
 
-Known safety flags in state:
+Known state flags:
 
 - `dry_run`
 - `new_entries_blocked`
@@ -393,37 +539,15 @@ Known safety flags in state:
 - `mode`
 - `watchdog`
 
-Important nuance:
+Important terms:
 
-- `Dry Run` means generated order intents must not be sent to broker.
-- `신규 진입 차단` blocks new entry/buy orders.
-- `Kill Switch` is a hard stop.
+- `Dry Run`: generate and audit intent, do not send to broker.
+- `신규 진입 차단`: block new entry/buy orders.
+- `Kill Switch`: hard stop.
 
-## Automation Model
+## Desktop / EXE Build
 
-Main file: `live_trader\state.py`, `automation_profiles`.
-
-Current profiles:
-
-- `stock`
-  - title: `주식/ETF 자동화`
-  - provider: `kis`
-  - assets: Korean stocks, US stocks, gold ETF, oil ETF
-- `crypto`
-  - title: `코인 자동화`
-  - provider: `binance` or `upbit`
-  - assets: Binance spot, Upbit KRW market
-
-Important:
-
-- `MONITOR`, `SMALL_LIVE`, and `FULL_LIVE` are route-level modes.
-- User wants stock/ETF and crypto separated because capital and broker accounts are separate.
-- The UI now reflects this separation.
-- The actual long-running automation engine is still a future implementation step.
-
-## EXE / Desktop Build
-
-Build script:
+Build command:
 
 ```powershell
 .\build_exe.ps1
@@ -435,28 +559,28 @@ Output:
 release\LiveTrader.exe
 ```
 
-The build script:
+Build script responsibilities:
 
-- installs Python desktop requirements
-- runs `npm run build`
-- creates/updates app icon files
-- runs PyInstaller
-- adds `packages\trading_runtime` to the PyInstaller search path and hidden imports so the EXE uses the shared order/risk engine.
-
-Notes from recent builds:
-
-- Build succeeded after the latest UI changes.
-- PyInstaller may warn about Android/webview or pycparser hidden imports; these were non-blocking in recent runs.
-- Current output EXE was rebuilt on 2026-07-02 after adding read-only broker reconciliation snapshots.
+- install/check Python desktop requirements.
+- run `npm run build`.
+- create/update icon files.
+- run PyInstaller.
+- include shared `packages\trading_runtime`.
 
 User preference:
 
-- When code changes, rebuild the EXE too.
-- Documentation-only changes do not necessarily require EXE rebuild unless code/runtime behavior changed.
+- When code/UI/runtime changes are made, always rebuild the EXE.
+- The user explicitly said: "exe파일은 항상 만들어줘."
+- Documentation-only changes do not alter the EXE, but future implementation turns should include EXE generation before final.
 
-## Testing
+Recent known EXE state:
 
-Recent verification:
+- `release\LiveTrader.exe` was successfully rebuilt after the compact status-card UI changes.
+- PyInstaller warnings about Android/webview or pycparser hidden imports were non-blocking.
+
+## Testing And Validation
+
+Preferred validation commands:
 
 ```powershell
 npm run build
@@ -464,14 +588,17 @@ npm run build
 .\build_exe.ps1
 ```
 
-Results:
+Use `unittest`, not pytest, unless pytest is intentionally added.
 
-- `npm run build`: passed.
-- `python -m unittest discover -s tests`: passed.
-- `pytest`: not installed in the current venv, so use `unittest` unless adding pytest intentionally.
-- EXE build: passed.
+Recent browser checks from the compact UI pass:
 
-## Git / Workflow Rules
+- API capability cards render at about 43px high.
+- Capability cards use flex and keep title/detail on one line.
+- Doctor cards render at about 360px x 72px.
+- Doctor/detail/Watchdog status rows use light state backgrounds with weak gray borders.
+- 1280px viewport had no horizontal document overflow.
+
+## Git Workflow
 
 Repository:
 
@@ -485,98 +612,75 @@ Branch:
 develop
 ```
 
-Recent commit:
+Rules:
 
-```text
-d2a1adb Add live trading watchdog fail closed gate
-```
+- Commit and push changes to `develop`.
+- Commit/push inside the `live_trader` repo, not the parent `trading-system` repo.
+- Do not include ignored generated artifacts unless the repo already tracks them.
+- `logs/`, `.env`, `.venv`, `dist`, `build`, `release`, and cache folders are local/ignored or should stay out of ordinary commits.
 
-User wants changes committed and pushed to `develop`.
+Current note:
 
-Important:
+- A local untracked `logs/` folder may appear after running the app. It is runtime data and should not be staged unless the user explicitly asks.
 
-- Commit/push in the `live_trader` repo, not the parent `trading-system` repo.
-- The working tree was clean before this handoff rewrite.
-- After modifying `handoff.md`, commit and push the doc update.
+## User-Specific Record-Keeping
 
-## User-Specific Logging Requirement
-
-The user asked that important work summaries be appended to:
+When important work is done, append a readable summary to:
 
 ```text
 F:\동기화용 파일\인쇄용\live_trader_print.py
 ```
 
-They also asked that summaries be appended to the Notion project page under a `요약` toggle.
+Also append the same general-document summary to the Notion page for folder name `live_trader`.
 
-Known Notion page used previously:
+Known Notion page:
 
 ```text
 3818d558-4385-8048-8fe4-d5c2c9695fce
 ```
 
-Use the Notion update tool when available.
+The page already contains multiple `요약` toggles. Continue appending in the same style unless the user asks to restructure it.
 
 ## Current Known Gaps
 
-Critical gaps before real money should be enabled:
+Critical before real money:
 
-- No complete continuous automation engine yet; the shared `StrategyExecutionRunner -> OrderIntent -> PreTradeRiskGate` boundary and local Watchdog fail-closed layer are in place for test strategy cycles.
-- KIS domestic account/position snapshot is implemented, but overseas stock/ETF reconciliation still needs real API integration.
-- Binance account/balance snapshot is implemented, but order status, cancel, and user stream still need integration.
-- Upbit account/balance snapshot is implemented, but order status and cancel still need integration.
-- Program-side cash ledger persistence is still missing, so cash reconciliation cannot fully pass yet.
-- Real broker submission must be audited with sandbox or tiny live orders before enabling.
-- Strategy plugin execution from Backtester/Paper artifacts to live market signals still needs production-grade market data wiring, plugin loading, and scheduling.
-- Shared risk engine now runs for live test/retry/strategy-cycle order intents, but the future continuous automation engine must keep using the same `OrderIntent -> PreTradeRiskGate -> adapter` boundary before any broker transmission.
-- Logs are currently derived from audit events, not yet a true streaming engine log source.
+- No complete continuous automation engine yet.
+- KIS overseas stock/ETF account and position reconciliation still needs official API wiring.
+- Binance/Upbit order status, cancel, and user-stream reconciliation are incomplete.
+- Program-side cash ledger must be completed before cash reconciliation can fully pass.
+- Real broker send layer must be tested with fixtures, sandbox/paper equivalents, and tiny live-order procedures before enabling.
+- Strategy plugin execution needs production-grade market data, scheduling, and stricter artifact lifecycle gates.
+- Audit logs need persistent production-grade retention and streaming behavior.
 
-UI gaps to watch:
+UI gaps to keep watching:
 
-- Keep all pages scrollable at desktop and narrow widths.
-- Avoid duplicate panels across tabs.
-- Keep tabs and buttons aligned vertically centered.
-- Keep white mode text high-contrast.
-- Keep selected nav using user accent color where applicable.
+- All pages must remain scrollable.
+- Narrow desktop widths must avoid panel overlap.
+- Placeholder text must remain visibly different from actual user-entered values.
+- Colored status cards should use soft backgrounds and weak gray borders.
+- Avoid duplicate explanatory panels and oversized cards.
+- Keep layout dense and professional rather than landing-page-like.
 
 ## Selected Roadmap
 
-The user selected this order on 2026-07-02:
+User-selected roadmap from earlier work:
 
-1. Strengthen real-time order/risk audit logs:
-   - every submitted, blocked, or retried order should leave the risk gate result in the audit log
-   - CSV/HTML exports should contain the same reason trail
-2. Share the strategy plugin runner boundary:
-   - load approved Backtester/Paper artifact
-   - normalize signal into `OrderIntent`
-   - pass through `PreTradeRiskGate`
-   - only then send to adapter or dry-run ledger
-   - 2026-07-02 foundation implemented with `trading_runtime.strategy_runner`, Paper integration, and Live `/api/strategy-cycle`
-3. Implement a Live Trader watchdog:
-   - monitor heartbeat, stale data, broker/API health, and runaway order conditions
-   - fail closed to MONITOR or new-entry block when critical checks fail
-   - 2026-07-02 implemented local Watchdog state, `/api/watchdog`, UI panel/Doctor card, background loop, and risk-report integration
-4. Implement real account/position reconciliation:
-   - KIS balance/holdings
-   - Binance account/order status
-   - Upbit balances
-   - feed reconciliation dashboard from real snapshots
-   - 2026-07-02 foundation implemented with read-only KIS domestic balance, Binance account, Upbit account snapshots, normalized account/position rows, and UI error-count summary
+1. Strengthen real-time order/risk audit logs.
+   - implemented foundation: risk report is included on submitted/blocked/retried order events.
+2. Share the strategy plugin runner boundary.
+   - implemented foundation: shared `StrategyExecutionRunner`, Paper integration, Live `/api/strategy-cycle`.
+3. Implement a Live Trader Watchdog.
+   - implemented foundation: local Watchdog state, `/api/watchdog`, background loop, UI, risk-report integration.
+4. Implement real account/position reconciliation.
+   - partially implemented: KIS domestic balance, Binance account, Upbit account snapshots, normalized rows, UI error summary.
 
-Lower-priority follow-up:
+Next best engineering work:
 
-- Add real order adapter send layer only after explicit approval and adapter fixtures.
-- Add persistent order/audit storage after the in-memory flow is stable.
-- Add Playwright/Electron-style UI smoke sweep for labels, themes, and exports.
-
-## Best Next Engineering Steps
-
-1. Finish the selected roadmap in order:
-   - extend reconciliation to order status/user stream and program cash ledger
-   - then implement persistent order/audit storage
-2. Keep the live path fixed as:
-   - `OrderIntent -> PreTradeRiskGate -> adapter/dry-run boundary`
-   - no strategy, retry, or test order route should bypass this gate
+1. Expand reconciliation to KIS overseas, Binance/Upbit order status, and user streams.
+2. Finish program cash ledger persistence and connect it to reconciliation.
+3. Add durable order/audit storage and export paths.
+4. Only after that, implement the real broker send layer with explicit approval and tests.
 
 ## Files Most Likely To Touch Next
 
@@ -589,17 +693,20 @@ Frontend:
 Backend:
 
 - `live_trader\state.py`
-- `live_trader\order_management.py`
-- `live_trader\risk_engine.py`
+- `live_trader\server.py`
 - `live_trader\brokers.py`
 - `live_trader\live_adapters.py`
 - `live_trader\contracts.py`
-- `live_trader\server.py`
+- `live_trader\env_settings.py`
+- `live_trader\program_ledger.py`
+- `live_trader\audit_store.py`
 
 Tests:
 
+- `tests\test_live_adapters.py`
+- `tests\test_order_gate.py`
 - `tests\test_contracts.py`
-- add adapter/risk/order tests as real integration grows
+- `tests\test_state_memory.py`
 
 Build:
 
@@ -608,15 +715,15 @@ Build:
 
 ## Mental Model For The Next Chat
 
-Think of `live_trader` as three layers:
+Think of Live Trader as three layers:
 
 1. Preparation layer:
-   - strategies, risk settings, retry policy, broker/API readiness
+   - strategy artifacts, broker/API readiness, env setup, risk settings, retry policy.
 2. Automation layer:
-   - stock/ETF route and crypto route, each with monitor/small/full modes
+   - stock/ETF and crypto route profiles with monitor/small/full modes.
 3. Safety/audit layer:
-   - Doctor, order queue, order record, logs, exports
+   - Doctor, Watchdog, reconciliation, order risk gate, audit log, exports.
 
 The most important product truth:
 
-The UI is becoming a real trading desk, but real money must remain blocked until each broker route has verified official API implementation and the strategy-to-order pipeline is auditable end to end.
+Live Trader should feel like a real trading desk, but real money must remain blocked until every broker route, account snapshot, strategy artifact, order adapter, risk gate, Watchdog, and audit trail is verified end to end.
