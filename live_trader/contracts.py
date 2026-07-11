@@ -582,6 +582,7 @@ def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     strategy_instances = artifact.get("strategyInstances") if isinstance(artifact.get("strategyInstances"), list) else []
     target_portfolio = framework.get("targetPortfolio") if isinstance(framework.get("targetPortfolio"), list) else []
     risk_checks = framework.get("riskChecks") if isinstance(framework.get("riskChecks"), list) else []
+    portfolio_policy = _dict_value(artifact.get("portfolioPolicy") or _dict_value(artifact.get("evidence")).get("portfolioPolicy"))
     lifecycle_status = normalize_lifecycle_status(
         lifecycle.get("status")
         or artifact.get("lifecycleStatus")
@@ -612,6 +613,8 @@ def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "target_portfolio": [item for item in target_portfolio if isinstance(item, dict)],
         "risk_policy": _dict_value(artifact.get("riskPolicy") or artifact.get("risk_policy")),
         "risk_checks": [item for item in risk_checks if isinstance(item, dict)],
+        "portfolio_policy": portfolio_policy,
+        "portfolio_policy_hash": str(portfolio_policy.get("policyHash") or ""),
         "source_path": str(artifact.get("_source_path") or ""),
     }
 
@@ -728,6 +731,21 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         capabilities["canSubmitOrder"] = False
         capabilities["blockingFailReasons"] = list(dict.fromkeys([*capabilities.get("blockingFailReasons", []), "revalidation-expired"]))
         capabilities["failReasons"] = list(dict.fromkeys([*capabilities.get("failReasons", []), "revalidation-expired"]))
+    portfolio_candidate = _dict_value(artifact.get("portfolioCandidate") or artifact.get("portfolio_candidate"))
+    candidate_required = bool(portfolio_candidate)
+    candidate_blockers = _reason_list(portfolio_candidate.get("blockers"))
+    candidate_approved = (portfolio_candidate.get("approved") is True and not candidate_blockers) if candidate_required else True
+    if candidate_required and not candidate_approved:
+        candidate_reason = "portfolio-candidate-not-approved"
+        normalized_permissions["live_small_eligible"] = False
+        normalized_permissions["live_eligible"] = False
+        normalized_permissions["live_allowed"] = False
+        normalized_permissions["fail_reasons"] = list(dict.fromkeys([*normalized_permissions["fail_reasons"], candidate_reason, *candidate_blockers]))
+        capabilities["liveSmallEligible"] = False
+        capabilities["liveEligible"] = False
+        capabilities["canSubmitOrder"] = False
+        capabilities["blockingFailReasons"] = list(dict.fromkeys([*capabilities.get("blockingFailReasons", []), candidate_reason, *candidate_blockers]))
+        capabilities["failReasons"] = list(dict.fromkeys([*capabilities.get("failReasons", []), candidate_reason, *candidate_blockers]))
     verification = {
         "backtester": _backtester_verification_badge(normalized_permissions, final_test_status),
         "paper_trader": _paper_verification_badge(artifact, normalized_permissions, lifecycle_status),
@@ -793,6 +811,15 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "live_eligible": capabilities["liveEligible"],
         "verification": verification,
         "paper_portfolio_evidence": paper_portfolio_evidence,
+        "portfolio_candidate": {
+            "required": candidate_required,
+            "legacyGrandfathered": not candidate_required,
+            "candidateId": str(portfolio_candidate.get("candidateId") or ""),
+            "approved": candidate_approved,
+            "blockers": candidate_blockers,
+            "meaning": str(portfolio_candidate.get("meaning") or ("legacy-artifact-grandfathered" if not candidate_required else "portfolio-candidate-not-live-approval")),
+        },
+        "strategy_policy": _dict_value(artifact.get("strategyPolicy") or artifact.get("strategy_policy")),
         "backtester_verified": verification["backtester"]["status"] == "pass",
         "paper_trader_verified": verification["paper_trader"]["status"] == "pass",
         "contract_version": str(

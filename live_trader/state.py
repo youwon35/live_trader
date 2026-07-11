@@ -31,6 +31,7 @@ from trading_runtime import (
     build_audit_event,
     build_live_execution_evidence,
     normalize_broker_execution,
+    rebalance_decision,
 )
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .program_ledger import ProgramLedger
@@ -562,8 +563,20 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         return None
 
     allocation = matching_instance.get("allocation") if isinstance(matching_instance, dict) and isinstance(matching_instance.get("allocation"), dict) else {}
+    portfolio_policy = portfolio.get("portfolio_policy") if isinstance(portfolio.get("portfolio_policy"), dict) else {}
+    policy_allocations = portfolio_policy.get("allocations") if isinstance(portfolio_policy.get("allocations"), list) else []
+    policy_profiles = portfolio_policy.get("profiles") if isinstance(portfolio_policy.get("profiles"), list) else []
+    instance_id = portfolio_strategy_value(matching_instance or {}, "instanceId", "strategyInstanceId")
+    policy_allocation = next(
+        (item for item in policy_allocations if isinstance(item, dict) and str(item.get("strategyInstanceId") or "") == instance_id),
+        None,
+    )
+    policy_profile = next(
+        (item for item in policy_profiles if isinstance(item, dict) and str(item.get("strategyInstanceId") or "") == instance_id),
+        None,
+    )
     target_weight = safe_float(
-        (matching_target or {}).get("targetWeight") if isinstance(matching_target, dict) else None,
+        (policy_allocation or {}).get("targetWeight") if isinstance(policy_allocation, dict) else ((matching_target or {}).get("targetWeight") if isinstance(matching_target, dict) else None),
         safe_float(allocation.get("scoreTargetWeight"), safe_float(allocation.get("normalizedWeight"), 0.0)),
     )
     risk_policy = portfolio.get("risk_policy") if isinstance(portfolio.get("risk_policy"), dict) else {}
@@ -594,6 +607,33 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         blockers.append("riskChecks=" + ", ".join(failed_checks[:3]))
     if target_weight <= 0:
         blockers.append("targetWeight=0")
+    policy_limit_blockers: list[str] = []
+    limits = portfolio_policy.get("limits") if isinstance(portfolio_policy.get("limits"), list) else []
+    if portfolio_policy and policy_allocation is None:
+        policy_limit_blockers.append("portfolio-policy-allocation-missing")
+    for limit in limits:
+        if not isinstance(limit, dict):
+            continue
+        level = str(limit.get("level") or "")
+        key = str(limit.get("key") or "")
+        maximum = safe_float(limit.get("maximumWeight"), 1.0)
+        total = 0.0
+        for item in policy_allocations:
+            if not isinstance(item, dict):
+                continue
+            profile = next((candidate for candidate in policy_profiles if isinstance(candidate, dict) and str(candidate.get("strategyInstanceId") or "") == str(item.get("strategyInstanceId") or "")), {})
+            values = {
+                "account": "default",
+                "asset_class": str(profile.get("assetClass") or "UNKNOWN"),
+                "risk_cluster": str(item.get("returnSource") or profile.get("returnSource") or "OTHER"),
+                "instrument": str(profile.get("instrumentId") or "UNKNOWN"),
+                "strategy": str(item.get("strategyInstanceId") or ""),
+            }
+            if level != "order" and (key == "*" or values.get(level) == key):
+                total += abs(safe_float(item.get("targetWeight"), 0.0))
+        if level != "order" and total > maximum + 1e-12:
+            policy_limit_blockers.append(f"{level}:{key}:exposure-limit")
+    blockers.extend(policy_limit_blockers)
 
     return {
         "active": True,
@@ -610,6 +650,11 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         "strategyCapitalRatio": min(target_weight, max_strategy_weight / 100 if max_strategy_weight > 0 else target_weight),
         "instance": matching_instance or {},
         "target": matching_target or {},
+        "policyAllocation": policy_allocation or {},
+        "policyProfile": policy_profile or {},
+        "portfolioPolicyHash": str(portfolio.get("portfolio_policy_hash") or portfolio_policy.get("policyHash") or ""),
+        "rebalancePolicy": portfolio_policy.get("rebalancePolicy") if isinstance(portfolio_policy.get("rebalancePolicy"), dict) else {},
+        "policyLimitBlockers": policy_limit_blockers,
     }
 
 
@@ -618,12 +663,49 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
     if strategy:
         gate = strategy.get("portfolio_gate") if isinstance(strategy.get("portfolio_gate"), dict) else None
         if gate is not None:
-            return gate
-    return portfolio_gate_for_strategy(
+            selected_gate = dict(gate)
+        else:
+            selected_gate = None
+    else:
+        selected_gate = None
+    if selected_gate is None:
+        selected_gate = portfolio_gate_for_strategy(
         {"strategy_id": intent.strategy_id, "symbol": intent.symbol},
         checks.get("portfolios") if isinstance(checks.get("portfolios"), list) else None,
         mode=current_mode(),
     )
+    policy = selected_gate.get("rebalancePolicy") if isinstance(selected_gate.get("rebalancePolicy"), dict) else {}
+    if not policy or not selected_gate.get("active") or selected_gate.get("allowed") is not True:
+        return selected_gate
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    required_inputs = ("current_weight", "portfolio_equity", "expected_alpha_bps", "expected_cost_bps")
+    missing = [key for key in required_inputs if metadata.get(key) is None]
+    if missing:
+        selected_gate["allowed"] = False
+        selected_gate["rebalanceDecision"] = {"action": "HOLD", "reason": "rebalance-inputs-missing", "missing": missing}
+        selected_gate["detail"] = "Portfolio policy 차단: 리밸런싱 경제성 입력 누락(" + ", ".join(missing) + ")"
+        return selected_gate
+    decision = rebalance_decision(
+        current_weight=safe_float(metadata.get("current_weight"), 0.0),
+        target_weight=safe_float(selected_gate.get("targetWeight"), 0.0),
+        portfolio_equity=safe_float(metadata.get("portfolio_equity"), 0.0),
+        expected_alpha_bps=safe_float(metadata.get("expected_alpha_bps"), 0.0),
+        expected_cost_bps=safe_float(metadata.get("expected_cost_bps"), 0.0),
+        deadband_weight=safe_float(policy.get("deadbandWeight"), 0.0025),
+        minimum_notional=safe_float(policy.get("minimumNotional"), 0.0),
+        risk_limit_breached=metadata.get("risk_limit_breached") is True,
+    )
+    selected_gate["rebalanceDecision"] = {
+        "action": decision.action,
+        "reason": decision.reason,
+        "tradeWeight": decision.trade_weight,
+        "expectedNotional": decision.expected_notional,
+        "priority": decision.priority,
+    }
+    if decision.action != "TRADE":
+        selected_gate["allowed"] = False
+        selected_gate["detail"] = f"Portfolio policy 차단: {decision.reason}"
+    return selected_gate
 
 
 def apply_portfolio_gate_to_context(context: PreTradeContext, gate: dict[str, Any], intent: OrderIntent) -> PreTradeContext:

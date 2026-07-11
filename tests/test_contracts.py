@@ -8,6 +8,7 @@ from live_trader.contracts import (
     can_live_use_artifact,
     load_portfolio_artifacts,
     load_strategy_artifacts,
+    normalize_portfolio_artifact,
     normalize_strategy_artifact,
     strategy_artifact_dirs,
     strategy_plugin_dirs,
@@ -17,6 +18,36 @@ from trading_runtime.artifact_governance import DeploymentStore, EvidenceStore, 
 
 
 class StrategyContractTest(unittest.TestCase):
+    def test_unapproved_portfolio_candidate_cannot_be_overridden_by_live_permissions(self) -> None:
+        artifact = normalize_strategy_artifact(
+            {
+                "id": "CANDIDATE-BLOCKED",
+                "dataset": {"symbol": "BTCUSDT", "assetClass": "CRYPTO", "interval": "1h"},
+                "lifecycle": {"status": "live"},
+                "finalTest": {"status": "pass"},
+                "permissions": {"live_allowed": True, "live_small_eligible": True, "live_eligible": True},
+                "portfolioCandidate": {"candidateId": "candidate-1", "approved": False, "blockers": ["failed-stage:walk_forward"]},
+            }
+        )
+
+        self.assertFalse(artifact["portfolio_candidate"]["approved"])
+        self.assertFalse(artifact["live_small_eligible"])
+        self.assertFalse(artifact["live_eligible"])
+        self.assertFalse(artifact["capabilities"]["canSubmitOrder"])
+        self.assertIn("portfolio-candidate-not-approved", artifact["permissions"]["fail_reasons"])
+
+    def test_legacy_candidate_is_explicitly_grandfathered_and_portfolio_policy_is_normalized(self) -> None:
+        strategy = normalize_strategy_artifact({"id": "LEGACY", "permissions": {}})
+        portfolio = normalize_portfolio_artifact(
+            {
+                "id": "P1",
+                "portfolioPolicy": {"policyHash": "policy-hash", "allocations": []},
+            }
+        )
+
+        self.assertTrue(strategy["portfolio_candidate"]["legacyGrandfathered"])
+        self.assertEqual(portfolio["portfolio_policy_hash"], "policy-hash")
+
     def test_backtester_custom_strategy_artifact_keeps_contract_fields(self) -> None:
         custom_definition = {
             "id": "custom-draft",

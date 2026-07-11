@@ -259,6 +259,44 @@ class OrderGateTest(unittest.TestCase):
         )
         self.assertTrue("전략별 자본 한도" in reason or "종목별 최대 비중" in reason)
 
+    def test_portfolio_policy_requires_complete_economic_rebalance_inputs(self) -> None:
+        state.STATE["mode"] = "SMALL_LIVE"
+        portfolio = {
+            "id": "policy-portfolio",
+            "name": "Policy Portfolio",
+            "lifecycle_status": "before-live-small",
+            "permissions": {"live_small_allowed": True},
+            "strategy_instances": [{"strategyId": "STRAT-1", "symbol": "069500.KS", "instanceId": "instance-1"}],
+            "target_portfolio": [{"strategyId": "STRAT-1", "symbol": "069500.KS", "targetWeight": 0.4}],
+            "risk_policy": {"maxSingleSymbolWeight": 1.0, "maxStrategyWeight": 1.0},
+            "risk_checks": [],
+            "portfolio_policy_hash": "policy-hash",
+            "portfolio_policy": {
+                "policyHash": "policy-hash",
+                "profiles": [{"strategyInstanceId": "instance-1", "assetClass": "KR_STOCK", "returnSource": "TREND", "instrumentId": "KRX:069500"}],
+                "allocations": [{"strategyInstanceId": "instance-1", "targetWeight": 0.25, "returnSource": "TREND"}],
+                "limits": [{"level": "risk_cluster", "key": "TREND", "maximumWeight": 0.4}],
+                "rebalancePolicy": {"deadbandWeight": 0.01, "minimumNotional": 10000},
+            },
+        }
+        base = dict(strategy_id="STRAT-1", asset="kr-stock", symbol="069500.KS", side="BUY", quantity=1, reference_price=38900, mode="SMALL_LIVE", reason="unit")
+        missing = state.OrderIntent(**base, metadata={"broker_id": "kis"})
+        uneconomic = state.OrderIntent(**base, metadata={"broker_id": "kis", "current_weight": 0.1, "portfolio_equity": 10_000_000, "expected_alpha_bps": 5, "expected_cost_bps": 8})
+        economic = state.OrderIntent(**base, metadata={"broker_id": "kis", "current_weight": 0.1, "portfolio_equity": 10_000_000, "expected_alpha_bps": 12, "expected_cost_bps": 8})
+        checks = {"strategies": [], "portfolios": [portfolio]}
+
+        missing_gate = state.portfolio_gate_for_intent(checks, missing)
+        uneconomic_gate = state.portfolio_gate_for_intent(checks, uneconomic)
+        economic_gate = state.portfolio_gate_for_intent(checks, economic)
+
+        self.assertFalse(missing_gate["allowed"])
+        self.assertEqual(missing_gate["rebalanceDecision"]["reason"], "rebalance-inputs-missing")
+        self.assertFalse(uneconomic_gate["allowed"])
+        self.assertEqual(uneconomic_gate["rebalanceDecision"]["reason"], "expected-alpha-does-not-cover-cost")
+        self.assertTrue(economic_gate["allowed"])
+        self.assertEqual(economic_gate["targetWeight"], 0.25)
+        self.assertEqual(economic_gate["rebalanceDecision"]["action"], "TRADE")
+
     def test_portfolio_paper_evidence_blocks_live_order_when_missing(self) -> None:
         state.STATE["mode"] = "SMALL_LIVE"
         state.STATE["new_entries_blocked"] = False
