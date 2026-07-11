@@ -7,11 +7,13 @@ from pathlib import Path
 from live_trader.contracts import (
     can_live_use_artifact,
     load_portfolio_artifacts,
+    load_strategy_artifacts,
     normalize_strategy_artifact,
     strategy_artifact_dirs,
     strategy_plugin_dirs,
     strategy_plugin_status,
 )
+from trading_runtime.artifact_governance import DeploymentStore, EvidenceStore, build_paper_portfolio_evidence
 
 
 class StrategyContractTest(unittest.TestCase):
@@ -109,6 +111,88 @@ class StrategyContractTest(unittest.TestCase):
         self.assertTrue(evidence["ready"])
         self.assertEqual(evidence["portfolioId"], "portfolio-1")
         self.assertEqual(evidence["filledCount"], 1)
+        self.assertEqual(evidence["source"], "legacy-embedded")
+
+    def test_external_evidence_and_deployment_override_legacy_artifact_lifecycle(self) -> None:
+        previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                artifact_dir = Path(tmp)
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
+                strategy_payload = {
+                    "id": "STRAT-EXT-1",
+                    "strategy_id": "STRAT-EXT-1",
+                    "name": "Immutable Strategy",
+                    "dataset": {"symbol": "BTCUSDT", "assetClass": "CRYPTO", "interval": "5m"},
+                    "plugin": "moving_average_cross",
+                    "lifecycle": {"status": "backtested"},
+                    "finalTest": {"status": "pass"},
+                    "permissions": {"trader_export_allowed": True, "fail_reasons": []},
+                }
+                portfolio_payload = {
+                    "artifactType": "portfolio",
+                    "schemaVersion": "portfolio-artifact-v1",
+                    "id": "PORT-EXT-1",
+                    "name": "External Portfolio",
+                    "strategyInstances": [{"strategyId": "STRAT-EXT-1", "symbol": "BTCUSDT"}],
+                }
+                (artifact_dir / "strategy.json").write_text(json.dumps(strategy_payload), encoding="utf-8")
+                portfolio_dir = artifact_dir / "portfolios"
+                portfolio_dir.mkdir()
+                (portfolio_dir / "portfolio.json").write_text(json.dumps(portfolio_payload), encoding="utf-8")
+
+                deployments = DeploymentStore(artifact_dir)
+                definition = deployments.create_definition(
+                    deployment_id="dep:STRAT-EXT-1:PORT-EXT-1:paper",
+                    strategy_artifact=strategy_payload,
+                    portfolio_artifact=portfolio_payload,
+                    account_id="paper-main",
+                    environment="PAPER",
+                    symbol="BTCUSDT",
+                    route="crypto",
+                )
+                deployments.transition(
+                    definition["deploymentId"],
+                    lifecycle="before-live-small",
+                    mode="MONITOR",
+                    actor="unit-test",
+                    reason="paper pass",
+                    permissions={
+                        "trader_export_allowed": True,
+                        "paper_trader_verified": True,
+                        "live_small_eligible": True,
+                        "live_allowed": False,
+                        "fail_reasons": [],
+                    },
+                )
+                evidence = build_paper_portfolio_evidence(
+                    evidence_id="paper-ext-1",
+                    strategy_artifact=strategy_payload,
+                    portfolio_artifact=portfolio_payload,
+                    deployment_id=definition["deploymentId"],
+                    filled_count=4,
+                    rejected_count=0,
+                    order_count=4,
+                    target_weight=0.2,
+                )
+                EvidenceStore(artifact_dir).save_paper(evidence)
+
+                strategies = load_strategy_artifacts()
+
+            loaded = next(item for item in strategies if item["strategy_id"] == "STRAT-EXT-1")
+            self.assertEqual("before-live-small", loaded["lifecycle_status"])
+            self.assertEqual(definition["deploymentId"], loaded["deployment_id"])
+            self.assertEqual("deployment-registry", loaded["deployment_source"])
+            self.assertTrue(loaded["permissions"]["paper_trader_verified"])
+            self.assertTrue(loaded["live_small_eligible"])
+            self.assertTrue(loaded["paper_portfolio_evidence"]["ready"])
+            self.assertEqual("external", loaded["paper_portfolio_evidence"]["source"])
+            self.assertEqual("paper-ext-1", loaded["paper_portfolio_evidence"]["evidenceId"])
+        finally:
+            if previous_artifact is None:
+                os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+            else:
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact
 
     def test_strategy_paths_can_be_configured_from_shared_environment(self) -> None:
         previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")

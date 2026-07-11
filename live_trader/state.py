@@ -5,12 +5,33 @@ import csv
 import html
 import json
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
+import sys
 from typing import Any, Literal
 
-from trading_runtime import AuditEvent, audit_event_from_order_gate, build_audit_event
+
+for parent in Path(__file__).resolve().parents:
+    shared_runtime = parent / "packages" / "trading_runtime"
+    if shared_runtime.exists():
+        if str(shared_runtime) not in sys.path:
+            sys.path.insert(0, str(shared_runtime))
+        break
+
+from trading_runtime import (
+    AuditEvent,
+    DeploymentStore,
+    DurableControlState,
+    EvidenceStore,
+    MarketEvent,
+    OrderManagementSystem,
+    build_idempotency_key,
+    audit_event_from_order_gate,
+    build_audit_event,
+    build_live_execution_evidence,
+    normalize_broker_execution,
+)
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .program_ledger import ProgramLedger
 from .contracts import (
@@ -247,6 +268,7 @@ AUDIT_DB_PATH = Path(os.environ.get("LIVE_TRADER_AUDIT_DB") or APP_ROOT / "logs"
 AUDIT_STORE = SQLiteAuditEventStore(AUDIT_DB_PATH)
 PROGRAM_LEDGER_PATH = Path(os.environ.get("LIVE_TRADER_PROGRAM_LEDGER_DB") or APP_ROOT / "logs" / "live_trader_program_ledger.sqlite3")
 PROGRAM_LEDGER = ProgramLedger(PROGRAM_LEDGER_PATH)
+LIVE_OMS = OrderManagementSystem()
 DEFAULT_WATCHDOG_SETTINGS: dict[str, float] = {
     "heartbeat_timeout_sec": 45.0,
     "market_data_stale_sec": 90.0,
@@ -1244,6 +1266,8 @@ def retry_policy_rows() -> list[dict[str, object]]:
 
 
 def can_retry_order(order: dict[str, Any]) -> bool:
+    if str(order.get("oms_status") or "").upper() in {"SUBMITTING", "ACKNOWLEDGED", "PARTIALLY_FILLED", "CANCEL_PENDING", "UNKNOWN"}:
+        return False
     if order.get("state") in FINAL_ORDER_STATES:
         return False
     if order.get("queue_state") == "canceled":
@@ -1874,6 +1898,62 @@ def set_flag(name: str, value: bool) -> dict[str, Any]:
     return {"ok": True, "reason": "flag changed", "snapshot": snapshot()}
 
 
+def raw_portfolio_payload(strategy_dir: Path, portfolio_id: str) -> dict[str, Any] | None:
+    if not portfolio_id:
+        return None
+    folder = strategy_dir / "portfolios"
+    if not folder.exists():
+        return None
+    for path in folder.glob("*.json"):
+        if path.name in {"portfolio-registry.json", "package.json", "package-lock.json"}:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and str(payload.get("id") or payload.get("portfolioId") or path.stem) == portfolio_id:
+            return payload
+    return None
+
+
+def ensure_live_deployment(
+    strategy_dir: Path,
+    strategy_payload: dict[str, Any],
+    normalized: dict[str, Any],
+) -> tuple[DeploymentStore, dict[str, Any], dict[str, Any] | None]:
+    store = DeploymentStore(strategy_dir)
+    portfolio_id = str((normalized.get("paper_portfolio_evidence") or {}).get("portfolioId") or "")
+    deployment_id = str(normalized.get("deployment_id") or f"dep:{normalized.get('strategy_id')}:{portfolio_id or 'standalone'}:live")
+    current = store.get(deployment_id)
+    portfolio_payload = raw_portfolio_payload(strategy_dir, portfolio_id)
+    if current is not None:
+        return store, current, portfolio_payload
+
+    definition = store.create_definition(
+        deployment_id=deployment_id,
+        strategy_artifact=strategy_payload,
+        portfolio_artifact=portfolio_payload,
+        account_id="live-account-unresolved",
+        environment="SMALL_LIVE",
+        symbol=str(normalized.get("symbol") or "UNKNOWN"),
+        instrument_id=str(normalized.get("instrument_id") or ""),
+        route="crypto" if str(normalized.get("asset") or "").upper() == "CRYPTO" else "stock",
+    )
+    lifecycle = normalize_lifecycle_status(normalized.get("lifecycle_status") or "draft")
+    if lifecycle != "draft":
+        current = store.transition(
+            definition["deploymentId"],
+            lifecycle=lifecycle,
+            mode="MONITOR",
+            permissions=dict(normalized.get("permissions") or {}),
+            actor="live_trader-migration",
+            reason="legacy strategy lifecycle seeded into live deployment",
+        )
+    else:
+        current = store.get(definition["deploymentId"])
+    return store, current or {}, portfolio_payload
+
+
 def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
     strategy_id = str(strategy_id or "").strip()
     if not strategy_id:
@@ -1885,20 +1965,16 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
         append_audit("danger", "Live 승급 차단", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
 
-    current_status = normalize_lifecycle_status(
-        normalized.get("lifecycle_status")
-        or normalized.get("promotion_stage")
-        or payload.get("lifecycleStatus")
-        or payload.get("promotionStage")
-        or payload.get("status")
-    )
+    deployment_store, deployment, portfolio_payload = ensure_live_deployment(strategy_dir, payload, normalized)
+    current_status = normalize_lifecycle_status(deployment.get("lifecycle") or normalized.get("lifecycle_status"))
     if current_status == "live":
         return {"ok": True, "reason": "이미 live 상태입니다.", "snapshot": snapshot()}
     if current_status != "before-live-small":
         reason = f"before-live-small 상태에서만 live로 승급할 수 있습니다. 현재 상태: {current_status}"
         append_audit("danger", "Live 승급 차단", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
-    if normalized.get("live_small_eligible") is not True:
+    deployment_permissions = dict(deployment.get("permissions") or {})
+    if deployment_permissions.get("live_small_eligible") is not True and normalized.get("live_small_eligible") is not True:
         reason = "live_small_eligible=true 전략만 소액 실거래 후 live로 승급할 수 있습니다."
         append_audit("danger", "Live 승급 차단", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
@@ -1922,44 +1998,12 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
         reason = f"readiness blocker {data['summary']['blocker_count']}개가 남아 있어 live 승급을 차단했습니다."
         append_audit("danger", "Live 승급 차단", reason)
         return {"ok": False, "reason": reason, "snapshot": data}
-    now = datetime.now().astimezone().replace(microsecond=0).isoformat()
-    lifecycle = payload.get("lifecycle") if isinstance(payload.get("lifecycle"), dict) else {}
-    promotion = payload.get("promotion") if isinstance(payload.get("promotion"), dict) else {}
-    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
-    permissions = payload.get("permissions") if isinstance(payload.get("permissions"), dict) else {}
-    capabilities = payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {}
-
-    lifecycle_history = lifecycle.get("history") if isinstance(lifecycle.get("history"), list) else []
-    promotion_history = promotion.get("history") if isinstance(promotion.get("history"), list) else []
-    lifecycle_history.append({
-        "from": current_status,
-        "to": "live",
-        "at": now,
-        "by": "live_trader",
-        "reason": "SMALL_LIVE 성공 주문과 live readiness gate를 통과했습니다.",
-    })
-    promotion_history.append({
-        "from": current_status,
-        "to": "live",
-        "at": now,
-        "by": "live_trader",
-        "reason": "소액 실거래 검증 후 정식 live로 승급했습니다.",
-    })
-    lifecycle.update({"status": "live", "updatedAt": now, "history": lifecycle_history})
-    promotion.update({"stage": "live", "promotedAt": now, "updatedAt": now, "history": promotion_history})
-    evidence["liveSmall"] = {
-        "status": "pass",
-        "checkedAt": now,
-        "source": "live_trader",
-        "successfulOrders": execution["successful"],
-        "blockedOrders": execution["blocked"],
-    }
-
     fail_reasons = [
         reason
-        for reason in permissions.get("fail_reasons", payload.get("fail_reasons", [])) or []
+        for reason in (deployment.get("permissions") or normalized.get("permissions") or {}).get("fail_reasons", []) or []
         if str(reason) not in {"live-activation-required", "before-live-small 승급 후 소액 실거래 확인이 필요합니다."}
     ]
+    permissions = dict(deployment.get("permissions") or normalized.get("permissions") or {})
     permissions.update({
         "paper_trader_verified": True,
         "live_small_eligible": True,
@@ -1967,36 +2011,36 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
         "live_allowed": True,
         "fail_reasons": fail_reasons,
     })
-    capabilities.update({
-        "lifecycleStatus": "live",
-        "paperTraderVerified": True,
-        "liveSmallVerified": True,
-        "liveSmallEligible": True,
-        "liveEligible": True,
-        "canSubmitOrder": False,
-        "failReasons": fail_reasons,
-        "blockingFailReasons": fail_reasons,
-    })
-    payload.update({
-        "status": "live",
-        "lifecycleStatus": "live",
-        "promotionStage": "live",
-        "lifecycle": lifecycle,
-        "promotion": promotion,
-        "evidence": evidence,
-        "permissions": permissions,
-        "capabilities": capabilities,
-        "paper_trader_verified": True,
-        "live_small_eligible": True,
-        "live_eligible": True,
-        "live_allowed": True,
-        "fail_reasons": fail_reasons,
-        "updatedAt": now,
-    })
-
-    artifact_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    update_strategy_registry(strategy_dir, payload, artifact_path)
-    append_strategy_promotion_log(strategy_dir, payload, artifact_path, "live_trader")
+    now = datetime.now().astimezone().replace(microsecond=0).isoformat()
+    evidence_id = f"live-{strategy_id}-{datetime.now().strftime('%Y%m%dT%H%M%S%f')}"
+    live_evidence = build_live_execution_evidence(
+        evidence_id=evidence_id,
+        strategy_artifact=payload,
+        portfolio_artifact=portfolio_payload,
+        deployment_id=deployment["deploymentId"],
+        environment="SMALL_LIVE",
+        mode="SMALL_LIVE",
+        runtime_version="live-trader-v1",
+        ended_at=now,
+        successful_orders=execution["successful"],
+        blocked_orders=execution["blocked"],
+        details={"operatorConfirmed": True, "readinessBlockers": 0},
+    )
+    live_record = EvidenceStore(strategy_dir).save_live(live_evidence)
+    permissions.update(
+        {
+            "liveEvidenceId": evidence_id,
+            "liveEvidenceHash": live_evidence["integrity"]["contentHash"],
+        }
+    )
+    deployment_store.transition(
+        deployment["deploymentId"],
+        lifecycle="live",
+        mode=str(STATE.get("mode") or "SMALL_LIVE"),
+        permissions=permissions,
+        actor="live_trader",
+        reason=f"SMALL_LIVE 성공 주문 {execution['successful']}건과 readiness gate 통과 / evidence={live_record.path.name}",
+    )
     append_audit(
         "warn",
         "Live 승급",
@@ -2019,28 +2063,21 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
         append_audit("danger", "전략 lifecycle 변경 차단", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
 
-    current_status = normalize_lifecycle_status(
-        normalized.get("lifecycle_status")
-        or normalized.get("promotion_stage")
-        or payload.get("lifecycleStatus")
-        or payload.get("promotionStage")
-        or payload.get("status")
-    )
-    lifecycle = payload.get("lifecycle") if isinstance(payload.get("lifecycle"), dict) else {}
-    promotion = payload.get("promotion") if isinstance(payload.get("promotion"), dict) else {}
-    permissions = payload.get("permissions") if isinstance(payload.get("permissions"), dict) else {}
-    capabilities = payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {}
-    now = datetime.now().astimezone().replace(microsecond=0).isoformat()
+    deployment_store, deployment, _portfolio_payload = ensure_live_deployment(strategy_dir, payload, normalized)
+    current_status = normalize_lifecycle_status(deployment.get("lifecycle") or normalized.get("lifecycle_status"))
+    permissions = dict(deployment.get("permissions") or normalized.get("permissions") or {})
 
     if action == "resume":
         if current_status != "paused":
             return {"ok": False, "reason": "paused 상태에서만 재개할 수 있습니다.", "snapshot": snapshot()}
-        target_status = normalize_lifecycle_status(lifecycle.get("pausedFrom") or payload.get("pausedFrom") or "before-live-small")
+        target_status = normalize_lifecycle_status(permissions.get("pausedFrom") or "before-live-small")
         if target_status in {"paused", "retired", "unknown"}:
             target_status = "before-live-small"
-        restored_permissions = lifecycle.get("pausedPermissions") if isinstance(lifecycle.get("pausedPermissions"), dict) else {}
-        if restored_permissions:
-            permissions.update(restored_permissions)
+        paused_permissions = permissions.get("pausedPermissions") if isinstance(permissions.get("pausedPermissions"), dict) else {}
+        if paused_permissions:
+            paused_from = permissions.get("pausedFrom")
+            permissions = dict(paused_permissions)
+            permissions["pausedFrom"] = paused_from
         permissions["fail_reasons"] = [
             reason
             for reason in permissions.get("fail_reasons", [])
@@ -2052,8 +2089,8 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
     else:
         target_status = "paused" if action == "pause" else "retired"
         if action == "pause":
-            lifecycle["pausedFrom"] = current_status
-            lifecycle["pausedPermissions"] = dict(permissions)
+            permissions["pausedFrom"] = current_status
+            permissions["pausedPermissions"] = dict(permissions)
         fail_reasons = list(permissions.get("fail_reasons", payload.get("fail_reasons", [])) or [])
         fail_reasons.append(f"lifecycle-{target_status}")
         fail_reasons = list(dict.fromkeys(str(reason) for reason in fail_reasons))
@@ -2063,58 +2100,18 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
             "live_allowed": False,
             "fail_reasons": fail_reasons,
         })
-        capabilities.update({
-            "lifecycleStatus": target_status,
-            "liveSmallEligible": False,
-            "liveEligible": False,
-            "canSubmitOrder": False,
-            "failReasons": fail_reasons,
-            "blockingFailReasons": fail_reasons,
-        })
-        payload.update({
-            "live_small_eligible": False,
-            "live_eligible": False,
-            "live_allowed": False,
-            "fail_reasons": fail_reasons,
-        })
         audit_level = "warn" if action == "pause" else "danger"
         audit_label = "전략 일시중지" if action == "pause" else "전략 폐기/보관"
         audit_reason = f"{payload.get('name') or strategy_id} 전략을 {target_status} 상태로 변경하고 실거래 권한을 차단했습니다."
 
-    lifecycle_history = lifecycle.get("history") if isinstance(lifecycle.get("history"), list) else []
-    promotion_history = promotion.get("history") if isinstance(promotion.get("history"), list) else []
-    lifecycle_history.append({"from": current_status, "to": target_status, "at": now, "by": "live_trader", "reason": audit_reason})
-    promotion_history.append({"from": current_status, "to": target_status, "at": now, "by": "live_trader", "reason": audit_reason})
-    lifecycle.update({
-        "schemaVersion": lifecycle.get("schemaVersion") or "strategy-lifecycle-v2",
-        "status": target_status,
-        "label": target_status,
-        "updatedAt": now,
-        "history": lifecycle_history,
-    })
-    promotion.update({
-        "schemaVersion": promotion.get("schemaVersion") or "strategy-promotion-v1",
-        "stage": target_status,
-        "stageLabel": target_status,
-        "promotedAt": now,
-        "updatedAt": now,
-        "promotedBy": "live_trader",
-        "history": promotion_history,
-    })
-    capabilities["lifecycleStatus"] = target_status
-    payload.update({
-        "status": target_status,
-        "lifecycleStatus": target_status,
-        "promotionStage": target_status,
-        "lifecycle": lifecycle,
-        "promotion": promotion,
-        "permissions": permissions,
-        "capabilities": capabilities,
-        "updatedAt": now,
-    })
-    artifact_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    update_strategy_registry(strategy_dir, payload, artifact_path)
-    append_strategy_promotion_log(strategy_dir, payload, artifact_path, "live_trader")
+    deployment_store.transition(
+        deployment["deploymentId"],
+        lifecycle=target_status,
+        mode="MONITOR" if target_status in {"paused", "retired"} else str(STATE.get("mode") or "MONITOR"),
+        permissions=permissions,
+        actor="live_trader",
+        reason=audit_reason,
+    )
     append_audit(audit_level, audit_label, audit_reason)
     return {"ok": True, "reason": audit_reason, "snapshot": snapshot()}
 
@@ -2322,7 +2319,22 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
             if isinstance(rows, list):
                 for row in rows:
                     if isinstance(row, dict):
-                        events.append({"broker_id": selected_broker, **row})
+                        normalized = normalize_broker_execution(selected_broker, row)
+                        events.append({
+                            "broker_id": selected_broker,
+                            "event_id": normalized.event_id,
+                            "order_id": normalized.client_order_id,
+                            "broker_order_id": normalized.broker_order_id,
+                            "symbol": normalized.symbol,
+                            "side": str(row.get("side") or ""),
+                            "quantity": normalized.filled_quantity,
+                            "price": normalized.fill_price,
+                            "fee": normalized.fee,
+                            "state": normalized.status,
+                            "occurred_at": normalized.occurred_at,
+                            "instrument_id": normalized.instrument_id,
+                            "raw": normalized.raw,
+                        })
             accounts = result.get("accounts", []) if isinstance(result, dict) else []
             positions_data = result.get("positions", []) if isinstance(result, dict) else []
             received_snapshot = False
@@ -2575,6 +2587,20 @@ def explicit_artifact_signal(artifact: Any) -> OrderSide | None:
 
 
 def strategy_market_data(strategy: dict[str, Any]) -> StrategyMarketData:
+    event = strategy_market_event(strategy)
+    return StrategyMarketData(
+        price=event.price,
+        close_price=event.price,
+        volume=event.quantity,
+        occurred_at=event.event_time,
+        instrument_id=event.instrument_id,
+        provider=event.provider,
+        received_at=event.received_time,
+        latency_seconds=event.latency_seconds,
+    )
+
+
+def strategy_market_event(strategy: dict[str, Any]) -> MarketEvent:
     price = strategy_float(
         strategy,
         "reference_price",
@@ -2584,7 +2610,22 @@ def strategy_market_data(strategy: dict[str, Any]) -> StrategyMarketData:
         "close_price",
         default=1.0 if strategy_broker_id(strategy) == "binance" else 1000.0,
     )
-    return StrategyMarketData(price=price, close_price=price)
+    symbol = str(strategy.get("symbol") or "UNKNOWN")
+    provider = strategy_broker_id(strategy)
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return MarketEvent(
+        instrument_id=str(strategy.get("instrument_id") or f"symbol:{symbol}"),
+        symbol=symbol,
+        provider=provider,
+        market=str(strategy.get("market") or provider).upper(),
+        market_type=str(strategy.get("market_type") or strategy.get("asset") or "UNKNOWN").upper(),
+        event_time=str(strategy.get("price_time") or strategy.get("occurred_at") or now),
+        received_time=now,
+        price=price,
+        quantity=max(0.0, strategy_float(strategy, "volume", default=0.0)),
+        event_id=str(strategy.get("market_event_id") or ""),
+        metadata={"source": "strategy-artifact-reference-price"},
+    )
 
 
 def strategy_float(strategy: dict[str, Any], *keys: str, default: float = 0.0) -> float:
@@ -2661,7 +2702,7 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
     return PreTradeContext(
         mode=current_mode(),
         dry_run=dry_run,
-        halted=bool(STATE["kill_switch"]),
+        halted=bool(STATE["kill_switch"]) or durable_global_kill_active(),
         new_entries_blocked=bool(STATE["new_entries_blocked"]),
         readiness_blockers=int(checks.get("summary", {}).get("blocker_count", 0)),
         readiness_warnings=int(checks.get("summary", {}).get("warning_count", 0)),
@@ -2685,6 +2726,16 @@ def current_mode() -> Mode:
     if value in {"MONITOR", "SMALL_LIVE", "FULL_LIVE"}:
         return value  # type: ignore[return-value]
     return "MONITOR"
+
+
+def durable_global_kill_active() -> bool:
+    path = str(os.environ.get("TRADING_CONTROL_STATE_PATH") or "").strip()
+    if not path:
+        return False
+    try:
+        return bool(DurableControlState(path).read().get("globalKill"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return True
 
 
 def asset_from_symbol(symbol: str) -> str:
@@ -2798,11 +2849,30 @@ def submit_order_intent(
     ok, order_state, queue_state, reason, risk_report = evaluate_order_gate_with_report(checks, intent.side, dry_run, intent)
     portfolio_gate = portfolio_gate_for_intent(checks, intent)
     retry_backoff = float(STATE["retry_policy"]["backoff_sec"])
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    target_revision = int(metadata.get("target_revision") or (len(STATE["orders"]) + 1))
+    idempotency_key = build_idempotency_key(
+        portfolio_id=str(metadata.get("portfolio_id") or portfolio_gate.get("portfolio_id") or "default-portfolio"),
+        strategy_instance_id=str(metadata.get("strategy_instance_id") or intent.strategy_id),
+        instrument_id=str(metadata.get("instrument_id") or intent.symbol),
+        target_revision=target_revision,
+        purpose=str(metadata.get("order_purpose") or "REBALANCE"),
+    )
+    managed_order, oms_created = LIVE_OMS.create(intent, idempotency_key)
+    if oms_created:
+        if ok:
+            LIVE_OMS.transition(managed_order.order_id, "RISK_APPROVED", "PreTradeRiskGate passed")
+        else:
+            LIVE_OMS.transition(managed_order.order_id, "REJECTED", reason)
     order = {
         "time": now_text(),
         "created_at": now_text(),
         "updated_at": now_text(),
         "order_id": next_order_id(order_state, dry_run),
+        "oms_order_id": managed_order.order_id,
+        "idempotency_key": idempotency_key,
+        "idempotency_duplicate": not oms_created,
+        "oms_status": managed_order.status,
         "strategy_id": intent.strategy_id,
         "symbol": intent.symbol,
         "asset": intent.asset,

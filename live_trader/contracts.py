@@ -2,9 +2,29 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+def _ensure_shared_runtime_path() -> None:
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "packages" / "trading_runtime"
+        if candidate.exists():
+            path = str(candidate)
+            if path not in sys.path:
+                sys.path.insert(0, path)
+            return
+
+
+_ensure_shared_runtime_path()
+
+from trading_runtime.artifact_governance import (  # noqa: E402
+    DeploymentStore,
+    EvidenceStore,
+    artifact_reference,
+)
 
 
 ARTIFACT_SCHEMA_VERSION = "strategy-artifact-v2"
@@ -263,6 +283,39 @@ def _safe_float(value: Any, fallback: float = 0.0) -> float:
 
 
 def normalize_paper_portfolio_evidence(artifact: dict[str, Any]) -> dict[str, Any]:
+    external = _dict_value(artifact.get("_external_paper_evidence"))
+    if external:
+        strategy_ref = _dict_value(external.get("strategyArtifact"))
+        portfolio_ref = _dict_value(external.get("portfolioArtifact"))
+        filled_count = _safe_int(external.get("filledCount"))
+        rejected_count = _safe_int(external.get("rejectedCount"))
+        status = str(external.get("status") or "")
+        integrity = _dict_value(external.get("integrity"))
+        valid = artifact.get("_external_paper_evidence_valid") is True
+        ready = valid and str(external.get("result") or "").upper() == "PASS" and status.lower() == "submitted" and filled_count > 0 and rejected_count == 0
+        details = _dict_value(external.get("details"))
+        legacy_detail = _dict_value(details.get("portfolioEvidence"))
+        return {
+            "required": external.get("portfolioRequired") is True,
+            "ready": ready,
+            "portfolioId": str(portfolio_ref.get("artifactId") or ""),
+            "portfolioHash": str(portfolio_ref.get("artifactHash") or ""),
+            "strategyArtifactId": str(strategy_ref.get("artifactId") or ""),
+            "strategyArtifactHash": str(strategy_ref.get("artifactHash") or ""),
+            "deploymentId": str(external.get("deploymentId") or ""),
+            "evidenceId": str(external.get("evidenceId") or ""),
+            "evidenceHash": str(integrity.get("contentHash") or ""),
+            "source": "external",
+            "legacy": False,
+            "submittedAt": str(external.get("endedAt") or external.get("createdAt") or ""),
+            "status": status,
+            "orderCount": _safe_int(external.get("orderCount")),
+            "filledCount": filled_count,
+            "rejectedCount": rejected_count,
+            "targetWeight": _safe_float(external.get("targetWeight")),
+            "detail": str(legacy_detail.get("detail") or details.get("performanceDetail") or "별도 Paper evidence 파일"),
+            "validationIssues": list(artifact.get("_external_paper_evidence_issues") or []),
+        }
     evidence = _dict_value(artifact.get("paperPortfolioEvidence") or artifact.get("paper_portfolio_evidence"))
     if not evidence:
         return {"required": False, "ready": True, "detail": "Portfolio paper evidence 없음"}
@@ -278,6 +331,8 @@ def normalize_paper_portfolio_evidence(artifact: dict[str, Any]) -> dict[str, An
         "rejectedCount": _safe_int(evidence.get("rejectedCount") or evidence.get("rejected_count")),
         "targetWeight": _safe_float(evidence.get("targetWeight") or evidence.get("target_weight")),
         "detail": str(evidence.get("detail") or ""),
+        "source": "legacy-embedded",
+        "legacy": True,
     }
 
 
@@ -573,6 +628,32 @@ def load_strategy_artifacts(limit: int = 16) -> list[dict[str, Any]]:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
+            if not isinstance(payload, dict):
+                continue
+            try:
+                reference = artifact_reference(payload)
+            except ValueError:
+                reference = {"artifactId": "", "artifactHash": ""}
+            deployments = [
+                item
+                for item in DeploymentStore(folder).list()
+                if _dict_value(item.get("strategyArtifact")).get("artifactId") == reference.get("artifactId")
+                and _dict_value(item.get("strategyArtifact")).get("artifactHash") == reference.get("artifactHash")
+            ]
+            deployment = deployments[0] if deployments else {}
+            if deployment:
+                payload["_deployment"] = deployment
+            portfolio_ref = _dict_value(deployment.get("portfolioArtifact"))
+            evidence_record = EvidenceStore(folder).latest_for_strategy(
+                str(reference.get("artifactId") or ""),
+                strategy_artifact_hash=str(reference.get("artifactHash") or ""),
+                portfolio_artifact_id=str(portfolio_ref.get("artifactId") or ""),
+                portfolio_artifact_hash=str(portfolio_ref.get("artifactHash") or ""),
+            )
+            if evidence_record is not None:
+                payload["_external_paper_evidence"] = evidence_record.payload
+                payload["_external_paper_evidence_valid"] = evidence_record.valid
+                payload["_external_paper_evidence_issues"] = list(evidence_record.issues)
             payload["_source_path"] = str(path)
             artifacts.append(normalize_strategy_artifact(payload))
             if len(artifacts) >= limit:
@@ -589,6 +670,7 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     final_test = _dict_value(artifact.get("finalTest") or artifact.get("final_test"))
     strategy_contract = _dict_value(artifact.get("strategy_contract") or artifact.get("strategyContract"))
     trader_contract = _dict_value(artifact.get("trader_contract") or artifact.get("traderContract"))
+    deployment = _dict_value(artifact.get("_deployment"))
     custom_definition = _custom_definition_from_artifact(artifact, strategy_contract)
     plugin_id = _normalize_plugin_id(
         artifact.get("plugin")
@@ -604,6 +686,7 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         or "unknown-strategy"
     )
     permissions = dict(artifact.get("permissions") or {})
+    permissions.update(_dict_value(deployment.get("permissions")))
     if "live_allowed" not in permissions and "live_allowed" in artifact:
         permissions["live_allowed"] = artifact.get("live_allowed") is True
     if "live_small_eligible" not in permissions and "live_small_eligible" in artifact:
@@ -613,7 +696,8 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     if "trader_export_allowed" not in permissions and "trader_export_allowed" in artifact:
         permissions["trader_export_allowed"] = artifact.get("trader_export_allowed") is True
     lifecycle_status = normalize_lifecycle_status(
-        lifecycle.get("status")
+        deployment.get("lifecycle")
+        or lifecycle.get("status")
         or artifact.get("lifecycleStatus")
         or artifact.get("status")
         or artifact.get("stage")
@@ -650,11 +734,24 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "live": _live_verification_badge(capabilities),
     }
     promotion = _promotion_snapshot(artifact, normalized_permissions, lifecycle_status)
+    if deployment:
+        promotion.update(
+            {
+                "stage": lifecycle_status,
+                "stage_label": _promotion_stage_label(lifecycle_status),
+                "source_stage": "deployment-registry",
+            }
+        )
     release = _release_snapshot(artifact)
     paper_portfolio_evidence = normalize_paper_portfolio_evidence(artifact)
 
     return {
         "strategy_id": strategy_id,
+        "deployment_id": str(deployment.get("deploymentId") or ""),
+        "deployment_revision": _safe_int(deployment.get("revision")),
+        "deployment_environment": str(deployment.get("environment") or ""),
+        "deployment_mode": str(deployment.get("mode") or ""),
+        "deployment_source": "deployment-registry" if deployment else "legacy-artifact",
         "name": str(artifact.get("name") or artifact.get("strategyName") or strategy_id),
         "symbol": str(artifact.get("symbol") or dataset.get("symbol") or data_artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN"),
         "asset": str(artifact.get("asset") or dataset.get("assetClass") or data_artifact.get("assetClass") or artifact.get("assetClass") or "unknown"),

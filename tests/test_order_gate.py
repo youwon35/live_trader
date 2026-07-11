@@ -37,6 +37,47 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(state.PreTradeContext.__module__, "trading_runtime.risk_engine")
         self.assertEqual(state.StrategyExecutionRunner.__module__, "trading_runtime.strategy_runner")
 
+    def test_strategy_market_data_uses_shared_canonical_event(self) -> None:
+        strategy = {
+            "symbol": "BTCUSDT",
+            "instrument_id": "crypto:binance:spot:BTCUSDT",
+            "broker_id": "binance",
+            "market": "BINANCE",
+            "market_type": "SPOT",
+            "reference_price": 60000,
+            "price_time": "2026-07-01T00:00:00Z",
+        }
+
+        event = state.strategy_market_event(strategy)
+        market_data = state.strategy_market_data(strategy)
+
+        self.assertEqual(event.__class__.__module__, "trading_runtime.market_data")
+        self.assertEqual(market_data.instrument_id, event.instrument_id)
+        self.assertEqual(market_data.provider, "binance")
+        self.assertEqual(market_data.occurred_at, "2026-07-01T00:00:00Z")
+        self.assertEqual(market_data.reference_price, 60000)
+
+    def test_live_order_intent_is_registered_in_shared_oms_with_idempotency(self) -> None:
+        checks = state.snapshot()
+        intent = state.default_order_intent(checks, "BUY")
+        intent = state.OrderIntent(
+            **{**intent.__dict__, "metadata": {**intent.metadata, "portfolio_id": "test", "instrument_id": "btc", "target_revision": 999991}}
+        )
+        result = state.submit_order_intent(checks, intent, dry_run=True, audit_event="OMS test")
+        order = result["order"]
+        self.assertIn("idempotency_key", order)
+        self.assertIn("oms_status", order)
+        self.assertTrue(state.LIVE_OMS.verify_event_chain(order["oms_order_id"]))
+        self.assertFalse(order["idempotency_duplicate"])
+
+    def test_durable_global_kill_blocks_order_even_if_local_switch_is_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            control_path = Path(temp_dir) / "control.json"
+            state.DurableControlState(control_path).set_global_kill(True, "hub incident")
+            with patch.dict(os.environ, {"TRADING_CONTROL_STATE_PATH": str(control_path)}):
+                context = state.pre_trade_context(state.snapshot(), state.default_order_intent(state.snapshot(), "BUY"), True)
+        self.assertTrue(context.halted)
+
     def test_order_gate_blocks_buy_when_new_entries_are_blocked(self) -> None:
         state.STATE["new_entries_blocked"] = True
 
@@ -373,13 +414,16 @@ class OrderGateTest(unittest.TestCase):
                 },
             }
             artifact_path.write_text(json.dumps(artifact_payload, ensure_ascii=False), encoding="utf-8")
+            immutable_source = artifact_path.read_bytes()
             try:
                 pause = state.set_strategy_lifecycle_status("LIFE-1", "pause")
-                paused_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                registry_path = artifact_dir / "deployments" / "deployment-registry.json"
+                paused_payload = next(iter(json.loads(registry_path.read_text(encoding="utf-8"))["entries"].values()))
                 resume = state.set_strategy_lifecycle_status("LIFE-1", "resume")
-                resumed_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                resumed_payload = next(iter(json.loads(registry_path.read_text(encoding="utf-8"))["entries"].values()))
                 retire = state.set_strategy_lifecycle_status("LIFE-1", "retire")
-                retired_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                retired_payload = next(iter(json.loads(registry_path.read_text(encoding="utf-8"))["entries"].values()))
+                immutable_after = artifact_path.read_bytes()
             finally:
                 if previous_artifact_dir is None:
                     os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
@@ -387,15 +431,79 @@ class OrderGateTest(unittest.TestCase):
                     os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact_dir
 
         self.assertTrue(pause["ok"])
-        self.assertEqual(paused_payload["promotionStage"], "paused")
+        self.assertEqual(immutable_source, immutable_after)
+        self.assertEqual(paused_payload["lifecycle"], "paused")
         self.assertFalse(paused_payload["permissions"]["live_small_eligible"])
-        self.assertEqual(paused_payload["lifecycle"]["pausedFrom"], "before-live-small")
-        self.assertTrue(resume["ok"])
-        self.assertEqual(resumed_payload["promotionStage"], "before-live-small")
+        self.assertEqual(paused_payload["permissions"]["pausedFrom"], "before-live-small")
+        self.assertTrue(resume["ok"], resume["reason"])
+        self.assertEqual(resumed_payload["lifecycle"], "before-live-small")
         self.assertTrue(resumed_payload["permissions"]["live_small_eligible"])
         self.assertTrue(retire["ok"])
-        self.assertEqual(retired_payload["promotionStage"], "retired")
+        self.assertEqual(retired_payload["lifecycle"], "retired")
         self.assertFalse(retired_payload["permissions"]["live_small_eligible"])
+
+    def test_live_promotion_keeps_strategy_immutable_and_writes_live_evidence(self) -> None:
+        previous_artifact_dir = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_dir = Path(temp_dir)
+            os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
+            artifact_path = artifact_dir / "strategy.json"
+            artifact_payload = {
+                "id": "LIVE-PROMOTE-1",
+                "strategy_id": "LIVE-PROMOTE-1",
+                "name": "Immutable Live Candidate",
+                "symbol": "BTCUSDT",
+                "asset": "CRYPTO",
+                "timeframe": "5m",
+                "plugin": "moving_average_cross",
+                "finalTest": {"status": "pass"},
+                "lifecycle": {"status": "before-live-small"},
+                "permissions": {
+                    "trader_export_allowed": True,
+                    "paper_trader_verified": True,
+                    "live_small_eligible": True,
+                    "live_eligible": False,
+                    "live_allowed": False,
+                    "fail_reasons": [],
+                },
+            }
+            artifact_path.write_text(json.dumps(artifact_payload, ensure_ascii=False), encoding="utf-8")
+            immutable_source = artifact_path.read_bytes()
+            state.STATE["orders"] = [
+                {
+                    "strategy_id": "LIVE-PROMOTE-1",
+                    "state": "filled",
+                    "queue_state": "filled",
+                    "dry_run": False,
+                }
+            ]
+            readiness = {"operator_confirmed": True, "summary": {"blocker_count": 0}}
+            try:
+                with patch("live_trader.state.snapshot", return_value=readiness):
+                    result = state.promote_strategy_to_live("LIVE-PROMOTE-1")
+                deployment = next(
+                    iter(
+                        json.loads(
+                            (artifact_dir / "deployments" / "deployment-registry.json").read_text(encoding="utf-8")
+                        )["entries"].values()
+                    )
+                )
+                live_files = list((artifact_dir / "evidence" / "live").glob("*.json"))
+                evidence = json.loads(live_files[0].read_text(encoding="utf-8"))
+                immutable_after = artifact_path.read_bytes()
+            finally:
+                if previous_artifact_dir is None:
+                    os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+                else:
+                    os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact_dir
+
+        self.assertTrue(result["ok"], result["reason"])
+        self.assertEqual(immutable_source, immutable_after)
+        self.assertEqual("live", deployment["lifecycle"])
+        self.assertTrue(deployment["permissions"]["live_allowed"])
+        self.assertEqual("live-execution", evidence["evidenceType"])
+        self.assertEqual("PASS", evidence["result"])
+        self.assertTrue(evidence["integrity"]["contentHash"])
 
     def test_submit_test_intent_creates_dry_run_order_when_gate_passes(self) -> None:
         state.STATE["orders"] = []
