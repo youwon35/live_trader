@@ -1,0 +1,71 @@
+name: Windows Release Quality
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-package:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: trading-system/apps/live_trader
+    steps:
+      - name: Checkout shared trading system
+        uses: actions/checkout@v4
+        with:
+          repository: youwon35/trading-system
+          ref: develop
+          path: trading-system
+      - name: Checkout Live Trader
+        uses: actions/checkout@v4
+        with:
+          path: trading-system/apps/live_trader
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: trading-system/apps/live_trader/package-lock.json
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
+          npm ci
+      - name: Run tests
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests
+      - name: Build EXE
+        run: .\build_exe.ps1
+      - name: Smoke packaged EXE without enabling broker orders
+        run: ..\..\apps\scripts\smoke_windows_exe.ps1 -ExePath release\LiveTrader.exe -WorkingDirectory .
+      - name: Write SHA-256 manifest
+        run: >-
+          .\.venv\Scripts\python.exe ..\..\apps\scripts\write_release_manifest.py
+          --app live_trader --app-root . --shared-root ..\.. --output release\release-manifest.json
+          --file release\LiveTrader.exe
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-trader-windows-${{ github.sha }}
+          path: |
+            trading-system/apps/live_trader/release/LiveTrader.exe
+            trading-system/apps/live_trader/release/release-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
