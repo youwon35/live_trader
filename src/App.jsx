@@ -191,6 +191,7 @@ const fallbackSnapshot = {
     execution_event_count: 0,
   },
   execution_events: { last_poll: null, errors: [], event_count: 0, recorded_count: 0, recent: [] },
+  execution_calibration: { status: "review", sampleCount: 0, meanAbsoluteModelErrorBps: null, p95AbsoluteSlippageBps: null },
   operation_report: { generated_at: "-", sections: [] },
   final_preflight: [],
   launch_report: {
@@ -1588,6 +1589,7 @@ function LivePreparationPanel({
             runtimeRecovery={snapshot.runtime_recovery}
             shadowLive={snapshot.shadow_live}
             multiStrategy={snapshot.multi_strategy}
+            executionCalibration={snapshot.execution_calibration}
           />
           <StrategyPanel strategies={filteredStrategies} selectedStrategyId={selectedStrategy?.strategy_id} onSelect={setSelectedStrategyId} />
           <OperationalSafeguardsPanel
@@ -1609,7 +1611,7 @@ function LivePreparationPanel({
   );
 }
 
-function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operationalReadiness = {}, runtimeRecovery = {}, shadowLive = {}, multiStrategy = {} }) {
+function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operationalReadiness = {}, runtimeRecovery = {}, shadowLive = {}, multiStrategy = {}, executionCalibration = {} }) {
   const gate = selectedStrategy?.portfolio_gate ?? {};
   const evidenceGate = selectedStrategy?.paper_portfolio_evidence_gate ?? {};
   const [replay, setReplay] = useState(null);
@@ -1684,6 +1686,7 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operational
           <MetricCard className="metric-card" label="Operational Readiness" value={`${operationalReadiness.score ?? 0}/${operationalReadiness.threshold ?? 85}`} detail={operationalReadiness.liveEligible ? "LIVE ELIGIBLE" : "신규 위험 차단"} />
           <MetricCard className="metric-card" label="Recovery" value={runtimeRecovery.verified && !runtimeRecovery.safeMode ? "VERIFIED" : "SAFE MODE"} detail={runtimeRecovery.detail || "복구 훈련 대기"} />
           <MetricCard className="metric-card" label="Shadow Live" value={`${shadowLive.count ?? 0} observations`} detail="브로커 전송은 항상 차단" />
+          <MetricCard className="metric-card" label="Execution Calibration" value={`${executionCalibration.sampleCount ?? 0} samples`} detail={executionCalibration.status === "pass" ? `모델오차 ${Number(executionCalibration.meanAbsoluteModelErrorBps ?? 0).toFixed(1)} bps` : "Paper/Shadow 체결 표본 필요"} />
           <MetricCard className="metric-card" label="Strategy Sleeves" value={`${multiStrategy.sleeveCount ?? 0} active`} detail="종목별 순주문 1건 · Short는 명시 상품만" />
         </div>
       )}

@@ -1,4 +1,5 @@
 @import "../../../packages/design/design-tokens.css";
+@import "../../../packages/design/interaction-standards.css";
 
 :root {
   --accent-contrast-text: #ffffff;

@@ -45,6 +45,9 @@ from trading_runtime import (
     InstrumentTradePolicy,
     MultiStrategySleeveCoordinator,
     SleeveSignal,
+    ExecutionSample,
+    assess_recovery_drill,
+    calibrate_execution,
 )
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .program_ledger import ProgramLedger
@@ -1225,6 +1228,24 @@ def execution_event_snapshot() -> dict[str, Any]:
     }
 
 
+def execution_calibration_snapshot() -> dict[str, Any]:
+    samples = []
+    for evidence in STATE.get("shadow_evidence", []):
+        decision = evidence.get("decision") if isinstance(evidence, dict) and isinstance(evidence.get("decision"), dict) else {}
+        decision_price = safe_float(decision.get("decision_price"), 0.0)
+        virtual_fill = safe_float(decision.get("virtual_fill_price"), 0.0)
+        if decision_price > 0 and virtual_fill > 0:
+            samples.append(ExecutionSample(
+                "shadow-live", str(decision.get("side") or "BUY"), decision_price, virtual_fill,
+                safe_float(decision.get("expected_cost_bps"), 0.0), int(safe_float(decision.get("latency_ms"), 0)),
+            ))
+    return calibrate_execution(
+        samples,
+        maximum_model_error_bps=10.0,
+        maximum_p95_slippage_bps=safe_float(STATE.get("risk_settings", {}).get("max_slippage_bps"), 30.0),
+    )
+
+
 def positions() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     broker_rows = live_position_rows()
@@ -1953,6 +1974,7 @@ def snapshot() -> dict[str, Any]:
         "reconciliation": reconciliation,
         "program_ledger": program_ledger_snapshot(),
         "execution_events": execution_event_snapshot(),
+        "execution_calibration": execution_calibration_snapshot(),
         "policy_replays": list(STATE.get("policy_replays", [])),
         "shadow_live": {"brokerSubmissionBlocked": True, "evidence": list(STATE.get("shadow_evidence", []))[:20], "count": len(STATE.get("shadow_evidence", []))},
         "runtime_recovery": dict(STATE.get("recovery_status", {})),
@@ -3193,17 +3215,27 @@ def run_recovery_drill() -> dict[str, Any]:
     checkpoint = RECOVERY_JOURNAL.save(recovery_state_payload(), reason="operator-recovery-drill", idempotency_keys=[str(item.get("idempotency_key") or "") for item in STATE.get("orders", [])])
     loaded = RECOVERY_JOURNAL.load_latest()
     verified = loaded.get("contentHash") == checkpoint.get("contentHash") and loaded.get("state") == checkpoint.get("state")
+    idempotency_keys = [str(item.get("idempotency_key") or "") for item in STATE.get("orders", []) if item.get("idempotency_key")]
+    reconciliation_status = reconciliation_snapshot().get("summary", {}).get("status")
+    broker_reconciled = reconciliation_status == "pass" or current_mode() == "MONITOR"
+    assurance = assess_recovery_drill(
+        checkpoint_saved=bool(checkpoint.get("contentHash")),
+        checkpoint_hash_verified=verified,
+        idempotency_verified=len(idempotency_keys) == len(set(idempotency_keys)),
+        broker_reconciled=broker_reconciled,
+    )
     STATE["recovery_status"] = {
-        "verified": verified, "safeMode": bool(loaded.get("safeMode")) or not verified,
+        "verified": assurance["status"] == "pass", "safeMode": bool(loaded.get("safeMode")) or assurance["safeModeRequired"],
         "generation": int(loaded.get("generation") or 0),
-        "detail": "복구 체크포인트 검증 통과" if verified else "복구 체크포인트 검증 실패: 신규 위험 차단",
+        "detail": "복구·멱등성·브로커 대조 훈련 통과" if assurance["status"] == "pass" else "복구 훈련 미통과: 안전 모드에서 신규 위험 차단",
         "corruptCheckpoints": loaded.get("corruptCheckpoints", []),
+        "assurance": assurance,
     }
-    if not verified:
+    if assurance["status"] != "pass":
         STATE["new_entries_blocked"] = True
         STATE["mode"] = "MONITOR"
     append_audit("info" if verified else "danger", "Recovery Drill", STATE["recovery_status"]["detail"])
-    return {"ok": verified, "recovery": dict(STATE["recovery_status"]), "snapshot": snapshot()}
+    return {"ok": assurance["status"] == "pass", "recovery": dict(STATE["recovery_status"]), "snapshot": snapshot()}
 
 
 def restore_runtime_from_checkpoint() -> dict[str, Any]:
