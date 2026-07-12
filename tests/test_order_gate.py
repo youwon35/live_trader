@@ -1142,6 +1142,37 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("event adapter required", result["errors"][0]["detail"])
 
+    def test_recovery_drill_verifies_atomic_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal = state.RecoveryJournal(Path(temp_dir) / "recovery")
+            with patch.object(state, "RECOVERY_JOURNAL", journal):
+                result = state.run_recovery_drill()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["recovery"]["verified"])
+        self.assertFalse(result["recovery"]["safeMode"])
+
+    def test_shadow_live_records_virtual_fill_without_order_or_broker_submission(self) -> None:
+        state.STATE["orders"] = []
+        before = len(state.STATE["orders"])
+        result = state.run_shadow_live({"decision_price": 1000, "virtual_fill_price": 1001, "paper_fill_price": 1000.5})
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["evidence"]["brokerSubmissionBlocked"])
+        self.assertEqual(before, len(state.STATE["orders"]))
+        self.assertEqual(1, len(state.STATE["shadow_evidence"]))
+
+    def test_startup_restore_keeps_idempotency_keys_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal = state.RecoveryJournal(Path(temp_dir) / "recovery")
+            journal.save({"mode": "SMALL_LIVE", "dry_run": False, "orders": [], "strategy_runner": {}}, reason="before-restart", idempotency_keys=["persisted-key"])
+            with patch.object(state, "RECOVERY_JOURNAL", journal):
+                restored = state.restore_runtime_from_checkpoint()
+        self.assertTrue(restored["verified"])
+        self.assertTrue(restored["safeMode"])
+        self.assertEqual("MONITOR", state.STATE["mode"])
+        self.assertTrue(state.STATE["dry_run"])
+        self.assertTrue(state.STATE["new_entries_blocked"])
+        self.assertIn("persisted-key", state.STATE["persisted_idempotency_keys"])
+
 
 if __name__ == "__main__":
     unittest.main()

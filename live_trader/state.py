@@ -36,6 +36,10 @@ from trading_runtime import (
     ReplayEvent,
     DeRiskInputs,
     automatic_de_risk,
+    operational_readiness,
+    RecoveryJournal,
+    ShadowLiveEngine,
+    ShadowOrder,
 )
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .program_ledger import ProgramLedger
@@ -345,6 +349,9 @@ STATE: dict[str, Any] = {
     "reconciliation_last_run": None,
     "preflight_last_run": None,
     "orders": [],
+    "persisted_idempotency_keys": [],
+    "shadow_evidence": [],
+    "recovery_status": {"verified": False, "safeMode": True, "generation": 0, "detail": "복구 훈련 미실행"},
     "audit": [
         {
             "time": "08:57:04",
@@ -360,6 +367,10 @@ STATE: dict[str, Any] = {
         },
     ],
 }
+
+RUNTIME_RECOVERY_ROOT = Path(os.getenv("LIVE_TRADER_RECOVERY_DIR") or (Path(__file__).resolve().parents[1] / "logs" / "recovery-journal"))
+RECOVERY_JOURNAL = RecoveryJournal(RUNTIME_RECOVERY_ROOT)
+SHADOW_ENGINE = ShadowLiveEngine()
 
 
 def now_text() -> str:
@@ -569,6 +580,7 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
     allocation = matching_instance.get("allocation") if isinstance(matching_instance, dict) and isinstance(matching_instance.get("allocation"), dict) else {}
     portfolio_policy = portfolio.get("portfolio_policy") if isinstance(portfolio.get("portfolio_policy"), dict) else {}
     advanced_operations = portfolio.get("advanced_operations") if isinstance(portfolio.get("advanced_operations"), dict) else {}
+    operational_bundle = portfolio.get("operational_readiness_bundle") if isinstance(portfolio.get("operational_readiness_bundle"), dict) else {}
     mandate = advanced_operations.get("mandate") if isinstance(advanced_operations.get("mandate"), dict) else {}
     automatic_de_risk = advanced_operations.get("automaticDeRisk") if isinstance(advanced_operations.get("automaticDeRisk"), dict) else {}
     capital_multiplier = max(0.0, min(1.0, safe_float(automatic_de_risk.get("capitalMultiplier"), 1.0)))
@@ -678,6 +690,8 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         "decisionQuality": advanced_operations.get("decisionQuality") if isinstance(advanced_operations.get("decisionQuality"), dict) else {},
         "contagionGraph": advanced_operations.get("contagionGraph") if isinstance(advanced_operations.get("contagionGraph"), dict) else {},
         "championChallenger": advanced_operations.get("championChallenger") if isinstance(advanced_operations.get("championChallenger"), dict) else {},
+        "operationalReadinessBundle": operational_bundle,
+        "operationalReadinessHash": str(portfolio.get("operational_readiness_hash") or operational_bundle.get("contentHash") or ""),
     }
 
 
@@ -757,6 +771,10 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
         advanced_blockers.append("portfolio-stress-library-failed")
     if safe_float(selected_gate.get("capitalMultiplier"), 1.0) <= 0 and not risk_reducing:
         advanced_blockers.append("automatic-de-risk-freeze")
+    operational_bundle = selected_gate.get("operationalReadinessBundle") if isinstance(selected_gate.get("operationalReadinessBundle"), dict) else {}
+    runtime_readiness = checks.get("operational_readiness") if isinstance(checks.get("operational_readiness"), dict) else {}
+    if operational_bundle and runtime_readiness.get("liveEligible") is not True and not risk_reducing:
+        advanced_blockers.append(f"operational-readiness={runtime_readiness.get('score', 0)}/{runtime_readiness.get('threshold', 85)}")
     if advanced_blockers:
         selected_gate["allowed"] = False
         selected_gate["advancedOperationBlockers"] = list(dict.fromkeys(advanced_blockers))
@@ -1882,6 +1900,7 @@ def snapshot() -> dict[str, Any]:
     warnings = [check for check in checks if check.status == "warn"]
     blocker_count = len(blockers) + int(watchdog["critical_count"])
     warning_count = len(warnings) + int(watchdog["warning_count"])
+    operational = runtime_operational_readiness(strategies, portfolios)
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode": STATE["mode"],
@@ -1919,6 +1938,9 @@ def snapshot() -> dict[str, Any]:
         "program_ledger": program_ledger_snapshot(),
         "execution_events": execution_event_snapshot(),
         "policy_replays": list(STATE.get("policy_replays", [])),
+        "shadow_live": {"brokerSubmissionBlocked": True, "evidence": list(STATE.get("shadow_evidence", []))[:20], "count": len(STATE.get("shadow_evidence", []))},
+        "runtime_recovery": dict(STATE.get("recovery_status", {})),
+        "operational_readiness": operational,
         "accounts": reconciliation["accounts"],
         "positions": reconciliation["positions"],
         "operation_report": report,
@@ -3020,6 +3042,7 @@ def submit_order_intent(
     audit_event: str,
     runner_report: StrategyExecutionResult | None = None,
 ) -> dict[str, Any]:
+    RECOVERY_JOURNAL.save(recovery_state_payload(), reason="before-order", idempotency_keys=[str(item.get("idempotency_key") or "") for item in STATE.get("orders", [])])
     ok, order_state, queue_state, reason, risk_report = evaluate_order_gate_with_report(checks, intent.side, dry_run, intent)
     portfolio_gate = portfolio_gate_for_intent(checks, intent)
     retry_backoff = float(STATE["retry_policy"]["backoff_sec"])
@@ -3032,7 +3055,15 @@ def submit_order_intent(
         target_revision=target_revision,
         purpose=str(metadata.get("order_purpose") or "REBALANCE"),
     )
+    if idempotency_key in set(STATE.get("persisted_idempotency_keys", [])):
+        existing = next((item for item in STATE.get("orders", []) if item.get("idempotency_key") == idempotency_key), None)
+        append_audit("warn", audit_event, f"재시작 이후 중복 주문 차단: idempotency_key={idempotency_key}")
+        return {"ok": existing is not None, "reason": "persistent-duplicate-idempotency-key", "order": existing or {}, "duplicate": True, "snapshot": snapshot()}
     managed_order, oms_created = LIVE_OMS.create(intent, idempotency_key)
+    if not oms_created:
+        existing = next((item for item in STATE.get("orders", []) if item.get("oms_order_id") == managed_order.order_id), None)
+        append_audit("warn", audit_event, f"중복 주문 차단: idempotency_key={idempotency_key}")
+        return {"ok": existing is not None, "reason": "duplicate-idempotency-key", "order": existing or {}, "duplicate": True, "snapshot": snapshot()}
     if oms_created:
         if ok:
             LIVE_OMS.transition(managed_order.order_id, "RISK_APPROVED", "PreTradeRiskGate passed")
@@ -3068,6 +3099,10 @@ def submit_order_intent(
         order["runner_report"] = runner_report.to_dict()
     STATE["orders"].insert(0, order)
     STATE["orders"] = STATE["orders"][:50]
+    STATE.setdefault("persisted_idempotency_keys", []).append(idempotency_key)
+    STATE["persisted_idempotency_keys"] = list(dict.fromkeys(STATE["persisted_idempotency_keys"]))[-5000:]
+    checkpoint = RECOVERY_JOURNAL.save(recovery_state_payload(), reason="after-order", idempotency_keys=[str(item.get("idempotency_key") or "") for item in STATE.get("orders", [])])
+    STATE["recovery_status"] = {"verified": True, "safeMode": False, "generation": checkpoint["generation"], "detail": "주문 전후 원자적 체크포인트 저장 완료"}
     append_audit(
         "info" if ok else "danger",
         audit_event,
@@ -3087,6 +3122,101 @@ def submit_test_intent() -> dict[str, Any]:
     checks = snapshot()
     intent = default_order_intent(checks, "BUY")
     return submit_order_intent(checks, intent, dry_run=bool(STATE["dry_run"]), audit_event="주문 게이트")
+
+
+def recovery_state_payload() -> dict[str, Any]:
+    return {
+        "mode": STATE.get("mode"), "dry_run": STATE.get("dry_run"), "kill_switch": STATE.get("kill_switch"),
+        "new_entries_blocked": STATE.get("new_entries_blocked"), "orders": list(STATE.get("orders", [])),
+        "strategy_runner": dict(STATE.get("strategy_runner", {})),
+    }
+
+
+def run_recovery_drill() -> dict[str, Any]:
+    checkpoint = RECOVERY_JOURNAL.save(recovery_state_payload(), reason="operator-recovery-drill", idempotency_keys=[str(item.get("idempotency_key") or "") for item in STATE.get("orders", [])])
+    loaded = RECOVERY_JOURNAL.load_latest()
+    verified = loaded.get("contentHash") == checkpoint.get("contentHash") and loaded.get("state") == checkpoint.get("state")
+    STATE["recovery_status"] = {
+        "verified": verified, "safeMode": bool(loaded.get("safeMode")) or not verified,
+        "generation": int(loaded.get("generation") or 0),
+        "detail": "복구 체크포인트 검증 통과" if verified else "복구 체크포인트 검증 실패: 신규 위험 차단",
+        "corruptCheckpoints": loaded.get("corruptCheckpoints", []),
+    }
+    if not verified:
+        STATE["new_entries_blocked"] = True
+        STATE["mode"] = "MONITOR"
+    append_audit("info" if verified else "danger", "Recovery Drill", STATE["recovery_status"]["detail"])
+    return {"ok": verified, "recovery": dict(STATE["recovery_status"]), "snapshot": snapshot()}
+
+
+def restore_runtime_from_checkpoint() -> dict[str, Any]:
+    loaded = RECOVERY_JOURNAL.load_latest()
+    generation = int(loaded.get("generation") or 0)
+    if generation <= 0:
+        STATE["recovery_status"] = {"verified": False, "safeMode": True, "generation": 0, "detail": "유효한 체크포인트 없음: MONITOR 유지", "corruptCheckpoints": loaded.get("corruptCheckpoints", [])}
+        return dict(STATE["recovery_status"])
+    recovered = loaded.get("state") if isinstance(loaded.get("state"), dict) else {}
+    STATE["orders"] = list(recovered.get("orders", []))[:50] if isinstance(recovered.get("orders"), list) else []
+    if isinstance(recovered.get("strategy_runner"), dict):
+        STATE["strategy_runner"].update(recovered["strategy_runner"])
+    STATE["persisted_idempotency_keys"] = list(dict.fromkeys(str(item) for item in loaded.get("idempotencyKeys", []) if item))
+    STATE["mode"] = "MONITOR"
+    STATE["dry_run"] = True
+    STATE["new_entries_blocked"] = True
+    STATE["recovery_status"] = {
+        "verified": not loaded.get("safeMode"), "safeMode": True, "generation": generation,
+        "detail": "체크포인트 복구 완료. 브로커 reconciliation 전까지 MONITOR/신규 진입 차단",
+        "corruptCheckpoints": loaded.get("corruptCheckpoints", []),
+    }
+    append_audit("warn", "Startup Recovery", STATE["recovery_status"]["detail"])
+    return dict(STATE["recovery_status"])
+
+
+def run_shadow_live(payload: dict[str, Any]) -> dict[str, Any]:
+    checks = snapshot()
+    intent = default_order_intent(checks, str(payload.get("side") or "BUY"))
+    reference = safe_float(payload.get("decision_price"), intent.reference_price)
+    virtual_fill = safe_float(payload.get("virtual_fill_price"), reference)
+    paper_fill = safe_float(payload.get("paper_fill_price"), 0.0)
+    evidence = SHADOW_ENGINE.execute(
+        ShadowOrder(
+            decision_id=str(payload.get("decision_id") or f"shadow-{len(STATE.get('shadow_evidence', [])) + 1}"),
+            strategy_id=intent.strategy_id,
+            instrument_id=str((intent.metadata or {}).get("instrument_id") or intent.symbol),
+            side=intent.side, quantity=intent.quantity, decision_price=reference, virtual_fill_price=virtual_fill,
+            expected_cost_bps=safe_float(payload.get("expected_cost_bps"), safe_float((intent.metadata or {}).get("expected_cost_bps"), 0.0)),
+            latency_ms=int(safe_float(payload.get("latency_ms"), 0)),
+        ), paper_fill_price=paper_fill or None,
+    )
+    STATE.setdefault("shadow_evidence", []).insert(0, evidence)
+    STATE["shadow_evidence"] = STATE["shadow_evidence"][:100]
+    append_audit("info", "Shadow Live", f"브로커 전송 없이 가상 체결 기록: {evidence['contentHash'][:12]}")
+    return {"ok": True, "evidence": evidence, "snapshot": snapshot()}
+
+
+def runtime_operational_readiness(strategies: list[dict[str, Any]], portfolios: list[dict[str, Any]]) -> dict[str, Any]:
+    bundles = [item.get("operational_readiness_bundle") for item in portfolios if isinstance(item.get("operational_readiness_bundle"), dict) and item.get("operational_readiness_bundle")]
+    if not bundles:
+        return {"schemaVersion": "operational-readiness-v1", "score": 0, "status": "NOT_REQUIRED", "liveEligible": False, "components": []}
+    base = bundles[0]
+    source = base.get("operationalReadiness") if isinstance(base.get("operationalReadiness"), dict) else {}
+    components = source.get("components") if isinstance(source.get("components"), list) else []
+    paper_ready = any((item.get("paper_portfolio_evidence_gate") or {}).get("ready") is True for item in strategies)
+    execution_component = next((item for item in components if isinstance(item, dict) and item.get("id") == "executionQuality"), {})
+    execution_ok = bool(execution_component.get("passed") or safe_float(execution_component.get("awarded"), 0) > 0 or STATE.get("shadow_evidence"))
+    capacity_ok = all(
+        not (item.get("advanced_operations") or {}).get("capacity")
+        or all(entry.get("allowed") is True for entry in (item.get("advanced_operations") or {}).get("capacity", []) if isinstance(entry, dict))
+        for item in portfolios
+    )
+    return operational_readiness({
+        "dataIntegrity": next((component.get("passed") for component in components if isinstance(component, dict) and component.get("id") == "dataIntegrity"), False),
+        "artifactReproducibility": bool(base.get("contentHash")), "paperObservation": paper_ready,
+        "executionQuality": execution_ok, "capacityHeadroom": capacity_ok,
+        "recoveryVerified": STATE.get("recovery_status", {}).get("verified") is True and STATE.get("recovery_status", {}).get("safeMode") is False,
+        "policyReplayPassed": bool(STATE.get("policy_replays")),
+        "operatorDrill": bool(STATE.get("preflight_last_run")) and all(STATE.get("checklist", {}).values()),
+    })
 
 
 def run_policy_replay(payload: dict[str, Any]) -> dict[str, Any]:

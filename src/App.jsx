@@ -57,6 +57,8 @@ import {
   saveEnvSettings,
   submitTestIntent,
   runPolicyReplay,
+  runShadowLive,
+  runRecoveryDrill,
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
@@ -1579,7 +1581,13 @@ function LivePreparationPanel({
             summary={snapshot.summary ?? {}}
             operatorConfirmed={Boolean(snapshot.operator_confirmed)}
           />
-          <PortfolioArtifactPanel portfolios={snapshot.portfolios ?? []} selectedStrategy={selectedStrategy} />
+          <PortfolioArtifactPanel
+            portfolios={snapshot.portfolios ?? []}
+            selectedStrategy={selectedStrategy}
+            operationalReadiness={snapshot.operational_readiness}
+            runtimeRecovery={snapshot.runtime_recovery}
+            shadowLive={snapshot.shadow_live}
+          />
           <StrategyPanel strategies={filteredStrategies} selectedStrategyId={selectedStrategy?.strategy_id} onSelect={setSelectedStrategyId} />
           <OperationalSafeguardsPanel
             dryRun={snapshot.dry_run}
@@ -1600,11 +1608,12 @@ function LivePreparationPanel({
   );
 }
 
-function PortfolioArtifactPanel({ portfolios = [], selectedStrategy }) {
+function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operationalReadiness = {}, runtimeRecovery = {}, shadowLive = {} }) {
   const gate = selectedStrategy?.portfolio_gate ?? {};
   const evidenceGate = selectedStrategy?.paper_portfolio_evidence_gate ?? {};
   const [replay, setReplay] = useState(null);
   const [replayRunning, setReplayRunning] = useState(false);
+  const [operationResult, setOperationResult] = useState(null);
   async function replayPolicy() {
     setReplayRunning(true);
     try {
@@ -1620,6 +1629,14 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy }) {
     } finally {
       setReplayRunning(false);
     }
+  }
+  async function observeShadow() {
+    const response = await runShadowLive({ side: "BUY", expected_cost_bps: 6, latency_ms: 100 });
+    setOperationResult(response.evidence ? `Shadow evidence ${response.evidence.contentHash.slice(0, 12)}` : "Shadow 실행 완료");
+  }
+  async function verifyRecovery() {
+    const response = await runRecoveryDrill();
+    setOperationResult(response.ok ? `Recovery generation ${response.recovery.generation} 검증 완료` : "Recovery 안전 모드 진입");
   }
   return (
     <section className="panel portfolio-artifact-panel">
@@ -1655,7 +1672,17 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy }) {
       {gate.active && (
         <div className="operator-actions">
           <ActionButton className="secondary-button" label="정책 Replay" onClick={replayPolicy} status={replayRunning ? "pending" : replay ? "success" : undefined} disabled={replayRunning} />
+          <ActionButton className="secondary-button" label="Shadow 관찰" onClick={observeShadow} />
+          <ActionButton className="secondary-button" label="복구 훈련" onClick={verifyRecovery} />
           {replay && <span className="inline-state success">{replay.eventCount}건 · 결정 변경 {replay.changedDecisionCount} · 원본 불변 {replay.sourceEventsImmutable ? "PASS" : "FAIL"}</span>}
+          {operationResult && <span className="inline-state success">{operationResult}</span>}
+        </div>
+      )}
+      {gate.active && (
+        <div className="portfolio-gate-metrics">
+          <MetricCard className="metric-card" label="Operational Readiness" value={`${operationalReadiness.score ?? 0}/${operationalReadiness.threshold ?? 85}`} detail={operationalReadiness.liveEligible ? "LIVE ELIGIBLE" : "신규 위험 차단"} />
+          <MetricCard className="metric-card" label="Recovery" value={runtimeRecovery.verified && !runtimeRecovery.safeMode ? "VERIFIED" : "SAFE MODE"} detail={runtimeRecovery.detail || "복구 훈련 대기"} />
+          <MetricCard className="metric-card" label="Shadow Live" value={`${shadowLive.count ?? 0} observations`} detail="브로커 전송은 항상 차단" />
         </div>
       )}
       <div className="portfolio-artifact-list">

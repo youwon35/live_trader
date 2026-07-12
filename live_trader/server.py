@@ -112,6 +112,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/policy-replay":
             self.send_json(state.run_policy_replay(payload))
             return
+        if parsed.path == "/api/shadow-live":
+            self.send_json(state.run_shadow_live(payload))
+            return
+        if parsed.path == "/api/recovery-drill":
+            self.send_json(state.run_recovery_drill())
+            return
         if parsed.path == "/api/strategy-cycle":
             self.send_json(state.run_strategy_cycle(str(payload.get("profile_id", "stock"))))
             return
@@ -191,6 +197,7 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
 
 
 def create_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
+    state.restore_runtime_from_checkpoint()
     return ThreadingHTTPServer((host, port), LiveTraderHandler)
 
 

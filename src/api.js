@@ -82,6 +82,14 @@ export async function runPolicyReplay(payload = {}) {
   return request("/api/policy-replay", { method: "POST", body: payload });
 }
 
+export async function runShadowLive(payload = {}) {
+  return request("/api/shadow-live", { method: "POST", body: payload });
+}
+
+export async function runRecoveryDrill() {
+  return request("/api/recovery-drill", { method: "POST", body: {} });
+}
+
 export async function runStrategyCycle(profileId) {
   return request("/api/strategy-cycle", { method: "POST", body: { profile_id: profileId } });
 }
