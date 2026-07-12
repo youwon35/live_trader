@@ -29,6 +29,8 @@ from trading_runtime import (
     build_idempotency_key,
     audit_event_from_order_gate,
     build_audit_event,
+    artifact_content_hash,
+    build_lineage_manifest,
     build_live_execution_evidence,
     normalize_broker_execution,
     rebalance_decision,
@@ -50,6 +52,7 @@ from .contracts import (
     IGNORED_STRATEGY_FILE_NAMES,
     can_live_small_use_artifact,
     can_live_use_artifact,
+    enrich_strategy_artifact_runtime,
     lifecycle_rank,
     load_portfolio_artifacts,
     load_strategy_artifacts,
@@ -855,7 +858,7 @@ def find_strategy_artifact_payload(strategy_id: str) -> tuple[Path | None, Path 
             if not isinstance(payload, dict):
                 continue
             try:
-                normalized = normalize_strategy_artifact(payload)
+                normalized = normalize_strategy_artifact(enrich_strategy_artifact_runtime(folder, path, payload))
             except (KeyError, TypeError, ValueError):
                 continue
             if str(normalized.get("strategy_id")) == target:
@@ -2174,6 +2177,12 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
         append_audit("danger", "Live 승급 차단", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
 
+    lineage_blockers = (normalized.get("lineage") or {}).get("blockingIssues") if isinstance(normalized.get("lineage"), dict) else []
+    if lineage_blockers:
+        reason = f"Professional Flow lineage 무결성 실패: {', '.join(str(item) for item in lineage_blockers)}"
+        append_audit("danger", "Live 승급 차단", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
     deployment_store, deployment, portfolio_payload = ensure_live_deployment(strategy_dir, payload, normalized)
     current_status = normalize_lifecycle_status(deployment.get("lifecycle") or normalized.get("lifecycle_status"))
     if current_status == "live":
@@ -2222,6 +2231,7 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
     })
     now = datetime.now().astimezone().replace(microsecond=0).isoformat()
     evidence_id = f"live-{strategy_id}-{datetime.now().strftime('%Y%m%dT%H%M%S%f')}"
+    paper_evidence = normalized.get("paper_portfolio_evidence") if isinstance(normalized.get("paper_portfolio_evidence"), dict) else {}
     live_evidence = build_live_execution_evidence(
         evidence_id=evidence_id,
         strategy_artifact=payload,
@@ -2233,7 +2243,23 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
         ended_at=now,
         successful_orders=execution["successful"],
         blocked_orders=execution["blocked"],
-        details={"operatorConfirmed": True, "readinessBlockers": 0},
+        details={
+            "operatorConfirmed": True,
+            "readinessBlockers": 0,
+            "lineageManifest": build_lineage_manifest(
+                stage="live",
+                producer="live_trader",
+                created_at=now,
+                inputs={
+                    "strategyArtifactHash": artifact_content_hash(payload),
+                    "paperEvidenceHash": str(paper_evidence.get("evidenceHash") or normalized.get("permissions", {}).get("paperEvidenceHash") or "legacy-paper-evidence"),
+                    "runtimeVersion": "live-trader-v1",
+                    "brokerRoute": strategy_broker_id(normalized),
+                },
+                policies={"environment": "SMALL_LIVE", "mode": "SMALL_LIVE", "deploymentRevision": deployment.get("revision")},
+                parent={"stage": "paper", "contentHash": normalized.get("lineage", {}).get("paper", {}).get("contentHash") or "legacy"},
+            ),
+        },
     )
     live_record = EvidenceStore(strategy_dir).save_live(live_evidence)
     permissions.update(

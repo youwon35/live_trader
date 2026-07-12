@@ -25,6 +25,14 @@ from trading_runtime.artifact_governance import (  # noqa: E402
     EvidenceStore,
     artifact_reference,
 )
+from trading_runtime.lifecycle import (  # noqa: E402
+    ACTIVE_REVALIDATION_STAGES,
+    LIFECYCLE_LABELS,
+    lifecycle_at_least,
+    lifecycle_rank,
+    normalize_lifecycle_status,
+)
+from trading_runtime.professional_flow import validate_lineage_manifest  # noqa: E402
 
 
 ARTIFACT_SCHEMA_VERSION = "strategy-artifact-v2"
@@ -61,75 +69,11 @@ IGNORED_PORTFOLIO_FILE_NAMES = {
     "package-lock.json",
     "portfolio-registry.json",
 }
-LIFECYCLE_STAGE_ALIASES = {
-    "approved": "backtested",
-    "final_tested": "backtested",
-    "final-tested": "backtested",
-    "candidate": "backtested",
-    "shadow": "before-shadow",
-    "shadow_candidate": "before-shadow",
-    "shadow-candidate": "before-shadow",
-    "paper_candidate": "before-shadow",
-    "paper-candidate": "before-shadow",
-    "paper": "papered",
-    "live_candidate": "before-live-small",
-    "live-candidate": "before-live-small",
-    "live_small": "before-live-small",
-    "live-small": "before-live-small",
-    "live_canary": "before-live-small",
-    "live-canary": "before-live-small",
-    "live_active": "live",
-    "live-active": "live",
-    "production": "live",
-}
-LIFECYCLE_STAGE_ORDER = {
-    "draft": 0,
-    "backtested": 10,
-    "before-shadow": 20,
-    "shadowed": 30,
-    "papered": 40,
-    "before-live-small": 50,
-    "live": 60,
-    "paused": 70,
-    "retired": 80,
-}
-LIFECYCLE_LABELS = {
-    "draft": "Draft",
-    "backtested": "Backtested",
-    "before-shadow": "Before Shadow",
-    "shadowed": "Shadowed",
-    "papered": "Papered",
-    "before-live-small": "Before Live-Small",
-    "live": "Live",
-    "paused": "Paused",
-    "retired": "Retired",
-}
 NON_BLOCKING_CAPABILITY_REASONS = {"live-activation-required"}
-ACTIVE_REVALIDATION_STAGES = {
-    "backtested",
-    "before-shadow",
-    "shadowed",
-    "papered",
-    "before-live-small",
-    "live",
-}
 
 
 def _dict_value(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
-
-
-def normalize_lifecycle_status(value: Any) -> str:
-    normalized = str(value or "").strip().lower().replace("_", "-")
-    return LIFECYCLE_STAGE_ALIASES.get(normalized, normalized or "draft")
-
-
-def lifecycle_rank(value: Any) -> int:
-    return LIFECYCLE_STAGE_ORDER.get(normalize_lifecycle_status(value), -1)
-
-
-def lifecycle_at_least(value: Any, minimum: str) -> bool:
-    return lifecycle_rank(value) >= lifecycle_rank(minimum)
 
 
 def _status_pass(value: Any) -> bool:
@@ -625,6 +569,36 @@ def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def enrich_strategy_artifact_runtime(folder: Path, path: Path, artifact: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(artifact)
+    try:
+        reference = artifact_reference(payload)
+    except ValueError:
+        reference = {"artifactId": "", "artifactHash": ""}
+    deployments = [
+        item
+        for item in DeploymentStore(folder).list()
+        if _dict_value(item.get("strategyArtifact")).get("artifactId") == reference.get("artifactId")
+        and _dict_value(item.get("strategyArtifact")).get("artifactHash") == reference.get("artifactHash")
+    ]
+    deployment = deployments[0] if deployments else {}
+    if deployment:
+        payload["_deployment"] = deployment
+    portfolio_ref = _dict_value(deployment.get("portfolioArtifact"))
+    evidence_record = EvidenceStore(folder).latest_for_strategy(
+        str(reference.get("artifactId") or ""),
+        strategy_artifact_hash=str(reference.get("artifactHash") or ""),
+        portfolio_artifact_id=str(portfolio_ref.get("artifactId") or ""),
+        portfolio_artifact_hash=str(portfolio_ref.get("artifactHash") or ""),
+    )
+    if evidence_record is not None:
+        payload["_external_paper_evidence"] = evidence_record.payload
+        payload["_external_paper_evidence_valid"] = evidence_record.valid
+        payload["_external_paper_evidence_issues"] = list(evidence_record.issues)
+    payload["_source_path"] = str(path)
+    return payload
+
+
 def load_strategy_artifacts(limit: int = 16) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
     for folder in strategy_artifact_dirs():
@@ -639,32 +613,7 @@ def load_strategy_artifacts(limit: int = 16) -> list[dict[str, Any]]:
                 continue
             if not isinstance(payload, dict):
                 continue
-            try:
-                reference = artifact_reference(payload)
-            except ValueError:
-                reference = {"artifactId": "", "artifactHash": ""}
-            deployments = [
-                item
-                for item in DeploymentStore(folder).list()
-                if _dict_value(item.get("strategyArtifact")).get("artifactId") == reference.get("artifactId")
-                and _dict_value(item.get("strategyArtifact")).get("artifactHash") == reference.get("artifactHash")
-            ]
-            deployment = deployments[0] if deployments else {}
-            if deployment:
-                payload["_deployment"] = deployment
-            portfolio_ref = _dict_value(deployment.get("portfolioArtifact"))
-            evidence_record = EvidenceStore(folder).latest_for_strategy(
-                str(reference.get("artifactId") or ""),
-                strategy_artifact_hash=str(reference.get("artifactHash") or ""),
-                portfolio_artifact_id=str(portfolio_ref.get("artifactId") or ""),
-                portfolio_artifact_hash=str(portfolio_ref.get("artifactHash") or ""),
-            )
-            if evidence_record is not None:
-                payload["_external_paper_evidence"] = evidence_record.payload
-                payload["_external_paper_evidence_valid"] = evidence_record.valid
-                payload["_external_paper_evidence_issues"] = list(evidence_record.issues)
-            payload["_source_path"] = str(path)
-            artifacts.append(normalize_strategy_artifact(payload))
+            artifacts.append(normalize_strategy_artifact(enrich_strategy_artifact_runtime(folder, path, payload)))
             if len(artifacts) >= limit:
                 return artifacts
     return artifacts
@@ -752,6 +701,28 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         capabilities["canSubmitOrder"] = False
         capabilities["blockingFailReasons"] = list(dict.fromkeys([*capabilities.get("blockingFailReasons", []), candidate_reason, *candidate_blockers]))
         capabilities["failReasons"] = list(dict.fromkeys([*capabilities.get("failReasons", []), candidate_reason, *candidate_blockers]))
+    backtest_lineage = _dict_value(artifact.get("lineageManifest"))
+    backtest_lineage_assessment = validate_lineage_manifest(backtest_lineage, expected_stage="backtest")
+    external_paper_evidence = _dict_value(artifact.get("_external_paper_evidence"))
+    paper_details = _dict_value(external_paper_evidence.get("details"))
+    paper_lineage = _dict_value(paper_details.get("lineageManifest"))
+    paper_lineage_assessment = validate_lineage_manifest(paper_lineage, expected_stage="paper")
+    lineage_issues = []
+    if not backtest_lineage_assessment.valid and not backtest_lineage_assessment.legacy:
+        lineage_issues.extend(f"backtest:{issue}" for issue in backtest_lineage_assessment.issues)
+    if not paper_lineage_assessment.valid and not paper_lineage_assessment.legacy:
+        lineage_issues.extend(f"paper:{issue}" for issue in paper_lineage_assessment.issues)
+    if lineage_issues:
+        lineage_reasons = [f"lineage-invalid:{issue}" for issue in lineage_issues]
+        normalized_permissions["live_small_eligible"] = False
+        normalized_permissions["live_eligible"] = False
+        normalized_permissions["live_allowed"] = False
+        normalized_permissions["fail_reasons"] = list(dict.fromkeys([*normalized_permissions["fail_reasons"], *lineage_reasons]))
+        capabilities["liveSmallEligible"] = False
+        capabilities["liveEligible"] = False
+        capabilities["canSubmitOrder"] = False
+        capabilities["blockingFailReasons"] = list(dict.fromkeys([*capabilities.get("blockingFailReasons", []), *lineage_reasons]))
+        capabilities["failReasons"] = list(dict.fromkeys([*capabilities.get("failReasons", []), *lineage_reasons]))
     verification = {
         "backtester": _backtester_verification_badge(normalized_permissions, final_test_status),
         "paper_trader": _paper_verification_badge(artifact, normalized_permissions, lifecycle_status),
@@ -823,6 +794,11 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "live_eligible": capabilities["liveEligible"],
         "verification": verification,
         "paper_portfolio_evidence": paper_portfolio_evidence,
+        "lineage": {
+            "backtest": {"valid": backtest_lineage_assessment.valid, "legacy": backtest_lineage_assessment.legacy, "issues": list(backtest_lineage_assessment.issues), "contentHash": str(backtest_lineage.get("contentHash") or "")},
+            "paper": {"valid": paper_lineage_assessment.valid, "legacy": paper_lineage_assessment.legacy, "issues": list(paper_lineage_assessment.issues), "contentHash": str(paper_lineage.get("contentHash") or "")},
+            "blockingIssues": lineage_issues,
+        },
         "portfolio_candidate": {
             "required": candidate_required,
             "legacyGrandfathered": not candidate_required,

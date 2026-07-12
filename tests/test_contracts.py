@@ -6,6 +6,7 @@ from pathlib import Path
 
 from live_trader.contracts import (
     can_live_use_artifact,
+    enrich_strategy_artifact_runtime,
     load_portfolio_artifacts,
     load_strategy_artifacts,
     normalize_portfolio_artifact,
@@ -15,9 +16,30 @@ from live_trader.contracts import (
     strategy_plugin_status,
 )
 from trading_runtime.artifact_governance import DeploymentStore, EvidenceStore, build_paper_portfolio_evidence
+from trading_runtime.professional_flow import build_lineage_manifest
 
 
 class StrategyContractTest(unittest.TestCase):
+    def test_tampered_professional_lineage_blocks_live_capability(self) -> None:
+        lineage = build_lineage_manifest(
+            stage="backtest",
+            producer="backtester",
+            inputs={"datasetHash": "data", "strategyCodeHash": "code", "parameterHash": "params", "costModelHash": "cost"},
+            created_at="2026-07-13T00:00:00+00:00",
+        )
+        lineage["inputs"]["parameterHash"] = "tampered"
+        artifact = normalize_strategy_artifact({
+            "id": "LINEAGE-TAMPERED",
+            "lifecycle": {"status": "live"},
+            "finalTest": {"status": "pass"},
+            "permissions": {"live_allowed": True, "live_small_eligible": True, "live_eligible": True},
+            "lineageManifest": lineage,
+        })
+
+        self.assertFalse(artifact["capabilities"]["canSubmitOrder"])
+        self.assertTrue(artifact["lineage"]["blockingIssues"])
+        self.assertTrue(any("lineage-hash-mismatch" in reason for reason in artifact["permissions"]["fail_reasons"]))
+
     def test_unapproved_portfolio_candidate_cannot_be_overridden_by_live_permissions(self) -> None:
         artifact = normalize_strategy_artifact(
             {
@@ -161,6 +183,11 @@ class StrategyContractTest(unittest.TestCase):
                     "lifecycle": {"status": "backtested"},
                     "finalTest": {"status": "pass"},
                     "permissions": {"trader_export_allowed": True, "fail_reasons": []},
+                    "lineageManifest": build_lineage_manifest(
+                        stage="backtest",
+                        producer="backtester",
+                        inputs={"datasetHash": "dataset", "strategyCodeHash": "code", "parameterHash": "params", "costModelHash": "cost"},
+                    ),
                 }
                 portfolio_payload = {
                     "artifactType": "portfolio",
@@ -207,9 +234,19 @@ class StrategyContractTest(unittest.TestCase):
                     rejected_count=0,
                     order_count=4,
                     target_weight=0.2,
+                    details={
+                        "lineageManifest": build_lineage_manifest(
+                            stage="paper",
+                            producer="paper_trader",
+                            inputs={"strategyArtifactHash": "strategy", "runtimeVersion": "paper-v1", "startedAt": "start", "endedAt": "end"},
+                            parent={"stage": "backtest", "contentHash": strategy_payload["lineageManifest"]["contentHash"]},
+                        )
+                    },
                 )
                 EvidenceStore(artifact_dir).save_paper(evidence)
 
+                enriched = enrich_strategy_artifact_runtime(artifact_dir, artifact_dir / "strategy.json", strategy_payload)
+                self.assertTrue(normalize_strategy_artifact(enriched)["lineage"]["paper"]["valid"])
                 strategies = load_strategy_artifacts()
 
             loaded = next(item for item in strategies if item["strategy_id"] == "STRAT-EXT-1")
@@ -221,6 +258,8 @@ class StrategyContractTest(unittest.TestCase):
             self.assertTrue(loaded["paper_portfolio_evidence"]["ready"])
             self.assertEqual("external", loaded["paper_portfolio_evidence"]["source"])
             self.assertEqual("paper-ext-1", loaded["paper_portfolio_evidence"]["evidenceId"])
+            self.assertTrue(loaded["lineage"]["backtest"]["valid"])
+            self.assertTrue(loaded["lineage"]["paper"]["valid"])
         finally:
             if previous_artifact is None:
                 os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
