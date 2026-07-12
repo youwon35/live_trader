@@ -28,6 +28,8 @@ jobs:
           repository: youwon35/trading-system
           ref: develop
           path: trading-system
+          ssh-key: ${{ secrets.TRADING_SYSTEM_DEPLOY_KEY }}
+          persist-credentials: false
       - name: Checkout Live Trader
         uses: actions/checkout@v4
         with:
@@ -68,4 +70,5 @@ jobs:
             trading-system/apps/live_trader/release/release-manifest.json
           if-no-files-found: error
           retention-days: 14
+
 
