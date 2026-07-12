@@ -1173,6 +1173,43 @@ class OrderGateTest(unittest.TestCase):
         self.assertTrue(state.STATE["new_entries_blocked"])
         self.assertIn("persisted-key", state.STATE["persisted_idempotency_keys"])
 
+    def test_multi_strategy_cycle_nets_opposite_spot_signals_to_one_order(self) -> None:
+        state.STATE["dry_run"] = True
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["orders"] = []
+        state.STATE["strategy_sleeves"] = {}
+        state.STATE["risk_settings"]["max_symbol_exposure_pct"] = 100.0
+        strategies = [
+            {
+                "strategy_id": "trend", "name": "Trend", "symbol": "BTCUSDT", "asset": "CRYPTO", "plugin": "moving_average_cross",
+                "test_signal": "BUY", "reference_price": 1000, "order_quantity": 1, "live_allowed": True,
+                "instrument_id": "CRYPTO:BINANCE:BTCUSDT", "market_type": "spot", "allow_short": False,
+                "portfolio_gate": {"active": True, "allowed": True, "targetWeight": 0.4, "policyTargetWeight": 0.4, "maxSymbolWeightPct": 100, "instance": {"instanceId": "trend-1"}},
+            },
+            {
+                "strategy_id": "revert", "name": "Revert", "symbol": "BTCUSDT", "asset": "CRYPTO", "plugin": "rsi_reversion",
+                "test_signal": "SELL", "reference_price": 1000, "order_quantity": 1, "live_allowed": True,
+                "instrument_id": "CRYPTO:BINANCE:BTCUSDT", "market_type": "spot", "allow_short": False,
+                "portfolio_gate": {"active": True, "allowed": True, "targetWeight": 0.3, "policyTargetWeight": 0.3, "maxSymbolWeightPct": 100, "instance": {"instanceId": "revert-1"}},
+            },
+        ]
+        fake_snapshot = {
+            "summary": {"blocker_count": 0, "warning_count": 0}, "strategies": strategies,
+            "portfolios": [{"strategy_instances": [{"strategyId": "trend"}, {"strategyId": "revert"}]}],
+            "brokers": [], "reconciliation": {"summary": {"status": "pass"}}, "operational_readiness": {},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(state, "RECOVERY_JOURNAL", state.RecoveryJournal(Path(temp_dir) / "recovery")):
+                with patch("live_trader.state.snapshot", return_value=fake_snapshot):
+                    result = state.run_strategy_cycle("crypto")
+        self.assertTrue(result["ok"])
+        self.assertEqual(2, len(result["runner_reports"]))
+        self.assertEqual(1, len(result["plans"]))
+        self.assertEqual(1, len(result["orders"]))
+        self.assertEqual("BUY", result["plans"][0]["side"])
+        self.assertEqual({"trend-1": 0.4, "revert-1": 0.0}, result["plans"][0]["sleeve_targets"])
+        self.assertEqual(1, len(state.STATE["orders"]))
+
 
 if __name__ == "__main__":
     unittest.main()

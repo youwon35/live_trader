@@ -1587,6 +1587,7 @@ function LivePreparationPanel({
             operationalReadiness={snapshot.operational_readiness}
             runtimeRecovery={snapshot.runtime_recovery}
             shadowLive={snapshot.shadow_live}
+            multiStrategy={snapshot.multi_strategy}
           />
           <StrategyPanel strategies={filteredStrategies} selectedStrategyId={selectedStrategy?.strategy_id} onSelect={setSelectedStrategyId} />
           <OperationalSafeguardsPanel
@@ -1608,7 +1609,7 @@ function LivePreparationPanel({
   );
 }
 
-function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operationalReadiness = {}, runtimeRecovery = {}, shadowLive = {} }) {
+function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operationalReadiness = {}, runtimeRecovery = {}, shadowLive = {}, multiStrategy = {} }) {
   const gate = selectedStrategy?.portfolio_gate ?? {};
   const evidenceGate = selectedStrategy?.paper_portfolio_evidence_gate ?? {};
   const [replay, setReplay] = useState(null);
@@ -1683,6 +1684,7 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operational
           <MetricCard className="metric-card" label="Operational Readiness" value={`${operationalReadiness.score ?? 0}/${operationalReadiness.threshold ?? 85}`} detail={operationalReadiness.liveEligible ? "LIVE ELIGIBLE" : "신규 위험 차단"} />
           <MetricCard className="metric-card" label="Recovery" value={runtimeRecovery.verified && !runtimeRecovery.safeMode ? "VERIFIED" : "SAFE MODE"} detail={runtimeRecovery.detail || "복구 훈련 대기"} />
           <MetricCard className="metric-card" label="Shadow Live" value={`${shadowLive.count ?? 0} observations`} detail="브로커 전송은 항상 차단" />
+          <MetricCard className="metric-card" label="Strategy Sleeves" value={`${multiStrategy.sleeveCount ?? 0} active`} detail="종목별 순주문 1건 · Short는 명시 상품만" />
         </div>
       )}
       <div className="portfolio-artifact-list">

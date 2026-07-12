@@ -40,6 +40,9 @@ from trading_runtime import (
     RecoveryJournal,
     ShadowLiveEngine,
     ShadowOrder,
+    InstrumentTradePolicy,
+    MultiStrategySleeveCoordinator,
+    SleeveSignal,
 )
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .program_ledger import ProgramLedger
@@ -317,6 +320,7 @@ STATE: dict[str, Any] = {
         "last_signal": "-",
         "last_action": "대기",
     },
+    "strategy_sleeves": {},
     "watchdog": {
         "last_run": "미실행",
         "status": "idle",
@@ -371,6 +375,7 @@ STATE: dict[str, Any] = {
 RUNTIME_RECOVERY_ROOT = Path(os.getenv("LIVE_TRADER_RECOVERY_DIR") or (Path(__file__).resolve().parents[1] / "logs" / "recovery-journal"))
 RECOVERY_JOURNAL = RecoveryJournal(RUNTIME_RECOVERY_ROOT)
 SHADOW_ENGINE = ShadowLiveEngine()
+LIVE_MULTI_COORDINATOR = MultiStrategySleeveCoordinator(conflict_policy="net")
 
 
 def now_text() -> str:
@@ -1929,6 +1934,14 @@ def snapshot() -> dict[str, Any]:
         "broker_adapter_contract": broker_adapter_contract(),
         "automation_profiles": automations,
         "strategy_runner": dict(STATE["strategy_runner"]),
+        "strategy_sleeves": dict(STATE.get("strategy_sleeves", {})),
+        "multi_strategy": {
+            "enabled": True,
+            "conflictPolicy": "net",
+            "sleeveCount": len(STATE.get("strategy_sleeves", {})),
+            "brokerOrderPolicy": "one-net-order-per-instrument",
+            "shortPolicy": "explicit-margin-or-futures-only",
+        },
         "strategies": strategies,
         "portfolios": portfolios,
         "strategy_plugin_sources": strategy_plugin_status(),
@@ -2837,38 +2850,56 @@ def strategy_float(strategy: dict[str, Any], *keys: str, default: float = 0.0) -
 
 
 def select_strategy_for_profile(checks: dict[str, Any], profile_id: str) -> dict[str, Any] | None:
+    strategies = select_strategies_for_profile(checks, profile_id)
+    return strategies[0] if strategies else None
+
+
+def select_strategies_for_profile(checks: dict[str, Any], profile_id: str) -> list[dict[str, Any]]:
     normalized_profile = "stock" if profile_id == "stock" else "crypto"
     provider = str(STATE["automation"][normalized_profile].get("provider") or ("kis" if normalized_profile == "stock" else "binance"))
     eligibility_key = "live_eligible" if current_mode() == "FULL_LIVE" else "live_allowed"
     strategies = [strategy for strategy in checks.get("strategies", []) if strategy.get(eligibility_key)]
     if normalized_profile == "stock":
-        return next((strategy for strategy in strategies if strategy_broker_id(strategy) == "kis"), None)
-    return next((strategy for strategy in strategies if strategy_broker_id(strategy) == provider), None) or next(
-        (strategy for strategy in strategies if strategy_broker_id(strategy) in {"binance", "upbit"}),
-        None,
-    )
+        matched = [strategy for strategy in strategies if strategy_broker_id(strategy) == "kis"]
+    else:
+        matched = [strategy for strategy in strategies if strategy_broker_id(strategy) == provider]
+        if not matched:
+            matched = [strategy for strategy in strategies if strategy_broker_id(strategy) in {"binance", "upbit"}]
+    if len(matched) <= 1:
+        return matched
+    portfolio_ids = {
+        str(instance.get("strategyId") or instance.get("strategy_id") or "")
+        for portfolio in checks.get("portfolios", []) if isinstance(portfolio, dict)
+        for instance in portfolio.get("strategy_instances", []) if isinstance(instance, dict)
+    }
+    portfolio_matched = [strategy for strategy in matched if str(strategy.get("strategy_id") or "") in portfolio_ids or str(strategy.get("plugin") or "") in portfolio_ids]
+    return portfolio_matched or matched[:1]
 
 
 def strategy_execution_for_profile(checks: dict[str, Any], profile_id: str) -> StrategyExecutionResult | None:
-    strategy = select_strategy_for_profile(checks, profile_id)
-    if not strategy:
-        return None
+    executions = strategy_executions_for_profile(checks, profile_id)
+    return executions[0][1] if executions else None
+
+
+def strategy_executions_for_profile(checks: dict[str, Any], profile_id: str) -> list[tuple[dict[str, Any], StrategyExecutionResult]]:
+    strategies = select_strategies_for_profile(checks, profile_id)
+    if not strategies:
+        return []
     normalized_profile = "stock" if profile_id == "stock" else "crypto"
-    broker_id = strategy_broker_id(strategy)
     runner = StrategyExecutionRunner(lambda _plugin_id: LiveArtifactSignalProvider())
-    return runner.run(
-        artifact=strategy,
-        market_data=strategy_market_data(strategy),
-        mode=current_mode(),
-        stream_id=f"live:{normalized_profile}:{strategy.get('strategy_id', 'unknown')}",
-        quantity=strategy_float(strategy, "order_quantity", "quantity", default=1.0),
-        metadata={
-            "broker_id": broker_id,
-            "profile_id": normalized_profile,
-            "runner": "StrategyExecutionRunner",
-        },
-        reason_prefix=f"{strategy.get('name') or strategy.get('strategy_id') or '전략'} live runner signal",
-    )
+    return [
+        (
+            strategy,
+            runner.run(
+                artifact=strategy, market_data=strategy_market_data(strategy), mode=current_mode(),
+                stream_id=f"live:{normalized_profile}:{strategy.get('strategy_id', 'unknown')}",
+                quantity=strategy_float(strategy, "order_quantity", "quantity", default=1.0),
+                metadata={"broker_id": strategy_broker_id(strategy), "profile_id": normalized_profile, "runner": "StrategyExecutionRunner"},
+                reason_prefix=f"{strategy.get('name') or strategy.get('strategy_id') or '전략'} live runner signal",
+            ),
+        )
+        for strategy in strategies
+    ]
 
 
 def default_order_intent(checks: dict[str, Any], side: str) -> OrderIntent:
@@ -3247,8 +3278,8 @@ def run_policy_replay(payload: dict[str, Any]) -> dict[str, Any]:
 def run_strategy_cycle(profile_id: str) -> dict[str, Any]:
     checks = snapshot()
     normalized_profile = "stock" if profile_id == "stock" else "crypto"
-    execution = strategy_execution_for_profile(checks, normalized_profile)
-    if execution is None:
+    strategy_executions = strategy_executions_for_profile(checks, normalized_profile)
+    if not strategy_executions:
         reason = f"{normalized_profile} 프로필에 live_small_eligible/live_eligible 전략이 없습니다."
         STATE["strategy_runner"].update({
             "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3259,6 +3290,11 @@ def run_strategy_cycle(profile_id: str) -> dict[str, Any]:
         })
         append_audit("warn", "전략 Runner", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    if len(strategy_executions) > 1:
+        return run_multi_strategy_cycle(checks, normalized_profile, strategy_executions)
+
+    execution = strategy_executions[0][1]
 
     STATE["strategy_runner"].update({
         "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3281,6 +3317,111 @@ def run_strategy_cycle(profile_id: str) -> dict[str, Any]:
     STATE["strategy_runner"]["last_action"] = f"{execution.signal} -> {result['reason']}"
     result["runner_report"] = execution.to_dict()
     return result
+
+
+def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_executions: list[tuple[dict[str, Any], StrategyExecutionResult]]) -> dict[str, Any]:
+    observed_at = datetime.now(timezone.utc).isoformat()
+    signals: list[SleeveSignal] = []
+    policies: dict[str, InstrumentTradePolicy] = {}
+    execution_by_instance: dict[str, tuple[dict[str, Any], StrategyExecutionResult]] = {}
+    for index, (strategy, execution) in enumerate(strategy_executions):
+        gate = strategy.get("portfolio_gate") if isinstance(strategy.get("portfolio_gate"), dict) else {}
+        instance = gate.get("instance") if isinstance(gate.get("instance"), dict) else {}
+        instance_id = str(instance.get("instanceId") or f"{strategy.get('strategy_id', 'strategy')}:{index}")
+        instrument_id = str(strategy.get("instrument_id") or strategy.get("symbol") or instance_id)
+        allocation = safe_float(gate.get("policyTargetWeight"), safe_float(gate.get("targetWeight"), 1 / max(1, len(strategy_executions))))
+        signals.append(SleeveSignal(
+            strategy_instance_id=instance_id,
+            strategy_id=str(strategy.get("strategy_id") or execution.artifact_id),
+            deployment_id=str(strategy.get("deployment_id") or ""),
+            instrument_id=instrument_id,
+            symbol=str(strategy.get("symbol") or "UNKNOWN"),
+            signal=str(execution.signal or "HOLD"),
+            occurred_at=observed_at,
+            reference_price=max(0.0, strategy_float(strategy, "reference_price", "last_price", default=0.0)),
+            allocation_weight=max(0.0, allocation),
+            confidence=safe_float(strategy.get("score"), 100.0) / 100 if str(strategy.get("score") or "").replace(".", "", 1).isdigit() else 1.0,
+            reason=execution.reason,
+        ))
+        policies[instrument_id] = InstrumentTradePolicy(
+            instrument_id=instrument_id,
+            asset_class=str(strategy.get("asset") or "UNKNOWN"),
+            market_type=str(strategy.get("market_type") or "spot"),
+            allow_short=strategy.get("allow_short") is True,
+            maximum_absolute_weight=min(1.0, max(0.0, safe_float(gate.get("maxSymbolWeightPct"), 100.0) / 100)),
+        )
+        execution_by_instance[instance_id] = (strategy, execution)
+
+    current_sleeves = {str(key): safe_float(value, 0.0) for key, value in STATE.get("strategy_sleeves", {}).items()}
+    current_weights: dict[str, float] = {}
+    current_quantities: dict[str, float] = {}
+    for signal in signals:
+        current_weights[signal.instrument_id] = current_weights.get(signal.instrument_id, 0.0) + current_sleeves.get(signal.strategy_instance_id, 0.0)
+        current_quantities.setdefault(signal.instrument_id, broker_position_quantity(signal.symbol))
+    portfolio_equity = max(float(STATE["risk_settings"]["strategy_capital_limit_krw"]), 1.0)
+    plans = LIVE_MULTI_COORDINATOR.coordinate(
+        signals, policies=policies, current_sleeve_weights=current_sleeves,
+        current_net_weights=current_weights, current_net_quantities=current_quantities,
+        portfolio_equity=portfolio_equity,
+    )
+    order_results: list[dict[str, Any]] = []
+    for plan in plans:
+        if plan.blocked or plan.side == "HOLD" or plan.quantity <= 0:
+            continue
+        preferred_signal = next((signal for signal in signals if signal.instrument_id == plan.instrument_id and signal.signal.upper() == plan.side), None)
+        lead_signal = preferred_signal or next(signal for signal in signals if signal.instrument_id == plan.instrument_id)
+        strategy, execution = execution_by_instance[lead_signal.strategy_instance_id]
+        source_intent = execution.intent or default_order_intent(checks, plan.side)
+        intent = replace(
+            source_intent,
+            strategy_id=str(strategy.get("strategy_id") or execution.artifact_id),
+            side=plan.side,
+            quantity=plan.quantity,
+            reference_price=lead_signal.reference_price,
+            metadata={
+                **(source_intent.metadata if isinstance(source_intent.metadata, dict) else {}),
+                "multi_strategy": True,
+                "strategy_instance_id": f"net:{plan.instrument_id}",
+                "strategy_instance_ids": list(plan.sleeve_targets),
+                "sleeve_targets": plan.sleeve_targets,
+                "target_revision": plan.target_revision,
+                "instrument_id": plan.instrument_id,
+                "current_weight": plan.current_weight,
+                "portfolio_equity": portfolio_equity,
+                "expected_alpha_bps": 10.0,
+                "expected_cost_bps": 5.0,
+                "risk_reducing": abs(plan.target_weight) < abs(plan.current_weight),
+                "shortable": plan.shortable,
+            },
+            reason=f"multi-strategy net target: {len(plan.sleeve_targets)} sleeves",
+        )
+        result = submit_order_intent(checks, intent, dry_run=bool(STATE["dry_run"]), audit_event="Multi-Strategy Runner", runner_report=execution)
+        result["coordinated_plan"] = plan.to_dict()
+        order_results.append(result)
+        if result.get("ok"):
+            STATE.setdefault("strategy_sleeves", {}).update(plan.sleeve_targets)
+    STATE["strategy_runner"].update({
+        "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "last_profile": profile_id,
+        "last_strategy": f"{len(strategy_executions)} sleeves", "last_signal": "NET",
+        "last_action": f"{len(plans)} instrument targets · {len(order_results)} net orders",
+    })
+    append_audit("info", "Multi-Strategy Runner", f"{len(strategy_executions)}개 Sleeve → {len(plans)}개 종목 목표 → {len(order_results)}개 순주문")
+    return {
+        "ok": all(item.get("ok") for item in order_results) if order_results else True,
+        "reason": f"multi-strategy coordinated: {len(strategy_executions)} sleeves, {len(order_results)} net orders",
+        "runner_reports": [execution.to_dict() for _, execution in strategy_executions],
+        "plans": [plan.to_dict() for plan in plans],
+        "orders": order_results,
+        "snapshot": snapshot(),
+    }
+
+
+def broker_position_quantity(symbol: str) -> float:
+    positions = STATE.get("broker_reconciliation", {}).get("positions", [])
+    return sum(
+        safe_float(item.get("quantity"), safe_float(item.get("qty"), 0.0))
+        for item in positions if isinstance(item, dict) and str(item.get("symbol") or "") == symbol
+    )
 
 
 def find_order(order_id: str) -> dict[str, Any] | None:

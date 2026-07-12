@@ -768,6 +768,9 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         )
     release = _release_snapshot(artifact)
     paper_portfolio_evidence = normalize_paper_portfolio_evidence(artifact)
+    execution_policy = _dict_value(artifact.get("executionPolicy") or artifact.get("execution_policy"))
+    market_type = str(artifact.get("marketType") or artifact.get("market_type") or data_artifact.get("marketType") or dataset.get("marketType") or "spot").lower()
+    allow_short = bool(execution_policy.get("allowShort") is True or artifact.get("allowShort") is True or artifact.get("shortAllowed") is True)
 
     return {
         "strategy_id": strategy_id,
@@ -779,6 +782,9 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "name": str(artifact.get("name") or artifact.get("strategyName") or strategy_id),
         "symbol": str(artifact.get("symbol") or dataset.get("symbol") or data_artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN"),
         "asset": str(artifact.get("asset") or dataset.get("assetClass") or data_artifact.get("assetClass") or artifact.get("assetClass") or "unknown"),
+        "instrument_id": str(data_artifact.get("instrumentId") or artifact.get("instrumentId") or artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN"),
+        "market_type": market_type,
+        "allow_short": allow_short and market_type in {"margin", "futures", "future", "perpetual"},
         "timeframe": str(artifact.get("timeframe") or dataset.get("interval") or data_artifact.get("interval") or artifact.get("interval") or "-"),
         "plugin": plugin_id,
         "plugin_label": PLUGIN_LABELS.get(plugin_id, plugin_id),
