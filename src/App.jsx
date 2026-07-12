@@ -56,6 +56,7 @@ import {
   saveUiSettings,
   saveEnvSettings,
   submitTestIntent,
+  runPolicyReplay,
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
@@ -1602,6 +1603,24 @@ function LivePreparationPanel({
 function PortfolioArtifactPanel({ portfolios = [], selectedStrategy }) {
   const gate = selectedStrategy?.portfolio_gate ?? {};
   const evidenceGate = selectedStrategy?.paper_portfolio_evidence_gate ?? {};
+  const [replay, setReplay] = useState(null);
+  const [replayRunning, setReplayRunning] = useState(false);
+  async function replayPolicy() {
+    setReplayRunning(true);
+    try {
+      const response = await runPolicyReplay({
+        side: "BUY",
+        currentWeight: Number(gate.targetWeight || 0) * 0.5,
+        portfolioEquity: 10000000,
+        expectedAlphaBps: 12,
+        expectedCostBps: 6,
+        alternative: { policyVersion: "live-conservative-v1", deadbandWeight: 0.005, costBufferBps: 2, capitalMultiplier: Number(gate.capitalMultiplier ?? 1) },
+      });
+      setReplay(response.bundle ?? null);
+    } finally {
+      setReplayRunning(false);
+    }
+  }
   return (
     <section className="panel portfolio-artifact-panel">
       <PanelHeader title="포트폴리오 Artifact" subtitle="Live 주문은 선택 전략이 포함된 포트폴리오 universe와 target weight를 기준으로 제한됩니다." />
@@ -1629,6 +1648,14 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy }) {
         <div className="portfolio-gate-metrics">
           <MetricCard className="metric-card" label="Portfolio" value={gate.portfolioName || gate.portfolioId || "-"} detail={gate.lifecycleStatus || "-"} />
           <MetricCard className="metric-card" label="Target Weight" value={`${formatPercentValue(gate.targetWeight)}%`} detail={`Symbol max ${formatPercentValue((gate.maxSymbolWeightPct || 0) / 100)}%`} />
+          <MetricCard className="metric-card" label="Mandate" value={gate.mandateCompliant === false ? "BLOCK" : "PASS"} detail={(gate.mandateBreaches ?? []).join(" · ") || "위반 없음"} />
+          <MetricCard className="metric-card" label="Auto De-risk" value={`${gate.automaticDeRiskAction || "KEEP"} ×${Number(gate.capitalMultiplier ?? 1).toFixed(2)}`} detail={`Stress ${gate.stressPassed === false ? "BLOCK" : "PASS"}`} />
+        </div>
+      )}
+      {gate.active && (
+        <div className="operator-actions">
+          <ActionButton className="secondary-button" label="정책 Replay" onClick={replayPolicy} status={replayRunning ? "pending" : replay ? "success" : undefined} disabled={replayRunning} />
+          {replay && <span className="inline-state success">{replay.eventCount}건 · 결정 변경 {replay.changedDecisionCount} · 원본 불변 {replay.sourceEventsImmutable ? "PASS" : "FAIL"}</span>}
         </div>
       )}
       <div className="portfolio-artifact-list">

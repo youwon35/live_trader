@@ -42,11 +42,13 @@ class StrategyContractTest(unittest.TestCase):
             {
                 "id": "P1",
                 "portfolioPolicy": {"policyHash": "policy-hash", "allocations": []},
+                "advancedOperations": {"contentHash": "advanced-hash", "automaticDeRisk": {"capitalMultiplier": 0.5}},
             }
         )
 
         self.assertTrue(strategy["portfolio_candidate"]["legacyGrandfathered"])
         self.assertEqual(portfolio["portfolio_policy_hash"], "policy-hash")
+        self.assertEqual(portfolio["advanced_operations_hash"], "advanced-hash")
 
     def test_backtester_custom_strategy_artifact_keeps_contract_fields(self) -> None:
         custom_definition = {

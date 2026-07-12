@@ -78,6 +78,10 @@ export async function submitTestIntent() {
   return request("/api/test-intent", { method: "POST", body: {} });
 }
 
+export async function runPolicyReplay(payload = {}) {
+  return request("/api/policy-replay", { method: "POST", body: payload });
+}
+
 export async function runStrategyCycle(profileId) {
   return request("/api/strategy-cycle", { method: "POST", body: { profile_id: profileId } });
 }

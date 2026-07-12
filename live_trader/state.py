@@ -32,6 +32,10 @@ from trading_runtime import (
     build_live_execution_evidence,
     normalize_broker_execution,
     rebalance_decision,
+    PolicyReplayEngine,
+    ReplayEvent,
+    DeRiskInputs,
+    automatic_de_risk,
 )
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .program_ledger import ProgramLedger
@@ -564,6 +568,10 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
 
     allocation = matching_instance.get("allocation") if isinstance(matching_instance, dict) and isinstance(matching_instance.get("allocation"), dict) else {}
     portfolio_policy = portfolio.get("portfolio_policy") if isinstance(portfolio.get("portfolio_policy"), dict) else {}
+    advanced_operations = portfolio.get("advanced_operations") if isinstance(portfolio.get("advanced_operations"), dict) else {}
+    mandate = advanced_operations.get("mandate") if isinstance(advanced_operations.get("mandate"), dict) else {}
+    automatic_de_risk = advanced_operations.get("automaticDeRisk") if isinstance(advanced_operations.get("automaticDeRisk"), dict) else {}
+    capital_multiplier = max(0.0, min(1.0, safe_float(automatic_de_risk.get("capitalMultiplier"), 1.0)))
     policy_allocations = portfolio_policy.get("allocations") if isinstance(portfolio_policy.get("allocations"), list) else []
     policy_profiles = portfolio_policy.get("profiles") if isinstance(portfolio_policy.get("profiles"), list) else []
     instance_id = portfolio_strategy_value(matching_instance or {}, "instanceId", "strategyInstanceId")
@@ -579,6 +587,10 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         (policy_allocation or {}).get("targetWeight") if isinstance(policy_allocation, dict) else ((matching_target or {}).get("targetWeight") if isinstance(matching_target, dict) else None),
         safe_float(allocation.get("scoreTargetWeight"), safe_float(allocation.get("normalizedWeight"), 0.0)),
     )
+    policy_target_weight = target_weight
+    target_weight *= capital_multiplier
+    capacity_entries = advanced_operations.get("capacity") if isinstance(advanced_operations.get("capacity"), list) else []
+    capacity = next((item for item in capacity_entries if isinstance(item, dict) and str(item.get("strategyInstanceId") or "") == instance_id), {})
     risk_policy = portfolio.get("risk_policy") if isinstance(portfolio.get("risk_policy"), dict) else {}
     max_symbol_weight = normalize_weight_percent(risk_policy.get("maxSingleSymbolWeight"), 100.0)
     max_strategy_weight = normalize_weight_percent(risk_policy.get("maxStrategyWeight"), 100.0)
@@ -645,6 +657,7 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         "lifecycleStatus": lifecycle_status,
         "requiredLifecycleStatus": required_status,
         "targetWeight": target_weight,
+        "policyTargetWeight": policy_target_weight,
         "maxSymbolWeightPct": effective_symbol_limit,
         "maxStrategyWeightPct": max_strategy_weight,
         "strategyCapitalRatio": min(target_weight, max_strategy_weight / 100 if max_strategy_weight > 0 else target_weight),
@@ -655,6 +668,16 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         "portfolioPolicyHash": str(portfolio.get("portfolio_policy_hash") or portfolio_policy.get("policyHash") or ""),
         "rebalancePolicy": portfolio_policy.get("rebalancePolicy") if isinstance(portfolio_policy.get("rebalancePolicy"), dict) else {},
         "policyLimitBlockers": policy_limit_blockers,
+        "advancedOperationsHash": str(portfolio.get("advanced_operations_hash") or advanced_operations.get("contentHash") or ""),
+        "mandateCompliant": mandate.get("compliant") is True if mandate else True,
+        "mandateBreaches": mandate.get("breaches") if isinstance(mandate.get("breaches"), list) else [],
+        "automaticDeRiskAction": str(automatic_de_risk.get("action") or "KEEP"),
+        "capitalMultiplier": capital_multiplier,
+        "capacity": capacity,
+        "stressPassed": (advanced_operations.get("stressLibrary") or {}).get("passed") is True if isinstance(advanced_operations.get("stressLibrary"), dict) else True,
+        "decisionQuality": advanced_operations.get("decisionQuality") if isinstance(advanced_operations.get("decisionQuality"), dict) else {},
+        "contagionGraph": advanced_operations.get("contagionGraph") if isinstance(advanced_operations.get("contagionGraph"), dict) else {},
+        "championChallenger": advanced_operations.get("championChallenger") if isinstance(advanced_operations.get("championChallenger"), dict) else {},
     }
 
 
@@ -678,6 +701,22 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
     if not policy or not selected_gate.get("active") or selected_gate.get("allowed") is not True:
         return selected_gate
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    if selected_gate.get("advancedOperationsHash"):
+        reconciliation = checks.get("reconciliation") if isinstance(checks.get("reconciliation"), dict) else {}
+        reconciliation_summary = reconciliation.get("summary") if isinstance(reconciliation.get("summary"), dict) else {}
+        dynamic_de_risk = automatic_de_risk(DeRiskInputs(
+            data_quality_ok=metadata.get("data_quality_ok") is not False,
+            implementation_match=metadata.get("implementation_match") is not False,
+            reconciliation_mismatches=0 if str(reconciliation_summary.get("status") or "pass") == "pass" else 1,
+            cost_ratio=safe_float(metadata.get("execution_cost_ratio"), 1.0),
+            mdd_ratio=safe_float(metadata.get("mdd_ratio"), 1.0),
+            correlation=safe_float(metadata.get("cross_strategy_correlation"), 0.0),
+            broker_available=bool(metadata.get("broker_available", broker_ready_for_intent(checks, intent))),
+        ))
+        combined_multiplier = min(safe_float(selected_gate.get("capitalMultiplier"), 1.0), safe_float(dynamic_de_risk.get("capitalMultiplier"), 1.0))
+        selected_gate["dynamicDeRisk"] = dynamic_de_risk
+        selected_gate["capitalMultiplier"] = combined_multiplier
+        selected_gate["targetWeight"] = safe_float(selected_gate.get("policyTargetWeight"), selected_gate.get("targetWeight")) * combined_multiplier
     required_inputs = ("current_weight", "portfolio_equity", "expected_alpha_bps", "expected_cost_bps")
     missing = [key for key in required_inputs if metadata.get(key) is None]
     if missing:
@@ -705,7 +744,59 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
     if decision.action != "TRADE":
         selected_gate["allowed"] = False
         selected_gate["detail"] = f"Portfolio policy 차단: {decision.reason}"
+        return selected_gate
+    risk_reducing = abs(safe_float(selected_gate.get("targetWeight"), 0.0)) < abs(safe_float(metadata.get("current_weight"), 0.0))
+    advanced_blockers: list[str] = []
+    capacity = selected_gate.get("capacity") if isinstance(selected_gate.get("capacity"), dict) else {}
+    maximum_order_notional = safe_float(capacity.get("maximumOrderNotional"), 0.0)
+    if maximum_order_notional > 0 and intent.notional > maximum_order_notional and not risk_reducing:
+        advanced_blockers.append("order-capacity-exceeded")
+    if selected_gate.get("mandateCompliant") is False and not risk_reducing:
+        advanced_blockers.extend(str(reason) for reason in selected_gate.get("mandateBreaches", []))
+    if selected_gate.get("stressPassed") is False and not risk_reducing:
+        advanced_blockers.append("portfolio-stress-library-failed")
+    if safe_float(selected_gate.get("capitalMultiplier"), 1.0) <= 0 and not risk_reducing:
+        advanced_blockers.append("automatic-de-risk-freeze")
+    if advanced_blockers:
+        selected_gate["allowed"] = False
+        selected_gate["advancedOperationBlockers"] = list(dict.fromkeys(advanced_blockers))
+        selected_gate["detail"] = "Advanced portfolio policy 차단: " + "; ".join(selected_gate["advancedOperationBlockers"])
     return selected_gate
+
+
+def policy_replay_for_intent(checks: dict[str, Any], intent: OrderIntent, alternative: dict[str, Any] | None = None) -> dict[str, Any]:
+    alternative = alternative or {}
+    original_gate = portfolio_gate_for_intent(checks, intent)
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    event = ReplayEvent(
+        event_id=str(metadata.get("event_id") or f"{intent.strategy_id}:{intent.symbol}:{intent.side}"),
+        occurred_at=str(metadata.get("occurred_at") or datetime.now(timezone.utc).isoformat()),
+        original_policy_version=str(original_gate.get("portfolioPolicyHash") or "legacy"),
+        original_decision="TRADE" if original_gate.get("allowed") is True else "HOLD",
+        inputs={
+            "currentWeight": metadata.get("current_weight"),
+            "targetWeight": original_gate.get("targetWeight"),
+            "portfolioEquity": metadata.get("portfolio_equity"),
+            "expectedAlphaBps": metadata.get("expected_alpha_bps"),
+            "expectedCostBps": metadata.get("expected_cost_bps"),
+            "notional": intent.notional,
+        },
+        original_reasons=(str(original_gate.get("detail") or ""),),
+    )
+
+    def evaluator(inputs: dict[str, Any]) -> dict[str, Any]:
+        decision = rebalance_decision(
+            current_weight=safe_float(inputs.get("currentWeight"), 0.0),
+            target_weight=safe_float(inputs.get("targetWeight"), 0.0) * max(0.0, min(1.0, safe_float(alternative.get("capitalMultiplier"), 1.0))),
+            portfolio_equity=safe_float(inputs.get("portfolioEquity"), 0.0),
+            expected_alpha_bps=safe_float(inputs.get("expectedAlphaBps"), 0.0),
+            expected_cost_bps=safe_float(inputs.get("expectedCostBps"), 0.0) + safe_float(alternative.get("costBufferBps"), 0.0),
+            deadband_weight=safe_float(alternative.get("deadbandWeight"), 0.0025),
+            minimum_notional=safe_float(alternative.get("minimumNotional"), 0.0),
+        )
+        return {"decision": "TRADE" if decision.action == "TRADE" else "HOLD", "reasons": [decision.reason]}
+
+    return PolicyReplayEngine().replay([event], alternative_policy_version=str(alternative.get("policyVersion") or "live-alternative-v1"), evaluator=evaluator)
 
 
 def apply_portfolio_gate_to_context(context: PreTradeContext, gate: dict[str, Any], intent: OrderIntent) -> PreTradeContext:
@@ -1827,6 +1918,7 @@ def snapshot() -> dict[str, Any]:
         "reconciliation": reconciliation,
         "program_ledger": program_ledger_snapshot(),
         "execution_events": execution_event_snapshot(),
+        "policy_replays": list(STATE.get("policy_replays", [])),
         "accounts": reconciliation["accounts"],
         "positions": reconciliation["positions"],
         "operation_report": report,
@@ -2995,6 +3087,31 @@ def submit_test_intent() -> dict[str, Any]:
     checks = snapshot()
     intent = default_order_intent(checks, "BUY")
     return submit_order_intent(checks, intent, dry_run=bool(STATE["dry_run"]), audit_event="주문 게이트")
+
+
+def run_policy_replay(payload: dict[str, Any]) -> dict[str, Any]:
+    checks = snapshot()
+    intent = default_order_intent(checks, str(payload.get("side") or "BUY"))
+    intent = replace(
+        intent,
+        quantity=max(0.0, safe_float(payload.get("quantity"), intent.quantity)),
+        reference_price=max(0.0, safe_float(payload.get("referencePrice"), intent.reference_price)),
+        metadata={
+            **intent.metadata,
+            "event_id": str(payload.get("eventId") or "live-policy-replay"),
+            "current_weight": safe_float(payload.get("currentWeight"), 0.0),
+            "portfolio_equity": safe_float(payload.get("portfolioEquity"), float(STATE["risk_settings"]["strategy_capital_limit_krw"])),
+            "expected_alpha_bps": safe_float(payload.get("expectedAlphaBps"), 10.0),
+            "expected_cost_bps": safe_float(payload.get("expectedCostBps"), 5.0),
+        },
+    )
+    alternative = payload.get("alternative") if isinstance(payload.get("alternative"), dict) else {}
+    bundle = policy_replay_for_intent(checks, intent, alternative)
+    STATE.setdefault("policy_replays", [])
+    STATE["policy_replays"].insert(0, bundle)
+    STATE["policy_replays"] = STATE["policy_replays"][:20]
+    append_audit("info", "정책 Replay", f"결정 변경 {bundle['changedDecisionCount']} / {bundle['eventCount']}")
+    return {"ok": True, "bundle": bundle, "snapshot": checks}
 
 
 def run_strategy_cycle(profile_id: str) -> dict[str, Any]:

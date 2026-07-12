@@ -297,6 +297,45 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(economic_gate["targetWeight"], 0.25)
         self.assertEqual(economic_gate["rebalanceDecision"]["action"], "TRADE")
 
+    def test_advanced_portfolio_policy_blocks_new_risk_but_allows_reduction_and_replay(self) -> None:
+        state.STATE["mode"] = "SMALL_LIVE"
+        portfolio = {
+            "id": "advanced-portfolio", "name": "Advanced", "lifecycle_status": "before-live-small",
+            "permissions": {"live_small_allowed": True},
+            "strategy_instances": [{"strategyId": "STRAT-1", "symbol": "069500.KS", "instanceId": "instance-1"}],
+            "target_portfolio": [{"strategyId": "STRAT-1", "symbol": "069500.KS", "targetWeight": 0.4}],
+            "risk_policy": {"maxSingleSymbolWeight": 1.0, "maxStrategyWeight": 1.0}, "risk_checks": [],
+            "portfolio_policy_hash": "policy-v1",
+            "portfolio_policy": {
+                "policyHash": "policy-v1",
+                "profiles": [{"strategyInstanceId": "instance-1", "assetClass": "KR_STOCK", "returnSource": "TREND", "instrumentId": "KRX:069500"}],
+                "allocations": [{"strategyInstanceId": "instance-1", "targetWeight": 0.4, "returnSource": "TREND"}],
+                "limits": [], "rebalancePolicy": {"deadbandWeight": 0.001, "minimumNotional": 0},
+            },
+            "advanced_operations_hash": "advanced-v1",
+            "advanced_operations": {
+                "mandate": {"compliant": False, "breaches": ["target-volatility-exceeded"]},
+                "capacity": [{"strategyInstanceId": "instance-1", "maximumOrderNotional": 50_000, "allowed": False}],
+                "automaticDeRisk": {"action": "REDUCE", "capitalMultiplier": 0.5},
+                "stressLibrary": {"passed": False},
+                "decisionQuality": {"score": 0.8},
+            },
+        }
+        checks = {"strategies": [], "portfolios": [portfolio]}
+        common = {"broker_id": "kis", "broker_available": True, "portfolio_equity": 1_000_000, "expected_alpha_bps": 20, "expected_cost_bps": 5}
+        increase = state.OrderIntent(strategy_id="STRAT-1", asset="kr-stock", symbol="069500.KS", side="BUY", quantity=2, reference_price=40_000, mode="SMALL_LIVE", reason="unit", metadata={**common, "current_weight": 0.0})
+        reduce = state.OrderIntent(strategy_id="STRAT-1", asset="kr-stock", symbol="069500.KS", side="SELL", quantity=1, reference_price=40_000, mode="SMALL_LIVE", reason="unit", metadata={**common, "current_weight": 0.4})
+
+        increase_gate = state.portfolio_gate_for_intent(checks, increase)
+        reduce_gate = state.portfolio_gate_for_intent(checks, reduce)
+        replay = state.policy_replay_for_intent(checks, reduce, {"policyVersion": "alt", "deadbandWeight": 0.5})
+
+        self.assertFalse(increase_gate["allowed"])
+        self.assertIn("order-capacity-exceeded", increase_gate["advancedOperationBlockers"])
+        self.assertTrue(reduce_gate["allowed"])
+        self.assertEqual(reduce_gate["targetWeight"], 0.2)
+        self.assertTrue(replay["sourceEventsImmutable"])
+
     def test_portfolio_paper_evidence_blocks_live_order_when_missing(self) -> None:
         state.STATE["mode"] = "SMALL_LIVE"
         state.STATE["new_entries_blocked"] = False

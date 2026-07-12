@@ -583,6 +583,7 @@ def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     target_portfolio = framework.get("targetPortfolio") if isinstance(framework.get("targetPortfolio"), list) else []
     risk_checks = framework.get("riskChecks") if isinstance(framework.get("riskChecks"), list) else []
     portfolio_policy = _dict_value(artifact.get("portfolioPolicy") or _dict_value(artifact.get("evidence")).get("portfolioPolicy"))
+    advanced_operations = _dict_value(artifact.get("advancedOperations") or _dict_value(artifact.get("evidence")).get("advancedOperations"))
     lifecycle_status = normalize_lifecycle_status(
         lifecycle.get("status")
         or artifact.get("lifecycleStatus")
@@ -615,6 +616,8 @@ def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "risk_checks": [item for item in risk_checks if isinstance(item, dict)],
         "portfolio_policy": portfolio_policy,
         "portfolio_policy_hash": str(portfolio_policy.get("policyHash") or ""),
+        "advanced_operations": advanced_operations,
+        "advanced_operations_hash": str(advanced_operations.get("contentHash") or ""),
         "source_path": str(artifact.get("_source_path") or ""),
     }
 

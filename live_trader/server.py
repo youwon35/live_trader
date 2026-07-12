@@ -109,6 +109,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/test-intent":
             self.send_json(state.submit_test_intent())
             return
+        if parsed.path == "/api/policy-replay":
+            self.send_json(state.run_policy_replay(payload))
+            return
         if parsed.path == "/api/strategy-cycle":
             self.send_json(state.run_strategy_cycle(str(payload.get("profile_id", "stock"))))
             return
