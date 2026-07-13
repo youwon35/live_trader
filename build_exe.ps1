@@ -9,6 +9,7 @@ if (-not (Test-Path ".venv")) {
 
 npm install
 npm run build
+node ..\scripts\desktop_scale_click_contract.mjs --app live_trader --app-root $PWD
 
 .\.venv\Scripts\python.exe tools\create_icon.py
 

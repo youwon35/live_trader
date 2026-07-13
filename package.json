@@ -16,5 +16,7 @@
     "react-dom": "^19.0.0",
     "lucide-react": "^0.468.0"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "playwright-core": "^1.60.0"
+  }
 }
