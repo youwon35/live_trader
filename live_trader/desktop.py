@@ -17,6 +17,9 @@ MIN_WINDOW_HEIGHT = 760
 
 def main() -> None:
     server, url = start_in_thread()
+    webview_started_at: float | None = None
+    window_was_visible = False
+    shutdown_requested = False
     try:
         import webview
 
@@ -30,24 +33,53 @@ def main() -> None:
         )
 
         def remember_window_state(*_args: object) -> None:
+            nonlocal shutdown_requested
+            shutdown_requested = True
             _save_window_state(window)
+
+        def mark_window_visible(*_args: object) -> None:
+            nonlocal window_was_visible
+            window_was_visible = True
 
         try:
             window.events.closing += remember_window_state
         except Exception:
             pass
-        webview.start()
+        for event_name in ("shown", "loaded"):
+            try:
+                event = getattr(window.events, event_name)
+                event += mark_window_visible
+            except Exception:
+                pass
+        webview_started_at = time.monotonic()
+        webview.start(gui="edgechromium")
         _save_window_state(window)
     except Exception as exc:
-        print(f"WebView unavailable ({exc}). Opening browser at {url}")
-        webbrowser.open(url)
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
+        if _should_open_browser_fallback(webview_started_at, window_was_visible, shutdown_requested):
+            print(f"WebView unavailable ({exc}). Opening browser at {url}")
+            webbrowser.open(url)
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+        else:
+            print(f"WebView 종료 중 예외가 발생해 서버를 정리합니다: {exc}")
     finally:
         server.shutdown()
+
+
+def _should_open_browser_fallback(
+    started_at: float | None,
+    window_was_visible: bool,
+    shutdown_requested: bool,
+) -> bool:
+    """Use browser fallback only when the native window genuinely failed to start."""
+    if shutdown_requested or window_was_visible:
+        return False
+    if started_at is None:
+        return True
+    return time.monotonic() - started_at < 2.0
 
 
 def _app_data_root() -> Path:
