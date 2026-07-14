@@ -438,6 +438,23 @@ class OrderGateTest(unittest.TestCase):
         self.assertTrue(state.STATE["new_entries_blocked"])
         self.assertTrue(state.STATE["kill_switch"])
 
+    def test_risky_safety_release_requires_explicit_confirmation(self) -> None:
+        scenarios = [
+            ("kill_switch", True),
+            ("new_entries_blocked", True),
+            ("dry_run", True),
+        ]
+        for name, initial in scenarios:
+            with self.subTest(name=name):
+                state.STATE[name] = initial
+                rejected = state.set_flag(name, False)
+                self.assertFalse(rejected["ok"])
+                self.assertTrue(state.STATE[name])
+
+                accepted = state.set_flag(name, False, confirmed=True)
+                self.assertTrue(accepted["ok"])
+                self.assertFalse(state.STATE[name])
+
     def test_full_live_mode_is_blocked_when_warnings_remain(self) -> None:
         state.STATE["mode"] = "MONITOR"
         snapshot = {"summary": {"blocker_count": 0, "warning_count": 1}}

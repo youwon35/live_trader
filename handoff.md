@@ -727,3 +727,50 @@ Think of Live Trader as three layers:
 The most important product truth:
 
 Live Trader should feel like a real trading desk, but real money must remain blocked until every broker route, account snapshot, strategy artifact, order adapter, risk gate, Watchdog, and audit trail is verified end to end.
+
+## 2026-07-14 Tab Audit And Safety Hardening
+
+The six current tabs were exercised against the packaged Python API, not only static fallback data.
+
+Important root cause fixed:
+
+- `execution_calibration` could contain `Infinity`.
+- Python's default JSON encoder emitted that non-standard value, so the browser rejected the entire `/api/snapshot` response.
+- The UI then remained on its fallback snapshot and could show unrelated checks as passing.
+- `live_trader/server.py` now recursively converts non-finite floats to JSON `null` and uses strict JSON encoding.
+- The frontend now marks snapshots with `api_connected`, clears stale data on failure, shows a visible connection banner, and treats Doctor checks as unavailable instead of passed.
+
+Safety changes:
+
+- Releasing Kill Switch, disabling Dry Run, and unblocking new entries require an explicit confirmation in both UI and Python state logic.
+- Saving a broker snapshot as the program-ledger baseline requires explicit confirmation at the API boundary.
+- Enabling `LIVE_TRADER_ENABLE_REAL_ORDERS=true` requires explicit confirmation at the UI and API boundary.
+- API requests now have a 10-second timeout, strict JSON-response validation, and more useful error messages.
+- When the API is unavailable, top-level emergency state becomes `확인 불가` and sensitive controls are disabled.
+
+Tab cleanup:
+
+- `사전점검`: Doctor's API detail was reduced to actionable broker/global blockers rather than repeating every passing capability.
+- `실거래 준비`: removed the duplicate Strategy table and duplicate Watchdog; empty asset groups no longer show misleading UNKNOWN/PORT LEGACY badges or an empty portfolio panel.
+- `자동화`: retained automation profile, Watchdog, queue, and order history as the operational set.
+- `로그`: verified filters, sort, scope/level controls, and CSV availability with real audit rows.
+- `API`: added a direct `연결 설정 열기` path to Settings.
+- `설정`: retained appearance/layout and broker connection assistant; real-order route enable now has a high-risk confirmation.
+- Added an explicit SVG favicon to eliminate the previous 404 console error.
+
+Verification completed:
+
+- `npm run build`: PASS.
+- `python -m unittest discover -s tests -v`: 65 tests PASS.
+- Playwright desktop review at 1440x1000: all six tabs exercised with real snapshot data; browser console 0 errors.
+- API-disconnect drill: visible fail-closed banner and `확인 불가` state verified.
+- UI confirmation drill: Dry Run release dialog verified and dismissed without changing state.
+- Direct API rejection drill: unconfirmed Dry Run release, ledger-baseline save, and real-order enable all rejected.
+- `build_exe.ps1`: PASS, including 100%/125%/150% desktop-scale contracts.
+- `release/LiveTrader.exe`: launched successfully and remained running during the smoke interval.
+
+The rebuilt executable is:
+
+```text
+D:\github\PROGRAM\trading-system\apps\live_trader\release\LiveTrader.exe
+```

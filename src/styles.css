@@ -33,6 +33,44 @@ body {
   line-height: var(--line-height);
 }
 
+.api-connection-banner {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 20px 0;
+  padding: 11px 14px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--danger) 9%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-radius: var(--radius-lg);
+}
+
+.api-connection-banner > svg {
+  color: var(--danger);
+}
+
+.api-connection-banner strong,
+.api-connection-banner span {
+  display: block;
+}
+
+.api-connection-banner span {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+@media (max-width: 640px) {
+  .api-connection-banner {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .api-connection-banner .mini-button {
+    grid-column: 1 / -1;
+  }
+}
+
 :root[data-ui-theme='light'] {
   --bg: #f4f7fb;
   --app-gradient: #f4f7fb;

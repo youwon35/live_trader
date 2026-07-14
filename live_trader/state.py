@@ -2114,9 +2114,23 @@ def set_mode(mode: str) -> dict[str, Any]:
     return {"ok": True, "reason": "mode changed", "snapshot": snapshot()}
 
 
-def set_flag(name: str, value: bool) -> dict[str, Any]:
+def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, Any]:
     if name not in {"kill_switch", "new_entries_blocked", "operator_confirmed", "dry_run"}:
         return {"ok": False, "reason": "unknown flag", "snapshot": snapshot()}
+    risky_release = (
+        (name == "kill_switch" and STATE.get(name) is True and not value)
+        or (name == "new_entries_blocked" and STATE.get(name) is True and not value)
+        or (name == "dry_run" and STATE.get(name) is True and not value)
+    )
+    if risky_release and not confirmed:
+        label = {
+            "kill_switch": "Kill Switch 해제",
+            "new_entries_blocked": "신규 진입 차단 해제",
+            "dry_run": "Dry Run 보호 해제",
+        }[name]
+        reason = f"{label}는 명시 확인이 필요합니다."
+        append_audit("warn", f"{label} 거부", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
     STATE[name] = bool(value)
     label = {
         "kill_switch": "Kill Switch",

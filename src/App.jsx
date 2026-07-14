@@ -132,6 +132,7 @@ const pageProfiles = {
 };
 
 const fallbackSnapshot = {
+  api_connected: false,
   generated_at: "-",
   mode: "MONITOR",
   dry_run: true,
@@ -148,8 +149,8 @@ const fallbackSnapshot = {
   order_queue: { total: 0, blocked: 0, dry_run: 0, retryable: 0, canceled: 0 },
   watchdog: {
     last_run: "미실행",
-    status: "idle",
-    status_label: "대기",
+    status: "unknown",
+    status_label: "확인 불가",
     last_action: "대기",
     last_trip: "-",
     trip_count: 0,
@@ -171,8 +172,8 @@ const fallbackSnapshot = {
   accounts: [],
   reconciliation: {
     summary: {
-      status: "warn",
-      status_label: "API 필요",
+      status: "unknown",
+      status_label: "확인 불가",
       last_run: "미실행",
       position_count: 0,
       account_count: 0,
@@ -613,7 +614,14 @@ function buildNotificationItems(snapshot, error) {
   };
 
   if (error) {
-    push({ id: "api-error", tone: "danger", title: "API 연결 오류", detail: error, targetNav: "overview" });
+    const disconnected = snapshot.api_connected === false;
+    push({
+      id: disconnected ? "api-error" : "action-error",
+      tone: "danger",
+      title: disconnected ? "API 연결 오류" : "작업 거부/오류",
+      detail: error,
+      targetNav: "overview",
+    });
   }
   if (snapshot.kill_switch) {
     push({ id: "kill-switch", tone: "danger", title: "긴급 차단 활성화", detail: "모든 실거래 모드가 MONITOR로 고정됩니다.", targetNav: "overview" });
@@ -1072,9 +1080,10 @@ function App() {
   async function refresh() {
     try {
       const next = await getSnapshot();
-      setSnapshot(next);
+      setSnapshot({ ...next, api_connected: true });
       setError("");
     } catch (err) {
+      setSnapshot(fallbackSnapshot);
       setError(err instanceof Error ? err.message : "API 연결 실패");
     } finally {
       setLoading(false);
@@ -1133,11 +1142,12 @@ function App() {
     setLoading(true);
     try {
       const result = await action();
-      setSnapshot(result.snapshot ?? result);
+      setSnapshot({ ...(result.snapshot ?? result), api_connected: true });
       setError(result.ok === false ? result.reason : "");
       return result;
     } catch (err) {
       const reason = err instanceof Error ? err.message : "요청 실패";
+      setSnapshot(fallbackSnapshot);
       setError(reason);
       return { ok: false, reason };
     } finally {
@@ -1193,8 +1203,13 @@ function App() {
     }
   }
 
+  function confirmSafetyChange(message, action) {
+    if (!window.confirm(message)) return Promise.resolve({ ok: false, cancelled: true });
+    return runAction(action);
+  }
+
   const title = navItems.find((item) => item.id === selectedNav)?.label ?? "사전점검";
-  const canLive = snapshot.summary.blocker_count === 0;
+  const canLive = snapshot.api_connected === true && snapshot.summary.blocker_count === 0;
   const canFullLive = canLive && snapshot.summary.warning_count === 0;
   const notifications = buildNotificationItems(snapshot, error);
   const notificationKey = notificationFingerprint(notifications);
@@ -1229,7 +1244,9 @@ function App() {
         </nav>
         <div className="sidebar-footer">
           <span>전체 차단</span>
-          <StatusPill tone={snapshot.kill_switch ? "danger" : "success"}>{snapshot.kill_switch ? "ON" : "OFF"}</StatusPill>
+          <StatusPill tone={snapshot.api_connected ? (snapshot.kill_switch ? "danger" : "success") : "warning"}>
+            {snapshot.api_connected ? (snapshot.kill_switch ? "ON" : "OFF") : "확인 불가"}
+          </StatusPill>
         </div>
       </aside>
 
@@ -1280,14 +1297,33 @@ function App() {
             </div>
             <button
               className={`danger-button ${snapshot.kill_switch ? "active" : ""}`}
+              disabled={!snapshot.api_connected}
               type="button"
-              onClick={() => runAction(() => setFlag("kill_switch", !snapshot.kill_switch))}
+              onClick={() =>
+                snapshot.kill_switch
+                  ? confirmSafetyChange("긴급 차단을 해제하시겠습니까? 해제 후에도 다른 실거래 게이트는 유지됩니다.", () => setFlag("kill_switch", false, true))
+                  : runAction(() => setFlag("kill_switch", true))
+              }
             >
               <CircleStop size={17} />
-              긴급 차단
+              {snapshot.kill_switch ? "긴급 차단 해제" : "긴급 차단"}
             </button>
           </div>
         </header>
+
+        {error && snapshot.api_connected === false && (
+          <section className="api-connection-banner" role="alert">
+            <Network size={18} />
+            <div>
+              <strong>API 연결이 끊어져 모든 상태를 확인 불가로 전환했습니다.</strong>
+              <span>{error}</span>
+            </div>
+            <button className="mini-button" type="button" disabled={loading} onClick={refresh}>
+              <RefreshCcw size={14} />
+              다시 연결
+            </button>
+          </section>
+        )}
 
         <WorkspaceContent
           selectedNav={selectedNav}
@@ -1298,8 +1334,16 @@ function App() {
           canFullLive={canFullLive}
           onMode={(mode) => runAction(() => setMode(mode))}
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
-          onDryRun={() => runAction(() => setFlag("dry_run", !snapshot.dry_run))}
-          onEntryBlock={() => runAction(() => setFlag("new_entries_blocked", !snapshot.new_entries_blocked))}
+          onDryRun={() =>
+            snapshot.dry_run
+              ? confirmSafetyChange("Dry Run 보호를 해제하시겠습니까? 이후 주문은 다른 모든 실거래 게이트를 통과해야만 전송됩니다.", () => setFlag("dry_run", false, true))
+              : runAction(() => setFlag("dry_run", true))
+          }
+          onEntryBlock={() =>
+            snapshot.new_entries_blocked
+              ? confirmSafetyChange("신규 진입 차단을 해제하시겠습니까? 기존 청산 주문에는 영향을 주지 않습니다.", () => setFlag("new_entries_blocked", false, true))
+              : runAction(() => setFlag("new_entries_blocked", true))
+          }
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
           onStrategyCycle={(profileId) => runAction(() => runStrategyCycle(profileId))}
           onPromoteLive={(strategyId) => runAction(() => promoteStrategyToLive(strategyId))}
@@ -1312,9 +1356,11 @@ function App() {
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
           onReconcile={() => runAction(runReconciliation)}
           onPreflight={() => runAction(runFinalPreflight)}
-          onProgramLedgerBaseline={() => runAction(seedProgramLedgerBaseline)}
+          onProgramLedgerBaseline={() =>
+            confirmSafetyChange("현재 브로커 잔고와 포지션을 프로그램 원장의 새 기준으로 저장하시겠습니까? 기존 기준이 바뀝니다.", () => seedProgramLedgerBaseline(true))
+          }
           onExecutionEvents={(brokerId) => runAction(() => syncExecutionEvents(brokerId))}
-          onEnvSettings={(values) => runAction(() => saveEnvSettings(values))}
+          onEnvSettings={(values, confirmed) => runAction(() => saveEnvSettings(values, confirmed))}
           appearance={appearance}
           updateAppearance={updateAppearance}
           layoutMode={layoutMode}
@@ -1450,7 +1496,6 @@ function WorkspaceContent({
         onDryRun={onDryRun}
         onEntryBlock={onEntryBlock}
         onTestIntent={onTestIntent}
-        onWatchdog={onWatchdog}
         onRiskSetting={onRiskSetting}
         onRetryPolicy={onRetryPolicy}
         onRetryOrder={onRetryOrder}
@@ -1465,7 +1510,7 @@ function WorkspaceContent({
     return renderPage(
       <section className="content-grid">
         <div className="content-column">
-          <BrokerPanel brokers={snapshot.brokers} />
+          <BrokerPanel brokers={snapshot.brokers} onOpenSettings={() => onNavigate("settings")} />
         </div>
         <div className="content-column">
           <BrokerCapabilityPanel diagnostics={snapshot.broker_diagnostics} />
@@ -1512,6 +1557,7 @@ function WorkspaceContent({
       </div>
       <div className="content-column">
         <ReconciliationSummaryPanel
+          apiConnected={snapshot.api_connected === true}
           reconciliation={snapshot.reconciliation}
           programLedger={snapshot.program_ledger}
           executionEvents={snapshot.execution_events}
@@ -1519,7 +1565,7 @@ function WorkspaceContent({
           onProgramLedgerBaseline={onProgramLedgerBaseline}
           onExecutionEvents={onExecutionEvents}
         />
-        <AccountReconciliationPanel accounts={snapshot.accounts ?? []} />
+        {(snapshot.accounts ?? []).length > 0 && <AccountReconciliationPanel accounts={snapshot.accounts} />}
       </div>
     </section>,
   );
@@ -1531,7 +1577,6 @@ function LivePreparationPanel({
   onDryRun,
   onEntryBlock,
   onTestIntent,
-  onWatchdog,
   onRiskSetting,
   onRetryPolicy,
   onPromoteLive,
@@ -1582,17 +1627,19 @@ function LivePreparationPanel({
             summary={snapshot.summary ?? {}}
             operatorConfirmed={Boolean(snapshot.operator_confirmed)}
           />
-          <PortfolioArtifactPanel
-            portfolios={snapshot.portfolios ?? []}
-            selectedStrategy={selectedStrategy}
-            operationalReadiness={snapshot.operational_readiness}
-            runtimeRecovery={snapshot.runtime_recovery}
-            shadowLive={snapshot.shadow_live}
-            multiStrategy={snapshot.multi_strategy}
-            executionCalibration={snapshot.execution_calibration}
-          />
-          <StrategyPanel strategies={filteredStrategies} selectedStrategyId={selectedStrategy?.strategy_id} onSelect={setSelectedStrategyId} />
+          {selectedStrategy && (
+            <PortfolioArtifactPanel
+              portfolios={snapshot.portfolios ?? []}
+              selectedStrategy={selectedStrategy}
+              operationalReadiness={snapshot.operational_readiness}
+              runtimeRecovery={snapshot.runtime_recovery}
+              shadowLive={snapshot.shadow_live}
+              multiStrategy={snapshot.multi_strategy}
+              executionCalibration={snapshot.execution_calibration}
+            />
+          )}
           <OperationalSafeguardsPanel
+            apiConnected={snapshot.api_connected === true}
             dryRun={snapshot.dry_run}
             newEntriesBlocked={snapshot.new_entries_blocked}
             killSwitch={snapshot.kill_switch}
@@ -1600,7 +1647,6 @@ function LivePreparationPanel({
             onEntryBlock={onEntryBlock}
             onTestIntent={onTestIntent}
           />
-          <WatchdogPanel watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
         </div>
         <div className="content-column">
           <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
@@ -1715,35 +1761,40 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operational
   );
 }
 
-function OperationalSafeguardsPanel({ dryRun, newEntriesBlocked, killSwitch, onDryRun, onEntryBlock, onTestIntent }) {
+function OperationalSafeguardsPanel({ apiConnected, dryRun, newEntriesBlocked, killSwitch, onDryRun, onEntryBlock, onTestIntent }) {
   return (
     <section className="panel operational-safeguards-panel">
       <PanelHeader title="운영 차단 설정" subtitle="자동화 모드 전환 전에 공통 보호 장치를 확인합니다." />
       <div className="operator-actions">
         <ActionButton
           className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`}
+          disabled={!apiConnected}
           icon={<ShieldCheck size={16} />}
           label="Dry Run"
           onClick={onDryRun}
-          status={dryRun ? "success" : "error"}
+          status={apiConnected ? (dryRun ? "success" : "error") : undefined}
         />
         <ActionButton
           active={newEntriesBlocked}
           className="secondary-button"
+          disabled={!apiConnected}
           icon={<ShieldCheck size={16} />}
           label="신규 진입 차단"
           onClick={onEntryBlock}
-          status={newEntriesBlocked ? "success" : undefined}
+          status={apiConnected && newEntriesBlocked ? "success" : undefined}
         />
         <ActionButton
           className="primary-button"
+          disabled={!apiConnected}
           icon={<TerminalSquare size={16} />}
           label="테스트 주문 게이트"
           onClick={onTestIntent}
           pendingLabel="확인 중"
           variant="primary"
         />
-        <span className={`inline-state ${killSwitch ? "danger" : "success"}`}>{killSwitch ? "긴급 차단 켜짐" : "긴급 차단 꺼짐"}</span>
+        <span className={`inline-state ${apiConnected ? (killSwitch ? "danger" : "success") : "warning"}`}>
+          {apiConnected ? (killSwitch ? "긴급 차단 켜짐" : "긴급 차단 꺼짐") : "긴급 차단 확인 불가"}
+        </span>
       </div>
     </section>
   );
@@ -1782,7 +1833,7 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, o
         </div>
         <ActionButton
           className="primary-button doctor-run-button"
-          disabled={running}
+          disabled={running || snapshot.api_connected === false}
           icon={<Play size={16} />}
           label="점검 실행"
           onClick={runDoctor}
@@ -1851,6 +1902,27 @@ function makeDetail(label, value, status = "neutral") {
 }
 
 function buildDoctorItems(snapshot) {
+  if (snapshot.api_connected === false) {
+    const disconnectedItems = [
+      ["API / 브로커 연결", "Python API 연결이 필요합니다.", "brokers"],
+      ["운영 체크리스트", "API 연결 후 현재 체크 상태를 확인합니다.", "gate"],
+      ["리스크 한도", "API 연결 후 현재 리스크 한도를 확인합니다.", "gate"],
+      ["전략 lifecycle eligibility", "API 연결 후 전략 승인 상태를 확인합니다.", "gate"],
+      ["포지션·계좌 대조", "API 연결 후 브로커 대조 상태를 확인합니다.", "overview"],
+      ["Live Watchdog", "API 연결 후 Watchdog 상태를 확인합니다.", "automation"],
+      ["최종 Preflight", "API 연결 후 최종 점검을 실행합니다.", "overview"],
+    ];
+    return disconnectedItems.map(([title, detail, targetNav], index) => ({
+      id: `doctor-disconnected-${index + 1}`,
+      index: index + 1,
+      title,
+      detail,
+      tone: index === 0 ? "danger" : "warning",
+      status: index === 0 ? "연결 필요" : "확인 불가",
+      targetNav,
+      details: [makeDetail("API 연결", detail, index === 0 ? "fail" : "warn")],
+    }));
+  }
   const readinessFails = (snapshot.readiness ?? []).filter((check) => check.status === "fail");
   const readinessWarns = (snapshot.readiness ?? []).filter((check) => check.status === "warn");
   const brokerDiagnostics = snapshot.broker_diagnostics ?? [];
@@ -1871,15 +1943,18 @@ function buildDoctorItems(snapshot) {
   const finalWarnings = (snapshot.final_preflight ?? []).filter((check) => check.status === "warn");
   const strategyBlocked = (snapshot.strategies ?? []).filter((strategy) => !strategy.live_allowed);
   const apiDetails = [
-    ...(snapshot.brokers ?? []).flatMap((broker) =>
-      (broker.missing_env?.length ? broker.missing_env : broker.required_env ?? []).map((name) =>
-        makeDetail(`${broker.name} · ${name}`, broker.missing_env?.includes(name) ? "환경 변수가 비어 있습니다." : "환경 변수가 입력되어 있습니다.", broker.missing_env?.includes(name) ? "fail" : "pass"),
+    ...(snapshot.brokers ?? []).map((broker) =>
+      makeDetail(
+        broker.name,
+        broker.missing_env?.length ? `환경 변수 ${broker.missing_env.length}개 누락 · ${broker.missing_env.join(", ")}` : broker.detail,
+        broker.order_ready ? "pass" : "fail",
       ),
     ),
-    ...brokerDiagnostics.flatMap((broker) => [
-      ...(broker.steps ?? []).map((step) => makeDetail(`${broker.name} · ${step.label}`, step.detail, step.status)),
-      ...(broker.capabilities ?? []).map((capability) => makeDetail(`${broker.name} · ${capability.label}`, capability.detail, capability.implemented ? "pass" : "warn")),
-    ]),
+    ...brokerDiagnostics.flatMap((broker) =>
+      (broker.capabilities ?? [])
+        .filter((capability) => !capability.implemented)
+        .map((capability) => makeDetail(`${broker.name} · ${capability.label}`, capability.detail, "warn")),
+    ),
     ...readinessFails.map((check) => makeDetail(check.label, check.detail, check.status)),
     ...readinessWarns.map((check) => makeDetail(check.label, check.detail, check.status)),
   ];
@@ -1954,7 +2029,7 @@ function buildDoctorItems(snapshot) {
       detail: strategyBlocked.length ? `Live-Small/Live 전 전략 ${strategyBlocked.length}개를 검토해야 합니다.` : "Live-Small 이상 전략을 확인했습니다.",
       tone: strategyBlocked.length ? "warning" : "success",
       status: strategyBlocked.length ? "검토" : "통과",
-      targetNav: "strategies",
+      targetNav: "gate",
       details: strategyDetails.length ? strategyDetails : [makeDetail("전략", "점검할 전략이 없습니다.", "warn")],
     },
     {
@@ -2440,9 +2515,11 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
       values[field.key] = value ?? "";
     });
     if (!Object.keys(values).length) return;
+    const enablingRealOrders = String(values.LIVE_TRADER_ENABLE_REAL_ORDERS || "").toLowerCase() === "true";
+    if (enablingRealOrders && !window.confirm("실전 주문 라우트를 활성화하시겠습니까? API 키·리스크·대조·전략 승인 게이트는 계속 적용됩니다.")) return;
     setSaving(true);
     setMessage("");
-    const result = await onSave(values);
+    const result = await onSave(values, enablingRealOrders);
     if (result?.settings) setSettings(result.settings);
     setDraft((current) => clearSecretDrafts(visibleFields, current));
     setMessage(result?.ok === false ? result.reason || "저장 실패" : `${Object.keys(values).length}개 설정을 저장했습니다.`);
@@ -2623,10 +2700,17 @@ function ModeConsole({
   );
 }
 
-function BrokerPanel({ brokers }) {
+function BrokerPanel({ brokers, onOpenSettings }) {
   return (
     <section className="panel broker-panel">
       <PanelHeader title="브로커/API 연결" subtitle="실거래 API 키와 주문 어댑터 준비 상태입니다." />
+      <div className="panel-action-line">
+        <span>키와 계좌 값은 설정 탭에서 안전하게 저장합니다.</span>
+        <button className="mini-button" type="button" onClick={onOpenSettings}>
+          <Settings size={14} />
+          연결 설정 열기
+        </button>
+      </div>
       <div className="broker-list">
         {brokers.map((broker) => (
           <div className="broker-row" key={broker.broker_id}>
@@ -3074,7 +3158,7 @@ function BrokerRequirementsPanel({ brokers }) {
   );
 }
 
-function ReconciliationSummaryPanel({ reconciliation, programLedger, executionEvents, onReconcile, onProgramLedgerBaseline, onExecutionEvents }) {
+function ReconciliationSummaryPanel({ apiConnected, reconciliation, programLedger, executionEvents, onReconcile, onProgramLedgerBaseline, onExecutionEvents }) {
   const summary = reconciliation?.summary ?? fallbackSnapshot.reconciliation.summary;
   const actions = reconciliation?.next_actions ?? [];
   const items = [
@@ -3097,15 +3181,15 @@ function ReconciliationSummaryPanel({ reconciliation, programLedger, executionEv
       <PanelHeader title="포지션·계좌 대조 요약" subtitle={`마지막 대조 ${summary.last_run}`} />
       <div className="panel-action-line">
         <StatusPill tone={statusTone(summary.status)}>{summary.status_label}</StatusPill>
-        <button className="mini-button" type="button" onClick={onReconcile}>
+        <button className="mini-button" type="button" disabled={!apiConnected} onClick={onReconcile}>
           <RefreshCcw size={14} />
           대조 실행
         </button>
-        <button className="mini-button" type="button" onClick={onProgramLedgerBaseline}>
+        <button className="mini-button" type="button" disabled={!apiConnected} onClick={onProgramLedgerBaseline}>
           <DatabaseZap size={14} />
           원장 기준 저장
         </button>
-        <button className="mini-button" type="button" onClick={() => onExecutionEvents("all")}>
+        <button className="mini-button" type="button" disabled={!apiConnected} onClick={() => onExecutionEvents("all")}>
           <FileClock size={14} />
           체결 동기화
         </button>
@@ -3291,12 +3375,14 @@ function LiveStrategySelectorPanel({
             ))}
           </select>
         </label>
-        <div className="live-strategy-status-strip">
-          <StatusPill tone={promotionTone(promotionStage)}>{promotionLabel(promotionStage)}</StatusPill>
-          <StatusPill tone={selectedStrategy?.live_allowed ? "success" : "danger"}>{selectedStrategy?.permission_label || "WAIT"}</StatusPill>
-          <StatusPill tone={portfolioEvidenceTone(evidenceGate)}>PORT {portfolioEvidenceLabel(evidenceGate)}</StatusPill>
-          <StatusPill tone="info">READ ONLY</StatusPill>
-        </div>
+        {selectedStrategy && (
+          <div className="live-strategy-status-strip">
+            <StatusPill tone={promotionTone(promotionStage)}>{promotionLabel(promotionStage)}</StatusPill>
+            <StatusPill tone={selectedStrategy.live_allowed ? "success" : "danger"}>{selectedStrategy.permission_label || "WAIT"}</StatusPill>
+            <StatusPill tone={portfolioEvidenceTone(evidenceGate)}>PORT {portfolioEvidenceLabel(evidenceGate)}</StatusPill>
+            <StatusPill tone="info">READ ONLY</StatusPill>
+          </div>
+        )}
       </div>
       {selectedStrategy ? (
         <>

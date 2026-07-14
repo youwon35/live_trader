@@ -14,16 +14,16 @@ export async function getEnvSettings() {
   return request("/api/env-settings");
 }
 
-export async function saveEnvSettings(values) {
-  return request("/api/env-settings", { method: "POST", body: { values } });
+export async function saveEnvSettings(values, confirmed = false) {
+  return request("/api/env-settings", { method: "POST", body: { values, confirmed } });
 }
 
 export async function setMode(mode) {
   return request("/api/mode", { method: "POST", body: { mode } });
 }
 
-export async function setFlag(name, value) {
-  return request("/api/flag", { method: "POST", body: { name, value } });
+export async function setFlag(name, value, confirmed = false) {
+  return request("/api/flag", { method: "POST", body: { name, value, confirmed } });
 }
 
 export async function setAutomationProfile(profileId, enabled, provider, mode) {
@@ -58,8 +58,8 @@ export async function runReconciliation() {
   return request("/api/reconcile", { method: "POST", body: {} });
 }
 
-export async function seedProgramLedgerBaseline() {
-  return request("/api/program-ledger-baseline", { method: "POST", body: {} });
+export async function seedProgramLedgerBaseline(confirmed = false) {
+  return request("/api/program-ledger-baseline", { method: "POST", body: { confirmed } });
 }
 
 export async function syncExecutionEvents(brokerId = "all") {
@@ -107,13 +107,26 @@ export async function runWatchdog() {
 }
 
 async function request(path, options = {}) {
-  const response = await fetch(path, {
-    method: options.method ?? "GET",
-    headers: { "Content-Type": "application/json" },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-  if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs ?? 10000);
+  try {
+    const response = await fetch(path, {
+      method: options.method ?? "GET",
+      headers: { "Content-Type": "application/json" },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal,
+    });
+    const contentType = response.headers.get("content-type") ?? "";
+    const result = contentType.includes("application/json") ? await response.json() : null;
+    if (!response.ok) {
+      throw new Error(result?.reason || result?.message || `요청 실패 (${response.status})`);
+    }
+    if (!result) throw new Error("API가 올바른 JSON 응답을 반환하지 않았습니다.");
+    return result;
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("API 응답 시간이 10초를 초과했습니다.");
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
   }
-  return response.json();
 }

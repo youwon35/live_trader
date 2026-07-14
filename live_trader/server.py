@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import mimetypes
 import os
 import threading
@@ -19,6 +20,25 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8795
 SETTINGS_DIR = Path(os.getenv("APPDATA") or Path.home()) / "LiveTrader"
 UI_SETTINGS_FILE = SETTINGS_DIR / "ui-settings.json"
+
+
+def json_safe_value(value: object) -> object:
+    """Return strict-JSON data so one non-finite metric cannot break the UI."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {str(key): json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_value(item) for item in value]
+    return value
+
+
+def requests_real_order_enable(payload: dict[str, object]) -> bool:
+    values = payload.get("values")
+    if not isinstance(values, dict):
+        return False
+    requested = str(values.get("LIVE_TRADER_ENABLE_REAL_ORDERS", "")).strip().lower()
+    return requested in {"true", "1", "yes", "on"}
 
 
 def read_ui_settings() -> dict[str, object]:
@@ -61,7 +81,13 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             self.send_json(state.set_mode(str(payload.get("mode", "MONITOR"))))
             return
         if parsed.path == "/api/flag":
-            self.send_json(state.set_flag(str(payload.get("name", "")), bool(payload.get("value"))))
+            self.send_json(
+                state.set_flag(
+                    str(payload.get("name", "")),
+                    bool(payload.get("value")),
+                    confirmed=payload.get("confirmed") is True,
+                )
+            )
             return
         if parsed.path == "/api/automation":
             self.send_json(
@@ -95,6 +121,15 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             self.send_json(state.run_reconciliation())
             return
         if parsed.path == "/api/program-ledger-baseline":
+            if payload.get("confirmed") is not True:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "reason": "프로그램 원장 기준 저장은 명시 확인이 필요합니다.",
+                        "snapshot": state.snapshot(),
+                    }
+                )
+                return
             self.send_json(state.seed_program_ledger_from_broker_snapshot())
             return
         if parsed.path == "/api/execution-events":
@@ -134,6 +169,16 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "settings": write_ui_settings(payload)})
             return
         if parsed.path == "/api/env-settings":
+            if requests_real_order_enable(payload) and payload.get("confirmed") is not True:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "reason": "실전 주문 라우트 활성화는 명시 확인이 필요합니다.",
+                        "settings": env_settings.env_settings_snapshot(),
+                        "snapshot": state.snapshot(),
+                    }
+                )
+                return
             settings = env_settings.save_env_settings(payload.get("values", {}) if isinstance(payload.get("values"), dict) else payload)
             self.send_json({"ok": True, "settings": settings, "snapshot": state.snapshot()})
             return
@@ -153,7 +198,7 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return {}
 
     def send_json(self, payload: dict[str, object]) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(json_safe_value(payload), ensure_ascii=False, allow_nan=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
