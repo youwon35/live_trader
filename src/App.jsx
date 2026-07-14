@@ -307,9 +307,13 @@ function customAccentVars(color) {
   const primary = normalizeHexColor(color);
   const { r, g, b } = hexToRgb(primary);
   return {
+    "--custom-accent": primary,
     "--primary": primary,
     "--primary-hover": `color-mix(in srgb, ${primary} 70%, #000000)`,
     "--primary-border": `color-mix(in srgb, ${primary} 76%, #ffffff)`,
+    "--command-primary-background": `color-mix(in srgb, ${primary} 42%, #07111f)`,
+    "--command-primary-hover-background": `color-mix(in srgb, ${primary} 34%, #07111f)`,
+    "--command-primary-border": `color-mix(in srgb, ${primary} 82%, #ffffff)`,
     "--icon-blue": `color-mix(in srgb, ${primary} 68%, #ffffff)`,
     "--secondary": `color-mix(in srgb, ${primary} 48%, #55d6be)`,
     "--primary-gradient": primary,
