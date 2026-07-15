@@ -25,6 +25,9 @@ AUDIT_COLUMNS = (
     "decision",
     "state",
     "reason",
+    "run_id",
+    "passport_id",
+    "trace_id",
     "payload_json",
 )
 
@@ -47,8 +50,8 @@ class SQLiteAuditEventStore:
                 insert or replace into audit_events (
                     event_id, occurred_at, app, category, scope, level, source, message,
                     strategy_id, dataset_id, symbol, order_id, risk_gate, decision, state,
-                    reason, payload_json
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    reason, run_id, passport_id, trace_id, payload_json
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["event_id"],
@@ -67,6 +70,9 @@ class SQLiteAuditEventStore:
                     row["decision"],
                     row["state"],
                     row["reason"],
+                    row["run_id"],
+                    row["passport_id"],
+                    row["trace_id"],
                     payload_json,
                 ),
             )
@@ -122,13 +128,21 @@ class SQLiteAuditEventStore:
                 decision text not null default '',
                 state text not null default '',
                 reason text not null default '',
+                run_id text not null default '',
+                passport_id text not null default '',
+                trace_id text not null default '',
                 payload_json text not null default '{}'
             )
             """
         )
+        columns = {row[1] for row in connection.execute("pragma table_info(audit_events)").fetchall()}
+        for column in ("run_id", "passport_id", "trace_id"):
+            if column not in columns:
+                connection.execute(f"alter table audit_events add column {column} text not null default ''")
         connection.execute("create index if not exists idx_audit_events_time on audit_events(occurred_at)")
         connection.execute("create index if not exists idx_audit_events_order on audit_events(order_id)")
         connection.execute("create index if not exists idx_audit_events_strategy on audit_events(strategy_id)")
+        connection.execute("create index if not exists idx_audit_events_run on audit_events(run_id)")
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:

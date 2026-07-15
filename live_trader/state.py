@@ -48,6 +48,7 @@ from trading_runtime import (
     ExecutionSample,
     assess_recovery_drill,
     calibrate_execution,
+    record_flight_event,
 )
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .program_ledger import ProgramLedger
@@ -1055,6 +1056,7 @@ def readiness_checks(
     checklist = checklist_rows()
     checklist_missing = [item for item in checklist if item["required"] and not item["checked"]]
     reconcile_blocking = int(reconciliation_summary["api_required_count"]) + int(reconciliation_summary["mismatch_count"])
+    central_control = durable_control_snapshot()
     checks = [
         Check(
             "Dry Run 보호",
@@ -1095,6 +1097,11 @@ def readiness_checks(
             "Kill Switch",
             "fail" if STATE["kill_switch"] else "pass",
             "Kill Switch가 켜져 있습니다." if STATE["kill_switch"] else "긴급 정지 상태가 아닙니다.",
+        ),
+        Check(
+            "중앙 Control Plane",
+            "fail" if central_control["halted"] else "pass",
+            " · ".join(central_control["reasons"]) if central_control["halted"] else "Hub 중앙 Kill 정책이 신규 주문을 차단하지 않습니다.",
         ),
         Check(
             "신규 진입",
@@ -1937,6 +1944,7 @@ def snapshot() -> dict[str, Any]:
         "kill_switch": STATE["kill_switch"],
         "new_entries_blocked": STATE["new_entries_blocked"],
         "operator_confirmed": STATE["operator_confirmed"],
+        "central_control": durable_control_snapshot(),
         "summary": {
             "status": "blocked" if blocker_count else ("watch" if warning_count else "ready"),
             "blocker_count": blocker_count,
@@ -2017,6 +2025,21 @@ def audit_category_for_event(event: str) -> str:
 def persist_audit_event(record: AuditEvent) -> None:
     try:
         AUDIT_STORE.append(record)
+        record_flight_event(
+            app="live_trader",
+            event_type=f"{record.category}:{record.source}",
+            level=record.level,
+            message=record.message,
+            payload={
+                "eventId": record.event_id,
+                "decision": record.decision,
+                "state": record.state,
+                "strategyId": record.strategy_id,
+                "symbol": record.symbol,
+                "orderId": record.order_id,
+                "reason": record.reason,
+            },
+        )
     except Exception as exc:  # pragma: no cover - persistence must never block trading.
         errors = STATE.setdefault("audit_persist_errors", [])
         errors.append(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {type(exc).__name__}: {exc}")
@@ -2991,7 +3014,7 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
     return PreTradeContext(
         mode=current_mode(),
         dry_run=dry_run,
-        halted=bool(STATE["kill_switch"]) or durable_global_kill_active(),
+        halted=bool(STATE["kill_switch"]) or durable_control_halt_active(intent),
         new_entries_blocked=bool(STATE["new_entries_blocked"]),
         readiness_blockers=int(checks.get("summary", {}).get("blocker_count", 0)),
         readiness_warnings=int(checks.get("summary", {}).get("warning_count", 0)),
@@ -3025,6 +3048,41 @@ def durable_global_kill_active() -> bool:
         return bool(DurableControlState(path).read().get("globalKill"))
     except (OSError, ValueError, json.JSONDecodeError):
         return True
+
+
+def durable_control_halt_active(intent: OrderIntent | None = None) -> bool:
+    path = str(os.environ.get("TRADING_CONTROL_STATE_PATH") or "").strip()
+    if not path:
+        return False
+    if intent is None:
+        return durable_global_kill_active()
+    broker_id = str(intent.metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset))
+    assessment = DurableControlState(path).halt_assessment(
+        app="live_trader",
+        route=broker_id,
+        strategy=intent.strategy_id,
+        instrument=intent.symbol,
+    )
+    return bool(assessment.get("halted"))
+
+
+def durable_control_snapshot() -> dict[str, Any]:
+    path = str(os.environ.get("TRADING_CONTROL_STATE_PATH") or "").strip()
+    if not path:
+        return {"configured": False, "halted": False, "globalKill": False, "scopedKills": {}, "reasons": [], "path": ""}
+    try:
+        state = DurableControlState(path).read()
+        assessment = DurableControlState(path).halt_assessment(app="live_trader")
+        return {
+            "configured": True,
+            "halted": bool(assessment.get("halted")),
+            "globalKill": state.get("globalKill") is True,
+            "scopedKills": state.get("scopedKills") or {},
+            "reasons": assessment.get("reasons") or [],
+            "path": path,
+        }
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {"configured": True, "halted": True, "globalKill": True, "scopedKills": {}, "reasons": [f"control-state-unavailable:{type(exc).__name__}"], "path": path}
 
 
 def asset_from_symbol(symbol: str) -> str:
