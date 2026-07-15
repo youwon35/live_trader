@@ -61,6 +61,7 @@ import {
   runRecoveryDrill,
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
+import { createGuidedFlow, readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
 import { createOperatorContext } from "../../../packages/design/operator-context.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
 import {
@@ -78,6 +79,7 @@ import {
 import designTokens from "../../../packages/design/design_tokens.json";
 
 const ActionButton = createActionButton(React);
+const GuidedFlow = createGuidedFlow(React);
 const OperatorContext = createOperatorContext(React);
 const StatusPill = createStatusPill(React);
 const EmptyState = createEmptyState(React);
@@ -1067,9 +1069,12 @@ function useEditablePanels(rootRef) {
 applyAppearance(readAppearance());
 applyLayoutMode(readLayoutMode());
 
+const LIVE_FLOW_STORAGE_KEY = "live_trader.guidedFlow.v1";
+const LIVE_FLOW_IDS = ["overview", "brokers", "gate", "automation", "audit"];
+
 function App() {
   const [snapshot, setSnapshot] = useState(fallbackSnapshot);
-  const [selectedNav, setSelectedNav] = useState("overview");
+  const [selectedNav, setSelectedNav] = useState(() => readGuidedFlowStep(LIVE_FLOW_STORAGE_KEY, LIVE_FLOW_IDS, "overview"));
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [appearance, setAppearance] = useState(readAppearance);
@@ -1196,6 +1201,9 @@ function App() {
   }
 
   function navigateWorkspace(navId) {
+    if (LIVE_FLOW_IDS.includes(navId)) {
+      writeGuidedFlowStep(LIVE_FLOW_STORAGE_KEY, navId);
+    }
     setSelectedNav(navId);
     setNotificationsOpen(false);
   }
@@ -1217,6 +1225,39 @@ function App() {
   const title = navItems.find((item) => item.id === selectedNav)?.label ?? "사전점검";
   const canLive = snapshot.api_connected === true && snapshot.summary.blocker_count === 0;
   const canFullLive = canLive && snapshot.summary.warning_count === 0;
+  const brokerReady = Boolean(snapshot.brokers?.some((broker) => broker.order_ready));
+  const automationEvidence = Boolean(snapshot.strategy_runner?.last_action || snapshot.orders?.length);
+  const auditEvidence = Boolean(snapshot.audit?.length);
+  const liveFlowSteps = [
+    { id: "overview", label: "상태 확인", description: "API 연결과 현재 차단·경고 상태를 확인합니다.", completed: snapshot.api_connected === true },
+    { id: "brokers", label: "브로커 연결", description: "주문 가능한 브로커와 계좌 환경을 확인합니다.", completed: brokerReady },
+    { id: "gate", label: "진입 게이트", description: "리스크 한도와 최종 Preflight를 통과시킵니다.", completed: canLive },
+    { id: "automation", label: "자동화", description: "승인된 전략의 실행 범위와 자동화 상태를 확인합니다.", completed: automationEvidence },
+    { id: "audit", label: "감사 기록", description: "주문·판단·운영 기록을 마지막으로 검토합니다.", completed: auditEvidence },
+  ];
+  const liveFlowCanAdvance = selectedNav === "overview"
+    ? snapshot.api_connected === true
+    : selectedNav === "brokers"
+      ? brokerReady
+      : selectedNav === "gate"
+        ? canLive
+        : selectedNav === "automation"
+          ? automationEvidence
+          : true;
+  const liveFlowBlockedReason = selectedNav === "overview"
+    ? "API 연결이 확인되면 브로커 연결 단계로 이동할 수 있습니다."
+    : selectedNav === "brokers"
+      ? "주문 가능한 브로커가 한 개 이상 확인되어야 합니다."
+      : selectedNav === "gate"
+        ? "차단 항목을 모두 해결하고 Preflight를 통과해야 합니다."
+        : selectedNav === "automation"
+          ? "전략 자동화 실행 기록이 만들어지면 감사 기록으로 이동할 수 있습니다."
+          : "";
+  const liveFlowStageAction = selectedNav === "overview"
+    ? { label: "상태 새로고침", onClick: refresh, disabled: loading }
+    : selectedNav === "gate"
+      ? { label: "최종 Preflight 실행", onClick: () => runAction(runFinalPreflight), disabled: loading || !snapshot.api_connected }
+      : undefined;
   const notifications = buildNotificationItems(snapshot, error);
   const notificationKey = notificationFingerprint(notifications);
   const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
@@ -1244,7 +1285,7 @@ function App() {
                     className={`nav-item ${selectedNav === item.id ? "active" : ""}`}
                     type="button"
                     key={item.id}
-                    onClick={() => setSelectedNav(item.id)}
+                    onClick={() => navigateWorkspace(item.id)}
                   >
                     <Icon size={17} />
                     <span>{item.label}</span>
@@ -1348,11 +1389,24 @@ function App() {
               ? "차단 항목은 없지만 경고가 남아 있습니다. 경고를 확인한 뒤 운용 범위를 결정하세요."
               : "실거래를 시작할 수 없습니다. 사전점검에서 차단 항목을 먼저 해결하세요."}
           meta={[`차단 ${snapshot.summary.blocker_count}`, `경고 ${snapshot.summary.warning_count}`, snapshot.api_connected ? "API 연결" : "API 확인 불가"]}
-          onAction={() => setSelectedNav(canFullLive ? "automation" : canLive ? "gate" : "overview")}
+          onAction={() => navigateWorkspace(canFullLive ? "automation" : canLive ? "gate" : "overview")}
           statusLabel={canFullLive ? "실거래 준비" : canLive ? "경고 확인" : "실거래 차단"}
           summary={canFullLive ? "실거래 게이트를 통과했습니다." : canLive ? "운용 전 확인할 경고가 남아 있습니다." : "실거래가 안전하게 차단되어 있습니다."}
           tone={canFullLive ? "success" : canLive ? "warning" : "danger"}
         />
+
+        {LIVE_FLOW_IDS.includes(selectedNav) && (
+          <GuidedFlow
+            activeStepId={selectedNav}
+            advanceBlockedReason={liveFlowBlockedReason}
+            canAdvance={liveFlowCanAdvance}
+            onNavigate={navigateWorkspace}
+            onStageAction={liveFlowStageAction?.onClick}
+            stageActionDisabled={liveFlowStageAction?.disabled}
+            stageActionLabel={liveFlowStageAction?.label}
+            steps={liveFlowSteps}
+          />
+        )}
 
         <WorkspaceContent
           selectedNav={selectedNav}
@@ -2227,8 +2281,7 @@ const STRATEGY_LIFECYCLE_STEPS = [
 ];
 
 const navGroups = [
-  { id: "operate", label: "준비·운영", itemIds: ["overview", "gate", "automation"] },
-  { id: "records", label: "기록·연결", itemIds: ["audit", "brokers"] },
+  { id: "operate", label: "주 운영 흐름", itemIds: LIVE_FLOW_IDS },
   { id: "system", label: "시스템", itemIds: ["settings"] },
 ];
 
