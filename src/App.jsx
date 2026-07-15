@@ -1226,14 +1226,58 @@ function App() {
   const canLive = snapshot.api_connected === true && snapshot.summary.blocker_count === 0;
   const canFullLive = canLive && snapshot.summary.warning_count === 0;
   const brokerReady = Boolean(snapshot.brokers?.some((broker) => broker.order_ready));
-  const automationEvidence = Boolean(snapshot.strategy_runner?.last_action || snapshot.orders?.length);
+  const readyBrokerCount = snapshot.brokers?.filter((broker) => broker.order_ready).length ?? 0;
+  const runnerLastAction = snapshot.strategy_runner?.last_action || "대기";
+  const automationEvidence = Boolean((runnerLastAction && runnerLastAction !== "대기") || snapshot.orders?.length);
   const auditEvidence = Boolean(snapshot.audit?.length);
   const liveFlowSteps = [
-    { id: "overview", label: "상태 확인", description: "API 연결과 현재 차단·경고 상태를 확인합니다.", completed: snapshot.api_connected === true },
-    { id: "brokers", label: "브로커 연결", description: "주문 가능한 브로커와 계좌 환경을 확인합니다.", completed: brokerReady },
-    { id: "gate", label: "진입 게이트", description: "리스크 한도와 최종 Preflight를 통과시킵니다.", completed: canLive },
-    { id: "automation", label: "자동화", description: "승인된 전략의 실행 범위와 자동화 상태를 확인합니다.", completed: automationEvidence },
-    { id: "audit", label: "감사 기록", description: "주문·판단·운영 기록을 마지막으로 검토합니다.", completed: auditEvidence },
+    {
+      id: "overview",
+      label: "상태 확인",
+      description: "로컬 API 연결과 현재 차단·경고·보호 모드를 한 번에 확인합니다.",
+      completionCriteria: "API가 연결되어 최신 운영 상태를 읽을 수 있어야 합니다.",
+      evidence: snapshot.api_connected
+        ? `API 연결 · 차단 ${snapshot.summary.blocker_count}개 · 경고 ${snapshot.summary.warning_count}개`
+        : "API 연결 끊김 · 이후 모든 상태는 확인 불가로 처리됩니다.",
+      handoff: "최신 상태를 기준으로 주문 가능한 브로커와 계좌 환경을 확인합니다.",
+      completed: snapshot.api_connected === true,
+    },
+    {
+      id: "brokers",
+      label: "브로커 연결",
+      description: "브로커 자격 증명·계좌 환경·주문 가능 상태를 확인합니다.",
+      completionCriteria: "order_ready인 브로커가 한 개 이상 있어야 합니다.",
+      evidence: `주문 준비 ${readyBrokerCount.toLocaleString("ko-KR")} / ${(snapshot.brokers?.length ?? 0).toLocaleString("ko-KR")}개 브로커`,
+      handoff: "준비된 브로커를 대상으로 리스크 한도와 최종 Preflight를 실행합니다.",
+      completed: brokerReady,
+    },
+    {
+      id: "gate",
+      label: "진입 게이트",
+      description: "전략 승급 근거·계좌 상태·리스크 한도·보호 장치를 최종 점검합니다.",
+      completionCriteria: "API가 연결되고 차단 항목이 0개여야 합니다.",
+      evidence: `차단 ${snapshot.summary.blocker_count}개 · 경고 ${snapshot.summary.warning_count}개 · ${canLive ? "진입 가능" : "진입 차단"}`,
+      handoff: "통과한 전략과 주문 범위만 자동화 단계에서 실행할 수 있습니다.",
+      completed: canLive,
+    },
+    {
+      id: "automation",
+      label: "자동화",
+      description: "승인된 전략의 자산·브로커·모드·주문 범위와 최근 실행을 확인합니다.",
+      completionCriteria: "대기 상태가 아닌 전략 실행 기록 또는 주문 기록이 있어야 합니다.",
+      evidence: `${runnerLastAction} · 주문 ${(snapshot.orders?.length ?? 0).toLocaleString("ko-KR")}건`,
+      handoff: "전략 판단과 주문 결과를 감사 기록에서 추적 가능한 형태로 확인합니다.",
+      completed: automationEvidence,
+    },
+    {
+      id: "audit",
+      label: "감사 기록",
+      description: "주문·판단·차단·운영 변경 기록을 시간순으로 최종 검토합니다.",
+      completionCriteria: "감사 기록이 한 건 이상 있어야 하며 오류·차단 사유를 설명할 수 있어야 합니다.",
+      evidence: `감사 기록 ${(snapshot.audit?.length ?? 0).toLocaleString("ko-KR")}건`,
+      handoff: "최종 기록을 운영 근거로 유지하고 Hub Center에서 실행 상태를 계속 추적합니다.",
+      completed: auditEvidence,
+    },
   ];
   const liveFlowCanAdvance = selectedNav === "overview"
     ? snapshot.api_connected === true
