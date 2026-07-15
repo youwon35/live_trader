@@ -61,6 +61,7 @@ import {
   runRecoveryDrill,
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
+import { createOperatorContext } from "../../../packages/design/operator-context.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
 import {
   createEmptyState,
@@ -77,6 +78,7 @@ import {
 import designTokens from "../../../packages/design/design_tokens.json";
 
 const ActionButton = createActionButton(React);
+const OperatorContext = createOperatorContext(React);
 const StatusPill = createStatusPill(React);
 const EmptyState = createEmptyState(React);
 const FormField = createFormField(React);
@@ -1231,20 +1233,28 @@ function App() {
           </div>
         </div>
         <nav className="nav-list" aria-label="주요 메뉴">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            return (
-              <button
-                className={`nav-item ${selectedNav === item.id ? "active" : ""}`}
-                type="button"
-                key={item.id}
-                onClick={() => setSelectedNav(item.id)}
-              >
-                <Icon size={17} />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
+          {navGroups.map((group) => (
+            <div className="nav-group" key={group.id}>
+              <span className="nav-group-label">{group.label}</span>
+              {group.itemIds.map((itemId) => {
+                const item = navItems.find((candidate) => candidate.id === itemId);
+                const Icon = item.icon;
+                return (
+                  <button
+                    className={`nav-item ${selectedNav === item.id ? "active" : ""}`}
+                    type="button"
+                    key={item.id}
+                    onClick={() => setSelectedNav(item.id)}
+                  >
+                    <Icon size={17} />
+                    <span>{item.label}</span>
+                    {item.id === "overview" && snapshot.summary.blocker_count > 0 && <span className="nav-item-badge is-danger" aria-hidden="true">{snapshot.summary.blocker_count}</span>}
+                    {item.id === "audit" && unreadNotificationCount > 0 && <span className="nav-item-badge" aria-hidden="true">{Math.min(unreadNotificationCount, 9)}</span>}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
         </nav>
         <div className="sidebar-footer">
           <span>전체 차단</span>
@@ -1328,6 +1338,21 @@ function App() {
             </button>
           </section>
         )}
+
+        <OperatorContext
+          actionLabel={canFullLive ? "자동화 확인" : canLive ? "경고 확인" : "차단 원인 확인"}
+          currentStage="live"
+          detail={canFullLive
+            ? "브로커 연결과 위험 게이트가 모두 준비됐습니다. 주문 전 운용 범위를 마지막으로 확인하세요."
+            : canLive
+              ? "차단 항목은 없지만 경고가 남아 있습니다. 경고를 확인한 뒤 운용 범위를 결정하세요."
+              : "실거래를 시작할 수 없습니다. 사전점검에서 차단 항목을 먼저 해결하세요."}
+          meta={[`차단 ${snapshot.summary.blocker_count}`, `경고 ${snapshot.summary.warning_count}`, snapshot.api_connected ? "API 연결" : "API 확인 불가"]}
+          onAction={() => setSelectedNav(canFullLive ? "automation" : canLive ? "gate" : "overview")}
+          statusLabel={canFullLive ? "실거래 준비" : canLive ? "경고 확인" : "실거래 차단"}
+          summary={canFullLive ? "실거래 게이트를 통과했습니다." : canLive ? "운용 전 확인할 경고가 남아 있습니다." : "실거래가 안전하게 차단되어 있습니다."}
+          tone={canFullLive ? "success" : canLive ? "warning" : "danger"}
+        />
 
         <WorkspaceContent
           selectedNav={selectedNav}
@@ -2199,6 +2224,12 @@ const STRATEGY_LIFECYCLE_STEPS = [
   { id: "papered", label: "Papered" },
   { id: "before-live-small", label: "Before Live-Small" },
   { id: "live", label: "Live" },
+];
+
+const navGroups = [
+  { id: "operate", label: "준비·운영", itemIds: ["overview", "gate", "automation"] },
+  { id: "records", label: "기록·연결", itemIds: ["audit", "brokers"] },
+  { id: "system", label: "시스템", itemIds: ["settings"] },
 ];
 
 function strategyLifecycleRank(stage = "") {
