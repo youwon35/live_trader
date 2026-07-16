@@ -9,8 +9,9 @@ from pathlib import Path
 
 from .server import start_in_thread
 
-DEFAULT_WINDOW_WIDTH = 1480
-DEFAULT_WINDOW_HEIGHT = 980
+WINDOW_STATE_VERSION = 2
+DEFAULT_WINDOW_WIDTH = 1360
+DEFAULT_WINDOW_HEIGHT = 820
 MIN_WINDOW_WIDTH = 1180
 MIN_WINDOW_HEIGHT = 760
 
@@ -101,6 +102,8 @@ def _load_window_state() -> dict[str, int]:
         data = json.loads(_window_state_path().read_text(encoding="utf-8"))
     except Exception:
         return defaults
+    if data.get("version") != WINDOW_STATE_VERSION:
+        return defaults
     return {
         "width": _clamp_int(data.get("width"), DEFAULT_WINDOW_WIDTH, MIN_WINDOW_WIDTH, 7680),
         "height": _clamp_int(data.get("height"), DEFAULT_WINDOW_HEIGHT, MIN_WINDOW_HEIGHT, 4320),
@@ -116,7 +119,7 @@ def _save_window_state(window: object | None) -> None:
         root = _app_data_root()
         root.mkdir(parents=True, exist_ok=True)
         _window_state_path().write_text(
-            json.dumps({"width": width, "height": height}, ensure_ascii=False, indent=2),
+            json.dumps({"version": WINDOW_STATE_VERSION, "width": width, "height": height}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     except Exception:
