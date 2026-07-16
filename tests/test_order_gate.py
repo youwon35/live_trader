@@ -106,6 +106,32 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(queue_state, "blocked")
         self.assertIn("readiness blocker 2개", reason)
 
+    def test_exchange_holiday_blocks_equity_order(self) -> None:
+        state.STATE["new_entries_blocked"] = False
+        intent = state.OrderIntent(
+            strategy_id="krx-calendar-test",
+            asset="KR_STOCK",
+            symbol="069500.KS",
+            side="BUY",
+            quantity=1,
+            reference_price=1000,
+            mode=state.current_mode(),
+            reason="calendar test",
+            metadata={"broker_id": "kis"},
+        )
+        with patch.object(state, "market_session_state", return_value={"orderable": False, "detail": "거래소 휴장일"}):
+            ok, order_state, _queue_state, reason, report = state.evaluate_order_gate_with_report(
+                {"summary": {"blocker_count": 0}},
+                "BUY",
+                dry_run=False,
+                intent=intent,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual("adapter_blocked", order_state)
+        self.assertTrue(reason)
+        self.assertTrue(any(check.label == "거래소 세션" for check in report.checks))
+
     def test_order_gate_records_dry_run_without_broker_transmission(self) -> None:
         state.STATE["new_entries_blocked"] = False
 

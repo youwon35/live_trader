@@ -35,11 +35,13 @@ if (-not (Test-Path -LiteralPath $sharedRuntime)) {
   --workpath build `
   --specpath build `
   --add-data "$root\dist;dist" `
+  --add-data "$sharedRuntime\trading_runtime\data\market_calendars;trading_runtime\data\market_calendars" `
   --paths "$sharedRuntime" `
   --hidden-import trading_runtime.order_management `
   --hidden-import trading_runtime.audit_events `
   --hidden-import trading_runtime.artifact_governance `
   --hidden-import trading_runtime.risk_engine `
   --hidden-import trading_runtime.strategy_runner `
+  --hidden-import trading_runtime.market_calendar `
   --collect-submodules webview `
   live_trader\__main__.py

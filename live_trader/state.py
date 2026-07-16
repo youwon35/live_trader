@@ -72,6 +72,7 @@ from .live_adapters import build_binance_spot_order_request, build_kis_live_orde
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
+from trading_runtime.market_calendar import market_session_state
 
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
@@ -1035,9 +1036,11 @@ def build_adapter_preview(provider: str, strategies: list[dict[str, Any]]) -> di
 
 
 def market_sessions() -> list[dict[str, str]]:
+    krx = market_session_state("XKRX", regular_open="09:00", regular_close="15:30")
+    nyse = market_session_state("XNYS", regular_open="09:30", regular_close="16:00")
     return [
-        {"label": "KRX", "state": "watch", "time": "KST", "detail": "정규장/동시호가 구분 필요"},
-        {"label": "NYSE", "state": "closed", "time": "ET", "detail": "정규장 외 주문 품질 주의"},
+        {"label": "KRX", "state": str(krx["state"]), "time": "KST", "detail": str(krx["detail"])},
+        {"label": "NYSE", "state": str(nyse["state"]), "time": "ET", "detail": str(nyse["detail"])},
         {"label": "Binance", "state": "open", "time": "24/7", "detail": "레이트 리밋/급변동 감시"},
         {"label": "Risk Engine", "state": "blocked", "time": "LIVE GATE", "detail": "API/권한 준비 전 차단"},
     ]
@@ -2825,6 +2828,16 @@ def evaluate_order_gate_with_report(
     if watchdog_critical:
         detail = f"Watchdog critical {watchdog_critical}개: {', '.join(watchdog.get('next_actions', [])[:4])}"
         report = PreTradeRiskReport(report.checked_at, (*report.checks, RiskCheck("Watchdog", "fail", detail)))
+    # Dry-run is an offline safety simulation and remains usable outside market
+    # hours.  Paper Trader enforces its own exchange-session clock; this gate is
+    # for orders that could otherwise reach the live adapter.
+    calendar_state = order_intent_market_session(intent) if not dry_run else None
+    if calendar_state is not None:
+        calendar_status: CheckStatus = "pass" if calendar_state.get("orderable") is True else "fail"
+        report = PreTradeRiskReport(
+            report.checked_at,
+            (*report.checks, RiskCheck("거래소 세션", calendar_status, str(calendar_state.get("detail") or "시장 일정 확인 실패"))),
+        )
     if report.can_submit:
         if dry_run:
             return True, "dry_run", "simulated", "Dry Run 보호가 켜져 있어 브로커 전송 없이 주문 의도를 감사 로그에만 기록했습니다.", report
@@ -2832,10 +2845,29 @@ def evaluate_order_gate_with_report(
 
     adapter_labels = {"운용 모드", "실거래 환경 변수", "실주문 어댑터"}
     non_adapter_blockers = [check for check in report.blockers if check.label not in adapter_labels]
+    adapter_blockers = [check for check in report.blockers if check.label in adapter_labels]
+    # Until the live adapter itself is verified, retain that stronger/earlier
+    # hold reason even when the exchange is also closed.  The failed session
+    # check remains visible in the report and becomes the active blocker once
+    # the adapter gates pass.
+    if adapter_blockers and all(check.label == "거래소 세션" for check in non_adapter_blockers):
+        adapter_blocker = next((check for check in adapter_blockers if check.label == "실주문 어댑터"), adapter_blockers[0])
+        return False, "adapter_blocked", "held", adapter_blocker.detail, report
     if non_adapter_blockers:
         return False, "risk_blocked", "blocked", report.summary, report
     adapter_blocker = next((check for check in report.blockers if check.label == "실주문 어댑터"), report.blockers[0])
     return False, "adapter_blocked", "held", adapter_blocker.detail, report
+
+
+def order_intent_market_session(intent: OrderIntent) -> dict[str, object] | None:
+    text = f"{intent.asset} {intent.symbol} {intent.metadata.get('broker_id', '')}".lower()
+    if any(token in text for token in ("crypto", "btc", "eth", "usdt", "binance", "upbit")):
+        return None
+    if any(token in text for token in ("kr_stock", "stock_kr", ".ks", ".kq", "kis")):
+        return market_session_state("XKRX", regular_open="09:00", regular_close="15:30")
+    if any(token in text for token in ("us_stock", "stock_us", "nyse", "nasdaq", "amex")):
+        return market_session_state("XNYS", regular_open="09:30", regular_close="16:00")
+    return None
 
 
 class LiveArtifactSignalProvider:
