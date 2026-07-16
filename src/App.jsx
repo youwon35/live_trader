@@ -295,9 +295,7 @@ function accentContrastText(color) {
     0.2126 * relativeLuminanceChannel(r) +
     0.7152 * relativeLuminanceChannel(g) +
     0.0722 * relativeLuminanceChannel(b);
-  const whiteContrast = 1.05 / (luminance + 0.05);
-  const darkContrast = (luminance + 0.05) / 0.05;
-  return whiteContrast >= darkContrast ? "#ffffff" : "#0f172a";
+  return luminance >= 0.45 ? "#0f172a" : "#ffffff";
 }
 
 function accentColorForContrast(accent, customAccent) {
