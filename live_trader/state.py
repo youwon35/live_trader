@@ -720,10 +720,10 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
         selected_gate = None
     if selected_gate is None:
         selected_gate = portfolio_gate_for_strategy(
-        {"strategy_id": intent.strategy_id, "symbol": intent.symbol},
-        checks.get("portfolios") if isinstance(checks.get("portfolios"), list) else None,
-        mode=current_mode(),
-    )
+            {"strategy_id": intent.strategy_id, "symbol": intent.symbol},
+            checks.get("portfolios") if isinstance(checks.get("portfolios"), list) else [],
+            mode=current_mode(),
+        )
     policy = selected_gate.get("rebalancePolicy") if isinstance(selected_gate.get("rebalancePolicy"), dict) else {}
     if not policy or not selected_gate.get("active") or selected_gate.get("allowed") is not True:
         return selected_gate
@@ -3321,7 +3321,7 @@ def run_recovery_drill() -> dict[str, Any]:
     verified = loaded.get("contentHash") == checkpoint.get("contentHash") and loaded.get("state") == checkpoint.get("state")
     idempotency_keys = [str(item.get("idempotency_key") or "") for item in STATE.get("orders", []) if item.get("idempotency_key")]
     reconciliation_status = reconciliation_snapshot().get("summary", {}).get("status")
-    broker_reconciled = reconciliation_status == "pass" or current_mode() == "MONITOR"
+    broker_reconciled = reconciliation_status == "pass"
     assurance = assess_recovery_drill(
         checkpoint_saved=bool(checkpoint.get("contentHash")),
         checkpoint_hash_verified=verified,

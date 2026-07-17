@@ -4158,7 +4158,7 @@ body {
   }
 }
 
-@media (max-width: 1260px) {
+@media (max-width: 1360px) {
   .command-grid,
   .content-grid {
     grid-template-columns: minmax(0, 1fr);

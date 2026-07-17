@@ -1,8 +1,10 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from live_trader.contracts import (
     can_live_use_artifact,
@@ -11,6 +13,7 @@ from live_trader.contracts import (
     load_strategy_artifacts,
     normalize_portfolio_artifact,
     normalize_strategy_artifact,
+    resolve_trading_system_root,
     strategy_artifact_dirs,
     strategy_plugin_dirs,
     strategy_plugin_status,
@@ -20,6 +23,17 @@ from trading_runtime.professional_flow import build_lineage_manifest
 
 
 class StrategyContractTest(unittest.TestCase):
+    def test_frozen_executable_resolves_workspace_strategy_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trading_system = Path(tmp) / "trading-system"
+            (trading_system / "packages" / "strategy-core").mkdir(parents=True)
+            executable = trading_system / "apps" / "live_trader" / "release" / "LiveTrader.exe"
+            executable.parent.mkdir(parents=True)
+            with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", str(executable)):
+                resolved = resolve_trading_system_root()
+
+        self.assertEqual(resolved, trading_system)
+
     def test_tampered_professional_lineage_blocks_live_capability(self) -> None:
         lineage = build_lineage_manifest(
             stage="backtest",

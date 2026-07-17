@@ -169,7 +169,7 @@ def broker_diagnostics(broker_id: str | None = None) -> list[dict[str, Any]]:
                 "name": name,
                 "present": bool(os.getenv(name, "").strip()),
                 "masked": mask_env_value(name),
-                "secret": "SECRET" in name or "KEY" in name,
+                "secret": "SECRET" in name or "KEY" in name or name in {"KIS_ACCOUNT_NO", "KIS_HTS_ID"},
             }
             for name in required
         ]

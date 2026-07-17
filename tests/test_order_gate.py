@@ -146,6 +146,17 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(queue_state, "simulated")
         self.assertIn("브로커 전송 없이", reason)
 
+    def test_explicit_gate_snapshot_does_not_reload_portfolios_from_disk(self) -> None:
+        state.STATE["new_entries_blocked"] = False
+        checks = {"summary": {"blocker_count": 0}, "strategies": []}
+
+        with patch.object(state, "portfolio_rows", side_effect=AssertionError("disk reload")):
+            ok, order_state, queue_state, _reason = state.evaluate_order_gate(checks, "BUY", dry_run=True)
+
+        self.assertTrue(ok)
+        self.assertEqual(order_state, "dry_run")
+        self.assertEqual(queue_state, "simulated")
+
     def test_order_gate_blocks_new_buy_when_strategy_revalidation_expired(self) -> None:
         state.STATE["new_entries_blocked"] = False
         checks = {
@@ -1186,13 +1197,40 @@ class OrderGateTest(unittest.TestCase):
         self.assertIn("event adapter required", result["errors"][0]["detail"])
 
     def test_recovery_drill_verifies_atomic_checkpoint(self) -> None:
+        snapshot_reconciliation = state.reconciliation_snapshot()
+        passing_reconciliation = copy.deepcopy(snapshot_reconciliation)
+        passing_reconciliation["summary"]["status"] = "pass"
         with tempfile.TemporaryDirectory() as temp_dir:
             journal = state.RecoveryJournal(Path(temp_dir) / "recovery")
-            with patch.object(state, "RECOVERY_JOURNAL", journal):
+            with patch.object(state, "RECOVERY_JOURNAL", journal), patch.object(
+                state,
+                "reconciliation_snapshot",
+                side_effect=[passing_reconciliation, snapshot_reconciliation],
+            ):
                 result = state.run_recovery_drill()
         self.assertTrue(result["ok"])
         self.assertTrue(result["recovery"]["verified"])
         self.assertFalse(result["recovery"]["safeMode"])
+
+    def test_recovery_drill_stays_blocked_in_monitor_without_broker_reconciliation(self) -> None:
+        state.STATE["mode"] = "MONITOR"
+        snapshot_reconciliation = state.reconciliation_snapshot()
+        warning_reconciliation = copy.deepcopy(snapshot_reconciliation)
+        warning_reconciliation["summary"]["status"] = "warn"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal = state.RecoveryJournal(Path(temp_dir) / "recovery")
+            with patch.object(state, "RECOVERY_JOURNAL", journal), patch.object(
+                state,
+                "reconciliation_snapshot",
+                side_effect=[warning_reconciliation, snapshot_reconciliation],
+            ):
+                result = state.run_recovery_drill()
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["recovery"]["verified"])
+        self.assertTrue(result["recovery"]["safeMode"])
+        self.assertFalse(result["recovery"]["assurance"]["checks"]["brokerReconciled"])
+        self.assertFalse(result["recovery"]["assurance"]["newEntriesAllowed"])
 
     def test_shadow_live_records_virtual_fill_without_order_or_broker_submission(self) -> None:
         state.STATE["orders"] = []

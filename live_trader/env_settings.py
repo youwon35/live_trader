@@ -27,10 +27,10 @@ class EnvSettingField:
 ENV_SETTING_FIELDS = (
     EnvSettingField("KIS_APP_KEY", "KIS app key", "KIS 실전투자 app key입니다.", "kis", "secret", required=True),
     EnvSettingField("KIS_APP_SECRET", "KIS app secret", "KIS 실전투자 app secret입니다.", "kis", "secret", required=True),
-    EnvSettingField("KIS_ACCOUNT_NO", "KIS 계좌번호", "계좌번호 앞 8자리입니다.", "kis", "text", required=True),
+    EnvSettingField("KIS_ACCOUNT_NO", "KIS 실계좌 번호", "한국투자증권 로그인 ID가 아니라 실계좌 번호(CANO) 앞 8자리입니다.", "kis", "secret", required=True),
     EnvSettingField("KIS_ACCOUNT_PRODUCT_CODE", "KIS 상품 코드", "계좌번호 뒤 2자리입니다. 보통 01을 사용합니다.", "kis", "text", "01", True),
     EnvSettingField("KIS_BASE_URL", "KIS 실전 URL", "실전 서버 URL입니다. 모의투자 URL과 섞지 마세요.", "kis", "text", KIS_LIVE_BASE_URL),
-    EnvSettingField("KIS_HTS_ID", "KIS HTS ID", "체결/시세 경로에서 필요한 HTS ID입니다.", "kis", "text"),
+    EnvSettingField("KIS_HTS_ID", "KIS HTS ID", "한국투자증권 로그인/HTS ID이며 일부 체결·시세 경로에서 사용합니다.", "kis", "secret"),
     EnvSettingField("BINANCE_API_KEY", "Binance API key", "Binance Spot API key입니다.", "binance", "secret", required=True),
     EnvSettingField("BINANCE_API_SECRET", "Binance API secret", "Binance Spot API secret입니다.", "binance", "secret", required=True),
     EnvSettingField("BINANCE_BASE_URL", "Binance URL", "Binance REST base URL입니다.", "binance", "text", BINANCE_BASE_URL),

@@ -56,7 +56,30 @@ PLUGIN_LABELS = {
     "threshold_momentum": "Threshold Momentum",
 }
 
-TRADING_SYSTEM_ROOT = Path(__file__).resolve().parents[3]
+
+def resolve_trading_system_root() -> Path:
+    configured = os.getenv("TRADING_SYSTEM_ROOT", "").strip()
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(os.path.expandvars(configured)).expanduser())
+    if getattr(sys, "frozen", False):
+        executable = Path(sys.executable).resolve()
+        candidates.extend(executable.parents)
+    source_path = Path(__file__).resolve()
+    candidates.extend(source_path.parents)
+    candidates.extend(Path.cwd().resolve().parents)
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if (candidate / "packages" / "strategy-core").is_dir():
+            return candidate
+    return source_path.parents[3]
+
+
+TRADING_SYSTEM_ROOT = resolve_trading_system_root()
 PRIMARY_STRATEGY_ARTIFACT_DIR = TRADING_SYSTEM_ROOT / "packages" / "strategy-core"
 IGNORED_STRATEGY_FILE_NAMES = {
     "package.json",
@@ -463,9 +486,10 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
 
 def strategy_artifact_dirs() -> list[Path]:
     configured = _env_paths("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", "TRADER_STRATEGY_ARTIFACT_DIR")
+    if configured:
+        return _dedupe_paths(configured)
     return _dedupe_paths(
-        configured
-        + [
+        [
             PRIMARY_STRATEGY_ARTIFACT_DIR,
             _appdata_strategy_artifact_dir(),
         ]

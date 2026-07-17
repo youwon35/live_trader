@@ -774,3 +774,44 @@ The rebuilt executable is:
 ```text
 D:\github\PROGRAM\trading-system\apps\live_trader\release\LiveTrader.exe
 ```
+
+## 2026-07-18 API 없는 전체 탭 검증과 안전 보강
+
+현재 실제 상태:
+
+- `MONITOR`, `Dry Run ON`, 신규 진입 차단 ON, Kill Switch OFF.
+- KIS/Binance/Upbit 자격 증명은 모두 미등록이며 주문 준비 브로커는 0개다.
+- 공유 전략 5개와 Portfolio 3개를 읽으며, 최신 Portfolio `portfolio-20260717T191245-36dd3b8d`는 `parameter_surface`, `cross_market` 미통과라 Live 승인을 정확히 차단한다.
+
+API 없이 실제 실행한 기능:
+
+- Watchdog, Final Preflight, 브로커 3종 점검, 계좌/포지션 대조, stock/crypto 전략 사이클, 테스트 주문 게이트, Shadow Live, 정책 Replay, Recovery Drill, 체결 이벤트 동기화, CSV/HTML 감사 내보내기.
+- 테스트 주문은 Portfolio lifecycle/evidence, 신규 진입 차단, readiness, 대조 불일치 사유로 `risk_blocked` 됐다.
+- Shadow Live는 브로커 전송 없이 해시 증거를 만들었고 정책 Replay와 감사 내보내기는 성공했다.
+- 계좌/체결 동기화는 KIS 2개, Binance 2개, Upbit 2개 키 누락을 구체적으로 기록했다.
+
+수정한 안전/품질 문제:
+
+- 주문 게이트가 전달받은 snapshot 대신 디스크 Portfolio를 중간에 다시 읽던 TOCTOU 경계를 제거했다.
+- 환경 변수로 지정한 Strategy Artifact 경로가 기본 경로와 섞이지 않고 명시적 override로 동작한다.
+- `MONITOR`라는 이유만으로 Recovery Drill의 브로커 대조를 통과시키던 오류를 제거했다. 실제 대조가 `pass`가 아니면 `safeMode=true`, `newEntriesAllowed=false`다.
+- KIS 실계좌 번호와 HTS ID는 설정 응답/UI에서 원문을 재표시하지 않고 마스킹한다. 계좌번호(CANO)는 로그인 ID가 아니라는 설명을 명시했다.
+- 1280px 설정 화면에서 버튼/탭/입력칸이 패널 밖으로 나가던 반응형 배치를 수정했다.
+- `npm run ui:smoke`를 추가해 1707×960과 1280×800에서 6개 탭, API 연결, 가로 넘침, 화면 밖 컨트롤, 콘솔 오류를 반복 검증한다.
+- PyInstaller EXE가 임시 `_MEI` 경로를 workspace로 오인해 샘플 전략만 읽던 문제를 수정했다. 최종 EXE는 공유 전략 5개와 Portfolio 3개를 확인했다.
+
+검증:
+
+- Python unittest 71개 통과.
+- frontend build 통과.
+- 100/125/150% desktop-scale 계약 통과.
+- 소스 및 최종 EXE 대상 UI smoke 12개 조합 통과.
+- 최신 EXE: `D:\github\PROGRAM\trading-system\apps\live_trader\release\LiveTrader.exe`.
+
+### API 등록 후 다음 작업
+
+1. 먼저 Paper Trader를 기존 이력 보존 상태로 Artifact 탭부터 전체 재검증하고, 정규장 알고리즘 신호가 있을 때만 KIS 모의 주문 접수/체결을 확인한다.
+2. Live Trader KIS를 쓸 때 `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO`(실계좌 CANO 앞 8자리), `KIS_ACCOUNT_PRODUCT_CODE`(보통 01), 필요 시 `KIS_HTS_ID`를 등록한다.
+3. Binance를 쓸 때 `BINANCE_API_KEY`, `BINANCE_API_SECRET`; Upbit를 쓸 때 `UPBIT_ACCESS_KEY`, `UPBIT_SECRET_KEY`를 등록한다. 사용할 거래소 한 종류만 등록해도 된다.
+4. 키 등록 후에는 먼저 읽기 전용 인증·잔고·포지션 대조와 체결 이벤트 동기화부터 확인한다. 성공 전에는 `LIVE_TRADER_ENABLE_REAL_ORDERS=false`를 유지한다.
+5. Strategy/Portfolio 전문 게이트와 Paper Portfolio Evidence가 모두 일치하고, 취소/정정·체결 스트림 등 미구현 기능까지 완료된 뒤에만 별도 확인을 받아 SMALL_LIVE 소액 절차를 설계한다. 자동으로 실주문을 켜지 않는다.
