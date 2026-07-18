@@ -2837,7 +2837,7 @@ function BrokerPanel({ brokers, onOpenSettings }) {
             <p>{broker.detail}</p>
             <div className="env-list">
               {broker.required_env.map((name) => (
-                <span className={broker.missing_env.includes(name) ? "missing" : ""} key={name}>
+                <span className={broker.missing_env.includes(name) ? "missing" : ""} data-ts-contrast="light" key={name}>
                   {name}
                 </span>
               ))}
@@ -3001,7 +3001,7 @@ function BrokerCapabilityPanel({ diagnostics }) {
             </div>
             <div className="capability-grid">
               {broker.capabilities.map((capability) => (
-                <div className={`capability-item ${capability.status}`} key={capability.key}>
+                <div className={`capability-item ${capability.status}`} data-ts-contrast="light" key={capability.key}>
                   <strong>{capability.label}</strong>
                   <span>{capability.detail}</span>
                 </div>

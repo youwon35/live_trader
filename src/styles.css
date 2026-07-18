@@ -899,7 +899,7 @@ button {
   place-items: center;
   min-height: 26px;
   padding: 0 8px 1px;
-  color: var(--success-text);
+  color: var(--status-pill-text, #0f172a);
   background: var(--status-pill-success-background, #dcfce7);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -1301,7 +1301,7 @@ button {
 }
 
 .env-check.present span {
-  color: var(--success-text);
+  color: var(--status-pill-text, #0f172a);
 }
 
 .env-check.missing span {
@@ -4005,7 +4005,19 @@ body {
 
 :root[data-ui-theme='light'] .env-list span,
 :root[data-ui-theme='light'] .env-check.present span {
-  color: var(--success-text);
+  color: var(--status-pill-text, #0f172a);
+}
+
+.promotion-checklist article > div,
+.promotion-checklist article > div > :is(strong, span, em) {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.promotion-checklist article > div > :is(strong, span, em) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 :root[data-ui-theme='light'] .capability-item.pass strong,
