@@ -695,6 +695,49 @@ button {
   min-width: 0;
 }
 
+.upbit-smoke-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.upbit-smoke-panel .panel-header,
+.upbit-smoke-panel .panel-action-line {
+  margin-bottom: 0;
+}
+
+.upbit-smoke-metrics {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.upbit-smoke-detail {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 10px 12px;
+  color: var(--text-muted);
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  font-size: var(--font-size-small);
+  line-height: 1.45;
+}
+
+.upbit-smoke-detail strong,
+.upbit-smoke-detail span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.upbit-smoke-detail strong {
+  color: var(--text);
+}
+
+.mini-button.danger {
+  color: var(--danger-text);
+  background: var(--danger-surface);
+  border-color: var(--border);
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));

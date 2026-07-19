@@ -138,6 +138,20 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/preflight":
             self.send_json(state.run_final_preflight())
             return
+        if parsed.path == "/api/upbit-smoke-preview":
+            self.send_json(state.preview_upbit_smoke_order(payload.get("notional_krw", 5000)))
+            return
+        if parsed.path == "/api/upbit-smoke-submit":
+            self.send_json(
+                state.submit_upbit_smoke_order(
+                    payload.get("confirmation_token", ""),
+                    confirmed=payload.get("confirmed") is True,
+                )
+            )
+            return
+        if parsed.path == "/api/upbit-smoke-refresh":
+            self.send_json(state.refresh_upbit_smoke_order())
+            return
         if parsed.path == "/api/audit-export":
             self.send_json(state.export_audit(str(payload.get("format", "csv"))))
             return

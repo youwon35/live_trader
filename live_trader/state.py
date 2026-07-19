@@ -4,6 +4,7 @@ import os
 import csv
 import html
 import json
+import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -368,6 +369,17 @@ STATE: dict[str, Any] = {
     "orders": [],
     "persisted_idempotency_keys": [],
     "shadow_evidence": [],
+    "upbit_smoke_order": {
+        "status": "idle",
+        "status_label": "미리보기 필요",
+        "market": "KRW-BTC",
+        "notional_krw": 5000,
+        "confirmation_token": "",
+        "identifier": "",
+        "expires_at": "",
+        "used": False,
+        "detail": "실제 주문 전 주문 가능 정보와 원화 잔고를 먼저 조회합니다.",
+    },
     "recovery_status": {"verified": False, "safeMode": True, "generation": 0, "detail": "복구 훈련 미실행"},
     "audit": [
         {
@@ -1311,6 +1323,9 @@ def positions() -> list[dict[str, str]]:
                 "currency": str(item["currency"]),
                 "program_qty": format_quantity(program_qty),
                 "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "API 필요",
+                "broker_value_display": format_money(broker_row.get("broker_value"), str(item["currency"])) if broker_row and safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
+                "average_price_display": format_money(broker_row.get("average_price"), str(item["currency"])) if broker_row and safe_float(broker_row.get("average_price"), 0.0) > 0 else "-",
+                "current_price_display": format_money(broker_row.get("current_price"), str(item["currency"])) if broker_row and safe_float(broker_row.get("current_price"), 0.0) > 0 else "-",
                 "delta_qty": delta_qty,
                 "status": status,
                 "status_label": status_label,
@@ -1345,6 +1360,9 @@ def positions() -> list[dict[str, str]]:
                 "currency": str(ledger_row.get("currency") or ""),
                 "program_qty": format_quantity(program_qty),
                 "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "API 필요",
+                "broker_value_display": format_money(broker_row.get("broker_value"), str(ledger_row.get("currency") or "")) if broker_row and safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
+                "average_price_display": format_money(broker_row.get("average_price"), str(ledger_row.get("currency") or "")) if broker_row and safe_float(broker_row.get("average_price"), 0.0) > 0 else "-",
+                "current_price_display": format_money(broker_row.get("current_price"), str(ledger_row.get("currency") or "")) if broker_row and safe_float(broker_row.get("current_price"), 0.0) > 0 else "-",
                 "delta_qty": delta_qty,
                 "status": status,
                 "status_label": status_label,
@@ -1365,6 +1383,9 @@ def positions() -> list[dict[str, str]]:
                 "currency": str(broker_row.get("currency") or ""),
                 "program_qty": "0",
                 "broker_qty": format_quantity(broker_qty),
+                "broker_value_display": format_money(broker_row.get("broker_value"), str(broker_row.get("currency") or "")) if safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
+                "average_price_display": format_money(broker_row.get("average_price"), str(broker_row.get("currency") or "")) if safe_float(broker_row.get("average_price"), 0.0) > 0 else "-",
+                "current_price_display": format_money(broker_row.get("current_price"), str(broker_row.get("currency") or "")) if safe_float(broker_row.get("current_price"), 0.0) > 0 else "-",
                 "delta_qty": format_quantity(-broker_qty),
                 "status": "mismatch",
                 "status_label": "불일치",
@@ -2004,6 +2025,7 @@ def snapshot() -> dict[str, Any]:
         "reconciliation": reconciliation,
         "program_ledger": program_ledger_snapshot(),
         "execution_events": execution_event_snapshot(),
+        "upbit_smoke_order": dict(STATE.get("upbit_smoke_order", {})),
         "execution_calibration": execution_calibration_snapshot(),
         "policy_replays": list(STATE.get("policy_replays", [])),
         "shadow_live": {"brokerSubmissionBlocked": True, "evidence": list(STATE.get("shadow_evidence", []))[:20], "count": len(STATE.get("shadow_evidence", []))},
@@ -2708,6 +2730,233 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
         "execution_events": execution_event_snapshot(),
         "snapshot": snapshot(),
     }
+
+
+UPBIT_SMOKE_MARKET = "KRW-BTC"
+UPBIT_SMOKE_MIN_KRW = 5_000
+UPBIT_SMOKE_MAX_KRW = 10_000
+UPBIT_SMOKE_PREVIEW_TTL_SECONDS = 600
+
+
+def _upbit_smoke_order_view(**updates: Any) -> dict[str, Any]:
+    current = dict(STATE.get("upbit_smoke_order", {}))
+    current.update(updates)
+    STATE["upbit_smoke_order"] = current
+    return current
+
+
+def preview_upbit_smoke_order(notional_krw: object = UPBIT_SMOKE_MIN_KRW) -> dict[str, Any]:
+    amount = int(safe_float(notional_krw, 0.0))
+    if amount < UPBIT_SMOKE_MIN_KRW or amount > UPBIT_SMOKE_MAX_KRW:
+        reason = f"Upbit 점검 주문은 {UPBIT_SMOKE_MIN_KRW:,}~{UPBIT_SMOKE_MAX_KRW:,}원만 허용합니다."
+        _upbit_smoke_order_view(status="blocked", status_label="차단", detail=reason, confirmation_token="")
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    router = LiveBrokerRouter()
+    try:
+        account_snapshot = router.get_account_snapshot("upbit")
+        chance = router.get_upbit_order_chance(UPBIT_SMOKE_MARKET)
+    except (BrokerNotReadyError, RuntimeError) as exc:
+        reason = str(exc)
+        _upbit_smoke_order_view(status="blocked", status_label="조회 실패", detail=reason, confirmation_token="")
+        append_audit("danger", "Upbit 소액 주문 미리보기", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    accounts = account_snapshot.get("accounts", []) if isinstance(account_snapshot, dict) else []
+    krw_account = accounts[0] if isinstance(accounts, list) and accounts and isinstance(accounts[0], dict) else {}
+    available_krw = safe_float(krw_account.get("broker_cash"), 0.0)
+    market_info = chance.get("market") if isinstance(chance.get("market"), dict) else {}
+    bid_rules = market_info.get("bid") if isinstance(market_info.get("bid"), dict) else {}
+    bid_account = chance.get("bid_account") if isinstance(chance.get("bid_account"), dict) else {}
+    chance_balance = safe_float(bid_account.get("balance"), available_krw)
+    if chance_balance > 0:
+        available_krw = min(available_krw, chance_balance) if available_krw > 0 else chance_balance
+    min_total = safe_float(bid_rules.get("min_total"), float(UPBIT_SMOKE_MIN_KRW))
+    max_total = safe_float(bid_rules.get("max_total"), 0.0)
+    bid_fee_rate = safe_float(chance.get("bid_fee"), 0.0)
+    required_krw = amount * (1.0 + max(0.0, bid_fee_rate))
+    blocked_reasons: list[str] = []
+    if min_total > 0 and amount < min_total:
+        blocked_reasons.append(f"거래소 최소 주문 {min_total:,.0f}원 미만")
+    if max_total > 0 and amount > max_total:
+        blocked_reasons.append(f"거래소 최대 주문 {max_total:,.0f}원 초과")
+    if available_krw + 1e-9 < required_krw:
+        blocked_reasons.append(f"수수료 포함 필요 금액 {required_krw:,.0f}원 대비 잔고 부족")
+
+    now = datetime.now(timezone.utc)
+    identifier = f"lt-smoke-{now.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(4)}"
+    order_intent = {
+        "broker_id": "upbit",
+        "market": UPBIT_SMOKE_MARKET,
+        "symbol": UPBIT_SMOKE_MARKET,
+        "side": "BUY",
+        "order_type": "price",
+        "notional": amount,
+        "identifier": identifier,
+    }
+    prepared = build_upbit_order_request(order_intent)
+    if not prepared.can_send:
+        blocked_reasons.append("주문 요청 설정 누락: " + ", ".join(prepared.blocked_reasons))
+    ready = not blocked_reasons
+    confirmation_token = secrets.token_urlsafe(24) if ready else ""
+    expires = now + timedelta(seconds=UPBIT_SMOKE_PREVIEW_TTL_SECONDS)
+    preview = prepared.preview()
+    detail = (
+        f"{UPBIT_SMOKE_MARKET} 시장가 매수 {amount:,}원 · 예상 수수료율 {bid_fee_rate:.4%} · "
+        f"주문 가능 KRW {available_krw:,.0f}원"
+    )
+    if blocked_reasons:
+        detail = " · ".join(blocked_reasons)
+    state_row = _upbit_smoke_order_view(
+        status="ready" if ready else "blocked",
+        status_label="확인 대기" if ready else "차단",
+        market=UPBIT_SMOKE_MARKET,
+        side="BUY",
+        order_type="시장가 매수",
+        notional_krw=amount,
+        available_krw=available_krw,
+        required_krw=required_krw,
+        minimum_krw=min_total,
+        maximum_krw=max_total,
+        fee_rate=bid_fee_rate,
+        identifier=identifier,
+        confirmation_token=confirmation_token,
+        expires_at=expires.isoformat().replace("+00:00", "Z"),
+        expires_epoch=expires.timestamp(),
+        used=False,
+        broker_order_id="",
+        broker_state="",
+        detail=detail,
+        request_preview=preview,
+        blocked_reasons=blocked_reasons,
+    )
+    append_audit(
+        "info" if ready else "danger",
+        "Upbit 소액 주문 미리보기",
+        detail + (" · 실제 주문 전송 없음" if ready else ""),
+    )
+    return {"ok": ready, "reason": detail, "preview": state_row, "snapshot": snapshot()}
+
+
+def submit_upbit_smoke_order(confirmation_token: object, *, confirmed: bool) -> dict[str, Any]:
+    preview = dict(STATE.get("upbit_smoke_order", {}))
+    token = str(confirmation_token or "")
+    if not confirmed or not token or not secrets.compare_digest(token, str(preview.get("confirmation_token") or "")):
+        return {"ok": False, "reason": "정확한 주문 미리보기의 1회 확인 토큰이 필요합니다.", "snapshot": snapshot()}
+    if preview.get("status") != "ready" or bool(preview.get("used")):
+        return {"ok": False, "reason": "이미 사용되었거나 전송 가능한 미리보기가 아닙니다.", "snapshot": snapshot()}
+    if safe_float(preview.get("expires_epoch"), 0.0) <= datetime.now(timezone.utc).timestamp():
+        _upbit_smoke_order_view(status="expired", status_label="만료", confirmation_token="", detail="미리보기가 만료되었습니다. 다시 조회하세요.")
+        return {"ok": False, "reason": "미리보기가 만료되었습니다. 다시 조회하세요.", "snapshot": snapshot()}
+    if STATE.get("kill_switch"):
+        return {"ok": False, "reason": "긴급 차단이 켜져 있어 실제 주문을 전송할 수 없습니다.", "snapshot": snapshot()}
+    if not real_orders_enabled():
+        return {"ok": False, "reason": "LIVE_TRADER_ENABLE_REAL_ORDERS=true가 필요합니다.", "snapshot": snapshot()}
+
+    amount = int(safe_float(preview.get("notional_krw"), 0.0))
+    if amount < UPBIT_SMOKE_MIN_KRW or amount > UPBIT_SMOKE_MAX_KRW:
+        return {"ok": False, "reason": "서버의 소액 주문 하드 한도를 벗어났습니다.", "snapshot": snapshot()}
+
+    router = LiveBrokerRouter()
+    try:
+        fresh_account = router.get_account_snapshot("upbit")
+        accounts = fresh_account.get("accounts", []) if isinstance(fresh_account, dict) else []
+        row = accounts[0] if isinstance(accounts, list) and accounts and isinstance(accounts[0], dict) else {}
+        fresh_cash = safe_float(row.get("broker_cash"), 0.0)
+        required_krw = safe_float(preview.get("required_krw"), float(amount))
+        if fresh_cash + 1e-9 < required_krw:
+            raise BrokerNotReadyError(f"전송 직전 잔고 {fresh_cash:,.0f}원이 필요 금액 {required_krw:,.0f}원보다 적습니다.")
+    except (BrokerNotReadyError, RuntimeError) as exc:
+        reason = str(exc)
+        _upbit_smoke_order_view(status="blocked", status_label="전송 직전 차단", detail=reason, confirmation_token="")
+        append_audit("danger", "Upbit 실제 소액 주문", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    # 네트워크 결과가 불명확해도 같은 identifier로 재전송하지 않도록 전송 직전에 소진 처리합니다.
+    _upbit_smoke_order_view(status="submitting", status_label="전송 중", used=True, confirmation_token="")
+    intent = {
+        "broker_id": "upbit",
+        "market": str(preview.get("market") or UPBIT_SMOKE_MARKET),
+        "symbol": str(preview.get("market") or UPBIT_SMOKE_MARKET),
+        "side": "BUY",
+        "order_type": "price",
+        "notional": amount,
+        "identifier": str(preview.get("identifier") or ""),
+    }
+    response = router.place_order(intent)
+    payload = response.get("json") if isinstance(response.get("json"), dict) else {}
+    if not bool(response.get("ok")):
+        safe_error = str(payload.get("error") or response.get("text") or "Upbit 주문 요청 실패")[:500]
+        _upbit_smoke_order_view(status="rejected", status_label="거절", detail=safe_error, broker_response=payload)
+        append_audit("danger", "Upbit 실제 소액 주문", f"거래소 거절 · {safe_error}")
+        return {"ok": False, "reason": safe_error, "response": payload, "snapshot": snapshot()}
+
+    order_uuid = str(payload.get("uuid") or "").strip()
+    broker_state = str(payload.get("state") or "wait").strip().lower()
+    order_detail = payload
+    if order_uuid:
+        try:
+            order_detail = router.get_upbit_order(order_uuid)
+            broker_state = str(order_detail.get("state") or broker_state).strip().lower()
+        except (BrokerNotReadyError, RuntimeError):
+            pass
+    trades = order_detail.get("trades") if isinstance(order_detail.get("trades"), list) else []
+    executed_volume = sum(safe_float(item.get("volume"), 0.0) for item in trades if isinstance(item, dict))
+    executed_funds = sum(safe_float(item.get("funds"), 0.0) for item in trades if isinstance(item, dict))
+    paid_fee = safe_float(order_detail.get("paid_fee"), 0.0)
+    filled_after_cancel = broker_state == "cancel" and executed_funds > 0
+    final_status = "filled" if broker_state == "done" or filled_after_cancel else "acknowledged"
+    detail = (
+        f"Upbit 주문 접수 {order_uuid or '-'} · 상태 {broker_state or '-'} · "
+        f"체결금액 {executed_funds:,.0f}원 · 수수료 {paid_fee:,.2f}원"
+    )
+    _upbit_smoke_order_view(
+        status=final_status,
+        status_label="체결·잔여취소" if filled_after_cancel else "체결" if final_status == "filled" else "접수",
+        broker_order_id=order_uuid,
+        broker_state=broker_state,
+        executed_volume=executed_volume,
+        executed_funds=executed_funds,
+        paid_fee=paid_fee,
+        detail=detail,
+        broker_response=order_detail,
+    )
+    append_audit("info", "Upbit 실제 소액 주문", detail)
+    poll_execution_events("upbit")
+    run_reconciliation()
+    return {"ok": True, "reason": detail, "order": dict(STATE["upbit_smoke_order"]), "snapshot": snapshot()}
+
+
+def refresh_upbit_smoke_order() -> dict[str, Any]:
+    current = dict(STATE.get("upbit_smoke_order", {}))
+    order_uuid = str(current.get("broker_order_id") or "").strip()
+    if not order_uuid:
+        return {"ok": False, "reason": "조회할 Upbit 주문 UUID가 없습니다.", "snapshot": snapshot()}
+    try:
+        detail = LiveBrokerRouter().get_upbit_order(order_uuid)
+    except (BrokerNotReadyError, RuntimeError) as exc:
+        return {"ok": False, "reason": str(exc), "snapshot": snapshot()}
+    broker_state = str(detail.get("state") or "").strip().lower()
+    trades = detail.get("trades") if isinstance(detail.get("trades"), list) else []
+    executed_volume = sum(safe_float(item.get("volume"), 0.0) for item in trades if isinstance(item, dict))
+    executed_funds = sum(safe_float(item.get("funds"), 0.0) for item in trades if isinstance(item, dict))
+    paid_fee = safe_float(detail.get("paid_fee"), 0.0)
+    filled_after_cancel = broker_state == "cancel" and executed_funds > 0
+    final_status = "filled" if broker_state == "done" or filled_after_cancel else "acknowledged"
+    detail_text = f"Upbit 주문 {order_uuid} · 상태 {broker_state or '-'} · 체결금액 {executed_funds:,.0f}원 · 수수료 {paid_fee:,.2f}원"
+    _upbit_smoke_order_view(
+        status=final_status,
+        status_label="체결·잔여취소" if filled_after_cancel else "체결" if final_status == "filled" else "접수",
+        broker_state=broker_state,
+        executed_volume=executed_volume,
+        executed_funds=executed_funds,
+        paid_fee=paid_fee,
+        detail=detail_text,
+        broker_response=detail,
+    )
+    poll_execution_events("upbit")
+    run_reconciliation()
+    return {"ok": True, "reason": detail_text, "order": dict(STATE["upbit_smoke_order"]), "snapshot": snapshot()}
 
 
 def run_reconciliation() -> dict[str, Any]:

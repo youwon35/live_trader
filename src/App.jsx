@@ -40,6 +40,9 @@ import {
   getSnapshot,
   getUiSettings,
   runFinalPreflight,
+  previewUpbitSmokeOrder,
+  submitUpbitSmokeOrder,
+  refreshUpbitSmokeOrder,
   runReconciliation,
   runStrategyCycle,
   runWatchdog,
@@ -61,6 +64,7 @@ import {
   runRecoveryDrill,
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
+import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
 import { createGuidedFlow, readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
 import {
@@ -78,6 +82,7 @@ import {
 import designTokens from "../../../packages/design/design_tokens.json";
 
 const ActionButton = createActionButton(React);
+const BrokerAccountWorkspace = createBrokerAccountWorkspace(React);
 const GuidedFlow = createGuidedFlow(React);
 const StatusPill = createStatusPill(React);
 const EmptyState = createEmptyState(React);
@@ -194,6 +199,13 @@ const fallbackSnapshot = {
     execution_event_count: 0,
   },
   execution_events: { last_poll: null, errors: [], event_count: 0, recorded_count: 0, recent: [] },
+  upbit_smoke_order: {
+    status: "idle",
+    status_label: "미리보기 필요",
+    market: "KRW-BTC",
+    notional_krw: 5000,
+    detail: "실제 주문 전 주문 가능 정보와 원화 잔고를 먼저 조회합니다.",
+  },
   execution_calibration: { status: "review", sampleCount: 0, meanAbsoluteModelErrorBps: null, p95AbsoluteSlippageBps: null },
   operation_report: { generated_at: "-", sections: [] },
   final_preflight: [],
@@ -1104,6 +1116,30 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (selectedNav !== "overview" || snapshot.api_connected !== true) return undefined;
+    let stopped = false;
+    let running = false;
+    const refreshBrokerAccounts = async () => {
+      if (stopped || running) return;
+      running = true;
+      try {
+        await syncExecutionEvents("all");
+        const result = await runReconciliation();
+        if (!stopped && result?.snapshot) setSnapshot({ ...result.snapshot, api_connected: true });
+      } catch {
+        // Background account refresh stays quiet; the normal snapshot poll keeps connection status visible.
+      } finally {
+        running = false;
+      }
+    };
+    const timer = window.setInterval(refreshBrokerAccounts, 10000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [selectedNav, snapshot.api_connected]);
+
+  useEffect(() => {
     applyAppearance(appearance);
   }, [appearance]);
 
@@ -1468,6 +1504,18 @@ function App() {
             confirmSafetyChange("현재 브로커 잔고와 포지션을 프로그램 원장의 새 기준으로 저장하시겠습니까? 기존 기준이 바뀝니다.", () => seedProgramLedgerBaseline(true))
           }
           onExecutionEvents={(brokerId) => runAction(() => syncExecutionEvents(brokerId))}
+          onAccountRefresh={() => runAction(async () => {
+            await syncExecutionEvents("all");
+            return runReconciliation();
+          })}
+          onUpbitPreview={() => runAction(() => previewUpbitSmokeOrder(5000))}
+          onUpbitSubmit={(token) =>
+            confirmSafetyChange(
+              "실제 금융 거래입니다. Upbit KRW-BTC를 시장가로 5,000원 매수합니다. 수수료와 시장가 슬리피지가 발생할 수 있습니다. 전송하시겠습니까?",
+              () => submitUpbitSmokeOrder(token, true),
+            )
+          }
+          onUpbitRefresh={() => runAction(refreshUpbitSmokeOrder)}
           onEnvSettings={(values, confirmed) => runAction(() => saveEnvSettings(values, confirmed))}
           appearance={appearance}
           updateAppearance={updateAppearance}
@@ -1547,6 +1595,10 @@ function WorkspaceContent({
   onPreflight,
   onProgramLedgerBaseline,
   onExecutionEvents,
+  onAccountRefresh,
+  onUpbitPreview,
+  onUpbitSubmit,
+  onUpbitRefresh,
   onEnvSettings,
   appearance,
   updateAppearance,
@@ -1673,7 +1725,20 @@ function WorkspaceContent({
           onProgramLedgerBaseline={onProgramLedgerBaseline}
           onExecutionEvents={onExecutionEvents}
         />
-        {(snapshot.accounts ?? []).length > 0 && <AccountReconciliationPanel accounts={snapshot.accounts} />}
+        <UpbitSmokeOrderPanel
+          apiConnected={snapshot.api_connected === true}
+          order={snapshot.upbit_smoke_order}
+          onPreview={onUpbitPreview}
+          onSubmit={onUpbitSubmit}
+          onRefresh={onUpbitRefresh}
+        />
+        <UnifiedBrokerAccountPanel
+          accounts={snapshot.accounts ?? []}
+          executionEvents={snapshot.execution_events}
+          onRefresh={onAccountRefresh}
+          positions={snapshot.positions ?? []}
+          refreshDisabled={snapshot.api_connected !== true}
+        />
       </div>
     </section>,
   );
@@ -3331,6 +3396,107 @@ function ReconciliationSummaryPanel({ apiConnected, reconciliation, programLedge
         {events.errors?.length ? <span>이벤트 어댑터 확인 필요 {events.errors.length}건</span> : null}
       </div>
     </section>
+  );
+}
+
+function UpbitSmokeOrderPanel({ apiConnected, order, onPreview, onSubmit, onRefresh }) {
+  const item = order ?? fallbackSnapshot.upbit_smoke_order;
+  const ready = item.status === "ready" && Boolean(item.confirmation_token) && !item.used;
+  const submitted = ["acknowledged", "filled"].includes(item.status) && Boolean(item.broker_order_id);
+  const tone = item.status === "filled"
+    ? "success"
+    : item.status === "ready" || item.status === "acknowledged"
+      ? "warning"
+      : item.status === "blocked" || item.status === "rejected"
+        ? "danger"
+        : "info";
+  return (
+    <section className="panel upbit-smoke-panel">
+      <PanelHeader
+        title="Upbit 실제 주문 1회 점검"
+        subtitle="알고리즘 승급과 별개인 브로커 연결 점검입니다. 서버 하드 한도는 10,000원입니다."
+      />
+      <div className="panel-action-line">
+        <StatusPill tone={tone}>{item.status_label ?? "미리보기 필요"}</StatusPill>
+        <button className="mini-button" type="button" disabled={!apiConnected} onClick={onPreview}>
+          <Search size={14} />
+          5,000원 미리보기
+        </button>
+        <button
+          className="mini-button danger"
+          type="button"
+          disabled={!apiConnected || !ready}
+          onClick={() => onSubmit(item.confirmation_token)}
+        >
+          <WalletCards size={14} />
+          실제 5,000원 매수
+        </button>
+        <button className="mini-button" type="button" disabled={!apiConnected || !submitted} onClick={onRefresh}>
+          <RefreshCcw size={14} />
+          주문·체결 조회
+        </button>
+      </div>
+      <MetricGrid className="metric-grid upbit-smoke-metrics">
+        <MetricCard label="마켓" value={item.market ?? "KRW-BTC"} detail="시장가 매수" tone="info" />
+        <MetricCard label="주문 총액" value={`${Number(item.notional_krw ?? 5000).toLocaleString("ko-KR")}원`} detail="실제 자산 영향" tone="warning" />
+        <MetricCard label="주문 가능 KRW" value={item.available_krw == null ? "조회 전" : `${Number(item.available_krw).toLocaleString("ko-KR")}원`} detail="전송 직전 재확인" tone={item.available_krw >= 5000 ? "success" : "warning"} />
+        <MetricCard label="체결 금액" value={`${Number(item.executed_funds ?? 0).toLocaleString("ko-KR")}원`} detail={`수수료 ${Number(item.paid_fee ?? 0).toLocaleString("ko-KR")}원`} tone={item.status === "filled" ? "success" : "info"} />
+      </MetricGrid>
+      <div className="upbit-smoke-detail">
+        <strong>{item.detail ?? "미리보기를 실행하세요."}</strong>
+        {item.broker_order_id ? <span>Upbit 주문 UUID: {item.broker_order_id}</span> : null}
+        <span>이 기능은 거래소 주문 통신을 검증하며, 승급된 KRW-BTC 전략의 자동매매 검증을 대신하지 않습니다.</span>
+      </div>
+    </section>
+  );
+}
+
+function numericDisplayValue(value) {
+  const parsed = Number(String(value ?? "").replaceAll(",", "").replace(/[^0-9.+-]/g, ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function UnifiedBrokerAccountPanel({ accounts, executionEvents, onRefresh, positions, refreshDisabled }) {
+  const accountRows = accounts.map((account) => ({
+    id: account.broker_id,
+    provider: account.broker_id,
+    providerLabel: account.broker_name,
+    accountLabel: `${account.account} · ${account.currency}`,
+    balance: account.broker_cash,
+    available: account.broker_cash,
+    total: account.broker_cash,
+    detail: account.detail,
+    statusLabel: account.status_label,
+    tone: statusTone(account.status),
+  }));
+  const positionRows = positions
+    .filter((position) => numericDisplayValue(position.broker_qty) > 0 || numericDisplayValue(position.program_qty) > 0)
+    .map((position) => ({
+      id: `${position.broker_id}:${position.symbol}`,
+      provider: position.broker_id,
+      providerLabel: position.broker_name,
+      symbol: position.symbol,
+      name: position.asset,
+      quantity: position.broker_qty,
+      averagePrice: position.average_price_display || "조회 정보 없음",
+      currentPrice: position.current_price_display || "조회 정보 없음",
+      evaluation: position.broker_value_display || "평가 대기",
+      profitLoss: position.status === "pass" ? "원장 일치" : `대조 Δ ${position.delta_qty}`,
+      profitLossTone: position.status === "pass" ? "success" : "danger",
+    }));
+  return (
+    <BrokerAccountWorkspace
+      accounts={accountRows}
+      autoRefreshLabel="10초 자동 갱신"
+      className="live-unified-account-panel"
+      emptyMessage="KIS·Binance·Upbit에 현재 보유 포지션이 없습니다."
+      onRefresh={onRefresh}
+      positions={positionRows}
+      refreshDisabled={refreshDisabled}
+      subtitle="KIS·Binance·Upbit의 실제 계좌 잔고와 보유 포지션을 같은 형식으로 표시합니다."
+      title="내 계좌·보유 포지션"
+      updatedAt={executionEvents?.last_poll ?? "미조회"}
+    />
   );
 }
 

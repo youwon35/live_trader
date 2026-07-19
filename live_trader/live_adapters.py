@@ -33,6 +33,8 @@ BINANCE_ACCOUNT_ENDPOINT = "/api/v3/account"
 UPBIT_BASE_URL = "https://api.upbit.com"
 UPBIT_ORDER_ENDPOINT = "/v1/orders"
 UPBIT_ACCOUNTS_ENDPOINT = "/v1/accounts"
+UPBIT_ORDER_CHANCE_ENDPOINT = "/v1/orders/chance"
+UPBIT_ORDER_DETAIL_ENDPOINT = "/v1/order"
 
 _KIS_TOKEN_CACHE: dict[str, object] = {"key": "", "token": "", "expires_at": 0.0}
 _KIS_TOKEN_LOCK = threading.Lock()
@@ -262,6 +264,54 @@ def build_upbit_accounts_request() -> PreparedRequest:
     )
 
 
+def build_upbit_order_chance_request(market: str) -> PreparedRequest:
+    blocked = missing_env("UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY")
+    access_key = env_value("UPBIT_ACCESS_KEY")
+    secret_key = env_value("UPBIT_SECRET_KEY")
+    base_url = env_value("UPBIT_BASE_URL") or UPBIT_BASE_URL
+    normalized_market = str(market or "").strip().upper()
+    query = {"market": normalized_market}
+    if not normalized_market:
+        blocked.append("market")
+    authorization = build_upbit_authorization(access_key, secret_key, query) if access_key and secret_key else ""
+    encoded = urllib.parse.urlencode(query)
+    return PreparedRequest(
+        provider="upbit",
+        method="GET",
+        url=f"{base_url.rstrip('/')}{UPBIT_ORDER_CHANCE_ENDPOINT}?{encoded}",
+        endpoint=UPBIT_ORDER_CHANCE_ENDPOINT,
+        headers={"Authorization": authorization},
+        safe_headers={"authorization_configured": bool(authorization)},
+        body=None,
+        query=query,
+        blocked_reasons=blocked,
+    )
+
+
+def build_upbit_order_detail_request(order_uuid: str) -> PreparedRequest:
+    blocked = missing_env("UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY")
+    access_key = env_value("UPBIT_ACCESS_KEY")
+    secret_key = env_value("UPBIT_SECRET_KEY")
+    base_url = env_value("UPBIT_BASE_URL") or UPBIT_BASE_URL
+    normalized_uuid = str(order_uuid or "").strip()
+    query = {"uuid": normalized_uuid}
+    if not normalized_uuid:
+        blocked.append("uuid")
+    authorization = build_upbit_authorization(access_key, secret_key, query) if access_key and secret_key else ""
+    encoded = urllib.parse.urlencode(query)
+    return PreparedRequest(
+        provider="upbit",
+        method="GET",
+        url=f"{base_url.rstrip('/')}{UPBIT_ORDER_DETAIL_ENDPOINT}?{encoded}",
+        endpoint=UPBIT_ORDER_DETAIL_ENDPOINT,
+        headers={"Authorization": authorization},
+        safe_headers={"authorization_configured": bool(authorization)},
+        body=None,
+        query=query,
+        blocked_reasons=blocked,
+    )
+
+
 def build_binance_spot_order_request(intent: dict[str, object], *, test: bool = False) -> PreparedRequest:
     blocked = missing_env("BINANCE_API_KEY", "BINANCE_API_SECRET")
     api_key = env_value("BINANCE_API_KEY")
@@ -309,6 +359,9 @@ def build_upbit_order_request(intent: dict[str, object]) -> PreparedRequest:
     side = "bid" if normalize_side(intent.get("side")) == "BUY" else "ask"
     ord_type = str(intent.get("order_type") or "limit").strip().lower()
     body: dict[str, object] = {"market": market, "side": side, "ord_type": ord_type}
+    identifier = str(intent.get("identifier") or "").strip()
+    if identifier:
+        body["identifier"] = identifier
     if ord_type == "price":
         body["price"] = normalize_decimal_text(intent.get("price") or intent.get("notional") or 0)
     else:

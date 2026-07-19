@@ -1176,6 +1176,7 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(result["broker_id"], "upbit")
         self.assertEqual(result["accounts"][0]["broker_cash"], 105000.0)
         self.assertEqual(result["positions"][0]["symbol"], "KRW-BTC")
+        self.assertEqual(result["positions"][0]["currency"], "KRW")
         self.assertEqual(result["positions"][0]["broker_value"], 960000.0)
         self.assertTrue(any(event["state"] == "account_snapshot" for event in result["events"]))
         self.assertTrue(

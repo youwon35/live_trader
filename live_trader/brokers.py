@@ -11,6 +11,8 @@ from .live_adapters import (
     build_kis_domestic_balance_request,
     build_kis_live_order_request,
     build_upbit_accounts_request,
+    build_upbit_order_chance_request,
+    build_upbit_order_detail_request,
     build_upbit_order_request,
     issue_kis_access_token,
     send_prepared_request,
@@ -353,6 +355,8 @@ def parse_kis_positions(payload: object) -> list[dict[str, object]]:
                 "currency": "KRW",
                 "broker_qty": qty,
                 "broker_value": first_numeric(row, "evlu_amt", "pchs_amt", "pchs_avg_pric", default=0.0),
+                "average_price": first_numeric(row, "pchs_avg_pric", "avg_pric", default=0.0),
+                "current_price": first_numeric(row, "prpr", "stck_prpr", default=0.0),
                 "detail": first_text(row, "prdt_name", "prdt_name1", default="KIS 보유 종목"),
             }
         )
@@ -451,6 +455,8 @@ def parse_binance_positions(payload: object) -> list[dict[str, object]]:
                 "currency": asset,
                 "broker_qty": qty,
                 "broker_value": 0.0,
+                "average_price": 0.0,
+                "current_price": 0.0,
                 "detail": "Binance spot balance입니다.",
             }
         )
@@ -490,9 +496,13 @@ def parse_upbit_positions(payload: object) -> list[dict[str, object]]:
                 "asset": "코인",
                 "broker_id": "upbit",
                 "broker_name": "Upbit API",
-                "currency": currency,
+                # Upbit's average buy price and evaluated value are denominated
+                # in unit_currency (normally KRW), not in the held asset.
+                "currency": unit,
                 "broker_qty": qty,
                 "broker_value": first_numeric(row, "avg_buy_price") * qty,
+                "average_price": first_numeric(row, "avg_buy_price"),
+                "current_price": 0.0,
                 "detail": "Upbit 보유 자산입니다.",
             }
         )
@@ -549,6 +559,24 @@ class LiveBrokerRouter:
         if broker_id == "upbit":
             return send_prepared_request(build_upbit_order_request(intent))
         raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
+
+    def get_upbit_order_chance(self, market: str) -> dict[str, object]:
+        payload = ensure_response_ok(
+            "upbit",
+            send_prepared_request(build_upbit_order_chance_request(market)),
+        )
+        if not isinstance(payload, dict):
+            raise BrokerNotReadyError("Upbit 주문 가능 정보 응답 형식이 올바르지 않습니다.")
+        return payload
+
+    def get_upbit_order(self, order_uuid: str) -> dict[str, object]:
+        payload = ensure_response_ok(
+            "upbit",
+            send_prepared_request(build_upbit_order_detail_request(order_uuid)),
+        )
+        if not isinstance(payload, dict):
+            raise BrokerNotReadyError("Upbit 개별 주문 응답 형식이 올바르지 않습니다.")
+        return payload
 
     def cancel_order(self, broker_id: str, broker_order_id: str) -> dict[str, object]:
         _ = (broker_id, broker_order_id)

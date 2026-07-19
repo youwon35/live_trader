@@ -70,6 +70,21 @@ export async function runFinalPreflight() {
   return request("/api/preflight", { method: "POST", body: {} });
 }
 
+export async function previewUpbitSmokeOrder(notionalKrw = 5000) {
+  return request("/api/upbit-smoke-preview", { method: "POST", body: { notional_krw: notionalKrw } });
+}
+
+export async function submitUpbitSmokeOrder(confirmationToken, confirmed = false) {
+  return request("/api/upbit-smoke-submit", {
+    method: "POST",
+    body: { confirmation_token: confirmationToken, confirmed },
+  });
+}
+
+export async function refreshUpbitSmokeOrder() {
+  return request("/api/upbit-smoke-refresh", { method: "POST", body: {} });
+}
+
 export async function exportAudit(format) {
   return request("/api/audit-export", { method: "POST", body: { format } });
 }
