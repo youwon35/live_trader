@@ -625,10 +625,16 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         (item for item in policy_profiles if isinstance(item, dict) and str(item.get("strategyInstanceId") or "") == instance_id),
         None,
     )
-    target_weight = safe_float(
+    configured_target_weight = safe_float(
         (policy_allocation or {}).get("targetWeight") if isinstance(policy_allocation, dict) else ((matching_target or {}).get("targetWeight") if isinstance(matching_target, dict) else None),
         safe_float(allocation.get("scoreTargetWeight"), safe_float(allocation.get("normalizedWeight"), 0.0)),
     )
+    position_size_fraction = safe_float(
+        (policy_allocation or {}).get("positionSizeFraction") if isinstance(policy_allocation, dict) else None,
+        safe_float((matching_instance or {}).get("positionSizeFraction"), 1.0),
+    )
+    position_size_fraction = max(0.0, min(1.0, position_size_fraction))
+    target_weight = configured_target_weight * position_size_fraction
     policy_target_weight = target_weight
     target_weight *= capital_multiplier
     capacity_entries = advanced_operations.get("capacity") if isinstance(advanced_operations.get("capacity"), list) else []
@@ -684,7 +690,10 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
                 "strategy": str(item.get("strategyInstanceId") or ""),
             }
             if level != "order" and (key == "*" or values.get(level) == key):
-                total += abs(safe_float(item.get("targetWeight"), 0.0))
+                total += abs(
+                    safe_float(item.get("targetWeight"), 0.0)
+                    * max(0.0, min(1.0, safe_float(item.get("positionSizeFraction"), 1.0)))
+                )
         if level != "order" and total > maximum + 1e-12:
             policy_limit_blockers.append(f"{level}:{key}:exposure-limit")
     blockers.extend(policy_limit_blockers)
@@ -700,6 +709,8 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         "requiredLifecycleStatus": required_status,
         "targetWeight": target_weight,
         "policyTargetWeight": policy_target_weight,
+        "configuredTargetWeight": configured_target_weight,
+        "positionSizeFraction": position_size_fraction,
         "maxSymbolWeightPct": effective_symbol_limit,
         "maxStrategyWeightPct": max_strategy_weight,
         "strategyCapitalRatio": min(target_weight, max_strategy_weight / 100 if max_strategy_weight > 0 else target_weight),

@@ -301,6 +301,47 @@ class OrderGateTest(unittest.TestCase):
         )
         self.assertTrue("전략별 자본 한도" in reason or "종목별 최대 비중" in reason)
 
+    def test_portfolio_gate_applies_strategy_instance_position_size_fraction(self) -> None:
+        state.STATE["mode"] = "SMALL_LIVE"
+        portfolio = {
+            "id": "sized-portfolio",
+            "name": "Sized Portfolio",
+            "lifecycle_status": "before-live-small",
+            "permissions": {"live_small_allowed": True},
+            "strategy_instances": [
+                {
+                    "strategyId": "STRAT-1",
+                    "symbol": "069500.KS",
+                    "instanceId": "instance-1",
+                    "positionSizeFraction": 0.2,
+                }
+            ],
+            "target_portfolio": [{"strategyId": "STRAT-1", "symbol": "069500.KS", "targetWeight": 0.6}],
+            "risk_policy": {"maxSingleSymbolWeight": 1.0, "maxStrategyWeight": 1.0},
+            "risk_checks": [],
+            "portfolio_policy": {
+                "allocations": [
+                    {
+                        "strategyInstanceId": "instance-1",
+                        "targetWeight": 0.6,
+                        "positionSizeFraction": 0.2,
+                    }
+                ]
+            },
+        }
+
+        gate = state.portfolio_gate_for_strategy(
+            {"strategy_id": "STRAT-1", "symbol": "069500.KS"},
+            [portfolio],
+            mode="SMALL_LIVE",
+        )
+
+        self.assertTrue(gate["allowed"])
+        self.assertAlmostEqual(gate["configuredTargetWeight"], 0.6)
+        self.assertAlmostEqual(gate["positionSizeFraction"], 0.2)
+        self.assertAlmostEqual(gate["policyTargetWeight"], 0.12)
+        self.assertAlmostEqual(gate["targetWeight"], 0.12)
+
     def test_portfolio_policy_requires_complete_economic_rebalance_inputs(self) -> None:
         state.STATE["mode"] = "SMALL_LIVE"
         portfolio = {

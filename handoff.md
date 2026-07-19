@@ -867,3 +867,14 @@ API 없이 실제 실행한 기능:
 - Python unittest 81개, frontend/desktop-scale/PyInstaller 빌드를 통과했다.
 
 다음 실제 알고리즘 검증은 승급된 `KRW-BTC` 전략이 준비된 뒤 신호→비중계산→주문→체결→원장 대조 전체 경로로 수행한다. 이번 소액 주문은 거래소 커넥터 검증이며 알고리즘 전략 검증을 대신하지 않는다.
+
+## 2026-07-20 새 Portfolio Live 차단 검증과 노출 계약 수정
+
+- 새 Portfolio `portfolio-20260720-kodex-btc-robust-v1`과 두 Strategy Instance를 Live Trader가 읽는 것을 확인했다. KODEX는 `Shadowed`, BTCUSDT는 `Papered`지만 둘 다 `LIVE BLOCKED / PORT BLOCK`이다.
+- Live Portfolio gate도 Backtester/Paper와 동일하게 `targetWeight × positionSizeFraction`을 사용하도록 수정했다. KODEX는 60%×0.2=12%, BTC는 40%×0.00001=0.0004%가 실효 목표다.
+- 새 후보는 lifecycle `backtested`, `live_export_allowed=false`, `portfolio-candidate-not-approved`, `failed-stage:parameter_surface`, `failed-stage:cross_market`로 정확히 차단된다.
+- DryRun 전략 사이클은 `crypto 프로필에 live_small_eligible/live_eligible 전략이 없습니다`로 종료됐고 주문 큐 0건을 유지했다. 계좌 읽기 전용 상태는 KIS 100,346원, Upbit 44,999원, Binance 0.0763 USDT 및 BTC 0.00000451이며 불일치 0건이다.
+- 최종 Preflight는 hard stop 5개를 유지한다. 실거래 route OFF, MONITOR, Dry Run ON, 신규 진입 차단 ON 상태이며 실제 주문은 전송하지 않았다.
+- Python 82 tests, frontend build, 100/125/150% desktop scale, PyInstaller, 12-view UI smoke가 통과했다. 최신 EXE는 `release\LiveTrader.exe`다.
+
+다음 단계는 새 불변 전략/Portfolio가 전문 연구 게이트와 Paper Portfolio Evidence를 모두 통과한 뒤에만 before-live-small 승급을 재검증하는 것이다. 현재 후보의 차단을 우회하지 않는다.
