@@ -3,10 +3,16 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from live_trader.desktop import _should_open_browser_fallback
+from live_trader.desktop import _default_window_state, _should_open_browser_fallback
 
 
 class DesktopLifecycleTests(unittest.TestCase):
+    def test_default_window_state_targets_right_monitor(self) -> None:
+        self.assertEqual(
+            _default_window_state(),
+            {"width": 1360, "height": 820, "x": 3840, "y": 0},
+        )
+
     def test_uses_browser_when_native_window_fails_before_start(self) -> None:
         self.assertTrue(_should_open_browser_fallback(None, False, False))
 

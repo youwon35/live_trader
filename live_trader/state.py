@@ -68,6 +68,7 @@ from .contracts import (
     strategy_revalidation_status,
 )
 from .audit_store import SQLiteAuditEventStore
+from .env_loader import default_runtime_data_root
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
@@ -283,10 +284,12 @@ ACCOUNT_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
 
 FINAL_ORDER_STATES = {"dry_run", "sent", "filled", "canceled", "retry_exhausted"}
 AUDIT_LOG_LIMIT = 500
-APP_ROOT = Path(__file__).resolve().parents[1]
-AUDIT_DB_PATH = Path(os.environ.get("LIVE_TRADER_AUDIT_DB") or APP_ROOT / "logs" / "live_trader_audit.sqlite3")
+APP_DATA_ROOT = default_runtime_data_root()
+AUDIT_DB_PATH = Path(os.environ.get("LIVE_TRADER_AUDIT_DB") or APP_DATA_ROOT / "logs" / "live_trader_audit.sqlite3")
 AUDIT_STORE = SQLiteAuditEventStore(AUDIT_DB_PATH)
-PROGRAM_LEDGER_PATH = Path(os.environ.get("LIVE_TRADER_PROGRAM_LEDGER_DB") or APP_ROOT / "logs" / "live_trader_program_ledger.sqlite3")
+PROGRAM_LEDGER_PATH = Path(
+    os.environ.get("LIVE_TRADER_PROGRAM_LEDGER_DB") or APP_DATA_ROOT / "logs" / "live_trader_program_ledger.sqlite3"
+)
 PROGRAM_LEDGER = ProgramLedger(PROGRAM_LEDGER_PATH)
 LIVE_OMS = OrderManagementSystem()
 DEFAULT_WATCHDOG_SETTINGS: dict[str, float] = {
@@ -344,6 +347,8 @@ STATE: dict[str, Any] = {
         "accounts": [],
         "positions": [],
         "errors": [],
+        "successful_account_brokers": [],
+        "successful_position_brokers": [],
     },
     "program_ledger": {
         "last_baseline": None,
@@ -380,7 +385,7 @@ STATE: dict[str, Any] = {
     ],
 }
 
-RUNTIME_RECOVERY_ROOT = Path(os.getenv("LIVE_TRADER_RECOVERY_DIR") or (Path(__file__).resolve().parents[1] / "logs" / "recovery-journal"))
+RUNTIME_RECOVERY_ROOT = Path(os.getenv("LIVE_TRADER_RECOVERY_DIR") or APP_DATA_ROOT / "logs" / "recovery-journal")
 RECOVERY_JOURNAL = RecoveryJournal(RUNTIME_RECOVERY_ROOT)
 SHADOW_ENGINE = ShadowLiveEngine()
 LIVE_MULTI_COORDINATOR = MultiStrategySleeveCoordinator(conflict_policy="net")
@@ -1238,6 +1243,11 @@ def execution_event_snapshot() -> dict[str, Any]:
     }
 
 
+def successful_position_brokers() -> set[str]:
+    rows = STATE.get("broker_reconciliation", {}).get("successful_position_brokers", [])
+    return {str(item) for item in rows} if isinstance(rows, list) else set()
+
+
 def execution_calibration_snapshot() -> dict[str, Any]:
     samples = []
     for evidence in STATE.get("shadow_evidence", []):
@@ -1261,18 +1271,25 @@ def positions() -> list[dict[str, str]]:
     broker_rows = live_position_rows()
     ledger_rows = program_position_rows()
     errors = broker_reconciliation_errors()
+    successful_brokers = successful_position_brokers()
     for item in POSITION_RECONCILIATION_BOOK:
         key = (str(item["broker_id"]), str(item["symbol"]))
         broker_row = broker_rows.pop(key, None)
         ledger_row = ledger_rows.pop(key, None)
         broker_qty = broker_row.get("broker_qty") if broker_row else item["broker_qty"]
+        broker_id = str(item["broker_id"])
+        has_complete_zero_snapshot = broker_id in successful_brokers and not (
+            broker_id == "kis" and str(item["currency"]).upper() != "KRW"
+        )
+        if broker_qty is None and has_complete_zero_snapshot:
+            broker_qty = 0.0
         program_qty = float(ledger_row["quantity"] if ledger_row else item["program_qty"])
         tolerance_qty = float(item["tolerance_qty"])
         if broker_qty is None:
             status = "api_required"
             status_label = "API 필요"
             delta_qty = "-"
-            detail = errors.get(str(item["broker_id"]), "브로커 포지션 조회 결과가 아직 없습니다.")
+            detail = errors.get(broker_id, "브로커 포지션 조회 결과가 아직 없습니다.")
         else:
             numeric_broker_qty = float(broker_qty)
             delta = program_qty - numeric_broker_qty
@@ -1304,6 +1321,8 @@ def positions() -> list[dict[str, str]]:
     for key, ledger_row in sorted(ledger_rows.items()):
         broker_row = broker_rows.pop(key, None)
         broker_qty = broker_row.get("broker_qty") if broker_row else None
+        if broker_qty is None and str(ledger_row.get("broker_id")) in successful_brokers:
+            broker_qty = 0.0
         program_qty = float(ledger_row.get("quantity") or 0.0)
         if broker_qty is None:
             status = "api_required"
@@ -2544,6 +2563,8 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
         "accounts": [],
         "positions": [],
         "errors": [],
+        "successful_account_brokers": [],
+        "successful_position_brokers": [],
     }
     for broker_id in ("kis", "binance", "upbit"):
         try:
@@ -2551,6 +2572,7 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
             accounts = account_snapshot.get("accounts", []) if isinstance(account_snapshot, dict) else []
             if isinstance(accounts, list):
                 data["accounts"].extend(accounts)
+                data["successful_account_brokers"].append(broker_id)
         except (BrokerNotReadyError, RuntimeError) as exc:
             data["errors"].append({"broker_id": broker_id, "scope": "account", "detail": str(exc)})
 
@@ -2558,6 +2580,7 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
             positions_snapshot = router.list_positions(broker_id)
             if isinstance(positions_snapshot, list):
                 data["positions"].extend(positions_snapshot)
+                data["successful_position_brokers"].append(broker_id)
         except (BrokerNotReadyError, RuntimeError) as exc:
             data["errors"].append({"broker_id": broker_id, "scope": "positions", "detail": str(exc)})
     STATE["broker_reconciliation"] = data

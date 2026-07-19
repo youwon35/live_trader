@@ -5,11 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from .env_loader import default_env_path
 from .live_adapters import BINANCE_BASE_URL, KIS_LIVE_BASE_URL, UPBIT_BASE_URL
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ENV_PATH = ROOT / ".env"
+ENV_PATH = default_env_path()
 SettingKind = Literal["text", "secret", "bool"]
 
 

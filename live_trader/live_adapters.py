@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -32,6 +33,9 @@ BINANCE_ACCOUNT_ENDPOINT = "/api/v3/account"
 UPBIT_BASE_URL = "https://api.upbit.com"
 UPBIT_ORDER_ENDPOINT = "/v1/orders"
 UPBIT_ACCOUNTS_ENDPOINT = "/v1/accounts"
+
+_KIS_TOKEN_CACHE: dict[str, object] = {"key": "", "token": "", "expires_at": 0.0}
+_KIS_TOKEN_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -331,22 +335,49 @@ def issue_kis_access_token(*, timeout_seconds: float = 10.0) -> str:
     missing = missing_env("KIS_APP_KEY", "KIS_APP_SECRET")
     if missing:
         raise RuntimeError(f"KIS token settings missing: {', '.join(missing)}")
-    response = http_json(
-        "POST",
-        (env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL).rstrip("/") + KIS_TOKEN_ENDPOINT,
-        body={
-            "grant_type": "client_credentials",
-            "appkey": env_value("KIS_APP_KEY"),
-            "appsecret": env_value("KIS_APP_SECRET"),
-        },
-        headers={"content-type": "application/json; charset=utf-8"},
-        timeout_seconds=timeout_seconds,
-    )
-    payload = response.get("json") if isinstance(response.get("json"), dict) else {}
-    token = str(payload.get("access_token") or "").strip()
-    if not token:
-        raise RuntimeError(str(payload.get("msg1") or response.get("text") or "KIS token response did not include access_token."))
-    return token
+    base_url = (env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL).rstrip("/")
+    app_key = env_value("KIS_APP_KEY")
+    app_secret = env_value("KIS_APP_SECRET")
+    cache_key = hashlib.sha256(f"{base_url}\0{app_key}\0{app_secret}".encode("utf-8")).hexdigest()
+    with _KIS_TOKEN_LOCK:
+        now = time.monotonic()
+        if (
+            _KIS_TOKEN_CACHE.get("key") == cache_key
+            and str(_KIS_TOKEN_CACHE.get("token") or "")
+            and float(_KIS_TOKEN_CACHE.get("expires_at") or 0.0) > now
+        ):
+            return str(_KIS_TOKEN_CACHE["token"])
+
+        response = http_json(
+            "POST",
+            base_url + KIS_TOKEN_ENDPOINT,
+            body={
+                "grant_type": "client_credentials",
+                "appkey": app_key,
+                "appsecret": app_secret,
+            },
+            headers={"content-type": "application/json; charset=utf-8"},
+            timeout_seconds=timeout_seconds,
+        )
+        payload = response.get("json") if isinstance(response.get("json"), dict) else {}
+        token = str(payload.get("access_token") or "").strip()
+        if not token:
+            raise RuntimeError(
+                str(payload.get("msg1") or response.get("text") or "KIS token response did not include access_token.")
+            )
+        try:
+            expires_in = max(1.0, float(payload.get("expires_in") or 86400.0))
+        except (TypeError, ValueError):
+            expires_in = 86400.0
+        _KIS_TOKEN_CACHE.update(
+            {"key": cache_key, "token": token, "expires_at": now + max(1.0, expires_in - 60.0)}
+        )
+        return token
+
+
+def _clear_kis_access_token_cache() -> None:
+    with _KIS_TOKEN_LOCK:
+        _KIS_TOKEN_CACHE.update({"key": "", "token": "", "expires_at": 0.0})
 
 
 def send_prepared_request(prepared: PreparedRequest, *, timeout_seconds: float = 10.0) -> dict[str, object]:

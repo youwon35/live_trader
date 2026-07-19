@@ -822,3 +822,36 @@ API 없이 실제 실행한 기능:
 - Python unittest 71개, frontend build, PyInstaller 패키징, 실제 최신 EXE 대상 UI smoke 12조합(6탭 x 1707x960/1280x800)을 통과했다. 넘침·화면 밖 컨트롤·콘솔 오류는 모두 0건이다.
 - 최신 `release\LiveTrader.exe`를 사용자가 지정한 오른쪽 모니터 논리 좌표 2560,1600(물리 1707x960)에 최대화해 실제 렌더를 확인했다.
 - 후속 사용자 입력: 실거래 API 검증 전 KIS `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO`, `KIS_ACCOUNT_PRODUCT_CODE`와 선택한 거래소(Binance/Upbit) 자격 증명을 설정한다. 실제 주문 활성화는 별도 최종 승인과 최소 단위 점검 뒤에만 수행한다.
+
+## 2026-07-20 실계좌 API 읽기 전용 검증과 EXE 영속화 보강
+
+실제 등록값을 사용하되 주문 전송과 실거래 활성화는 하지 않고 KIS, Binance, Upbit를 읽기 전용으로 검증했다.
+
+- KIS OAuth 인증과 국내 계좌 조회 성공: 현금성 잔고 346 KRW.
+- Binance signed account 조회 성공: 현금성 잔고 약 0.08 USDT, BTC 포지션 0.00000451.
+- Upbit 전체 계좌 조회 성공: 현금성 잔고 약 1 KRW.
+- 세 브로커 최종 대조의 조회 오류 0건, 프로그램 원장과 불일치 0건을 확인했다.
+- 남은 `API 필요 1건`은 KIS 해외주식(SPY) 잔고 조회 어댑터가 아직 없기 때문이며 자격 증명 오류가 아니다.
+
+실제 EXE에서 발견하고 수정한 문제:
+
+- PyInstaller 임시 `_MEI...\.env`에 설정을 저장하던 문제를 고쳐 `%LOCALAPPDATA%\live_trader\.env`에 영구 저장한다.
+- 감사 DB, 프로그램 원장, 복구 저널도 `_MEI...\logs`가 아니라 `%LOCALAPPDATA%\live_trader\logs`를 사용한다.
+- KIS 점검 한 번에 토큰을 두 번 발급해 `EGW00133`(1분당 1회)에 걸리던 문제를 만료 직전까지 안전하게 재사용하는 캐시로 고쳤다.
+- 성공한 빈 포지션 조회를 `API 필요`로 오판하지 않고 국내주식/코인 0포지션으로 판정한다. 아직 구현되지 않은 KIS 해외주식 범위는 계속 차단한다.
+- 창 상태 버전을 올리고 사용자 지정 오른쪽 모니터 좌표 `(3840, 0)`에서 항상 최대화해 열도록 고정했다.
+
+실제 흐름 검증:
+
+- 브로커 스냅샷을 영구 프로그램 원장 기준으로 저장해 현금 3개, 포지션 1개가 일치했다.
+- EXE를 완전히 종료하고 다시 실행한 뒤 설정과 원장이 유지되는 것을 확인했고, 재대조도 오류 0·불일치 0으로 복원됐다.
+- `MONITOR`, Dry Run ON, 신규 진입 차단 ON, 전체 차단 OFF 상태를 유지했다.
+- `사전점검 → API → 실거래 준비 → 자동화 → 로그 → 설정`을 실제 EXE에서 순서대로 확인했다.
+- `npm run ui:smoke`: 오른쪽 모니터/compact desktop의 12개 조합 모두 document/workspace overflow 0, escaped control 0.
+- Python unittest 76개 통과, frontend/desktop-scale/PyInstaller 빌드 통과.
+
+다음 안전 출발점:
+
+1. Live Trader의 KIS 해외주식 잔고 조회, 브로커별 주문 상태/취소·정정, 체결 스트림 어댑터를 구현·검증한다.
+2. 그 전까지 `LIVE_TRADER_ENABLE_REAL_ORDERS=false`와 MONITOR를 유지한다.
+3. 사용자가 원래 지정한 다음 큰 작업은 최신 Paper Trader EXE를 열어 기존 이력을 변경하지 않고 전략 Artifact 탭부터 화면 순서대로 재검증하는 것이다.

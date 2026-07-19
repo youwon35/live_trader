@@ -1,10 +1,28 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_runtime_data_root() -> Path:
+    configured = str(os.getenv("LIVE_TRADER_DATA_DIR") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if getattr(sys, "frozen", False):
+        base = Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        return base / "live_trader"
+    return ROOT
+
+
+def default_env_path() -> Path:
+    configured = str(os.getenv("LIVE_TRADER_ENV_PATH") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return default_runtime_data_root() / ".env"
 
 
 def _strip_inline_comment(value: str) -> str:
@@ -33,7 +51,7 @@ def _unquote(value: str) -> str:
 
 
 def load_local_env(path: Path | None = None) -> None:
-    env_path = path or ROOT / ".env"
+    env_path = path or default_env_path()
     if not env_path.exists():
         return
     for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():

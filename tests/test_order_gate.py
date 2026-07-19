@@ -16,10 +16,15 @@ from live_trader.program_ledger import ProgramLedger
 class OrderGateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.original_state = copy.deepcopy(state.STATE)
+        self.original_recovery_journal = state.RECOVERY_JOURNAL
+        self.recovery_temp_dir = tempfile.TemporaryDirectory()
+        state.RECOVERY_JOURNAL = state.RecoveryJournal(Path(self.recovery_temp_dir.name) / "recovery-journal")
 
     def tearDown(self) -> None:
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
+        state.RECOVERY_JOURNAL = self.original_recovery_journal
+        self.recovery_temp_dir.cleanup()
 
     def use_temp_program_ledger(self, temp_dir: str) -> ProgramLedger:
         self.original_program_ledger = state.PROGRAM_LEDGER
@@ -955,6 +960,7 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(len(broker_data["accounts"]), 3)
         self.assertEqual(len(broker_data["positions"]), 2)
         self.assertEqual(len(broker_data["errors"]), 0)
+        self.assertEqual(broker_data["successful_position_brokers"], ["kis", "binance", "upbit"])
         self.assertEqual(result["reconciliation"]["summary"]["error_count"], 0)
         self.assertGreaterEqual(result["reconciliation"]["summary"]["mismatch_count"], 1)
         self.assertTrue(

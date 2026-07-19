@@ -10,12 +10,14 @@ from live_trader.live_adapters import (
     KIS_OVERSEAS_ORDER_ENDPOINT,
     UPBIT_ACCOUNTS_ENDPOINT,
     UPBIT_ORDER_ENDPOINT,
+    _clear_kis_access_token_cache,
     build_binance_account_request,
     build_binance_spot_order_request,
     build_kis_domestic_balance_request,
     build_kis_live_order_request,
     build_upbit_accounts_request,
     build_upbit_order_request,
+    issue_kis_access_token,
     sign_binance_query,
 )
 
@@ -38,10 +40,12 @@ ADAPTER_ENV_KEYS = (
 class EnvRestoreMixin:
     def setUp(self) -> None:
         self.previous_env = {key: os.environ.get(key) for key in ADAPTER_ENV_KEYS}
+        _clear_kis_access_token_cache()
         for key in ADAPTER_ENV_KEYS:
             os.environ.pop(key, None)
 
     def tearDown(self) -> None:
+        _clear_kis_access_token_cache()
         for key, value in self.previous_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -228,6 +232,26 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertEqual(upbit.endpoint, UPBIT_ACCOUNTS_ENDPOINT)
         self.assertTrue(upbit.headers["Authorization"].startswith("Bearer "))
         self.assertEqual(upbit.safe_headers["authorization_configured"], True)
+
+    def test_kis_access_token_is_reused_until_near_expiry(self) -> None:
+        os.environ.update(
+            {
+                "KIS_APP_KEY": "kis-app-key",
+                "KIS_APP_SECRET": "kis-app-secret",
+                "KIS_BASE_URL": "https://kis.example.test",
+            }
+        )
+        response = {"json": {"access_token": "token-123", "expires_in": 3600}}
+
+        with patch("live_trader.live_adapters.http_json", return_value=response) as request, patch(
+            "live_trader.live_adapters.time.monotonic", side_effect=[100.0, 101.0]
+        ):
+            first = issue_kis_access_token()
+            second = issue_kis_access_token()
+
+        self.assertEqual(first, "token-123")
+        self.assertEqual(second, "token-123")
+        request.assert_called_once()
 
     def test_missing_settings_and_invalid_intent_are_reported_as_blocked_reasons(self) -> None:
         kis = build_kis_live_order_request({"symbol": "", "side": "BUY", "quantity": 0, "price": 0})
