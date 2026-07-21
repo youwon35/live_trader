@@ -6,7 +6,7 @@ import hmac
 import json
 import unittest
 
-from live_trader.execution_streams import parse_kis_domestic_execution, parse_upbit_my_order, upbit_websocket_token
+from live_trader.execution_streams import parse_kis_domestic_execution, parse_kis_overseas_execution, parse_upbit_my_order, upbit_websocket_token
 
 
 class ExecutionStreamTest(unittest.TestCase):
@@ -39,6 +39,22 @@ class ExecutionStreamTest(unittest.TestCase):
         self.assertEqual("069500.KS", event["symbol"])
         self.assertEqual("filled", event["state"])
         self.assertEqual(2.0, event["quantity"])
+
+    def test_kis_overseas_execution_normalizes_official_25_columns(self) -> None:
+        fields = [""] * 25
+        fields[2] = "order-us-1"
+        fields[4] = "02"
+        fields[7] = "AAPL"
+        fields[8] = "1"
+        fields[9] = "327.69"
+        fields[10] = "160001"
+        fields[11] = "N"
+        fields[12] = "2"
+        event = parse_kis_overseas_execution(fields)
+        self.assertIsNotNone(event)
+        self.assertEqual("AAPL", event["symbol"])
+        self.assertEqual("filled", event["state"])
+        self.assertEqual(327.69, event["price"])
 
 
 if __name__ == "__main__":

@@ -76,6 +76,32 @@ def parse_kis_domestic_execution(fields: list[str]) -> dict[str, Any] | None:
     }
 
 
+def parse_kis_overseas_execution(fields: list[str]) -> dict[str, Any] | None:
+    """Normalize official H0GSCNI0/H0GSCNI9 25-column notice."""
+    if len(fields) < 25:
+        return None
+    order_no = str(fields[2])
+    symbol = str(fields[7]).upper()
+    quantity = _float(fields[8])
+    price = _float(fields[9]) or _float(fields[24])
+    rejected = str(fields[11]).upper() == "Y"
+    filled = str(fields[12]) in {"1", "2", "Y"} or quantity > 0
+    return {
+        "event_id": f"kis-overseas:{order_no}:{fields[10]}:{quantity}:{price}",
+        "broker_id": "kis",
+        "order_id": "",
+        "broker_order_id": order_no,
+        "symbol": symbol,
+        "side": "SELL" if str(fields[4]) in {"01", "1", "S"} else "BUY",
+        "quantity": quantity,
+        "price": price,
+        "fee": 0.0,
+        "state": "rejected" if rejected else "filled" if filled else "accepted",
+        "occurred_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "raw_type": "kis_overseas_execution",
+    }
+
+
 def _float(value: Any) -> float:
     try:
         return float(str(value or "0").replace(",", ""))
@@ -234,7 +260,7 @@ class ExecutionStreamManager:
                 if len(parts) < 4 or parts[1] not in aes:
                     continue
                 fields = self._decrypt_kis(parts[3], *aes[parts[1]]).split("^")
-                event = parse_kis_domestic_execution(fields) if parts[1] == "H0STCNI0" else None
+                event = parse_kis_domestic_execution(fields) if parts[1] == "H0STCNI0" else parse_kis_overseas_execution(fields)
                 if event:
                     self._record("kis", event)
         finally:

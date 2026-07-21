@@ -907,7 +907,8 @@ API 없이 실제 실행한 기능:
 - Live Trader에 Upbit private `myOrder`와 KIS `H0STCNI0`/`H0GSCNI0` 체결 스트림을 추가했다. KIS 암호화 통지는 AES-CBC로 복호화하며 이벤트는 durable JSONL과 프로그램 원장 동기화 경계로 전달된다.
 - `--daemon` CLI와 Windows 예약 작업 설치/제거 스크립트를 추가했다. `TradingSystem-LiveTrader-Monitor` 작업은 로그온 시 최신 EXE를 MONITOR로 시작하고 실패 시 재시작한다. 재부팅이 실거래 모드로 자동 승격시키지는 않는다.
 - 실제 계좌 읽기 결과는 KIS 100,346원/포지션 없음, Upbit 44,999.37843058원과 KRW-BTC 0.0000526이다. KIS/Upbit 개인 WebSocket은 모두 connected, reconnect 0, REST 대조 오류 0으로 확인했다.
-- Windows 작업의 최신 EXE heartbeat, stock/crypto RUNNING, KIS/Upbit connected, execution poll ok를 확인했다. Live Python 86개, 공용 runtime 86개, frontend/DPI/PyInstaller 및 격리 daemon EXE smoke를 통과했다.
+- Windows 작업의 최신 EXE heartbeat, stock/crypto RUNNING, KIS/Upbit connected, execution poll ok를 확인했다. Live Python 87개, 공용 runtime 86개, frontend/DPI/PyInstaller 및 격리 daemon EXE smoke를 통과했다.
 - 현재 Portfolio 16개는 모두 live_small_allowed=false이며 Upbit `KRW-*` Portfolio가 없다. 따라서 사용자 자금 사용 허가는 보유하지만, 검증되지 않은 심볼 치환이나 승급 우회 주문은 내지 않았다. 기존 Upbit 5,000원 커넥터 체결 외에 이번 작업에서 새 실주문은 0건이다.
 - 장마감 관찰 중 Windows가 상태 JSON 교체를 잠깐 거부해 Paper runtime이 한 번 정지했다. `DurableRuntimeState.write()`가 WinError 5/32를 지수형 짧은 재시도로 흡수하도록 보강했고 회귀 테스트를 추가했다.
 - 수정 후 05:00 KST 확정 봉에서 AAPL RSI(5)=73.65, AMZN RSI(7)=54.78을 각각 정확히 한 번 평가해 둘 다 자연 HOLD였다. 15초 뒤에도 RUNNING, bar 2, decision 2, HOLD 2, duplicate 0, error 없음으로 다음 봉 대기를 확인했다.
+- 공식 `overseas_stock_functions_ws.py`의 H0GSCNI0 25개 컬럼 순서에 맞춰 해외 체결도 symbol/side/quantity/price/state로 정규화하고 회귀 테스트를 추가했다.
