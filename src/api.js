@@ -109,6 +109,14 @@ export async function runStrategyCycle(profileId) {
   return request("/api/strategy-cycle", { method: "POST", body: { profile_id: profileId } });
 }
 
+export async function startContinuousRuntime(profileId, mode, portfolioId = "") {
+  return request("/api/runtime/start", { method: "POST", body: { profile_id: profileId, mode, portfolio_id: portfolioId }, timeoutMs: 30000 });
+}
+
+export async function stopContinuousRuntime(profileId = "") {
+  return request("/api/runtime/stop", { method: "POST", body: { profile_id: profileId }, timeoutMs: 15000 });
+}
+
 export async function promoteStrategyToLive(strategyId) {
   return request("/api/strategy-live-promotion", { method: "POST", body: { strategy_id: strategyId } });
 }

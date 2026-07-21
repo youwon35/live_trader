@@ -45,6 +45,8 @@ import {
   refreshUpbitSmokeOrder,
   runReconciliation,
   runStrategyCycle,
+  startContinuousRuntime,
+  stopContinuousRuntime,
   runWatchdog,
   promoteStrategyToLive,
   seedProgramLedgerBaseline,
@@ -1490,6 +1492,8 @@ function App() {
           }
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
           onStrategyCycle={(profileId) => runAction(() => runStrategyCycle(profileId))}
+          onRuntimeStart={(profileId, mode) => runAction(() => startContinuousRuntime(profileId, mode))}
+          onRuntimeStop={(profileId) => runAction(() => stopContinuousRuntime(profileId))}
           onPromoteLive={(strategyId) => runAction(() => promoteStrategyToLive(strategyId))}
           onStrategyLifecycle={(strategyId, action) => runAction(() => setStrategyLifecycle(strategyId, action))}
           onWatchdog={() => runAction(runWatchdog)}
@@ -1583,6 +1587,8 @@ function WorkspaceContent({
   onEntryBlock,
   onAutomation,
   onStrategyCycle,
+  onRuntimeStart,
+  onRuntimeStop,
   onPromoteLive,
   onStrategyLifecycle,
   onWatchdog,
@@ -1637,6 +1643,9 @@ function WorkspaceContent({
             runnerState={snapshot.strategy_runner}
             onAutomation={onAutomation}
             onStrategyCycle={onStrategyCycle}
+            onRuntimeStart={onRuntimeStart}
+            onRuntimeStop={onRuntimeStop}
+            runtime={snapshot.continuous_runtime}
           />
         </div>
         <div className="content-column">
@@ -2915,7 +2924,7 @@ function BrokerPanel({ brokers, onOpenSettings }) {
   );
 }
 
-function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomation, onStrategyCycle }) {
+function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomation, onStrategyCycle, onRuntimeStart, onRuntimeStop, runtime }) {
   const rows = profiles?.length ? profiles : fallbackSnapshot.automation_profiles;
   const [assetTab, setAssetTab] = useState(rows[0]?.id ?? "stock");
   const activeProfile = rows.find((profile) => profile.id === assetTab) ?? rows[0];
@@ -2941,6 +2950,9 @@ function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomati
 
   const routeStrategies = strategies.filter((strategy) => (activeProfile.id === "stock" ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy)));
   const runnerText = runnerState?.last_profile === activeProfile.id ? runnerState.last_action : activeProfile.last_action;
+  const profileRuntime = runtime?.profiles?.[activeProfile.id] || runtime;
+  const runtimeForProfile = profileRuntime?.profileId === activeProfile.id;
+  const runtimeRunning = Boolean(profileRuntime?.running && runtimeForProfile);
 
   return (
     <section className="panel automation-panel">
@@ -3034,15 +3046,40 @@ function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomati
           {!routeStrategies.length && <span>연결 가능한 전략 artifact가 없습니다.</span>}
         </div>
         <div className="automation-actions">
-          <span>{runnerText}</span>
+          <span>{runtimeRunning ? `${profileRuntime.mode} · 확정 봉 ${profileRuntime.engine?.barCount ?? 0} · 판단 ${profileRuntime.engine?.decisionCount ?? 0} · ${profileRuntime.engine?.lastCycleAt || "새 봉 대기"}` : runnerText}</span>
+          <button
+            className="ts-action-button"
+            type="button"
+            disabled={profileRuntime?.running}
+            onClick={() => onRuntimeStart(activeProfile.id, activeProfile.mode)}
+          >
+            <Play size={16} />
+            <span>Run 지속 감시</span>
+          </button>
+          <button
+            className="ts-action-button"
+            type="button"
+            disabled={!profileRuntime?.running}
+            onClick={() => onRuntimeStop(activeProfile.id)}
+          >
+            <CircleStop size={16} />
+            <span>Stop</span>
+          </button>
           <button
             className="ts-action-button"
             type="button"
             onClick={() => onStrategyCycle(activeProfile.id)}
           >
             <Play size={16} />
-            <span>전략 사이클 점검</span>
+            <span>1회 진단</span>
           </button>
+        </div>
+        <div className="continuous-runtime-status">
+          <StatusPill tone={runtimeRunning ? (profileRuntime.phase === "DEGRADED" ? "warning" : "success") : profileRuntime?.phase === "FAILED" ? "danger" : "neutral"}>
+            {runtimeRunning ? `${profileRuntime.mode} RUNNING` : profileRuntime?.phase || "STOPPED"}
+          </StatusPill>
+          <span>시세는 계속 수신하고 전략은 확정 봉마다 1회만 평가합니다. HOLD 후에도 다음 봉에서 자동으로 다시 판단합니다.</span>
+          {profileRuntime?.lastError && <small>{profileRuntime.lastError}</small>}
         </div>
       </div>
     </section>

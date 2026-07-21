@@ -170,6 +170,16 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/strategy-cycle":
             self.send_json(state.run_strategy_cycle(str(payload.get("profile_id", "stock"))))
             return
+        if parsed.path == "/api/runtime/start":
+            self.send_json(state.start_continuous_runtime(
+                str(payload.get("profile_id", "stock")),
+                str(payload.get("mode", "MONITOR")),
+                str(payload.get("portfolio_id", "")),
+            ))
+            return
+        if parsed.path == "/api/runtime/stop":
+            self.send_json(state.stop_continuous_runtime(str(payload.get("profile_id", ""))))
+            return
         if parsed.path == "/api/strategy-live-promotion":
             self.send_json(state.promote_strategy_to_live(str(payload.get("strategy_id", ""))))
             return

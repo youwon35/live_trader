@@ -43,5 +43,6 @@ if (-not (Test-Path -LiteralPath $sharedRuntime)) {
   --hidden-import trading_runtime.risk_engine `
   --hidden-import trading_runtime.strategy_runner `
   --hidden-import trading_runtime.market_calendar `
+  --hidden-import websocket `
   --collect-submodules webview `
   live_trader\__main__.py

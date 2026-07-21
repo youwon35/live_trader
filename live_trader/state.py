@@ -401,6 +401,9 @@ RUNTIME_RECOVERY_ROOT = Path(os.getenv("LIVE_TRADER_RECOVERY_DIR") or APP_DATA_R
 RECOVERY_JOURNAL = RecoveryJournal(RUNTIME_RECOVERY_ROOT)
 SHADOW_ENGINE = ShadowLiveEngine()
 LIVE_MULTI_COORDINATOR = MultiStrategySleeveCoordinator(conflict_policy="net")
+from .continuous_live import LiveContinuousRuntimeManager  # noqa: E402
+
+LIVE_CONTINUOUS_CONTROLLER = LiveContinuousRuntimeManager(APP_DATA_ROOT)
 
 
 def now_text() -> str:
@@ -2061,6 +2064,7 @@ def snapshot() -> dict[str, Any]:
         "broker_diagnostics": broker_diagnostics(),
         "broker_adapter_contract": broker_adapter_contract(),
         "automation_profiles": automations,
+        "continuous_runtime": LIVE_CONTINUOUS_CONTROLLER.snapshot(),
         "strategy_runner": dict(STATE["strategy_runner"]),
         "strategy_sleeves": dict(STATE.get("strategy_sleeves", {})),
         "multi_strategy": {
@@ -3605,6 +3609,65 @@ def submit_order_intent(
     }
     if runner_report is not None:
         order["runner_report"] = runner_report.to_dict()
+    if ok and not dry_run:
+        broker_id = str(metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset)).lower()
+        broker_payload = {
+            "broker_id": broker_id,
+            "symbol": intent.symbol,
+            "asset": intent.asset,
+            "side": intent.side,
+            "quantity": intent.quantity,
+            "qty": intent.quantity,
+            "price": intent.reference_price,
+            "notional": intent.notional,
+            "order_type": str(metadata.get("order_type") or "LIMIT"),
+            "identifier": idempotency_key,
+            "exchange": str(metadata.get("exchange") or ""),
+        }
+        try:
+            LIVE_OMS.transition(managed_order.order_id, "SUBMITTING", "broker request dispatch")
+            broker_response = LiveBrokerRouter().place_order(broker_payload)
+            order["broker_response"] = broker_response
+            response_ok = broker_response.get("ok") is True
+            response_payload = broker_response.get("json") if isinstance(broker_response.get("json"), dict) else {}
+            broker_order_id = str(
+                response_payload.get("uuid")
+                or response_payload.get("orderId")
+                or response_payload.get("clientOrderId")
+                or (response_payload.get("output") or {}).get("ODNO")
+                or ""
+            )
+            if response_ok and broker_order_id:
+                LIVE_OMS.acknowledge(managed_order.order_id, broker_order_id)
+                order.update({
+                    "state": "acknowledged",
+                    "queue_state": "submitted",
+                    "broker_order_id": broker_order_id,
+                    "reason": "broker-acknowledged",
+                    "next_retry_at": "-",
+                })
+                reason = "broker-acknowledged"
+            elif response_ok:
+                LIVE_OMS.mark_unknown(managed_order.order_id, "broker response missing order id")
+                order.update({"state": "unknown", "queue_state": "reconcile_required", "reason": "broker-response-missing-order-id", "next_retry_at": "-"})
+                reason = "broker-response-missing-order-id"
+                ok = False
+            elif int(safe_float(broker_response.get("statusCode"), 0.0)) == 0:
+                LIVE_OMS.mark_unknown(managed_order.order_id, "network outcome unknown; reconcile before retry")
+                order.update({"state": "unknown", "queue_state": "reconcile_required", "reason": "network-outcome-unknown", "next_retry_at": "-"})
+                reason = "network-outcome-unknown"
+                ok = False
+            else:
+                LIVE_OMS.transition(managed_order.order_id, "REJECTED", "broker rejected request", {"response": broker_response})
+                order.update({"state": "broker_rejected", "queue_state": "failed", "reason": str(broker_response.get("text") or "broker-rejected")[:500], "next_retry_at": "-"})
+                reason = str(order["reason"])
+                ok = False
+        except BrokerNotReadyError as exc:
+            LIVE_OMS.transition(managed_order.order_id, "REJECTED", str(exc))
+            order.update({"state": "adapter_blocked", "queue_state": "failed", "reason": str(exc), "next_retry_at": "-"})
+            reason = str(exc)
+            ok = False
+        order["oms_status"] = LIVE_OMS.orders[managed_order.order_id].status
     STATE["orders"].insert(0, order)
     STATE["orders"] = STATE["orders"][:50]
     STATE.setdefault("persisted_idempotency_keys", []).append(idempotency_key)
@@ -3624,6 +3687,14 @@ def submit_order_intent(
         ),
     )
     return {"ok": ok, "reason": reason, "order": order, "snapshot": snapshot()}
+
+
+def start_continuous_runtime(profile_id: str, mode: str, portfolio_id: str = "") -> dict[str, Any]:
+    return LIVE_CONTINUOUS_CONTROLLER.start(profile_id, mode, portfolio_id)
+
+
+def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
+    return LIVE_CONTINUOUS_CONTROLLER.stop(profile_id)
 
 
 def submit_test_intent() -> dict[str, Any]:

@@ -888,3 +888,15 @@ API 없이 실제 실행한 기능:
 - Live-Small/Live 승인 전략은 0개다. 현재 전략은 Paper 관찰 1일·1 regime으로 최소 30일·2 regime에 미달하고 Portfolio도 live 권한이 없어, 사용자의 손실 감수 의사와 별개로 실전 알고리즘 주문을 만들지 않았다.
 - 최신 EXE 실화면에서 `Shadowed 현재 단계`, `Papered 대기`, `Before Live-Small 대기`, Portfolio Evidence BLOCK을 확인했다. 실거래 route OFF, MONITOR, Dry Run ON, 신규 진입 차단 ON을 유지했다.
 - Python unittest 83개, frontend build, 100/125/150% desktop scale, PyInstaller 빌드를 통과했다. 최신 `release\LiveTrader.exe` SHA-256은 `06E3A08981EEB6A7BB9F60C789A9D1502C3C93AAF83C9586F37B0218DDDD1D76`이다.
+
+## 2026-07-22 Portfolio 기반 Live 연속 감시와 실제 주문 경로 연결
+
+- Live Trader 자동화를 1회 진단과 별도의 `지속 감시 Run/Stop`으로 분리했다. stock/crypto 프로필은 서로 독립된 장기 실행 루프를 가질 수 있고, 선택 Portfolio의 Strategy Instance를 각 시장에 맞춰 계속 감시한다.
+- Binance/Upbit는 공식 WebSocket의 확정 봉을 우선 사용하고 REST warm-up/fallback을 둔다. 주식은 Yahoo 완료 봉을 polling한다. 전략은 새 확정 봉당 정확히 한 번 평가하며 HOLD 뒤에도 종료하지 않는다.
+- 연결 끊김은 지수 backoff로 재연결하고, heartbeat·마지막 봉·마지막 평가·재연결 수를 상태 파일과 UI에 남긴다. 시세 지연 또는 intraday 누락 봉이 있으면 주문 신호를 fail-closed HOLD로 바꾼다. Portfolio hash별 checkpoint로 재시작 중복 주문을 막는다.
+- MONITOR 모드는 실제 공개 시세와 전략을 계속 실행하되 주문하지 않는다. SMALL_LIVE/FULL_LIVE는 Portfolio permissions와 기존 승급·Dry Run·신규 진입·kill switch·계좌 대조·리스크 게이트를 모두 통과해야 시작된다.
+- 기존 `submit_order_intent`가 리스크 판정과 OMS 기록까지만 하고 broker adapter를 호출하지 않던 단절을 수정했다. 모든 게이트 통과 및 dry-run 해제 시에만 `LiveBrokerRouter.place_order`를 실제 호출하며, OMS를 SUBMITTING → ACKNOWLEDGED/REJECTED/UNKNOWN으로 전이한다. 네트워크 결과 불명은 자동 재주문하지 않는다.
+- 실제 AAPL/AMZN Portfolio를 MONITOR로 실행해 Yahoo warm-up과 지속 대기를 확인했다. 실제 주문은 보내지 않았다. 현재 Portfolio는 Live-Small 승인 조건 미충족이므로 실전 모드는 계속 안전 차단된다.
+- Live Python 83개 테스트, frontend build, 최신 EXE 빌드와 실제 EXE API/UI smoke 12조합(2 viewport × 6 tab)을 통과했다. 최신 실행 파일은 `release\LiveTrader.exe`다.
+
+전문 운용의 핵심은 CPU가 허용하는 만큼 전략을 반복 실행하는 것이 아니라, 데이터 수집은 지속하되 확정 봉 이벤트에만 정확히 한 번 판단하는 것이다. 초단타가 필요하면 tick/order-book 전용 전략과 별도 이벤트 엔진을 사용해야 하며, 현재 봉 전략과 섞지 않는다.

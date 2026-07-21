@@ -1651,6 +1651,38 @@ button {
   grid-template-columns: minmax(190px, 1.25fr) 110px 92px 62px minmax(200px, 1fr) 112px 92px minmax(240px, 1.3fr);
 }
 
+.automation-actions {
+  flex-wrap: wrap;
+}
+
+.automation-actions > span {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.continuous-runtime-status {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 7px 10px;
+  align-items: center;
+  padding: 10px;
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.continuous-runtime-status span,
+.continuous-runtime-status small {
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  line-height: 1.45;
+}
+
+.continuous-runtime-status small {
+  grid-column: 1 / -1;
+  color: var(--danger);
+}
+
 .strategy-verification-pills {
   display: flex;
   flex-wrap: wrap;
