@@ -557,6 +557,44 @@ def portfolio_strategy_value(item: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def portfolio_fx_freshness(portfolio: dict[str, Any], symbol: str) -> dict[str, Any]:
+    """Return the auditable FX quote age used by a portfolio strategy."""
+
+    portfolio_body = portfolio.get("portfolio") if isinstance(portfolio.get("portfolio"), dict) else {}
+    base_currency = str(portfolio_body.get("baseCurrency") or portfolio.get("base_currency") or "KRW").upper()
+    upper_symbol = str(symbol or "").upper()
+    currency = next((suffix for suffix in ("USDT", "USDC", "USD", "KRW") if upper_symbol.endswith(suffix)), base_currency)
+    if currency == base_currency:
+        return {"currency": currency, "baseCurrency": base_currency, "rate": 1.0, "asOf": datetime.now(timezone.utc).date().isoformat(), "ageDays": 0, "fresh": True, "limitDays": 7, "source": "same-currency"}
+    fx_policy = portfolio_body.get("fxPolicy") if isinstance(portfolio_body.get("fxPolicy"), dict) else {}
+    if not fx_policy:
+        fx_policy = portfolio.get("fx_policy") if isinstance(portfolio.get("fx_policy"), dict) else portfolio.get("fxPolicy") if isinstance(portfolio.get("fxPolicy"), dict) else {}
+    for conversion in fx_policy.get("conversions", []):
+        if not isinstance(conversion, dict):
+            continue
+        if str(conversion.get("currency") or "").upper() != currency or str(conversion.get("baseCurrency") or "").upper() != base_currency:
+            continue
+        as_of = str(conversion.get("sourceDate") or conversion.get("asOf") or "")[:10]
+        age_days = 999999
+        if as_of:
+            try:
+                age_days = max(0, (datetime.now(timezone.utc).date() - datetime.fromisoformat(as_of).date()).days)
+            except ValueError:
+                age_days = 999999
+        limit_days = max(1, int(safe_float(conversion.get("freshnessLimitDays"), 7)))
+        return {
+            "currency": currency,
+            "baseCurrency": base_currency,
+            "rate": safe_float(conversion.get("rate"), 0.0),
+            "asOf": as_of,
+            "ageDays": age_days,
+            "fresh": age_days <= limit_days and safe_float(conversion.get("rate"), 0.0) > 0,
+            "limitDays": limit_days,
+            "source": str(conversion.get("seriesId") or conversion.get("mode") or "artifact-fx"),
+        }
+    return {"currency": currency, "baseCurrency": base_currency, "rate": 0.0, "asOf": "", "ageDays": 999999, "fresh": False, "limitDays": 7, "source": "missing-fx"}
+
+
 def portfolio_gate_for_strategy(
     strategy: dict[str, Any],
     portfolios: list[dict[str, Any]] | None = None,
@@ -652,6 +690,7 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         or (mode != "FULL_LIVE" and permissions.get("live_small_allowed") is True)
     )
     blockers: list[str] = []
+    fx_freshness = portfolio_fx_freshness(portfolio, symbol)
     if lifecycle_status in {"paused", "retired"}:
         blockers.append(f"lifecycle={lifecycle_status}")
     if lifecycle_rank(lifecycle_status) < lifecycle_rank(required_status):
@@ -667,6 +706,8 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         blockers.append("riskChecks=" + ", ".join(failed_checks[:3]))
     if target_weight <= 0:
         blockers.append("targetWeight=0")
+    if fx_freshness.get("fresh") is not True:
+        blockers.append(f"fx-stale:{fx_freshness.get('asOf') or 'timestamp-missing'}:{fx_freshness.get('ageDays')}d")
     policy_limit_blockers: list[str] = []
     limits = portfolio_policy.get("limits") if isinstance(portfolio_policy.get("limits"), list) else []
     if portfolio_policy and policy_allocation is None:
@@ -711,6 +752,7 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         "policyTargetWeight": policy_target_weight,
         "configuredTargetWeight": configured_target_weight,
         "positionSizeFraction": position_size_fraction,
+        "fxFreshness": fx_freshness,
         "maxSymbolWeightPct": effective_symbol_limit,
         "maxStrategyWeightPct": max_strategy_weight,
         "strategyCapitalRatio": min(target_weight, max_strategy_weight / 100 if max_strategy_weight > 0 else target_weight),

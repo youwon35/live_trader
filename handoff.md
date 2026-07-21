@@ -878,3 +878,13 @@ API 없이 실제 실행한 기능:
 - Python 82 tests, frontend build, 100/125/150% desktop scale, PyInstaller, 12-view UI smoke가 통과했다. 최신 EXE는 `release\LiveTrader.exe`다.
 
 다음 단계는 새 불변 전략/Portfolio가 전문 연구 게이트와 Paper Portfolio Evidence를 모두 통과한 뒤에만 before-live-small 승급을 재검증하는 것이다. 현재 후보의 차단을 우회하지 않는다.
+
+## 2026-07-21 FX 신선도 hard gate와 실제 계좌 재점검
+
+- 외화 자산의 Portfolio gate가 Artifact에 고정된 환율의 기준일·허용 일수·환율 값을 읽어 신선도를 판정하도록 했다. 기준통화와 동일한 자산은 1.0으로 통과하고, 환율 누락·0 이하·기준일 초과는 `fx-stale` hard blocker로 차단한다.
+- 실거래 준비 화면에 `FX 기준시각` 카드를 추가해 통화쌍, 환율, 기준일, 경과 일수와 STALE 여부를 바로 확인할 수 있게 했다.
+- 실제 저장 자격 증명을 노출하지 않고 KIS·Binance·Upbit를 읽기 전용으로 재대조했다. KIS 100,346원, Upbit 44,999원, Binance 0.08 USDT가 프로그램 원장과 일치했고 조회 오류·수량 불일치는 0건이었다. KIS 해외주식 범위 1건은 어댑터 미구현으로 계속 `API 필요`다.
+- Upbit 주문 가능 정보 Preview는 KRW-BTC 시장가 5,000원, 수수료율 0.05%, 수수료 포함 필요액 5,002.5원, 주문 가능 잔고 44,999원으로 통과했다. 이는 커넥터 점검일 뿐 통과 전략 주문이 아니며 실주문은 전송하지 않았다.
+- Live-Small/Live 승인 전략은 0개다. 현재 전략은 Paper 관찰 1일·1 regime으로 최소 30일·2 regime에 미달하고 Portfolio도 live 권한이 없어, 사용자의 손실 감수 의사와 별개로 실전 알고리즘 주문을 만들지 않았다.
+- 최신 EXE 실화면에서 `Shadowed 현재 단계`, `Papered 대기`, `Before Live-Small 대기`, Portfolio Evidence BLOCK을 확인했다. 실거래 route OFF, MONITOR, Dry Run ON, 신규 진입 차단 ON을 유지했다.
+- Python unittest 83개, frontend build, 100/125/150% desktop scale, PyInstaller 빌드를 통과했다. 최신 `release\LiveTrader.exe` SHA-256은 `06E3A08981EEB6A7BB9F60C789A9D1502C3C93AAF83C9586F37B0218DDDD1D76`이다.

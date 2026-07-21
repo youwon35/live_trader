@@ -1886,7 +1886,8 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operational
       {gate.active && (
         <div className="portfolio-gate-metrics">
           <MetricCard className="metric-card" label="Portfolio" value={gate.portfolioName || gate.portfolioId || "-"} detail={gate.lifecycleStatus || "-"} />
-          <MetricCard className="metric-card" label="Target Weight" value={`${formatPercentValue(gate.targetWeight)}%`} detail={`Symbol max ${formatPercentValue((gate.maxSymbolWeightPct || 0) / 100)}%`} />
+          <MetricCard className="metric-card" label="실효 목표 비중" value={`${formatPercentValue(gate.targetWeight)}%`} detail={`설정 ${formatPercentValue(gate.configuredTargetWeight)}% × 전략 ${formatPercentValue(gate.positionSizeFraction)}% · Symbol max ${formatPercentValue((gate.maxSymbolWeightPct || 0) / 100)}%`} />
+          <MetricCard className="metric-card" label="FX 기준시각" value={gate.fxFreshness?.source === "same-currency" ? "동일 통화" : gate.fxFreshness?.asOf || "없음"} detail={`${gate.fxFreshness?.currency || "-"}/${gate.fxFreshness?.baseCurrency || "-"} ×${Number(gate.fxFreshness?.rate ?? 0).toLocaleString("ko-KR")} · ${gate.fxFreshness?.fresh ? `신선 ${gate.fxFreshness?.ageDays ?? 0}일` : `STALE ${gate.fxFreshness?.ageDays ?? "?"}일`}`} />
           <MetricCard className="metric-card" label="Mandate" value={gate.mandateCompliant === false ? "BLOCK" : "PASS"} detail={(gate.mandateBreaches ?? []).join(" · ") || "위반 없음"} />
           <MetricCard className="metric-card" label="Auto De-risk" value={`${gate.automaticDeRiskAction || "KEEP"} ×${Number(gate.capitalMultiplier ?? 1).toFixed(2)}`} detail={`Stress ${gate.stressPassed === false ? "BLOCK" : "PASS"}`} />
         </div>

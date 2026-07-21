@@ -341,6 +341,28 @@ class OrderGateTest(unittest.TestCase):
         self.assertAlmostEqual(gate["positionSizeFraction"], 0.2)
         self.assertAlmostEqual(gate["policyTargetWeight"], 0.12)
         self.assertAlmostEqual(gate["targetWeight"], 0.12)
+        self.assertTrue(gate["fxFreshness"]["fresh"])
+        self.assertEqual(gate["fxFreshness"]["source"], "same-currency")
+
+    def test_portfolio_gate_blocks_foreign_asset_when_fx_is_stale(self) -> None:
+        state.STATE["mode"] = "SMALL_LIVE"
+        portfolio = {
+            "id": "stale-fx-portfolio",
+            "lifecycle_status": "before-live-small",
+            "permissions": {"live_small_allowed": True},
+            "strategy_instances": [{"strategyId": "BTC-1", "symbol": "BTCUSDT", "instanceId": "btc-1"}],
+            "target_portfolio": [{"strategyId": "BTC-1", "symbol": "BTCUSDT", "targetWeight": 0.1}],
+            "risk_policy": {"maxSingleSymbolWeight": 1.0, "maxStrategyWeight": 1.0},
+            "risk_checks": [],
+            "portfolio_policy": {"allocations": [{"strategyInstanceId": "btc-1", "targetWeight": 0.1}]},
+            "portfolio": {"baseCurrency": "KRW", "fxPolicy": {"conversions": [{"currency": "USDT", "baseCurrency": "KRW", "rate": 1400, "sourceDate": "2020-01-01"}]}},
+        }
+
+        gate = state.portfolio_gate_for_strategy({"strategy_id": "BTC-1", "symbol": "BTCUSDT"}, [portfolio], mode="SMALL_LIVE")
+
+        self.assertFalse(gate["allowed"])
+        self.assertFalse(gate["fxFreshness"]["fresh"])
+        self.assertIn("fx-stale", gate["detail"])
 
     def test_portfolio_policy_requires_complete_economic_rebalance_inputs(self) -> None:
         state.STATE["mode"] = "SMALL_LIVE"
