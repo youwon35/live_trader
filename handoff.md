@@ -900,3 +900,12 @@ API 없이 실제 실행한 기능:
 - Live Python 83개 테스트, frontend build, 최신 EXE 빌드와 실제 EXE API/UI smoke 12조합(2 viewport × 6 tab)을 통과했다. 최신 실행 파일은 `release\LiveTrader.exe`다.
 
 전문 운용의 핵심은 CPU가 허용하는 만큼 전략을 반복 실행하는 것이 아니라, 데이터 수집은 지속하되 확정 봉 이벤트에만 정확히 한 번 판단하는 것이다. 초단타가 필요하면 tick/order-book 전용 전략과 별도 이벤트 엔진을 사용해야 하며, 현재 봉 전략과 섞지 않는다.
+
+## 2026-07-22 KIS/Upbit 네이티브 실시간 감시와 Windows 상시 실행
+
+- 공용 런타임에 KIS 국내 체결 `H0STCNT0` WebSocket feed를 추가했다. 틱은 전략 timeframe의 OHLCV로 모으고 완료된 버킷만 내보낸다. historical warm-up 및 KIS VTS가 제공하지 않는 미국 모의 시세는 Yahoo 완료 봉을 사용한다.
+- Live Trader에 Upbit private `myOrder`와 KIS `H0STCNI0`/`H0GSCNI0` 체결 스트림을 추가했다. KIS 암호화 통지는 AES-CBC로 복호화하며 이벤트는 durable JSONL과 프로그램 원장 동기화 경계로 전달된다.
+- `--daemon` CLI와 Windows 예약 작업 설치/제거 스크립트를 추가했다. `TradingSystem-LiveTrader-Monitor` 작업은 로그온 시 최신 EXE를 MONITOR로 시작하고 실패 시 재시작한다. 재부팅이 실거래 모드로 자동 승격시키지는 않는다.
+- 실제 계좌 읽기 결과는 KIS 100,346원/포지션 없음, Upbit 44,999.37843058원과 KRW-BTC 0.0000526이다. KIS/Upbit 개인 WebSocket은 모두 connected, reconnect 0, REST 대조 오류 0으로 확인했다.
+- Windows 작업의 최신 EXE heartbeat, stock/crypto RUNNING, KIS/Upbit connected, execution poll ok를 확인했다. Live Python 86개, 공용 runtime 85개, frontend/DPI/PyInstaller 및 격리 daemon EXE smoke를 통과했다.
+- 현재 Portfolio 16개는 모두 live_small_allowed=false이며 Upbit `KRW-*` Portfolio가 없다. 따라서 사용자 자금 사용 허가는 보유하지만, 검증되지 않은 심볼 치환이나 승급 우회 주문은 내지 않았다. 기존 Upbit 5,000원 커넥터 체결 외에 이번 작업에서 새 실주문은 0건이다.

@@ -70,6 +70,7 @@ from .contracts import (
 )
 from .audit_store import SQLiteAuditEventStore
 from .env_loader import default_runtime_data_root
+from .execution_streams import ExecutionStreamManager
 from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
@@ -404,6 +405,7 @@ LIVE_MULTI_COORDINATOR = MultiStrategySleeveCoordinator(conflict_policy="net")
 from .continuous_live import LiveContinuousRuntimeManager  # noqa: E402
 
 LIVE_CONTINUOUS_CONTROLLER = LiveContinuousRuntimeManager(APP_DATA_ROOT)
+LIVE_EXECUTION_STREAMS = ExecutionStreamManager(APP_DATA_ROOT)
 
 
 def now_text() -> str:
@@ -1308,6 +1310,7 @@ def execution_event_snapshot() -> dict[str, Any]:
         "synced_cash_count": int(state.get("synced_cash_count", 0)),
         "synced_position_count": int(state.get("synced_position_count", 0)),
         "recent": PROGRAM_LEDGER.execution_event_rows(20),
+        "streams": LIVE_EXECUTION_STREAMS.snapshot(),
     }
 
 
@@ -2065,6 +2068,7 @@ def snapshot() -> dict[str, Any]:
         "broker_adapter_contract": broker_adapter_contract(),
         "automation_profiles": automations,
         "continuous_runtime": LIVE_CONTINUOUS_CONTROLLER.snapshot(),
+        "execution_streams": LIVE_EXECUTION_STREAMS.snapshot(),
         "strategy_runner": dict(STATE["strategy_runner"]),
         "strategy_sleeves": dict(STATE.get("strategy_sleeves", {})),
         "multi_strategy": {
@@ -2713,6 +2717,23 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
     successful_snapshot_brokers: set[str] = set()
     for selected_broker in broker_ids:
         try:
+            for row in LIVE_EXECUTION_STREAMS.drain(selected_broker):
+                normalized = normalize_broker_execution(selected_broker, row)
+                events.append({
+                    "broker_id": selected_broker,
+                    "event_id": normalized.event_id,
+                    "order_id": normalized.client_order_id,
+                    "broker_order_id": normalized.broker_order_id,
+                    "symbol": normalized.symbol,
+                    "side": str(row.get("side") or ""),
+                    "quantity": normalized.filled_quantity,
+                    "price": normalized.fill_price,
+                    "fee": normalized.fee,
+                    "state": normalized.status,
+                    "occurred_at": normalized.occurred_at,
+                    "instrument_id": normalized.instrument_id,
+                    "raw": normalized.raw,
+                })
             result = router.poll_execution_events(selected_broker)
             rows = result.get("events", []) if isinstance(result, dict) else result
             if isinstance(rows, list):
@@ -3695,6 +3716,19 @@ def start_continuous_runtime(profile_id: str, mode: str, portfolio_id: str = "")
 
 def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
     return LIVE_CONTINUOUS_CONTROLLER.stop(profile_id)
+
+
+def start_execution_streams(broker_id: str = "all") -> dict[str, Any]:
+    brokers = ("kis", "upbit") if str(broker_id).lower().strip() in {"", "all"} else (str(broker_id).lower().strip(),)
+    result = LIVE_EXECUTION_STREAMS.start(brokers)
+    append_audit("info", "체결 스트림", f"실시간 체결 감시 시작: {', '.join(brokers)}")
+    return {"ok": True, "reason": "execution streams started", "streams": result, "snapshot": snapshot()}
+
+
+def stop_execution_streams() -> dict[str, Any]:
+    result = LIVE_EXECUTION_STREAMS.stop()
+    append_audit("info", "체결 스트림", "실시간 체결 감시 정지")
+    return {"ok": True, "reason": "execution streams stopped", "streams": result, "snapshot": snapshot()}
 
 
 def submit_test_intent() -> dict[str, Any]:

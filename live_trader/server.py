@@ -135,6 +135,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/execution-events":
             self.send_json(state.poll_execution_events(str(payload.get("broker_id", "all"))))
             return
+        if parsed.path == "/api/execution-streams/start":
+            self.send_json(state.start_execution_streams(str(payload.get("broker_id", "all"))))
+            return
+        if parsed.path == "/api/execution-streams/stop":
+            self.send_json(state.stop_execution_streams())
+            return
         if parsed.path == "/api/preflight":
             self.send_json(state.run_final_preflight())
             return

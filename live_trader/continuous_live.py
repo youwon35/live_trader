@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import os
 import threading
 from typing import Any
 
@@ -65,7 +66,13 @@ class LiveContinuousController:
                 cycle_handler=self._handle_cycle,
                 state_store=DurableRuntimeState(self.root / "logs" / f"continuous_{normalized_profile}_{loaded.portfolio_hash[:16]}_engine.json"),
             )
-            feeds = feeds_for_specs(specs)
+            feeds = feeds_for_specs(
+                specs,
+                prefer_kis=True,
+                kis_demo=False,
+                kis_app_key=os.getenv("KIS_APP_KEY", ""),
+                kis_app_secret=os.getenv("KIS_APP_SECRET", ""),
+            )
             for feed in feeds:
                 feed.connect()
             warmup: dict[str, int] = {}

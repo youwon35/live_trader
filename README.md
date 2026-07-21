@@ -51,7 +51,19 @@ BINANCE_API_KEY=
 BINANCE_API_SECRET=
 ```
 
-Current implementation includes broker readiness checks and blocked adapter stubs. Actual signed order placement still needs provider-specific API code before real orders can be enabled.
+Current implementation includes signed KIS/Binance/Upbit order adapters and private KIS/Upbit execution streams. Real orders still require an eligible immutable portfolio, Paper evidence, account reconciliation, risk checks, explicit mode/route enablement, and a natural confirmed-bar signal.
+
+## Headless continuous monitor
+
+```powershell
+release\LiveTrader.exe --daemon --profiles stock,crypto --mode MONITOR --poll-seconds 30
+```
+
+`scripts\install_monitor_task.ps1` installs the per-user Windows task `TradingSystem-LiveTrader-Monitor`; `scripts\uninstall_monitor_task.ps1` removes it. It deliberately starts in `MONITOR`, so a reboot never upgrades itself to live-order mode. Status is written to `%LOCALAPPDATA%\live_trader\logs\daemon_status.json`.
+
+- KIS domestic trades use `H0STCNT0` and are aggregated into the configured timeframe. Only a completed bucket reaches the strategy.
+- Upbit `myOrder` and KIS domestic/overseas execution notifications use private WebSockets and reconnect independently from market data.
+- REST account reconciliation remains a backstop. An ambiguous order outcome is never blindly resubmitted.
 
 ## Compatibility Notes
 

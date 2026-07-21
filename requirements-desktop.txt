@@ -1,3 +1,4 @@
 pywebview==6.1
 pyinstaller>=6.0
 websocket-client>=1.8
+pycryptodome>=3.20
