@@ -922,3 +922,14 @@ API 없이 실제 실행한 기능:
 - 운영 중인 `TradingSystem-LiveTrader-Monitor` 중단 승인이 없어 기존 `release\LiveTrader.exe`는 계속 감시 중이다. 새 코드는 `release_pending\LiveTrader.exe`에 무중단 빌드했다.
 - pending EXE SHA-256은 `6D26987EB90632A9DE4BA3A4BAA50CCBCC2AE9CAA8E8262E34D988B01799F979`다. active EXE SHA-256은 `9D75EDE07B5A83BA5AC9E6B9901F62C348FF9671B8C7A3C540839C5EFD9DFD1F`다.
 - `build_exe.ps1`은 LiveTrader 실행 중이면 `release_pending`/`build_pending`을 사용한다. pending EXE를 예약 감시에 적용하려면 사용자에게 짧은 daemon 중단·교체·재시작을 명시적으로 승인받아야 한다.
+
+## 2026-07-23 사전점검·실거래 준비 UI 정리와 Doctor 판정 분리
+
+- 상단 알림 배지는 흰 배경·진한 빨강 숫자·빨강 외곽선으로 바꿔 숫자가 배경에 묻히지 않게 했다. 긴급 차단은 빨간 배경, 회색 외곽선, 검은 글자로 고정해 안전 조작임을 즉시 구분하게 했다.
+- 실거래 Doctor의 `API / 브로커 연결` 판정에서 전역 readiness, 실주문 활성화 플래그, 선택 기능 capability를 제거했다. 이제 이 카드는 API 인증정보 누락과 실제 계좌 조회 오류만 차단으로 판단하고, 전략 승격·운영 체크리스트·리스크·대조·Preflight는 각각의 전용 카드가 책임진다.
+- Doctor 7개 요약 카드 우측의 `조치/주의/API/차단/검토` 배지를 제거하고, 카드 배경과 설명으로 상태를 전달하도록 단순화했다. 상세 점검의 상태 표시는 진단 정보이므로 유지했다.
+- 포지션·계좌 대조의 상태·실행 버튼을 8px 간격으로 한쪽에 묶고, 요약 상자와 다음 조치 칩 사이에 12px 여백을 추가했다.
+- 사전점검 화면의 `Upbit 실제 주문 1회 점검` 패널과 프런트엔드 전용 호출 연결을 제거했다. 서버의 안전 제한 및 테스트 API는 회귀 테스트와 내부 진단을 위해 유지했다.
+- 계좌 카드의 `10초 자동 갱신`과 계좌 상태 배지 글자를 검은색으로 통일했다. 승급 체크리스트 카드는 모든 외곽선을 회색으로 통일하고 PASS는 초록, WAIT는 노랑, BLOCK은 빨강 배경으로 구분한다.
+- 검증: Python unittest 88개 통과, Vite production build 통과, 100%/125%/150% desktop-scale 계약 통과, Playwright 실제 렌더 확인, PyInstaller 재패키징, 최신 EXE 5초 실행 유지 smoke 통과.
+- 최신 실행 파일: `release\LiveTrader.exe`, SHA-256 `0D5033CE002CAE76DD1A90E3FEBB7DD87A9C3A0B815D37A5537802833A7F3BC9`.

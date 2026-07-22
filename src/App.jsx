@@ -40,9 +40,6 @@ import {
   getSnapshot,
   getUiSettings,
   runFinalPreflight,
-  previewUpbitSmokeOrder,
-  submitUpbitSmokeOrder,
-  refreshUpbitSmokeOrder,
   runReconciliation,
   runStrategyCycle,
   startContinuousRuntime,
@@ -67,7 +64,7 @@ import {
 } from "./api";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
-import { createGuidedFlow, readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
+import { readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
 import {
   createEmptyState,
@@ -85,7 +82,6 @@ import designTokens from "../../../packages/design/design_tokens.json";
 
 const ActionButton = createActionButton(React);
 const BrokerAccountWorkspace = createBrokerAccountWorkspace(React);
-const GuidedFlow = createGuidedFlow(React);
 const StatusPill = createStatusPill(React);
 const EmptyState = createEmptyState(React);
 const FormField = createFormField(React);
@@ -1429,7 +1425,7 @@ function App() {
               {notificationsOpen && <NotificationPanel items={notifications} onNavigate={navigateWorkspace} />}
             </div>
             <button
-              className={`danger-button ${snapshot.kill_switch ? "active" : ""}`}
+              className={`danger-button emergency-stop-button ${snapshot.kill_switch ? "active" : ""}`}
               disabled={!snapshot.api_connected}
               type="button"
               onClick={() =>
@@ -1456,19 +1452,6 @@ function App() {
               다시 연결
             </button>
           </section>
-        )}
-
-        {LIVE_FLOW_IDS.includes(selectedNav) && (
-          <GuidedFlow
-            activeStepId={selectedNav}
-            advanceBlockedReason={liveFlowBlockedReason}
-            canAdvance={liveFlowCanAdvance}
-            onNavigate={navigateWorkspace}
-            onStageAction={liveFlowStageAction?.onClick}
-            stageActionDisabled={liveFlowStageAction?.disabled}
-            stageActionLabel={liveFlowStageAction?.label}
-            steps={liveFlowSteps}
-          />
         )}
 
         <WorkspaceContent
@@ -1512,14 +1495,6 @@ function App() {
             await syncExecutionEvents("all");
             return runReconciliation();
           })}
-          onUpbitPreview={() => runAction(() => previewUpbitSmokeOrder(5000))}
-          onUpbitSubmit={(token) =>
-            confirmSafetyChange(
-              "실제 금융 거래입니다. Upbit KRW-BTC를 시장가로 5,000원 매수합니다. 수수료와 시장가 슬리피지가 발생할 수 있습니다. 전송하시겠습니까?",
-              () => submitUpbitSmokeOrder(token, true),
-            )
-          }
-          onUpbitRefresh={() => runAction(refreshUpbitSmokeOrder)}
           onEnvSettings={(values, confirmed) => runAction(() => saveEnvSettings(values, confirmed))}
           appearance={appearance}
           updateAppearance={updateAppearance}
@@ -1602,9 +1577,6 @@ function WorkspaceContent({
   onProgramLedgerBaseline,
   onExecutionEvents,
   onAccountRefresh,
-  onUpbitPreview,
-  onUpbitSubmit,
-  onUpbitRefresh,
   onEnvSettings,
   appearance,
   updateAppearance,
@@ -1733,13 +1705,6 @@ function WorkspaceContent({
           onReconcile={onReconcile}
           onProgramLedgerBaseline={onProgramLedgerBaseline}
           onExecutionEvents={onExecutionEvents}
-        />
-        <UpbitSmokeOrderPanel
-          apiConnected={snapshot.api_connected === true}
-          order={snapshot.upbit_smoke_order}
-          onPreview={onUpbitPreview}
-          onSubmit={onUpbitSubmit}
-          onRefresh={onUpbitRefresh}
         />
         <UnifiedBrokerAccountPanel
           accounts={snapshot.accounts ?? []}
@@ -2037,7 +2002,6 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, o
             leading={<span className="doctor-step">{item.index}</span>}
             title={item.title}
             detail={item.detail}
-            badge={<span className="doctor-status">{item.status}</span>}
             onClick={() => setSelectedDoctorId(item.id)}
           />
         ))}
@@ -2106,18 +2070,12 @@ function buildDoctorItems(snapshot) {
       details: [makeDetail("API 연결", detail, index === 0 ? "fail" : "warn")],
     }));
   }
-  const readinessFails = (snapshot.readiness ?? []).filter((check) => check.status === "fail");
-  const readinessWarns = (snapshot.readiness ?? []).filter((check) => check.status === "warn");
   const brokerDiagnostics = snapshot.broker_diagnostics ?? [];
   const missingBrokerEnvCount =
     brokerDiagnostics.reduce((count, broker) => count + (broker.env ?? []).filter((item) => !item.present).length, 0) ||
     (snapshot.brokers ?? []).reduce((count, broker) => count + (broker.missing_env?.length ?? 0), 0);
-  const diagnosticFailures = brokerDiagnostics.reduce((count, broker) => count + (broker.steps ?? []).filter((step) => step.status === "fail").length, 0);
-  const diagnosticWarnings = brokerDiagnostics.reduce((count, broker) => count + (broker.steps ?? []).filter((step) => step.status === "warn").length, 0);
-  const missingCapabilities = brokerDiagnostics.reduce(
-    (count, broker) => count + (broker.capabilities ?? []).filter((capability) => !capability.implemented).length,
-    0,
-  );
+  const brokerConnectionErrors = snapshot.reconciliation?.errors ?? [];
+  const configuredBrokerCount = (snapshot.brokers ?? []).filter((broker) => !(broker.missing_env?.length)).length;
   const missingChecklist = (snapshot.checklist ?? []).filter((item) => item.required && !item.checked);
   const riskFailures = (snapshot.risk_checks ?? []).filter((check) => check.status === "fail");
   const riskWarnings = (snapshot.risk_checks ?? []).filter((check) => check.status === "warn");
@@ -2129,17 +2087,13 @@ function buildDoctorItems(snapshot) {
     ...(snapshot.brokers ?? []).map((broker) =>
       makeDetail(
         broker.name,
-        broker.missing_env?.length ? `환경 변수 ${broker.missing_env.length}개 누락 · ${broker.missing_env.join(", ")}` : broker.detail,
-        broker.order_ready ? "pass" : "fail",
+        broker.missing_env?.length
+          ? `환경 변수 ${broker.missing_env.length}개 누락 · ${broker.missing_env.join(", ")}`
+          : "API 인증정보가 설정되어 있습니다. 실주문 승격 조건은 최종 Preflight에서 별도로 확인합니다.",
+        broker.missing_env?.length ? "fail" : "pass",
       ),
     ),
-    ...brokerDiagnostics.flatMap((broker) =>
-      (broker.capabilities ?? [])
-        .filter((capability) => !capability.implemented)
-        .map((capability) => makeDetail(`${broker.name} · ${capability.label}`, capability.detail, "warn")),
-    ),
-    ...readinessFails.map((check) => makeDetail(check.label, check.detail, check.status)),
-    ...readinessWarns.map((check) => makeDetail(check.label, check.detail, check.status)),
+    ...brokerConnectionErrors.map((error) => makeDetail(`${error.broker_id ?? "브로커"} 계좌 조회`, error.detail ?? "계좌 조회 오류가 발생했습니다.", "fail")),
   ];
   const checklistDetails = (snapshot.checklist ?? []).map((item) => makeDetail(item.label, item.detail, item.checked ? "pass" : item.required ? "fail" : "warn"));
   const riskDetails = (snapshot.risk_checks ?? []).map((check) => makeDetail(check.label, `${check.detail} · ${check.value}`, check.status));
@@ -2173,15 +2127,11 @@ function buildDoctorItems(snapshot) {
       title: "API / 브로커 연결",
       detail: missingBrokerEnvCount
         ? `API 환경 변수 ${missingBrokerEnvCount}개가 비어 있습니다.`
-        : diagnosticFailures || readinessFails.length
-          ? `브로커/API hard stop ${diagnosticFailures + readinessFails.length}개가 남아 있습니다.`
-          : missingCapabilities
-            ? `주문 capability ${missingCapabilities}개 구현 확인이 필요합니다.`
-            : diagnosticWarnings || readinessWarns.length
-              ? `API warning ${diagnosticWarnings + readinessWarns.length}개를 검토하세요.`
-              : "실거래 API 키와 브로커 어댑터 상태를 확인했습니다.",
-      tone: missingBrokerEnvCount || diagnosticFailures || readinessFails.length ? "danger" : missingCapabilities || diagnosticWarnings || readinessWarns.length ? "warning" : "success",
-      status: missingBrokerEnvCount || diagnosticFailures || readinessFails.length ? "조치" : missingCapabilities || diagnosticWarnings || readinessWarns.length ? "주의" : "통과",
+        : brokerConnectionErrors.length
+          ? `브로커 계좌 조회 오류 ${brokerConnectionErrors.length}개를 확인하세요.`
+          : `${configuredBrokerCount}개 브로커의 API 인증정보와 계좌 조회 상태를 확인했습니다.`,
+      tone: missingBrokerEnvCount || brokerConnectionErrors.length ? "danger" : "success",
+      status: missingBrokerEnvCount || brokerConnectionErrors.length ? "조치" : "통과",
       targetNav: "brokers",
       details: apiDetails.length ? apiDetails : [makeDetail("API / 브로커", "점검할 API 문제가 없습니다.", "pass")],
     },
@@ -3432,58 +3382,6 @@ function ReconciliationSummaryPanel({ apiConnected, reconciliation, programLedge
         <span>프로그램 원장: {ledger.path ?? "-"}</span>
         <span>마지막 체결 동기화: {events.last_poll ?? "미실행"}</span>
         {events.errors?.length ? <span>이벤트 어댑터 확인 필요 {events.errors.length}건</span> : null}
-      </div>
-    </section>
-  );
-}
-
-function UpbitSmokeOrderPanel({ apiConnected, order, onPreview, onSubmit, onRefresh }) {
-  const item = order ?? fallbackSnapshot.upbit_smoke_order;
-  const ready = item.status === "ready" && Boolean(item.confirmation_token) && !item.used;
-  const submitted = ["acknowledged", "filled"].includes(item.status) && Boolean(item.broker_order_id);
-  const tone = item.status === "filled"
-    ? "success"
-    : item.status === "ready" || item.status === "acknowledged"
-      ? "warning"
-      : item.status === "blocked" || item.status === "rejected"
-        ? "danger"
-        : "info";
-  return (
-    <section className="panel upbit-smoke-panel">
-      <PanelHeader
-        title="Upbit 실제 주문 1회 점검"
-        subtitle="알고리즘 승급과 별개인 브로커 연결 점검입니다. 서버 하드 한도는 10,000원입니다."
-      />
-      <div className="panel-action-line">
-        <StatusPill tone={tone}>{item.status_label ?? "미리보기 필요"}</StatusPill>
-        <button className="mini-button" type="button" disabled={!apiConnected} onClick={onPreview}>
-          <Search size={14} />
-          5,000원 미리보기
-        </button>
-        <button
-          className="mini-button danger"
-          type="button"
-          disabled={!apiConnected || !ready}
-          onClick={() => onSubmit(item.confirmation_token)}
-        >
-          <WalletCards size={14} />
-          실제 5,000원 매수
-        </button>
-        <button className="mini-button" type="button" disabled={!apiConnected || !submitted} onClick={onRefresh}>
-          <RefreshCcw size={14} />
-          주문·체결 조회
-        </button>
-      </div>
-      <MetricGrid className="metric-grid upbit-smoke-metrics">
-        <MetricCard label="마켓" value={item.market ?? "KRW-BTC"} detail="시장가 매수" tone="info" />
-        <MetricCard label="주문 총액" value={`${Number(item.notional_krw ?? 5000).toLocaleString("ko-KR")}원`} detail="실제 자산 영향" tone="warning" />
-        <MetricCard label="주문 가능 KRW" value={item.available_krw == null ? "조회 전" : `${Number(item.available_krw).toLocaleString("ko-KR")}원`} detail="전송 직전 재확인" tone={item.available_krw >= 5000 ? "success" : "warning"} />
-        <MetricCard label="체결 금액" value={`${Number(item.executed_funds ?? 0).toLocaleString("ko-KR")}원`} detail={`수수료 ${Number(item.paid_fee ?? 0).toLocaleString("ko-KR")}원`} tone={item.status === "filled" ? "success" : "info"} />
-      </MetricGrid>
-      <div className="upbit-smoke-detail">
-        <strong>{item.detail ?? "미리보기를 실행하세요."}</strong>
-        {item.broker_order_id ? <span>Upbit 주문 UUID: {item.broker_order_id}</span> : null}
-        <span>이 기능은 거래소 주문 통신을 검증하며, 승급된 KRW-BTC 전략의 자동매매 검증을 대신하지 않습니다.</span>
       </div>
     </section>
   );
