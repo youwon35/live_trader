@@ -1014,60 +1014,7 @@ button {
 }
 
 .internal-tabs {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
   margin: 0 0 12px;
-  padding: 0 0 12px;
-  background: transparent;
-  border: 0;
-  border-bottom: 2px solid color-mix(in srgb, var(--primary) 42%, var(--border));
-  border-radius: 0;
-}
-
-.internal-tabs button {
-  display: grid;
-  place-items: center;
-  gap: 6px;
-  min-height: 78px;
-  padding: 12px 14px;
-  text-align: center;
-  color: var(--text);
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition:
-    background 0.16s ease,
-    border-color 0.16s ease,
-    box-shadow 0.16s ease,
-    color 0.16s ease;
-}
-
-.internal-tabs button.active {
-  color: var(--text);
-  background: color-mix(in srgb, var(--primary) 11%, var(--panel));
-  border-color: color-mix(in srgb, var(--primary) 62%, var(--border));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 18%, transparent);
-}
-
-.internal-tabs strong,
-.internal-tabs span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.internal-tabs strong {
-  color: inherit;
-  font-size: 14px;
-  font-weight: var(--font-weight-strong);
-}
-
-.internal-tabs span {
-  color: inherit;
-  font-size: var(--font-size-small);
-  opacity: 0.88;
 }
 
 .automation-profile-tabs {
@@ -4628,54 +4575,6 @@ body {
 .logs-panel.logs-page-panel .level-running {
   color: #155e75;
   background: #cffafe;
-}
-
-/* Unified nested tabs: compact segmented controls with the configured accent. */
-.internal-tabs {
-  display: flex;
-  align-items: center;
-  width: fit-content;
-  max-width: 100%;
-  gap: 4px;
-  margin: 0 0 12px;
-  padding: 4px;
-  overflow-x: auto;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--panel-muted, var(--panel));
-}
-
-.internal-tabs button {
-  display: inline-flex;
-  place-items: initial;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  min-height: 36px;
-  padding: 0 14px;
-  border: 0;
-  border-radius: 7px;
-  color: var(--text-soft);
-  background: transparent;
-  box-shadow: none;
-  white-space: nowrap;
-}
-
-.internal-tabs button span {
-  display: none;
-}
-
-.internal-tabs button.active,
-.internal-tabs [role='tab'][aria-selected='true'] {
-  color: var(--accent-contrast-text, #ffffff) !important;
-  background: var(--primary) !important;
-  border-color: var(--primary-border) !important;
-  box-shadow: none !important;
-}
-
-.internal-tabs button.active *,
-.internal-tabs [role='tab'][aria-selected='true'] * {
-  color: var(--accent-contrast-text, #ffffff) !important;
 }
 
 /* Safety controls and overview spacing */

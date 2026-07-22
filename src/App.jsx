@@ -65,6 +65,7 @@ import {
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
 import { readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
+import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
 import {
   createEmptyState,
@@ -88,6 +89,7 @@ const FormField = createFormField(React);
 const IconButton = createIconButton(React);
 const MetricCard = createMetricCard(React);
 const MetricGrid = createMetricGrid(React);
+const NestedTabs = createNestedTabs(React);
 const PanelHeader = createPanelHeader(React);
 const SegmentedControl = createSegmentedControl(React);
 const StatusCard = createStatusCard(React);
@@ -1653,19 +1655,13 @@ function LivePreparationPanel({
 
   return (
     <section className="live-prep-shell">
-      <div className="internal-tabs prep-tabs" role="tablist" aria-label="실거래 준비 자산군">
-        {tabItems.map((item) => (
-          <button
-            className={assetTab === item.id ? "active" : ""}
-            type="button"
-            key={item.id}
-            onClick={() => setAssetTab(item.id)}
-          >
-            <strong>{item.label}</strong>
-            <span>{item.detail} · 전략 {item.count}개</span>
-          </button>
-        ))}
-      </div>
+      <NestedTabs
+        ariaLabel="실거래 준비 자산군"
+        className="internal-tabs prep-tabs"
+        onChange={setAssetTab}
+        options={tabItems.map((item) => ({ id: item.id, label: item.label, detail: `전략 ${item.count}개`, title: item.detail }))}
+        value={assetTab}
+      />
       <section className="content-grid">
         <div className="content-column">
           <LiveStrategySelectorPanel
@@ -2553,21 +2549,13 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         subtitle=".env에 저장되는 실거래 브로커 설정을 탭별로 점검합니다."
         suffix={<StatusPill tone={checkCount ? "warning" : "success"}>{checkCount ? `${checkCount} CHECK` : "READY"}</StatusPill>}
       />
-      <div className="internal-tabs live-assistant-tabs" role="tablist" aria-label="실거래 연결 설정">
-        {groups.map((group) => (
-          <button
-            aria-selected={activeGroup === group.id}
-            className={activeGroup === group.id ? "active" : ""}
-            key={group.id}
-            onClick={() => setActiveGroup(group.id)}
-            role="tab"
-            type="button"
-          >
-            <strong>{group.label}</strong>
-            <span>{group.detail}</span>
-          </button>
-        ))}
-      </div>
+      <NestedTabs
+        ariaLabel="실거래 연결 설정"
+        className="internal-tabs live-assistant-tabs"
+        onChange={setActiveGroup}
+        options={groups.map((group) => ({ id: group.id, label: group.label, title: group.detail }))}
+        value={activeGroup}
+      />
       {broker && (
         <div className="live-assistant-summary">
           <strong>{broker.name}</strong>
@@ -2789,19 +2777,13 @@ function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomati
   return (
     <section className="panel automation-panel">
       <PanelHeader title="브로커별 자동화" subtitle="실거래 자동화는 자산군과 브로커별로 분리해서 시작합니다." />
-      <div className="internal-tabs automation-profile-tabs" role="tablist" aria-label="자동화 자산군">
-        {tabs.map((tab) => (
-          <button
-            className={assetTab === tab.id ? "active" : ""}
-            type="button"
-            key={tab.id}
-            onClick={() => setAssetTab(tab.id)}
-          >
-            <strong>{tab.label}</strong>
-            <span>{tab.detail}</span>
-          </button>
-        ))}
-      </div>
+      <NestedTabs
+        ariaLabel="자동화 자산군"
+        className="internal-tabs automation-profile-tabs"
+        onChange={setAssetTab}
+        options={tabs.map((tab) => ({ id: tab.id, label: tab.label, title: tab.detail }))}
+        value={assetTab}
+      />
       <div className={`automation-card ${activeProfile.enabled ? "running" : ""}`}>
         <div className="automation-card-head">
           <div>

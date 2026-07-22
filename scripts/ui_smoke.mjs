@@ -1,15 +1,17 @@
 import { chromium } from "playwright-core";
 
 const baseUrl = process.env.LIVE_TRADER_SMOKE_URL || "http://127.0.0.1:8795";
-const chromePath = process.env.CHROME_PATH || "C:/Program Files/Google/Chrome/Application/chrome.exe";
+const chromePath = process.env.CHROME_PATH || "";
 const viewports = [
   { name: "right-monitor", width: 1707, height: 960 },
   { name: "compact-desktop", width: 1280, height: 800 },
 ];
-const tabs = ["사전점검", "API", "실거래 준비", "자동화", "로그", "설정"];
+const tabs = ["사전점검", "실거래 준비", "자동화", "로그", "설정"];
 const issues = [];
 const views = [];
-const browser = await chromium.launch({ headless: true, executablePath: chromePath });
+const browser = await chromium.launch(chromePath
+  ? { headless: true, executablePath: chromePath }
+  : { channel: "msedge", headless: true });
 
 try {
   for (const viewport of viewports) {
@@ -20,7 +22,8 @@ try {
     });
     page.on("pageerror", (error) => consoleErrors.push(error.message));
 
-    const response = await page.goto(baseUrl, { waitUntil: "networkidle" });
+    const response = await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await page.locator(".nav-item").first().waitFor({ state: "visible" });
     if (!response?.ok()) issues.push(`${viewport.name}: app response ${response?.status() || "missing"}`);
     if (await page.locator(".api-connection-banner").count()) {
       issues.push(`${viewport.name}: Python API connection banner is visible`);
