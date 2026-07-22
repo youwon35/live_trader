@@ -8,7 +8,6 @@ import {
   DatabaseZap,
   Download,
   FileClock,
-  KeyRound,
   LayoutDashboard,
   ListChecks,
   Lock,
@@ -51,7 +50,6 @@ import {
   setFlag,
   setStrategyLifecycle,
   setAutomationProfile,
-  setMode,
   syncExecutionEvents,
   setRetryPolicy,
   setRiskSetting,
@@ -1249,8 +1247,6 @@ function App() {
   }
 
   const title = navItems.find((item) => item.id === selectedNav)?.label ?? "사전점검";
-  const canLive = snapshot.api_connected === true && snapshot.summary.blocker_count === 0;
-  const canFullLive = canLive && snapshot.summary.warning_count === 0;
   const notifications = buildNotificationItems(snapshot, error);
   const notificationKey = notificationFingerprint(notifications);
   const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
@@ -1378,9 +1374,6 @@ function App() {
           onNavigate={navigateWorkspace}
           snapshot={snapshot}
           searchQuery={searchQuery}
-          canLive={canLive}
-          canFullLive={canFullLive}
-          onMode={(mode) => runAction(() => setMode(mode))}
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
           onDryRun={() =>
             snapshot.dry_run
@@ -1473,9 +1466,6 @@ function WorkspaceContent({
   onNavigate,
   snapshot,
   searchQuery,
-  canLive,
-  canFullLive,
-  onMode,
   onConfirm,
   onDryRun,
   onEntryBlock,
@@ -1503,21 +1493,6 @@ function WorkspaceContent({
   changeLayoutMode,
   resetWorkspaceLayout,
 }) {
-  const modeConsole = (
-    <ModeConsole
-      mode={snapshot.mode}
-      canLive={canLive}
-      canFullLive={canFullLive}
-      onMode={onMode}
-      onConfirm={onConfirm}
-      dryRun={snapshot.dry_run}
-      onDryRun={onDryRun}
-      operatorConfirmed={snapshot.operator_confirmed}
-      newEntriesBlocked={snapshot.new_entries_blocked}
-      onEntryBlock={onEntryBlock}
-      onTestIntent={onTestIntent}
-    />
-  );
   const renderPage = (content) => (
     <PageView selectedNav={selectedNav} onNavigate={onNavigate} snapshot={snapshot} searchQuery={searchQuery}>
       {content}
@@ -1690,6 +1665,8 @@ function LivePreparationPanel({
             dryRun={snapshot.dry_run}
             newEntriesBlocked={snapshot.new_entries_blocked}
             killSwitch={snapshot.kill_switch}
+            operatorConfirmed={snapshot.operator_confirmed}
+            onConfirm={onConfirm}
             onDryRun={onDryRun}
             onEntryBlock={onEntryBlock}
             onTestIntent={onTestIntent}
@@ -1788,11 +1765,20 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operational
   );
 }
 
-function OperationalSafeguardsPanel({ apiConnected, dryRun, newEntriesBlocked, killSwitch, onDryRun, onEntryBlock, onTestIntent }) {
+function OperationalSafeguardsPanel({ apiConnected, dryRun, newEntriesBlocked, killSwitch, operatorConfirmed, onConfirm, onDryRun, onEntryBlock, onTestIntent }) {
   return (
     <section className="panel operational-safeguards-panel">
       <PanelHeader title="운영 차단 설정" subtitle="자동화 모드 전환 전에 공통 보호 장치를 확인합니다." />
       <div className="operator-actions">
+        <ActionButton
+          active={operatorConfirmed}
+          className="secondary-button"
+          disabled={!apiConnected}
+          icon={<BadgeCheck size={16} />}
+          label="운용자 확인"
+          onClick={onConfirm}
+          status={operatorConfirmed ? "success" : undefined}
+        />
         <ActionButton
           className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`}
           disabled={!apiConnected}
@@ -2629,119 +2615,6 @@ function clearSecretDrafts(fields, draft) {
     if (field.kind === "secret") next[field.key] = "";
   });
   return next;
-}
-
-function ModeConsole({
-  mode,
-  canLive,
-  canFullLive,
-  onMode,
-  dryRun,
-  onDryRun,
-  operatorConfirmed,
-  onConfirm,
-  newEntriesBlocked,
-  onEntryBlock,
-  onTestIntent,
-}) {
-  const modes = [
-    { id: "MONITOR", icon: Power, locked: false },
-    { id: "SMALL_LIVE", icon: Play, locked: !canLive },
-    { id: "FULL_LIVE", icon: LockKeyhole, locked: !canFullLive },
-  ];
-  return (
-    <section className="panel mode-console">
-      <PanelHeader title="실거래 모드" subtitle="실계좌 주문은 모든 게이트 통과 후에만 열립니다." />
-      <div className="mode-selector">
-        {modes.map((item) => {
-          const Icon = item.icon;
-          return (
-            <button
-              type="button"
-              key={item.id}
-              className={`mode-button ts-action-button ${mode === item.id ? "active" : ""}`}
-              data-action-status={mode === item.id ? "success" : undefined}
-              aria-pressed={mode === item.id}
-              onClick={() => onMode(item.id)}
-            >
-              <Icon size={16} />
-              <span>{item.id}</span>
-              {item.locked && <LockKeyhole size={13} />}
-            </button>
-          );
-        })}
-      </div>
-      <div className="operator-actions">
-        <ActionButton
-          active={operatorConfirmed}
-          className="secondary-button"
-          icon={<BadgeCheck size={16} />}
-          label="운용자 확인"
-          onClick={onConfirm}
-          status={operatorConfirmed ? "success" : undefined}
-        />
-        <ActionButton
-          className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`}
-          icon={<ShieldCheck size={16} />}
-          label="Dry Run"
-          onClick={onDryRun}
-          status={dryRun ? "success" : "error"}
-        />
-        <ActionButton
-          active={newEntriesBlocked}
-          className="secondary-button"
-          icon={<ShieldCheck size={16} />}
-          label="신규 진입 차단"
-          onClick={onEntryBlock}
-          status={newEntriesBlocked ? "success" : undefined}
-        />
-        <ActionButton
-          className="primary-button"
-          icon={<TerminalSquare size={16} />}
-          label="테스트 주문 게이트"
-          onClick={onTestIntent}
-          pendingLabel="확인 중"
-          variant="primary"
-        />
-      </div>
-    </section>
-  );
-}
-
-function BrokerPanel({ brokers, onOpenSettings }) {
-  return (
-    <section className="panel broker-panel">
-      <PanelHeader title="브로커/API 연결" subtitle="실거래 API 키와 주문 어댑터 준비 상태입니다." />
-      <div className="panel-action-line">
-        <span>키와 계좌 값은 설정 탭에서 안전하게 저장합니다.</span>
-        <button className="mini-button" type="button" onClick={onOpenSettings}>
-          <Settings size={14} />
-          연결 설정 열기
-        </button>
-      </div>
-      <div className="broker-list">
-        {brokers.map((broker) => (
-          <div className="broker-row" key={broker.broker_id}>
-            <div className="broker-title">
-              <KeyRound size={17} />
-              <div>
-                <strong>{broker.name}</strong>
-                <span>{broker.role}</span>
-              </div>
-            </div>
-            <p>{broker.detail}</p>
-            <div className="env-list">
-              {broker.required_env.map((name) => (
-                <span className={broker.missing_env.includes(name) ? "missing" : ""} data-ts-contrast="light" key={name}>
-                  {name}
-                </span>
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
 }
 
 function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomation, onStrategyCycle, onRuntimeStart, onRuntimeStop, runtime }) {
