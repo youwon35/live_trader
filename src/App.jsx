@@ -99,7 +99,6 @@ const navItems = [
   { id: "gate", label: "실거래 준비", icon: ListChecks },
   { id: "automation", label: "자동화", icon: Power },
   { id: "audit", label: "로그", icon: FileClock },
-  { id: "brokers", label: "API", icon: Network },
   { id: "settings", label: "설정", icon: Settings },
 ];
 
@@ -118,11 +117,6 @@ const pageProfiles = {
     title: "자동화",
     eyebrow: "브로커별 실행",
     summary: "주식/ETF는 한국투자증권, 코인은 Binance 또는 Upbit로 분리해 자동화를 시작합니다.",
-  },
-  brokers: {
-    title: "API",
-    eyebrow: "브로커/API 관리",
-    summary: "KIS/Binance 연결, 환경 변수, 주문 어댑터, 인터페이스 계약을 한곳에서 관리합니다.",
   },
   audit: {
     title: "로그",
@@ -541,7 +535,7 @@ function buildSearchResults(snapshot, queryValue) {
       label: broker.name,
       detail: broker.detail,
       meta: [broker.status, broker.role, ...(broker.missing_env ?? [])].join(" "),
-      targetNav: "brokers",
+      targetNav: "settings",
       tone: statusTone(broker.status),
     });
   });
@@ -692,7 +686,7 @@ function buildNotificationItems(snapshot, error) {
         tone: "danger",
         title: `${broker.name} 준비 필요`,
         detail: broker.missing_env?.length ? `${broker.missing_env.length}개 환경 변수가 비어 있습니다.` : broker.detail,
-        targetNav: "brokers",
+        targetNav: "settings",
       });
     });
 
@@ -1076,7 +1070,7 @@ applyAppearance(readAppearance());
 applyLayoutMode(readLayoutMode());
 
 const LIVE_FLOW_STORAGE_KEY = "live_trader.guidedFlow.v1";
-const LIVE_FLOW_IDS = ["overview", "brokers", "gate", "automation", "audit"];
+const LIVE_FLOW_IDS = ["overview", "gate", "automation", "audit"];
 
 function App() {
   const [snapshot, setSnapshot] = useState(fallbackSnapshot);
@@ -1255,83 +1249,6 @@ function App() {
   const title = navItems.find((item) => item.id === selectedNav)?.label ?? "사전점검";
   const canLive = snapshot.api_connected === true && snapshot.summary.blocker_count === 0;
   const canFullLive = canLive && snapshot.summary.warning_count === 0;
-  const brokerReady = Boolean(snapshot.brokers?.some((broker) => broker.order_ready));
-  const readyBrokerCount = snapshot.brokers?.filter((broker) => broker.order_ready).length ?? 0;
-  const runnerLastAction = snapshot.strategy_runner?.last_action || "대기";
-  const automationEvidence = Boolean((runnerLastAction && runnerLastAction !== "대기") || snapshot.orders?.length);
-  const auditEvidence = Boolean(snapshot.audit?.length);
-  const liveFlowSteps = [
-    {
-      id: "overview",
-      label: "상태 확인",
-      description: "로컬 API 연결과 현재 차단·경고·보호 모드를 한 번에 확인합니다.",
-      completionCriteria: "API가 연결되어 최신 운영 상태를 읽을 수 있어야 합니다.",
-      evidence: snapshot.api_connected
-        ? `API 연결 · 차단 ${snapshot.summary.blocker_count}개 · 경고 ${snapshot.summary.warning_count}개`
-        : "API 연결 끊김 · 이후 모든 상태는 확인 불가로 처리됩니다.",
-      handoff: "최신 상태를 기준으로 주문 가능한 브로커와 계좌 환경을 확인합니다.",
-      completed: snapshot.api_connected === true,
-    },
-    {
-      id: "brokers",
-      label: "브로커 연결",
-      description: "브로커 자격 증명·계좌 환경·주문 가능 상태를 확인합니다.",
-      completionCriteria: "order_ready인 브로커가 한 개 이상 있어야 합니다.",
-      evidence: `주문 준비 ${readyBrokerCount.toLocaleString("ko-KR")} / ${(snapshot.brokers?.length ?? 0).toLocaleString("ko-KR")}개 브로커`,
-      handoff: "준비된 브로커를 대상으로 리스크 한도와 최종 Preflight를 실행합니다.",
-      completed: brokerReady,
-    },
-    {
-      id: "gate",
-      label: "진입 게이트",
-      description: "전략 승급 근거·계좌 상태·리스크 한도·보호 장치를 최종 점검합니다.",
-      completionCriteria: "API가 연결되고 차단 항목이 0개여야 합니다.",
-      evidence: `차단 ${snapshot.summary.blocker_count}개 · 경고 ${snapshot.summary.warning_count}개 · ${canLive ? "진입 가능" : "진입 차단"}`,
-      handoff: "통과한 전략과 주문 범위만 자동화 단계에서 실행할 수 있습니다.",
-      completed: canLive,
-    },
-    {
-      id: "automation",
-      label: "자동화",
-      description: "승인된 전략의 자산·브로커·모드·주문 범위와 최근 실행을 확인합니다.",
-      completionCriteria: "대기 상태가 아닌 전략 실행 기록 또는 주문 기록이 있어야 합니다.",
-      evidence: `${runnerLastAction} · 주문 ${(snapshot.orders?.length ?? 0).toLocaleString("ko-KR")}건`,
-      handoff: "전략 판단과 주문 결과를 감사 기록에서 추적 가능한 형태로 확인합니다.",
-      completed: automationEvidence,
-    },
-    {
-      id: "audit",
-      label: "감사 기록",
-      description: "주문·판단·차단·운영 변경 기록을 시간순으로 최종 검토합니다.",
-      completionCriteria: "감사 기록이 한 건 이상 있어야 하며 오류·차단 사유를 설명할 수 있어야 합니다.",
-      evidence: `감사 기록 ${(snapshot.audit?.length ?? 0).toLocaleString("ko-KR")}건`,
-      handoff: "최종 기록을 운영 근거로 유지하고 Hub Center에서 실행 상태를 계속 추적합니다.",
-      completed: auditEvidence,
-    },
-  ];
-  const liveFlowCanAdvance = selectedNav === "overview"
-    ? snapshot.api_connected === true
-    : selectedNav === "brokers"
-      ? brokerReady
-      : selectedNav === "gate"
-        ? canLive
-        : selectedNav === "automation"
-          ? automationEvidence
-          : true;
-  const liveFlowBlockedReason = selectedNav === "overview"
-    ? "API 연결이 확인되면 브로커 연결 단계로 이동할 수 있습니다."
-    : selectedNav === "brokers"
-      ? "주문 가능한 브로커가 한 개 이상 확인되어야 합니다."
-      : selectedNav === "gate"
-        ? "차단 항목을 모두 해결하고 Preflight를 통과해야 합니다."
-        : selectedNav === "automation"
-          ? "전략 자동화 실행 기록이 만들어지면 감사 기록으로 이동할 수 있습니다."
-          : "";
-  const liveFlowStageAction = selectedNav === "overview"
-    ? { label: "상태 새로고침", onClick: refresh, disabled: loading }
-    : selectedNav === "gate"
-      ? { label: "최종 Preflight 실행", onClick: () => runAction(runFinalPreflight), disabled: loading || !snapshot.api_connected }
-      : undefined;
   const notifications = buildNotificationItems(snapshot, error);
   const notificationKey = notificationFingerprint(notifications);
   const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
@@ -1647,19 +1564,6 @@ function WorkspaceContent({
     );
   }
 
-  if (selectedNav === "brokers") {
-    return renderPage(
-      <section className="content-grid">
-        <div className="content-column">
-          <BrokerPanel brokers={snapshot.brokers} onOpenSettings={() => onNavigate("settings")} />
-        </div>
-        <div className="content-column">
-          <BrokerCapabilityPanel diagnostics={snapshot.broker_diagnostics} />
-        </div>
-      </section>,
-    );
-  }
-
   if (selectedNav === "audit") {
     return renderPage(
       <section className="audit-page-layout">
@@ -1806,7 +1710,6 @@ function LivePreparationPanel({
 
 function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operationalReadiness = {}, runtimeRecovery = {}, shadowLive = {}, multiStrategy = {}, executionCalibration = {} }) {
   const gate = selectedStrategy?.portfolio_gate ?? {};
-  const evidenceGate = selectedStrategy?.paper_portfolio_evidence_gate ?? {};
   const [replay, setReplay] = useState(null);
   const [replayRunning, setReplayRunning] = useState(false);
   const [operationResult, setOperationResult] = useState(null);
@@ -1837,26 +1740,6 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operational
   return (
     <section className="panel portfolio-artifact-panel">
       <PanelHeader title="포트폴리오 Artifact" subtitle="Live 주문은 선택 전략이 포함된 포트폴리오 universe와 target weight를 기준으로 제한됩니다." />
-      <div className="portfolio-gate-summary">
-        <div>
-          <span>선택 전략 Gate</span>
-          <strong>{gate.active ? gate.detail : "단일 전략 기준"}</strong>
-        </div>
-        <StatusPill tone={!gate.active ? "info" : gate.allowed ? "success" : "danger"}>
-          {!gate.active ? "LEGACY" : gate.allowed ? "PASS" : "BLOCK"}
-        </StatusPill>
-      </div>
-      {evidenceGate.required && (
-        <div className="portfolio-gate-summary portfolio-evidence-summary">
-          <div>
-            <span>Paper Portfolio Evidence</span>
-            <strong>{evidenceGate.detail || "Paper Trader 리밸런싱 실행 증거를 확인합니다."}</strong>
-          </div>
-          <StatusPill tone={evidenceGate.ready ? "success" : "danger"}>
-            {evidenceGate.ready ? "PASS" : "BLOCK"}
-          </StatusPill>
-        </div>
-      )}
       {gate.active && (
         <div className="portfolio-gate-metrics">
           <MetricCard className="metric-card" label="Portfolio" value={gate.portfolioName || gate.portfolioId || "-"} detail={gate.lifecycleStatus || "-"} />
@@ -2023,7 +1906,6 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, o
                 className={`doctor-detail-row ${detail.tone}`}
                 tone={detail.tone}
                 key={`${selectedItem.id}-${detail.label}-${detail.value}`}
-                leading={<StatusPill tone={detail.tone}>{detail.status}</StatusPill>}
                 title={detail.label}
                 detail={detail.value}
               />
@@ -2051,7 +1933,7 @@ function makeDetail(label, value, status = "neutral") {
 function buildDoctorItems(snapshot) {
   if (snapshot.api_connected === false) {
     const disconnectedItems = [
-      ["API / 브로커 연결", "Python API 연결이 필요합니다.", "brokers"],
+      ["API / 브로커 연결", "Python API 연결이 필요합니다.", "settings"],
       ["운영 체크리스트", "API 연결 후 현재 체크 상태를 확인합니다.", "gate"],
       ["리스크 한도", "API 연결 후 현재 리스크 한도를 확인합니다.", "gate"],
       ["전략 lifecycle eligibility", "API 연결 후 전략 승인 상태를 확인합니다.", "gate"],
@@ -2132,7 +2014,7 @@ function buildDoctorItems(snapshot) {
           : `${configuredBrokerCount}개 브로커의 API 인증정보와 계좌 조회 상태를 확인했습니다.`,
       tone: missingBrokerEnvCount || brokerConnectionErrors.length ? "danger" : "success",
       status: missingBrokerEnvCount || brokerConnectionErrors.length ? "조치" : "통과",
-      targetNav: "brokers",
+      targetNav: "settings",
       details: apiDetails.length ? apiDetails : [makeDetail("API / 브로커", "점검할 API 문제가 없습니다.", "pass")],
     },
     {
@@ -3551,9 +3433,7 @@ function LiveStrategySelectorPanel({
   const promotionStage = selectedStrategy?.promotion?.stage || selectedStrategy?.promotion_stage || selectedStrategy?.lifecycle_status || "unknown";
   const normalizedStage = normalizePromotionStage(promotionStage);
   const execution = liveSmallExecutionSummaryForStrategy(selectedStrategy?.strategy_id, orders);
-  const checklist = buildLivePromotionChecklist(selectedStrategy, normalizedStage, execution, summary, operatorConfirmed);
   const lifecycleTimeline = buildLiveLifecycleTimeline(selectedStrategy);
-  const evidenceGate = selectedStrategy?.paper_portfolio_evidence_gate ?? {};
   const canPromoteLive = Boolean(
     selectedStrategy
       && normalizedStage === "before-live-small"
@@ -3566,15 +3446,6 @@ function LiveStrategySelectorPanel({
   );
   const isPaused = normalizedStage === "paused";
   const isRetired = normalizedStage === "retired";
-  const livePromotionHint = !selectedStrategy
-    ? "전략을 먼저 선택하세요."
-    : normalizedStage === "live"
-      ? "이미 정식 Live 상태입니다."
-      : normalizedStage !== "before-live-small"
-        ? `현재 ${promotionLabel(normalizedStage)} 단계입니다. Paper Trader에서 before-live-small까지 승급한 뒤 진행합니다.`
-        : selectedStrategy.live_small_eligible
-          ? "SMALL_LIVE 성공 주문과 현재 운용 게이트를 다시 확인한 뒤 live로 고정합니다."
-          : "before-live-small 상태이지만 live_small_eligible 증거가 부족합니다.";
   return (
     <section className="panel live-strategy-selector-panel">
       <PanelHeader title="활성 전략 선택" subtitle="Backtester/Paper Trader에서 검증된 artifact를 읽기 전용으로 확인합니다." />
@@ -3590,14 +3461,6 @@ function LiveStrategySelectorPanel({
             ))}
           </select>
         </label>
-        {selectedStrategy && (
-          <div className="live-strategy-status-strip">
-            <StatusPill tone={promotionTone(promotionStage)}>{promotionLabel(promotionStage)}</StatusPill>
-            <StatusPill tone={selectedStrategy.live_allowed ? "success" : "danger"}>{selectedStrategy.permission_label || "WAIT"}</StatusPill>
-            <StatusPill tone={portfolioEvidenceTone(evidenceGate)}>PORT {portfolioEvidenceLabel(evidenceGate)}</StatusPill>
-            <StatusPill tone="info">READ ONLY</StatusPill>
-          </div>
-        )}
       </div>
       {selectedStrategy ? (
         <>
@@ -3605,17 +3468,6 @@ function LiveStrategySelectorPanel({
             <MetricCard className="metric-card" label="전략" value={selectedStrategy.plugin_label || selectedStrategy.plugin} detail={selectedStrategy.strategy_id} />
             <MetricCard className="metric-card" label="대상" value={`${selectedStrategy.symbol} · ${selectedStrategy.timeframe}`} detail={selectedStrategy.asset} />
             <MetricCard className="metric-card" label="Release" value={selectedStrategy.release?.release_id || selectedStrategy.release_id || "-"} detail={selectedStrategy.release?.parameter_hash || "parameter hash 없음"} />
-            <MetricCard className="metric-card" label="검증" value={selectedStrategy.verification?.paper_trader?.label || "Paper 상태 없음"} detail={selectedStrategy.promotion?.promoted_at || "승급 시간 없음"} />
-            <MetricCard
-              className="metric-card"
-              label="Portfolio Evidence"
-              value={portfolioEvidenceLabel(evidenceGate)}
-              detail={evidenceGate.required ? evidenceGate.detail : "단일 전략 모드"}
-            />
-          </div>
-          <div className="live-strategy-readonly-note">
-            <strong>이 전략은 Backtester/Paper Trader에서 저장된 검증본입니다.</strong>
-            <span>Live Trader에서는 파라미터를 직접 수정하지 않고, 새 파라미터는 Backtester에서 새 release로 다시 승급합니다.</span>
           </div>
           <div className="live-strategy-promotion-line">
             <ActionButton
@@ -3626,7 +3478,6 @@ function LiveStrategySelectorPanel({
               onClick={() => onPromoteLive?.(selectedStrategy.strategy_id)}
               status={canPromoteLive ? "success" : undefined}
             />
-            <span>{livePromotionHint}</span>
           </div>
           <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="전략 승급 타임라인">
             {lifecycleTimeline.map((item) => (
@@ -3635,17 +3486,6 @@ function LiveStrategySelectorPanel({
                 <div>
                   <strong>{item.label}</strong>
                   <em>{item.time || item.statusLabel}</em>
-                </div>
-              </article>
-            ))}
-          </div>
-          <div className="promotion-checklist live-promotion-checklist">
-            {checklist.map((item) => (
-              <article className={item.tone} key={item.label}>
-                <StatusPill tone={item.tone}>{item.status}</StatusPill>
-                <div>
-                  <strong>{item.label}</strong>
-                  <span>{item.detail}</span>
                 </div>
               </article>
             ))}

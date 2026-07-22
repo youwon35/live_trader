@@ -7,10 +7,13 @@ from typing import Any, Literal
 
 from .live_adapters import (
     build_binance_account_request,
+    build_binance_cancel_order_request,
     build_binance_spot_order_request,
+    build_kis_cancel_order_request,
     build_kis_domestic_balance_request,
     build_kis_live_order_request,
     build_upbit_accounts_request,
+    build_upbit_cancel_order_request,
     build_upbit_order_chance_request,
     build_upbit_order_detail_request,
     build_upbit_order_request,
@@ -64,7 +67,7 @@ BROKER_SPECS = (
             ("account_balance", "계좌 잔고 조회", True, "국내 주식 잔고 조회 요청 구현됨"),
             ("positions", "보유/체결 조회", True, "국내 주식 보유 잔고 조회 요청 구현됨"),
             ("place_order", "현금 주문 전송", True, "국내/해외 주식 실계좌 주문 요청 생성 구현됨"),
-            ("cancel_order", "주문 취소/정정", False, "원주문번호 기반 취소/정정 API 구현 필요"),
+            ("cancel_order", "주문 취소/정정", True, "국내/해외 원주문번호 기반 전량 취소 요청 구현됨"),
         ),
         "automation_group": "stock",
         "asset_scope": ("한국주식", "미국주식", "금/오일 ETF", "ETF"),
@@ -80,8 +83,8 @@ BROKER_SPECS = (
             ("account_balance", "계좌 잔고 조회", True, "signed account endpoint 조회 구현됨"),
             ("positions", "보유 자산 조회", True, "spot asset balance 대조 구현됨"),
             ("place_order", "현물 주문 전송", True, "POST /api/v3/order signed 요청 생성 구현됨"),
-            ("cancel_order", "주문 취소", False, "orderId/clientOrderId 취소 구현 필요"),
-            ("user_stream", "체결 스트림", False, "listenKey 발급과 WebSocket 수신 구현 필요"),
+            ("cancel_order", "주문 취소", True, "orderId/clientOrderId signed 취소 요청 구현됨"),
+            ("user_stream", "체결 스트림", True, "WebSocket API 서명 구독과 executionReport 수신 구현됨"),
         ),
         "automation_group": "crypto",
         "asset_scope": ("코인 현물",),
@@ -97,7 +100,7 @@ BROKER_SPECS = (
             ("account_balance", "계좌 잔고 조회", True, "전체 계좌 조회 API 연결 구현됨"),
             ("positions", "보유 자산 조회", True, "원화/코인 잔고 대조 구현됨"),
             ("place_order", "코인 주문 전송", True, "POST /v1/orders JWT 서명 요청 생성 구현됨"),
-            ("cancel_order", "주문 취소", False, "uuid 기반 주문 취소 API 구현 필요"),
+            ("cancel_order", "주문 취소", True, "uuid/identifier 기반 JWT 취소 요청 구현됨"),
         ),
         "automation_group": "crypto",
         "asset_scope": ("KRW 코인",),
@@ -254,8 +257,8 @@ def broker_adapter_contract() -> list[dict[str, str]]:
         {"method": "get_account_snapshot", "purpose": "현금/잔고/평가금액 조회", "status": "interface_ready"},
         {"method": "list_positions", "purpose": "브로커 포지션 대조", "status": "interface_ready"},
         {"method": "place_order", "purpose": "서명된 실주문 요청 생성/전송", "status": "interface_ready"},
-        {"method": "cancel_order", "purpose": "주문 취소/정정", "status": "blocked_stub"},
-        {"method": "stream_executions", "purpose": "체결/계좌 이벤트 스트림", "status": "blocked_stub"},
+        {"method": "cancel_order", "purpose": "주문 취소/정정", "status": "interface_ready"},
+        {"method": "stream_executions", "purpose": "체결/계좌 이벤트 스트림", "status": "interface_ready"},
         {"method": "poll_execution_events", "purpose": "체결/계좌 이벤트 폴링", "status": "account_poll_ready"},
     ]
 
@@ -516,6 +519,9 @@ class LiveBrokerRouter:
     still gated by LIVE_TRADER_ENABLE_REAL_ORDERS and the state-layer risk checks.
     """
 
+    def __init__(self, execution_stream_manager: Any | None = None) -> None:
+        self.execution_stream_manager = execution_stream_manager
+
     def health_check(self, broker_id: str) -> dict[str, object]:
         return {"broker_id": broker_id, "diagnostics": broker_diagnostics(broker_id)}
 
@@ -578,13 +584,34 @@ class LiveBrokerRouter:
             raise BrokerNotReadyError("Upbit 개별 주문 응답 형식이 올바르지 않습니다.")
         return payload
 
-    def cancel_order(self, broker_id: str, broker_order_id: str) -> dict[str, object]:
-        _ = (broker_id, broker_order_id)
-        raise BrokerNotReadyError("Broker cancel-order adapters are not implemented yet.")
+    def cancel_order(self, broker_id: str, broker_order_id: str, **context: object) -> dict[str, object]:
+        if not real_orders_enabled():
+            raise BrokerNotReadyError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 아니므로 실제 주문 취소 전송을 차단했습니다.")
+        broker_id = broker_id.lower().strip()
+        if broker_id == "kis":
+            token = issue_kis_access_token()
+            order = {**context, "broker_order_id": broker_order_id}
+            return send_prepared_request(build_kis_cancel_order_request(order, access_token=token))
+        if broker_id == "binance":
+            return send_prepared_request(build_binance_cancel_order_request(
+                str(context.get("symbol") or ""),
+                broker_order_id,
+                client_order_id=bool(context.get("client_order_id")),
+            ))
+        if broker_id == "upbit":
+            return send_prepared_request(build_upbit_cancel_order_request(
+                broker_order_id,
+                identifier=bool(context.get("identifier")),
+            ))
+        raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
 
-    def stream_executions(self, broker_id: str) -> None:
-        _ = broker_id
-        raise BrokerNotReadyError("Broker execution stream adapters are not implemented yet.")
+    def stream_executions(self, broker_id: str) -> dict[str, object]:
+        broker_id = broker_id.lower().strip()
+        if broker_id not in {"kis", "binance", "upbit"}:
+            raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
+        if self.execution_stream_manager is None:
+            raise BrokerNotReadyError("ExecutionStreamManager를 LiveBrokerRouter에 연결해야 합니다.")
+        return self.execution_stream_manager.start((broker_id,))
 
     def poll_execution_events(self, broker_id: str) -> dict[str, object]:
         broker_id = broker_id.lower().strip()

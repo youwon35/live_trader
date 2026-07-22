@@ -4,18 +4,24 @@ from unittest.mock import patch
 
 from live_trader.live_adapters import (
     BINANCE_ACCOUNT_ENDPOINT,
+    BINANCE_ORDER_ENDPOINT,
     BINANCE_TEST_ORDER_ENDPOINT,
     KIS_DOMESTIC_BALANCE_ENDPOINT,
+    KIS_DOMESTIC_CANCEL_ENDPOINT,
     KIS_DOMESTIC_ORDER_ENDPOINT,
     KIS_OVERSEAS_ORDER_ENDPOINT,
     UPBIT_ACCOUNTS_ENDPOINT,
     UPBIT_ORDER_ENDPOINT,
+    UPBIT_ORDER_DETAIL_ENDPOINT,
     _clear_kis_access_token_cache,
     build_binance_account_request,
+    build_binance_cancel_order_request,
     build_binance_spot_order_request,
     build_kis_domestic_balance_request,
+    build_kis_cancel_order_request,
     build_kis_live_order_request,
     build_upbit_accounts_request,
+    build_upbit_cancel_order_request,
     build_upbit_order_request,
     issue_kis_access_token,
     sign_binance_query,
@@ -54,6 +60,39 @@ class EnvRestoreMixin:
 
 
 class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
+    def test_cancel_request_builders_use_official_endpoints_and_identifiers(self) -> None:
+        os.environ.update({
+            "KIS_APP_KEY": "kis-app-key",
+            "KIS_APP_SECRET": "kis-app-secret",
+            "KIS_ACCOUNT_NO": "12345678-01",
+            "KIS_ACCOUNT_PRODUCT_CODE": "01",
+            "BINANCE_API_KEY": "binance-key",
+            "BINANCE_API_SECRET": "binance-secret",
+            "UPBIT_ACCESS_KEY": "upbit-access",
+            "UPBIT_SECRET_KEY": "upbit-secret",
+        })
+        kis = build_kis_cancel_order_request({
+            "symbol": "005930.KS",
+            "asset": "KR-STOCK",
+            "broker_order_id": "00012345",
+            "organization_no": "91252",
+            "quantity": 3,
+        }, access_token="kis-token")
+        with patch("live_trader.live_adapters.time.time", return_value=1700000000.123):
+            binance = build_binance_cancel_order_request("BTCUSDT", "98765")
+        upbit = build_upbit_cancel_order_request("upbit-order-uuid")
+
+        self.assertTrue(kis.can_send)
+        self.assertEqual(KIS_DOMESTIC_CANCEL_ENDPOINT, kis.endpoint)
+        self.assertEqual("02", kis.body["RVSE_CNCL_DVSN_CD"])
+        self.assertEqual("Y", kis.body["QTY_ALL_ORD_YN"])
+        self.assertEqual("DELETE", binance.method)
+        self.assertEqual(BINANCE_ORDER_ENDPOINT, binance.endpoint)
+        self.assertEqual("98765", binance.query["orderId"])
+        self.assertEqual("DELETE", upbit.method)
+        self.assertEqual(UPBIT_ORDER_DETAIL_ENDPOINT, upbit.endpoint)
+        self.assertEqual("upbit-order-uuid", upbit.query["uuid"])
+
     def test_kis_domestic_order_request_uses_safe_headers_and_cash_order_body(self) -> None:
         os.environ.update(
             {

@@ -20,6 +20,8 @@ KIS_LIVE_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_TOKEN_ENDPOINT = "/oauth2/tokenP"
 KIS_DOMESTIC_ORDER_ENDPOINT = "/uapi/domestic-stock/v1/trading/order-cash"
 KIS_OVERSEAS_ORDER_ENDPOINT = "/uapi/overseas-stock/v1/trading/order"
+KIS_DOMESTIC_CANCEL_ENDPOINT = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
+KIS_OVERSEAS_CANCEL_ENDPOINT = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 KIS_DOMESTIC_BALANCE_ENDPOINT = "/uapi/domestic-stock/v1/trading/inquire-balance"
 KIS_DOMESTIC_TR_IDS = {"BUY": "TTTC0012U", "SELL": "TTTC0011U"}
 KIS_OVERSEAS_TR_IDS = {"BUY": "TTTT1002U", "SELL": "TTTT1006U"}
@@ -225,6 +227,97 @@ def build_kis_domestic_balance_request(*, access_token: str = "") -> PreparedReq
     )
 
 
+def build_kis_cancel_order_request(order: dict[str, object], *, access_token: str = "") -> PreparedRequest:
+    """Build an official KIS domestic/overseas full-cancel request.
+
+    KIS cancellation needs original-order metadata in addition to the order
+    number. Missing fields remain explicit blocked reasons instead of guessing.
+    """
+    required = ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE")
+    blocked = missing_env(*required)
+    app_key = env_value("KIS_APP_KEY")
+    app_secret = env_value("KIS_APP_SECRET")
+    base_url = env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL
+    cano, acnt_prdt_cd = split_kis_account(env_value("KIS_ACCOUNT_NO"), env_value("KIS_ACCOUNT_PRODUCT_CODE"))
+    symbol = str(order.get("symbol") or "").strip().upper()
+    broker_order_id = str(order.get("broker_order_id") or order.get("order_id") or "").strip()
+    quantity = normalize_quantity(order.get("quantity") or order.get("qty") or 0)
+    market = normalize_kis_market(symbol, str(order.get("asset") or order.get("asset_class") or ""))
+    env_dv = str(order.get("environment") or env_value("KIS_ENV") or "real").strip().lower()
+
+    if not access_token:
+        blocked.append("access_token")
+    if not symbol:
+        blocked.append("symbol")
+    if not broker_order_id:
+        blocked.append("broker_order_id")
+    if quantity <= 0:
+        blocked.append("quantity")
+    if env_dv not in {"real", "demo"}:
+        blocked.append("environment")
+
+    if market == "KR":
+        organization_no = str(order.get("organization_no") or order.get("krx_fwdg_ord_orgno") or "").strip()
+        if not organization_no:
+            blocked.append("organization_no")
+        endpoint = KIS_DOMESTIC_CANCEL_ENDPOINT
+        tr_id = "VTTC0013U" if env_dv == "demo" else "TTTC0013U"
+        body = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt_cd,
+            "KRX_FWDG_ORD_ORGNO": organization_no,
+            "ORGN_ODNO": broker_order_id,
+            "ORD_DVSN": str(order.get("order_type") or "00"),
+            "RVSE_CNCL_DVSN_CD": "02",
+            "ORD_QTY": str(int(quantity)),
+            "ORD_UNPR": "0",
+            "QTY_ALL_ORD_YN": "Y",
+            "EXCG_ID_DVSN_CD": str(order.get("exchange") or "KRX"),
+        }
+    else:
+        endpoint = KIS_OVERSEAS_CANCEL_ENDPOINT
+        tr_id = "VTTT1004U" if env_dv == "demo" else "TTTT1004U"
+        body = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt_cd,
+            "OVRS_EXCG_CD": str(order.get("exchange") or infer_us_exchange(symbol)),
+            "PDNO": symbol,
+            "ORGN_ODNO": broker_order_id,
+            "RVSE_CNCL_DVSN_CD": "02",
+            "ORD_QTY": str(int(quantity)),
+            "OVRS_ORD_UNPR": "0",
+            "MGCO_APTM_ODNO": str(order.get("manager_order_id") or ""),
+            "ORD_SVR_DVSN_CD": "0",
+        }
+
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {access_token}" if access_token else "",
+        "appkey": app_key,
+        "appsecret": app_secret,
+        "tr_id": tr_id,
+        "custtype": "P",
+    }
+    return PreparedRequest(
+        provider="kis",
+        method="POST",
+        url=base_url.rstrip("/") + endpoint,
+        endpoint=endpoint,
+        headers=headers,
+        safe_headers={
+            "content-type": headers["content-type"],
+            "authorization_configured": bool(access_token),
+            "appkey_configured": bool(app_key),
+            "appsecret_configured": bool(app_secret),
+            "tr_id": tr_id,
+            "custtype": "P",
+        },
+        body=body,
+        query=None,
+        blocked_reasons=blocked,
+    )
+
+
 def build_binance_account_request() -> PreparedRequest:
     blocked = missing_env("BINANCE_API_KEY", "BINANCE_API_SECRET")
     api_key = env_value("BINANCE_API_KEY")
@@ -350,6 +443,33 @@ def build_binance_spot_order_request(intent: dict[str, object], *, test: bool = 
     )
 
 
+def build_binance_cancel_order_request(symbol: str, broker_order_id: str, *, client_order_id: bool = False) -> PreparedRequest:
+    blocked = missing_env("BINANCE_API_KEY", "BINANCE_API_SECRET")
+    api_key = env_value("BINANCE_API_KEY")
+    api_secret = env_value("BINANCE_API_SECRET")
+    base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_order_id = str(broker_order_id or "").strip()
+    query: dict[str, object] = {"symbol": normalized_symbol, "timestamp": int(time.time() * 1000)}
+    query["origClientOrderId" if client_order_id else "orderId"] = normalized_order_id
+    if not normalized_symbol:
+        blocked.append("symbol")
+    if not normalized_order_id:
+        blocked.append("broker_order_id")
+    signed_query = sign_binance_query(query, api_secret) if api_secret else urllib.parse.urlencode(query)
+    return PreparedRequest(
+        provider="binance",
+        method="DELETE",
+        url=f"{base_url.rstrip('/')}{BINANCE_ORDER_ENDPOINT}?{signed_query}",
+        endpoint=BINANCE_ORDER_ENDPOINT,
+        headers={"X-MBX-APIKEY": api_key},
+        safe_headers={"X-MBX-APIKEY_configured": bool(api_key)},
+        body=None,
+        query={**query, "signature": "***" if api_secret else ""},
+        blocked_reasons=blocked,
+    )
+
+
 def build_upbit_order_request(intent: dict[str, object]) -> PreparedRequest:
     blocked = missing_env("UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY")
     access_key = env_value("UPBIT_ACCESS_KEY")
@@ -380,6 +500,30 @@ def build_upbit_order_request(intent: dict[str, object]) -> PreparedRequest:
         safe_headers={"authorization_configured": bool(authorization), "content-type": "application/json"},
         body=body,
         query=None,
+        blocked_reasons=blocked,
+    )
+
+
+def build_upbit_cancel_order_request(broker_order_id: str, *, identifier: bool = False) -> PreparedRequest:
+    blocked = missing_env("UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY")
+    access_key = env_value("UPBIT_ACCESS_KEY")
+    secret_key = env_value("UPBIT_SECRET_KEY")
+    base_url = env_value("UPBIT_BASE_URL") or UPBIT_BASE_URL
+    normalized_order_id = str(broker_order_id or "").strip()
+    query = {"identifier" if identifier else "uuid": normalized_order_id}
+    if not normalized_order_id:
+        blocked.append("broker_order_id")
+    authorization = build_upbit_authorization(access_key, secret_key, query) if access_key and secret_key else ""
+    encoded = urllib.parse.urlencode(query)
+    return PreparedRequest(
+        provider="upbit",
+        method="DELETE",
+        url=f"{base_url.rstrip('/')}{UPBIT_ORDER_DETAIL_ENDPOINT}?{encoded}",
+        endpoint=UPBIT_ORDER_DETAIL_ENDPOINT,
+        headers={"Authorization": authorization},
+        safe_headers={"authorization_configured": bool(authorization)},
+        body=None,
+        query=query,
         blocked_reasons=blocked,
     )
 

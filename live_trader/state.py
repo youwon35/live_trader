@@ -3645,6 +3645,8 @@ def submit_order_intent(
             "identifier": idempotency_key,
             "exchange": str(metadata.get("exchange") or ""),
         }
+        order["broker_id"] = broker_id
+        order["broker_request"] = dict(broker_payload)
         try:
             LIVE_OMS.transition(managed_order.order_id, "SUBMITTING", "broker request dispatch")
             broker_response = LiveBrokerRouter().place_order(broker_payload)
@@ -3719,7 +3721,7 @@ def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
 
 
 def start_execution_streams(broker_id: str = "all") -> dict[str, Any]:
-    brokers = ("kis", "upbit") if str(broker_id).lower().strip() in {"", "all"} else (str(broker_id).lower().strip(),)
+    brokers = ("kis", "binance", "upbit") if str(broker_id).lower().strip() in {"", "all"} else (str(broker_id).lower().strip(),)
     result = LIVE_EXECUTION_STREAMS.start(brokers)
     append_audit("info", "체결 스트림", f"실시간 체결 감시 시작: {', '.join(brokers)}")
     return {"ok": True, "reason": "execution streams started", "streams": result, "snapshot": snapshot()}
@@ -4078,10 +4080,41 @@ def cancel_order(order_id: str) -> dict[str, Any]:
         return {"ok": False, "reason": "order not found", "snapshot": snapshot()}
     if order.get("state") == "canceled":
         return {"ok": True, "reason": "order already canceled", "snapshot": snapshot()}
+    broker_order_id = str(order.get("broker_order_id") or "").strip()
+    submitted_to_broker = (
+        not bool(order.get("dry_run"))
+        and broker_order_id not in {"", "-"}
+        and str(order.get("queue_state") or "").lower() in {"submitted", "sent", "partially_filled"}
+    )
+    if submitted_to_broker:
+        broker_request = order.get("broker_request") if isinstance(order.get("broker_request"), dict) else {}
+        broker_response = order.get("broker_response") if isinstance(order.get("broker_response"), dict) else {}
+        response_payload = broker_response.get("json") if isinstance(broker_response.get("json"), dict) else {}
+        output = response_payload.get("output") if isinstance(response_payload.get("output"), dict) else {}
+        broker_id = str(order.get("broker_id") or broker_request.get("broker_id") or broker_id_from_symbol(str(order.get("symbol") or ""), str(order.get("asset") or ""))).lower()
+        try:
+            cancel_response = LiveBrokerRouter().cancel_order(
+                broker_id,
+                broker_order_id,
+                symbol=str(order.get("symbol") or broker_request.get("symbol") or ""),
+                asset=str(order.get("asset") or broker_request.get("asset") or ""),
+                quantity=order.get("qty") or broker_request.get("quantity") or 0,
+                exchange=str(broker_request.get("exchange") or ""),
+                organization_no=str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("KRX_FWDG_ORD_ORG_NO") or ""),
+            )
+        except (BrokerNotReadyError, RuntimeError) as exc:
+            reason = f"브로커 주문 취소 실패: {exc}"
+            append_audit("error", "주문 취소 실패", f"{order_id} · {reason}")
+            return {"ok": False, "reason": reason, "snapshot": snapshot()}
+        if cancel_response.get("ok") is not True:
+            reason = str(cancel_response.get("text") or cancel_response.get("status") or "broker cancel rejected")
+            append_audit("error", "주문 취소 실패", f"{order_id} · {reason}")
+            return {"ok": False, "reason": reason, "snapshot": snapshot()}
+        order["broker_cancel_response"] = cancel_response
     order["state"] = "canceled"
     order["queue_state"] = "canceled"
     order["updated_at"] = now_text()
     order["next_retry_at"] = "-"
-    order["reason"] = "운용자 요청으로 주문 큐 항목을 취소했습니다."
-    append_audit("warn", "주문 취소", f"{order_id} 주문 큐 항목을 취소했습니다.")
+    order["reason"] = "브로커 주문과 로컬 큐를 취소했습니다." if submitted_to_broker else "운용자 요청으로 주문 큐 항목을 취소했습니다."
+    append_audit("warn", "주문 취소", f"{order_id} {'브로커 주문 및 ' if submitted_to_broker else ''}주문 큐 항목을 취소했습니다.")
     return {"ok": True, "reason": "order canceled", "snapshot": snapshot()}

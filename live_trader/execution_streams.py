@@ -51,6 +51,43 @@ def parse_upbit_my_order(payload: Any) -> dict[str, Any] | None:
     }
 
 
+def parse_binance_execution_report(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    event = payload.get("event") if isinstance(payload.get("event"), dict) else payload
+    if str(event.get("e") or event.get("eventType") or "") != "executionReport":
+        return None
+    order_id = str(event.get("i") or event.get("orderId") or "")
+    client_order_id = str(event.get("c") or event.get("clientOrderId") or "")
+    execution_type = str(event.get("x") or event.get("executionType") or "").upper()
+    order_status = str(event.get("X") or event.get("orderStatus") or "").upper()
+    state = {
+        "FILLED": "filled",
+        "PARTIALLY_FILLED": "partially_filled",
+        "CANCELED": "canceled",
+        "REJECTED": "rejected",
+        "EXPIRED": "expired",
+        "NEW": "accepted",
+    }.get(order_status, execution_type.lower() or "accepted")
+    quantity = _float(event.get("l") or event.get("lastExecutedQuantity") or 0)
+    price = _float(event.get("L") or event.get("lastExecutedPrice") or 0)
+    trade_id = str(event.get("t") or event.get("tradeId") or "")
+    return {
+        "event_id": f"binance:{order_id}:{trade_id or execution_type}:{order_status}:{quantity}",
+        "broker_id": "binance",
+        "order_id": client_order_id,
+        "broker_order_id": order_id,
+        "symbol": str(event.get("s") or event.get("symbol") or "").upper(),
+        "side": str(event.get("S") or event.get("side") or "").upper(),
+        "quantity": quantity,
+        "price": price,
+        "fee": _float(event.get("n") or event.get("commissionAmount") or 0),
+        "state": state,
+        "occurred_at": datetime.fromtimestamp(_float(event.get("E") or event.get("eventTime") or 0) / 1000).strftime("%Y-%m-%d %H:%M:%S") if _float(event.get("E") or event.get("eventTime") or 0) > 0 else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "raw_type": "binance_execution_report",
+    }
+
+
 def parse_kis_domestic_execution(fields: list[str]) -> dict[str, Any] | None:
     if len(fields) < 14:
         return None
@@ -119,15 +156,15 @@ class ExecutionStreamManager:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._threads: dict[str, threading.Thread] = {}
-        self._events: dict[str, deque[dict[str, Any]]] = {"kis": deque(maxlen=1000), "upbit": deque(maxlen=1000)}
+        self._events: dict[str, deque[dict[str, Any]]] = {"kis": deque(maxlen=1000), "binance": deque(maxlen=1000), "upbit": deque(maxlen=1000)}
         self._status: dict[str, dict[str, Any]] = {}
 
-    def start(self, brokers: Iterable[str] = ("kis", "upbit")) -> dict[str, Any]:
+    def start(self, brokers: Iterable[str] = ("kis", "binance", "upbit")) -> dict[str, Any]:
         with self._lock:
             self._stop.clear()
             for broker_id in brokers:
                 name = str(broker_id).lower().strip()
-                if name not in {"kis", "upbit"} or (name in self._threads and self._threads[name].is_alive()):
+                if name not in {"kis", "binance", "upbit"} or (name in self._threads and self._threads[name].is_alive()):
                     continue
                 thread = threading.Thread(target=self._run, args=(name,), daemon=True, name=f"{name}-execution-stream")
                 self._threads[name] = thread
@@ -165,6 +202,8 @@ class ExecutionStreamManager:
             try:
                 if broker_id == "upbit":
                     self._run_upbit()
+                elif broker_id == "binance":
+                    self._run_binance()
                 else:
                     self._run_kis()
             except Exception as exc:  # process boundary; status is deliberately credential-free.
@@ -204,6 +243,43 @@ class ExecutionStreamManager:
                 event = parse_upbit_my_order(payload)
                 if event:
                     self._record("upbit", event)
+        finally:
+            socket.close()
+
+    def _run_binance(self) -> None:
+        import websocket  # type: ignore[import-not-found]
+
+        api_key = os.getenv("BINANCE_API_KEY", "").strip()
+        api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+        if not api_key or not api_secret:
+            raise RuntimeError("Binance private stream credentials missing")
+        socket = websocket.create_connection("wss://ws-api.binance.com:443/ws-api/v3", timeout=20)
+        request_id = str(uuid.uuid4())
+        params: dict[str, Any] = {"apiKey": api_key, "timestamp": int(time.time() * 1000)}
+        signing_payload = "&".join(f"{key}={params[key]}" for key in sorted(params))
+        params["signature"] = hmac.new(api_secret.encode(), signing_payload.encode(), hashlib.sha256).hexdigest()
+        socket.send(json.dumps({
+            "id": request_id,
+            "method": "userDataStream.subscribe.signature",
+            "params": params,
+        }))
+        with self._lock:
+            self._status["binance"].update({"connected": True, "lastError": ""})
+        try:
+            while not self._stop.is_set():
+                try:
+                    raw = socket.recv()
+                except Exception as exc:
+                    if type(exc).__name__ == "WebSocketTimeoutException":
+                        socket.ping()
+                        continue
+                    raise
+                payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+                if payload.get("id") == request_id and int(payload.get("status") or 0) >= 400:
+                    raise RuntimeError(f"Binance user stream subscription failed: {payload.get('error') or payload.get('status')}")
+                event = parse_binance_execution_report(payload)
+                if event:
+                    self._record("binance", event)
         finally:
             socket.close()
 

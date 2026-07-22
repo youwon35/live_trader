@@ -8,10 +8,24 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from live_trader.execution_streams import ExecutionStreamManager, parse_kis_domestic_execution, parse_kis_overseas_execution, parse_upbit_my_order, upbit_websocket_token
+from live_trader.execution_streams import ExecutionStreamManager, parse_binance_execution_report, parse_kis_domestic_execution, parse_kis_overseas_execution, parse_upbit_my_order, upbit_websocket_token
 
 
 class ExecutionStreamTest(unittest.TestCase):
+    def test_binance_execution_report_normalizes_fill(self) -> None:
+        event = parse_binance_execution_report({
+            "subscriptionId": 0,
+            "event": {
+                "e": "executionReport", "E": 1700000000123, "s": "BTCUSDT", "c": "client-1",
+                "S": "BUY", "x": "TRADE", "X": "FILLED", "i": 42, "l": "0.01", "L": "43000", "n": "0.00001", "t": 7,
+            },
+        })
+        self.assertIsNotNone(event)
+        self.assertEqual("binance", event["broker_id"])
+        self.assertEqual("filled", event["state"])
+        self.assertEqual("42", event["broker_order_id"])
+        self.assertEqual(0.01, event["quantity"])
+
     def test_execution_log_rotates_with_bounded_backups(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manager = ExecutionStreamManager(Path(temporary), log_max_bytes=1024, log_backup_count=2)

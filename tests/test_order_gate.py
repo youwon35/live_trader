@@ -42,6 +42,36 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(state.PreTradeContext.__module__, "trading_runtime.risk_engine")
         self.assertEqual(state.StrategyExecutionRunner.__module__, "trading_runtime.strategy_runner")
 
+    def test_submitted_order_cancel_calls_broker_before_local_transition(self) -> None:
+        order = {
+            "order_id": "ord-live-1",
+            "state": "acknowledged",
+            "queue_state": "submitted",
+            "dry_run": False,
+            "broker_id": "binance",
+            "broker_order_id": "778899",
+            "symbol": "BTCUSDT",
+            "asset": "crypto",
+            "qty": "0.01",
+            "broker_request": {"broker_id": "binance", "symbol": "BTCUSDT"},
+        }
+        state.STATE["orders"] = [order]
+
+        class FakeRouter:
+            def cancel_order(self, broker_id, broker_order_id, **context):
+                self.called = (broker_id, broker_order_id, context)
+                return {"ok": True, "json": {"status": "CANCELED"}}
+
+        fake_router = FakeRouter()
+        with patch("live_trader.state.LiveBrokerRouter", return_value=fake_router):
+            result = state.cancel_order("ord-live-1")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(("binance", "778899"), fake_router.called[:2])
+        self.assertEqual("BTCUSDT", fake_router.called[2]["symbol"])
+        self.assertEqual("canceled", order["state"])
+        self.assertIn("broker_cancel_response", order)
+
     def test_strategy_market_data_uses_shared_canonical_event(self) -> None:
         strategy = {
             "symbol": "BTCUSDT",
