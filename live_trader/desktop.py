@@ -8,7 +8,7 @@ from pathlib import Path
 from .server import start_in_thread
 from .env_loader import default_runtime_data_root
 
-WINDOW_STATE_VERSION = 3
+WINDOW_STATE_VERSION = 4
 DEFAULT_WINDOW_WIDTH = 1360
 DEFAULT_WINDOW_HEIGHT = 820
 DEFAULT_WINDOW_X = 3840
@@ -33,7 +33,7 @@ def main() -> None:
             height=window_state["height"],
             x=window_state["x"],
             y=window_state["y"],
-            maximized=True,
+            maximized=window_state["maximized"],
             min_size=(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT),
         )
 
@@ -95,7 +95,7 @@ def _window_state_path() -> Path:
     return _app_data_root() / "window_state.json"
 
 
-def _load_window_state() -> dict[str, int]:
+def _load_window_state() -> dict[str, int | bool]:
     defaults = _default_window_state()
     try:
         data = json.loads(_window_state_path().read_text(encoding="utf-8"))
@@ -108,15 +108,17 @@ def _load_window_state() -> dict[str, int]:
         "height": _clamp_int(data.get("height"), DEFAULT_WINDOW_HEIGHT, MIN_WINDOW_HEIGHT, 4320),
         "x": _clamp_int(data.get("x"), DEFAULT_WINDOW_X, -16384, 16384),
         "y": _clamp_int(data.get("y"), DEFAULT_WINDOW_Y, -16384, 16384),
+        "maximized": bool(data.get("maximized")),
     }
 
 
-def _default_window_state() -> dict[str, int]:
+def _default_window_state() -> dict[str, int | bool]:
     return {
         "width": DEFAULT_WINDOW_WIDTH,
         "height": DEFAULT_WINDOW_HEIGHT,
         "x": DEFAULT_WINDOW_X,
         "y": DEFAULT_WINDOW_Y,
+        "maximized": True,
     }
 
 
@@ -132,7 +134,14 @@ def _save_window_state(window: object | None) -> None:
         root.mkdir(parents=True, exist_ok=True)
         _window_state_path().write_text(
             json.dumps(
-                {"version": WINDOW_STATE_VERSION, "width": width, "height": height, "x": x, "y": y},
+                {
+                    "version": WINDOW_STATE_VERSION,
+                    "width": width,
+                    "height": height,
+                    "x": x,
+                    "y": y,
+                    "maximized": _read_window_maximized(window),
+                },
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -156,6 +165,13 @@ def _read_window_dimension(window: object, name: str, minimum: int, maximum: int
         "y": DEFAULT_WINDOW_Y,
     }
     return _clamp_int(value, fallbacks[name], minimum, maximum)
+
+
+def _read_window_maximized(window: object) -> bool:
+    try:
+        return str(getattr(getattr(window, "native", None), "WindowState", "")).lower().endswith("maximized")
+    except (AttributeError, OSError, RuntimeError, TypeError):
+        return False
 
 
 def _clamp_int(value: object, fallback: int, minimum: int, maximum: int) -> int:
