@@ -4,12 +4,25 @@ import base64
 import hashlib
 import hmac
 import json
+from pathlib import Path
+import tempfile
 import unittest
 
-from live_trader.execution_streams import parse_kis_domestic_execution, parse_kis_overseas_execution, parse_upbit_my_order, upbit_websocket_token
+from live_trader.execution_streams import ExecutionStreamManager, parse_kis_domestic_execution, parse_kis_overseas_execution, parse_upbit_my_order, upbit_websocket_token
 
 
 class ExecutionStreamTest(unittest.TestCase):
+    def test_execution_log_rotates_with_bounded_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = ExecutionStreamManager(Path(temporary), log_max_bytes=1024, log_backup_count=2)
+            manager._status["upbit"] = {"lastEventAt": ""}
+            for index in range(30):
+                manager._record("upbit", {"event_id": f"event-{index}", "occurred_at": "now", "detail": "x" * 120})
+            log_dir = Path(temporary) / "logs"
+            self.assertTrue((log_dir / "broker_execution_stream.jsonl").exists())
+            self.assertTrue((log_dir / "broker_execution_stream.jsonl.1").exists())
+            self.assertFalse((log_dir / "broker_execution_stream.jsonl.3").exists())
+
     def test_upbit_jwt_is_hs512_and_signature_is_valid(self) -> None:
         token = upbit_websocket_token("access", "secret", "fixed-nonce")
         header, payload, signature = token.split(".")

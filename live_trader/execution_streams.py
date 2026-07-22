@@ -112,8 +112,10 @@ def _float(value: Any) -> float:
 class ExecutionStreamManager:
     """Reconnectable private order/execution streams with a durable audit log."""
 
-    def __init__(self, data_root: Path) -> None:
+    def __init__(self, data_root: Path, *, log_max_bytes: int = 5 * 1024 * 1024, log_backup_count: int = 3) -> None:
         self.data_root = Path(data_root)
+        self.log_max_bytes = max(1024, int(log_max_bytes))
+        self.log_backup_count = max(1, int(log_backup_count))
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._threads: dict[str, threading.Thread] = {}
@@ -280,7 +282,26 @@ class ExecutionStreamManager:
         with self._lock:
             self._events[broker_id].append(dict(event))
             self._status[broker_id]["lastEventAt"] = str(event.get("occurred_at") or "")
-        log_dir = self.data_root / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with (log_dir / "broker_execution_stream.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+            log_dir = self.data_root / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / "broker_execution_stream.jsonl"
+            line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+            self._rotate_log_if_needed(path, len(line.encode("utf-8")))
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+
+    def _rotate_log_if_needed(self, path: Path, incoming_bytes: int) -> None:
+        try:
+            current_size = path.stat().st_size
+        except FileNotFoundError:
+            return
+        if current_size + incoming_bytes <= self.log_max_bytes:
+            return
+        oldest = path.with_name(f"{path.name}.{self.log_backup_count}")
+        if oldest.exists():
+            oldest.unlink()
+        for index in range(self.log_backup_count - 1, 0, -1):
+            source = path.with_name(f"{path.name}.{index}")
+            if source.exists():
+                source.replace(path.with_name(f"{path.name}.{index + 1}"))
+        path.replace(path.with_name(f"{path.name}.1"))

@@ -13,11 +13,18 @@ node ..\scripts\desktop_scale_click_contract.mjs --app live_trader --app-root $P
 
 .\.venv\Scripts\python.exe tools\create_icon.py
 
-if (Test-Path "build") {
-  Remove-Item -Recurse -Force "build"
+$liveTraderRunning = @(Get-Process -Name "LiveTrader" -ErrorAction SilentlyContinue).Count -gt 0
+$distPath = if ($liveTraderRunning) { "release_pending" } else { "release" }
+$workPath = if ($liveTraderRunning) { "build_pending" } else { "build" }
+
+if (Test-Path $workPath) {
+  Remove-Item -Recurse -Force $workPath
 }
-if (Test-Path "release") {
-  Remove-Item -Recurse -Force "release"
+if (Test-Path $distPath) {
+  Remove-Item -Recurse -Force $distPath
+}
+if ($liveTraderRunning) {
+  Write-Host "LiveTrader is running; building the replacement binary in $distPath without interrupting monitoring."
 }
 
 $root = (Get-Location).Path
@@ -31,9 +38,9 @@ if (-not (Test-Path -LiteralPath $sharedRuntime)) {
   --onefile `
   --name LiveTrader `
   --icon "$root\assets\app-icon.ico" `
-  --distpath release `
-  --workpath build `
-  --specpath build `
+  --distpath $distPath `
+  --workpath $workPath `
+  --specpath $workPath `
   --add-data "$root\dist;dist" `
   --add-data "$sharedRuntime\trading_runtime\data\market_calendars;trading_runtime\data\market_calendars" `
   --paths "$sharedRuntime" `
@@ -48,3 +55,5 @@ if (-not (Test-Path -LiteralPath $sharedRuntime)) {
   --hidden-import Crypto.Util.Padding `
   --collect-submodules webview `
   live_trader\__main__.py
+
+Write-Host "Created LiveTrader executable: $(Join-Path $root "$distPath\LiveTrader.exe")"

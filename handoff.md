@@ -912,3 +912,13 @@ API 없이 실제 실행한 기능:
 - 장마감 관찰 중 Windows가 상태 JSON 교체를 잠깐 거부해 Paper runtime이 한 번 정지했다. `DurableRuntimeState.write()`가 WinError 5/32를 지수형 짧은 재시도로 흡수하도록 보강했고 회귀 테스트를 추가했다.
 - 수정 후 05:00 KST 확정 봉에서 AAPL RSI(5)=73.65, AMZN RSI(7)=54.78을 각각 정확히 한 번 평가해 둘 다 자연 HOLD였다. 15초 뒤에도 RUNNING, bar 2, decision 2, HOLD 2, duplicate 0, error 없음으로 다음 봉 대기를 확인했다.
 - 공식 `overseas_stock_functions_ws.py`의 H0GSCNI0 25개 컬럼 순서에 맞춰 해외 체결도 symbol/side/quantity/price/state로 정규화하고 회귀 테스트를 추가했다.
+
+## 2026-07-22 장기 실행 자원 상한과 무중단 대기 빌드
+
+- private execution queue는 broker별 1,000개 상한을 유지한다. `broker_execution_stream.jsonl`은 5MB 단위로 회전하며 백업은 3개까지만 보존한다.
+- 공용 realtime feed 중복키와 runtime 평가키는 각각 10,000개로 제한했다. REST fallback 최소 간격은 일봉 60초, 1시간봉 15초, 15분봉 5초다.
+- 30초 실측에서 MONITOR daemon은 CPU 1.063초(단일 코어 약 3.54%), working set 61.55~64.63MB, private memory 58.72~60.66MB, handle 294→295, thread 8개였다.
+- Live 88 tests와 새 EXE `--help` smoke가 통과했다.
+- 운영 중인 `TradingSystem-LiveTrader-Monitor` 중단 승인이 없어 기존 `release\LiveTrader.exe`는 계속 감시 중이다. 새 코드는 `release_pending\LiveTrader.exe`에 무중단 빌드했다.
+- pending EXE SHA-256은 `6D26987EB90632A9DE4BA3A4BAA50CCBCC2AE9CAA8E8262E34D988B01799F979`다. active EXE SHA-256은 `9D75EDE07B5A83BA5AC9E6B9901F62C348FF9671B8C7A3C540839C5EFD9DFD1F`다.
+- `build_exe.ps1`은 LiveTrader 실행 중이면 `release_pending`/`build_pending`을 사용한다. pending EXE를 예약 감시에 적용하려면 사용자에게 짧은 daemon 중단·교체·재시작을 명시적으로 승인받아야 한다.
