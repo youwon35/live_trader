@@ -953,3 +953,13 @@ API 없이 실제 실행한 기능:
 - 실제 계좌에서 0.0001 BTC 시장가 매수가 65,588.48 USDT에 FILLED 됐다. USDT는 약 30.36→23.80, BTC는 약 0.00000451→0.00010441로 반영됐고 체결 스트림 5건 저장, 대조 mismatch 0을 확인했다.
 - 검증 뒤 실주문 플래그를 false, MONITOR/Dry Run/신규 진입 차단 상태로 복구하고 runtime을 중지했다. 구매 BTC는 계좌에 남아 다음 실행 시 보유 포지션으로 인식된다.
 - Live unittest 103개, 공통 runtime 90개, Vite build, 10화면 UI smoke, PyInstaller 패키징이 통과했다. Windows 시장 캘린더를 위해 `tzdata`도 실행 파일에 포함했다.
+
+## 2026-07-24 브로커 기준 운영·자동 승급/중지·재시작 복구
+
+- 주문 의도, OMS, 브로커 접수, 체결 이벤트, 프로그램 원장을 같은 `trace_id`로 연결하고 주문–trace 인덱스를 체크포인트에 포함했다.
+- 브로커 포지션을 최종 진실로 원장 기대 수량과 대조한다. API 미확인이나 수량 불일치가 있으면 신규 진입을 자동 차단한다.
+- 해당 브로커의 fresh position snapshot이 있을 때만 Before Live-Small 후보를 자동 승급하거나, Live 전략을 대조 불일치로 자동 일시정지한다.
+- 재시작 시 체크포인트·미확정 주문·누락 봉·멱등성 인덱스를 합친 복구 계획을 만들며 MONITOR에서 안전하게 복구한다.
+- 운영 대조 패널에 진실 원본과 접힌 체결 Trace·복구 계획을 추가해 기존 화면 밀도를 유지했다.
+- Live Python 104개, Vite build, 2개 뷰포트×5개 탭 UI smoke에서 overflow·이탈 control·console 오류 0건이 통과했다.
+- 최신 `release\LiveTrader.exe`를 재생성하고 `--help` 기동 smoke를 통과했다. SHA-256 `A5FC5559E7ACBCB72D737182583594F133D654593708CCB23A5776AFB0F58F1B`.

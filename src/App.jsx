@@ -198,6 +198,9 @@ const fallbackSnapshot = {
     execution_event_count: 0,
   },
   execution_events: { last_poll: null, errors: [], event_count: 0, recorded_count: 0, recent: [] },
+  broker_position_truth: { sourceOfTruth: "broker", matched: false, newEntriesBlocked: true, mismatchCount: 0, lines: [] },
+  restart_recovery_plan: { canResume: false, requiredMode: "MONITOR", newEntriesBlocked: true, riskReductionAllowed: true, blockers: ["checkpoint-invalid"], actions: ["load-last-valid-checkpoint"] },
+  automatic_promotion: { lastRun: null, results: [] },
   upbit_smoke_order: {
     status: "idle",
     status_label: "미리보기 필요",
@@ -1595,9 +1598,11 @@ function WorkspaceContent({
       <div className="content-column">
         <ReconciliationSummaryPanel
           apiConnected={snapshot.api_connected === true}
+          brokerTruth={snapshot.broker_position_truth}
           reconciliation={snapshot.reconciliation}
           programLedger={snapshot.program_ledger}
           executionEvents={snapshot.execution_events}
+          recoveryPlan={snapshot.restart_recovery_plan}
           onReconcile={onReconcile}
           onProgramLedgerBaseline={onProgramLedgerBaseline}
           onExecutionEvents={onExecutionEvents}
@@ -1789,6 +1794,7 @@ function LivePreparationPanel({
             }}
           />
           <LiveStrategySelectorPanel
+            automaticPromotion={snapshot.automatic_promotion}
             strategies={filteredStrategies}
             selectedStrategy={selectedStrategy}
             onSelect={setSelectedStrategyId}
@@ -3211,7 +3217,7 @@ function BrokerRequirementsPanel({ brokers }) {
   );
 }
 
-function ReconciliationSummaryPanel({ apiConnected, reconciliation, programLedger, executionEvents, onReconcile, onProgramLedgerBaseline, onExecutionEvents }) {
+function ReconciliationSummaryPanel({ apiConnected, brokerTruth, reconciliation, programLedger, executionEvents, recoveryPlan, onReconcile, onProgramLedgerBaseline, onExecutionEvents }) {
   const summary = reconciliation?.summary ?? fallbackSnapshot.reconciliation.summary;
   const actions = reconciliation?.next_actions ?? [];
   const items = [
@@ -3224,6 +3230,8 @@ function ReconciliationSummaryPanel({ apiConnected, reconciliation, programLedge
   ];
   const ledger = programLedger ?? fallbackSnapshot.program_ledger;
   const events = executionEvents ?? fallbackSnapshot.execution_events;
+  const truth = brokerTruth ?? fallbackSnapshot.broker_position_truth;
+  const recovery = recoveryPlan ?? fallbackSnapshot.restart_recovery_plan;
   const ledgerItems = [
     { label: "원장 현금", value: ledger.cash_count ?? 0, tone: ledger.cash_count ? "success" : "warning" },
     { label: "원장 포지션", value: ledger.position_count ?? 0, tone: ledger.position_count ? "success" : "warning" },
@@ -3266,10 +3274,31 @@ function ReconciliationSummaryPanel({ apiConnected, reconciliation, programLedge
         ))}
       </div>
       <div className="ledger-footnote">
+        <span>포지션 진실 원본: {truth.sourceOfTruth ?? "broker"} · {truth.newEntriesBlocked ? "신규 진입 차단" : "일치"}</span>
         <span>프로그램 원장: {ledger.path ?? "-"}</span>
         <span>마지막 체결 동기화: {events.last_poll ?? "미실행"}</span>
         {events.errors?.length ? <span>이벤트 어댑터 확인 필요 {events.errors.length}건</span> : null}
       </div>
+      <details className="operations-trace-disclosure">
+        <summary>
+          체결 Trace · 재시작 복구
+          <StatusPill tone={recovery.canResume ? "success" : "warning"}>{recovery.canResume ? "RESUME READY" : "MONITOR ONLY"}</StatusPill>
+        </summary>
+        <div className="operations-trace-list">
+          {(events.recent ?? []).slice(0, 6).map((event) => (
+            <article key={event.event_id}>
+              <strong>{event.symbol || event.broker_id} · {event.state}</strong>
+              <span>{event.trace_id || "legacy/no-trace"}</span>
+              <em>{event.occurred_at}</em>
+            </article>
+          ))}
+          {!(events.recent ?? []).length && <p>아직 체결 trace가 없습니다.</p>}
+          <p>
+            복구: {(recovery.actions ?? []).join(" · ")}
+            {(recovery.blockers ?? []).length ? ` / 차단 ${recovery.blockers.join(", ")}` : ""}
+          </p>
+        </div>
+      </details>
     </section>
   );
 }
@@ -3425,6 +3454,7 @@ function LaunchReportPanel({ report }) {
 }
 
 function LiveStrategySelectorPanel({
+  automaticPromotion,
   strategies,
   selectedStrategy,
   onSelect,
@@ -3438,6 +3468,9 @@ function LiveStrategySelectorPanel({
   const promotionStage = selectedStrategy?.promotion?.stage || selectedStrategy?.promotion_stage || selectedStrategy?.lifecycle_status || "unknown";
   const normalizedStage = normalizePromotionStage(promotionStage);
   const execution = liveSmallExecutionSummaryForStrategy(selectedStrategy?.strategy_id, orders);
+  const automaticResult = (automaticPromotion?.results ?? []).find(
+    (item) => item.strategyId === selectedStrategy?.strategy_id,
+  );
   const lifecycleTimeline = buildLiveLifecycleTimeline(selectedStrategy);
   const canPromoteLive = Boolean(
     selectedStrategy
@@ -3475,6 +3508,11 @@ function LiveStrategySelectorPanel({
             <MetricCard className="metric-card" label="Release" value={selectedStrategy.release?.release_id || selectedStrategy.release_id || "-"} detail={selectedStrategy.release?.parameter_hash || "parameter hash 없음"} />
           </div>
           <div className="live-strategy-promotion-line">
+            {automaticResult && (
+              <StatusPill tone={automaticResult.action === "PROMOTE" ? "success" : automaticResult.action === "PAUSE" ? "danger" : "warning"}>
+                AUTO {automaticResult.action}
+              </StatusPill>
+            )}
             <ActionButton
               className="secondary-button"
               disabled={!canPromoteLive}

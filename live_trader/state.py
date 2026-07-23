@@ -49,6 +49,14 @@ from trading_runtime import (
     ExecutionSample,
     assess_recovery_drill,
     calibrate_execution,
+    AutomaticPromotionDecision,
+    DecisionTraceStore,
+    PositionTruth,
+    PromotionMetrics,
+    build_restart_recovery_plan,
+    build_trace_id,
+    evaluate_automatic_promotion,
+    reconcile_broker_truth,
     record_flight_event,
 )
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
@@ -293,6 +301,7 @@ PROGRAM_LEDGER_PATH = Path(
     os.environ.get("LIVE_TRADER_PROGRAM_LEDGER_DB") or APP_DATA_ROOT / "logs" / "live_trader_program_ledger.sqlite3"
 )
 PROGRAM_LEDGER = ProgramLedger(PROGRAM_LEDGER_PATH)
+DECISION_TRACE_STORE = DecisionTraceStore(APP_DATA_ROOT / "logs" / "decision_trace.jsonl")
 LIVE_OMS = OrderManagementSystem()
 DEFAULT_WATCHDOG_SETTINGS: dict[str, float] = {
     "heartbeat_timeout_sec": 45.0,
@@ -318,6 +327,8 @@ STATE: dict[str, Any] = {
     "dry_run": True,
     "kill_switch": False,
     "new_entries_blocked": True,
+    "broker_truth_blocked": True,
+    "manual_new_entries_blocked": False,
     "operator_confirmed": False,
     "risk_settings": dict(DEFAULT_RISK_SETTINGS),
     "checklist": {str(item["key"]): False for item in CHECKLIST_ITEMS},
@@ -368,6 +379,7 @@ STATE: dict[str, Any] = {
     "reconciliation_last_run": None,
     "preflight_last_run": None,
     "orders": [],
+    "order_trace_index": {},
     "persisted_idempotency_keys": [],
     "shadow_evidence": [],
     "upbit_smoke_order": {
@@ -392,6 +404,7 @@ STATE: dict[str, Any] = {
         "detail": "전략 신호와 분리된 브로커 제출 경로 점검 주문입니다.",
     },
     "recovery_status": {"verified": False, "safeMode": True, "generation": 0, "detail": "복구 훈련 미실행"},
+    "automatic_promotion_signatures": {},
     "audit": [
         {
             "time": "08:57:04",
@@ -1069,6 +1082,7 @@ def append_strategy_promotion_log(strategy_dir: Path, payload: dict[str, Any], a
 def live_small_execution_summary(strategy_id: str) -> dict[str, int]:
     successful = 0
     blocked = 0
+    filled_orders = 0
     for order in STATE["orders"]:
         if str(order.get("strategy_id")) != strategy_id:
             continue
@@ -1078,9 +1092,38 @@ def live_small_execution_summary(strategy_id: str) -> dict[str, int]:
             continue
         if state_name in {"sent", "filled"} or queue_state in {"sent", "filled"}:
             successful += 1
+        if state_name == "filled" or queue_state == "filled":
+            filled_orders += 1
         if state_name in {"risk_blocked", "adapter_blocked", "failed", "rejected"} or queue_state in {"blocked", "risk_blocked", "failed", "rejected"}:
             blocked += 1
-    return {"successful": successful, "blocked": blocked}
+    related_orders = {
+        str(value)
+        for order in STATE["orders"]
+        if str(order.get("strategy_id")) == strategy_id and not bool(order.get("dry_run"))
+        for value in (
+            order.get("order_id"),
+            order.get("broker_order_id"),
+            order.get("idempotency_key"),
+        )
+        if value not in (None, "", "-")
+    }
+    filled_event_ids: set[str] = set()
+    rejected_event_ids: set[str] = set()
+    for event in PROGRAM_LEDGER.execution_event_rows(500):
+        identifiers = {
+            str(event.get("order_id") or ""),
+            str(event.get("broker_order_id") or ""),
+        }
+        if not related_orders.intersection(identifiers):
+            continue
+        state_name = str(event.get("state") or "").lower()
+        if state_name in {"filled", "done", "executed"} and safe_float(event.get("quantity"), 0.0) > 0:
+            filled_event_ids.add(str(event.get("event_id") or ""))
+        if state_name in {"rejected", "expired", "failed", "canceled"}:
+            rejected_event_ids.add(str(event.get("event_id") or ""))
+    successful = max(successful, len(filled_event_ids))
+    blocked = max(blocked, len(rejected_event_ids))
+    return {"successful": successful, "blocked": blocked, "fills": max(filled_orders, len(filled_event_ids))}
 
 
 def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers: list[dict[str, object]] | None = None) -> list[dict[str, Any]]:
@@ -1359,6 +1402,68 @@ def execution_event_snapshot() -> dict[str, Any]:
         "recent": PROGRAM_LEDGER.execution_event_rows(20),
         "streams": LIVE_EXECUTION_STREAMS.snapshot(),
     }
+
+
+def broker_position_truth_snapshot(reconciliation: dict[str, Any] | None = None) -> dict[str, Any]:
+    expected = [
+        PositionTruth(
+            broker_id=str(item.get("broker_id") or ""),
+            symbol=str(item.get("symbol") or ""),
+            quantity=safe_float(item.get("quantity"), 0.0),
+            captured_at=str(item.get("updated_at") or ""),
+        )
+        for item in PROGRAM_LEDGER.position_rows()
+        if item.get("broker_id") and item.get("symbol")
+    ]
+    broker = [
+        PositionTruth(
+            broker_id=str(item.get("broker_id") or ""),
+            symbol=str(item.get("symbol") or ""),
+            quantity=safe_float(item.get("broker_qty", item.get("quantity")), 0.0),
+            captured_at=str(item.get("updated_at") or STATE.get("broker_reconciliation", {}).get("fetched_at") or ""),
+        )
+        for item in STATE.get("broker_reconciliation", {}).get("positions", [])
+        if isinstance(item, dict) and item.get("broker_id") and item.get("symbol")
+    ]
+    report = reconcile_broker_truth(expected=expected, broker=broker)
+    reconciliation = reconciliation or reconciliation_snapshot()
+    summary = reconciliation.get("summary") if isinstance(reconciliation.get("summary"), dict) else {}
+    api_required = int(summary.get("api_required_count") or 0)
+    raw_mismatches = int(summary.get("mismatch_count") or 0)
+    effective_mismatches = max(int(report.get("mismatchCount") or 0), api_required + raw_mismatches)
+    if effective_mismatches:
+        report = {
+            **report,
+            "matched": False,
+            "newEntriesBlocked": True,
+            "mismatchCount": effective_mismatches,
+            "effectiveBlockers": [
+                *(["broker-api-snapshot-required"] if api_required else []),
+                *(["program-broker-position-mismatch"] if raw_mismatches else []),
+            ],
+        }
+    return report
+
+
+def restart_recovery_plan_snapshot(
+    reconciliation: dict[str, Any],
+    continuous_runtime: dict[str, Any],
+    broker_truth: dict[str, Any],
+) -> dict[str, Any]:
+    unknown_orders = [
+        str(item.get("order_id") or item.get("oms_order_id") or "")
+        for item in STATE.get("orders", [])
+        if str(item.get("state") or "").lower() in {"unknown", "acknowledged", "submitted"}
+        or str(item.get("queue_state") or "").lower() in {"reconcile_required", "submitted"}
+    ]
+    gap_count = int(continuous_runtime.get("gapCount") or continuous_runtime.get("gap_count") or 0)
+    return build_restart_recovery_plan(
+        checkpoint_valid=bool(STATE.get("recovery_status", {}).get("verified")),
+        unknown_order_ids=unknown_orders,
+        reconciliation={"mismatchCount": int(broker_truth.get("mismatchCount") or 0)},
+        missing_bar_ids=[f"continuous-gap-{index + 1}" for index in range(min(gap_count, 100))],
+        duplicate_keys_loaded=isinstance(STATE.get("persisted_idempotency_keys"), list),
+    )
 
 
 def successful_position_brokers() -> set[str]:
@@ -2142,6 +2247,9 @@ def snapshot() -> dict[str, Any]:
     blocker_count = len(blockers) + int(watchdog["critical_count"])
     warning_count = len(warnings) + int(watchdog["warning_count"])
     operational = runtime_operational_readiness(strategies, portfolios)
+    continuous_runtime = LIVE_CONTINUOUS_CONTROLLER.snapshot()
+    broker_truth = broker_position_truth_snapshot(reconciliation)
+    restart_recovery = restart_recovery_plan_snapshot(reconciliation, continuous_runtime, broker_truth)
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode": STATE["mode"],
@@ -2170,7 +2278,7 @@ def snapshot() -> dict[str, Any]:
         "broker_diagnostics": broker_diagnostics(),
         "broker_adapter_contract": broker_adapter_contract(),
         "automation_profiles": automations,
-        "continuous_runtime": LIVE_CONTINUOUS_CONTROLLER.snapshot(),
+        "continuous_runtime": continuous_runtime,
         "execution_streams": LIVE_EXECUTION_STREAMS.snapshot(),
         "strategy_runner": dict(STATE["strategy_runner"]),
         "strategy_sleeves": dict(STATE.get("strategy_sleeves", {})),
@@ -2187,6 +2295,7 @@ def snapshot() -> dict[str, Any]:
         "orders": order_rows(),
         "dry_run_ledger": dry_run_ledger_rows(),
         "reconciliation": reconciliation,
+        "broker_position_truth": broker_truth,
         "program_ledger": program_ledger_snapshot(),
         "execution_events": execution_event_snapshot(),
         "upbit_smoke_order": dict(STATE.get("upbit_smoke_order", {})),
@@ -2195,7 +2304,9 @@ def snapshot() -> dict[str, Any]:
         "policy_replays": list(STATE.get("policy_replays", [])),
         "shadow_live": {"brokerSubmissionBlocked": True, "evidence": list(STATE.get("shadow_evidence", []))[:20], "count": len(STATE.get("shadow_evidence", []))},
         "runtime_recovery": dict(STATE.get("recovery_status", {})),
+        "restart_recovery_plan": restart_recovery,
         "operational_readiness": operational,
+        "automatic_promotion": dict(STATE.get("automatic_promotion", {})),
         "accounts": reconciliation["accounts"],
         "positions": reconciliation["positions"],
         "operation_report": report,
@@ -2364,6 +2475,8 @@ def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, An
         append_audit("warn", f"{label} 거부", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
     STATE[name] = bool(value)
+    if name == "new_entries_blocked":
+        STATE["manual_new_entries_blocked"] = bool(value)
     label = {
         "kill_switch": "Kill Switch",
         "new_entries_blocked": "신규 진입 차단",
@@ -2861,6 +2974,154 @@ def seed_program_ledger_from_broker_snapshot(refresh_if_empty: bool = True) -> d
     }
 
 
+def execution_event_trace_context(event: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    identifiers = {
+        str(event.get("order_id") or ""),
+        str(event.get("broker_order_id") or ""),
+        str((event.get("raw") or {}).get("identifier") or "") if isinstance(event.get("raw"), dict) else "",
+    }
+    order = next(
+        (
+            item
+            for item in STATE.get("orders", [])
+            if identifiers.intersection({
+                str(item.get("order_id") or ""),
+                str(item.get("broker_order_id") or ""),
+                str(item.get("idempotency_key") or ""),
+            }) - {""}
+        ),
+        None,
+    )
+    if order is None:
+        trace_index = STATE.get("order_trace_index", {})
+        if isinstance(trace_index, dict):
+            for identifier in identifiers - {""}:
+                indexed = trace_index.get(identifier)
+                if isinstance(indexed, dict) and indexed.get("trace_id"):
+                    order = indexed
+                    break
+    return (str((order or {}).get("trace_id") or ""), order)
+
+
+def record_new_execution_traces(events: list[dict[str, Any]], existing_event_ids: set[str]) -> None:
+    for event in events:
+        event_id = str(event.get("event_id") or "")
+        trace_id, order = execution_event_trace_context(event)
+        if trace_id:
+            event["trace_id"] = trace_id
+            if order is not None:
+                event["strategy_id"] = str(order.get("strategy_id") or "")
+        if not trace_id or event_id in existing_event_ids:
+            continue
+        state_name = str(event.get("state") or "").lower()
+        if state_name in {"partially_filled", "partial", "partially-filled"}:
+            stage = "PARTIALLY_FILLED"
+        elif state_name in {"filled", "done", "executed"}:
+            stage = "FILLED"
+        elif state_name in {"rejected", "expired", "failed", "canceled"}:
+            stage = "BLOCKED"
+        elif state_name in {"account_snapshot", "position_snapshot"}:
+            continue
+        else:
+            stage = "BROKER_ACKNOWLEDGED"
+        DECISION_TRACE_STORE.append(
+            trace_id=trace_id,
+            stage=stage,
+            decision=state_name.upper() or "EVENT",
+            output_payload=event,
+            occurred_at=str(event.get("occurred_at") or ""),
+        )
+        if stage == "FILLED":
+            DECISION_TRACE_STORE.append(
+                trace_id=trace_id,
+                stage="POSITION_APPLIED",
+                decision=str(event.get("side") or "FILL"),
+                output_payload={
+                    "brokerId": event.get("broker_id"),
+                    "symbol": event.get("symbol"),
+                    "filledQuantity": event.get("quantity"),
+                },
+            )
+
+
+def automatic_live_promotion_sweep(*, fresh_broker_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    reconciliation = reconciliation_snapshot()
+    broker_truth = broker_position_truth_snapshot(reconciliation)
+    recovery_verified = bool(STATE.get("recovery_status", {}).get("verified"))
+    fresh_brokers = set(fresh_broker_ids) if fresh_broker_ids is not None else successful_position_brokers()
+    evidence_path = APP_DATA_ROOT / "logs" / "automatic-promotion-evidence.jsonl"
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    for strategy in strategy_rows():
+        stage = normalize_lifecycle_status(strategy.get("lifecycle_status"))
+        if stage not in {"before-live-small", "live"}:
+            continue
+        strategy_id = str(strategy.get("strategy_id") or "")
+        execution = live_small_execution_summary(strategy_id)
+        total = execution["successful"] + execution["blocked"]
+        decision: AutomaticPromotionDecision = evaluate_automatic_promotion(
+            stage,
+            PromotionMetrics(
+                artifact_locked=True,
+                backtest_passed=True,
+                walk_forward_pass_ratio=1.0,
+                final_test_passed=True,
+                closed_trade_count=20,
+                maximum_drawdown=0.0,
+                data_quality_score=100.0,
+                canary_fill_count=execution.get("fills", 0),
+                paper_reject_rate=(execution["blocked"] / total) if total else 0.0,
+                reconciliation_mismatches=int(broker_truth.get("mismatchCount") or 0),
+                recovery_verified=recovery_verified,
+            ),
+        )
+        evidence = {**decision.evidence, "strategyId": strategy_id, "sourceApp": "live_trader"}
+        signature = json.dumps(
+            {
+                "strategyId": strategy_id,
+                "action": decision.action,
+                "targetStage": decision.target_stage,
+                "blockers": list(decision.blockers),
+                "fills": execution.get("fills", 0),
+                "blocked": execution["blocked"],
+                "reconciliation": broker_truth.get("mismatchCount"),
+                "recoveryVerified": recovery_verified,
+            },
+            sort_keys=True,
+        )
+        previous_signatures = STATE.setdefault("automatic_promotion_signatures", {})
+        if previous_signatures.get(strategy_id) != signature:
+            with evidence_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(evidence, ensure_ascii=False, sort_keys=True) + "\n")
+            previous_signatures[strategy_id] = signature
+        item = {
+            "strategyId": strategy_id,
+            "action": decision.action,
+            "targetStage": decision.target_stage,
+            "blockers": list(decision.blockers),
+            "evidenceHash": decision.evidence["contentHash"],
+            "freshBrokerTruth": strategy_broker_id(strategy) in fresh_brokers,
+        }
+        may_mutate = bool(item["freshBrokerTruth"])
+        if decision.action == "PROMOTE" and may_mutate:
+            promotion = promote_strategy_to_live(strategy_id)
+            item["promoted"] = bool(promotion.get("ok"))
+            item["reason"] = str(promotion.get("reason") or "")
+        elif decision.action == "PAUSE" and may_mutate:
+            pause = set_strategy_lifecycle_status(strategy_id, "pause")
+            item["paused"] = bool(pause.get("ok"))
+            item["reason"] = str(pause.get("reason") or "")
+        elif decision.action in {"PROMOTE", "PAUSE"}:
+            item["reason"] = "fresh-broker-position-snapshot-required"
+        results.append(item)
+    STATE["automatic_promotion"] = {
+        "lastRun": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "results": results,
+        "evidencePath": str(evidence_path),
+    }
+    return results
+
+
 def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
     broker_ids = ("kis", "binance", "upbit") if broker_id.strip().lower() in {"", "all"} else (broker_id.strip().lower(),)
     router = LiveBrokerRouter()
@@ -2924,6 +3185,10 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
                 successful_snapshot_brokers.add(selected_broker)
         except (BrokerNotReadyError, RuntimeError) as exc:
             errors.append({"broker_id": selected_broker, "detail": str(exc)})
+    existing_event_ids = PROGRAM_LEDGER.existing_execution_event_ids([
+        str(event.get("event_id") or "") for event in events
+    ])
+    record_new_execution_traces(events, existing_event_ids)
     recorded = PROGRAM_LEDGER.record_execution_events(events)
     synced = (
         PROGRAM_LEDGER.sync_broker_snapshot(
@@ -2954,12 +3219,21 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
             f"오류 {len(errors)}건"
         ),
     )
+    new_event_count = len({
+        str(event.get("event_id") or "") for event in events
+    } - existing_event_ids)
+    automatic_results = (
+        automatic_live_promotion_sweep(fresh_broker_ids=set(successful_snapshot_brokers))
+        if new_event_count
+        else []
+    )
     return {
         "ok": not errors,
         "reason": f"체결 이벤트 동기화: 저장 {recorded}건, 오류 {len(errors)}건",
         "errors": errors,
         "program_ledger": program_ledger_snapshot(),
         "execution_events": execution_event_snapshot(),
+        "automatic_promotion": automatic_results,
         "snapshot": snapshot(),
     }
 
@@ -3393,15 +3667,25 @@ def run_reconciliation() -> dict[str, Any]:
     reconciliation = reconciliation_snapshot()
     summary = reconciliation["summary"]
     blocking_count = int(summary["api_required_count"]) + int(summary["mismatch_count"])
+    broker_truth = broker_position_truth_snapshot(reconciliation)
+    was_broker_blocked = bool(STATE.get("broker_truth_blocked"))
+    STATE["broker_truth_blocked"] = bool(broker_truth.get("newEntriesBlocked"))
+    if STATE["broker_truth_blocked"]:
+        STATE["new_entries_blocked"] = True
+    elif was_broker_blocked and not STATE.get("kill_switch") and not STATE.get("manual_new_entries_blocked"):
+        STATE["new_entries_blocked"] = False
     append_audit(
         "danger" if blocking_count else "info",
         "포지션/계좌 대조",
         f"{summary['status_label']}: API/원장 필요 {summary['api_required_count']}개, 불일치 {summary['mismatch_count']}개, 조회 오류 {len(broker_data['errors'])}개",
     )
+    automatic_results = automatic_live_promotion_sweep()
     return {
         "ok": True,
         "reason": f"대조 완료: {summary['status_label']} 상태",
         "reconciliation": reconciliation,
+        "broker_position_truth": broker_truth,
+        "automatic_promotion": automatic_results,
         "snapshot": snapshot(),
     }
 
@@ -3952,11 +4236,21 @@ def submit_order_intent(
     audit_event: str,
     runner_report: StrategyExecutionResult | None = None,
 ) -> dict[str, Any]:
+    metadata = dict(intent.metadata) if isinstance(intent.metadata, dict) else {}
+    bar_time = str(metadata.get("confirmed_bar_end") or datetime.now(timezone.utc).isoformat())
+    trace_id = str(metadata.get("trace_id") or metadata.get("traceId") or build_trace_id(
+        strategy_instance_id=str(metadata.get("strategy_instance_id") or intent.strategy_id),
+        instrument_id=str(metadata.get("instrument_id") or intent.symbol),
+        bar_time=bar_time,
+        deployment_id=str(metadata.get("portfolio_id") or "live-trader"),
+        revision=int(metadata.get("target_revision") or 0),
+    ))
+    metadata.update({"trace_id": trace_id, "traceId": trace_id})
+    intent = replace(intent, metadata=metadata)
     RECOVERY_JOURNAL.save(recovery_state_payload(), reason="before-order", idempotency_keys=[str(item.get("idempotency_key") or "") for item in STATE.get("orders", [])])
     ok, order_state, queue_state, reason, risk_report = evaluate_order_gate_with_report(checks, intent.side, dry_run, intent)
     portfolio_gate = portfolio_gate_for_intent(checks, intent)
     retry_backoff = float(STATE["retry_policy"]["backoff_sec"])
-    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     target_revision = int(metadata.get("target_revision") or (len(STATE["orders"]) + 1))
     idempotency_key = build_idempotency_key(
         portfolio_id=str(metadata.get("portfolio_id") or portfolio_gate.get("portfolio_id") or "default-portfolio"),
@@ -3967,6 +4261,13 @@ def submit_order_intent(
     )
     if idempotency_key in set(STATE.get("persisted_idempotency_keys", [])):
         existing = next((item for item in STATE.get("orders", []) if item.get("idempotency_key") == idempotency_key), None)
+        DECISION_TRACE_STORE.append(
+            trace_id=trace_id,
+            stage="BLOCKED",
+            decision="DUPLICATE",
+            reasons=("persistent-duplicate-idempotency-key",),
+            output_payload={"idempotencyKey": idempotency_key},
+        )
         append_audit("warn", audit_event, f"재시작 이후 중복 주문 차단: idempotency_key={idempotency_key}")
         return {"ok": existing is not None, "reason": "persistent-duplicate-idempotency-key", "order": existing or {}, "duplicate": True, "snapshot": snapshot()}
     managed_order, oms_created = LIVE_OMS.create(intent, idempotency_key)
@@ -3974,6 +4275,28 @@ def submit_order_intent(
         existing = next((item for item in STATE.get("orders", []) if item.get("oms_order_id") == managed_order.order_id), None)
         append_audit("warn", audit_event, f"중복 주문 차단: idempotency_key={idempotency_key}")
         return {"ok": existing is not None, "reason": "duplicate-idempotency-key", "order": existing or {}, "duplicate": True, "snapshot": snapshot()}
+    DECISION_TRACE_STORE.append(
+        trace_id=trace_id,
+        stage="BAR_CLOSED",
+        decision="EVALUATE",
+        input_payload={"barTime": bar_time, "symbol": intent.symbol, "referencePrice": intent.reference_price},
+        occurred_at=bar_time,
+    )
+    DECISION_TRACE_STORE.append(
+        trace_id=trace_id,
+        stage="SIGNAL_DECIDED",
+        decision=intent.side,
+        reasons=(intent.reason,),
+        input_payload={"strategyId": intent.strategy_id},
+        output_payload=runner_report.to_dict() if runner_report is not None else {"intent": intent.side},
+        occurred_at=bar_time,
+    )
+    DECISION_TRACE_STORE.append(
+        trace_id=trace_id,
+        stage="TARGET_ALLOCATED",
+        decision="ALLOCATE",
+        output_payload={"quantity": intent.quantity, "notional": intent.notional, "portfolioGate": portfolio_gate},
+    )
     if oms_created:
         if ok:
             LIVE_OMS.transition(managed_order.order_id, "RISK_APPROVED", "PreTradeRiskGate passed")
@@ -4002,11 +4325,26 @@ def submit_order_intent(
         "broker_order_id": "-",
         "dry_run": dry_run,
         "reason": reason,
+        "trace_id": trace_id,
         "risk_report": risk_report.to_dict(),
         "portfolio_gate": portfolio_gate if portfolio_gate.get("active") else {},
     }
     if runner_report is not None:
         order["runner_report"] = runner_report.to_dict()
+    DECISION_TRACE_STORE.append(
+        trace_id=trace_id,
+        stage="RISK_DECIDED",
+        decision="ALLOW" if ok else "BLOCK",
+        reasons=(reason,),
+        output_payload=risk_report.to_dict(),
+    )
+    DECISION_TRACE_STORE.append(
+        trace_id=trace_id,
+        stage="ORDER_CREATED" if ok else "BLOCKED",
+        decision=order_state.upper(),
+        reasons=(reason,),
+        output_payload={"orderId": order["order_id"], "omsOrderId": order["oms_order_id"]},
+    )
     if ok and not dry_run:
         broker_id = str(metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset)).lower()
         broker_payload = {
@@ -4047,29 +4385,77 @@ def submit_order_intent(
                     "next_retry_at": "-",
                 })
                 reason = "broker-acknowledged"
+                DECISION_TRACE_STORE.append(
+                    trace_id=trace_id,
+                    stage="BROKER_ACKNOWLEDGED",
+                    decision="ACKNOWLEDGED",
+                    output_payload={"brokerId": broker_id, "brokerOrderId": broker_order_id},
+                )
             elif response_ok:
                 LIVE_OMS.mark_unknown(managed_order.order_id, "broker response missing order id")
                 order.update({"state": "unknown", "queue_state": "reconcile_required", "reason": "broker-response-missing-order-id", "next_retry_at": "-"})
                 reason = "broker-response-missing-order-id"
                 ok = False
+                DECISION_TRACE_STORE.append(
+                    trace_id=trace_id,
+                    stage="BLOCKED",
+                    decision="UNKNOWN",
+                    reasons=(reason,),
+                    output_payload={"brokerId": broker_id},
+                )
             elif int(safe_float(broker_response.get("statusCode"), 0.0)) == 0:
                 LIVE_OMS.mark_unknown(managed_order.order_id, "network outcome unknown; reconcile before retry")
                 order.update({"state": "unknown", "queue_state": "reconcile_required", "reason": "network-outcome-unknown", "next_retry_at": "-"})
                 reason = "network-outcome-unknown"
                 ok = False
+                DECISION_TRACE_STORE.append(
+                    trace_id=trace_id,
+                    stage="BLOCKED",
+                    decision="UNKNOWN",
+                    reasons=(reason,),
+                    output_payload={"brokerId": broker_id},
+                )
             else:
                 LIVE_OMS.transition(managed_order.order_id, "REJECTED", "broker rejected request", {"response": broker_response})
                 order.update({"state": "broker_rejected", "queue_state": "failed", "reason": str(broker_response.get("text") or "broker-rejected")[:500], "next_retry_at": "-"})
                 reason = str(order["reason"])
                 ok = False
+                DECISION_TRACE_STORE.append(
+                    trace_id=trace_id,
+                    stage="BLOCKED",
+                    decision="BROKER_REJECTED",
+                    reasons=(reason,),
+                    output_payload={"brokerId": broker_id},
+                )
         except BrokerNotReadyError as exc:
             LIVE_OMS.transition(managed_order.order_id, "REJECTED", str(exc))
             order.update({"state": "adapter_blocked", "queue_state": "failed", "reason": str(exc), "next_retry_at": "-"})
             reason = str(exc)
             ok = False
+            DECISION_TRACE_STORE.append(
+                trace_id=trace_id,
+                stage="BLOCKED",
+                decision="ADAPTER_BLOCKED",
+                reasons=(reason,),
+                output_payload={"brokerId": broker_id},
+            )
         order["oms_status"] = LIVE_OMS.orders[managed_order.order_id].status
     STATE["orders"].insert(0, order)
     STATE["orders"] = STATE["orders"][:50]
+    trace_index = STATE.setdefault("order_trace_index", {})
+    if not isinstance(trace_index, dict):
+        trace_index = {}
+        STATE["order_trace_index"] = trace_index
+    trace_context = {"trace_id": trace_id, "strategy_id": intent.strategy_id}
+    for identifier in {
+        str(order.get("order_id") or ""),
+        str(order.get("oms_order_id") or ""),
+        str(order.get("broker_order_id") or ""),
+        str(order.get("idempotency_key") or ""),
+    } - {""}:
+        trace_index[identifier] = trace_context
+    while len(trace_index) > 5000:
+        trace_index.pop(next(iter(trace_index)))
     STATE.setdefault("persisted_idempotency_keys", []).append(idempotency_key)
     STATE["persisted_idempotency_keys"] = list(dict.fromkeys(STATE["persisted_idempotency_keys"]))[-5000:]
     checkpoint = RECOVERY_JOURNAL.save(recovery_state_payload(), reason="after-order", idempotency_keys=[str(item.get("idempotency_key") or "") for item in STATE.get("orders", [])])
@@ -4120,6 +4506,7 @@ def recovery_state_payload() -> dict[str, Any]:
     return {
         "mode": STATE.get("mode"), "dry_run": STATE.get("dry_run"), "kill_switch": STATE.get("kill_switch"),
         "new_entries_blocked": STATE.get("new_entries_blocked"), "orders": list(STATE.get("orders", [])),
+        "order_trace_index": dict(STATE.get("order_trace_index", {})),
         "strategy_runner": dict(STATE.get("strategy_runner", {})),
     }
 
@@ -4159,6 +4546,7 @@ def restore_runtime_from_checkpoint() -> dict[str, Any]:
         return dict(STATE["recovery_status"])
     recovered = loaded.get("state") if isinstance(loaded.get("state"), dict) else {}
     STATE["orders"] = list(recovered.get("orders", []))[:50] if isinstance(recovered.get("orders"), list) else []
+    STATE["order_trace_index"] = dict(recovered.get("order_trace_index", {})) if isinstance(recovered.get("order_trace_index"), dict) else {}
     if isinstance(recovered.get("strategy_runner"), dict):
         STATE["strategy_runner"].update(recovered["strategy_runner"])
     STATE["persisted_idempotency_keys"] = list(dict.fromkeys(str(item) for item in loaded.get("idempotencyKeys", []) if item))

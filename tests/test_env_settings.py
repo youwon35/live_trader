@@ -13,7 +13,7 @@ class EnvSettingsSafetyTests(unittest.TestCase):
     def test_packaged_env_path_uses_persistent_local_app_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
-            {"LOCALAPPDATA": tmp},
+            {"LOCALAPPDATA": tmp, "LIVE_TRADER_DATA_DIR": ""},
             clear=False,
         ), patch.object(env_loader.sys, "frozen", True, create=True):
             self.assertEqual(env_loader.default_env_path(), Path(tmp) / "live_trader" / ".env")
@@ -21,7 +21,7 @@ class EnvSettingsSafetyTests(unittest.TestCase):
     def test_packaged_runtime_data_uses_persistent_local_app_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
-            {"LOCALAPPDATA": tmp},
+            {"LOCALAPPDATA": tmp, "LIVE_TRADER_DATA_DIR": ""},
             clear=False,
         ), patch.object(env_loader.sys, "frozen", True, create=True):
             self.assertEqual(env_loader.default_runtime_data_root(), Path(tmp) / "live_trader")

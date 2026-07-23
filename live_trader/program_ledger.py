@@ -84,10 +84,14 @@ class ProgramLedger:
                     price REAL NOT NULL,
                     state TEXT NOT NULL,
                     occurred_at TEXT NOT NULL,
+                    trace_id TEXT NOT NULL DEFAULT '',
                     raw_json TEXT NOT NULL
                 )
                 """
             )
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(execution_events)").fetchall()}
+            if "trace_id" not in columns:
+                conn.execute("ALTER TABLE execution_events ADD COLUMN trace_id TEXT NOT NULL DEFAULT ''")
 
     def cash_rows(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -116,7 +120,7 @@ class ProgramLedger:
             rows = conn.execute(
                 """
                 SELECT event_id, broker_id, order_id, broker_order_id, symbol, side,
-                       quantity, price, state, occurred_at, raw_json
+                       quantity, price, state, occurred_at, trace_id, raw_json
                 FROM execution_events
                 ORDER BY occurred_at DESC, event_id DESC
                 LIMIT ?
@@ -132,6 +136,18 @@ class ProgramLedger:
                 item["raw"] = {}
             result.append(item)
         return result
+
+    def existing_execution_event_ids(self, event_ids: list[str]) -> set[str]:
+        unique_ids = list(dict.fromkeys(str(item) for item in event_ids if str(item)))
+        if not unique_ids:
+            return set()
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"SELECT event_id FROM execution_events WHERE event_id IN ({placeholders})",
+                unique_ids,
+            ).fetchall()
+        return {str(row["event_id"]) for row in rows}
 
     def replace_cash_rows(self, rows: list[dict[str, Any]], source: str) -> int:
         updated_at = now_text()
@@ -279,7 +295,7 @@ class ProgramLedger:
         }
 
     def record_execution_events(self, events: list[dict[str, Any]]) -> int:
-        prepared: list[tuple[str, str, str, str, str, str, float, float, str, str, str]] = []
+        prepared: list[tuple[str, str, str, str, str, str, float, float, str, str, str, str]] = []
         for event in events:
             broker_id = str(event.get("broker_id") or "").strip()
             occurred_at = str(event.get("occurred_at") or event.get("time") or now_text())
@@ -303,6 +319,7 @@ class ProgramLedger:
                     numeric_value(event.get("price", 0.0)),
                     state,
                     occurred_at,
+                    str(event.get("trace_id") or event.get("traceId") or ""),
                     json.dumps(event, ensure_ascii=False, sort_keys=True),
                 )
             )
@@ -311,8 +328,8 @@ class ProgramLedger:
                 """
                 INSERT OR REPLACE INTO execution_events
                 (event_id, broker_id, order_id, broker_order_id, symbol, side,
-                 quantity, price, state, occurred_at, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 quantity, price, state, occurred_at, trace_id, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 prepared,
             )

@@ -17,14 +17,17 @@ class OrderGateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.original_state = copy.deepcopy(state.STATE)
         self.original_recovery_journal = state.RECOVERY_JOURNAL
+        self.original_decision_trace_store = state.DECISION_TRACE_STORE
         self.recovery_temp_dir = tempfile.TemporaryDirectory()
         state.RECOVERY_JOURNAL = state.RecoveryJournal(Path(self.recovery_temp_dir.name) / "recovery-journal")
+        state.DECISION_TRACE_STORE = state.DecisionTraceStore(Path(self.recovery_temp_dir.name) / "decision-trace.jsonl")
 
     def tearDown(self) -> None:
         self.restore_temp_program_ledger()
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
         state.RECOVERY_JOURNAL = self.original_recovery_journal
+        state.DECISION_TRACE_STORE = self.original_decision_trace_store
         self.recovery_temp_dir.cleanup()
 
     def use_temp_program_ledger(self, temp_dir: str) -> ProgramLedger:
@@ -103,6 +106,10 @@ class OrderGateTest(unittest.TestCase):
         order = result["order"]
         self.assertIn("idempotency_key", order)
         self.assertIn("oms_status", order)
+        self.assertTrue(order["trace_id"].startswith("trace_"))
+        trace_stages = [item["eventType"] for item in state.DECISION_TRACE_STORE.trace(order["trace_id"])]
+        self.assertEqual(trace_stages[:4], ["BAR_CLOSED", "SIGNAL_DECIDED", "TARGET_ALLOCATED", "RISK_DECIDED"])
+        self.assertEqual(trace_stages[-1], "ORDER_CREATED" if result["ok"] else "BLOCKED")
         self.assertTrue(state.LIVE_OMS.verify_event_chain(order["oms_order_id"]))
         self.assertFalse(order["idempotency_duplicate"])
 
@@ -1149,7 +1156,10 @@ class OrderGateTest(unittest.TestCase):
                 }
                 return rows[broker_id]
 
-        with patch("live_trader.state.LiveBrokerRouter", return_value=FakeRouter()):
+        with patch("live_trader.state.LiveBrokerRouter", return_value=FakeRouter()), patch(
+            "live_trader.state.automatic_live_promotion_sweep",
+            return_value=[],
+        ):
             result = state.run_reconciliation()
 
         self.assertTrue(result["ok"])
@@ -1207,6 +1217,18 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(kis_account["program_source"], "broker_snapshot")
 
     def test_execution_event_poll_records_events_in_program_ledger(self) -> None:
+        trace_id = "trace_test_live_fill"
+        state.STATE["orders"] = [
+            {
+                "order_id": "LIVE-ORDER-1",
+                "broker_order_id": "BRK-1",
+                "trace_id": trace_id,
+                "strategy_id": "strategy-live-1",
+                "state": "acknowledged",
+                "queue_state": "submitted",
+                "dry_run": False,
+            }
+        ]
         class FakeRouter:
             def poll_execution_events(self, broker_id):
                 return {
@@ -1238,6 +1260,11 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(result["execution_events"]["event_count"], 1)
         self.assertEqual(result["program_ledger"]["execution_event_count"], 1)
         self.assertEqual(result["program_ledger"]["execution_events"][0]["symbol"], "BTCUSDT")
+        self.assertEqual(result["program_ledger"]["execution_events"][0]["trace_id"], trace_id)
+        self.assertEqual(
+            [item["eventType"] for item in state.DECISION_TRACE_STORE.trace(trace_id)],
+            ["FILLED", "POSITION_APPLIED"],
+        )
 
     def test_execution_event_poll_syncs_broker_snapshot_to_program_ledger(self) -> None:
         class FakeRouter:
@@ -1457,7 +1484,17 @@ class OrderGateTest(unittest.TestCase):
     def test_startup_restore_keeps_idempotency_keys_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             journal = state.RecoveryJournal(Path(temp_dir) / "recovery")
-            journal.save({"mode": "SMALL_LIVE", "dry_run": False, "orders": [], "strategy_runner": {}}, reason="before-restart", idempotency_keys=["persisted-key"])
+            journal.save(
+                {
+                    "mode": "SMALL_LIVE",
+                    "dry_run": False,
+                    "orders": [],
+                    "order_trace_index": {"BRK-RESTORE-1": {"trace_id": "trace_restore", "strategy_id": "strategy-restore"}},
+                    "strategy_runner": {},
+                },
+                reason="before-restart",
+                idempotency_keys=["persisted-key"],
+            )
             with patch.object(state, "RECOVERY_JOURNAL", journal):
                 restored = state.restore_runtime_from_checkpoint()
         self.assertTrue(restored["verified"])
@@ -1466,6 +1503,31 @@ class OrderGateTest(unittest.TestCase):
         self.assertTrue(state.STATE["dry_run"])
         self.assertTrue(state.STATE["new_entries_blocked"])
         self.assertIn("persisted-key", state.STATE["persisted_idempotency_keys"])
+        self.assertEqual(state.STATE["order_trace_index"]["BRK-RESTORE-1"]["trace_id"], "trace_restore")
+
+    def test_broker_position_truth_fails_closed_on_quantity_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = self.use_temp_program_ledger(temp_dir)
+            try:
+                ledger.replace_position_rows(
+                    [{"broker_id": "binance", "symbol": "BTCUSDT", "asset": "CRYPTO", "currency": "USDT", "broker_qty": 0.02}],
+                    "test",
+                )
+                state.STATE["broker_reconciliation"] = {
+                    "fetched_at": "2026-07-04 10:00:00",
+                    "positions": [{"broker_id": "binance", "symbol": "BTCUSDT", "broker_qty": 0.01}],
+                    "accounts": [],
+                    "errors": [],
+                }
+                report = state.broker_position_truth_snapshot(
+                    {"summary": {"api_required_count": 0, "mismatch_count": 0}}
+                )
+            finally:
+                self.restore_temp_program_ledger()
+
+        self.assertFalse(report["matched"])
+        self.assertTrue(report["newEntriesBlocked"])
+        self.assertEqual(report["mismatchCount"], 1)
 
     def test_multi_strategy_cycle_nets_opposite_spot_signals_to_one_order(self) -> None:
         state.STATE["dry_run"] = True
