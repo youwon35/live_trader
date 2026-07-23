@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BadgeCheck,
   Bell,
@@ -221,6 +221,7 @@ const SIDEBAR_COLLAPSED_STORAGE_KEY = "live-trader.sidebarCollapsed.v1";
 const APPEARANCE_STORAGE_KEY = "live-trader.appearance.v1";
 const NOTIFICATION_ACK_STORAGE_KEY = "live-trader.notifications.ack.v1";
 const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
+const STRATEGY_SAVED_SEARCHES_KEY = "live-trader.strategySavedSearches.v1";
 const LAYOUT_RESET_EVENT = "live-trader-layout-reset";
 const LAYOUT_RESTORE_EVENT = "live-trader-layout-restore";
 const LAYOUT_SNAP_SIZE = 8;
@@ -229,6 +230,13 @@ const LAYOUT_MAX_DIMENSION = 100000;
 const LAYOUT_MAX_OFFSET = 100000;
 const MIN_PANEL_WIDTH = 260;
 const MIN_PANEL_HEIGHT = 150;
+const DEFAULT_STRATEGY_DISCOVERY_FILTERS = {
+  query: "",
+  stage: "all",
+  timeframe: "all",
+  plugin: "all",
+  sort: "updated-desc",
+};
 
 function readStoredValue(key, fallback = null) {
   try {
@@ -1612,8 +1620,37 @@ function LivePreparationPanel({
 }) {
   const [assetTab, setAssetTab] = useState("stock");
   const [selectedStrategyId, setSelectedStrategyId] = useState("");
+  const [discoveryFilters, setDiscoveryFilters] = useState(DEFAULT_STRATEGY_DISCOVERY_FILTERS);
+  const [savedSearches, setSavedSearches] = useState(() => {
+    const stored = readStoredValue(STRATEGY_SAVED_SEARCHES_KEY, []);
+    return Array.isArray(stored) ? stored : [];
+  });
+  const [savedSearchId, setSavedSearchId] = useState("");
+  const [savedSearchName, setSavedSearchName] = useState("");
   const isStock = assetTab === "stock";
-  const filteredStrategies = (snapshot.strategies ?? []).filter((strategy) => (isStock ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy)));
+  const assetStrategies = useMemo(
+    () => (snapshot.strategies ?? []).filter((strategy) => (isStock ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy))),
+    [isStock, snapshot.strategies],
+  );
+  const stageOptions = useMemo(
+    () => uniqueStrategyDiscoveryValues(assetStrategies.map(liveStrategyStageId)),
+    [assetStrategies],
+  );
+  const timeframeOptions = useMemo(
+    () => uniqueStrategyDiscoveryValues(assetStrategies.map((strategy) => strategy.timeframe)),
+    [assetStrategies],
+  );
+  const pluginOptions = useMemo(
+    () => uniqueStrategyDiscoveryValues(assetStrategies.map((strategy) => strategy.plugin_label || strategy.plugin)),
+    [assetStrategies],
+  );
+  const filteredStrategies = useMemo(
+    () => sortLiveStrategies(
+      assetStrategies.filter((strategy) => liveStrategyMatchesDiscovery(strategy, discoveryFilters)),
+      discoveryFilters.sort,
+    ),
+    [assetStrategies, discoveryFilters],
+  );
   const selectedStrategy = filteredStrategies.find((strategy) => strategy.strategy_id === selectedStrategyId) ?? filteredStrategies[0] ?? null;
   const tabItems = [
     { id: "stock", label: "주식/ETF", detail: "한국투자증권 KIS", count: (snapshot.strategies ?? []).filter((strategy) => !isCryptoStrategy(strategy)).length },
@@ -1628,17 +1665,83 @@ function LivePreparationPanel({
     }
   }, [filteredStrategies, selectedStrategyId]);
 
+  function updateDiscoveryFilter(key, value) {
+    setDiscoveryFilters((current) => ({ ...current, [key]: value }));
+    setSavedSearchId("");
+  }
+
+  function changeAssetTab(value) {
+    setAssetTab(value);
+    setDiscoveryFilters(DEFAULT_STRATEGY_DISCOVERY_FILTERS);
+    setSavedSearchId("");
+  }
+
+  function saveCurrentSearch() {
+    const name = savedSearchName.trim();
+    if (!name) return;
+    const existing = savedSearches.find((item) => item.assetTab === assetTab && String(item.name).toLocaleLowerCase() === name.toLocaleLowerCase());
+    const saved = {
+      id: existing?.id || `live-strategy-search-${Date.now()}`,
+      name,
+      assetTab,
+      filters: discoveryFilters,
+    };
+    const next = existing
+      ? savedSearches.map((item) => item.id === existing.id ? saved : item)
+      : [...savedSearches, saved];
+    setSavedSearches(next);
+    setSavedSearchId(saved.id);
+    window.localStorage.setItem(STRATEGY_SAVED_SEARCHES_KEY, JSON.stringify(next.slice(-30)));
+  }
+
+  function applySavedSearch(id) {
+    setSavedSearchId(id);
+    const saved = savedSearches.find((item) => item.id === id);
+    if (!saved) return;
+    setAssetTab(saved.assetTab || "stock");
+    setDiscoveryFilters({ ...DEFAULT_STRATEGY_DISCOVERY_FILTERS, ...(saved.filters || {}) });
+    setSavedSearchName(saved.name);
+  }
+
+  function deleteCurrentSavedSearch() {
+    if (!savedSearchId) return;
+    const next = savedSearches.filter((item) => item.id !== savedSearchId);
+    setSavedSearches(next);
+    setSavedSearchId("");
+    window.localStorage.setItem(STRATEGY_SAVED_SEARCHES_KEY, JSON.stringify(next));
+  }
+
   return (
     <section className="live-prep-shell">
       <NestedTabs
         ariaLabel="실거래 준비 자산군"
         className="internal-tabs prep-tabs"
-        onChange={setAssetTab}
+        onChange={changeAssetTab}
         options={tabItems.map((item) => ({ id: item.id, label: item.label, detail: `전략 ${item.count}개`, title: item.detail }))}
         value={assetTab}
       />
       <section className="content-grid">
         <div className="content-column">
+          <StrategyDiscoveryToolbar
+            filters={discoveryFilters}
+            onFilterChange={updateDiscoveryFilter}
+            stageOptions={stageOptions}
+            timeframeOptions={timeframeOptions}
+            pluginOptions={pluginOptions}
+            visibleCount={filteredStrategies.length}
+            totalCount={assetStrategies.length}
+            savedSearches={savedSearches}
+            savedSearchId={savedSearchId}
+            savedSearchName={savedSearchName}
+            onSavedSearchNameChange={setSavedSearchName}
+            onSavedSearchApply={applySavedSearch}
+            onSavedSearchSave={saveCurrentSearch}
+            onSavedSearchDelete={deleteCurrentSavedSearch}
+            onReset={() => {
+              setDiscoveryFilters(DEFAULT_STRATEGY_DISCOVERY_FILTERS);
+              setSavedSearchId("");
+            }}
+          />
           <LiveStrategySelectorPanel
             strategies={filteredStrategies}
             selectedStrategy={selectedStrategy}
@@ -2160,6 +2263,7 @@ function normalizePromotionStage(stage = "") {
 function promotionLabel(stage = "") {
   const normalized = normalizePromotionStage(stage);
   const labels = {
+    draft: "Draft",
     backtested: "Backtested",
     "before-shadow": "Before Shadow",
     shadowed: "Shadowed",
@@ -3382,6 +3486,112 @@ function LiveStrategySelectorPanel({
       )}
     </section>
   );
+}
+
+function StrategyDiscoveryToolbar({
+  filters,
+  onFilterChange,
+  stageOptions,
+  timeframeOptions,
+  pluginOptions,
+  visibleCount,
+  totalCount,
+  savedSearches,
+  savedSearchId,
+  savedSearchName,
+  onSavedSearchNameChange,
+  onSavedSearchApply,
+  onSavedSearchSave,
+  onSavedSearchDelete,
+  onReset,
+}) {
+  const activeLabels = [
+    filters.query && `검색: ${filters.query}`,
+    filters.stage !== "all" && `단계: ${promotionLabel(filters.stage)}`,
+    filters.timeframe !== "all" && `주기: ${filters.timeframe}`,
+    filters.plugin !== "all" && `전략 유형: ${filters.plugin}`,
+  ].filter(Boolean);
+  return (
+    <section className="panel strategy-discovery-panel">
+      <PanelHeader title="전략 찾기" subtitle="이름·ID·종목·파라미터를 검색하고, 자주 쓰는 조건은 저장해서 다시 불러옵니다." />
+      <div className="strategy-discovery-primary">
+        <label className="strategy-discovery-search">
+          <Search size={16} />
+          <input
+            type="search"
+            value={filters.query}
+            onChange={(event) => onFilterChange("query", event.target.value)}
+            placeholder="이름, ID, 종목, 파라미터, 차단 사유 검색"
+          />
+        </label>
+        <label><span>현재 단계</span><select value={filters.stage} onChange={(event) => onFilterChange("stage", event.target.value)}><option value="all">전체 단계</option>{stageOptions.map((value) => <option key={value} value={value}>{promotionLabel(value)}</option>)}</select></label>
+        <label><span>주기</span><select value={filters.timeframe} onChange={(event) => onFilterChange("timeframe", event.target.value)}><option value="all">전체 주기</option>{timeframeOptions.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+        <label><span>전략 유형</span><select value={filters.plugin} onChange={(event) => onFilterChange("plugin", event.target.value)}><option value="all">전체 유형</option>{pluginOptions.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+        <label><span>정렬</span><select value={filters.sort} onChange={(event) => onFilterChange("sort", event.target.value)}><option value="updated-desc">최근 갱신순</option><option value="name-asc">이름순</option><option value="stage-desc">단계 높은순</option><option value="stage-asc">단계 낮은순</option></select></label>
+      </div>
+      <div className="strategy-discovery-saved">
+        <select aria-label="저장된 전략 검색" value={savedSearchId} onChange={(event) => onSavedSearchApply(event.target.value)}>
+          <option value="">저장된 검색 불러오기</option>
+          {savedSearches.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.assetTab === "crypto" ? "코인" : "주식/ETF"}</option>)}
+        </select>
+        <input aria-label="검색 조건 이름" value={savedSearchName} onChange={(event) => onSavedSearchNameChange(event.target.value)} placeholder="검색 조건 이름" />
+        <button className="secondary-button compact-button" type="button" disabled={!savedSearchName.trim()} onClick={onSavedSearchSave}><Save size={15} />조건 저장</button>
+        <button className="secondary-button compact-button icon-only" type="button" disabled={!savedSearchId} onClick={onSavedSearchDelete} aria-label="저장 검색 삭제"><Trash2 size={15} /></button>
+      </div>
+      <div className="strategy-discovery-summary">
+        <span><strong>{visibleCount}</strong> / {totalCount}개 표시</span>
+        <div>{activeLabels.map((label) => <em key={label}>{label}</em>)}</div>
+        <button className="secondary-button compact-button" type="button" onClick={onReset} disabled={!activeLabels.length && filters.sort === DEFAULT_STRATEGY_DISCOVERY_FILTERS.sort}>조건 초기화</button>
+      </div>
+    </section>
+  );
+}
+
+function liveStrategyStageId(strategy) {
+  const raw = strategy?.lifecycle?.status || strategy?.promotion?.stage || strategy?.promotion_stage || strategy?.lifecycle_status || "draft";
+  const normalized = normalizePromotionStage(raw);
+  return STRATEGY_LIFECYCLE_STEPS.some((step) => step.id === normalized) ? normalized : normalized || "draft";
+}
+
+function uniqueStrategyDiscoveryValues(values) {
+  return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right, "ko"));
+}
+
+function liveStrategyMatchesDiscovery(strategy, filters) {
+  const query = String(filters.query || "").trim().toLocaleLowerCase();
+  const stage = liveStrategyStageId(strategy);
+  const plugin = strategy.plugin_label || strategy.plugin || "";
+  const queryMatches = !query || [
+    strategy.name,
+    strategy.strategy_id,
+    strategy.symbol,
+    strategy.asset,
+    strategy.timeframe,
+    plugin,
+    strategy.block_reason,
+    strategy.permission_label,
+    promotionLabel(stage),
+    JSON.stringify(strategy.parameters || {}),
+    JSON.stringify(strategy.release || {}),
+  ].some((value) => String(value || "").toLocaleLowerCase().includes(query));
+  return queryMatches
+    && (filters.stage === "all" || stage === filters.stage)
+    && (filters.timeframe === "all" || strategy.timeframe === filters.timeframe)
+    && (filters.plugin === "all" || plugin === filters.plugin);
+}
+
+function sortLiveStrategies(strategies, sort) {
+  return [...strategies].sort((left, right) => {
+    const leftName = left.name || left.strategy_id || "";
+    const rightName = right.name || right.strategy_id || "";
+    if (sort === "name-asc") return leftName.localeCompare(rightName, "ko");
+    if (sort === "stage-desc") return strategyLifecycleRank(liveStrategyStageId(right)) - strategyLifecycleRank(liveStrategyStageId(left)) || leftName.localeCompare(rightName, "ko");
+    if (sort === "stage-asc") return strategyLifecycleRank(liveStrategyStageId(left)) - strategyLifecycleRank(liveStrategyStageId(right)) || leftName.localeCompare(rightName, "ko");
+    const leftDate = left.updated_at || left.updatedAt || left.release?.created_at || "";
+    const rightDate = right.updated_at || right.updatedAt || right.release?.created_at || "";
+    return String(rightDate).localeCompare(String(leftDate)) || leftName.localeCompare(rightName, "ko");
+  });
 }
 
 function StrategyPanel({ strategies, selectedStrategyId, onSelect }) {
