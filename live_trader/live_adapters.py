@@ -31,6 +31,7 @@ BINANCE_BASE_URL = "https://api.binance.com"
 BINANCE_ORDER_ENDPOINT = "/api/v3/order"
 BINANCE_TEST_ORDER_ENDPOINT = "/api/v3/order/test"
 BINANCE_ACCOUNT_ENDPOINT = "/api/v3/account"
+BINANCE_TIME_ENDPOINT = "/api/v3/time"
 
 UPBIT_BASE_URL = "https://api.upbit.com"
 UPBIT_ORDER_ENDPOINT = "/v1/orders"
@@ -40,6 +41,8 @@ UPBIT_ORDER_DETAIL_ENDPOINT = "/v1/order"
 
 _KIS_TOKEN_CACHE: dict[str, object] = {"key": "", "token": "", "expires_at": 0.0}
 _KIS_TOKEN_LOCK = threading.Lock()
+_BINANCE_TIME_CACHE: dict[str, object] = {"base_url": "", "offset_ms": 0, "expires_at": 0.0}
+_BINANCE_TIME_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,52 @@ class PreparedRequest:
 
 def env_value(name: str) -> str:
     return os.getenv(name, "").strip()
+
+
+def binance_timestamp_ms() -> int:
+    with _BINANCE_TIME_LOCK:
+        offset_ms = int(_BINANCE_TIME_CACHE.get("offset_ms") or 0)
+    return int(time.time() * 1000) + offset_ms
+
+
+def refresh_binance_time_offset(*, timeout_seconds: float = 5.0) -> int:
+    base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
+    now = time.monotonic()
+    with _BINANCE_TIME_LOCK:
+        if (
+            _BINANCE_TIME_CACHE.get("base_url") == base_url
+            and float(_BINANCE_TIME_CACHE.get("expires_at") or 0.0) > now
+        ):
+            return int(_BINANCE_TIME_CACHE.get("offset_ms") or 0)
+
+    started_ms = int(time.time() * 1000)
+    response = http_json(
+        "GET",
+        f"{base_url.rstrip('/')}{BINANCE_TIME_ENDPOINT}",
+        body=None,
+        headers={},
+        timeout_seconds=timeout_seconds,
+    )
+    finished_ms = int(time.time() * 1000)
+    payload = response.get("json") if isinstance(response.get("json"), dict) else {}
+    server_time = int(payload.get("serverTime") or 0)
+    if response.get("ok") is not True or server_time <= 0:
+        raise RuntimeError(str(response.get("text") or "Binance server time query failed."))
+    offset_ms = server_time - ((started_ms + finished_ms) // 2)
+    with _BINANCE_TIME_LOCK:
+        _BINANCE_TIME_CACHE.update(
+            {
+                "base_url": base_url,
+                "offset_ms": offset_ms,
+                "expires_at": time.monotonic() + 300.0,
+            }
+        )
+    return offset_ms
+
+
+def _clear_binance_time_offset_cache() -> None:
+    with _BINANCE_TIME_LOCK:
+        _BINANCE_TIME_CACHE.update({"base_url": "", "offset_ms": 0, "expires_at": 0.0})
 
 
 def missing_env(*names: str) -> list[str]:
@@ -323,7 +372,7 @@ def build_binance_account_request() -> PreparedRequest:
     api_key = env_value("BINANCE_API_KEY")
     api_secret = env_value("BINANCE_API_SECRET")
     base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
-    query: dict[str, object] = {"timestamp": int(time.time() * 1000)}
+    query: dict[str, object] = {"timestamp": binance_timestamp_ms()}
     signed_query = sign_binance_query(query, api_secret) if api_secret else urllib.parse.urlencode(query)
     return PreparedRequest(
         provider="binance",
@@ -419,7 +468,7 @@ def build_binance_spot_order_request(intent: dict[str, object], *, test: bool = 
         "side": side,
         "type": order_type,
         "quantity": quantity,
-        "timestamp": int(time.time() * 1000),
+        "timestamp": binance_timestamp_ms(),
     }
     if order_type == "LIMIT":
         query["timeInForce"] = str(intent.get("time_in_force") or "GTC")
@@ -450,7 +499,7 @@ def build_binance_cancel_order_request(symbol: str, broker_order_id: str, *, cli
     base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_order_id = str(broker_order_id or "").strip()
-    query: dict[str, object] = {"symbol": normalized_symbol, "timestamp": int(time.time() * 1000)}
+    query: dict[str, object] = {"symbol": normalized_symbol, "timestamp": binance_timestamp_ms()}
     query["origClientOrderId" if client_order_id else "orderId"] = normalized_order_id
     if not normalized_symbol:
         blocked.append("symbol")

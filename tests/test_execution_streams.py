@@ -7,11 +7,28 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from live_trader.execution_streams import ExecutionStreamManager, parse_binance_execution_report, parse_kis_domestic_execution, parse_kis_overseas_execution, parse_upbit_my_order, upbit_websocket_token
+from live_trader.execution_streams import ExecutionStreamManager, binance_stream_subscription_params, parse_binance_execution_report, parse_kis_domestic_execution, parse_kis_overseas_execution, parse_upbit_my_order, upbit_websocket_token
 
 
 class ExecutionStreamTest(unittest.TestCase):
+    def test_binance_subscription_uses_server_adjusted_timestamp(self) -> None:
+        with patch("live_trader.execution_streams.refresh_binance_time_offset") as refresh, patch(
+            "live_trader.execution_streams.binance_timestamp_ms",
+            return_value=1700000005123,
+        ):
+            params = binance_stream_subscription_params("key", "secret")
+
+        refresh.assert_called_once_with()
+        self.assertEqual(1700000005123, params["timestamp"])
+        expected = hmac.new(
+            b"secret",
+            b"apiKey=key&timestamp=1700000005123",
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertEqual(expected, params["signature"])
+
     def test_binance_execution_report_normalizes_fill(self) -> None:
         event = parse_binance_execution_report({
             "subscriptionId": 0,

@@ -10,6 +10,14 @@ export async function saveUiSettings(settings) {
   return request("/api/ui-settings", { method: "POST", body: settings });
 }
 
+export async function loadSharedSearchPresets() {
+  return request("/api/search-presets");
+}
+
+export async function saveSharedSearchPresets(presets) {
+  return request("/api/search-presets", { method: "POST", body: { presets } });
+}
+
 export async function getEnvSettings() {
   return request("/api/env-settings");
 }

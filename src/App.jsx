@@ -38,6 +38,7 @@ import {
   getEnvSettings,
   getSnapshot,
   getUiSettings,
+  loadSharedSearchPresets,
   runFinalPreflight,
   runReconciliation,
   runStrategyCycle,
@@ -54,6 +55,7 @@ import {
   setRetryPolicy,
   setRiskSetting,
   saveUiSettings,
+  saveSharedSearchPresets,
   saveEnvSettings,
   submitTestIntent,
   runPolicyReplay,
@@ -78,6 +80,11 @@ import {
   createToggleSwitch,
 } from "../../../packages/design/ui-primitives.js";
 import designTokens from "../../../packages/design/design_tokens.json";
+import {
+  createStrategySearchPreset,
+  mergeStrategySearchPresets,
+  normalizeStrategySearchPresetDocument,
+} from "../../../packages/trading-contracts/src/index.js";
 
 const ActionButton = createActionButton(React);
 const BrokerAccountWorkspace = createBrokerAccountWorkspace(React);
@@ -1623,10 +1630,11 @@ function LivePreparationPanel({
   const [discoveryFilters, setDiscoveryFilters] = useState(DEFAULT_STRATEGY_DISCOVERY_FILTERS);
   const [savedSearches, setSavedSearches] = useState(() => {
     const stored = readStoredValue(STRATEGY_SAVED_SEARCHES_KEY, []);
-    return Array.isArray(stored) ? stored : [];
+    return normalizeStrategySearchPresetDocument(stored, "live_trader").presets;
   });
   const [savedSearchId, setSavedSearchId] = useState("");
   const [savedSearchName, setSavedSearchName] = useState("");
+  const initialSavedSearches = useRef(savedSearches);
   const isStock = assetTab === "stock";
   const assetStrategies = useMemo(
     () => (snapshot.strategies ?? []).filter((strategy) => (isStock ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy))),
@@ -1656,6 +1664,7 @@ function LivePreparationPanel({
     { id: "stock", label: "주식/ETF", detail: "한국투자증권 KIS", count: (snapshot.strategies ?? []).filter((strategy) => !isCryptoStrategy(strategy)).length },
     { id: "crypto", label: "코인", detail: "Binance / Upbit", count: (snapshot.strategies ?? []).filter(isCryptoStrategy).length },
   ];
+  const strategySearchPresets = savedSearches.filter((item) => item.entity === "strategy");
 
   useEffect(() => {
     const firstId = filteredStrategies[0]?.strategy_id ?? "";
@@ -1664,6 +1673,26 @@ function LivePreparationPanel({
       setSelectedStrategyId(firstId);
     }
   }, [filteredStrategies, selectedStrategyId]);
+
+  useEffect(() => {
+    let active = true;
+    loadSharedSearchPresets()
+      .then((document) => {
+        if (!active) return;
+        const shared = normalizeStrategySearchPresetDocument(document, "shared").presets;
+        const merged = mergeStrategySearchPresets(shared, initialSavedSearches.current);
+        setSavedSearches(merged);
+        window.localStorage.setItem(STRATEGY_SAVED_SEARCHES_KEY, JSON.stringify(merged));
+        if (merged.length !== shared.length) {
+          return saveSharedSearchPresets(merged);
+        }
+        return null;
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
 
   function updateDiscoveryFilter(key, value) {
     setDiscoveryFilters((current) => ({ ...current, [key]: value }));
@@ -1679,27 +1708,43 @@ function LivePreparationPanel({
   function saveCurrentSearch() {
     const name = savedSearchName.trim();
     if (!name) return;
-    const existing = savedSearches.find((item) => item.assetTab === assetTab && String(item.name).toLocaleLowerCase() === name.toLocaleLowerCase());
-    const saved = {
-      id: existing?.id || `live-strategy-search-${Date.now()}`,
+    const existing = savedSearches.find((item) => item.entity === "strategy" && String(item.name).toLocaleLowerCase() === name.toLocaleLowerCase());
+    const saved = createStrategySearchPreset({
+      id: existing?.id,
       name,
+      entity: "strategy",
+      sourceApp: "live_trader",
       assetTab,
-      filters: discoveryFilters,
-    };
-    const next = existing
-      ? savedSearches.map((item) => item.id === existing.id ? saved : item)
-      : [...savedSearches, saved];
+      filters: {
+        query: discoveryFilters.query,
+        lifecycle: discoveryFilters.stage,
+        asset: discoveryFilters.asset || "all",
+        timeframe: discoveryFilters.timeframe,
+        strategyType: discoveryFilters.plugin,
+        sort: discoveryFilters.sort,
+      },
+    });
+    const next = mergeStrategySearchPresets(savedSearches.filter((item) => item.id !== existing?.id), saved);
     setSavedSearches(next);
     setSavedSearchId(saved.id);
     window.localStorage.setItem(STRATEGY_SAVED_SEARCHES_KEY, JSON.stringify(next.slice(-30)));
+    saveSharedSearchPresets(next).catch(() => undefined);
   }
 
   function applySavedSearch(id) {
     setSavedSearchId(id);
     const saved = savedSearches.find((item) => item.id === id);
     if (!saved) return;
-    setAssetTab(saved.assetTab || "stock");
-    setDiscoveryFilters({ ...DEFAULT_STRATEGY_DISCOVERY_FILTERS, ...(saved.filters || {}) });
+    const assetValue = String(saved.filters?.asset || "").toLocaleLowerCase();
+    setAssetTab(saved.context?.assetTab || (/(crypto|coin|코인)/.test(assetValue) ? "crypto" : "stock"));
+    setDiscoveryFilters({
+      ...DEFAULT_STRATEGY_DISCOVERY_FILTERS,
+      query: saved.filters?.query ?? "",
+      stage: saved.filters?.lifecycle ?? "all",
+      timeframe: saved.filters?.timeframe ?? "all",
+      plugin: saved.filters?.strategyType ?? "all",
+      sort: saved.filters?.sort ?? "updated-desc",
+    });
     setSavedSearchName(saved.name);
   }
 
@@ -1709,6 +1754,7 @@ function LivePreparationPanel({
     setSavedSearches(next);
     setSavedSearchId("");
     window.localStorage.setItem(STRATEGY_SAVED_SEARCHES_KEY, JSON.stringify(next));
+    saveSharedSearchPresets(next).catch(() => undefined);
   }
 
   return (
@@ -1730,7 +1776,7 @@ function LivePreparationPanel({
             pluginOptions={pluginOptions}
             visibleCount={filteredStrategies.length}
             totalCount={assetStrategies.length}
-            savedSearches={savedSearches}
+            savedSearches={strategySearchPresets}
             savedSearchId={savedSearchId}
             savedSearchName={savedSearchName}
             onSavedSearchNameChange={setSavedSearchName}
@@ -3532,7 +3578,7 @@ function StrategyDiscoveryToolbar({
       <div className="strategy-discovery-saved">
         <select aria-label="저장된 전략 검색" value={savedSearchId} onChange={(event) => onSavedSearchApply(event.target.value)}>
           <option value="">저장된 검색 불러오기</option>
-          {savedSearches.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.assetTab === "crypto" ? "코인" : "주식/ETF"}</option>)}
+          {savedSearches.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.sourceApp}</option>)}
         </select>
         <input aria-label="검색 조건 이름" value={savedSearchName} onChange={(event) => onSavedSearchNameChange(event.target.value)} placeholder="검색 조건 이름" />
         <button className="secondary-button compact-button" type="button" disabled={!savedSearchName.trim()} onClick={onSavedSearchSave}><Save size={15} />조건 저장</button>

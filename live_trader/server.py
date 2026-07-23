@@ -20,6 +20,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8795
 SETTINGS_DIR = Path(os.getenv("APPDATA") or Path.home()) / "LiveTrader"
 UI_SETTINGS_FILE = SETTINGS_DIR / "ui-settings.json"
+SHARED_SETTINGS_DIR = Path(os.getenv("APPDATA") or Path.home()) / "trading_programs"
+STRATEGY_SEARCH_PRESETS_FILE = SHARED_SETTINGS_DIR / "strategy-search-presets.json"
+STRATEGY_SEARCH_PRESET_SCHEMA = "strategy-search-presets-v1"
+STRATEGY_SEARCH_PRESET_LIMIT = 30
 
 
 def json_safe_value(value: object) -> object:
@@ -58,6 +62,38 @@ def write_ui_settings(payload: dict[str, object]) -> dict[str, object]:
     return current
 
 
+def read_strategy_search_presets() -> dict[str, object]:
+    try:
+        payload = json.loads(STRATEGY_SEARCH_PRESETS_FILE.read_text(encoding="utf-8")) if STRATEGY_SEARCH_PRESETS_FILE.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    presets = payload.get("presets") if isinstance(payload, dict) else []
+    if not isinstance(presets, list):
+        presets = []
+    return {
+        "schemaVersion": STRATEGY_SEARCH_PRESET_SCHEMA,
+        "updatedAt": str(payload.get("updatedAt") or "") if isinstance(payload, dict) else "",
+        "presets": [item for item in presets if isinstance(item, dict)][-STRATEGY_SEARCH_PRESET_LIMIT:],
+        "path": str(STRATEGY_SEARCH_PRESETS_FILE),
+    }
+
+
+def write_strategy_search_presets(payload: dict[str, object]) -> dict[str, object]:
+    presets = payload.get("presets")
+    if not isinstance(presets, list):
+        raise ValueError("presets 배열이 필요합니다.")
+    document = {
+        "schemaVersion": STRATEGY_SEARCH_PRESET_SCHEMA,
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "presets": [item for item in presets if isinstance(item, dict)][-STRATEGY_SEARCH_PRESET_LIMIT:],
+    }
+    STRATEGY_SEARCH_PRESETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = STRATEGY_SEARCH_PRESETS_FILE.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(STRATEGY_SEARCH_PRESETS_FILE)
+    return {**document, "path": str(STRATEGY_SEARCH_PRESETS_FILE)}
+
+
 class LiveTraderHandler(BaseHTTPRequestHandler):
     server_version = "LiveTraderHTTP/0.1"
 
@@ -68,6 +104,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/ui-settings":
             self.send_json({"ok": True, "settings": read_ui_settings()})
+            return
+        if parsed.path == "/api/search-presets":
+            self.send_json(read_strategy_search_presets())
             return
         if parsed.path == "/api/env-settings":
             self.send_json({"ok": True, "settings": env_settings.env_settings_snapshot()})
@@ -158,6 +197,17 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/upbit-smoke-refresh":
             self.send_json(state.refresh_upbit_smoke_order())
             return
+        if parsed.path == "/api/binance-smoke-preview":
+            self.send_json(state.preview_binance_smoke_order(str(payload.get("strategy_id", ""))))
+            return
+        if parsed.path == "/api/binance-smoke-submit":
+            self.send_json(
+                state.submit_binance_smoke_order(
+                    payload.get("confirmation_token", ""),
+                    confirmed=payload.get("confirmed") is True,
+                )
+            )
+            return
         if parsed.path == "/api/audit-export":
             self.send_json(state.export_audit(str(payload.get("format", "csv"))))
             return
@@ -197,6 +247,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/ui-settings":
             self.send_json({"ok": True, "settings": write_ui_settings(payload)})
+            return
+        if parsed.path == "/api/search-presets":
+            try:
+                self.send_json(write_strategy_search_presets(payload))
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)})
             return
         if parsed.path == "/api/env-settings":
             if requests_real_order_enable(payload) and payload.get("confirmed") is not True:

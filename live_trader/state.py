@@ -71,7 +71,7 @@ from .contracts import (
 from .audit_store import SQLiteAuditEventStore
 from .env_loader import default_runtime_data_root
 from .execution_streams import ExecutionStreamManager
-from .live_adapters import build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request
+from .live_adapters import BINANCE_BASE_URL, build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request, env_value, http_json
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
@@ -381,6 +381,16 @@ STATE: dict[str, Any] = {
         "used": False,
         "detail": "실제 주문 전 주문 가능 정보와 원화 잔고를 먼저 조회합니다.",
     },
+    "binance_smoke_order": {
+        "status": "idle",
+        "status_label": "미리보기 필요",
+        "symbol": "BTCUSDT",
+        "quantity": 0.0001,
+        "confirmation_token": "",
+        "expires_at": "",
+        "used": False,
+        "detail": "전략 신호와 분리된 브로커 제출 경로 점검 주문입니다.",
+    },
     "recovery_status": {"verified": False, "safeMode": True, "generation": 0, "detail": "복구 훈련 미실행"},
     "audit": [
         {
@@ -420,6 +430,12 @@ def parse_state_datetime(value: object) -> datetime | None:
     text = str(value or "").strip()
     if not text or text in {"-", "미실행", "대기"}:
         return None
+    if "T" in text:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
+        except ValueError:
+            pass
     for fmt in ("%Y-%m-%d %H:%M:%S", "%H:%M:%S"):
         try:
             parsed = datetime.strptime(text, fmt)
@@ -617,9 +633,9 @@ def portfolio_gate_for_strategy(
         if match is not None:
             return match
     return {
-        "active": True,
-        "allowed": False,
-        "detail": f"유효한 Portfolio artifact가 있지만 {strategy_id}/{symbol} 조합이 live universe에 없습니다.",
+        "active": False,
+        "allowed": True,
+        "detail": f"일치하는 Portfolio artifact가 없어 {strategy_id}/{symbol}을(를) 단일 전략으로 평가합니다.",
         "portfolioCount": len(portfolio_artifacts),
     }
 
@@ -784,15 +800,47 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
 
 
 def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> dict[str, Any]:
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    selected_portfolio_id = str(metadata.get("portfolio_id") or metadata.get("portfolioId") or "").strip()
+    if selected_portfolio_id:
+        portfolios = checks.get("portfolios") if isinstance(checks.get("portfolios"), list) else []
+        selected_portfolio = next(
+            (
+                item
+                for item in portfolios
+                if isinstance(item, dict)
+                and str(item.get("id") or item.get("portfolio_id") or item.get("portfolioId") or "") == selected_portfolio_id
+            ),
+            None,
+        )
+        if selected_portfolio is None:
+            return {
+                "active": True,
+                "allowed": False,
+                "portfolioId": selected_portfolio_id,
+                "detail": f"명시적으로 선택한 Portfolio artifact {selected_portfolio_id}를 찾을 수 없습니다.",
+            }
+        selected_match = portfolio_match_for_strategy(
+            selected_portfolio,
+            intent.strategy_id,
+            intent.symbol,
+            mode=current_mode(),
+        )
+        if selected_match is None:
+            return {
+                "active": True,
+                "allowed": False,
+                "portfolioId": selected_portfolio_id,
+                "detail": f"선택 Portfolio artifact에 {intent.strategy_id}/{intent.symbol} 조합이 없습니다.",
+            }
+        selected_gate = selected_match
+    else:
+        selected_gate = None
     strategy = strategy_for_order_intent(checks, intent)
-    if strategy:
+    if selected_gate is None and strategy:
         gate = strategy.get("portfolio_gate") if isinstance(strategy.get("portfolio_gate"), dict) else None
         if gate is not None:
             selected_gate = dict(gate)
-        else:
-            selected_gate = None
-    else:
-        selected_gate = None
     if selected_gate is None:
         selected_gate = portfolio_gate_for_strategy(
             {"strategy_id": intent.strategy_id, "symbol": intent.symbol},
@@ -802,7 +850,6 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
     policy = selected_gate.get("rebalancePolicy") if isinstance(selected_gate.get("rebalancePolicy"), dict) else {}
     if not policy or not selected_gate.get("active") or selected_gate.get("allowed") is not True:
         return selected_gate
-    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     if selected_gate.get("advancedOperationsHash"):
         reconciliation = checks.get("reconciliation") if isinstance(checks.get("reconciliation"), dict) else {}
         reconciliation_summary = reconciliation.get("summary") if isinstance(reconciliation.get("summary"), dict) else {}
@@ -1531,6 +1578,33 @@ def reconciliation_snapshot() -> dict[str, Any]:
     }
 
 
+def reconciliation_summary_for_broker(broker_id: str) -> dict[str, Any]:
+    normalized = str(broker_id or "").strip().lower()
+    data = reconciliation_snapshot()
+    rows = [
+        item
+        for item in [*data["positions"], *data["accounts"]]
+        if str(item.get("broker_id") or "").strip().lower() == normalized
+    ]
+    broker_error = broker_reconciliation_errors().get(normalized, "")
+    api_required_count = sum(1 for item in rows if item["status"] == "api_required")
+    if broker_error or not rows:
+        api_required_count += 1
+    mismatch_count = sum(1 for item in rows if item["status"] == "mismatch")
+    pass_count = sum(1 for item in rows if item["status"] == "pass")
+    status = "fail" if mismatch_count else "warn" if api_required_count else "pass"
+    return {
+        "status": status,
+        "status_label": "불일치" if mismatch_count else "API 필요" if api_required_count else "정상",
+        "api_required_count": api_required_count,
+        "mismatch_count": mismatch_count,
+        "pass_count": pass_count,
+        "row_count": len(rows),
+        "broker_id": normalized,
+        "broker_error": broker_error,
+    }
+
+
 def reconciliation_next_actions(api_required_count: int, mismatch_count: int) -> list[str]:
     actions: list[str] = []
     if api_required_count:
@@ -1639,8 +1713,6 @@ def active_watchdog_broker_ids() -> set[str]:
         broker_ids.add("kis")
     if crypto.get("enabled") or str(crypto.get("mode", "MONITOR")).upper() != "MONITOR":
         broker_ids.add(str(crypto.get("provider") or "binance"))
-    if current_mode() != "MONITOR":
-        broker_ids.update({"kis", str(crypto.get("provider") or "binance")})
     return {broker_id for broker_id in broker_ids if broker_id}
 
 
@@ -1701,7 +1773,26 @@ def watchdog_snapshot(
 
     stale_limit = int(float(settings.get("market_data_stale_sec", DEFAULT_WATCHDOG_SETTINGS["market_data_stale_sec"])))
     runner_age = seconds_since(STATE["strategy_runner"].get("last_run"), current)
-    if active_live and runner_age is None:
+    continuous = LIVE_CONTINUOUS_CONTROLLER.snapshot()
+    continuous_profiles = continuous.get("profiles") if isinstance(continuous.get("profiles"), dict) else {}
+    live_continuous_profiles = [
+        profile
+        for profile in continuous_profiles.values()
+        if isinstance(profile, dict)
+        and profile.get("running") is True
+        and str(profile.get("phase") or "").upper() == "RUNNING"
+    ]
+    continuous_heartbeat_ages = [
+        age
+        for age in (seconds_since(profile.get("lastHeartbeat"), current) for profile in live_continuous_profiles)
+        if age is not None
+    ]
+    continuous_fresh = bool(continuous_heartbeat_ages) and min(continuous_heartbeat_ages) <= heartbeat_timeout
+    if active_live and continuous_fresh:
+        data_status = "pass"
+        data_detail = "연속 실행기가 완료 봉을 감시 중이며 feed heartbeat가 정상입니다."
+        data_value = f"{min(continuous_heartbeat_ages)}초"
+    elif active_live and runner_age is None:
         data_status: CheckStatus = "fail"
         data_detail = "자동화가 활성화됐지만 최근 전략/시장 데이터 점검 시간이 없습니다."
         data_value = "미실행"
@@ -1786,7 +1877,19 @@ def watchdog_snapshot(
     event_state = execution_event_snapshot()
     event_age = seconds_since(event_state.get("last_poll"), current)
     event_errors = event_state.get("errors", [])
-    if active_live and event_age is None:
+    execution_streams = LIVE_EXECUTION_STREAMS.snapshot()
+    stream_brokers = execution_streams.get("brokers") if isinstance(execution_streams.get("brokers"), dict) else {}
+    active_streams_ready = bool(active_brokers) and all(
+        isinstance(stream_brokers.get(broker_id), dict)
+        and stream_brokers[broker_id].get("running") is True
+        and stream_brokers[broker_id].get("connected") is True
+        for broker_id in active_brokers
+    )
+    if active_live and active_streams_ready:
+        event_status = "pass"
+        event_detail = "활성 브로커의 사설 체결 스트림이 연결되어 있습니다."
+        event_value = f"{len(active_brokers)}/{len(active_brokers)}"
+    elif active_live and event_age is None:
         event_status: CheckStatus = "fail"
         event_detail = "자동화가 활성화됐지만 체결/계좌 이벤트 동기화 이력이 없습니다."
         event_value = "미실행"
@@ -2087,6 +2190,7 @@ def snapshot() -> dict[str, Any]:
         "program_ledger": program_ledger_snapshot(),
         "execution_events": execution_event_snapshot(),
         "upbit_smoke_order": dict(STATE.get("upbit_smoke_order", {})),
+        "binance_smoke_order": dict(STATE.get("binance_smoke_order", {})),
         "execution_calibration": execution_calibration_snapshot(),
         "policy_replays": list(STATE.get("policy_replays", [])),
         "shadow_live": {"brokerSubmissionBlocked": True, "evidence": list(STATE.get("shadow_evidence", []))[:20], "count": len(STATE.get("shadow_evidence", []))},
@@ -2515,6 +2619,50 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
     return {"ok": True, "reason": audit_reason, "snapshot": snapshot()}
 
 
+def profile_readiness_blocker_count(
+    data: dict[str, Any],
+    profile_id: str,
+    provider_id: str,
+    mode: str,
+    reconciliation_summary: dict[str, Any] | None = None,
+) -> int:
+    provider = str(provider_id or "").strip().lower()
+    required_key = "live_eligible" if str(mode).upper() == "FULL_LIVE" else "live_small_eligible"
+    strategies = [
+        item
+        for item in data.get("strategies", [])
+        if isinstance(item, dict)
+        and strategy_broker_id(item) == provider
+        and item.get(required_key) is True
+    ]
+    broker = next(
+        (
+            item
+            for item in data.get("brokers", [])
+            if isinstance(item, dict) and str(item.get("broker_id") or "").lower() == provider
+        ),
+        None,
+    )
+    checklist_missing = [
+        item
+        for item in checklist_rows()
+        if item["required"] and not item["checked"]
+    ]
+    reconciliation = reconciliation_summary or reconciliation_summary_for_broker(provider)
+    central_control = durable_control_snapshot()
+    return sum(
+        (
+            0 if real_orders_enabled() else 1,
+            0 if not checklist_missing else 1,
+            0 if broker and broker.get("order_ready") is True else 1,
+            0 if strategies else 1,
+            1 if STATE["kill_switch"] else 0,
+            1 if central_control["halted"] else 0,
+            0 if reconciliation["status"] == "pass" else 1,
+        )
+    )
+
+
 def set_automation_profile(profile_id: str, enabled: bool, provider: str | None = None, mode: str | None = None) -> dict[str, Any]:
     profile_id = profile_id if profile_id in {"stock", "crypto"} else ""
     if not profile_id:
@@ -2543,8 +2691,10 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
             STATE["automation"][profile_id]["last_action"] = reason
             append_audit("danger", "자동화 시작 차단", f"{profile['title']}: {reason}")
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
-        if data["summary"]["blocker_count"]:
-            reason = f"readiness blocker {data['summary']['blocker_count']}개 때문에 {next_mode} 전환이 차단되었습니다."
+        provider_id = str(STATE["automation"][profile_id].get("provider") or ("kis" if profile_id == "stock" else "binance"))
+        profile_blockers = profile_readiness_blocker_count(data, profile_id, provider_id, next_mode)
+        if profile_blockers:
+            reason = f"{provider_id} 범위 readiness blocker {profile_blockers}개 때문에 {next_mode} 전환이 차단되었습니다."
             STATE["automation"][profile_id]["last_action"] = reason
             append_audit("danger", "자동화 시작 차단", f"{profile['title']}: {reason}")
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
@@ -2565,6 +2715,10 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
     STATE["automation"][profile_id]["enabled"] = bool(enabled)
     STATE["automation"][profile_id]["mode"] = next_mode
+    if enabled:
+        STATE["mode"] = next_mode
+    elif not any(bool(item.get("enabled")) for item in STATE["automation"].values()):
+        STATE["mode"] = "MONITOR"
     action = f"{next_mode} 전환"
     STATE["automation"][profile_id]["last_action"] = f"{action} {now_text()}"
     append_audit("info" if next_mode == "MONITOR" else "warn", f"{profile['title']} {action}", f"{profile['provider_label']} 라우트의 자동화 모드를 {next_mode}(으)로 기록했습니다.")
@@ -2808,6 +2962,202 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
         "execution_events": execution_event_snapshot(),
         "snapshot": snapshot(),
     }
+
+
+BINANCE_SMOKE_SYMBOL = "BTCUSDT"
+BINANCE_SMOKE_QUANTITY = 0.0001
+BINANCE_SMOKE_MIN_USDT = 5.0
+BINANCE_SMOKE_MAX_USDT = 10.0
+BINANCE_SMOKE_PREVIEW_TTL_SECONDS = 600
+
+
+def _binance_smoke_order_view(**updates: Any) -> dict[str, Any]:
+    current = dict(STATE.get("binance_smoke_order", {}))
+    current.update(updates)
+    STATE["binance_smoke_order"] = current
+    return current
+
+
+def _binance_ticker_price() -> float:
+    base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
+    response = http_json(
+        "GET",
+        f"{base_url.rstrip('/')}/api/v3/ticker/price?symbol={BINANCE_SMOKE_SYMBOL}",
+        body=None,
+        headers={},
+        timeout_seconds=10.0,
+    )
+    payload = response.get("json") if isinstance(response.get("json"), dict) else {}
+    price = safe_float(payload.get("price"), 0.0)
+    if response.get("ok") is not True or price <= 0:
+        raise RuntimeError(str(response.get("text") or "Binance BTCUSDT 현재가 조회 실패"))
+    return price
+
+
+def preview_binance_smoke_order(strategy_id: str) -> dict[str, Any]:
+    strategy = next(
+        (
+            item
+            for item in strategy_rows()
+            if str(item.get("strategy_id") or "") == str(strategy_id or "")
+            and item.get("live_small_eligible") is True
+            and strategy_broker_id(item) == "binance"
+            and str(item.get("symbol") or "").upper() == BINANCE_SMOKE_SYMBOL
+        ),
+        None,
+    )
+    if strategy is None:
+        reason = "선택한 Binance Strategy Instance가 before-live-small 및 검증 evidence를 통과하지 못했습니다."
+        _binance_smoke_order_view(status="blocked", status_label="차단", detail=reason, confirmation_token="")
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    router = LiveBrokerRouter()
+    try:
+        account_snapshot = router.get_account_snapshot("binance")
+        price = _binance_ticker_price()
+    except (BrokerNotReadyError, RuntimeError) as exc:
+        reason = str(exc)
+        _binance_smoke_order_view(status="blocked", status_label="조회 실패", detail=reason, confirmation_token="")
+        append_audit("danger", "Binance 소액 주문 미리보기", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    accounts = account_snapshot.get("accounts", []) if isinstance(account_snapshot, dict) else []
+    usdt_row = next(
+        (
+            item
+            for item in accounts
+            if isinstance(item, dict) and str(item.get("currency") or "").upper() == "USDT"
+        ),
+        {},
+    )
+    available_usdt = safe_float(usdt_row.get("broker_cash"), 0.0)
+    notional_usdt = BINANCE_SMOKE_QUANTITY * price
+    blocked_reasons: list[str] = []
+    if notional_usdt < BINANCE_SMOKE_MIN_USDT:
+        blocked_reasons.append(f"거래소 최소 주문 {BINANCE_SMOKE_MIN_USDT:g} USDT 미만")
+    if notional_usdt > BINANCE_SMOKE_MAX_USDT:
+        blocked_reasons.append(f"점검 주문 하드 한도 {BINANCE_SMOKE_MAX_USDT:g} USDT 초과")
+    if available_usdt + 1e-9 < notional_usdt * 1.01:
+        blocked_reasons.append("수수료 여유분을 포함한 USDT 잔고 부족")
+
+    prepared = build_binance_spot_order_request(
+        {
+            "broker_id": "binance",
+            "symbol": BINANCE_SMOKE_SYMBOL,
+            "side": "BUY",
+            "quantity": BINANCE_SMOKE_QUANTITY,
+            "order_type": "MARKET",
+        }
+    )
+    if not prepared.can_send:
+        blocked_reasons.append("주문 요청 설정 누락: " + ", ".join(prepared.blocked_reasons))
+    ready = not blocked_reasons
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(seconds=BINANCE_SMOKE_PREVIEW_TTL_SECONDS)
+    token = secrets.token_urlsafe(24) if ready else ""
+    detail = (
+        f"{BINANCE_SMOKE_SYMBOL} 시장가 매수 {BINANCE_SMOKE_QUANTITY:g} BTC · "
+        f"현재가 {price:,.2f} USDT · 예상 {notional_usdt:.2f} USDT · 가용 {available_usdt:.2f} USDT"
+        if ready
+        else " · ".join(blocked_reasons)
+    )
+    preview = _binance_smoke_order_view(
+        status="ready" if ready else "blocked",
+        status_label="확인 대기" if ready else "차단",
+        strategy_id=str(strategy.get("strategy_id") or ""),
+        symbol=BINANCE_SMOKE_SYMBOL,
+        side="BUY",
+        order_type="MARKET",
+        quantity=BINANCE_SMOKE_QUANTITY,
+        price=price,
+        notional_usdt=notional_usdt,
+        available_usdt=available_usdt,
+        confirmation_token=token,
+        expires_at=expires.isoformat().replace("+00:00", "Z"),
+        expires_epoch=expires.timestamp(),
+        used=False,
+        broker_order_id="",
+        detail=detail,
+        request_preview=prepared.preview(),
+        blocked_reasons=blocked_reasons,
+    )
+    append_audit("info" if ready else "danger", "Binance 소액 주문 미리보기", detail + (" · 실제 주문 전송 없음" if ready else ""))
+    return {"ok": ready, "reason": detail, "preview": preview, "snapshot": snapshot()}
+
+
+def submit_binance_smoke_order(confirmation_token: object, *, confirmed: bool) -> dict[str, Any]:
+    preview = dict(STATE.get("binance_smoke_order", {}))
+    token = str(confirmation_token or "")
+    if not confirmed or not token or not secrets.compare_digest(token, str(preview.get("confirmation_token") or "")):
+        return {"ok": False, "reason": "정확한 Binance 주문 미리보기의 1회 확인 토큰이 필요합니다.", "snapshot": snapshot()}
+    if preview.get("status") != "ready" or bool(preview.get("used")):
+        return {"ok": False, "reason": "이미 사용되었거나 전송 가능한 미리보기가 아닙니다.", "snapshot": snapshot()}
+    if safe_float(preview.get("expires_epoch"), 0.0) <= datetime.now(timezone.utc).timestamp():
+        _binance_smoke_order_view(status="expired", status_label="만료", confirmation_token="", detail="미리보기가 만료되었습니다.")
+        return {"ok": False, "reason": "미리보기가 만료되었습니다. 다시 조회하세요.", "snapshot": snapshot()}
+    if STATE.get("kill_switch") or STATE.get("new_entries_blocked"):
+        return {"ok": False, "reason": "긴급/신규 진입 차단이 켜져 있어 실제 주문을 전송할 수 없습니다.", "snapshot": snapshot()}
+    if STATE.get("dry_run") or current_mode() != "SMALL_LIVE":
+        return {"ok": False, "reason": "Dry Run을 해제하고 SMALL_LIVE에서만 점검 주문을 보낼 수 있습니다.", "snapshot": snapshot()}
+    if not real_orders_enabled():
+        return {"ok": False, "reason": "LIVE_TRADER_ENABLE_REAL_ORDERS=true가 필요합니다.", "snapshot": snapshot()}
+
+    try:
+        fresh_price = _binance_ticker_price()
+        fresh_account = LiveBrokerRouter().get_account_snapshot("binance")
+        accounts = fresh_account.get("accounts", []) if isinstance(fresh_account, dict) else []
+        usdt_row = next(
+            (
+                item
+                for item in accounts
+                if isinstance(item, dict) and str(item.get("currency") or "").upper() == "USDT"
+            ),
+            {},
+        )
+        fresh_cash = safe_float(usdt_row.get("broker_cash"), 0.0)
+        fresh_notional = BINANCE_SMOKE_QUANTITY * fresh_price
+        if fresh_notional < BINANCE_SMOKE_MIN_USDT or fresh_notional > BINANCE_SMOKE_MAX_USDT:
+            raise BrokerNotReadyError(f"전송 직전 주문 금액 {fresh_notional:.2f} USDT가 5~10 USDT 하드 한도를 벗어났습니다.")
+        if fresh_cash + 1e-9 < fresh_notional * 1.01:
+            raise BrokerNotReadyError("전송 직전 수수료 여유분을 포함한 USDT 잔고가 부족합니다.")
+    except (BrokerNotReadyError, RuntimeError) as exc:
+        reason = str(exc)
+        _binance_smoke_order_view(status="blocked", status_label="전송 직전 차단", detail=reason, confirmation_token="")
+        append_audit("danger", "Binance 실제 소액 주문", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
+    _binance_smoke_order_view(status="submitting", status_label="전송 중", used=True, confirmation_token="")
+    strategy_id = str(preview.get("strategy_id") or "")
+    intent = OrderIntent(
+        strategy_id=strategy_id,
+        asset="CRYPTO",
+        symbol=BINANCE_SMOKE_SYMBOL,
+        side="BUY",
+        quantity=BINANCE_SMOKE_QUANTITY,
+        reference_price=fresh_price,
+        mode="SMALL_LIVE",
+        reason="승급 전략 기반 Binance 브로커 제출 경로 소액 검증(전략 신호 아님)",
+        metadata={
+            "broker_id": "binance",
+            "profile_id": "crypto",
+            "strategy_instance_id": strategy_id,
+            "instrument_id": BINANCE_SMOKE_SYMBOL,
+            "target_revision": int(datetime.now(timezone.utc).timestamp()),
+            "order_purpose": "BROKER_SMOKE",
+            "order_type": "MARKET",
+        },
+    )
+    result = submit_order_intent(snapshot(), intent, dry_run=False, audit_event="Binance Broker Smoke")
+    order = result.get("order") if isinstance(result.get("order"), dict) else {}
+    _binance_smoke_order_view(
+        status="acknowledged" if result.get("ok") else "rejected",
+        status_label="접수" if result.get("ok") else "거절/차단",
+        broker_order_id=str(order.get("broker_order_id") or ""),
+        detail=str(result.get("reason") or ""),
+        order_id=str(order.get("order_id") or ""),
+        order_state=str(order.get("state") or ""),
+    )
+    return {**result, "smoke_order": dict(STATE["binance_smoke_order"])}
 
 
 UPBIT_SMOKE_MARKET = "KRW-BTC"
@@ -3191,7 +3541,7 @@ def evaluate_order_gate_with_report(
     if report.can_submit:
         if dry_run:
             return True, "dry_run", "simulated", "Dry Run 보호가 켜져 있어 브로커 전송 없이 주문 의도를 감사 로그에만 기록했습니다.", report
-        return False, "adapter_blocked", "held", "실제 주문 전송 레이어가 아직 안전 검증 전이므로 브로커 전송을 차단했습니다.", report
+        return True, "approved", "ready", "Pre-trade 위험 게이트와 실주문 어댑터 검증을 통과했습니다.", report
 
     adapter_labels = {"운용 모드", "실거래 환경 변수", "실주문 어댑터"}
     non_adapter_blockers = [check for check in report.blockers if check.label not in adapter_labels]
@@ -3388,17 +3738,42 @@ def default_order_intent(checks: dict[str, Any], side: str) -> OrderIntent:
     )
 
 
+def intent_readiness_blocker_count(
+    checks: dict[str, Any],
+    intent: OrderIntent,
+    reconciliation_summary: dict[str, Any] | None = None,
+) -> int:
+    if not checks.get("strategies") or not checks.get("brokers"):
+        return int(checks.get("summary", {}).get("blocker_count", 0))
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset)).strip().lower()
+    profile_id = str(metadata.get("profile_id") or ("crypto" if broker_id in {"binance", "upbit"} else "stock"))
+    scoped = reconciliation_summary or reconciliation_summary_for_broker(broker_id)
+    return profile_readiness_blocker_count(
+        checks,
+        profile_id,
+        broker_id,
+        intent.mode,
+        reconciliation_summary=scoped,
+    )
+
+
 def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool) -> PreTradeContext:
     settings = STATE["risk_settings"]
-    reconciliation = checks.get("reconciliation") if isinstance(checks.get("reconciliation"), dict) else {}
-    reconciliation_summary = reconciliation.get("summary") if isinstance(reconciliation.get("summary"), dict) else {}
+    has_scoped_context = bool(checks.get("strategies")) and bool(checks.get("brokers"))
+    if has_scoped_context:
+        broker_id = str((intent.metadata or {}).get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset))
+        reconciliation_summary = reconciliation_summary_for_broker(broker_id)
+    else:
+        reconciliation = checks.get("reconciliation") if isinstance(checks.get("reconciliation"), dict) else {}
+        reconciliation_summary = reconciliation.get("summary") if isinstance(reconciliation.get("summary"), dict) else {}
     positions_matched = str(reconciliation_summary.get("status", "pass")) == "pass"
     return PreTradeContext(
         mode=current_mode(),
         dry_run=dry_run,
         halted=bool(STATE["kill_switch"]) or durable_control_halt_active(intent),
         new_entries_blocked=bool(STATE["new_entries_blocked"]),
-        readiness_blockers=int(checks.get("summary", {}).get("blocker_count", 0)),
+        readiness_blockers=int(intent_readiness_blocker_count(checks, intent, reconciliation_summary)),
         readiness_warnings=int(checks.get("summary", {}).get("warning_count", 0)),
         real_orders_enabled=real_orders_enabled(),
         live_order_adapter_verified=broker_ready_for_intent(checks, intent),
@@ -3532,6 +3907,8 @@ def parse_order_time(value: str) -> datetime | None:
 def next_order_id(state_name: str, dry_run: bool) -> str:
     if state_name == "dry_run" or dry_run:
         prefix = "LIVE-DRY"
+    elif state_name == "approved":
+        prefix = "LIVE-ORDER"
     elif state_name == "canceled":
         prefix = "LIVE-CXL"
     else:
@@ -4012,9 +4389,20 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
 
 def broker_position_quantity(symbol: str) -> float:
     positions = STATE.get("broker_reconciliation", {}).get("positions", [])
+    normalized_symbol = str(symbol or "").upper().replace("-", "")
+    aliases = {normalized_symbol}
+    for quote_currency in ("USDT", "USDC", "BUSD", "BTC", "ETH"):
+        if normalized_symbol.endswith(quote_currency) and len(normalized_symbol) > len(quote_currency):
+            aliases.add(normalized_symbol[: -len(quote_currency)])
+            break
     return sum(
-        safe_float(item.get("quantity"), safe_float(item.get("qty"), 0.0))
-        for item in positions if isinstance(item, dict) and str(item.get("symbol") or "") == symbol
+        safe_float(
+            item.get("quantity"),
+            safe_float(item.get("qty"), safe_float(item.get("broker_qty"), 0.0)),
+        )
+        for item in positions
+        if isinstance(item, dict)
+        and str(item.get("symbol") or "").upper().replace("-", "") in aliases
     )
 
 

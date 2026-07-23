@@ -941,3 +941,15 @@ API 없이 실제 실행한 기능:
 - 활성 조건 칩과 결과 수를 표시하고, 검색 결과가 달라지면 현재 선택을 보이는 첫 전략으로 안전하게 맞춘다.
 - 자주 쓰는 조건은 이름을 붙여 최대 30개까지 로컬 저장하며 자산 탭 범위도 함께 복원한다. 실제 실행 화면에서 `AAPL 모니터` 조건이 재접속 뒤 남고 다시 적용했을 때 15개 중 AAPL 3개만 복원되는 것을 확인했다.
 - 라이프사이클 `Draft` 표기도 다른 프로그램과 통일했다. production build, 100/125/150% 데스크톱 계약, PyInstaller 패키징과 10개 화면 UI smoke가 통과했다.
+
+## 2026-07-23 공용 검색 프리셋·Binance SMALL_LIVE 실체결 검증
+
+- 저장 검색 프리셋을 `%APPDATA%\trading_programs\strategy-search-presets.json` 공용 저장소로 옮겨 Backtester/Paper Trader와 공유하고 기존 localStorage 프리셋을 병합한다.
+- 승인된 단일 Strategy Artifact도 Portfolio 없이 연속 실행할 수 있게 했고, 포트폴리오가 명시된 주문에만 universe hard gate를 적용한다.
+- Binance signed REST와 사설 WebSocket 모두 `/api/v3/time` 기준 오프셋을 사용하고 `-1021`이면 한 번 재동기화한다.
+- 브로커별 readiness/대조를 분리해 KIS 해외 대조 경고가 Binance를 막지 않게 했다. Watchdog은 실행 중인 브로커만 감시하고, 완료 봉 전략은 연속 feed heartbeat와 사설 체결 스트림 연결을 정상 근거로 사용한다.
+- MONITOR→SMALL_LIVE는 실행기를 재시작하지 않고 워밍업·heartbeat를 유지한 채 원자적으로 전환한다. Binance `BTC` 잔고를 `BTCUSDT` 전략 포지션으로 매핑한다.
+- 1회용 확인 토큰과 5~10 USDT 하드 한도를 둔 Binance broker smoke를 추가했다. 이 주문은 전략 신호와 구분해 `BROKER_SMOKE`로 기록한다.
+- 실제 계좌에서 0.0001 BTC 시장가 매수가 65,588.48 USDT에 FILLED 됐다. USDT는 약 30.36→23.80, BTC는 약 0.00000451→0.00010441로 반영됐고 체결 스트림 5건 저장, 대조 mismatch 0을 확인했다.
+- 검증 뒤 실주문 플래그를 false, MONITOR/Dry Run/신규 진입 차단 상태로 복구하고 runtime을 중지했다. 구매 BTC는 계좌에 남아 다음 실행 시 보유 포지션으로 인식된다.
+- Live unittest 103개, 공통 runtime 90개, Vite build, 10화면 UI smoke, PyInstaller 패키징이 통과했다. Windows 시장 캘린더를 위해 `tzdata`도 실행 파일에 포함했다.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from .live_adapters import (
     build_binance_account_request,
@@ -18,11 +18,21 @@ from .live_adapters import (
     build_upbit_order_detail_request,
     build_upbit_order_request,
     issue_kis_access_token,
+    refresh_binance_time_offset,
     send_prepared_request,
 )
 
 BrokerStatus = Literal["connected", "missing_credentials", "adapter_required", "disabled"]
 CheckStatus = Literal["pass", "warn", "fail"]
+
+
+def send_binance_signed_request(builder: Callable[[], Any]) -> dict[str, object]:
+    response = send_prepared_request(builder())
+    payload = response.get("json") if isinstance(response.get("json"), dict) else {}
+    if int(payload.get("code") or 0) == -1021:
+        refresh_binance_time_offset()
+        response = send_prepared_request(builder())
+    return response
 
 
 @dataclass(frozen=True)
@@ -532,7 +542,7 @@ class LiveBrokerRouter:
             payload = ensure_response_ok("kis", send_prepared_request(build_kis_domestic_balance_request(access_token=token)))
             return {"broker_id": "kis", "accounts": parse_kis_accounts(payload)}
         if broker_id == "binance":
-            payload = ensure_response_ok("binance", send_prepared_request(build_binance_account_request()))
+            payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))
             return {"broker_id": "binance", "accounts": parse_binance_accounts(payload)}
         if broker_id == "upbit":
             payload = ensure_response_ok("upbit", send_prepared_request(build_upbit_accounts_request()))
@@ -546,7 +556,7 @@ class LiveBrokerRouter:
             payload = ensure_response_ok("kis", send_prepared_request(build_kis_domestic_balance_request(access_token=token)))
             return parse_kis_positions(payload)
         if broker_id == "binance":
-            payload = ensure_response_ok("binance", send_prepared_request(build_binance_account_request()))
+            payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))
             return parse_binance_positions(payload)
         if broker_id == "upbit":
             payload = ensure_response_ok("upbit", send_prepared_request(build_upbit_accounts_request()))
@@ -561,7 +571,7 @@ class LiveBrokerRouter:
             token = issue_kis_access_token()
             return send_prepared_request(build_kis_live_order_request(intent, access_token=token))
         if broker_id == "binance":
-            return send_prepared_request(build_binance_spot_order_request(intent))
+            return send_binance_signed_request(lambda: build_binance_spot_order_request(intent))
         if broker_id == "upbit":
             return send_prepared_request(build_upbit_order_request(intent))
         raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
@@ -593,11 +603,13 @@ class LiveBrokerRouter:
             order = {**context, "broker_order_id": broker_order_id}
             return send_prepared_request(build_kis_cancel_order_request(order, access_token=token))
         if broker_id == "binance":
-            return send_prepared_request(build_binance_cancel_order_request(
-                str(context.get("symbol") or ""),
-                broker_order_id,
-                client_order_id=bool(context.get("client_order_id")),
-            ))
+            return send_binance_signed_request(
+                lambda: build_binance_cancel_order_request(
+                    str(context.get("symbol") or ""),
+                    broker_order_id,
+                    client_order_id=bool(context.get("client_order_id")),
+                )
+            )
         if broker_id == "upbit":
             return send_prepared_request(build_upbit_cancel_order_request(
                 broker_order_id,
@@ -628,7 +640,7 @@ class LiveBrokerRouter:
                 "source": "kis_balance_poll",
             }
         if broker_id == "binance":
-            payload = ensure_response_ok("binance", send_prepared_request(build_binance_account_request()))
+            payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))
             accounts = parse_binance_accounts(payload)
             positions = parse_binance_positions(payload)
             return {

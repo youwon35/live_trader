@@ -21,6 +21,7 @@ class OrderGateTest(unittest.TestCase):
         state.RECOVERY_JOURNAL = state.RecoveryJournal(Path(self.recovery_temp_dir.name) / "recovery-journal")
 
     def tearDown(self) -> None:
+        self.restore_temp_program_ledger()
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
         state.RECOVERY_JOURNAL = self.original_recovery_journal
@@ -271,7 +272,7 @@ class OrderGateTest(unittest.TestCase):
             reference_price=38900,
             mode="SMALL_LIVE",
             reason="unit",
-            metadata={"broker_id": "kis"},
+            metadata={"broker_id": "kis", "portfolio_id": "portfolio-1"},
         )
 
         ok, order_state, queue_state, reason, report = state.evaluate_order_gate_with_report(checks, "BUY", True, intent)
@@ -373,6 +374,59 @@ class OrderGateTest(unittest.TestCase):
         self.assertAlmostEqual(gate["targetWeight"], 0.12)
         self.assertTrue(gate["fxFreshness"]["fresh"])
         self.assertEqual(gate["fxFreshness"]["source"], "same-currency")
+
+    def test_unmatched_portfolios_do_not_block_standalone_strategy(self) -> None:
+        portfolio = {
+            "id": "other-portfolio",
+            "lifecycle_status": "before-live-small",
+            "permissions": {"live_small_allowed": True},
+            "strategy_instances": [
+                {"strategyId": "OTHER", "symbol": "ETHUSDT", "instanceId": "other-1"}
+            ],
+            "target_portfolio": [
+                {"strategyId": "OTHER", "symbol": "ETHUSDT", "targetWeight": 0.1}
+            ],
+        }
+
+        gate = state.portfolio_gate_for_strategy(
+            {"strategy_id": "BTC-1", "symbol": "BTCUSDT"},
+            [portfolio],
+            mode="SMALL_LIVE",
+        )
+
+        self.assertTrue(gate["allowed"])
+        self.assertFalse(gate["active"])
+        self.assertIn("단일 전략", gate["detail"])
+
+    def test_reconciliation_summary_is_scoped_to_selected_broker(self) -> None:
+        mixed = {
+            "positions": [
+                {"broker_id": "binance", "status": "pass"},
+                {"broker_id": "kis", "status": "api_required"},
+            ],
+            "accounts": [{"broker_id": "binance", "status": "pass"}],
+        }
+        with patch("live_trader.state.reconciliation_snapshot", return_value=mixed), patch(
+            "live_trader.state.broker_reconciliation_errors",
+            return_value={"kis": "overseas balance unavailable"},
+        ):
+            binance = state.reconciliation_summary_for_broker("binance")
+            kis = state.reconciliation_summary_for_broker("kis")
+
+        self.assertEqual("pass", binance["status"])
+        self.assertEqual(2, binance["pass_count"])
+        self.assertEqual("warn", kis["status"])
+        self.assertGreater(kis["api_required_count"], 0)
+
+    def test_empty_broker_reconciliation_fails_closed(self) -> None:
+        with patch(
+            "live_trader.state.reconciliation_snapshot",
+            return_value={"positions": [], "accounts": []},
+        ), patch("live_trader.state.broker_reconciliation_errors", return_value={}):
+            summary = state.reconciliation_summary_for_broker("binance")
+
+        self.assertEqual("warn", summary["status"])
+        self.assertEqual(1, summary["api_required_count"])
 
     def test_portfolio_gate_blocks_foreign_asset_when_fx_is_stale(self) -> None:
         state.STATE["mode"] = "SMALL_LIVE"
@@ -962,6 +1016,54 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(state.STATE["watchdog"]["trip_count"], 1)
         self.assertEqual(state.STATE["audit"][-1]["event"], "Watchdog Fail Closed")
 
+    def test_watchdog_accepts_fresh_continuous_runtime_and_private_stream(self) -> None:
+        now = datetime.now()
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["automation"]["crypto"].update(
+            {"enabled": True, "provider": "binance", "mode": "SMALL_LIVE"}
+        )
+        state.STATE["automation"]["stock"].update({"enabled": False, "mode": "MONITOR"})
+        state.STATE["watchdog"]["last_run"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        state.STATE["strategy_runner"]["last_run"] = ""
+        state.STATE["execution_events"]["last_poll"] = ""
+        brokers = [{"broker_id": "binance", "order_ready": True}]
+        reconciliation = {
+            "status": "pass",
+            "status_label": "정상",
+            "last_run": now.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        queue = {"retryable": 0, "blocked": 0}
+        continuous = {
+            "profiles": {
+                "crypto": {
+                    "running": True,
+                    "phase": "RUNNING",
+                    "lastHeartbeat": now.isoformat(),
+                }
+            }
+        }
+        streams = {
+            "brokers": {
+                "binance": {
+                    "running": True,
+                    "connected": True,
+                }
+            }
+        }
+
+        with patch.object(state.LIVE_CONTINUOUS_CONTROLLER, "snapshot", return_value=continuous), patch.object(
+            state.LIVE_EXECUTION_STREAMS,
+            "snapshot",
+            return_value=streams,
+        ):
+            report = state.watchdog_snapshot(brokers, reconciliation, queue, now=now)
+
+        self.assertEqual(0, report["critical_count"], report["checks"])
+        checks = {item["label"]: item for item in report["checks"]}
+        self.assertEqual("pass", checks["시장 데이터 신선도"]["status"])
+        self.assertEqual("pass", checks["체결 이벤트 동기화"]["status"])
+        self.assertEqual(["binance"], report["active_brokers"])
+
     def test_automation_start_is_blocked_by_watchdog_critical(self) -> None:
         fake_snapshot = {
             "summary": {"blocker_count": 0, "warning_count": 0},
@@ -979,6 +1081,8 @@ class OrderGateTest(unittest.TestCase):
         self.assertFalse(state.STATE["automation"]["crypto"]["enabled"])
 
     def test_reconciliation_refreshes_read_only_broker_snapshots(self) -> None:
+        self.use_temp_program_ledger(self.recovery_temp_dir.name)
+
         class FakeRouter:
             def get_account_snapshot(self, broker_id):
                 rows = {
@@ -1243,6 +1347,15 @@ class OrderGateTest(unittest.TestCase):
                 for event in result["events"]
             )
         )
+
+    def test_binance_pair_position_lookup_maps_base_asset_balance(self) -> None:
+        state.STATE["broker_reconciliation"]["positions"] = [
+            {"broker_id": "binance", "symbol": "BTC", "broker_qty": 0.00010441},
+            {"broker_id": "binance", "symbol": "XRP", "broker_qty": 0.09257},
+        ]
+
+        self.assertEqual(0.00010441, state.broker_position_quantity("BTCUSDT"))
+        self.assertEqual(0.09257, state.broker_position_quantity("XRPUSDT"))
 
     def test_upbit_poll_execution_events_returns_balance_snapshot_events(self) -> None:
         payload = [

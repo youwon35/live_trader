@@ -13,6 +13,7 @@ from live_trader.live_adapters import (
     UPBIT_ACCOUNTS_ENDPOINT,
     UPBIT_ORDER_ENDPOINT,
     UPBIT_ORDER_DETAIL_ENDPOINT,
+    _clear_binance_time_offset_cache,
     _clear_kis_access_token_cache,
     build_binance_account_request,
     build_binance_cancel_order_request,
@@ -24,6 +25,7 @@ from live_trader.live_adapters import (
     build_upbit_cancel_order_request,
     build_upbit_order_request,
     issue_kis_access_token,
+    refresh_binance_time_offset,
     sign_binance_query,
 )
 
@@ -46,11 +48,13 @@ ADAPTER_ENV_KEYS = (
 class EnvRestoreMixin:
     def setUp(self) -> None:
         self.previous_env = {key: os.environ.get(key) for key in ADAPTER_ENV_KEYS}
+        _clear_binance_time_offset_cache()
         _clear_kis_access_token_cache()
         for key in ADAPTER_ENV_KEYS:
             os.environ.pop(key, None)
 
     def tearDown(self) -> None:
+        _clear_binance_time_offset_cache()
         _clear_kis_access_token_cache()
         for key, value in self.previous_env.items():
             if value is None:
@@ -291,6 +295,27 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertEqual(first, "token-123")
         self.assertEqual(second, "token-123")
         request.assert_called_once()
+
+    def test_binance_server_time_offset_is_applied_to_signed_requests(self) -> None:
+        os.environ.update(
+            {
+                "BINANCE_API_KEY": "binance-key",
+                "BINANCE_API_SECRET": "binance-secret",
+                "BINANCE_BASE_URL": "https://binance.example.test",
+            }
+        )
+        response = {"ok": True, "json": {"serverTime": 1700000005123}}
+
+        with patch("live_trader.live_adapters.http_json", return_value=response), patch(
+            "live_trader.live_adapters.time.time",
+            side_effect=[1700000000.123, 1700000000.123],
+        ):
+            offset = refresh_binance_time_offset()
+        with patch("live_trader.live_adapters.time.time", return_value=1700000000.123):
+            prepared = build_binance_account_request()
+
+        self.assertEqual(5000, offset)
+        self.assertEqual(1700000005123, prepared.query["timestamp"])
 
     def test_missing_settings_and_invalid_intent_are_reported_as_blocked_reasons(self) -> None:
         kis = build_kis_live_order_request({"symbol": "", "side": "BUY", "quantity": 0, "price": 0})

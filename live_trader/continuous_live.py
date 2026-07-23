@@ -12,7 +12,10 @@ from trading_runtime import (
     DurableRuntimeState,
     FeedSubscription,
     PortfolioRuntimeEngine,
+    RuntimeStrategySpec,
+    artifact_content_hash,
     feeds_for_specs,
+    infer_market_route,
     load_portfolio_runtime_path,
     required_warmup_bars,
 )
@@ -38,24 +41,53 @@ class LiveContinuousController:
             return {"ok": False, "reason": f"지원하지 않는 runtime mode입니다: {normalized_mode}", "snapshot": state.snapshot()}
         with self._lock:
             if self.supervisor and self.supervisor.running:
-                return {"ok": True, "reason": "continuous runtime already running", "runtime": self.snapshot(), "snapshot": state.snapshot()}
+                specs = tuple(self.supervisor.engine.specs)
+                if normalized_mode != "MONITOR" and not all(
+                    self._spec_mode_allowed(spec, normalized_mode) for spec in specs
+                ):
+                    return {
+                        "ok": False,
+                        "reason": f"실행 중인 Artifact가 {normalized_mode} 권한을 통과하지 못했습니다.",
+                        "runtime": self.snapshot(),
+                        "snapshot": state.snapshot(),
+                    }
+                previous_mode = self.mode
+                self.mode = normalized_mode
+                self.supervisor.engine.mode = normalized_mode
+                state.append_audit(
+                    "info" if normalized_mode == "MONITOR" else "warn",
+                    "Continuous Runtime",
+                    f"{normalized_profile} runtime {previous_mode} → {normalized_mode} 무중단 전환",
+                )
+                return {"ok": True, "reason": "continuous runtime mode transitioned", "runtime": self.snapshot(), "snapshot": state.snapshot()}
             portfolio = self._select_portfolio(normalized_profile, portfolio_id)
-            if portfolio is None:
-                return {"ok": False, "reason": f"{normalized_profile}용 Portfolio Artifact를 찾을 수 없습니다.", "snapshot": state.snapshot()}
-            source_path = str(portfolio.get("source_path") or "")
-            if not source_path or not Path(source_path).exists():
-                return {"ok": False, "reason": "Portfolio Artifact 원본 경로가 없습니다.", "snapshot": state.snapshot()}
-            loaded = load_portfolio_runtime_path(source_path)
-            specs = tuple(spec for spec in loaded.specs if self._matches_profile(spec, normalized_profile))
+            loaded = None
+            if portfolio is not None:
+                source_path = str(portfolio.get("source_path") or "")
+                if not source_path or not Path(source_path).exists():
+                    return {"ok": False, "reason": "Portfolio Artifact 원본 경로가 없습니다.", "snapshot": state.snapshot()}
+                loaded = load_portfolio_runtime_path(source_path)
+                specs = tuple(spec for spec in loaded.specs if self._matches_profile(spec, normalized_profile))
+                runtime_id = loaded.portfolio_id
+                runtime_hash = loaded.portfolio_hash
+                runtime_permissions = loaded.payload.get("permissions") if isinstance(loaded.payload.get("permissions"), dict) else {}
+            else:
+                standalone = self._select_standalone_strategy(normalized_profile, normalized_mode)
+                if standalone is None:
+                    return {"ok": False, "reason": f"{normalized_profile}용 Portfolio/Strategy Artifact를 찾을 수 없습니다.", "snapshot": state.snapshot()}
+                source_path = str(standalone.get("source_path") or "")
+                specs = (self._standalone_spec(standalone),)
+                runtime_id = specs[0].portfolio_id
+                runtime_hash = specs[0].portfolio_hash
+                runtime_permissions = dict(standalone.get("permissions") or {})
             if not specs:
-                return {"ok": False, "reason": f"선택 Portfolio에 {normalized_profile} Strategy Instance가 없습니다.", "snapshot": state.snapshot()}
+                return {"ok": False, "reason": f"선택 Artifact에 {normalized_profile} Strategy Instance가 없습니다.", "snapshot": state.snapshot()}
             if normalized_mode != "MONITOR":
-                permissions = loaded.payload.get("permissions") if isinstance(loaded.payload.get("permissions"), dict) else {}
-                allowed = permissions.get("live_eligible") is True or permissions.get("live_allowed") is True
+                allowed = runtime_permissions.get("live_eligible") is True or runtime_permissions.get("live_allowed") is True
                 if normalized_mode == "SMALL_LIVE":
-                    allowed = allowed or permissions.get("live_small_eligible") is True or permissions.get("live_small_allowed") is True
+                    allowed = allowed or runtime_permissions.get("live_small_eligible") is True or runtime_permissions.get("live_small_allowed") is True
                 if not allowed:
-                    return {"ok": False, "reason": f"{loaded.portfolio_id}는 {normalized_mode} 권한을 통과하지 못했습니다. MONITOR만 가능합니다.", "snapshot": state.snapshot()}
+                    return {"ok": False, "reason": f"{runtime_id}는 {normalized_mode} 권한을 통과하지 못했습니다. MONITOR만 가능합니다.", "snapshot": state.snapshot()}
             self.profile_id = normalized_profile
             self.mode = normalized_mode
             self.portfolio_path = source_path
@@ -64,7 +96,7 @@ class LiveContinuousController:
                 mode=normalized_mode,
                 evaluator=BuiltinBarSignalEvaluator(lambda spec: state.broker_position_quantity(spec.symbol)),
                 cycle_handler=self._handle_cycle,
-                state_store=DurableRuntimeState(self.root / "logs" / f"continuous_{normalized_profile}_{loaded.portfolio_hash[:16]}_engine.json"),
+                state_store=DurableRuntimeState(self.root / "logs" / f"continuous_{normalized_profile}_{runtime_hash[:16]}_engine.json"),
             )
             feeds = feeds_for_specs(
                 specs,
@@ -90,7 +122,8 @@ class LiveContinuousController:
                 heartbeat_seconds=5.0,
             )
             self.supervisor.start()
-            state.append_audit("info", "Continuous Runtime", f"{loaded.portfolio_id} · {normalized_profile} · {normalized_mode} 시작, {len(specs)}개 전략")
+            source_kind = "Portfolio" if loaded is not None else "Standalone Strategy"
+            state.append_audit("info", "Continuous Runtime", f"{runtime_id} · {source_kind} · {normalized_profile} · {normalized_mode} 시작, {len(specs)}개 전략")
             return {"ok": True, "reason": "continuous runtime started", "warmup": warmup, "runtime": self.snapshot(), "snapshot": state.snapshot()}
 
     def stop(self) -> dict[str, Any]:
@@ -125,6 +158,48 @@ class LiveContinuousController:
         # contracts.load_portfolio_artifacts() returns newest artifacts first.
         return candidates[0] if candidates else None
 
+    def _select_standalone_strategy(self, profile_id: str, mode: str) -> dict[str, Any] | None:
+        from . import state
+
+        required = "live_eligible" if mode == "FULL_LIVE" else "live_small_eligible"
+        for strategy in state.strategy_rows():
+            if strategy.get(required) is not True:
+                continue
+            symbol = str(strategy.get("symbol") or "")
+            if self._symbol_matches_profile(symbol, profile_id):
+                return strategy
+        return None
+
+    @staticmethod
+    def _standalone_spec(strategy: dict[str, Any]) -> RuntimeStrategySpec:
+        symbol = str(strategy.get("symbol") or "").strip().upper()
+        provider, broker_id, instrument_id = infer_market_route(symbol)
+        provider = str(strategy.get("provider") or provider).strip().lower()
+        broker_id = str(strategy.get("broker_id") or broker_id).strip().lower()
+        strategy_id = str(strategy.get("strategy_id") or strategy.get("id") or "").strip()
+        instance_id = str(strategy.get("instance_id") or f"standalone:{strategy_id}")
+        artifact_hash = str(
+            strategy.get("artifact_hash")
+            or ((strategy.get("artifactLock") or {}).get("artifactHash") if isinstance(strategy.get("artifactLock"), dict) else "")
+            or artifact_content_hash(strategy)
+        )
+        return RuntimeStrategySpec(
+            portfolio_id=f"standalone:{strategy_id}",
+            portfolio_hash=artifact_hash,
+            strategy_instance_id=instance_id,
+            strategy_id=strategy_id,
+            artifact_hash=artifact_hash,
+            plugin_id=str(strategy.get("plugin") or strategy.get("pluginId") or "").strip(),
+            instrument_id=instrument_id,
+            symbol=symbol,
+            timeframe=str(strategy.get("timeframe") or "1d").strip().lower(),
+            provider=provider,
+            broker_id=broker_id,
+            target_weight=max(0.0, float(strategy.get("parameters", {}).get("positionSize", 100.0))) / 100.0,
+            parameters=dict(strategy.get("parameters") or {}),
+            artifact={**strategy, "standalone": True},
+        )
+
     @staticmethod
     def _symbol_matches_profile(symbol: str, profile_id: str) -> bool:
         text = str(symbol).upper()
@@ -133,6 +208,23 @@ class LiveContinuousController:
 
     def _matches_profile(self, spec: Any, profile_id: str) -> bool:
         return self._symbol_matches_profile(spec.symbol, profile_id)
+
+    @staticmethod
+    def _spec_mode_allowed(spec: Any, mode: str) -> bool:
+        if mode == "MONITOR":
+            return True
+        artifact = spec.artifact if isinstance(spec.artifact, dict) else {}
+        permissions = artifact.get("portfolioPermissions") if isinstance(artifact.get("portfolioPermissions"), dict) else {}
+        if not permissions:
+            permissions = artifact.get("permissions") if isinstance(artifact.get("permissions"), dict) else {}
+        if mode == "FULL_LIVE":
+            return permissions.get("live_eligible") is True or permissions.get("live_allowed") is True
+        return (
+            permissions.get("live_small_eligible") is True
+            or permissions.get("live_small_allowed") is True
+            or permissions.get("live_eligible") is True
+            or permissions.get("live_allowed") is True
+        )
 
     def _handle_cycle(self, cycle: Any) -> dict[str, Any]:
         from . import state
@@ -163,7 +255,7 @@ class LiveContinuousController:
                 reason=decision.reason,
                 metadata={
                     "broker_id": spec.broker_id,
-                    "portfolio_id": spec.portfolio_id,
+                    "portfolio_id": "" if spec.artifact.get("standalone") else spec.portfolio_id,
                     "portfolio_hash": spec.portfolio_hash,
                     "strategy_instance_id": spec.strategy_instance_id,
                     "instrument_id": spec.instrument_id,

@@ -14,6 +14,8 @@ from typing import Any, Callable, Iterable
 import urllib.request
 import uuid
 
+from .live_adapters import binance_timestamp_ms, refresh_binance_time_offset
+
 
 def _b64url(payload: bytes) -> str:
     return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
@@ -24,6 +26,14 @@ def upbit_websocket_token(access_key: str, secret_key: str, nonce: str | None = 
     payload = _b64url(json.dumps({"access_key": access_key, "nonce": nonce or str(uuid.uuid4())}, separators=(",", ":")).encode())
     signature = hmac.new(secret_key.encode(), f"{header}.{payload}".encode(), hashlib.sha512).digest()
     return f"{header}.{payload}.{_b64url(signature)}"
+
+
+def binance_stream_subscription_params(api_key: str, api_secret: str) -> dict[str, Any]:
+    refresh_binance_time_offset()
+    params: dict[str, Any] = {"apiKey": api_key, "timestamp": binance_timestamp_ms()}
+    signing_payload = "&".join(f"{key}={params[key]}" for key in sorted(params))
+    params["signature"] = hmac.new(api_secret.encode(), signing_payload.encode(), hashlib.sha256).hexdigest()
+    return params
 
 
 def parse_upbit_my_order(payload: Any) -> dict[str, Any] | None:
@@ -255,9 +265,7 @@ class ExecutionStreamManager:
             raise RuntimeError("Binance private stream credentials missing")
         socket = websocket.create_connection("wss://ws-api.binance.com:443/ws-api/v3", timeout=20)
         request_id = str(uuid.uuid4())
-        params: dict[str, Any] = {"apiKey": api_key, "timestamp": int(time.time() * 1000)}
-        signing_payload = "&".join(f"{key}={params[key]}" for key in sorted(params))
-        params["signature"] = hmac.new(api_secret.encode(), signing_payload.encode(), hashlib.sha256).hexdigest()
+        params = binance_stream_subscription_params(api_key, api_secret)
         socket.send(json.dumps({
             "id": request_id,
             "method": "userDataStream.subscribe.signature",
