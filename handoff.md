@@ -1001,3 +1001,9 @@ API 없이 실제 실행한 기능:
 - 실제 연속 MONITOR에서 폐기된 v6 포트폴리오가 자동 선택되는 결함을 발견했다. 이제 Portfolio 구성 Strategy의 현재 배포 lifecycle과 Backtester 검증을 교차 확인해 paused/retired/미검증 구성요소를 자동 제외한다.
 - SMALL_LIVE와 FULL_LIVE는 모든 구성 전략이 각각 해당 권한을 가진 경우만 선택되며, 명시한 Portfolio가 부적격이면 과거 단일 전략으로 대체하지 않고 즉시 차단한다.
 - 실제 저장소에서 v6 자동 제외와 존재하지 않는 v8 Portfolio 명시 요청의 `running=false`를 확인했다. 최종 Live 회귀 테스트는 110개 모두 통과했다.
+
+## 2026-07-25 실체결·안전 Telegram 알림
+
+- KIS, Binance, Upbit execution stream에서 처음 들어온 `filled/done/executed` 이벤트만 Telegram으로 전송한다. 재시작이나 재동기화로 같은 체결을 다시 읽어도 broker event ID 기준으로 중복 발송하지 않는다.
+- 알림에는 브로커·운용 모드, 종목·방향·수량·가격·주문금액, 전략·포트폴리오, 동기화 후 현금·평가액·포지션 전후, 수수료·주문 ID·체결 시각·Kill Switch 상태가 포함된다.
+- Kill Switch, 심각 안전 경고, 포지션 불일치, 체결 스트림 이상도 별도 긴급 알림으로 보낸다. Telegram 네트워크 장애는 주문·감시 루프를 멈추지 않는다.

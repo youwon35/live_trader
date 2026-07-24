@@ -85,10 +85,16 @@ from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, 
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
 from trading_runtime.market_calendar import market_session_state
 from trading_runtime.artifact_metadata import ArtifactMetadataStore
+from trading_runtime.telegram_notifications import TelegramDispatcher, format_trade_notification
 
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
 CheckStatus = Literal["pass", "warn", "fail"]
+
+TELEGRAM_DISPATCHER = TelegramDispatcher(
+    "live_trader",
+    env_file=Path(__file__).resolve().parents[1] / ".env",
+)
 
 
 RISK_SETTING_META: dict[str, dict[str, object]] = {
@@ -2776,6 +2782,28 @@ def profile_readiness_blocker_count(
             0 if reconciliation["status"] == "pass" else 1,
         )
     )
+    important_event = (
+        level == "danger"
+        or "Kill Switch" in event
+        or "포지션 불일치" in event
+        or "체결 스트림" in event and level == "warn"
+    )
+    if important_event:
+        TELEGRAM_DISPATCHER.send_async(
+            "\n".join(
+                [
+                    f"⚠️ <b>Live Trader - {html.escape(event)}</b>",
+                    f"운용 모드: {html.escape(str(STATE.get('mode') or 'MONITOR'))}",
+                    f"Kill Switch: {'ON' if STATE.get('kill_switch') else 'OFF'}",
+                    f"신규 진입: {'차단' if STATE.get('new_entries_blocked') else '허용'}",
+                    "",
+                    html.escape(detail[:1200]),
+                ]
+            ),
+            dedupe_key=f"live-alert:{event}:{detail[:120]}",
+            dedupe_seconds=600,
+            severity="critical" if level == "danger" else "warning",
+        )
 
 
 def set_automation_profile(profile_id: str, enabled: bool, provider: str | None = None, mode: str | None = None) -> dict[str, Any]:
@@ -3124,6 +3152,80 @@ def automatic_live_promotion_sweep(*, fresh_broker_ids: set[str] | None = None) 
     return results
 
 
+def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[str]) -> int:
+    positions_by_key = {
+        (str(item.get("broker_id") or "").lower(), str(item.get("symbol") or "").upper()): item
+        for item in PROGRAM_LEDGER.position_rows()
+    }
+    cash_by_broker: dict[str, list[dict[str, Any]]] = {}
+    for item in PROGRAM_LEDGER.cash_rows():
+        cash_by_broker.setdefault(str(item.get("broker_id") or "").lower(), []).append(item)
+    sent = 0
+    for event in events:
+        event_id = str(event.get("event_id") or "")
+        state_name = str(event.get("state") or "").lower()
+        quantity = safe_float(event.get("quantity"), 0.0)
+        if not event_id or event_id in existing_event_ids:
+            continue
+        if state_name not in {"filled", "done", "executed"} or quantity <= 0:
+            continue
+        broker_id = str(event.get("broker_id") or "").lower()
+        symbol = str(event.get("symbol") or "").upper()
+        side = str(event.get("side") or (event.get("raw") or {}).get("side") or "").upper()
+        position = positions_by_key.get((broker_id, symbol), {})
+        position_after = safe_float(position.get("quantity"), 0.0)
+        if side == "BUY":
+            position_before = max(0.0, position_after - quantity)
+        elif side == "SELL":
+            position_before = position_after + quantity
+        else:
+            position_before = None
+        cash_rows = cash_by_broker.get(broker_id, [])
+        cash_summary = ", ".join(
+            f"{safe_float(item.get('cash'), 0.0):,.4f} {item.get('currency') or ''}".strip()
+            for item in cash_rows
+        ) or "-"
+        _trace_id, order = execution_event_trace_context(event)
+        portfolio_gate = (order or {}).get("portfolio_gate") if isinstance((order or {}).get("portfolio_gate"), dict) else {}
+        strategy_id = str((order or {}).get("strategy_id") or event.get("strategy_id") or "")
+        price = safe_float(event.get("price"), 0.0)
+        message = format_trade_notification(
+            app_name="Live Trader",
+            environment=str(STATE.get("mode") or "LIVE"),
+            broker=broker_id.upper(),
+            side=side or "FILL",
+            symbol=symbol,
+            quantity=f"{quantity:.12g}",
+            price=f"{price:,.12g}",
+            notional=f"{quantity * price:,.4f}" if price > 0 else None,
+            strategy=strategy_id,
+            portfolio=str(portfolio_gate.get("portfolio_id") or ""),
+            cash_after=cash_summary,
+            equity_after=(
+                f"{sum(safe_float(item.get('cash'), 0.0) for item in cash_rows) + sum(safe_float(item.get('value'), 0.0) for item in PROGRAM_LEDGER.position_rows() if str(item.get('broker_id') or '').lower() == broker_id):,.4f}"
+                if cash_rows
+                else None
+            ),
+            position_before=f"{position_before:.12g}" if position_before is not None else None,
+            position_after=f"{position_after:.12g}",
+            order_id=str(event.get("broker_order_id") or event.get("order_id") or ""),
+            occurred_at=str(event.get("occurred_at") or ""),
+            extra={
+                "수수료": event.get("fee"),
+                "원장 동기화": STATE.get("program_ledger", {}).get("last_event_sync", ""),
+                "Kill Switch": "ON" if STATE.get("kill_switch") else "OFF",
+            },
+        )
+        if TELEGRAM_DISPATCHER.send_async(
+            message,
+            dedupe_key=f"live-fill:{broker_id}:{event_id}",
+            dedupe_seconds=604800,
+            severity="warning",
+        ):
+            sent += 1
+    return sent
+
+
 def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
     broker_ids = ("kis", "binance", "upbit") if broker_id.strip().lower() in {"", "all"} else (broker_id.strip().lower(),)
     router = LiveBrokerRouter()
@@ -3212,6 +3314,7 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
         "synced_position_count": int(synced.get("position_count", 0)),
     }
     STATE["program_ledger"]["last_event_sync"] = now
+    telegram_fill_count = notify_new_live_fills(events, existing_event_ids)
     append_audit(
         "warn" if errors else "info",
         "체결 이벤트 동기화",
@@ -3235,6 +3338,7 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
         "errors": errors,
         "program_ledger": program_ledger_snapshot(),
         "execution_events": execution_event_snapshot(),
+        "telegram_fill_count": telegram_fill_count,
         "automatic_promotion": automatic_results,
         "snapshot": snapshot(),
     }

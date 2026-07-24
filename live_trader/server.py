@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from . import env_settings, state
 from trading_runtime.artifact_metadata import ArtifactMetadataStore
+from trading_runtime.telegram_notifications import save_shared_telegram_settings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -115,11 +116,23 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/env-settings":
             self.send_json({"ok": True, "settings": env_settings.env_settings_snapshot()})
             return
+        if parsed.path == "/api/telegram":
+            self.send_json({"ok": True, "telegram": state.TELEGRAM_DISPATCHER.status()})
+            return
         self.serve_static(parsed.path)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         payload = self.read_json()
+        if parsed.path == "/api/telegram":
+            values = payload.get("telegram") if isinstance(payload.get("telegram"), dict) else payload
+            save_shared_telegram_settings(values)
+            self.send_json({"ok": True, "telegram": state.TELEGRAM_DISPATCHER.status()})
+            return
+        if parsed.path == "/api/telegram/test":
+            state.TELEGRAM_DISPATCHER.send_test()
+            self.send_json({"ok": True, "telegram": state.TELEGRAM_DISPATCHER.status()})
+            return
         if parsed.path == "/api/mode":
             self.send_json(state.set_mode(str(payload.get("mode", "MONITOR"))))
             return

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from live_trader import state
 from live_trader.execution_streams import ExecutionStreamManager, binance_stream_subscription_params, parse_binance_execution_report, parse_kis_domestic_execution, parse_kis_overseas_execution, parse_upbit_my_order, upbit_websocket_token
 
 
@@ -99,6 +100,34 @@ class ExecutionStreamTest(unittest.TestCase):
         self.assertEqual("AAPL", event["symbol"])
         self.assertEqual("filled", event["state"])
         self.assertEqual(327.69, event["price"])
+
+    def test_new_fill_queues_telegram_with_ledger_position(self) -> None:
+        event = {
+            "broker_id": "binance",
+            "event_id": "trade-telegram-1",
+            "order_id": "client-1",
+            "broker_order_id": "broker-1",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "quantity": 0.001,
+            "price": 50_000,
+            "fee": 0.01,
+            "state": "filled",
+            "occurred_at": "2026-07-25T00:00:00Z",
+            "raw": {},
+        }
+        with patch.object(state.PROGRAM_LEDGER, "position_rows", return_value=[
+            {"broker_id": "binance", "symbol": "BTCUSDT", "quantity": 0.002, "value": 100, "currency": "USDT"}
+        ]), patch.object(state.PROGRAM_LEDGER, "cash_rows", return_value=[
+            {"broker_id": "binance", "cash": 20, "currency": "USDT"}
+        ]), patch.object(state.TELEGRAM_DISPATCHER, "send_async", return_value=True) as send:
+            count = state.notify_new_live_fills([event], set())
+
+        self.assertEqual(1, count)
+        send.assert_called_once()
+        message = send.call_args.args[0]
+        self.assertIn("BTCUSDT", message)
+        self.assertIn("0.001 → 0.002", message)
 
 
 if __name__ == "__main__":
