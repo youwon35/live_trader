@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Literal
 
 
@@ -32,6 +33,7 @@ BINANCE_ORDER_ENDPOINT = "/api/v3/order"
 BINANCE_TEST_ORDER_ENDPOINT = "/api/v3/order/test"
 BINANCE_ACCOUNT_ENDPOINT = "/api/v3/account"
 BINANCE_TIME_ENDPOINT = "/api/v3/time"
+BINANCE_EXCHANGE_INFO_ENDPOINT = "/api/v3/exchangeInfo"
 
 UPBIT_BASE_URL = "https://api.upbit.com"
 UPBIT_ORDER_ENDPOINT = "/v1/orders"
@@ -43,6 +45,8 @@ _KIS_TOKEN_CACHE: dict[str, object] = {"key": "", "token": "", "expires_at": 0.0
 _KIS_TOKEN_LOCK = threading.Lock()
 _BINANCE_TIME_CACHE: dict[str, object] = {"base_url": "", "offset_ms": 0, "expires_at": 0.0}
 _BINANCE_TIME_LOCK = threading.Lock()
+_BINANCE_SYMBOL_RULE_CACHE: dict[str, tuple[float, dict[str, Decimal]]] = {}
+_BINANCE_SYMBOL_RULE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -127,6 +131,90 @@ def _clear_binance_time_offset_cache() -> None:
 
 def missing_env(*names: str) -> list[str]:
     return [name for name in names if not env_value(name)]
+
+
+def binance_symbol_rules(symbol: str, *, timeout_seconds: float = 5.0) -> dict[str, Decimal]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        raise RuntimeError("Binance symbol이 비어 있습니다.")
+    now = time.monotonic()
+    with _BINANCE_SYMBOL_RULE_LOCK:
+        cached = _BINANCE_SYMBOL_RULE_CACHE.get(normalized_symbol)
+        if cached and cached[0] > now:
+            return dict(cached[1])
+    base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
+    url = (
+        f"{base_url.rstrip('/')}{BINANCE_EXCHANGE_INFO_ENDPOINT}?"
+        + urllib.parse.urlencode({"symbol": normalized_symbol})
+    )
+    response = http_json("GET", url, body=None, headers={}, timeout_seconds=timeout_seconds)
+    payload = response.get("json") if isinstance(response.get("json"), dict) else {}
+    symbols = payload.get("symbols") if isinstance(payload.get("symbols"), list) else []
+    if response.get("ok") is not True or not symbols or not isinstance(symbols[0], dict):
+        raise RuntimeError(str(response.get("text") or f"Binance {normalized_symbol} 거래 규칙 조회 실패"))
+    filters = symbols[0].get("filters") if isinstance(symbols[0].get("filters"), list) else []
+    by_type = {
+        str(item.get("filterType") or ""): item
+        for item in filters
+        if isinstance(item, dict)
+    }
+    lot = by_type.get("MARKET_LOT_SIZE") or by_type.get("LOT_SIZE") or {}
+    if Decimal(str(lot.get("stepSize") or "0")) <= 0:
+        lot = by_type.get("LOT_SIZE") or lot
+    notional = by_type.get("NOTIONAL") or by_type.get("MIN_NOTIONAL") or {}
+    rules = {
+        "minQty": Decimal(str(lot.get("minQty") or "0")),
+        "maxQty": Decimal(str(lot.get("maxQty") or "0")),
+        "stepSize": Decimal(str(lot.get("stepSize") or "0")),
+        "minNotional": Decimal(str(notional.get("minNotional") or "0")),
+    }
+    with _BINANCE_SYMBOL_RULE_LOCK:
+        _BINANCE_SYMBOL_RULE_CACHE[normalized_symbol] = (now + 1800.0, rules)
+    return dict(rules)
+
+
+def normalize_binance_spot_intent(intent: dict[str, object]) -> dict[str, object]:
+    normalized = dict(intent)
+    symbol = str(normalized.get("symbol") or "").strip().upper()
+    side = normalize_side(normalized.get("side"))
+    order_type = str(normalized.get("order_type") or "MARKET").strip().upper()
+    rules = binance_symbol_rules(symbol)
+    notional = _decimal_or_zero(normalized.get("notional"))
+    if order_type == "MARKET" and side == "BUY" and notional > 0:
+        if rules["minNotional"] > 0 and notional < rules["minNotional"]:
+            raise RuntimeError(
+                f"Binance {symbol} 최소 주문금액 {rules['minNotional']} USDT 미만입니다."
+            )
+        normalized["quote_order_qty"] = normalize_decimal_text(notional)
+        return normalized
+    quantity = _decimal_or_zero(normalized.get("quantity") or normalized.get("qty"))
+    step = rules["stepSize"]
+    if step > 0:
+        quantity = (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if quantity <= 0 or (rules["minQty"] > 0 and quantity < rules["minQty"]):
+        raise RuntimeError(f"Binance {symbol} 주문 수량이 최소 수량보다 작습니다.")
+    if rules["maxQty"] > 0 and quantity > rules["maxQty"]:
+        raise RuntimeError(f"Binance {symbol} 주문 수량이 최대 수량을 초과합니다.")
+    reference_price = _decimal_or_zero(normalized.get("price"))
+    if (
+        rules["minNotional"] > 0
+        and reference_price > 0
+        and quantity * reference_price < rules["minNotional"]
+    ):
+        raise RuntimeError(
+            f"Binance {symbol} 최소 주문금액 {rules['minNotional']} USDT 미만입니다."
+        )
+    normalized["quantity"] = normalize_decimal_text(quantity)
+    normalized["qty"] = normalized["quantity"]
+    return normalized
+
+
+def _decimal_or_zero(value: object) -> Decimal:
+    try:
+        number = Decimal(str(value or "0"))
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+    return number if number.is_finite() else Decimal("0")
 
 
 def split_kis_account(account_no: str, product_code: str) -> tuple[str, str]:
@@ -462,20 +550,37 @@ def build_binance_spot_order_request(intent: dict[str, object], *, test: bool = 
     symbol = str(intent.get("symbol") or "").strip().upper()
     side = normalize_side(intent.get("side"))
     quantity = normalize_decimal_text(intent.get("quantity") or intent.get("qty") or 0)
+    quote_order_quantity = normalize_decimal_text(
+        intent.get("quote_order_qty")
+        or intent.get("quoteOrderQty")
+        or (
+            intent.get("notional")
+            if side == "BUY" and str(intent.get("order_type") or "MARKET").strip().upper() == "MARKET"
+            else 0
+        )
+    )
     order_type = str(intent.get("order_type") or "MARKET").strip().upper()
     query: dict[str, object] = {
         "symbol": symbol,
         "side": side,
         "type": order_type,
-        "quantity": quantity,
-        "timestamp": binance_timestamp_ms(),
     }
+    uses_quote_order_quantity = (
+        order_type == "MARKET"
+        and side == "BUY"
+        and float(quote_order_quantity or 0) > 0
+    )
+    if uses_quote_order_quantity:
+        query["quoteOrderQty"] = quote_order_quantity
+    else:
+        query["quantity"] = quantity
+    query["timestamp"] = binance_timestamp_ms()
     if order_type == "LIMIT":
         query["timeInForce"] = str(intent.get("time_in_force") or "GTC")
         query["price"] = normalize_decimal_text(intent.get("price") or 0)
     if not symbol:
         blocked.append("symbol")
-    if float(quantity or 0) <= 0:
+    if not uses_quote_order_quantity and float(quantity or 0) <= 0:
         blocked.append("quantity")
     signed_query = sign_binance_query(query, api_secret) if api_secret else urllib.parse.urlencode(query)
     endpoint = BINANCE_TEST_ORDER_ENDPOINT if test else BINANCE_ORDER_ENDPOINT

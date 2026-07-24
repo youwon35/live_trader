@@ -60,7 +60,7 @@ class LiveContinuousController:
                     f"{normalized_profile} runtime {previous_mode} → {normalized_mode} 무중단 전환",
                 )
                 return {"ok": True, "reason": "continuous runtime mode transitioned", "runtime": self.snapshot(), "snapshot": state.snapshot()}
-            portfolio = self._select_portfolio(normalized_profile, portfolio_id)
+            portfolio = self._select_portfolio(normalized_profile, portfolio_id, normalized_mode)
             loaded = None
             if portfolio is not None:
                 source_path = str(portfolio.get("source_path") or "")
@@ -72,6 +72,12 @@ class LiveContinuousController:
                 runtime_hash = loaded.portfolio_hash
                 runtime_permissions = loaded.payload.get("permissions") if isinstance(loaded.payload.get("permissions"), dict) else {}
             else:
+                if portfolio_id:
+                    return {
+                        "ok": False,
+                        "reason": f"요청한 Portfolio Artifact({portfolio_id})가 없거나 현재 구성 전략 상태로는 실행할 수 없습니다.",
+                        "snapshot": state.snapshot(),
+                    }
                 standalone = self._select_standalone_strategy(normalized_profile, normalized_mode)
                 if standalone is None:
                     return {"ok": False, "reason": f"{normalized_profile}용 Portfolio/Strategy Artifact를 찾을 수 없습니다.", "snapshot": state.snapshot()}
@@ -144,8 +150,20 @@ class LiveContinuousController:
         }
         return {**base, "profileId": self.profile_id, "mode": self.mode, "portfolioPath": self.portfolio_path}
 
-    def _select_portfolio(self, profile_id: str, portfolio_id: str) -> dict[str, Any] | None:
+    def _select_portfolio(
+        self,
+        profile_id: str,
+        portfolio_id: str,
+        mode: str = "MONITOR",
+    ) -> dict[str, Any] | None:
         from . import state
+
+        strategy_rows = state.strategy_rows([])
+        strategies_by_id: dict[str, list[dict[str, Any]]] = {}
+        for strategy in strategy_rows:
+            strategy_id = str(strategy.get("strategy_id") or "")
+            if strategy_id:
+                strategies_by_id.setdefault(strategy_id, []).append(strategy)
 
         candidates: list[dict[str, Any]] = []
         for portfolio in state.portfolio_rows():
@@ -153,10 +171,53 @@ class LiveContinuousController:
                 continue
             instances = portfolio.get("strategy_instances") if isinstance(portfolio.get("strategy_instances"), list) else []
             symbols = [str(item.get("symbol") or item.get("qualifiedSymbol") or "") for item in instances if isinstance(item, dict)]
-            if any(self._symbol_matches_profile(symbol, profile_id) for symbol in symbols):
+            if (
+                any(self._symbol_matches_profile(symbol, profile_id) for symbol in symbols)
+                and self._portfolio_components_eligible(portfolio, strategies_by_id, mode)
+            ):
                 candidates.append(portfolio)
         # contracts.load_portfolio_artifacts() returns newest artifacts first.
         return candidates[0] if candidates else None
+
+    @staticmethod
+    def _portfolio_components_eligible(
+        portfolio: dict[str, Any],
+        strategies_by_id: dict[str, list[dict[str, Any]]],
+        mode: str,
+    ) -> bool:
+        from . import state
+
+        portfolio_lifecycle = state.normalize_lifecycle_status(portfolio.get("lifecycle_status"))
+        if portfolio_lifecycle in {"paused", "retired"}:
+            return False
+        instances = portfolio.get("strategy_instances") if isinstance(portfolio.get("strategy_instances"), list) else []
+        if not instances:
+            return False
+        for instance in instances:
+            if not isinstance(instance, dict):
+                return False
+            strategy_id = str(instance.get("sourceStrategyId") or instance.get("strategyId") or "")
+            source_hash = str(instance.get("sourceArtifactHash") or "")
+            matches = strategies_by_id.get(strategy_id, [])
+            if source_hash:
+                matches = [
+                    strategy
+                    for strategy in matches
+                    if str(strategy.get("artifact_hash") or "") in {"", source_hash}
+                ]
+            strategy = matches[0] if matches else None
+            if strategy is None:
+                return False
+            lifecycle = state.normalize_lifecycle_status(strategy.get("lifecycle_status"))
+            if lifecycle in {"paused", "retired"} or state.lifecycle_rank(lifecycle) < state.lifecycle_rank("backtested"):
+                return False
+            if strategy.get("backtester_verified") is not True:
+                return False
+            if mode == "SMALL_LIVE" and strategy.get("live_small_eligible") is not True:
+                return False
+            if mode == "FULL_LIVE" and strategy.get("live_eligible") is not True:
+                return False
+        return True
 
     def _select_standalone_strategy(self, profile_id: str, mode: str) -> dict[str, Any] | None:
         from . import state
@@ -267,7 +328,7 @@ class LiveContinuousController:
                     "expected_cost_bps": self._numeric_parameter(spec, "expectedCostBps", 5.0),
                     "runtime_evaluation_key": decision.evaluation_key,
                     "confirmed_bar_end": decision.bar.end_time,
-                    "order_type": "LIMIT",
+                    "order_type": "MARKET" if spec.broker_id == "binance" else "LIMIT",
                 },
             )
             checks = state.snapshot()
@@ -277,14 +338,18 @@ class LiveContinuousController:
 
     @staticmethod
     def _order_quantity(spec: Any, price: float) -> float:
-        override = spec.parameters.get("liveOrderQuantity") or spec.parameters.get("paperOrderQuantity")
+        override = spec.parameters.get("liveOrderQuantity")
         if override not in (None, ""):
             try:
                 return max(0.0, float(override))
             except (TypeError, ValueError):
                 pass
         if spec.broker_id == "binance":
-            return max(0.0, 5.0 / max(price, 1e-12))
+            try:
+                notional = float(spec.parameters.get("liveOrderNotionalUsdt", 5.5))
+            except (TypeError, ValueError):
+                notional = 5.5
+            return max(0.0, notional / max(price, 1e-12))
         if spec.broker_id == "upbit":
             return max(0.0, 5000.0 / max(price, 1e-12))
         return 1.0

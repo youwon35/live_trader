@@ -993,3 +993,11 @@ API 없이 실제 실행한 기능:
 - 첫 실행에서 앱 로컬 CSS에 가려진 공용 글자색 불일치 40건을 차단했고, 공용 selector를 보강한 뒤 220/220을 통과했다.
 - 현행 compact UI를 계약 버전 6과 30개 시각 기준으로 갱신했으며 최종 30/30, pixel diff 0.000%다.
 - GitHub Actions가 두 검사를 자동 실행한다. 최신 LiveTrader EXE 패키징, scale/click 계약과 `--help` 검증도 통과했다.
+
+## 2026-07-25 Binance 연속 감시·주문 경계 감사
+
+- Binance 연속 실행은 시장가 주문을 사용하고 매수는 quote notional, 매도는 거래소 step size/min notional 규칙으로 정규화한다. Paper의 큰 replay 수량을 실주문에 재사용하지 않고 기본 실거래 크기를 5.5 USDT로 제한한다.
+- v8에는 통과 Artifact가 없어 MONITOR/Shadow/Paper/Live 승급 요청과 신규 실주문을 만들지 않았다. 과거 실제 0.0001 BTC 체결은 커넥터 검증 증거로만 유지하며 새 전략의 성능 증거로 사용하지 않는다.
+- 실제 연속 MONITOR에서 폐기된 v6 포트폴리오가 자동 선택되는 결함을 발견했다. 이제 Portfolio 구성 Strategy의 현재 배포 lifecycle과 Backtester 검증을 교차 확인해 paused/retired/미검증 구성요소를 자동 제외한다.
+- SMALL_LIVE와 FULL_LIVE는 모든 구성 전략이 각각 해당 권한을 가진 경우만 선택되며, 명시한 Portfolio가 부적격이면 과거 단일 전략으로 대체하지 않고 즉시 차단한다.
+- 실제 저장소에서 v6 자동 제외와 존재하지 않는 v8 Portfolio 명시 요청의 `running=false`를 확인했다. 최종 Live 회귀 테스트는 110개 모두 통과했다.

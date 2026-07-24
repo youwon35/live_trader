@@ -18,6 +18,7 @@ from .live_adapters import (
     build_upbit_order_detail_request,
     build_upbit_order_request,
     issue_kis_access_token,
+    normalize_binance_spot_intent,
     refresh_binance_time_offset,
     send_prepared_request,
 )
@@ -571,7 +572,11 @@ class LiveBrokerRouter:
             token = issue_kis_access_token()
             return send_prepared_request(build_kis_live_order_request(intent, access_token=token))
         if broker_id == "binance":
-            return send_binance_signed_request(lambda: build_binance_spot_order_request(intent))
+            try:
+                normalized_intent = normalize_binance_spot_intent(intent)
+            except RuntimeError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
+            return send_binance_signed_request(lambda: build_binance_spot_order_request(normalized_intent))
         if broker_id == "upbit":
             return send_prepared_request(build_upbit_order_request(intent))
         raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")

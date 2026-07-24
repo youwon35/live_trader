@@ -1,5 +1,6 @@
 import os
 import unittest
+from decimal import Decimal
 from unittest.mock import patch
 
 from live_trader.live_adapters import (
@@ -25,6 +26,7 @@ from live_trader.live_adapters import (
     build_upbit_cancel_order_request,
     build_upbit_order_request,
     issue_kis_access_token,
+    normalize_binance_spot_intent,
     refresh_binance_time_offset,
     sign_binance_query,
 )
@@ -203,6 +205,48 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertEqual(prepared.headers["X-MBX-APIKEY"], "binance-key")
         self.assertEqual(prepared.safe_headers["X-MBX-APIKEY_configured"], True)
         self.assertEqual(prepared.preview()["query"]["signature"], "***")
+
+    def test_binance_market_buy_prefers_quote_notional(self) -> None:
+        os.environ.update(
+            {
+                "BINANCE_API_KEY": "binance-key",
+                "BINANCE_API_SECRET": "binance-secret",
+                "BINANCE_BASE_URL": "https://binance.example.test",
+            }
+        )
+
+        with patch("live_trader.live_adapters.time.time", return_value=1700000000.123):
+            prepared = build_binance_spot_order_request(
+                {
+                    "symbol": "ETHUSDT",
+                    "side": "BUY",
+                    "quantity": "0.00123456789",
+                    "notional": "5.5",
+                    "order_type": "MARKET",
+                }
+            )
+
+        self.assertTrue(prepared.can_send)
+        self.assertEqual("5.5", prepared.query["quoteOrderQty"])
+        self.assertNotIn("quantity", prepared.query)
+
+    def test_binance_sell_quantity_is_rounded_down_to_exchange_step(self) -> None:
+        rules = {
+            "minQty": Decimal("0.001"),
+            "maxQty": Decimal("1000"),
+            "stepSize": Decimal("0.001"),
+            "minNotional": Decimal("5"),
+        }
+        with patch("live_trader.live_adapters.binance_symbol_rules", return_value=rules):
+            normalized = normalize_binance_spot_intent({
+                "symbol": "ETHUSDT",
+                "side": "SELL",
+                "quantity": "0.012987",
+                "price": "4000",
+                "order_type": "MARKET",
+            })
+
+        self.assertEqual("0.012", normalized["quantity"])
 
     def test_upbit_order_request_builds_signed_limit_order_preview(self) -> None:
         os.environ.update(
