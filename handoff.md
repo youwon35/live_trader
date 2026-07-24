@@ -972,3 +972,9 @@ API 없이 실제 실행한 기능:
 - 공용 메타데이터 API는 `%APPDATA%\trading_programs\artifact-user-metadata.json`을 원자적으로 갱신한다.
 - 반응형 검사에서 발견한 검색 패널의 고정 min-content 폭을 제거했다. 1707×960과 1280×800의 5개 탭에서 가로 넘침·경계 이탈·콘솔 오류 0건이다.
 - Python 104개와 production build, 강화된 UI smoke를 통과했다.
+
+## 2026-07-24 전 프로그램 테마 대비 통일
+
+- Live Trader를 포함한 다섯 프로그램의 상태·시장·소스·로그 배지와 보조 버튼을 불투명 테마 표면으로 통일했다.
+- 다크 모드의 SETTINGS/INFO/WARN/STORAGE와 같은 짧은 영문 라벨은 흰 글자와 의미별 단색 배경을 사용하며, 화이트 모드도 밝은 표면과 짙은 글자로 대비를 유지한다.
+- production build와 Playwright 실제 브라우저 계산값 검증에서 대표 배지의 `opacity: 1`을 확인했다.
