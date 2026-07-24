@@ -84,6 +84,7 @@ from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
 from trading_runtime.market_calendar import market_session_state
+from trading_runtime.artifact_metadata import ArtifactMetadataStore
 
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
@@ -1077,6 +1078,7 @@ def append_strategy_promotion_log(strategy_dir: Path, payload: dict[str, Any], a
     }
     with (strategy_dir / "promotion-log.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+    ArtifactMetadataStore().update(event["artifactId"], "strategy", mark_promoted=True)
 
 
 def live_small_execution_summary(strategy_id: str) -> dict[str, int]:
@@ -4476,7 +4478,10 @@ def submit_order_intent(
 
 
 def start_continuous_runtime(profile_id: str, mode: str, portfolio_id: str = "") -> dict[str, Any]:
-    return LIVE_CONTINUOUS_CONTROLLER.start(profile_id, mode, portfolio_id)
+    result = LIVE_CONTINUOUS_CONTROLLER.start(profile_id, mode, portfolio_id)
+    if portfolio_id:
+        ArtifactMetadataStore().update(portfolio_id, "portfolio", mark_used=True)
+    return result
 
 
 def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:

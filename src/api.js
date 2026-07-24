@@ -18,6 +18,14 @@ export async function saveSharedSearchPresets(presets) {
   return request("/api/search-presets", { method: "POST", body: { presets } });
 }
 
+export async function loadArtifactMetadata() {
+  return request("/api/artifact-metadata");
+}
+
+export async function updateArtifactMetadata(artifactId, artifactType, changes) {
+  return request("/api/artifact-metadata", { method: "POST", body: { artifactId, artifactType, changes } });
+}
+
 export async function getEnvSettings() {
   return request("/api/env-settings");
 }

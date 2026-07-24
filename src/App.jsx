@@ -27,6 +27,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
+  Star,
   Sun,
   TerminalSquare,
   Trash2,
@@ -38,6 +39,7 @@ import {
   getEnvSettings,
   getSnapshot,
   getUiSettings,
+  loadArtifactMetadata,
   loadSharedSearchPresets,
   runFinalPreflight,
   runReconciliation,
@@ -56,6 +58,7 @@ import {
   setRiskSetting,
   saveUiSettings,
   saveSharedSearchPresets,
+  updateArtifactMetadata,
   saveEnvSettings,
   submitTestIntent,
   runPolicyReplay,
@@ -245,6 +248,8 @@ const DEFAULT_STRATEGY_DISCOVERY_FILTERS = {
   stage: "all",
   timeframe: "all",
   plugin: "all",
+  failure: "all",
+  quick: "all",
   sort: "updated-desc",
 };
 
@@ -1639,6 +1644,7 @@ function LivePreparationPanel({
   });
   const [savedSearchId, setSavedSearchId] = useState("");
   const [savedSearchName, setSavedSearchName] = useState("");
+  const [artifactMetadata, setArtifactMetadata] = useState({});
   const initialSavedSearches = useRef(savedSearches);
   const isStock = assetTab === "stock";
   const assetStrategies = useMemo(
@@ -1657,12 +1663,21 @@ function LivePreparationPanel({
     () => uniqueStrategyDiscoveryValues(assetStrategies.map((strategy) => strategy.plugin_label || strategy.plugin)),
     [assetStrategies],
   );
+  const failureOptions = useMemo(
+    () => uniqueStrategyDiscoveryValues(assetStrategies.flatMap((strategy) => liveArtifactFailureReasons(strategy))),
+    [assetStrategies],
+  );
   const filteredStrategies = useMemo(
     () => sortLiveStrategies(
-      assetStrategies.filter((strategy) => liveStrategyMatchesDiscovery(strategy, discoveryFilters)),
+      assetStrategies.filter((strategy) => liveStrategyMatchesDiscovery(
+        strategy,
+        discoveryFilters,
+        artifactMetadata[artifactMetadataKey(strategy.strategy_id, "strategy")],
+        liveArtifactRunning(snapshot.continuous_runtime, strategy.strategy_id),
+      )),
       discoveryFilters.sort,
     ),
-    [assetStrategies, discoveryFilters],
+    [artifactMetadata, assetStrategies, discoveryFilters, snapshot.continuous_runtime],
   );
   const selectedStrategy = filteredStrategies.find((strategy) => strategy.strategy_id === selectedStrategyId) ?? filteredStrategies[0] ?? null;
   const tabItems = [
@@ -1698,6 +1713,22 @@ function LivePreparationPanel({
       active = false;
     };
   }, []);
+  useEffect(() => {
+    let active = true;
+    loadArtifactMetadata()
+      .then((document) => {
+        if (active && document?.items) setArtifactMetadata(document.items);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function saveArtifactMetadata(artifactId, artifactType, changes) {
+    const response = await updateArtifactMetadata(artifactId, artifactType, changes);
+    if (response?.document?.items) setArtifactMetadata(response.document.items);
+  }
 
   function updateDiscoveryFilter(key, value) {
     setDiscoveryFilters((current) => ({ ...current, [key]: value }));
@@ -1729,6 +1760,8 @@ function LivePreparationPanel({
         sort: discoveryFilters.sort,
       },
     });
+    saved.filters.failure = discoveryFilters.failure;
+    saved.filters.quick = discoveryFilters.quick;
     const next = mergeStrategySearchPresets(savedSearches.filter((item) => item.id !== existing?.id), saved);
     setSavedSearches(next);
     setSavedSearchId(saved.id);
@@ -1748,6 +1781,8 @@ function LivePreparationPanel({
       stage: saved.filters?.lifecycle ?? "all",
       timeframe: saved.filters?.timeframe ?? "all",
       plugin: saved.filters?.strategyType ?? "all",
+      failure: saved.filters?.failure ?? "all",
+      quick: saved.filters?.quick ?? "all",
       sort: saved.filters?.sort ?? "updated-desc",
     });
     setSavedSearchName(saved.name);
@@ -1779,6 +1814,7 @@ function LivePreparationPanel({
             stageOptions={stageOptions}
             timeframeOptions={timeframeOptions}
             pluginOptions={pluginOptions}
+            failureOptions={failureOptions}
             visibleCount={filteredStrategies.length}
             totalCount={assetStrategies.length}
             savedSearches={strategySearchPresets}
@@ -1797,7 +1833,12 @@ function LivePreparationPanel({
             automaticPromotion={snapshot.automatic_promotion}
             strategies={filteredStrategies}
             selectedStrategy={selectedStrategy}
-            onSelect={setSelectedStrategyId}
+            onSelect={(strategyId) => {
+              setSelectedStrategyId(strategyId);
+              saveArtifactMetadata(strategyId, "strategy", { markUsed: true }).catch(() => undefined);
+            }}
+            metadata={selectedStrategy ? artifactMetadata[artifactMetadataKey(selectedStrategy.strategy_id, "strategy")] : null}
+            onMetadataSave={saveArtifactMetadata}
             onPromoteLive={onPromoteLive}
             onStrategyLifecycle={onStrategyLifecycle}
             orders={snapshot.orders ?? []}
@@ -1813,6 +1854,9 @@ function LivePreparationPanel({
               shadowLive={snapshot.shadow_live}
               multiStrategy={snapshot.multi_strategy}
               executionCalibration={snapshot.execution_calibration}
+              metadataItems={artifactMetadata}
+              onMetadataSave={saveArtifactMetadata}
+              continuousRuntime={snapshot.continuous_runtime}
             />
           )}
           <OperationalSafeguardsPanel
@@ -1836,11 +1880,40 @@ function LivePreparationPanel({
   );
 }
 
-function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operationalReadiness = {}, runtimeRecovery = {}, shadowLive = {}, multiStrategy = {}, executionCalibration = {} }) {
+function PortfolioArtifactPanel({
+  portfolios = [],
+  selectedStrategy,
+  operationalReadiness = {},
+  runtimeRecovery = {},
+  shadowLive = {},
+  multiStrategy = {},
+  executionCalibration = {},
+  metadataItems = {},
+  onMetadataSave,
+  continuousRuntime = {},
+}) {
   const gate = selectedStrategy?.portfolio_gate ?? {};
   const [replay, setReplay] = useState(null);
   const [replayRunning, setReplayRunning] = useState(false);
   const [operationResult, setOperationResult] = useState(null);
+  const [filters, setFilters] = useState({ query: "", failure: "all", quick: "all" });
+  const failureOptions = uniqueStrategyDiscoveryValues(portfolios.flatMap((portfolio) => liveArtifactFailureReasons(portfolio)));
+  const visiblePortfolios = portfolios.filter((portfolio) => {
+    const artifactId = portfolio.id || portfolio.source_path;
+    const metadata = metadataItems[artifactMetadataKey(artifactId, "portfolio")];
+    const query = filters.query.trim().toLocaleLowerCase();
+    const matchesQuery = !query || [
+      portfolio.name,
+      portfolio.id,
+      portfolio.lifecycle_status,
+      JSON.stringify(portfolio.strategy_instances || []),
+      JSON.stringify(metadata?.tags || []),
+      metadata?.note,
+    ].some((value) => String(value || "").toLocaleLowerCase().includes(query));
+    return matchesQuery
+      && (filters.failure === "all" || liveArtifactFailureReasons(portfolio).includes(filters.failure))
+      && artifactMatchesQuickFilter(metadata, filters.quick, liveArtifactRunning(continuousRuntime, artifactId));
+  });
   async function replayPolicy() {
     setReplayRunning(true);
     try {
@@ -1895,25 +1968,43 @@ function PortfolioArtifactPanel({ portfolios = [], selectedStrategy, operational
           <MetricCard className="metric-card" label="Strategy Sleeves" value={`${multiStrategy.sleeveCount ?? 0} active`} detail="종목별 순주문 1건 · Short는 명시 상품만" />
         </div>
       )}
+      <div className="portfolio-artifact-discovery">
+        <label><Search size={14} /><input value={filters.query} onChange={(event) => setFilters((current) => ({ ...current, query: event.target.value }))} placeholder="포트폴리오, 구성 전략, 태그, 메모 검색" /></label>
+        <select value={filters.failure} onChange={(event) => setFilters((current) => ({ ...current, failure: event.target.value }))}>
+          <option value="all">모든 실패 이유</option>
+          {failureOptions.map((value) => <option key={value} value={value}>{value}</option>)}
+        </select>
+        {[
+          ["all", "전체"],
+          ["favorite", "즐겨찾기"],
+          ["recent-used", "최근 사용"],
+          ["recent-promoted", "최근 승급"],
+          ["running", "현재 실행 중"],
+        ].map(([value, label]) => <button className={filters.quick === value ? "active" : ""} key={value} type="button" onClick={() => setFilters((current) => ({ ...current, quick: value }))}>{label}</button>)}
+      </div>
       <div className="portfolio-artifact-list">
-        {portfolios.length ? (
-          portfolios.map((portfolio) => {
+        {visiblePortfolios.length ? (
+          visiblePortfolios.map((portfolio) => {
             const permissions = portfolio.permissions ?? {};
             const targetCount = portfolio.target_portfolio?.length ?? 0;
             const strategyCount = portfolio.strategy_instances?.length ?? 0;
             const liveReady = permissions.live_allowed || permissions.live_export_allowed || permissions.live_small_allowed;
+            const artifactId = portfolio.id || portfolio.source_path;
+            const metadata = metadataItems[artifactMetadataKey(artifactId, "portfolio")];
             return (
               <article className="portfolio-artifact-item" key={portfolio.id || portfolio.source_path}>
                 <div>
-                  <strong>{portfolio.name || portfolio.id}</strong>
+                  <strong>{metadata?.favorite && <Star size={13} fill="currentColor" />}{portfolio.name || portfolio.id}</strong>
                   <span>{strategyCount} 전략 · {targetCount} target · {portfolio.lifecycle_status}</span>
+                  {metadata?.tags?.length > 0 && <small>{metadata.tags.map((tag) => `#${tag}`).join(" ")}</small>}
                 </div>
+                <ArtifactMetadataEditor artifactId={artifactId} artifactType="portfolio" metadata={metadata} onSave={onMetadataSave} compact />
                 <StatusPill tone={liveReady ? "success" : "danger"}>{liveReady ? "LIVE READY" : "LIVE BLOCKED"}</StatusPill>
               </article>
             );
           })
         ) : (
-          <EmptyRow text="저장된 portfolio artifact가 없습니다. 없을 때는 기존 단일 전략 게이트를 사용합니다." />
+          <EmptyRow text={portfolios.length ? "검색 조건에 맞는 portfolio artifact가 없습니다." : "저장된 portfolio artifact가 없습니다. 없을 때는 기존 단일 전략 게이트를 사용합니다."} />
         )}
       </div>
     </section>
@@ -3463,6 +3554,8 @@ function LiveStrategySelectorPanel({
   orders = [],
   summary = {},
   operatorConfirmed = false,
+  metadata,
+  onMetadataSave,
 }) {
   const parametersText = formatKeyValueMap(selectedStrategy?.parameters);
   const promotionStage = selectedStrategy?.promotion?.stage || selectedStrategy?.promotion_stage || selectedStrategy?.lifecycle_status || "unknown";
@@ -3564,6 +3657,7 @@ function LiveStrategySelectorPanel({
             <strong>Parameters</strong>
             <pre>{parametersText || "-"}</pre>
           </div>
+          <ArtifactMetadataEditor artifactId={selectedStrategy.strategy_id} artifactType="strategy" metadata={metadata} onSave={onMetadataSave} />
         </>
       ) : (
         <EmptyRow text="이 자산군에 표시할 전략 artifact가 없습니다." />
@@ -3578,6 +3672,7 @@ function StrategyDiscoveryToolbar({
   stageOptions,
   timeframeOptions,
   pluginOptions,
+  failureOptions,
   visibleCount,
   totalCount,
   savedSearches,
@@ -3594,6 +3689,8 @@ function StrategyDiscoveryToolbar({
     filters.stage !== "all" && `단계: ${promotionLabel(filters.stage)}`,
     filters.timeframe !== "all" && `주기: ${filters.timeframe}`,
     filters.plugin !== "all" && `전략 유형: ${filters.plugin}`,
+    filters.failure !== "all" && `실패 이유: ${filters.failure}`,
+    filters.quick !== "all" && `빠른 필터: ${artifactQuickFilterLabel(filters.quick)}`,
   ].filter(Boolean);
   return (
     <section className="panel strategy-discovery-panel">
@@ -3622,12 +3719,109 @@ function StrategyDiscoveryToolbar({
         <button className="secondary-button compact-button" type="button" disabled={!savedSearchName.trim()} onClick={onSavedSearchSave}><Save size={15} />조건 저장</button>
         <button className="secondary-button compact-button icon-only" type="button" disabled={!savedSearchId} onClick={onSavedSearchDelete} aria-label="저장 검색 삭제"><Trash2 size={15} /></button>
       </div>
+      <div className="artifact-quick-filters">
+        {[
+          ["all", "전체"],
+          ["favorite", "즐겨찾기"],
+          ["recent-used", "최근 사용"],
+          ["recent-promoted", "최근 승급"],
+          ["running", "현재 실행 중"],
+        ].map(([value, label]) => (
+          <button className={filters.quick === value ? "active" : ""} key={value} type="button" onClick={() => onFilterChange("quick", value)}>
+            {value === "favorite" && <Star size={13} />}
+            {label}
+          </button>
+        ))}
+        <select value={filters.failure} onChange={(event) => onFilterChange("failure", event.target.value)} aria-label="실패 이유 필터">
+          <option value="all">모든 실패 이유</option>
+          {failureOptions.map((value) => <option key={value} value={value}>{value}</option>)}
+        </select>
+      </div>
       <div className="strategy-discovery-summary">
         <span><strong>{visibleCount}</strong> / {totalCount}개 표시</span>
         <div>{activeLabels.map((label) => <em key={label}>{label}</em>)}</div>
         <button className="secondary-button compact-button" type="button" onClick={onReset} disabled={!activeLabels.length && filters.sort === DEFAULT_STRATEGY_DISCOVERY_FILTERS.sort}>조건 초기화</button>
       </div>
     </section>
+  );
+}
+
+function artifactMetadataKey(artifactId, artifactType = "strategy") {
+  return `${artifactType === "portfolio" ? "portfolio" : "strategy"}:${String(artifactId || "").trim()}`;
+}
+
+function liveArtifactFailureReasons(artifact) {
+  const permissions = artifact?.permissions && typeof artifact.permissions === "object" ? artifact.permissions : {};
+  const policy = artifact?.strategy_policy && typeof artifact.strategy_policy === "object"
+    ? artifact.strategy_policy
+    : artifact?.strategyPolicy && typeof artifact.strategyPolicy === "object"
+      ? artifact.strategyPolicy
+      : {};
+  return [...new Set([
+    artifact?.failure_reasons,
+    artifact?.failureReasons,
+    artifact?.fail_reasons,
+    artifact?.failure_modes,
+    artifact?.failureModes,
+    artifact?.blockers,
+    artifact?.block_reason,
+    permissions.fail_reasons,
+    permissions.failReasons,
+    policy.failureModes,
+  ].flatMap((value) => Array.isArray(value) ? value : value ? [value] : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean))];
+}
+
+function artifactMatchesQuickFilter(metadata, quick, running = false) {
+  if (quick === "favorite") return metadata?.favorite === true;
+  if (quick === "running") return running;
+  const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+  if (quick === "recent-used") return Date.parse(metadata?.lastUsedAt || "") >= cutoff;
+  if (quick === "recent-promoted") return Date.parse(metadata?.lastPromotedAt || "") >= cutoff;
+  return true;
+}
+
+function artifactQuickFilterLabel(value) {
+  return {
+    favorite: "즐겨찾기",
+    "recent-used": "최근 사용",
+    "recent-promoted": "최근 승급",
+    running: "현재 실행 중",
+  }[value] || "전체";
+}
+
+function liveArtifactRunning(runtime, artifactId) {
+  if (!runtime?.running || !artifactId) return false;
+  return JSON.stringify(runtime).includes(String(artifactId));
+}
+
+function ArtifactMetadataEditor({ artifactId, artifactType, metadata, onSave, compact = false }) {
+  const [tags, setTags] = useState((metadata?.tags || []).join(", "));
+  const [note, setNote] = useState(metadata?.note || "");
+  useEffect(() => {
+    setTags((metadata?.tags || []).join(", "));
+    setNote(metadata?.note || "");
+  }, [artifactId, metadata?.note, metadata?.tags]);
+  if (!artifactId || !onSave) return null;
+  return (
+    <details className={`artifact-metadata-editor ${compact ? "compact" : ""}`}>
+      <summary>
+        <Star size={14} fill={metadata?.favorite ? "currentColor" : "none"} />
+        {metadata?.favorite ? "즐겨찾기 · 태그·메모" : "즐겨찾기·태그·메모"}
+      </summary>
+      <div>
+        <button type="button" className="secondary-button compact-button" onClick={() => onSave(artifactId, artifactType, { favorite: !metadata?.favorite })}>
+          <Star size={13} fill={metadata?.favorite ? "currentColor" : "none"} />{metadata?.favorite ? "즐겨찾기 해제" : "즐겨찾기"}
+        </button>
+        <label><span>태그</span><input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="추세, Binance, 소액" /></label>
+        <label><span>메모</span><textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={4000} /></label>
+        <button type="button" className="secondary-button compact-button" onClick={() => onSave(artifactId, artifactType, {
+          tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean),
+          note,
+        })}><Save size={13} />저장</button>
+      </div>
+    </details>
   );
 }
 
@@ -3642,7 +3836,7 @@ function uniqueStrategyDiscoveryValues(values) {
     .sort((left, right) => left.localeCompare(right, "ko"));
 }
 
-function liveStrategyMatchesDiscovery(strategy, filters) {
+function liveStrategyMatchesDiscovery(strategy, filters, metadata, running = false) {
   const query = String(filters.query || "").trim().toLocaleLowerCase();
   const stage = liveStrategyStageId(strategy);
   const plugin = strategy.plugin_label || strategy.plugin || "";
@@ -3655,6 +3849,8 @@ function liveStrategyMatchesDiscovery(strategy, filters) {
     plugin,
     strategy.block_reason,
     strategy.permission_label,
+    metadata?.note,
+    ...(metadata?.tags || []),
     promotionLabel(stage),
     JSON.stringify(strategy.parameters || {}),
     JSON.stringify(strategy.release || {}),
@@ -3662,7 +3858,9 @@ function liveStrategyMatchesDiscovery(strategy, filters) {
   return queryMatches
     && (filters.stage === "all" || stage === filters.stage)
     && (filters.timeframe === "all" || strategy.timeframe === filters.timeframe)
-    && (filters.plugin === "all" || plugin === filters.plugin);
+    && (filters.plugin === "all" || plugin === filters.plugin)
+    && (filters.failure === "all" || liveArtifactFailureReasons(strategy).includes(filters.failure))
+    && artifactMatchesQuickFilter(metadata, filters.quick, running);
 }
 
 function sortLiveStrategies(strategies, sort) {

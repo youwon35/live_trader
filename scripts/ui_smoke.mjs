@@ -38,7 +38,7 @@ try {
         const workspace = document.querySelector("main.workspace");
         const pageView = document.querySelector(".page-view");
         const viewportWidth = window.innerWidth;
-        const escapedControls = [...document.querySelectorAll("button, input, select, textarea")]
+        const escapedControlBoxes = [...document.querySelectorAll("button, input, select, textarea")]
           .filter((element) => {
             const box = element.getBoundingClientRect();
             const style = window.getComputedStyle(element);
@@ -50,12 +50,35 @@ try {
               && box.top < window.innerHeight
               && (box.left < -1 || box.right > viewportWidth + 1);
           })
-          .map((element) => element.getAttribute("aria-label") || element.textContent?.trim() || element.tagName);
+          .map((element) => {
+            const box = element.getBoundingClientRect();
+            const ancestors = [];
+            let parent = element.parentElement;
+            while (parent && ancestors.length < 5) {
+              const parentBox = parent.getBoundingClientRect();
+              ancestors.push({
+                className: parent.className || parent.tagName,
+                left: Math.round(parentBox.left),
+                right: Math.round(parentBox.right),
+                width: Math.round(parentBox.width),
+              });
+              parent = parent.parentElement;
+            }
+            return {
+              label: element.getAttribute("aria-label") || element.textContent?.trim() || element.tagName,
+              left: Math.round(box.left),
+              right: Math.round(box.right),
+              width: Math.round(box.width),
+              viewportWidth,
+              ancestors,
+            };
+          });
         return {
           documentOverflow: root.scrollWidth > root.clientWidth + 1 || body.scrollWidth > body.clientWidth + 1,
           workspaceOverflow: Boolean(workspace && workspace.scrollWidth > workspace.clientWidth + 1),
           pageTextLength: pageView?.textContent?.trim().length || 0,
-          escapedControls,
+          escapedControls: escapedControlBoxes.map((item) => item.label),
+          escapedControlBoxes,
         };
       });
       if (layout.documentOverflow) issues.push(`${viewport.name}/${tab}: document horizontal overflow`);

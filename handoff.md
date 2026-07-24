@@ -963,3 +963,12 @@ API 없이 실제 실행한 기능:
 - 운영 대조 패널에 진실 원본과 접힌 체결 Trace·복구 계획을 추가해 기존 화면 밀도를 유지했다.
 - Live Python 104개, Vite build, 2개 뷰포트×5개 탭 UI smoke에서 overflow·이탈 control·console 오류 0건이 통과했다.
 - 최신 `release\LiveTrader.exe`를 재생성하고 `--help` 기동 smoke를 통과했다. SHA-256 `A5FC5559E7ACBCB72D737182583594F133D654593708CCB23A5776AFB0F58F1B`.
+
+## 2026-07-24 Artifact 탐색·메타데이터 통합
+
+- 실거래 준비의 전략과 포트폴리오 모두에 공용 즐겨찾기·태그·메모를 추가하고 검색 대상에 태그와 메모를 포함했다.
+- `최근 사용`, `최근 승급`, `현재 실행 중`, 실패 이유 필터를 두 Artifact 유형에 동일하게 제공한다.
+- 실제 연속 실행을 시작한 Portfolio는 최근 사용으로, 실제 라이프사이클 승급은 최근 승급으로 기록된다.
+- 공용 메타데이터 API는 `%APPDATA%\trading_programs\artifact-user-metadata.json`을 원자적으로 갱신한다.
+- 반응형 검사에서 발견한 검색 패널의 고정 min-content 폭을 제거했다. 1707×960과 1280×800의 5개 탭에서 가로 넘침·경계 이탈·콘솔 오류 0건이다.
+- Python 104개와 production build, 강화된 UI smoke를 통과했다.

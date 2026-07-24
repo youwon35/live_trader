@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import env_settings, state
+from trading_runtime.artifact_metadata import ArtifactMetadataStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,6 +108,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/search-presets":
             self.send_json(read_strategy_search_presets())
+            return
+        if parsed.path == "/api/artifact-metadata":
+            self.send_json(ArtifactMetadataStore().read())
             return
         if parsed.path == "/api/env-settings":
             self.send_json({"ok": True, "settings": env_settings.env_settings_snapshot()})
@@ -253,6 +257,23 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 self.send_json(write_strategy_search_presets(payload))
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)})
+            return
+        if parsed.path == "/api/artifact-metadata":
+            artifact_id = str(payload.get("artifactId") or "").strip()
+            changes = payload.get("changes") if isinstance(payload.get("changes"), dict) else {}
+            if not artifact_id:
+                self.send_json({"ok": False, "error": "artifactId가 필요합니다."})
+                return
+            entry = ArtifactMetadataStore().update(
+                artifact_id,
+                payload.get("artifactType") or "strategy",
+                favorite=changes.get("favorite") if "favorite" in changes else None,
+                tags=changes.get("tags") if "tags" in changes else None,
+                note=changes.get("note") if "note" in changes else None,
+                mark_used=changes.get("markUsed") is True,
+                mark_promoted=changes.get("markPromoted") is True,
+            )
+            self.send_json({"ok": True, "entry": entry, "document": ArtifactMetadataStore().read()})
             return
         if parsed.path == "/api/env-settings":
             if requests_real_order_enable(payload) and payload.get("confirmed") is not True:
