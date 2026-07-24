@@ -978,3 +978,11 @@ API 없이 실제 실행한 기능:
 - Live Trader를 포함한 다섯 프로그램의 상태·시장·소스·로그 배지와 보조 버튼을 불투명 테마 표면으로 통일했다.
 - 다크 모드의 SETTINGS/INFO/WARN/STORAGE와 같은 짧은 영문 라벨은 흰 글자와 의미별 단색 배경을 사용하며, 화이트 모드도 밝은 표면과 짙은 글자로 대비를 유지한다.
 - production build와 Playwright 실제 브라우저 계산값 검증에서 대표 배지의 `opacity: 1`을 확인했다.
+
+## 2026-07-24 라이트 팔레트 배지의 전 테마 고정
+
+- Live Trader를 포함한 다섯 프로그램의 운영 배지는 다크 모드에서도 화이트 모드의 파스텔 배경을 그대로 사용한다.
+- 글자는 `#0f172a`, 외곽선은 `#aab9cc` 회색 1px 실선이며, 상태와 시장·소스 값별 배경만 의미에 따라 달라진다.
+- KOSPI/KOSDAQ/Korea ETF/미국 시장/crypto와 KIS/pykrx/yfinance/Upbit/Binance 식별색을 공용 계층에 추가했다.
+- Playwright 5×2×22 검사에서 라이트·다크 계산 스타일이 전부 동일했고 흰 글자·비회색 외곽선은 0건이었다.
+- production build, 최신 `release/LiveTrader.exe` 패키징, scale/click 계약과 `--help` 실행 검증이 통과했다.
