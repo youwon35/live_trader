@@ -986,3 +986,10 @@ API 없이 실제 실행한 기능:
 - KOSPI/KOSDAQ/Korea ETF/미국 시장/crypto와 KIS/pykrx/yfinance/Upbit/Binance 식별색을 공용 계층에 추가했다.
 - Playwright 5×2×22 검사에서 라이트·다크 계산 스타일이 전부 동일했고 흰 글자·비회색 외곽선은 0건이었다.
 - production build, 최신 `release/LiveTrader.exe` 패키징, scale/click 계약과 `--help` 실행 검증이 통과했다.
+
+## 2026-07-25 배지 팔레트 자동 회귀 CI
+
+- 공용 Playwright 검사 `badge:check`가 다섯 앱 × 두 테마 × 22종 배지의 배경·글자·회색 실선·opacity·테마 동일성을 검사한다.
+- 첫 실행에서 앱 로컬 CSS에 가려진 공용 글자색 불일치 40건을 차단했고, 공용 selector를 보강한 뒤 220/220을 통과했다.
+- 현행 compact UI를 계약 버전 6과 30개 시각 기준으로 갱신했으며 최종 30/30, pixel diff 0.000%다.
+- GitHub Actions가 두 검사를 자동 실행한다. 최신 LiveTrader EXE 패키징, scale/click 계약과 `--help` 검증도 통과했다.
