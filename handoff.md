@@ -1044,3 +1044,11 @@ API 없이 실제 실행한 기능:
 - 최신 `release\LiveTrader.exe`는 19,421,996 bytes이며 SHA-256은 `E871160921BAC9E1EECF41753CB81B1275F28CDBCDF8B51B3BC4727CF085AF9B`다.
 - 재기동 뒤에도 `MONITOR`, Dry Run, 운용자 미확인, Kill Switch OFF, 주문 0건을 유지했다. 읽기 전용 실제 브로커 대조를 다시 실행해 KIS·Binance·Upbit 계좌 3개와 포지션 7개가 모두 PASS였고 API 오류·불일치·차단 항목은 0건이었다.
 - Node polling 회귀와 Live Trader unittest 163개가 통과했다. 실제 주문은 현재 Artifact와 정확히 일치하는 자연 Shadow/Paper 및 canary 체결 근거가 부족해 생성하지 않았다.
+
+## 2026-07-27 daemon lease·예약 작업·실제 계좌 재검증
+
+- daemon은 시작 즉시 PID, heartbeat lease, `STARTING`을 기록하고 startup 결과에 따라 `RUNNING` 또는 `DEGRADED`를 기록한다. 정상 종료는 `STOPPED`, PID가 없거나 lease가 만료된 기록은 조회 시 `STALE`, `running=false`로 원자 정정한다.
+- 서버 시작 시에도 daemon 상태를 reconciliation하므로 죽은 프로세스가 과거 `RUNNING` 파일만 남겨 정상으로 보이는 문제를 막았다. 전용 테스트 4개를 추가해 정상 heartbeat, heartbeat timeout, dead PID, 정상 종료를 검증했다.
+- 최신 EXE로 `TradingSystem-LiveTrader-Monitor` 예약 작업을 다시 설치했다. 30초 주기를 넘겨 PID가 살아 있고 heartbeat, execution poll, crypto runtime이 연속 갱신되는 것을 확인했다. stock profile은 실행 가능한 Portfolio/Strategy Artifact가 없어 `STOPPED`, 전체 daemon은 정직하게 `DEGRADED`로 표시된다.
+- 패키지가 저장된 KIS·Binance·Upbit 인증정보를 정상 인식했다. 실제 읽기 전용 대조에서 계좌 3개·포지션 7개가 모두 일치했고 API 필요·불일치·조회 오류는 0건이었다. 주문/취소는 호출하지 않았고 `LIVE_TRADER_ENABLE_REAL_ORDERS=false`, MONITOR 안전 잠금은 유지했다.
+- 전체 unittest 167개, Node polling, 5개 탭 × 2개 viewport UI smoke, production build와 실제 Windows 패키지를 확인했다. 최신 `release\LiveTrader.exe`는 19,425,916 bytes, SHA-256 `CF6D09CC9601D303C84101CFF98F87C1EE1104DB065E87D3FCBA098B2A85B135`다.

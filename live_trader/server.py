@@ -367,6 +367,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
 
 
 def create_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
+    # A hard-killed or crashed background monitor cannot execute its finally
+    # block. Reconcile the persisted lease before the desktop/API reports any
+    # previous RUNNING state.
+    from .daemon import read_daemon_status  # pylint: disable=import-outside-toplevel
+
+    read_daemon_status(persist=True)
     state.restore_runtime_from_checkpoint()
     return ThreadingHTTPServer((host, port), LiveTraderHandler)
 
