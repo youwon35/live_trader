@@ -3,14 +3,19 @@ from __future__ import annotations
 import os
 import csv
 import html
+import hashlib
 import json
 import secrets
+import threading
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from io import StringIO
 from pathlib import Path
 import sys
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 for parent in Path(__file__).resolve().parents:
@@ -31,6 +36,7 @@ from trading_runtime import (
     audit_event_from_order_gate,
     build_audit_event,
     artifact_content_hash,
+    artifact_reference,
     build_lineage_manifest,
     build_live_execution_evidence,
     normalize_broker_execution,
@@ -53,6 +59,7 @@ from trading_runtime import (
     DecisionTraceStore,
     PositionTruth,
     PromotionMetrics,
+    PromotionPolicy,
     build_restart_recovery_plan,
     build_trace_id,
     evaluate_automatic_promotion,
@@ -90,11 +97,32 @@ from trading_runtime.telegram_notifications import TelegramDispatcher, format_tr
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
 CheckStatus = Literal["pass", "warn", "fail"]
+RUNTIME_MODE_LOCK = threading.RLock()
+# Serializes public runtime control operations without participating in a
+# closed-bar cycle.  Public calls acquire this lock before manager/controller
+# locks; they never hold RUNTIME_MODE_LOCK while entering the manager.
+RUNTIME_CONTROL_LOCK = threading.RLock()
+RUNTIME_MODE_RANK = {"MONITOR": 0, "SMALL_LIVE": 1, "FULL_LIVE": 2}
+PROFESSIONAL_PROMOTION_POLICY = PromotionPolicy()
 
 TELEGRAM_DISPATCHER = TelegramDispatcher(
     "live_trader",
     env_file=Path(__file__).resolve().parents[1] / ".env",
 )
+
+TELEGRAM_SAFETY_AUDIT_EVENTS = {
+    "Kill Switch",
+    "신규 진입 차단",
+    "Watchdog",
+    "Watchdog Fail Closed",
+    "포지션/계좌 대조",
+    "Recovery Drill",
+    "Startup Recovery",
+}
+TELEGRAM_CONNECTIVITY_AUDIT_EVENTS = {
+    "체결 스트림",
+    "체결 이벤트 동기화",
+}
 
 
 RISK_SETTING_META: dict[str, dict[str, object]] = {
@@ -301,6 +329,10 @@ ACCOUNT_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
 
 FINAL_ORDER_STATES = {"dry_run", "sent", "filled", "canceled", "retry_exhausted"}
 AUDIT_LOG_LIMIT = 500
+BROKER_SNAPSHOT_ACTIVE_INTERVAL_SECONDS = 30.0
+BROKER_SNAPSHOT_IDLE_INTERVAL_SECONDS = 300.0
+BROKER_SNAPSHOT_MAX_BACKOFF_SECONDS = 1800.0
+EXECUTION_SUMMARY_AUDIT_INTERVAL_SECONDS = 900.0
 APP_DATA_ROOT = default_runtime_data_root()
 AUDIT_DB_PATH = Path(os.environ.get("LIVE_TRADER_AUDIT_DB") or APP_DATA_ROOT / "logs" / "live_trader_audit.sqlite3")
 AUDIT_STORE = SQLiteAuditEventStore(AUDIT_DB_PATH)
@@ -382,6 +414,13 @@ STATE: dict[str, Any] = {
         "recorded_count": 0,
         "synced_cash_count": 0,
         "synced_position_count": 0,
+        "snapshot_changed_brokers": [],
+        "snapshot_skipped_brokers": [],
+    },
+    "broker_snapshot_poll": {
+        "brokers": {},
+        "last_summary_audit_monotonic": 0.0,
+        "last_summary_signature": "",
     },
     "reconciliation_last_run": None,
     "preflight_last_run": None,
@@ -440,6 +479,82 @@ LIVE_EXECUTION_STREAMS = ExecutionStreamManager(APP_DATA_ROOT)
 
 def now_text() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+SENSITIVE_SNAPSHOT_KEYS = {
+    "authorization",
+    "accesstoken",
+    "refreshtoken",
+    "token",
+    "bottoken",
+    "confirmationtoken",
+    "signature",
+    "queryhash",
+    "apikey",
+    "apisecret",
+    "appkey",
+    "appsecret",
+    "accesskey",
+    "secretkey",
+    "xmbxapikey",
+    "cano",
+    "accountno",
+    "accountnumber",
+    "accountid",
+    "htsid",
+    "jwt",
+}
+
+
+@lru_cache(maxsize=512)
+def _normalized_sensitive_key_text(value: str) -> str:
+    return "".join(character for character in value.lower() if character.isalnum())
+
+
+def normalized_sensitive_key(value: object) -> str:
+    return _normalized_sensitive_key_text(str(value or ""))
+
+
+def redact_url_query(value: str) -> str:
+    if "://" not in value or "?" not in value:
+        return value
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if not parsed.scheme or not parsed.netloc or not parsed.query:
+        return value
+    changed = False
+    query: list[tuple[str, str]] = []
+    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+        if normalized_sensitive_key(key) in SENSITIVE_SNAPSHOT_KEYS:
+            query.append((key, "***"))
+            changed = True
+        else:
+            query.append((key, item))
+    if not changed:
+        return value
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+
+def redact_sensitive_payload(value: object, *, key_hint: str = "") -> object:
+    normalized_key = normalized_sensitive_key(key_hint)
+    if normalized_key in SENSITIVE_SNAPSHOT_KEYS:
+        if value in (None, ""):
+            return value
+        return "***"
+    if isinstance(value, dict):
+        return {
+            str(key): redact_sensitive_payload(item, key_hint=str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_sensitive_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_sensitive_payload(item) for item in value]
+    if isinstance(value, str):
+        return redact_url_query(value)
+    return value
 
 
 def future_text(seconds: float) -> str:
@@ -844,7 +959,7 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
             selected_portfolio,
             intent.strategy_id,
             intent.symbol,
-            mode=current_mode(),
+            mode=intent.mode,
         )
         if selected_match is None:
             return {
@@ -865,7 +980,7 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
         selected_gate = portfolio_gate_for_strategy(
             {"strategy_id": intent.strategy_id, "symbol": intent.symbol},
             checks.get("portfolios") if isinstance(checks.get("portfolios"), list) else [],
-            mode=current_mode(),
+            mode=intent.mode,
         )
     policy = selected_gate.get("rebalancePolicy") if isinstance(selected_gate.get("rebalancePolicy"), dict) else {}
     if not policy or not selected_gate.get("active") or selected_gate.get("allowed") is not True:
@@ -1087,51 +1202,245 @@ def append_strategy_promotion_log(strategy_dir: Path, payload: dict[str, Any], a
     ArtifactMetadataStore().update(event["artifactId"], "strategy", mark_promoted=True)
 
 
-def live_small_execution_summary(strategy_id: str) -> dict[str, int]:
-    successful = 0
-    blocked = 0
-    filled_orders = 0
-    for order in STATE["orders"]:
-        if str(order.get("strategy_id")) != strategy_id:
-            continue
-        state_name = str(order.get("state", "")).lower()
-        queue_state = str(order.get("queue_state", "")).lower()
-        if bool(order.get("dry_run")):
-            continue
-        if state_name in {"sent", "filled"} or queue_state in {"sent", "filled"}:
-            successful += 1
-        if state_name == "filled" or queue_state == "filled":
-            filled_orders += 1
-        if state_name in {"risk_blocked", "adapter_blocked", "failed", "rejected"} or queue_state in {"blocked", "risk_blocked", "failed", "rejected"}:
-            blocked += 1
-    related_orders = {
-        str(value)
-        for order in STATE["orders"]
-        if str(order.get("strategy_id")) == strategy_id and not bool(order.get("dry_run"))
-        for value in (
-            order.get("order_id"),
-            order.get("broker_order_id"),
-            order.get("idempotency_key"),
+CANARY_SCOPE_SCHEMA_VERSION = "live-canary-scope-v1"
+CANARY_SCOPE_FIELDS = (
+    "strategyId",
+    "strategyArtifactId",
+    "strategyArtifactHash",
+    "strategyContentHash",
+    "deploymentId",
+    "deploymentRevision",
+    "beforeLiveSmallAt",
+)
+
+
+def _canary_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.astimezone(timezone.utc)
+
+
+def _live_deployment_id(normalized: dict[str, Any]) -> str:
+    paper_evidence = (
+        normalized.get("paper_portfolio_evidence")
+        if isinstance(normalized.get("paper_portfolio_evidence"), dict)
+        else {}
+    )
+    portfolio_id = str(paper_evidence.get("portfolioId") or "")
+    return str(
+        normalized.get("deployment_id")
+        or (
+            f"dep:{normalized.get('strategy_id')}:"
+            f"{portfolio_id or 'standalone'}:live"
         )
-        if value not in (None, "", "-")
-    }
-    filled_event_ids: set[str] = set()
-    rejected_event_ids: set[str] = set()
-    for event in PROGRAM_LEDGER.execution_event_rows(500):
-        identifiers = {
-            str(event.get("order_id") or ""),
-            str(event.get("broker_order_id") or ""),
+    )
+
+
+def current_live_canary_scope(
+    strategy_id: str,
+    *,
+    materialize: bool = False,
+    strategy_payload: dict[str, Any] | None = None,
+    normalized: dict[str, Any] | None = None,
+    deployment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    target = str(strategy_id or "").strip()
+    strategy_dir: Path | None = None
+    payload = strategy_payload
+    normalized_payload = normalized
+    if payload is None or normalized_payload is None:
+        (
+            strategy_dir,
+            _artifact_path,
+            resolved_payload,
+            resolved_normalized,
+        ) = find_strategy_artifact_payload(target)
+        payload = payload or resolved_payload
+        normalized_payload = normalized_payload or resolved_normalized
+    elif target:
+        strategy_dir, _path, _payload, _normalized = find_strategy_artifact_payload(
+            target
+        )
+    if (
+        not target
+        or strategy_dir is None
+        or not isinstance(payload, dict)
+        or not isinstance(normalized_payload, dict)
+    ):
+        return {
+            "schemaVersion": CANARY_SCOPE_SCHEMA_VERSION,
+            "eligible": False,
+            "issues": ["strategy-artifact-context-missing"],
         }
-        if not related_orders.intersection(identifiers):
+
+    current_deployment = deployment
+    if current_deployment is None:
+        if materialize:
+            _store, current_deployment, _portfolio = ensure_live_deployment(
+                strategy_dir,
+                payload,
+                normalized_payload,
+            )
+        else:
+            current_deployment = DeploymentStore(strategy_dir).get(
+                _live_deployment_id(normalized_payload)
+            )
+    if not isinstance(current_deployment, dict):
+        return {
+            "schemaVersion": CANARY_SCOPE_SCHEMA_VERSION,
+            "eligible": False,
+            "issues": ["live-deployment-missing"],
+        }
+
+    current_reference = artifact_reference(payload)
+    deployed_reference = (
+        current_deployment.get("strategyArtifact")
+        if isinstance(current_deployment.get("strategyArtifact"), dict)
+        else {}
+    )
+    revision = int(safe_float(current_deployment.get("revision"), 0.0))
+    entered_at = str(current_deployment.get("updatedAt") or "")
+    issues: list[str] = []
+    if normalize_lifecycle_status(current_deployment.get("lifecycle")) != "before-live-small":
+        issues.append("deployment-not-before-live-small")
+    if revision <= 0:
+        issues.append("deployment-revision-missing")
+    if _canary_datetime(entered_at) is None:
+        issues.append("before-live-small-time-invalid")
+    for key in ("artifactId", "artifactHash", "contentHash"):
+        if (
+            not str(deployed_reference.get(key) or "")
+            or str(deployed_reference.get(key) or "")
+            != str(current_reference.get(key) or "")
+        ):
+            issues.append(f"current-strategy-{key}-mismatch")
+
+    scope = {
+        "schemaVersion": CANARY_SCOPE_SCHEMA_VERSION,
+        "strategyId": target,
+        "strategyArtifactId": str(current_reference.get("artifactId") or ""),
+        "strategyArtifactHash": str(current_reference.get("artifactHash") or ""),
+        "strategyContentHash": str(current_reference.get("contentHash") or ""),
+        "deploymentId": str(current_deployment.get("deploymentId") or ""),
+        "deploymentRevision": revision,
+        "beforeLiveSmallAt": entered_at,
+        "eligible": not issues,
+        "issues": issues,
+    }
+    scope["scopeId"] = hashlib.sha256(
+        json.dumps(
+            {
+                key: scope.get(key)
+                for key in CANARY_SCOPE_FIELDS
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return scope
+
+
+def _canary_scope_matches(
+    order_scope: object,
+    current_scope: dict[str, Any],
+) -> bool:
+    if not isinstance(order_scope, dict):
+        return False
+    if str(order_scope.get("schemaVersion") or "") != CANARY_SCOPE_SCHEMA_VERSION:
+        return False
+    return all(
+        str(order_scope.get(key) or "")
+        == str(current_scope.get(key) or "")
+        for key in CANARY_SCOPE_FIELDS
+    )
+
+
+def live_small_execution_summary(
+    strategy_id: str,
+    *,
+    strategy_payload: dict[str, Any] | None = None,
+    normalized: dict[str, Any] | None = None,
+    deployment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    scope = current_live_canary_scope(
+        strategy_id,
+        strategy_payload=strategy_payload,
+        normalized=normalized,
+        deployment=deployment,
+    )
+    empty = {
+        "successful": 0,
+        "blocked": 0,
+        "fills": 0,
+        "scope": scope,
+    }
+    if scope.get("eligible") is not True:
+        return empty
+    boundary = _canary_datetime(scope.get("beforeLiveSmallAt"))
+    if boundary is None:
+        return empty
+
+    scoped_orders: dict[tuple[str, str], dict[str, Any]] = {}
+    for order in STATE["orders"]:
+        if (
+            str(order.get("strategy_id") or "") != str(strategy_id)
+            or bool(order.get("dry_run"))
+            or str(order.get("mode") or "").upper() != "SMALL_LIVE"
+            or not _canary_scope_matches(order.get("canary_scope"), scope)
+        ):
             continue
-        state_name = str(event.get("state") or "").lower()
-        if state_name in {"filled", "done", "executed"} and safe_float(event.get("quantity"), 0.0) > 0:
-            filled_event_ids.add(str(event.get("event_id") or ""))
-        if state_name in {"rejected", "expired", "failed", "canceled"}:
-            rejected_event_ids.add(str(event.get("event_id") or ""))
-    successful = max(successful, len(filled_event_ids))
-    blocked = max(blocked, len(rejected_event_ids))
-    return {"successful": successful, "blocked": blocked, "fills": max(filled_orders, len(filled_event_ids))}
+        broker_id = str(order.get("broker_id") or "").strip().lower()
+        broker_order_id = str(order.get("broker_order_id") or "").strip()
+        created_at = _canary_datetime(
+            order.get("created_at") or order.get("time")
+        )
+        if (
+            not broker_id
+            or broker_order_id in {"", "-"}
+            or created_at is None
+            or created_at < boundary
+        ):
+            continue
+        scoped_orders[(broker_id, broker_order_id)] = order
+
+    fill_identities: set[tuple[str, str]] = set()
+    rejected_identities: set[tuple[str, str]] = set()
+    for event in PROGRAM_LEDGER.execution_event_rows(5000):
+        event_id = str(event.get("event_id") or "").strip()
+        broker_id = str(event.get("broker_id") or "").strip().lower()
+        broker_order_id = str(event.get("broker_order_id") or "").strip()
+        identity = (broker_id, broker_order_id)
+        if (
+            not event_id
+            or broker_order_id in {"", "-"}
+            or identity not in scoped_orders
+        ):
+            continue
+        occurred_at = _canary_datetime(event.get("occurred_at"))
+        if occurred_at is None or occurred_at < boundary:
+            continue
+        state_name = str(event.get("state") or "").strip().lower()
+        if (
+            state_name in {"filled", "done", "executed"}
+            and safe_float(event.get("quantity"), 0.0) > 0
+        ):
+            # Count one canary per broker order, even when a broker emits
+            # multiple partial-fill/update events for the same order.
+            fill_identities.add(identity)
+        elif state_name in {"rejected", "expired", "failed", "canceled"}:
+            rejected_identities.add(identity)
+    return {
+        "successful": len(fill_identities),
+        "blocked": len(rejected_identities),
+        "fills": len(fill_identities),
+        "scope": scope,
+    }
 
 
 def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers: list[dict[str, object]] | None = None) -> list[dict[str, Any]]:
@@ -1158,7 +1467,7 @@ def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers:
             "live_strategy_count": sum(1 for strategy in stock_strategies if strategy.get("live_allowed")),
             "full_live_strategy_count": sum(1 for strategy in stock_strategies if strategy.get("live_eligible")),
             "detail": "KIS 실계좌 API로 주식/ETF 주문을 라우팅합니다.",
-            "sample_request": build_adapter_preview("kis", stock_strategies),
+            "sample_request": redact_sensitive_payload(build_adapter_preview("kis", stock_strategies)),
         },
         {
             "id": "crypto",
@@ -1175,13 +1484,78 @@ def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers:
             "live_strategy_count": sum(1 for strategy in crypto_strategies if strategy.get("live_allowed")),
             "full_live_strategy_count": sum(1 for strategy in crypto_strategies if strategy.get("live_eligible")),
             "detail": "선택한 코인 거래소 API로 코인 주문을 라우팅합니다.",
-            "sample_request": build_adapter_preview(crypto_provider, crypto_strategies),
+            "sample_request": redact_sensitive_payload(build_adapter_preview(crypto_provider, crypto_strategies)),
         },
     ]
 
 
+def broker_id_from_hint(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if "upbit" in text:
+        return "upbit"
+    if "binance" in text:
+        return "binance"
+    if text == "kis" or "korea investment" in text or "한국투자" in text:
+        return "kis"
+    return ""
+
+
 def strategy_broker_id(strategy: dict[str, Any]) -> str:
-    asset = f"{strategy.get('asset', '')} {strategy.get('symbol', '')}".lower()
+    dataset = strategy.get("dataset") if isinstance(strategy.get("dataset"), dict) else {}
+    data_artifact = (
+        strategy.get("dataArtifact")
+        if isinstance(strategy.get("dataArtifact"), dict)
+        else strategy.get("data_artifact")
+        if isinstance(strategy.get("data_artifact"), dict)
+        else {}
+    )
+    trader_contract = (
+        strategy.get("traderContract")
+        if isinstance(strategy.get("traderContract"), dict)
+        else strategy.get("trader_contract")
+        if isinstance(strategy.get("trader_contract"), dict)
+        else {}
+    )
+    scope = trader_contract.get("scope") if isinstance(trader_contract.get("scope"), dict) else {}
+    for hint in (
+        dataset.get("provider"),
+        strategy.get("dataset_provider"),
+        strategy.get("marketDataProvider"),
+        strategy.get("market_data_provider"),
+        data_artifact.get("marketDataProvider"),
+        data_artifact.get("provider"),
+        strategy.get("brokerId"),
+        strategy.get("broker_id"),
+        scope.get("brokerId"),
+    ):
+        broker_id = broker_id_from_hint(hint)
+        if broker_id:
+            return broker_id
+
+    raw_allowed = (
+        scope.get("allowed_brokers")
+        or scope.get("allowedBrokers")
+        or strategy.get("allowed_brokers")
+        or strategy.get("allowedBrokers")
+        or []
+    )
+    allowed = {
+        broker_id
+        for item in raw_allowed
+        if (broker_id := broker_id_from_hint(item))
+    } if isinstance(raw_allowed, (list, tuple, set)) else set()
+    if len(allowed) == 1:
+        return next(iter(allowed))
+
+    symbol = str(strategy.get("symbol") or dataset.get("symbol") or data_artifact.get("symbol") or "").strip().upper()
+    if symbol.startswith("KRW-"):
+        return "upbit"
+    top_level_provider = broker_id_from_hint(strategy.get("provider"))
+    if top_level_provider:
+        return top_level_provider
+    asset = f"{strategy.get('asset', '')} {symbol}".lower()
     if any(token in asset for token in ("crypto", "coin", "btc", "eth", "usdt", "코인")):
         return "binance"
     return "kis"
@@ -1190,6 +1564,16 @@ def strategy_broker_id(strategy: dict[str, Any]) -> str:
 def build_adapter_preview(provider: str, strategies: list[dict[str, Any]]) -> dict[str, Any]:
     strategy = next((item for item in strategies if item.get("live_allowed")), strategies[0] if strategies else {})
     symbol = str(strategy.get("symbol") or ("BTCUSDT" if provider == "binance" else "KRW-BTC" if provider == "upbit" else "069500.KS"))
+    local_code = symbol.upper().removesuffix(".KS").removesuffix(".KQ")
+    order_type = (
+        "MARKET"
+        if provider == "binance"
+        else "price"
+        if provider == "upbit"
+        else "01"
+        if local_code.isdigit() and len(local_code) == 6
+        else "00"
+    )
     intent = {
         "broker_id": provider,
         "strategy_id": strategy.get("strategy_id", "sample"),
@@ -1198,8 +1582,14 @@ def build_adapter_preview(provider: str, strategies: list[dict[str, Any]]) -> di
         "asset": strategy.get("asset", ""),
         "side": "BUY",
         "quantity": 1,
-        "price": 1000 if provider != "binance" else 1,
-        "order_type": "LIMIT" if provider == "binance" else "limit" if provider == "upbit" else "00",
+        "price": (
+            0
+            if provider == "kis" and order_type == "01"
+            else 1000
+            if provider != "binance"
+            else 1
+        ),
+        "order_type": order_type,
     }
     if provider == "kis":
         return build_kis_live_order_request(intent).preview()
@@ -1407,6 +1797,9 @@ def execution_event_snapshot() -> dict[str, Any]:
         "recorded_count": int(state.get("recorded_count", 0)),
         "synced_cash_count": int(state.get("synced_cash_count", 0)),
         "synced_position_count": int(state.get("synced_position_count", 0)),
+        "snapshot_changed_brokers": list(state.get("snapshot_changed_brokers", [])),
+        "snapshot_skipped_brokers": list(state.get("snapshot_skipped_brokers", [])),
+        "snapshot_poll": redact_sensitive_payload(STATE.get("broker_snapshot_poll", {})),
         "recent": PROGRAM_LEDGER.execution_event_rows(20),
         "streams": LIVE_EXECUTION_STREAMS.snapshot(),
     }
@@ -1479,6 +1872,643 @@ def successful_position_brokers() -> set[str]:
     return {str(item) for item in rows} if isinstance(rows, list) else set()
 
 
+RESTORE_CONTEXT_MAX_AGE_SECONDS = 30.0
+RESTORE_CONTEXT_LOCK = threading.RLock()
+
+
+def _restore_context_hash(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _restore_account_scope(broker_id: str) -> str:
+    normalized = str(broker_id or "").strip().lower()
+    if normalized == "kis":
+        configured = ":".join(
+            (
+                os.getenv("KIS_ACCOUNT_NO", ""),
+                os.getenv("KIS_ACCOUNT_PRODUCT_CODE", ""),
+            )
+        )
+    elif normalized == "binance":
+        configured = os.getenv("BINANCE_API_KEY", "")
+    elif normalized == "upbit":
+        configured = os.getenv("UPBIT_ACCESS_KEY", "")
+    else:
+        configured = ""
+    opaque = configured or f"{normalized}:configured-account"
+    return f"{normalized}:{hashlib.sha256(opaque.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _canonical_restore_instrument(broker_id: str, symbol: str) -> str:
+    normalized_broker = str(broker_id or "").strip().lower()
+    text = str(symbol or "").strip().upper().replace(" ", "")
+    if normalized_broker == "kis":
+        return text.removesuffix(".KS").removesuffix(".KQ")
+    if normalized_broker == "upbit":
+        compact = text.replace("_", "-")
+        if "-" not in compact and compact.startswith("KRW") and len(compact) > 3:
+            compact = f"KRW-{compact[3:]}"
+        return compact
+    if normalized_broker == "binance":
+        compact = text.replace("-", "").replace("_", "")
+        for quote in ("USDT", "USDC", "FDUSD", "BUSD", "TUSD", "BTC", "ETH"):
+            if compact.endswith(quote) and len(compact) > len(quote):
+                return compact[: -len(quote)]
+        return compact
+    return text.replace("-", "").replace("_", "")
+
+
+def _restore_spec_route(spec: Any) -> dict[str, Any]:
+    broker_id = str(getattr(spec, "broker_id", "") or "").strip().lower()
+    symbol = str(getattr(spec, "symbol", "") or "").strip().upper()
+    canonical = _canonical_restore_instrument(broker_id, symbol)
+    exchange = ""
+    capability_known = bool(broker_id and canonical)
+    capability_reason = ""
+    if broker_id == "kis":
+        if symbol.endswith((".KS", ".KQ")) or canonical.isdigit():
+            exchange = "KRX"
+        else:
+            exchange = str(
+                getattr(spec, "parameters", {}).get("exchange")
+                or getattr(spec, "artifact", {}).get("exchange")
+                or "NASD"
+            ).upper()
+    elif broker_id == "binance":
+        exchange = "BINANCE_SPOT"
+    elif broker_id == "upbit":
+        exchange = "UPBIT_SPOT"
+    else:
+        capability_known = False
+        capability_reason = f"unsupported-broker:{broker_id or 'missing'}"
+    spec_payload = spec.to_dict() if callable(getattr(spec, "to_dict", None)) else {
+        "strategyInstanceId": str(getattr(spec, "strategy_instance_id", "") or ""),
+        "artifactHash": str(getattr(spec, "artifact_hash", "") or ""),
+        "brokerId": broker_id,
+        "symbol": symbol,
+    }
+    return {
+        "strategyInstanceId": str(getattr(spec, "strategy_instance_id", "") or ""),
+        "artifactHash": str(getattr(spec, "artifact_hash", "") or ""),
+        "brokerId": broker_id,
+        "accountScope": _restore_account_scope(broker_id),
+        "exchange": exchange,
+        "canonicalInstrument": canonical,
+        "specIdentityHash": _restore_context_hash(spec_payload),
+        "capabilityKnown": capability_known,
+        "capabilityReason": capability_reason,
+    }
+
+
+def _restore_quantity(row: dict[str, Any]) -> float:
+    return safe_float(
+        row.get("broker_qty"),
+        safe_float(row.get("quantity"), safe_float(row.get("qty"), 0.0)),
+    )
+
+
+def _restore_order_is_pending_or_unknown(order: dict[str, Any]) -> bool:
+    state_name = str(order.get("state") or "").strip().lower()
+    queue_state = str(order.get("queue_state") or "").strip().lower()
+    terminal_states = {
+        "dry_run",
+        "filled",
+        "canceled",
+        "cancelled",
+        "retry_exhausted",
+        "adapter_blocked",
+        "risk_blocked",
+        "broker_rejected",
+        "rejected",
+        "failed",
+    }
+    terminal_queues = {
+        "filled",
+        "canceled",
+        "cancelled",
+        "failed",
+        "blocked",
+        "risk_blocked",
+    }
+    return state_name not in terminal_states and queue_state not in terminal_queues
+
+
+def _restore_evaluator_contexts(
+    evaluator_state: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    contexts: dict[str, dict[str, Any]] = {}
+    entries = evaluator_state.get("entries")
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        identity = entry.get("specIdentity")
+        runtime_state = entry.get("state")
+        if not isinstance(identity, dict) or not isinstance(runtime_state, dict):
+            continue
+        instance_id = str(identity.get("strategyInstanceId") or "")
+        if instance_id:
+            contexts[instance_id] = dict(runtime_state)
+    return contexts
+
+
+def _restore_context_seal_matches(
+    saved_seal: Any,
+    current_seal: dict[str, Any],
+    *,
+    current_positions_are_flat: bool,
+    position_context_complete: bool,
+) -> bool:
+    if not isinstance(saved_seal, dict):
+        return False
+    saved_body = saved_seal.get("body")
+    if not isinstance(saved_body, dict):
+        return False
+    if (
+        str(saved_seal.get("bodyHash") or "") != _restore_context_hash(saved_body)
+        or str(current_seal.get("bodyHash") or "")
+        != _restore_context_hash(current_seal.get("body"))
+    ):
+        return False
+    if saved_seal.get("bodyHash") != current_seal.get("bodyHash"):
+        return False
+    # Existing positions require a broker-verifiable fill/order generation.
+    # The current list_positions adapters expose quantity (and sometimes
+    # average price), but no immutable fill identity.  Until that capability
+    # exists, restart with exposure is deliberately liquidation-only.
+    return current_positions_are_flat or position_context_complete
+
+
+def _publish_forced_restore_positions(
+    broker_rows_by_id: dict[str, list[dict[str, Any]]],
+    *,
+    observed_at: str,
+) -> None:
+    """Atomically replace only brokers proven by the forced read.
+
+    The assessment never *reads* this cache as recovery evidence.  Publishing
+    its successful result is nevertheless required so the evaluator and
+    pre-trade reconciliation immediately observe the same broker truth used
+    for the mode transition.
+    """
+
+    if not broker_rows_by_id:
+        return
+    successful = set(broker_rows_by_id)
+    cache = STATE.setdefault("broker_reconciliation", {})
+    previous_positions = (
+        cache.get("positions", [])
+        if isinstance(cache.get("positions"), list)
+        else []
+    )
+    replacement_rows = [
+        {
+            **row,
+            "broker_id": broker_id,
+            "observed_at": observed_at,
+        }
+        for broker_id, rows in broker_rows_by_id.items()
+        for row in rows
+    ]
+    cache["positions"] = [
+        row
+        for row in previous_positions
+        if isinstance(row, dict)
+        and str(row.get("broker_id") or "").strip().lower()
+        not in successful
+    ] + replacement_rows
+    previous_success = cache.get("successful_position_brokers", [])
+    cache["successful_position_brokers"] = sorted(
+        {
+            str(item).strip().lower()
+            for item in previous_success
+            if str(item).strip()
+        }
+        | successful
+    )
+    observations = (
+        dict(cache.get("position_observations"))
+        if isinstance(cache.get("position_observations"), dict)
+        else {}
+    )
+    for broker_id, rows in broker_rows_by_id.items():
+        observations[broker_id] = {
+            "observedAt": observed_at,
+            "generation": _restore_context_hash({
+                "brokerId": broker_id,
+                "positions": sorted(
+                    [
+                        {
+                            "symbol": str(row.get("symbol") or ""),
+                            "quantity": _restore_quantity(row),
+                            "averagePrice": safe_float(
+                                row.get("average_price"),
+                                0.0,
+                            ),
+                        }
+                        for row in rows
+                    ],
+                    key=lambda item: item["symbol"],
+                ),
+            }),
+        }
+    cache["position_observations"] = observations
+    cache["fetched_at"] = observed_at
+
+
+def forced_restore_context_assessment(
+    specs: tuple[Any, ...],
+    *,
+    portfolio_id: str,
+    portfolio_hash: str,
+    strategy_identity_hash: str,
+    checkpoint_seal: dict[str, Any] | None,
+    evaluator_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Force fresh broker truth and build an exact restart context seal.
+
+    This path never trusts the long-lived reconciliation cache.  Every
+    required broker is queried synchronously while RESTORE_CONTEXT_LOCK is
+    held, then compared with the program ledger and in-flight order set at
+    exact broker/account/exchange/instrument scope.
+    """
+
+    resolved_specs = tuple(specs)
+    routes = [_restore_spec_route(spec) for spec in resolved_specs]
+    broker_ids = sorted(
+        {
+            str(route.get("brokerId") or "")
+            for route in routes
+            if str(route.get("brokerId") or "")
+        }
+    )
+    started_monotonic = time.monotonic()
+    observed_at = datetime.now(timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+    broker_rows_by_id: dict[str, list[dict[str, Any]]] = {}
+    errors: list[str] = []
+    with RESTORE_CONTEXT_LOCK:
+        router = LiveBrokerRouter()
+        for broker_id in broker_ids:
+            try:
+                rows = router.list_positions(broker_id)
+                if not isinstance(rows, list):
+                    raise BrokerNotReadyError(
+                        "position snapshot response is not a list"
+                    )
+                broker_rows_by_id[broker_id] = [
+                    dict(item) for item in rows if isinstance(item, dict)
+                ]
+            except Exception as exc:
+                errors.append(
+                    f"{broker_id}:{type(exc).__name__}:{audit_clip(str(exc), 160)}"
+                )
+        elapsed_seconds = max(0.0, time.monotonic() - started_monotonic)
+        observed_at = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z")
+        _publish_forced_restore_positions(
+            broker_rows_by_id,
+            observed_at=observed_at,
+        )
+
+        try:
+            ledger_positions = [
+                dict(item) for item in PROGRAM_LEDGER.position_rows()
+                if isinstance(item, dict)
+            ]
+            ledger_events = [
+                dict(item) for item in PROGRAM_LEDGER.execution_event_rows(500)
+                if isinstance(item, dict)
+            ]
+        except Exception as exc:
+            ledger_positions = []
+            ledger_events = []
+            errors.append(
+                "program-ledger:"
+                f"{type(exc).__name__}:{audit_clip(str(exc), 160)}"
+            )
+        all_orders = [
+            dict(item) for item in STATE.get("orders", [])
+            if isinstance(item, dict)
+        ]
+
+    route_keys = {
+        (
+            str(route["brokerId"]),
+            str(route["canonicalInstrument"]),
+        )
+        for route in routes
+    }
+
+    pending_orders: list[dict[str, Any]] = []
+    for order in all_orders:
+        if not _restore_order_is_pending_or_unknown(order):
+            continue
+        broker_request = (
+            order.get("broker_request")
+            if isinstance(order.get("broker_request"), dict)
+            else {}
+        )
+        broker_id = str(
+            order.get("broker_id")
+            or broker_request.get("broker_id")
+            or ""
+        ).strip().lower()
+        symbol = str(order.get("symbol") or broker_request.get("symbol") or "")
+        if not broker_id or not symbol:
+            pending_orders.append(order)
+            continue
+        if (
+            broker_id,
+            _canonical_restore_instrument(broker_id, symbol),
+        ) in route_keys:
+            pending_orders.append(order)
+
+    evaluator_payload = (
+        dict(evaluator_state) if isinstance(evaluator_state, dict) else {}
+    )
+    evaluator_contexts = _restore_evaluator_contexts(evaluator_payload)
+    spec_contexts: list[dict[str, Any]] = []
+    broker_generation_rows: list[dict[str, Any]] = []
+    ledger_generation_rows: list[dict[str, Any]] = []
+    ledger_generation_events: list[dict[str, Any]] = []
+    all_broker_flat = True
+    all_ledger_flat = True
+    has_known_position = False
+    all_position_context_complete = True
+
+    for route in routes:
+        broker_id = str(route["brokerId"])
+        canonical = str(route["canonicalInstrument"])
+        matching_broker = [
+            row
+            for row in broker_rows_by_id.get(broker_id, [])
+            if _canonical_restore_instrument(
+                broker_id,
+                str(row.get("symbol") or ""),
+            ) == canonical
+        ]
+        matching_ledger = [
+            row
+            for row in ledger_positions
+            if str(row.get("broker_id") or "").strip().lower() == broker_id
+            and _canonical_restore_instrument(
+                broker_id,
+                str(row.get("symbol") or ""),
+            ) == canonical
+        ]
+        matching_events = [
+            event
+            for event in ledger_events
+            if str(event.get("broker_id") or "").strip().lower() == broker_id
+            and _canonical_restore_instrument(
+                broker_id,
+                str(event.get("symbol") or ""),
+            ) == canonical
+        ]
+        broker_qty = sum(_restore_quantity(row) for row in matching_broker)
+        ledger_qty = sum(
+            safe_float(row.get("quantity"), 0.0)
+            for row in matching_ledger
+        )
+        tolerance = 1e-12 if broker_id in {"binance", "upbit"} else 0.0
+        broker_flat = abs(broker_qty) <= tolerance
+        ledger_flat = abs(ledger_qty) <= tolerance
+        all_broker_flat = all_broker_flat and broker_flat
+        all_ledger_flat = all_ledger_flat and ledger_flat
+        has_known_position = has_known_position or not broker_flat or not ledger_flat
+
+        latest_fill = next(
+            (
+                event
+                for event in matching_events
+                if str(event.get("state") or "").lower() == "filled"
+                and str(event.get("side") or "").upper() in {"BUY", "SELL"}
+            ),
+            {},
+        )
+        evaluator_context = evaluator_contexts.get(
+            str(route["strategyInstanceId"]),
+            {},
+        )
+        position_context_complete = broker_flat and ledger_flat
+        if not position_context_complete:
+            position_context_complete = bool(
+                evaluator_context.get("lastHasPosition") is True
+                and evaluator_context.get("entryContextKnown") is True
+                and safe_float(evaluator_context.get("entryPrice"), 0.0) > 0
+                and isinstance(evaluator_context.get("barsHeld"), int)
+                and isinstance(evaluator_context.get("evaluationCount"), int)
+                and str(evaluator_context.get("lastBarKey") or "")
+                and str(
+                    latest_fill.get("broker_order_id")
+                    or latest_fill.get("order_id")
+                    or ""
+                )
+                and safe_float(latest_fill.get("quantity"), 0.0) > 0
+                and safe_float(latest_fill.get("price"), 0.0) > 0
+                and str(latest_fill.get("occurred_at") or "")
+            )
+            # list_positions has no immutable fill/order generation.  Even a
+            # locally complete context cannot prove that an external
+            # sell/re-buy of the same quantity did not occur during downtime.
+            position_context_complete = False
+        all_position_context_complete = (
+            all_position_context_complete and position_context_complete
+        )
+
+        broker_generation_rows.extend(
+            {
+                "brokerId": broker_id,
+                "accountScope": route["accountScope"],
+                "exchange": route["exchange"],
+                "canonicalInstrument": canonical,
+                "quantity": _restore_quantity(row),
+                "averagePrice": safe_float(row.get("average_price"), 0.0),
+            }
+            for row in matching_broker
+        )
+        ledger_generation_rows.extend(
+            {
+                "brokerId": broker_id,
+                "canonicalInstrument": canonical,
+                "quantity": safe_float(row.get("quantity"), 0.0),
+                "value": safe_float(row.get("value"), 0.0),
+                "updatedAt": str(row.get("updated_at") or ""),
+                "source": str(row.get("source") or ""),
+            }
+            for row in matching_ledger
+        )
+        ledger_generation_events.extend(
+            {
+                "eventId": str(event.get("event_id") or ""),
+                "orderId": str(event.get("order_id") or ""),
+                "brokerOrderId": str(event.get("broker_order_id") or ""),
+                "brokerId": broker_id,
+                "canonicalInstrument": canonical,
+                "side": str(event.get("side") or ""),
+                "quantity": safe_float(event.get("quantity"), 0.0),
+                "price": safe_float(event.get("price"), 0.0),
+                "state": str(event.get("state") or ""),
+                "occurredAt": str(event.get("occurred_at") or ""),
+            }
+            for event in matching_events
+        )
+        spec_contexts.append(
+            {
+                **route,
+                "brokerQuantity": broker_qty,
+                "programQuantity": ledger_qty,
+                "evaluatorContext": evaluator_context,
+                "latestFill": {
+                    "eventId": str(latest_fill.get("event_id") or ""),
+                    "orderId": str(latest_fill.get("order_id") or ""),
+                    "brokerOrderId": str(
+                        latest_fill.get("broker_order_id") or ""
+                    ),
+                    "quantity": safe_float(latest_fill.get("quantity"), 0.0),
+                    "price": safe_float(latest_fill.get("price"), 0.0),
+                    "occurredAt": str(latest_fill.get("occurred_at") or ""),
+                },
+                "positionContextComplete": position_context_complete,
+            }
+        )
+
+    broker_generation = _restore_context_hash(
+        sorted(
+            broker_generation_rows,
+            key=lambda item: (
+                item["brokerId"],
+                item["canonicalInstrument"],
+                item["quantity"],
+            ),
+        )
+    )
+    ledger_generation = _restore_context_hash(
+        {
+            "positions": sorted(
+                ledger_generation_rows,
+                key=lambda item: (
+                    item["brokerId"],
+                    item["canonicalInstrument"],
+                ),
+            ),
+            "fills": sorted(
+                ledger_generation_events,
+                key=lambda item: (
+                    item["occurredAt"],
+                    item["eventId"],
+                ),
+            ),
+        }
+    )
+    order_generation = _restore_context_hash(
+        sorted(
+            [
+                {
+                    "orderId": str(item.get("order_id") or ""),
+                    "brokerId": str(item.get("broker_id") or ""),
+                    "symbol": str(item.get("symbol") or ""),
+                    "state": str(item.get("state") or ""),
+                    "queueState": str(item.get("queue_state") or ""),
+                    "brokerOrderId": str(item.get("broker_order_id") or ""),
+                }
+                for item in pending_orders
+            ],
+            key=lambda item: (
+                item["brokerId"],
+                item["symbol"],
+                item["orderId"],
+            ),
+        )
+    )
+    context_body = {
+        "schemaVersion": "live-restore-context-v1",
+        "portfolioId": portfolio_id,
+        "portfolioHash": portfolio_hash,
+        "strategyIdentityHash": strategy_identity_hash,
+        "brokerSnapshotGeneration": broker_generation,
+        "programLedgerGeneration": ledger_generation,
+        "orderGeneration": order_generation,
+        "pendingOrUnknownOrderCount": len(pending_orders),
+        "evaluatorStateHash": _restore_context_hash(evaluator_payload),
+        "specs": sorted(
+            spec_contexts,
+            key=lambda item: (
+                str(item["strategyInstanceId"]),
+                str(item["brokerId"]),
+                str(item["canonicalInstrument"]),
+            ),
+        ),
+    }
+    current_seal = {
+        "schemaVersion": "live-restore-context-seal-v1",
+        "body": context_body,
+        "bodyHash": _restore_context_hash(context_body),
+    }
+    all_specs_known = bool(routes) and all(
+        route.get("capabilityKnown") is True for route in routes
+    )
+    snapshot_complete = (
+        all_specs_known
+        and not errors
+        and set(broker_rows_by_id) == set(broker_ids)
+        and elapsed_seconds <= RESTORE_CONTEXT_MAX_AGE_SECONDS
+    )
+    all_flat = snapshot_complete and all_broker_flat
+    program_ledger_flat = all_ledger_flat
+    context_seal_valid = (
+        snapshot_complete
+        and len(pending_orders) == 0
+        and _restore_context_seal_matches(
+            checkpoint_seal,
+            current_seal,
+            current_positions_are_flat=all_flat and program_ledger_flat,
+            position_context_complete=all_position_context_complete,
+        )
+    )
+    reasons = [
+        *errors,
+        *[
+            str(route.get("capabilityReason") or "")
+            for route in routes
+            if route.get("capabilityKnown") is not True
+        ],
+    ]
+    if elapsed_seconds > RESTORE_CONTEXT_MAX_AGE_SECONDS:
+        reasons.append(
+            f"forced-position-read-timeout:{elapsed_seconds:.3f}s"
+        )
+    if pending_orders:
+        reasons.append(f"pending-or-unknown-orders:{len(pending_orders)}")
+    return {
+        "schemaVersion": "live-restore-attestation-v1",
+        "portfolioId": portfolio_id,
+        "portfolioHash": portfolio_hash,
+        "strategyIdentityHash": strategy_identity_hash,
+        "observedAt": observed_at,
+        "ageSeconds": 0.0,
+        "fresh": snapshot_complete,
+        "allSpecsKnown": all_specs_known,
+        "brokerSnapshotComplete": snapshot_complete,
+        "allFlat": all_flat,
+        "programLedgerFlat": program_ledger_flat,
+        "hasKnownPosition": has_known_position,
+        "pendingOrUnknownOrderCount": len(pending_orders),
+        "contextSealValid": context_seal_valid,
+        "positionContextComplete": all_position_context_complete,
+        "contextSeal": current_seal,
+        "reason": ";".join(item for item in reasons if item) or "ok",
+    }
+
+
 def execution_calibration_snapshot() -> dict[str, Any]:
     samples = []
     for evidence in STATE.get("shadow_evidence", []):
@@ -1509,14 +2539,18 @@ def positions() -> list[dict[str, str]]:
         ledger_row = ledger_rows.pop(key, None)
         broker_qty = broker_row.get("broker_qty") if broker_row else item["broker_qty"]
         broker_id = str(item["broker_id"])
-        has_complete_zero_snapshot = broker_id in successful_brokers and not (
-            broker_id == "kis" and str(item["currency"]).upper() != "KRW"
-        )
+        has_complete_zero_snapshot = broker_id in successful_brokers
         if broker_qty is None and has_complete_zero_snapshot:
             broker_qty = 0.0
         program_qty = float(ledger_row["quantity"] if ledger_row else item["program_qty"])
         tolerance_qty = float(item["tolerance_qty"])
-        if broker_qty is None:
+        capability_unavailable = bool(item.get("capability")) and broker_qty is None and abs(program_qty) <= tolerance_qty
+        if capability_unavailable:
+            status = "capability_unavailable"
+            status_label = "미지원"
+            delta_qty = "-"
+            detail = "KIS 해외주식 잔고 대조 capability가 아직 구현되지 않았습니다. 실제 해외 포지션 원장이 생기면 fail-closed로 차단합니다."
+        elif broker_qty is None:
             status = "api_required"
             status_label = "API 필요"
             delta_qty = "-"
@@ -1541,7 +2575,7 @@ def positions() -> list[dict[str, str]]:
                 "broker_name": str(item["broker_name"]),
                 "currency": str(item["currency"]),
                 "program_qty": format_quantity(program_qty),
-                "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "API 필요",
+                "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "미지원" if capability_unavailable else "API 필요",
                 "broker_value_display": format_money(broker_row.get("broker_value"), str(item["currency"])) if broker_row and safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
                 "average_price_display": format_money(broker_row.get("average_price"), str(item["currency"])) if broker_row and safe_float(broker_row.get("average_price"), 0.0) > 0 else "-",
                 "current_price_display": format_money(broker_row.get("current_price"), str(item["currency"])) if broker_row and safe_float(broker_row.get("current_price"), 0.0) > 0 else "-",
@@ -1668,10 +2702,12 @@ def reconciliation_snapshot() -> dict[str, Any]:
     errors = STATE.get("broker_reconciliation", {}).get("errors", [])
     errors = errors if isinstance(errors, list) else []
     api_required_count = sum(1 for item in position_rows + account_rows if item["status"] == "api_required")
+    capability_gap_count = sum(1 for item in position_rows + account_rows if item["status"] == "capability_unavailable")
     mismatch_count = sum(1 for item in position_rows + account_rows if item["status"] == "mismatch")
     pass_count = sum(1 for item in position_rows + account_rows if item["status"] == "pass")
-    status = "fail" if mismatch_count else "warn" if api_required_count else "pass"
-    status_label = "불일치" if mismatch_count else "API 필요" if api_required_count else "정상"
+    blocking_count = api_required_count + mismatch_count
+    status = "fail" if mismatch_count else "warn" if api_required_count or capability_gap_count else "pass"
+    status_label = "불일치" if mismatch_count else "API 필요" if api_required_count else "일부 미지원" if capability_gap_count else "정상"
     return {
         "summary": {
             "status": status,
@@ -1680,14 +2716,16 @@ def reconciliation_snapshot() -> dict[str, Any]:
             "position_count": len(position_rows),
             "account_count": len(account_rows),
             "api_required_count": api_required_count,
+            "capability_gap_count": capability_gap_count,
             "mismatch_count": mismatch_count,
+            "blocking_count": blocking_count,
             "pass_count": pass_count,
             "error_count": len(errors),
         },
         "positions": position_rows,
         "accounts": account_rows,
         "errors": errors,
-        "next_actions": reconciliation_next_actions(api_required_count, mismatch_count),
+        "next_actions": reconciliation_next_actions(api_required_count, mismatch_count, capability_gap_count),
     }
 
 
@@ -1701,16 +2739,20 @@ def reconciliation_summary_for_broker(broker_id: str) -> dict[str, Any]:
     ]
     broker_error = broker_reconciliation_errors().get(normalized, "")
     api_required_count = sum(1 for item in rows if item["status"] == "api_required")
+    capability_gap_count = sum(1 for item in rows if item["status"] == "capability_unavailable")
     if broker_error or not rows:
         api_required_count += 1
     mismatch_count = sum(1 for item in rows if item["status"] == "mismatch")
     pass_count = sum(1 for item in rows if item["status"] == "pass")
-    status = "fail" if mismatch_count else "warn" if api_required_count else "pass"
+    blocking_count = api_required_count + mismatch_count
+    status = "fail" if mismatch_count else "warn" if api_required_count or capability_gap_count else "pass"
     return {
         "status": status,
-        "status_label": "불일치" if mismatch_count else "API 필요" if api_required_count else "정상",
+        "status_label": "불일치" if mismatch_count else "API 필요" if api_required_count else "일부 미지원" if capability_gap_count else "정상",
         "api_required_count": api_required_count,
+        "capability_gap_count": capability_gap_count,
         "mismatch_count": mismatch_count,
+        "blocking_count": blocking_count,
         "pass_count": pass_count,
         "row_count": len(rows),
         "broker_id": normalized,
@@ -1718,14 +2760,22 @@ def reconciliation_summary_for_broker(broker_id: str) -> dict[str, Any]:
     }
 
 
-def reconciliation_next_actions(api_required_count: int, mismatch_count: int) -> list[str]:
+def reconciliation_next_actions(api_required_count: int, mismatch_count: int, capability_gap_count: int = 0) -> list[str]:
     actions: list[str] = []
     if api_required_count:
         actions.append("브로커 계좌·포지션 조회 또는 프로그램 현금 원장 연결")
     if mismatch_count:
         actions.append("불일치 포지션 수동 확인 후 주문 잠금 유지")
+    if capability_gap_count:
+        actions.append("미지원 시장은 해당 broker capability 구현 전 MONITOR로 유지")
     actions.append("대조 결과가 정상일 때만 SMALL_LIVE 승인 검토")
     return actions
+
+
+def reconciliation_blocker_count(summary: dict[str, Any]) -> int:
+    if "blocking_count" in summary:
+        return int(summary.get("blocking_count") or 0)
+    return int(summary.get("api_required_count") or 0) + int(summary.get("mismatch_count") or 0)
 
 
 def format_quantity(value: float) -> str:
@@ -2058,6 +3108,12 @@ def apply_watchdog_fail_closed(report: dict[str, Any]) -> bool:
             profile["mode"] = "MONITOR"
             profile["last_action"] = "Watchdog fail-closed로 MONITOR 전환"
             changed = True
+    with RUNTIME_CONTROL_LOCK:
+        runtime_transition = LIVE_CONTINUOUS_CONTROLLER.transition_running(
+            "MONITOR"
+        )
+    if (runtime_transition.get("results") or {}):
+        changed = True
 
     if changed:
         STATE["watchdog"]["trip_count"] = int(STATE["watchdog"].get("trip_count", 0)) + 1
@@ -2258,7 +3314,7 @@ def snapshot() -> dict[str, Any]:
     continuous_runtime = LIVE_CONTINUOUS_CONTROLLER.snapshot()
     broker_truth = broker_position_truth_snapshot(reconciliation)
     restart_recovery = restart_recovery_plan_snapshot(reconciliation, continuous_runtime, broker_truth)
-    return {
+    payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode": STATE["mode"],
         "dry_run": STATE["dry_run"],
@@ -2322,6 +3378,7 @@ def snapshot() -> dict[str, Any]:
         "launch_report": launch,
         "audit": list(reversed(STATE["audit"][-30:])),
     }
+    return redact_sensitive_payload(payload)  # type: ignore[return-value]
 
 
 def audit_level_for_common_event(level: str) -> str:
@@ -2398,6 +3455,46 @@ def append_audit(level: str, event: str, detail: str, *, audit_record: AuditEven
             scope=current_mode(),
         )
     )
+    queue_live_audit_telegram(level, event, detail)
+
+
+def queue_live_audit_telegram(level: str, event: str, detail: str) -> bool:
+    """Queue only actionable Live safety alerts; fills use notify_new_live_fills."""
+
+    normalized_level = str(level or "").strip().lower()
+    normalized_event = str(event or "").strip()
+    is_critical = normalized_level in {"danger", "error", "critical"}
+    is_safety_event = normalized_event in TELEGRAM_SAFETY_AUDIT_EVENTS
+    is_connectivity_failure = (
+        normalized_event in TELEGRAM_CONNECTIVITY_AUDIT_EVENTS
+        and normalized_level in {"warn", "warning", "danger", "error", "critical"}
+    )
+    is_connectivity_recovery = (
+        normalized_event in TELEGRAM_CONNECTIVITY_AUDIT_EVENTS
+        and "연결 복구" in str(detail or "")
+    )
+    if not (is_critical or is_safety_event or is_connectivity_failure or is_connectivity_recovery):
+        return False
+
+    try:
+        return TELEGRAM_DISPATCHER.send_async(
+            "\n".join(
+                [
+                    f"⚠️ <b>Live Trader - {html.escape(normalized_event)}</b>",
+                    f"운용 모드: {html.escape(str(STATE.get('mode') or 'MONITOR'))}",
+                    f"Kill Switch: {'ON' if STATE.get('kill_switch') else 'OFF'}",
+                    f"신규 진입: {'차단' if STATE.get('new_entries_blocked') else '허용'}",
+                    "",
+                    html.escape(str(detail or "")[:1200]),
+                ]
+            ),
+            dedupe_key=f"live-alert:{normalized_event}:{str(detail or '')[:120]}",
+            dedupe_seconds=600,
+            severity="critical" if is_critical else "warning",
+        )
+    except Exception:
+        # Telegram 관제 실패는 감사 기록이나 주문/운용 경로를 중단시키지 않는다.
+        return False
 
 
 def audit_clip(text: object, limit: int = 160) -> str:
@@ -2445,11 +3542,52 @@ def order_gate_audit_detail(order: dict[str, Any], reason: str, report: PreTrade
     )
 
 
+def normalize_runtime_mode(mode: object) -> Mode:
+    normalized = str(mode or "MONITOR").strip().upper()
+    if normalized in RUNTIME_MODE_RANK:
+        return normalized  # type: ignore[return-value]
+    return "MONITOR"
+
+
+def effective_automation_mode() -> Mode:
+    active = [
+        normalize_runtime_mode(profile.get("mode"))
+        for profile in STATE["automation"].values()
+        if profile.get("enabled")
+        and normalize_runtime_mode(profile.get("mode")) != "MONITOR"
+    ]
+    return max(
+        active,
+        key=lambda value: RUNTIME_MODE_RANK[value],
+        default="MONITOR",
+    )
+
+
+def sync_runtime_profile_mode(
+    profile_id: str,
+    mode: object,
+    *,
+    action: str,
+) -> None:
+    normalized_profile = "stock" if profile_id == "stock" else "crypto"
+    normalized_mode = normalize_runtime_mode(mode)
+    profile = STATE["automation"][normalized_profile]
+    profile["mode"] = normalized_mode
+    profile["enabled"] = normalized_mode != "MONITOR"
+    profile["last_action"] = action
+    STATE["mode"] = effective_automation_mode()
+
+
 def set_mode(mode: str) -> dict[str, Any]:
+    with RUNTIME_CONTROL_LOCK:
+        return _set_mode_serialized(mode)
+
+
+def _set_mode_serialized(mode: str) -> dict[str, Any]:
     data = snapshot()
     blockers = data["summary"]["blocker_count"]
     watchdog_critical = int(data.get("watchdog", {}).get("critical_count", 0))
-    normalized = mode if mode in {"MONITOR", "SMALL_LIVE", "FULL_LIVE"} else "MONITOR"
+    normalized = normalize_runtime_mode(mode)
     if normalized != "MONITOR" and watchdog_critical:
         reason = f"Watchdog critical {watchdog_critical}개 때문에 {normalized} 전환이 차단되었습니다."
         append_audit("danger", "모드 전환 차단", reason)
@@ -2460,9 +3598,43 @@ def set_mode(mode: str) -> dict[str, Any]:
     if normalized == "FULL_LIVE" and data["summary"]["warning_count"]:
         append_audit("warn", "FULL LIVE 차단", "경고 항목이 남아 있어 FULL LIVE 전환을 차단했습니다.")
         return {"ok": False, "reason": "FULL LIVE는 경고 0개일 때만 허용됩니다.", "snapshot": snapshot()}
-    STATE["mode"] = normalized
+    runtime_transition = LIVE_CONTINUOUS_CONTROLLER.transition_running(
+        normalized
+    )
+    if not runtime_transition.get("ok"):
+        reason = (
+            "continuous runtime mode 전환 실패로 global mode를 유지했습니다: "
+            f"{runtime_transition.get('reason') or 'unknown'}"
+        )
+        append_audit("danger", "모드 전환 차단", reason)
+        return {
+            "ok": False,
+            "reason": reason,
+            "runtime": runtime_transition,
+            "snapshot": snapshot(),
+        }
+    with RUNTIME_MODE_LOCK:
+        STATE["mode"] = normalized
+        transitioned_profiles = set(
+            (runtime_transition.get("results") or {}).keys()
+        )
+        for profile_id in transitioned_profiles:
+            profile = STATE["automation"][profile_id]
+            profile["mode"] = normalized
+            profile["enabled"] = normalized != "MONITOR"
+            profile["last_action"] = f"Global mode 원자적 {normalized} 전환"
+        if normalized == "MONITOR":
+            for profile in STATE["automation"].values():
+                profile["mode"] = "MONITOR"
+                profile["enabled"] = False
+                profile["last_action"] = "Global MONITOR fail-closed 전환"
     append_audit("info", "모드 전환", f"운용 모드가 {normalized}(으)로 변경되었습니다.")
-    return {"ok": True, "reason": "mode changed", "snapshot": snapshot()}
+    return {
+        "ok": True,
+        "reason": "mode changed",
+        "runtime": runtime_transition,
+        "snapshot": snapshot(),
+    }
 
 
 def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, Any]:
@@ -2494,8 +3666,16 @@ def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, An
     level = "info" if name == "dry_run" and value else ("warn" if value else "info")
     append_audit(level, label, f"{label} 값이 {value}(으)로 변경되었습니다.")
     if name == "kill_switch" and value:
-        STATE["mode"] = "MONITOR"
-        STATE["new_entries_blocked"] = True
+        with RUNTIME_CONTROL_LOCK:
+            LIVE_CONTINUOUS_CONTROLLER.transition_running("MONITOR")
+            with RUNTIME_MODE_LOCK:
+                STATE["new_entries_blocked"] = True
+                for profile_id in ("stock", "crypto"):
+                    sync_runtime_profile_mode(
+                        profile_id,
+                        "MONITOR",
+                        action="Kill Switch fail-closed MONITOR 전환",
+                    )
     return {"ok": True, "reason": "flag changed", "snapshot": snapshot()}
 
 
@@ -2524,7 +3704,7 @@ def ensure_live_deployment(
 ) -> tuple[DeploymentStore, dict[str, Any], dict[str, Any] | None]:
     store = DeploymentStore(strategy_dir)
     portfolio_id = str((normalized.get("paper_portfolio_evidence") or {}).get("portfolioId") or "")
-    deployment_id = str(normalized.get("deployment_id") or f"dep:{normalized.get('strategy_id')}:{portfolio_id or 'standalone'}:live")
+    deployment_id = _live_deployment_id(normalized)
     current = store.get(deployment_id)
     portfolio_payload = raw_portfolio_payload(strategy_dir, portfolio_id)
     if current is not None:
@@ -2586,9 +3766,19 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
         append_audit("danger", "Live 승급 차단", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
 
-    execution = live_small_execution_summary(strategy_id)
-    if execution["successful"] <= 0:
-        reason = "소액 실거래 성공 주문이 아직 없습니다. SMALL_LIVE에서 1건 이상 실제 전송/체결을 확인해야 합니다."
+    execution = live_small_execution_summary(
+        strategy_id,
+        strategy_payload=payload,
+        normalized=normalized,
+        deployment=deployment,
+    )
+    minimum_canary_fills = PROFESSIONAL_PROMOTION_POLICY.minimum_canary_fills
+    if execution["fills"] < minimum_canary_fills:
+        reason = (
+            "소액 실거래 체결 표본이 "
+            f"{execution['fills']}건입니다. SMALL_LIVE에서 최소 "
+            f"{minimum_canary_fills}건의 실제 체결을 확인해야 합니다."
+        )
         append_audit("warn", "Live 승급 대기", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
     if execution["blocked"] > 0:
@@ -2630,11 +3820,12 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
         mode="SMALL_LIVE",
         runtime_version="live-trader-v1",
         ended_at=now,
-        successful_orders=execution["successful"],
+        successful_orders=execution["fills"],
         blocked_orders=execution["blocked"],
         details={
             "operatorConfirmed": True,
             "readinessBlockers": 0,
+            "canaryScope": execution.get("scope"),
             "lineageManifest": build_lineage_manifest(
                 stage="live",
                 producer="live_trader",
@@ -2663,14 +3854,310 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
         mode=str(STATE.get("mode") or "SMALL_LIVE"),
         permissions=permissions,
         actor="live_trader",
-        reason=f"SMALL_LIVE 성공 주문 {execution['successful']}건과 readiness gate 통과 / evidence={live_record.path.name}",
+        reason=f"SMALL_LIVE 실제 체결 {execution['fills']}건과 readiness gate 통과 / evidence={live_record.path.name}",
     )
     append_audit(
         "warn",
         "Live 승급",
-        f"{payload.get('name') or strategy_id} 전략을 live 상태로 승급했습니다. 성공 주문 {execution['successful']}건.",
+        f"{payload.get('name') or strategy_id} 전략을 live 상태로 승급했습니다. 실제 체결 {execution['fills']}건.",
     )
     return {"ok": True, "reason": "live 승급 완료", "snapshot": snapshot()}
+
+
+RESUME_PAPER_MINIMUM_OBSERVATION_DAYS = 30
+RESUME_PAPER_MINIMUM_REGIME_COUNT = 2
+RESUME_PAPER_MINIMUM_ORDER_COUNT = 5
+RESUME_REPROMOTION_REASON = "resume-current-paper-live-forward-repromotion-required"
+
+
+def _resume_evidence_number(value: object, fallback: int = -1) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _resume_evidence_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def paper_live_forward_resume_assessment(
+    strategy_dir: Path,
+    payload: dict[str, Any],
+    normalized: dict[str, Any],
+    deployment: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-evaluate immutable Paper evidence before restoring Live-Small permission."""
+
+    blockers: list[str] = []
+    try:
+        current_reference = artifact_reference(payload)
+    except ValueError:
+        return {
+            "ready": False,
+            "blockers": ["current-artifact-reference-invalid"],
+            "evidenceId": "",
+            "artifactHash": "",
+        }
+
+    current_artifact_id = str(current_reference.get("artifactId") or "")
+    current_artifact_hash = str(current_reference.get("artifactHash") or "")
+    portfolio_reference = (
+        deployment.get("portfolioArtifact")
+        if isinstance(deployment.get("portfolioArtifact"), dict)
+        else {}
+    )
+    current_portfolio_id = str(portfolio_reference.get("artifactId") or "")
+    current_portfolio_hash = str(portfolio_reference.get("artifactHash") or "")
+
+    records = EvidenceStore(strategy_dir).list_paper()
+    matching_id = [
+        record
+        for record in records
+        if str((record.payload.get("strategyArtifact") or {}).get("artifactId") or "")
+        == current_artifact_id
+    ]
+    if not matching_id:
+        blockers.append("paper-live-forward-evidence-missing")
+        return {
+            "ready": False,
+            "blockers": blockers,
+            "evidenceId": "",
+            "artifactHash": current_artifact_hash,
+        }
+
+    matching_hash = [
+        record
+        for record in matching_id
+        if str((record.payload.get("strategyArtifact") or {}).get("artifactHash") or "")
+        == current_artifact_hash
+    ]
+    if not matching_hash:
+        blockers.append("paper-evidence-artifact-hash-mismatch")
+        return {
+            "ready": False,
+            "blockers": blockers,
+            "evidenceId": "",
+            "artifactHash": current_artifact_hash,
+        }
+
+    matching_portfolio = []
+    for record in matching_hash:
+        evidence_portfolio = (
+            record.payload.get("portfolioArtifact")
+            if isinstance(record.payload.get("portfolioArtifact"), dict)
+            else {}
+        )
+        evidence_portfolio_id = str(evidence_portfolio.get("artifactId") or "")
+        evidence_portfolio_hash = str(evidence_portfolio.get("artifactHash") or "")
+        if evidence_portfolio_id != current_portfolio_id:
+            continue
+        if current_portfolio_hash and evidence_portfolio_hash != current_portfolio_hash:
+            continue
+        matching_portfolio.append(record)
+    if not matching_portfolio:
+        blockers.append("paper-evidence-portfolio-hash-mismatch")
+        return {
+            "ready": False,
+            "blockers": blockers,
+            "evidenceId": "",
+            "artifactHash": current_artifact_hash,
+        }
+
+    evidence_record = max(
+        matching_portfolio,
+        key=lambda item: str(
+            item.payload.get("endedAt")
+            or item.payload.get("createdAt")
+            or item.path.name
+        ),
+    )
+    evidence = evidence_record.payload
+    evidence_id = str(evidence.get("evidenceId") or "")
+    if not evidence_record.valid:
+        blockers.extend(
+            f"paper-evidence-invalid:{issue}"
+            for issue in (evidence_record.issues or ("integrity",))
+        )
+    if str(evidence.get("evidenceType") or "") != "paper-portfolio":
+        blockers.append("paper-evidence-type-invalid")
+    if str(evidence.get("result") or "").upper() != "PASS":
+        blockers.append("paper-evidence-result-not-pass")
+    if str(evidence.get("status") or "").lower() != "submitted":
+        blockers.append("paper-evidence-not-submitted")
+    if not str(evidence.get("runtimeVersion") or "").startswith("paper-trader"):
+        blockers.append("paper-runtime-version-untrusted")
+    evidence_ended_at = _resume_evidence_datetime(
+        evidence.get("endedAt") or evidence.get("createdAt")
+    )
+    if evidence_ended_at is None:
+        blockers.append("paper-evidence-ended-at-missing")
+    elif evidence_ended_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+        blockers.append("paper-evidence-ended-at-in-future")
+
+    metrics = evidence.get("metrics") if isinstance(evidence.get("metrics"), dict) else {}
+    details = evidence.get("details") if isinstance(evidence.get("details"), dict) else {}
+    evidence_policy = (
+        details.get("evidencePolicy")
+        if isinstance(details.get("evidencePolicy"), dict)
+        else {}
+    )
+    if (
+        str(evidence_policy.get("promotionSource") or "")
+        != "continuous-live-forward-closed-bar-v1"
+    ):
+        blockers.append("paper-live-forward-source-missing")
+
+    observed_days = _resume_evidence_number(metrics.get("forwardObservedDays"))
+    regime_count = _resume_evidence_number(metrics.get("forwardRegimeCount"))
+    order_count = _resume_evidence_number(
+        metrics.get("paperOrderCount"),
+        _resume_evidence_number(evidence.get("orderCount"), 0),
+    )
+    if observed_days < RESUME_PAPER_MINIMUM_OBSERVATION_DAYS:
+        blockers.append(
+            f"paper-observation-days:{max(0, observed_days)}/"
+            f"{RESUME_PAPER_MINIMUM_OBSERVATION_DAYS}"
+        )
+    if regime_count < RESUME_PAPER_MINIMUM_REGIME_COUNT:
+        blockers.append(
+            f"paper-market-regimes:{max(0, regime_count)}/"
+            f"{RESUME_PAPER_MINIMUM_REGIME_COUNT}"
+        )
+    if order_count < RESUME_PAPER_MINIMUM_ORDER_COUNT:
+        blockers.append(
+            f"paper-order-count:{max(0, order_count)}/"
+            f"{RESUME_PAPER_MINIMUM_ORDER_COUNT}"
+        )
+
+    operational = (
+        details.get("operationalReadiness")
+        if isinstance(details.get("operationalReadiness"), dict)
+        else {}
+    )
+    recovery_verified = metrics.get("recoveryVerified")
+    if recovery_verified is None:
+        recovery_verified = operational.get("recoveryVerified")
+    if recovery_verified is not True:
+        blockers.append("paper-recovery-drill-not-attested")
+
+    lifecycle_policy = (
+        details.get("lifecyclePolicy")
+        if isinstance(details.get("lifecyclePolicy"), dict)
+        else {}
+    )
+    lifecycle_inputs = (
+        lifecycle_policy.get("inputs")
+        if isinstance(lifecycle_policy.get("inputs"), dict)
+        else {}
+    )
+    reconciliation_value = metrics.get("reconciliationMismatches")
+    if reconciliation_value is None:
+        reconciliation_value = lifecycle_inputs.get("reconciliation_mismatches")
+    if _resume_evidence_number(reconciliation_value) != 0:
+        blockers.append("paper-reconciliation-not-attested-zero")
+    if (
+        str(lifecycle_policy.get("action") or "").upper() != "PROMOTE"
+        or normalize_lifecycle_status(lifecycle_policy.get("targetStage"))
+        != "before-live-small"
+    ):
+        blockers.append("paper-professional-promotion-not-attested")
+
+    current_contract = normalize_strategy_artifact(payload)
+    capabilities = (
+        current_contract.get("capabilities")
+        if isinstance(current_contract.get("capabilities"), dict)
+        else {}
+    )
+    if capabilities.get("finalTestPassed") is not True:
+        blockers.append("current-final-test-not-passed")
+    if capabilities.get("blockingFailReasons"):
+        blockers.extend(
+            f"current-capability:{reason}"
+            for reason in capabilities.get("blockingFailReasons", [])
+        )
+    revalidation = (
+        current_contract.get("revalidation")
+        if isinstance(current_contract.get("revalidation"), dict)
+        else {}
+    )
+    if revalidation.get("expired") is True:
+        blockers.append("current-revalidation-expired")
+    last_revalidated_at = _resume_evidence_datetime(
+        revalidation.get("lastRevalidatedAt")
+    )
+    if (
+        last_revalidated_at is not None
+        and evidence_ended_at is not None
+        and evidence_ended_at < last_revalidated_at
+    ):
+        blockers.append("paper-evidence-stale-before-current-revalidation")
+    candidate = (
+        current_contract.get("portfolio_candidate")
+        if isinstance(current_contract.get("portfolio_candidate"), dict)
+        else {}
+    )
+    if candidate.get("required") and candidate.get("approved") is not True:
+        blockers.append("current-portfolio-candidate-not-approved")
+    lineage = (
+        current_contract.get("lineage")
+        if isinstance(current_contract.get("lineage"), dict)
+        else {}
+    )
+    if lineage.get("blockingIssues"):
+        blockers.extend(
+            f"current-lineage:{issue}"
+            for issue in lineage.get("blockingIssues", [])
+        )
+
+    portfolio_gate = portfolio_gate_for_strategy(
+        current_contract,
+        load_portfolio_artifacts(limit=10_000),
+        mode="SMALL_LIVE",
+    )
+    if current_portfolio_id and not portfolio_gate.get("active"):
+        blockers.append("current-portfolio-artifact-gate-missing")
+    elif portfolio_gate.get("active") and portfolio_gate.get("allowed") is not True:
+        blockers.append(
+            "current-portfolio-gate:"
+            + str(portfolio_gate.get("detail") or "blocked")
+        )
+    paper_portfolio_gate = paper_portfolio_evidence_gate_for_strategy(
+        normalized,
+        portfolio_gate,
+    )
+    if (
+        paper_portfolio_gate.get("required")
+        and paper_portfolio_gate.get("ready") is not True
+    ):
+        blockers.append(
+            "current-paper-portfolio-evidence:"
+            + str(paper_portfolio_gate.get("detail") or "blocked")
+        )
+
+    return {
+        "ready": not blockers,
+        "blockers": list(dict.fromkeys(blockers)),
+        "evidenceId": evidence_id,
+        "evidenceHash": str((evidence.get("integrity") or {}).get("contentHash") or ""),
+        "artifactHash": current_artifact_hash,
+        "portfolioId": current_portfolio_id,
+        "portfolioHash": current_portfolio_hash,
+        "observedDays": max(0, observed_days),
+        "regimeCount": max(0, regime_count),
+        "orderCount": max(0, order_count),
+    }
 
 
 def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, Any]:
@@ -2694,22 +4181,114 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
     if action == "resume":
         if current_status != "paused":
             return {"ok": False, "reason": "paused 상태에서만 재개할 수 있습니다.", "snapshot": snapshot()}
-        target_status = normalize_lifecycle_status(permissions.get("pausedFrom") or "before-live-small")
+        paused_from = str(
+            permissions.get("pausedFrom")
+            or (normalized.get("lifecycle") or {}).get("pausedFrom")
+            or ""
+        )
+        target_status = normalize_lifecycle_status(paused_from)
         if target_status in {"paused", "retired", "unknown"}:
-            target_status = "before-live-small"
+            target_status = "backtested"
         paused_permissions = permissions.get("pausedPermissions") if isinstance(permissions.get("pausedPermissions"), dict) else {}
         if paused_permissions:
-            paused_from = permissions.get("pausedFrom")
             permissions = dict(paused_permissions)
             permissions["pausedFrom"] = paused_from
+        permissions.pop("pausedPermissions", None)
         permissions["fail_reasons"] = [
             reason
             for reason in permissions.get("fail_reasons", [])
             if str(reason) not in {"lifecycle-paused", "lifecycle-retired"}
+            and not str(reason).startswith(RESUME_REPROMOTION_REASON)
+            and str(reason) != "resume-live-canary-repromotion-required"
         ]
-        audit_level = "info"
+        live_capable_resume = lifecycle_rank(target_status) >= lifecycle_rank("before-live-small")
+        if live_capable_resume:
+            resume_evidence = paper_live_forward_resume_assessment(
+                strategy_dir,
+                payload,
+                normalized,
+                deployment,
+            )
+            permissions["resumeEvidence"] = resume_evidence
+            if resume_evidence.get("ready") is True:
+                resumed_from_live = lifecycle_rank(target_status) >= lifecycle_rank("live")
+                target_status = "before-live-small"
+                permissions.update(
+                    {
+                        "paper_trader_verified": True,
+                        "live_small_eligible": True,
+                        "live_eligible": False,
+                        "live_allowed": False,
+                        "paperEvidenceId": resume_evidence.get("evidenceId"),
+                        "paperEvidenceHash": resume_evidence.get("evidenceHash"),
+                    }
+                )
+                permissions.pop("liveEvidenceId", None)
+                permissions.pop("liveEvidenceHash", None)
+                if resumed_from_live:
+                    permissions["fail_reasons"].append(
+                        "resume-live-canary-repromotion-required"
+                    )
+                    audit_reason = (
+                        f"{payload.get('name') or strategy_id} 전략의 current-hash "
+                        "Paper live-forward 증거와 Portfolio gate를 재검증했습니다. "
+                        "기존 Live 권한은 복구하지 않고 before-live-small로 재개해 "
+                        "소액 실거래 승급을 다시 요구합니다."
+                    )
+                else:
+                    audit_reason = (
+                        f"{payload.get('name') or strategy_id} 전략의 current-hash "
+                        "Paper live-forward 증거와 Portfolio gate를 재검증해 "
+                        "before-live-small로 안전 재개했습니다."
+                    )
+                audit_level = "info"
+            else:
+                target_status = "papered"
+                blocker_text = ", ".join(
+                    str(item)
+                    for item in resume_evidence.get("blockers", [])[:6]
+                ) or "paper-live-forward-evidence-missing"
+                permissions["fail_reasons"].append(
+                    f"{RESUME_REPROMOTION_REASON}: {blocker_text}"
+                )
+                permissions.update(
+                    {
+                        "paper_trader_verified": False,
+                        "live_small_eligible": False,
+                        "live_eligible": False,
+                        "live_allowed": False,
+                    }
+                )
+                for evidence_key in (
+                    "paperEvidenceId",
+                    "paperEvidenceHash",
+                    "liveEvidenceId",
+                    "liveEvidenceHash",
+                ):
+                    permissions.pop(evidence_key, None)
+                audit_level = "warn"
+                audit_reason = (
+                    f"{payload.get('name') or strategy_id} 전략은 {blocker_text} 때문에 "
+                    "이전 Live 권한을 복구하지 않았습니다. papered 단계로 안전 재개했으며 "
+                    "Paper Trader에서 current-hash 연속 관찰 증거로 다시 승급해야 합니다."
+                )
+        else:
+            permissions.update(
+                {
+                    "live_small_eligible": False,
+                    "live_eligible": False,
+                    "live_allowed": False,
+                }
+            )
+            audit_level = "info"
+            audit_reason = (
+                f"{payload.get('name') or strategy_id} 전략을 {target_status} 단계로 "
+                "재개했습니다. 비-Live 단계이므로 실거래 권한은 복구하지 않았습니다."
+            )
+        permissions["fail_reasons"] = list(
+            dict.fromkeys(str(reason) for reason in permissions.get("fail_reasons", []))
+        )
         audit_label = "전략 재개"
-        audit_reason = f"{payload.get('name') or strategy_id} 전략을 {target_status} 단계로 재개했습니다."
     else:
         target_status = "paused" if action == "pause" else "retired"
         if action == "pause":
@@ -2779,31 +4358,9 @@ def profile_readiness_blocker_count(
             0 if strategies else 1,
             1 if STATE["kill_switch"] else 0,
             1 if central_control["halted"] else 0,
-            0 if reconciliation["status"] == "pass" else 1,
+            0 if reconciliation_blocker_count(reconciliation) == 0 else 1,
         )
     )
-    important_event = (
-        level == "danger"
-        or "Kill Switch" in event
-        or "포지션 불일치" in event
-        or "체결 스트림" in event and level == "warn"
-    )
-    if important_event:
-        TELEGRAM_DISPATCHER.send_async(
-            "\n".join(
-                [
-                    f"⚠️ <b>Live Trader - {html.escape(event)}</b>",
-                    f"운용 모드: {html.escape(str(STATE.get('mode') or 'MONITOR'))}",
-                    f"Kill Switch: {'ON' if STATE.get('kill_switch') else 'OFF'}",
-                    f"신규 진입: {'차단' if STATE.get('new_entries_blocked') else '허용'}",
-                    "",
-                    html.escape(detail[:1200]),
-                ]
-            ),
-            dedupe_key=f"live-alert:{event}:{detail[:120]}",
-            dedupe_seconds=600,
-            severity="critical" if level == "danger" else "warning",
-        )
 
 
 def set_automation_profile(profile_id: str, enabled: bool, provider: str | None = None, mode: str | None = None) -> dict[str, Any]:
@@ -2856,16 +4413,47 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
             STATE["automation"][profile_id]["last_action"] = reason
             append_audit("warn", "자동화 FULL LIVE 차단", f"{profile['title']}: {reason}")
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
-    STATE["automation"][profile_id]["enabled"] = bool(enabled)
-    STATE["automation"][profile_id]["mode"] = next_mode
-    if enabled:
-        STATE["mode"] = next_mode
-    elif not any(bool(item.get("enabled")) for item in STATE["automation"].values()):
-        STATE["mode"] = "MONITOR"
+    with RUNTIME_CONTROL_LOCK:
+        runtime_snapshot = LIVE_CONTINUOUS_CONTROLLER.snapshot()
+        runtime_profile = (
+            (runtime_snapshot.get("profiles") or {}).get(profile_id) or {}
+        )
+        runtime_transition: dict[str, Any] | None = None
+        if runtime_profile.get("running"):
+            runtime_transition = LIVE_CONTINUOUS_CONTROLLER.start(
+                profile_id,
+                next_mode,
+            )
+            if not runtime_transition.get("ok"):
+                reason = (
+                    "continuous runtime mode 전환 실패로 automation/global "
+                    f"mode를 유지했습니다: {runtime_transition.get('reason')}"
+                )
+                STATE["automation"][profile_id]["last_action"] = reason
+                append_audit(
+                    "danger",
+                    "자동화 시작 차단",
+                    f"{profile['title']}: {reason}",
+                )
+                return {
+                    "ok": False,
+                    "reason": reason,
+                    "runtime": runtime_transition,
+                    "snapshot": snapshot(),
+                }
+        with RUNTIME_MODE_LOCK:
+            STATE["automation"][profile_id]["enabled"] = bool(enabled)
+            STATE["automation"][profile_id]["mode"] = next_mode
+            STATE["mode"] = effective_automation_mode()
     action = f"{next_mode} 전환"
     STATE["automation"][profile_id]["last_action"] = f"{action} {now_text()}"
     append_audit("info" if next_mode == "MONITOR" else "warn", f"{profile['title']} {action}", f"{profile['provider_label']} 라우트의 자동화 모드를 {next_mode}(으)로 기록했습니다.")
-    return {"ok": True, "reason": f"{profile['title']} {action}", "snapshot": snapshot()}
+    return {
+        "ok": True,
+        "reason": f"{profile['title']} {action}",
+        "runtime": runtime_transition,
+        "snapshot": snapshot(),
+    }
 
 
 def set_risk_setting(name: str, value: object) -> dict[str, Any]:
@@ -3226,14 +4814,307 @@ def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[
     return sent
 
 
-def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
+def live_runtime_is_active() -> bool:
+    try:
+        continuous = LIVE_CONTINUOUS_CONTROLLER.snapshot()
+        streams = LIVE_EXECUTION_STREAMS.snapshot()
+    except Exception:
+        return False
+    return bool(continuous.get("running")) or bool(streams.get("running"))
+
+
+def broker_snapshot_poll_interval_seconds() -> float:
+    runtime_active = live_runtime_is_active()
+    env_key = (
+        "LIVE_TRADER_BROKER_SNAPSHOT_ACTIVE_SECONDS"
+        if runtime_active
+        else "LIVE_TRADER_BROKER_SNAPSHOT_IDLE_SECONDS"
+    )
+    default = (
+        BROKER_SNAPSHOT_ACTIVE_INTERVAL_SECONDS
+        if runtime_active
+        else BROKER_SNAPSHOT_IDLE_INTERVAL_SECONDS
+    )
+    try:
+        configured = float(os.environ.get(env_key, default))
+    except (TypeError, ValueError):
+        configured = default
+    minimum = 10.0 if default == BROKER_SNAPSHOT_ACTIVE_INTERVAL_SECONDS else 60.0
+    return max(minimum, configured)
+
+
+def broker_poll_control() -> dict[str, Any]:
+    control = STATE.setdefault(
+        "broker_snapshot_poll",
+        {"brokers": {}, "last_summary_audit_monotonic": 0.0, "last_summary_signature": ""},
+    )
+    if not isinstance(control.get("brokers"), dict):
+        control["brokers"] = {}
+    if not isinstance(control.get("connectivity"), dict):
+        control["connectivity"] = {}
+    return control
+
+
+def record_connectivity_state(
+    channel: str,
+    broker_id: str,
+    *,
+    healthy: bool,
+    recovery_marker: int | None = None,
+) -> bool:
+    """Alert only after a known down state or stream reconnect marker recovers."""
+
+    normalized_channel = str(channel or "").strip().lower()
+    normalized_broker = str(broker_id or "").strip().lower()
+    if not normalized_channel or not normalized_broker:
+        return False
+
+    connectivity = broker_poll_control()["connectivity"]
+    key = f"{normalized_channel}:{normalized_broker}"
+    previous = connectivity.get(key, {}) if isinstance(connectivity.get(key), dict) else {}
+    previous_status = str(previous.get("status") or "")
+    current_status = "healthy" if healthy else "down"
+    recovery_count = int(safe_float(previous.get("recovery_count"), 0.0))
+    previous_marker = int(safe_float(previous.get("recovery_marker"), 0.0))
+    marker = previous_marker if recovery_marker is None else max(0, int(recovery_marker))
+    recovered = current_status == "healthy" and (
+        previous_status == "down" or marker > previous_marker
+    )
+    if recovered:
+        recovery_count += 1
+    connectivity[key] = {
+        "channel": normalized_channel,
+        "broker_id": normalized_broker,
+        "status": current_status,
+        "recovery_count": recovery_count,
+        "recovery_marker": marker,
+    }
+    if not recovered:
+        return False
+
+    if normalized_channel == "execution_stream":
+        event = "체결 스트림"
+        boundary = "사설 체결 스트림"
+    else:
+        event = "체결 이벤트 동기화"
+        boundary = "체결/계좌 API"
+    append_audit(
+        "info",
+        event,
+        f"{normalized_broker.upper()} {boundary} 연결 복구 · 상태 전이 {recovery_count}회",
+    )
+    return True
+
+
+def observe_execution_stream_connectivity(broker_ids: tuple[str, ...]) -> int:
+    """Observe private streams; connecting/stopped states are not treated as failures."""
+
+    try:
+        snapshot_payload = LIVE_EXECUTION_STREAMS.snapshot()
+    except Exception:
+        return 0
+    brokers = snapshot_payload.get("brokers") if isinstance(snapshot_payload.get("brokers"), dict) else {}
+    recovered = 0
+    for broker_id in broker_ids:
+        status = brokers.get(broker_id)
+        if not isinstance(status, dict) or status.get("running") is not True:
+            continue
+        reconnect_count = max(0, int(safe_float(status.get("reconnectCount"), 0.0)))
+        if status.get("connected") is True:
+            recovered += int(
+                record_connectivity_state(
+                    "execution_stream",
+                    broker_id,
+                    healthy=True,
+                    recovery_marker=reconnect_count,
+                )
+            )
+        elif str(status.get("lastError") or "").strip():
+            record_connectivity_state(
+                "execution_stream",
+                broker_id,
+                healthy=False,
+                recovery_marker=reconnect_count,
+            )
+    return recovered
+
+
+def broker_snapshot_is_due(broker_id: str, now_monotonic: float, *, force: bool = False) -> bool:
+    if force:
+        return True
+    item = broker_poll_control()["brokers"].get(broker_id, {})
+    return now_monotonic >= safe_float(item.get("next_allowed_monotonic"), 0.0)
+
+
+def stable_broker_snapshot_digest(
+    broker_id: str,
+    accounts: list[dict[str, Any]],
+    positions_data: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "broker": broker_id,
+        "accounts": sorted(
+            [
+                {
+                    "account": str(item.get("account") or ""),
+                    "currency": str(item.get("currency") or ""),
+                    "cash": safe_float(item.get("broker_cash", item.get("cash")), 0.0),
+                }
+                for item in accounts
+            ],
+            key=lambda item: (item["account"], item["currency"]),
+        ),
+        "positions": sorted(
+            [
+                {
+                    "symbol": str(item.get("symbol") or ""),
+                    "currency": str(item.get("currency") or ""),
+                    "quantity": safe_float(item.get("broker_qty", item.get("quantity")), 0.0),
+                    "value": safe_float(item.get("broker_value", item.get("value")), 0.0),
+                }
+                for item in positions_data
+            ],
+            key=lambda item: (item["symbol"], item["currency"]),
+        ),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def mark_broker_snapshot_success(
+    broker_id: str,
+    now_monotonic: float,
+    digest: str,
+    *,
+    interval_seconds: float,
+) -> bool:
+    control = broker_poll_control()
+    brokers = control["brokers"]
+    previous = brokers.get(broker_id, {})
+    changed = str(previous.get("snapshot_digest") or "") != digest
+    brokers[broker_id] = {
+        **previous,
+        "last_attempt_monotonic": now_monotonic,
+        "last_success_monotonic": now_monotonic,
+        "next_allowed_monotonic": now_monotonic + interval_seconds,
+        "failure_count": 0,
+        "last_error": "",
+        "snapshot_digest": digest,
+        "last_status": "changed" if changed else "unchanged",
+    }
+    return changed
+
+
+def mark_broker_snapshot_failure(
+    broker_id: str,
+    now_monotonic: float,
+    detail: str,
+    *,
+    interval_seconds: float,
+) -> None:
+    control = broker_poll_control()
+    brokers = control["brokers"]
+    previous = brokers.get(broker_id, {})
+    failures = int(safe_float(previous.get("failure_count"), 0.0)) + 1
+    backoff = min(
+        BROKER_SNAPSHOT_MAX_BACKOFF_SECONDS,
+        interval_seconds * (2 ** min(max(0, failures - 1), 5)),
+    )
+    brokers[broker_id] = {
+        **previous,
+        "last_attempt_monotonic": now_monotonic,
+        "next_allowed_monotonic": now_monotonic + backoff,
+        "failure_count": failures,
+        "last_error": audit_clip(detail, 240),
+        "last_status": "backoff",
+        "backoff_seconds": backoff,
+    }
+
+
+def merge_broker_reconciliation_cache(
+    accounts: list[dict[str, Any]],
+    positions_data: list[dict[str, Any]],
+    successful_brokers: set[str],
+    errors: list[dict[str, str]],
+) -> None:
+    if not successful_brokers and not errors:
+        return
+    cache = STATE.setdefault("broker_reconciliation", {})
+    previous_accounts = cache.get("accounts", []) if isinstance(cache.get("accounts"), list) else []
+    previous_positions = cache.get("positions", []) if isinstance(cache.get("positions"), list) else []
+    previous_errors = cache.get("errors", []) if isinstance(cache.get("errors"), list) else []
+    touched = set(successful_brokers) | {str(item.get("broker_id") or "") for item in errors}
+    cache["accounts"] = [
+        item for item in previous_accounts
+        if str(item.get("broker_id") or "") not in touched
+    ] + list(accounts)
+    cache["positions"] = [
+        item for item in previous_positions
+        if str(item.get("broker_id") or "") not in touched
+    ] + list(positions_data)
+    cache["errors"] = [
+        item for item in previous_errors
+        if str(item.get("broker_id") or "") not in touched
+    ] + [
+        {"broker_id": item["broker_id"], "scope": "snapshot", "detail": item["detail"]}
+        for item in errors
+    ]
+    failed_brokers = {str(item.get("broker_id") or "") for item in errors}
+    account_success = (
+        set(cache.get("successful_account_brokers", [])) - failed_brokers
+    ) | set(successful_brokers)
+    position_success = (
+        set(cache.get("successful_position_brokers", [])) - failed_brokers
+    ) | set(successful_brokers)
+    cache["successful_account_brokers"] = sorted(account_success)
+    cache["successful_position_brokers"] = sorted(position_success)
+    cache["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def should_append_execution_sync_audit(
+    *,
+    now_monotonic: float,
+    signature: str,
+    has_new_events: bool,
+    has_snapshot_changes: bool,
+    has_errors: bool,
+    attempted_snapshot: bool,
+) -> bool:
+    control = broker_poll_control()
+    previous_signature = str(control.get("last_summary_signature") or "")
+    last_audit = safe_float(control.get("last_summary_audit_monotonic"), 0.0)
+    periodic_due = attempted_snapshot and now_monotonic - last_audit >= EXECUTION_SUMMARY_AUDIT_INTERVAL_SECONDS
+    should_append = (
+        has_new_events
+        or has_snapshot_changes
+        or (has_errors and signature != previous_signature)
+        or periodic_due
+    )
+    if should_append:
+        control["last_summary_signature"] = signature
+        control["last_summary_audit_monotonic"] = now_monotonic
+    return should_append
+
+
+def poll_execution_events(
+    broker_id: str = "all",
+    *,
+    force_snapshot: bool | None = None,
+) -> dict[str, Any]:
     broker_ids = ("kis", "binance", "upbit") if broker_id.strip().lower() in {"", "all"} else (broker_id.strip().lower(),)
+    force = len(broker_ids) == 1 if force_snapshot is None else bool(force_snapshot)
     router = LiveBrokerRouter()
     events: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     snapshot_accounts: list[dict[str, Any]] = []
     snapshot_positions: list[dict[str, Any]] = []
     successful_snapshot_brokers: set[str] = set()
+    changed_snapshot_brokers: set[str] = set()
+    skipped_snapshot_brokers: set[str] = set()
+    attempted_snapshot_brokers: set[str] = set()
+    now_monotonic = time.monotonic()
+    poll_interval = broker_snapshot_poll_interval_seconds()
+    observe_execution_stream_connectivity(broker_ids)
     for selected_broker in broker_ids:
         try:
             for row in LIVE_EXECUTION_STREAMS.drain(selected_broker):
@@ -3253,11 +5134,18 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
                     "instrument_id": normalized.instrument_id,
                     "raw": normalized.raw,
                 })
+            if not broker_snapshot_is_due(selected_broker, now_monotonic, force=force):
+                skipped_snapshot_brokers.add(selected_broker)
+                continue
+            attempted_snapshot_brokers.add(selected_broker)
             result = router.poll_execution_events(selected_broker)
             rows = result.get("events", []) if isinstance(result, dict) else result
             if isinstance(rows, list):
                 for row in rows:
                     if isinstance(row, dict):
+                        row_state = str(row.get("state") or row.get("status") or "").strip().lower()
+                        if row_state in {"account_snapshot", "position_snapshot"}:
+                            continue
                         normalized = normalize_broker_execution(selected_broker, row)
                         events.append({
                             "broker_id": selected_broker,
@@ -3276,33 +5164,78 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
                         })
             accounts = result.get("accounts", []) if isinstance(result, dict) else []
             positions_data = result.get("positions", []) if isinstance(result, dict) else []
-            received_snapshot = False
+            account_rows: list[dict[str, Any]] = []
+            position_rows: list[dict[str, Any]] = []
+            received_snapshot = isinstance(result, dict) and (
+                "accounts" in result or "positions" in result
+            )
             if isinstance(accounts, list):
                 account_rows = [item for item in accounts if isinstance(item, dict)]
                 snapshot_accounts.extend(account_rows)
-                received_snapshot = received_snapshot or bool(account_rows)
             if isinstance(positions_data, list):
                 position_rows = [item for item in positions_data if isinstance(item, dict)]
                 snapshot_positions.extend(position_rows)
-                received_snapshot = received_snapshot or bool(position_rows)
             if received_snapshot:
                 successful_snapshot_brokers.add(selected_broker)
+                digest = stable_broker_snapshot_digest(selected_broker, account_rows, position_rows)
+                if mark_broker_snapshot_success(
+                    selected_broker,
+                    now_monotonic,
+                    digest,
+                    interval_seconds=poll_interval,
+                ):
+                    changed_snapshot_brokers.add(selected_broker)
+            else:
+                mark_broker_snapshot_success(
+                    selected_broker,
+                    now_monotonic,
+                    stable_broker_snapshot_digest(selected_broker, [], []),
+                    interval_seconds=poll_interval,
+                )
+            record_connectivity_state("broker_api", selected_broker, healthy=True)
         except (BrokerNotReadyError, RuntimeError) as exc:
-            errors.append({"broker_id": selected_broker, "detail": str(exc)})
+            detail = str(exc)
+            errors.append({"broker_id": selected_broker, "detail": detail})
+            mark_broker_snapshot_failure(
+                selected_broker,
+                now_monotonic,
+                detail,
+                interval_seconds=poll_interval,
+            )
+            record_connectivity_state("broker_api", selected_broker, healthy=False)
     existing_event_ids = PROGRAM_LEDGER.existing_execution_event_ids([
         str(event.get("event_id") or "") for event in events
     ])
     record_new_execution_traces(events, existing_event_ids)
-    recorded = PROGRAM_LEDGER.record_execution_events(events)
+    new_events = [
+        event
+        for event in events
+        if str(event.get("event_id") or "") not in existing_event_ids
+    ]
+    recorded = PROGRAM_LEDGER.record_execution_events(new_events)
+    changed_accounts = [
+        item for item in snapshot_accounts
+        if str(item.get("broker_id") or "") in changed_snapshot_brokers
+    ]
+    changed_positions = [
+        item for item in snapshot_positions
+        if str(item.get("broker_id") or "") in changed_snapshot_brokers
+    ]
     synced = (
         PROGRAM_LEDGER.sync_broker_snapshot(
-            snapshot_accounts,
-            snapshot_positions,
-            sorted(successful_snapshot_brokers),
+            changed_accounts,
+            changed_positions,
+            sorted(changed_snapshot_brokers),
             source="event_poll",
         )
-        if successful_snapshot_brokers
+        if changed_snapshot_brokers
         else {"cash_count": 0, "position_count": 0}
+    )
+    merge_broker_reconciliation_cache(
+        snapshot_accounts,
+        snapshot_positions,
+        successful_snapshot_brokers,
+        errors,
     )
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     STATE["execution_events"] = {
@@ -3312,21 +5245,41 @@ def poll_execution_events(broker_id: str = "all") -> dict[str, Any]:
         "recorded_count": recorded,
         "synced_cash_count": int(synced.get("cash_count", 0)),
         "synced_position_count": int(synced.get("position_count", 0)),
+        "snapshot_changed_brokers": sorted(changed_snapshot_brokers),
+        "snapshot_skipped_brokers": sorted(skipped_snapshot_brokers),
     }
     STATE["program_ledger"]["last_event_sync"] = now
     telegram_fill_count = notify_new_live_fills(events, existing_event_ids)
-    append_audit(
-        "warn" if errors else "info",
-        "체결 이벤트 동기화",
-        (
-            f"체결/계좌 이벤트 {len(events)}건 수신, {recorded}건 저장, "
-            f"원장 현금 {synced.get('cash_count', 0)}개/포지션 {synced.get('position_count', 0)}개 동기화, "
-            f"오류 {len(errors)}건"
-        ),
-    )
-    new_event_count = len({
-        str(event.get("event_id") or "") for event in events
-    } - existing_event_ids)
+    new_event_count = len(new_events)
+    audit_signature = hashlib.sha256(
+        json.dumps(
+            {
+                "errors": errors,
+                "newEventCount": new_event_count,
+                "changedBrokers": sorted(changed_snapshot_brokers),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    if should_append_execution_sync_audit(
+        now_monotonic=now_monotonic,
+        signature=audit_signature,
+        has_new_events=bool(new_event_count),
+        has_snapshot_changes=bool(changed_snapshot_brokers),
+        has_errors=bool(errors),
+        attempted_snapshot=bool(attempted_snapshot_brokers),
+    ):
+        append_audit(
+            "warn" if errors else "info",
+            "체결 이벤트 동기화",
+            (
+                f"신규 체결 이벤트 {new_event_count}건, "
+                f"변경된 계좌 snapshot {len(changed_snapshot_brokers)}개 broker, "
+                f"원장 현금 {synced.get('cash_count', 0)}개/포지션 {synced.get('position_count', 0)}개 동기화, "
+                f"오류 {len(errors)}건"
+            ),
+        )
     automatic_results = (
         automatic_live_promotion_sweep(fresh_broker_ids=set(successful_snapshot_brokers))
         if new_event_count
@@ -3553,11 +5506,52 @@ def _upbit_smoke_order_view(**updates: Any) -> dict[str, Any]:
     return current
 
 
-def preview_upbit_smoke_order(notional_krw: object = UPBIT_SMOKE_MIN_KRW) -> dict[str, Any]:
+def approved_upbit_smoke_strategy(strategy_id: object) -> dict[str, Any] | None:
+    selected_id = str(strategy_id or "").strip()
+    if not selected_id:
+        return None
+    minimum_stage = lifecycle_rank("before-live-small")
+    return next(
+        (
+            item
+            for item in strategy_rows()
+            if str(item.get("strategy_id") or "") == selected_id
+            and str(item.get("symbol") or "").strip().upper() == UPBIT_SMOKE_MARKET
+            and strategy_broker_id(item) == "upbit"
+            and item.get("live_small_eligible") is True
+            and lifecycle_rank(normalize_lifecycle_status(item.get("lifecycle_status"))) >= minimum_stage
+            and normalize_lifecycle_status(item.get("lifecycle_status")) not in {"paused", "retired"}
+        ),
+        None,
+    )
+
+
+def preview_upbit_smoke_order(
+    strategy_id: object,
+    notional_krw: object = UPBIT_SMOKE_MIN_KRW,
+) -> dict[str, Any]:
+    strategy = approved_upbit_smoke_strategy(strategy_id)
+    if strategy is None:
+        reason = "선택한 Upbit KRW-BTC Strategy Instance가 before-live-small 및 검증 evidence를 통과하지 못했습니다."
+        _upbit_smoke_order_view(
+            status="blocked",
+            status_label="차단",
+            strategy_id=str(strategy_id or ""),
+            detail=reason,
+            confirmation_token="",
+        )
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+
     amount = int(safe_float(notional_krw, 0.0))
     if amount < UPBIT_SMOKE_MIN_KRW or amount > UPBIT_SMOKE_MAX_KRW:
         reason = f"Upbit 점검 주문은 {UPBIT_SMOKE_MIN_KRW:,}~{UPBIT_SMOKE_MAX_KRW:,}원만 허용합니다."
-        _upbit_smoke_order_view(status="blocked", status_label="차단", detail=reason, confirmation_token="")
+        _upbit_smoke_order_view(
+            status="blocked",
+            status_label="차단",
+            strategy_id=str(strategy.get("strategy_id") or ""),
+            detail=reason,
+            confirmation_token="",
+        )
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
 
     router = LiveBrokerRouter()
@@ -3595,6 +5589,7 @@ def preview_upbit_smoke_order(notional_krw: object = UPBIT_SMOKE_MIN_KRW) -> dic
     identifier = f"lt-smoke-{now.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(4)}"
     order_intent = {
         "broker_id": "upbit",
+        "strategy_id": str(strategy.get("strategy_id") or ""),
         "market": UPBIT_SMOKE_MARKET,
         "symbol": UPBIT_SMOKE_MARKET,
         "side": "BUY",
@@ -3618,6 +5613,7 @@ def preview_upbit_smoke_order(notional_krw: object = UPBIT_SMOKE_MIN_KRW) -> dic
     state_row = _upbit_smoke_order_view(
         status="ready" if ready else "blocked",
         status_label="확인 대기" if ready else "차단",
+        strategy_id=str(strategy.get("strategy_id") or ""),
         market=UPBIT_SMOKE_MARKET,
         side="BUY",
         order_type="시장가 매수",
@@ -3656,8 +5652,17 @@ def submit_upbit_smoke_order(confirmation_token: object, *, confirmed: bool) -> 
     if safe_float(preview.get("expires_epoch"), 0.0) <= datetime.now(timezone.utc).timestamp():
         _upbit_smoke_order_view(status="expired", status_label="만료", confirmation_token="", detail="미리보기가 만료되었습니다. 다시 조회하세요.")
         return {"ok": False, "reason": "미리보기가 만료되었습니다. 다시 조회하세요.", "snapshot": snapshot()}
-    if STATE.get("kill_switch"):
-        return {"ok": False, "reason": "긴급 차단이 켜져 있어 실제 주문을 전송할 수 없습니다.", "snapshot": snapshot()}
+    strategy = approved_upbit_smoke_strategy(preview.get("strategy_id"))
+    if strategy is None:
+        return {
+            "ok": False,
+            "reason": "미리보기 전략의 Upbit before-live-small/live_small_eligible 승인이 더 이상 유효하지 않습니다.",
+            "snapshot": snapshot(),
+        }
+    if STATE.get("kill_switch") or STATE.get("new_entries_blocked"):
+        return {"ok": False, "reason": "긴급/신규 진입 차단이 켜져 있어 실제 주문을 전송할 수 없습니다.", "snapshot": snapshot()}
+    if STATE.get("dry_run") or current_mode() != "SMALL_LIVE":
+        return {"ok": False, "reason": "Dry Run을 해제하고 SMALL_LIVE에서만 점검 주문을 보낼 수 있습니다.", "snapshot": snapshot()}
     if not real_orders_enabled():
         return {"ok": False, "reason": "LIVE_TRADER_ENABLE_REAL_ORDERS=true가 필요합니다.", "snapshot": snapshot()}
 
@@ -3684,6 +5689,7 @@ def submit_upbit_smoke_order(confirmation_token: object, *, confirmed: bool) -> 
     _upbit_smoke_order_view(status="submitting", status_label="전송 중", used=True, confirmation_token="")
     intent = {
         "broker_id": "upbit",
+        "strategy_id": str(strategy.get("strategy_id") or ""),
         "market": str(preview.get("market") or UPBIT_SMOKE_MARKET),
         "symbol": str(preview.get("market") or UPBIT_SMOKE_MARKET),
         "side": "BUY",
@@ -3772,7 +5778,6 @@ def run_reconciliation() -> dict[str, Any]:
     broker_data = refresh_broker_reconciliation()
     reconciliation = reconciliation_snapshot()
     summary = reconciliation["summary"]
-    blocking_count = int(summary["api_required_count"]) + int(summary["mismatch_count"])
     broker_truth = broker_position_truth_snapshot(reconciliation)
     was_broker_blocked = bool(STATE.get("broker_truth_blocked"))
     STATE["broker_truth_blocked"] = bool(broker_truth.get("newEntriesBlocked"))
@@ -3781,9 +5786,13 @@ def run_reconciliation() -> dict[str, Any]:
     elif was_broker_blocked and not STATE.get("kill_switch") and not STATE.get("manual_new_entries_blocked"):
         STATE["new_entries_blocked"] = False
     append_audit(
-        "danger" if blocking_count else "info",
+        "danger" if int(summary["mismatch_count"]) or broker_data["errors"] else "warn" if int(summary["api_required_count"]) or int(summary.get("capability_gap_count") or 0) else "info",
         "포지션/계좌 대조",
-        f"{summary['status_label']}: API/원장 필요 {summary['api_required_count']}개, 불일치 {summary['mismatch_count']}개, 조회 오류 {len(broker_data['errors'])}개",
+        (
+            f"{summary['status_label']}: API/원장 필요 {summary['api_required_count']}개, "
+            f"미지원 capability {summary.get('capability_gap_count', 0)}개, "
+            f"불일치 {summary['mismatch_count']}개, 조회 오류 {len(broker_data['errors'])}개"
+        ),
     )
     automatic_results = automatic_live_promotion_sweep()
     return {
@@ -3918,6 +5927,19 @@ def evaluate_order_gate_with_report(
     if watchdog_critical:
         detail = f"Watchdog critical {watchdog_critical}개: {', '.join(watchdog.get('next_actions', [])[:4])}"
         report = PreTradeRiskReport(report.checked_at, (*report.checks, RiskCheck("Watchdog", "fail", detail)))
+    quote_error = (
+        kis_overseas_next_open_quote_error(intent)
+        if not dry_run
+        else ""
+    )
+    if quote_error:
+        report = PreTradeRiskReport(
+            report.checked_at,
+            (
+                *report.checks,
+                RiskCheck("실행 가격 수명주기", "fail", quote_error),
+            ),
+        )
     # Dry-run is an offline safety simulation and remains usable outside market
     # hours.  Paper Trader enforces its own exchange-session clock; this gate is
     # for orders that could otherwise reach the live adapter.
@@ -3950,14 +5972,83 @@ def evaluate_order_gate_with_report(
 
 
 def order_intent_market_session(intent: OrderIntent) -> dict[str, object] | None:
-    text = f"{intent.asset} {intent.symbol} {intent.metadata.get('broker_id', '')}".lower()
-    if any(token in text for token in ("crypto", "btc", "eth", "usdt", "binance", "upbit")):
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    asset = str(intent.asset or "").strip().lower()
+    symbol = str(intent.symbol or "").strip().upper()
+    if broker_id in {"binance", "upbit"} or any(
+        token in asset for token in ("crypto", "코인")
+    ):
         return None
-    if any(token in text for token in ("kr_stock", "stock_kr", ".ks", ".kq", "kis")):
+    local_code = symbol.removesuffix(".KS").removesuffix(".KQ")
+    domestic = (
+        (local_code.isdigit() and len(local_code) == 6)
+        or symbol.endswith((".KS", ".KQ"))
+        or any(
+            token in asset
+            for token in ("한국", "kr_stock", "stock_kr", "korean")
+        )
+    )
+    if domestic:
         return market_session_state("XKRX", regular_open="09:00", regular_close="15:30")
-    if any(token in text for token in ("us_stock", "stock_us", "nyse", "nasdaq", "amex")):
+    if broker_id == "kis" or any(
+        token in f"{asset} {symbol}".lower()
+        for token in ("미국", "us_stock", "stock_us", "nyse", "nasdaq", "amex")
+    ):
         return market_session_state("XNYS", regular_open="09:30", regular_close="16:00")
     return None
+
+
+def kis_overseas_next_open_quote_error(intent: OrderIntent) -> str:
+    """Require a fresh priced quote before an automated KIS overseas order."""
+
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    if broker_id != "kis":
+        return ""
+    symbol = str(intent.symbol or "").strip().upper()
+    local_code = symbol.removesuffix(".KS").removesuffix(".KQ")
+    domestic = (
+        (local_code.isdigit() and len(local_code) == 6)
+        or symbol.endswith((".KS", ".KQ"))
+    )
+    if domestic or str(metadata.get("execution_timing") or "") != "next-open-boundary":
+        return ""
+    if str(metadata.get("order_type") or "") != "00":
+        return "KIS 미국주식 자동 주문은 신선한 지정가(ORD_DVSN=00)만 허용합니다."
+    quote_price = safe_float(metadata.get("fresh_quote_price"), 0.0)
+    quote_time_text = str(metadata.get("fresh_quote_observed_at") or "")
+    try:
+        quote_time = datetime.fromisoformat(
+            quote_time_text.replace("Z", "+00:00")
+        )
+        if quote_time.tzinfo is None:
+            quote_time = quote_time.replace(tzinfo=timezone.utc)
+        quote_age = max(
+            0.0,
+            (
+                datetime.now(timezone.utc)
+                - quote_time.astimezone(timezone.utc)
+            ).total_seconds(),
+        )
+    except (TypeError, ValueError):
+        quote_age = float("inf")
+    if (
+        metadata.get("fresh_quote_verified") is not True
+        or quote_price <= 0
+        or quote_age > 5.0
+    ):
+        return (
+            "KIS 미국주식 next-open 주문은 5초 이내 실시간 호가와 "
+            "미체결 취소/부분체결 수명주기 확인 전까지 차단됩니다."
+        )
+    return ""
 
 
 class LiveArtifactSignalProvider:
@@ -4139,13 +6230,31 @@ def intent_readiness_blocker_count(
     broker_id = str(metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset)).strip().lower()
     profile_id = str(metadata.get("profile_id") or ("crypto" if broker_id in {"binance", "upbit"} else "stock"))
     scoped = reconciliation_summary or reconciliation_summary_for_broker(broker_id)
-    return profile_readiness_blocker_count(
+    blockers = profile_readiness_blocker_count(
         checks,
         profile_id,
         broker_id,
         intent.mode,
         reconciliation_summary=scoped,
     )
+    if intent_requires_unavailable_capability(intent, scoped):
+        blockers += 1
+    return blockers
+
+
+def intent_requires_unavailable_capability(intent: OrderIntent, reconciliation_summary: dict[str, Any]) -> bool:
+    if int(reconciliation_summary.get("capability_gap_count") or 0) == 0:
+        return False
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset)).strip().lower()
+    if broker_id != "kis":
+        return False
+    symbol = str(intent.symbol or "").strip().upper()
+    local_code = symbol.split(":")[-1].split(".")[0]
+    asset = str(intent.asset or "").strip().lower()
+    domestic_asset = any(token in asset for token in ("한국", "kr-stock", "kr_stock", "korean"))
+    domestic_symbol = (len(local_code) == 6 and local_code.isdigit()) or symbol.endswith((".KS", ".KQ"))
+    return not (domestic_asset or domestic_symbol)
 
 
 def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool) -> PreTradeContext:
@@ -4157,9 +6266,9 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
     else:
         reconciliation = checks.get("reconciliation") if isinstance(checks.get("reconciliation"), dict) else {}
         reconciliation_summary = reconciliation.get("summary") if isinstance(reconciliation.get("summary"), dict) else {}
-    positions_matched = str(reconciliation_summary.get("status", "pass")) == "pass"
+    positions_matched = reconciliation_blocker_count(reconciliation_summary) == 0
     return PreTradeContext(
-        mode=current_mode(),
+        mode=intent.mode,
         dry_run=dry_run,
         halted=bool(STATE["kill_switch"]) or durable_control_halt_active(intent),
         new_entries_blocked=bool(STATE["new_entries_blocked"]),
@@ -4176,6 +6285,13 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
         max_open_orders=int(float(settings["max_open_orders"])),
         open_order_count=open_order_count(),
         positions_matched=positions_matched,
+        position_quantity=broker_position_quantity(
+            intent.symbol,
+            str(
+                (intent.metadata or {}).get("broker_id")
+                or broker_id_from_symbol(intent.symbol, intent.asset)
+            ),
+        ),
         recent_orders=recent_orders_for_risk(),
     )
 
@@ -4334,6 +6450,49 @@ def order_gate_audit_record(
     )
 
 
+def live_broker_payload(
+    intent: OrderIntent,
+    *,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).lower()
+    order_type = str(metadata.get("order_type") or "LIMIT")
+    broker_price = intent.reference_price
+    if broker_id == "upbit":
+        if order_type.lower() == "price":
+            broker_price = intent.notional
+        elif order_type.lower() == "market":
+            broker_price = 0.0
+    elif broker_id == "kis":
+        if order_type == "01":
+            broker_price = 0.0
+        elif (
+            order_type == "00"
+            and metadata.get("fresh_quote_verified") is True
+        ):
+            broker_price = safe_float(
+                metadata.get("fresh_quote_price"),
+                intent.reference_price,
+            )
+    return {
+        "broker_id": broker_id,
+        "symbol": intent.symbol,
+        "asset": intent.asset,
+        "side": intent.side,
+        "quantity": intent.quantity,
+        "qty": intent.quantity,
+        "price": broker_price,
+        "notional": intent.notional,
+        "order_type": order_type,
+        "identifier": idempotency_key,
+        "exchange": str(metadata.get("exchange") or ""),
+    }
+
+
 def submit_order_intent(
     checks: dict[str, Any],
     intent: OrderIntent,
@@ -4408,6 +6567,14 @@ def submit_order_intent(
             LIVE_OMS.transition(managed_order.order_id, "RISK_APPROVED", "PreTradeRiskGate passed")
         else:
             LIVE_OMS.transition(managed_order.order_id, "REJECTED", reason)
+    canary_scope = (
+        current_live_canary_scope(
+            intent.strategy_id,
+            materialize=True,
+        )
+        if ok and not dry_run and intent.mode == "SMALL_LIVE"
+        else {}
+    )
     order = {
         "time": now_text(),
         "created_at": now_text(),
@@ -4430,6 +6597,12 @@ def submit_order_intent(
         "next_retry_at": future_text(retry_backoff) if order_state in {"risk_blocked", "adapter_blocked"} else "-",
         "broker_order_id": "-",
         "dry_run": dry_run,
+        "mode": intent.mode,
+        "canary_scope": (
+            canary_scope
+            if canary_scope.get("eligible") is True
+            else {}
+        ),
         "reason": reason,
         "trace_id": trace_id,
         "risk_report": risk_report.to_dict(),
@@ -4452,20 +6625,11 @@ def submit_order_intent(
         output_payload={"orderId": order["order_id"], "omsOrderId": order["oms_order_id"]},
     )
     if ok and not dry_run:
-        broker_id = str(metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset)).lower()
-        broker_payload = {
-            "broker_id": broker_id,
-            "symbol": intent.symbol,
-            "asset": intent.asset,
-            "side": intent.side,
-            "quantity": intent.quantity,
-            "qty": intent.quantity,
-            "price": intent.reference_price,
-            "notional": intent.notional,
-            "order_type": str(metadata.get("order_type") or "LIMIT"),
-            "identifier": idempotency_key,
-            "exchange": str(metadata.get("exchange") or ""),
-        }
+        broker_payload = live_broker_payload(
+            intent,
+            idempotency_key=idempotency_key,
+        )
+        broker_id = str(broker_payload["broker_id"])
         order["broker_id"] = broker_id
         order["broker_request"] = dict(broker_payload)
         try:
@@ -4582,14 +6746,55 @@ def submit_order_intent(
 
 
 def start_continuous_runtime(profile_id: str, mode: str, portfolio_id: str = "") -> dict[str, Any]:
-    result = LIVE_CONTINUOUS_CONTROLLER.start(profile_id, mode, portfolio_id)
-    if portfolio_id:
+    normalized_profile = "stock" if profile_id == "stock" else "crypto"
+    normalized_mode = normalize_runtime_mode(mode)
+    with RUNTIME_CONTROL_LOCK:
+        result = LIVE_CONTINUOUS_CONTROLLER.start(
+            normalized_profile,
+            normalized_mode,
+            portfolio_id,
+        )
+        if result.get("ok"):
+            with RUNTIME_MODE_LOCK:
+                sync_runtime_profile_mode(
+                    normalized_profile,
+                    normalized_mode,
+                    action=f"Continuous runtime {normalized_mode} 동기화",
+                )
+                result["snapshot"] = snapshot()
+    if portfolio_id and result.get("ok"):
         ArtifactMetadataStore().update(portfolio_id, "portfolio", mark_used=True)
     return result
 
 
 def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
-    return LIVE_CONTINUOUS_CONTROLLER.stop(profile_id)
+    normalized_profile = (
+        profile_id if profile_id in {"stock", "crypto"} else ""
+    )
+    # Controller.stop() first transitions the engine to MONITOR under
+    # RUNTIME_MODE_LOCK, then releases that lock before joining the worker.
+    # Holding it here across stop() would deadlock a worker that is flushing a
+    # due bar through the supervisor's operation_lock.
+    with RUNTIME_CONTROL_LOCK:
+        result = LIVE_CONTINUOUS_CONTROLLER.stop(normalized_profile)
+        with RUNTIME_MODE_LOCK:
+            targets = (
+                (normalized_profile,)
+                if normalized_profile
+                else ("stock", "crypto")
+            )
+            for target in targets:
+                sync_runtime_profile_mode(
+                    target,
+                    "MONITOR",
+                    action=(
+                        "Continuous runtime 정지 동기화"
+                        if result.get("ok")
+                        else "Continuous runtime 정지 실패 fail-closed MONITOR"
+                    ),
+                )
+            result["snapshot"] = snapshot()
+    return result
 
 
 def start_execution_streams(broker_id: str = "all") -> dict[str, Any]:
@@ -4651,7 +6856,17 @@ def restore_runtime_from_checkpoint() -> dict[str, Any]:
     loaded = RECOVERY_JOURNAL.load_latest()
     generation = int(loaded.get("generation") or 0)
     if generation <= 0:
-        STATE["recovery_status"] = {"verified": False, "safeMode": True, "generation": 0, "detail": "유효한 체크포인트 없음: MONITOR 유지", "corruptCheckpoints": loaded.get("corruptCheckpoints", [])}
+        STATE["mode"] = "MONITOR"
+        STATE["dry_run"] = True
+        STATE["new_entries_blocked"] = True
+        STATE["recovery_status"] = {
+            "verified": False,
+            "safeMode": True,
+            "generation": 0,
+            "detail": "유효한 체크포인트 없음: MONITOR/신규 진입 차단 유지",
+            "corruptCheckpoints": loaded.get("corruptCheckpoints", []),
+        }
+        append_audit("warn", "Startup Recovery", STATE["recovery_status"]["detail"])
         return dict(STATE["recovery_status"])
     recovered = loaded.get("state") if isinstance(loaded.get("state"), dict) else {}
     STATE["orders"] = list(recovered.get("orders", []))[:50] if isinstance(recovered.get("orders"), list) else []
@@ -4791,6 +7006,7 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
     observed_at = datetime.now(timezone.utc).isoformat()
     signals: list[SleeveSignal] = []
     policies: dict[str, InstrumentTradePolicy] = {}
+    broker_by_instrument: dict[str, str] = {}
     execution_by_instance: dict[str, tuple[dict[str, Any], StrategyExecutionResult]] = {}
     for index, (strategy, execution) in enumerate(strategy_executions):
         gate = strategy.get("portfolio_gate") if isinstance(strategy.get("portfolio_gate"), dict) else {}
@@ -4818,6 +7034,7 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
             allow_short=strategy.get("allow_short") is True,
             maximum_absolute_weight=min(1.0, max(0.0, safe_float(gate.get("maxSymbolWeightPct"), 100.0) / 100)),
         )
+        broker_by_instrument[instrument_id] = strategy_broker_id(strategy)
         execution_by_instance[instance_id] = (strategy, execution)
 
     current_sleeves = {str(key): safe_float(value, 0.0) for key, value in STATE.get("strategy_sleeves", {}).items()}
@@ -4825,7 +7042,13 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
     current_quantities: dict[str, float] = {}
     for signal in signals:
         current_weights[signal.instrument_id] = current_weights.get(signal.instrument_id, 0.0) + current_sleeves.get(signal.strategy_instance_id, 0.0)
-        current_quantities.setdefault(signal.instrument_id, broker_position_quantity(signal.symbol))
+        current_quantities.setdefault(
+            signal.instrument_id,
+            broker_position_quantity(
+                signal.symbol,
+                broker_by_instrument.get(signal.instrument_id, ""),
+            ),
+        )
     portfolio_equity = max(float(STATE["risk_settings"]["strategy_capital_limit_krw"]), 1.0)
     plans = LIVE_MULTI_COORDINATOR.coordinate(
         signals, policies=policies, current_sleeve_weights=current_sleeves,
@@ -4884,9 +7107,10 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
     }
 
 
-def broker_position_quantity(symbol: str) -> float:
+def broker_position_quantity(symbol: str, broker_id: str = "") -> float:
     positions = STATE.get("broker_reconciliation", {}).get("positions", [])
     normalized_symbol = str(symbol or "").upper().replace("-", "")
+    normalized_broker = str(broker_id or "").strip().lower()
     aliases = {normalized_symbol}
     for quote_currency in ("USDT", "USDC", "BUSD", "BTC", "ETH"):
         if normalized_symbol.endswith(quote_currency) and len(normalized_symbol) > len(quote_currency):
@@ -4899,6 +7123,11 @@ def broker_position_quantity(symbol: str) -> float:
         )
         for item in positions
         if isinstance(item, dict)
+        and (
+            not normalized_broker
+            or str(item.get("broker_id") or "").strip().lower()
+            == normalized_broker
+        )
         and str(item.get("symbol") or "").upper().replace("-", "") in aliases
     )
 

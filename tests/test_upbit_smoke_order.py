@@ -21,8 +21,14 @@ class UpbitSmokeOrderTest(unittest.TestCase):
             },
         )
         self.env.start()
+        self.strategy_rows = patch.object(state, "strategy_rows", return_value=[self.strategy()])
+        self.strategy_rows.start()
+        self.snapshot = patch.object(state, "snapshot", return_value={})
+        self.snapshot.start()
 
     def tearDown(self) -> None:
+        self.snapshot.stop()
+        self.strategy_rows.stop()
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
         self.env.stop()
@@ -42,13 +48,25 @@ class UpbitSmokeOrderTest(unittest.TestCase):
             "bid_account": {"balance": str(balance), "currency": "KRW"},
         }
 
+    @staticmethod
+    def strategy() -> dict[str, object]:
+        return {
+            "strategy_id": "upbit-btc-qualified",
+            "symbol": "KRW-BTC",
+            "asset": "CRYPTO",
+            "dataset_provider": "upbit",
+            "broker_id": "upbit",
+            "lifecycle_status": "before-live-small",
+            "live_small_eligible": True,
+        }
+
     def preview(self) -> dict[str, object]:
         with patch.object(state.LiveBrokerRouter, "get_account_snapshot", return_value=self.account_snapshot()), patch.object(
             state.LiveBrokerRouter,
             "get_upbit_order_chance",
             return_value=self.order_chance(),
         ):
-            return state.preview_upbit_smoke_order(5000)
+            return state.preview_upbit_smoke_order("upbit-btc-qualified", 5000)
 
     def test_preview_is_read_only_and_builds_exact_market_buy(self) -> None:
         result = self.preview()
@@ -56,6 +74,7 @@ class UpbitSmokeOrderTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         preview = result["preview"]
         self.assertEqual(preview["market"], "KRW-BTC")
+        self.assertEqual(preview["strategy_id"], "upbit-btc-qualified")
         self.assertEqual(preview["notional_krw"], 5000)
         self.assertEqual(preview["status"], "ready")
         self.assertTrue(preview["confirmation_token"])
@@ -69,29 +88,88 @@ class UpbitSmokeOrderTest(unittest.TestCase):
         self.assertTrue(request["body"]["identifier"].startswith("lt-smoke-"))
 
     def test_preview_hard_blocks_more_than_user_cap(self) -> None:
-        result = state.preview_upbit_smoke_order(10_001)
+        result = state.preview_upbit_smoke_order("upbit-btc-qualified", 10_001)
 
         self.assertFalse(result["ok"])
         self.assertIn("10,000", result["reason"])
         self.assertFalse(state.STATE["upbit_smoke_order"]["confirmation_token"])
 
-    def test_submit_requires_action_time_confirmation_and_real_order_flag(self) -> None:
+    def test_preview_requires_approved_upbit_krw_btc_strategy(self) -> None:
+        with patch.object(state, "strategy_rows", return_value=[]), patch.object(state, "snapshot", return_value={}):
+            result = state.preview_upbit_smoke_order("missing", 5000)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("before-live-small", result["reason"])
+
+    def test_submit_requires_action_time_confirmation_and_all_live_gates(self) -> None:
         preview = self.preview()["preview"]
         token = preview["confirmation_token"]
 
         without_confirmation = state.submit_upbit_smoke_order(token, confirmed=False)
         wrong_token = state.submit_upbit_smoke_order("wrong", confirmed=True)
+
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["dry_run"] = False
+        state.STATE["new_entries_blocked"] = True
+        entry_blocked = state.submit_upbit_smoke_order(token, confirmed=True)
+
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["dry_run"] = True
+        dry_run_blocked = state.submit_upbit_smoke_order(token, confirmed=True)
+
+        state.STATE["dry_run"] = False
+        state.STATE["mode"] = "MONITOR"
+        mode_blocked = state.submit_upbit_smoke_order(token, confirmed=True)
+
+        state.STATE["mode"] = "SMALL_LIVE"
         flag_off = state.submit_upbit_smoke_order(token, confirmed=True)
 
         self.assertFalse(without_confirmation["ok"])
         self.assertFalse(wrong_token["ok"])
+        self.assertFalse(entry_blocked["ok"])
+        self.assertIn("신규 진입", entry_blocked["reason"])
+        self.assertFalse(dry_run_blocked["ok"])
+        self.assertIn("Dry Run", dry_run_blocked["reason"])
+        self.assertFalse(mode_blocked["ok"])
+        self.assertIn("SMALL_LIVE", mode_blocked["reason"])
         self.assertFalse(flag_off["ok"])
         self.assertIn("LIVE_TRADER_ENABLE_REAL_ORDERS", flag_off["reason"])
+        self.assertFalse(state.STATE["upbit_smoke_order"]["used"])
+
+    def test_submit_revalidates_strategy_approval(self) -> None:
+        preview = self.preview()["preview"]
+        token = preview["confirmation_token"]
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["dry_run"] = False
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["kill_switch"] = False
+
+        with patch.dict(os.environ, {"LIVE_TRADER_ENABLE_REAL_ORDERS": "true"}), patch.object(
+            state,
+            "strategy_rows",
+            return_value=[],
+        ), patch.object(
+            state.LiveBrokerRouter,
+            "place_order",
+        ) as place_order, patch.object(
+            state,
+            "snapshot",
+            return_value={},
+        ):
+            result = state.submit_upbit_smoke_order(token, confirmed=True)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("승인이 더 이상 유효하지 않습니다", result["reason"])
+        place_order.assert_not_called()
         self.assertFalse(state.STATE["upbit_smoke_order"]["used"])
 
     def test_successful_submit_consumes_token_once_and_records_fill(self) -> None:
         preview = self.preview()["preview"]
         token = preview["confirmation_token"]
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["dry_run"] = False
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["kill_switch"] = False
         order_payload = {
             "uuid": "upbit-order-1",
             "state": "done",
@@ -125,6 +203,7 @@ class UpbitSmokeOrderTest(unittest.TestCase):
         self.assertEqual(result["order"]["confirmation_token"], "")
         sent = place_order.call_args.args[0]
         self.assertEqual(sent["market"], "KRW-BTC")
+        self.assertEqual(sent["strategy_id"], "upbit-btc-qualified")
         self.assertEqual(sent["order_type"], "price")
         self.assertEqual(sent["notional"], 5000)
 

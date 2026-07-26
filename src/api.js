@@ -86,8 +86,11 @@ export async function runFinalPreflight() {
   return request("/api/preflight", { method: "POST", body: {} });
 }
 
-export async function previewUpbitSmokeOrder(notionalKrw = 5000) {
-  return request("/api/upbit-smoke-preview", { method: "POST", body: { notional_krw: notionalKrw } });
+export async function previewUpbitSmokeOrder(strategyId, notionalKrw = 5000) {
+  return request("/api/upbit-smoke-preview", {
+    method: "POST",
+    body: { strategy_id: strategyId, notional_krw: notionalKrw },
+  });
 }
 
 export async function submitUpbitSmokeOrder(confirmationToken, confirmed = false) {

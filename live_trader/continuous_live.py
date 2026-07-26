@@ -41,6 +41,27 @@ class LiveContinuousController:
             return {"ok": False, "reason": f"지원하지 않는 runtime mode입니다: {normalized_mode}", "snapshot": state.snapshot()}
         with self._lock:
             if self.supervisor and self.supervisor.running:
+                raw_supervisor_phase = self.supervisor.snapshot().get("phase")
+                supervisor_phase = (
+                    raw_supervisor_phase.upper()
+                    if isinstance(raw_supervisor_phase, str)
+                    else ""
+                )
+                if supervisor_phase and supervisor_phase not in {
+                    "STARTING",
+                    "RUNNING",
+                    "DEGRADED",
+                }:
+                    return {
+                        "ok": False,
+                        "reason": (
+                            "기존 runtime thread가 "
+                            f"{supervisor_phase or 'UNKNOWN'} 상태로 아직 "
+                            "종료되지 않아 새 시작/전환을 차단했습니다."
+                        ),
+                        "runtime": self.snapshot(),
+                        "snapshot": state.snapshot(),
+                    }
                 specs = tuple(self.supervisor.engine.specs)
                 if normalized_mode != "MONITOR" and not all(
                     self._spec_mode_allowed(spec, normalized_mode) for spec in specs
@@ -51,9 +72,28 @@ class LiveContinuousController:
                         "runtime": self.snapshot(),
                         "snapshot": state.snapshot(),
                     }
-                previous_mode = self.mode
-                self.mode = normalized_mode
-                self.supervisor.engine.mode = normalized_mode
+                with state.RUNTIME_MODE_LOCK:
+                    restore_context = (
+                        self._restore_context_assessment(
+                            specs,
+                            self.supervisor.engine,
+                        )
+                        if normalized_mode != "MONITOR"
+                        else None
+                    )
+                    restore_blocker = self.supervisor.engine.transition_mode(
+                        normalized_mode,  # type: ignore[arg-type]
+                        restore_context=restore_context,
+                    )
+                    if restore_blocker:
+                        return {
+                            "ok": False,
+                            "reason": restore_blocker,
+                            "runtime": self.snapshot(),
+                            "snapshot": state.snapshot(),
+                        }
+                    previous_mode = self.mode
+                    self.mode = normalized_mode
                 state.append_audit(
                     "info" if normalized_mode == "MONITOR" else "warn",
                     "Continuous Runtime",
@@ -94,16 +134,43 @@ class LiveContinuousController:
                     allowed = allowed or runtime_permissions.get("live_small_eligible") is True or runtime_permissions.get("live_small_allowed") is True
                 if not allowed:
                     return {"ok": False, "reason": f"{runtime_id}는 {normalized_mode} 권한을 통과하지 못했습니다. MONITOR만 가능합니다.", "snapshot": state.snapshot()}
-            self.profile_id = normalized_profile
-            self.mode = normalized_mode
-            self.portfolio_path = source_path
             engine = PortfolioRuntimeEngine(
                 specs,
-                mode=normalized_mode,
-                evaluator=BuiltinBarSignalEvaluator(lambda spec: state.broker_position_quantity(spec.symbol)),
+                mode="MONITOR",
+                evaluator=BuiltinBarSignalEvaluator(
+                    lambda spec: state.broker_position_quantity(
+                        spec.symbol,
+                        spec.broker_id,
+                    )
+                ),
                 cycle_handler=self._handle_cycle,
                 state_store=DurableRuntimeState(self.root / "logs" / f"continuous_{normalized_profile}_{runtime_hash[:16]}_engine.json"),
             )
+            with state.RUNTIME_MODE_LOCK:
+                restore_context = (
+                    self._restore_context_assessment(specs, engine)
+                    if normalized_mode != "MONITOR"
+                    else None
+                )
+                restore_blocker = engine.transition_mode(
+                    normalized_mode,  # type: ignore[arg-type]
+                    restore_context=restore_context,
+                )
+            if restore_blocker:
+                return {
+                    "ok": False,
+                    "reason": restore_blocker,
+                    "runtime": {
+                        **engine.snapshot(),
+                        "profileId": normalized_profile,
+                        "mode": "MONITOR",
+                        "portfolioPath": source_path,
+                    },
+                    "snapshot": state.snapshot(),
+                }
+            self.profile_id = normalized_profile
+            self.mode = normalized_mode
+            self.portfolio_path = source_path
             feeds = feeds_for_specs(
                 specs,
                 prefer_kis=True,
@@ -126,6 +193,7 @@ class LiveContinuousController:
                 status_store=DurableRuntimeState(self.root / "logs" / f"continuous_{normalized_profile}_status.json"),
                 poll_seconds=2.0,
                 heartbeat_seconds=5.0,
+                operation_lock=state.RUNTIME_MODE_LOCK,
             )
             self.supervisor.start()
             source_kind = "Portfolio" if loaded is not None else "Standalone Strategy"
@@ -137,10 +205,49 @@ class LiveContinuousController:
 
         with self._lock:
             if self.supervisor is None:
+                self.mode = "MONITOR"
                 return {"ok": True, "reason": "continuous runtime already stopped", "runtime": self.snapshot(), "snapshot": state.snapshot()}
-            result = self.supervisor.stop()
-            state.append_audit("info", "Continuous Runtime", f"{self.profile_id or '-'} runtime 정지")
-            return {"ok": True, "reason": "continuous runtime stopped", "runtime": result, "snapshot": state.snapshot()}
+            supervisor = self.supervisor
+            # A due-bar cycle and a mode transition share this lock, so the
+            # worker observes one complete mode.  Release it before stop()
+            # joins: the worker may currently be waiting to flush a due bar.
+            with state.RUNTIME_MODE_LOCK:
+                transition_blocker = supervisor.engine.transition_mode(
+                    "MONITOR"
+                )
+                self.mode = "MONITOR"
+        result = supervisor.stop()
+        phase = str(result.get("phase") or "").upper()
+        running = bool(result.get("running"))
+        last_error = str(result.get("lastError") or "").strip()
+        stopped = not transition_blocker and phase == "STOPPED" and not running
+        if transition_blocker:
+            reason = f"MONITOR 전환 실패: {transition_blocker}"
+        elif phase == "FAILED" or running:
+            reason = last_error or "continuous runtime stop failed"
+        elif not stopped:
+            reason = (
+                f"continuous runtime stop 상태가 확정되지 않았습니다: "
+                f"{phase or 'UNKNOWN'}"
+            )
+        else:
+            reason = "continuous runtime stopped"
+        with self._lock:
+            state.append_audit(
+                "info" if stopped else "danger",
+                "Continuous Runtime",
+                (
+                    f"{self.profile_id or '-'} runtime 정지"
+                    if stopped
+                    else f"{self.profile_id or '-'} runtime 정지 실패: {reason}"
+                ),
+            )
+            return {
+                "ok": stopped,
+                "reason": reason,
+                "runtime": result,
+                "snapshot": state.snapshot(),
+            }
 
     def snapshot(self) -> dict[str, Any]:
         base = self.supervisor.snapshot() if self.supervisor is not None else {
@@ -287,7 +394,64 @@ class LiveContinuousController:
             or permissions.get("live_allowed") is True
         )
 
+    @staticmethod
+    def _state_context_reconciled(specs: tuple[Any, ...]) -> bool:
+        """Legacy cache-only probe retained for diagnostics, never unlocking live."""
+
+        from . import state
+
+        broker_ids = {
+            str(spec.broker_id or "").strip().lower()
+            for spec in specs
+            if str(spec.broker_id or "").strip()
+        }
+        if not broker_ids:
+            return False
+        successful = state.successful_position_brokers()
+        if not broker_ids.issubset(successful):
+            return False
+        for broker_id in broker_ids:
+            summary = state.reconciliation_summary_for_broker(broker_id)
+            if (
+                state.reconciliation_blocker_count(summary) > 0
+                or int(summary.get("capability_gap_count") or 0) > 0
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _restore_context_assessment(
+        specs: tuple[Any, ...],
+        engine: PortfolioRuntimeEngine,
+    ) -> dict[str, Any]:
+        from . import state
+
+        export_state = getattr(engine.evaluator, "export_state", None)
+        evaluator_state = (
+            export_state(engine.specs)
+            if callable(export_state)
+            else {}
+        )
+        return state.forced_restore_context_assessment(
+            specs,
+            portfolio_id=engine.portfolio_id,
+            portfolio_hash=engine.portfolio_hash,
+            strategy_identity_hash=engine.strategy_identity_hash,
+            checkpoint_seal=engine.restore_context_seal,
+            evaluator_state=evaluator_state,
+        )
+
     def _handle_cycle(self, cycle: Any) -> dict[str, Any]:
+        # The supervisor acquires this lock before engine evaluation and keeps
+        # it through this handler.  Re-entering it here also protects direct
+        # unit/integration calls without introducing an inverse controller
+        # lock order.
+        from . import state
+
+        with state.RUNTIME_MODE_LOCK:
+            return self._handle_cycle_locked(cycle)
+
+    def _handle_cycle_locked(self, cycle: Any) -> dict[str, Any]:
         from . import state
 
         results: list[dict[str, Any]] = []
@@ -312,7 +476,7 @@ class LiveContinuousController:
                 side=decision.signal,
                 quantity=quantity,
                 reference_price=decision.bar.close,
-                mode=state.current_mode(),
+                mode=self.mode,  # type: ignore[arg-type]
                 reason=decision.reason,
                 metadata={
                     "broker_id": spec.broker_id,
@@ -322,13 +486,26 @@ class LiveContinuousController:
                     "instrument_id": spec.instrument_id,
                     "target_revision": max(1, int(datetime.fromisoformat(decision.bar.end_time.replace("Z", "+00:00")).timestamp())),
                     "order_purpose": "SIGNAL",
-                    "current_weight": spec.target_weight if state.broker_position_quantity(spec.symbol) > 0 else 0.0,
+                    "current_weight": (
+                        spec.target_weight
+                        if state.broker_position_quantity(
+                            spec.symbol,
+                            spec.broker_id,
+                        ) > 0
+                        else 0.0
+                    ),
                     "portfolio_equity": max(1.0, float(state.STATE["risk_settings"]["strategy_capital_limit_krw"])),
                     "expected_alpha_bps": self._numeric_parameter(spec, "expectedAlphaBps", 0.0),
                     "expected_cost_bps": self._numeric_parameter(spec, "expectedCostBps", 5.0),
                     "runtime_evaluation_key": decision.evaluation_key,
                     "confirmed_bar_end": decision.bar.end_time,
-                    "order_type": "MARKET" if spec.broker_id == "binance" else "LIMIT",
+                    "order_type": self._order_type_for_broker(
+                        spec.broker_id,
+                        decision.signal,
+                        spec.symbol,
+                    ),
+                    "execution_timing": "next-open-boundary",
+                    "decision_price_role": "reference-and-sizing-only",
                 },
             )
             checks = state.snapshot()
@@ -361,11 +538,36 @@ class LiveContinuousController:
         except (TypeError, ValueError):
             return float(default)
 
+    @staticmethod
+    def _order_type_for_broker(
+        broker_id: str,
+        side: str = "BUY",
+        symbol: str = "",
+    ) -> str:
+        normalized = str(broker_id or "").strip().lower()
+        normalized_side = str(side or "BUY").strip().upper()
+        if normalized == "binance":
+            return "MARKET"
+        if normalized == "kis":
+            text = str(symbol or "").strip().upper()
+            local_code = text.removesuffix(".KS").removesuffix(".KQ")
+            # Domestic cash equities support ordinary market orders as
+            # ORD_DVSN=01 / ORD_UNPR=0.  Overseas KIS remains a priced limit
+            # route and is separately blocked unless a fresh quote lifecycle
+            # is attested.
+            return "01" if local_code.isdigit() and len(local_code) == 6 else "00"
+        if normalized == "upbit":
+            # Upbit native market buy spends quote notional (`price`), while
+            # native market sell submits base quantity (`market`).
+            return "price" if normalized_side == "BUY" else "market"
+        return "LIMIT"
+
 
 class LiveContinuousRuntimeManager:
     """Runs stock and crypto portfolio loops independently and concurrently."""
 
     def __init__(self, root: Path) -> None:
+        self._lock = threading.RLock()
         self.controllers = {
             "stock": LiveContinuousController(root),
             "crypto": LiveContinuousController(root),
@@ -373,13 +575,89 @@ class LiveContinuousRuntimeManager:
 
     def start(self, profile_id: str, mode: str, portfolio_id: str = "") -> dict[str, Any]:
         normalized = "stock" if profile_id == "stock" else "crypto"
-        return self.controllers[normalized].start(normalized, mode, portfolio_id)
+        with self._lock:
+            return self.controllers[normalized].start(
+                normalized,
+                mode,
+                portfolio_id,
+            )
 
     def stop(self, profile_id: str = "") -> dict[str, Any]:
-        if profile_id in self.controllers:
-            return self.controllers[profile_id].stop()
-        results = {key: controller.stop() for key, controller in self.controllers.items()}
-        return {"ok": True, "reason": "all continuous runtimes stopped", "results": results, "runtime": self.snapshot()}
+        with self._lock:
+            if profile_id in self.controllers:
+                return self.controllers[profile_id].stop()
+            results = {
+                key: controller.stop()
+                for key, controller in self.controllers.items()
+            }
+            failed_profiles = [
+                key
+                for key, result in results.items()
+                if result.get("ok") is not True
+            ]
+            return {
+                "ok": not failed_profiles,
+                "reason": (
+                    "all continuous runtimes stopped"
+                    if not failed_profiles
+                    else "continuous runtime stop failed: "
+                    + ", ".join(failed_profiles)
+                ),
+                "results": results,
+                "runtime": self.snapshot(),
+            }
+
+    def transition_running(self, mode: str) -> dict[str, Any]:
+        """Transition all running profiles together, rolling back on failure."""
+
+        with self._lock:
+            running = [
+                (profile_id, controller)
+                for profile_id, controller in self.controllers.items()
+                if controller.supervisor is not None
+                and controller.supervisor.running
+            ]
+            acquired: list[threading.RLock] = []
+            previous_modes = {
+                profile_id: controller.mode
+                for profile_id, controller in running
+            }
+            try:
+                for _profile_id, controller in running:
+                    controller._lock.acquire()  # noqa: SLF001 - coordinated owner
+                    acquired.append(controller._lock)  # noqa: SLF001
+                results: dict[str, dict[str, Any]] = {}
+                transitioned: list[tuple[str, LiveContinuousController]] = []
+                for profile_id, controller in running:
+                    result = controller.start(profile_id, mode)
+                    results[profile_id] = result
+                    if not result.get("ok"):
+                        for rollback_id, rollback_controller in reversed(
+                            transitioned
+                        ):
+                            rollback_controller.start(
+                                rollback_id,
+                                previous_modes[rollback_id],
+                            )
+                        return {
+                            "ok": False,
+                            "reason": str(
+                                result.get("reason")
+                                or f"{profile_id} runtime mode transition failed"
+                            ),
+                            "results": results,
+                            "runtime": self.snapshot(),
+                        }
+                    transitioned.append((profile_id, controller))
+                return {
+                    "ok": True,
+                    "reason": "running continuous runtimes transitioned",
+                    "results": results,
+                    "runtime": self.snapshot(),
+                }
+            finally:
+                for lock in reversed(acquired):
+                    lock.release()
 
     def snapshot(self) -> dict[str, Any]:
         profiles = {key: controller.snapshot() for key, controller in self.controllers.items()}

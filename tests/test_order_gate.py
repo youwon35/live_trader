@@ -3,14 +3,20 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from live_trader import state
-from live_trader.brokers import LiveBrokerRouter
+from live_trader.brokers import (
+    BrokerNotReadyError,
+    LiveBrokerRouter,
+    fetch_kis_overseas_balance,
+    parse_kis_overseas_positions,
+)
 from live_trader.audit_store import SQLiteAuditEventStore
 from live_trader.program_ledger import ProgramLedger
+from trading_runtime import DeploymentStore, build_paper_portfolio_evidence
 
 
 class OrderGateTest(unittest.TestCase):
@@ -40,11 +46,202 @@ class OrderGateTest(unittest.TestCase):
         if hasattr(self, "original_program_ledger"):
             state.PROGRAM_LEDGER = self.original_program_ledger
 
+    @staticmethod
+    def resume_artifact(
+        strategy_id: str,
+        *,
+        lifecycle: str = "before-live-small",
+        artifact_hash: str = "current-artifact-hash",
+        validated_until: str = "2099-01-01T00:00:00+00:00",
+    ) -> dict:
+        return {
+            "id": strategy_id,
+            "strategy_id": strategy_id,
+            "strategyId": "moving_average_cross",
+            "name": f"{strategy_id} Resume Test",
+            "symbol": "BTCUSDT",
+            "asset": "CRYPTO",
+            "timeframe": "1h",
+            "plugin": "moving_average_cross",
+            "parameters": {"shortMa": 20, "longMa": 60},
+            "status": lifecycle,
+            "lifecycleStatus": lifecycle,
+            "promotionStage": lifecycle,
+            "lifecycle": {"status": lifecycle, "history": []},
+            "promotion": {"stage": lifecycle, "history": []},
+            "artifactLock": {
+                "schemaVersion": "strategy-artifact-lock-v1",
+                "lockId": f"lock-{artifact_hash}",
+                "artifactHash": artifact_hash,
+            },
+            "finalTest": {"status": "pass", "passed": True},
+            "portfolioCandidate": {"approved": True, "blockers": []},
+            "revalidation": {
+                "required": True,
+                "status": "valid",
+                "lastRevalidatedAt": "2026-07-25T00:00:00+00:00",
+                "validatedUntil": validated_until,
+            },
+            "permissions": {
+                "trader_export_allowed": True,
+                "paper_trader_verified": True,
+                "live_small_eligible": lifecycle in {"before-live-small", "live"},
+                "live_eligible": lifecycle == "live",
+                "live_allowed": lifecycle == "live",
+                "fail_reasons": [],
+            },
+        }
+
+    @staticmethod
+    def save_resume_evidence(
+        artifact_dir: Path,
+        artifact_reference_payload: dict,
+        *,
+        evidence_id: str = "paper-resume-current",
+        observed_days: int = 30,
+        regime_count: int = 2,
+        recovery_verified: bool = True,
+        reconciliation_mismatches: int = 0,
+        ended_at: str = "2026-07-25T00:00:00+00:00",
+    ) -> None:
+        evidence = build_paper_portfolio_evidence(
+            evidence_id=evidence_id,
+            strategy_artifact=artifact_reference_payload,
+            portfolio_artifact=None,
+            deployment_id=f"dep:{artifact_reference_payload['id']}:standalone:live",
+            runtime_version="paper-trader-react-v1",
+            started_at="2026-06-25T00:00:00+00:00",
+            ended_at=ended_at,
+            status="submitted",
+            filled_count=5,
+            rejected_count=0,
+            order_count=5,
+            metrics={
+                "paperOrderCount": 5,
+                "forwardObservedDays": observed_days,
+                "forwardRegimeCount": regime_count,
+                "recoveryVerified": recovery_verified,
+                "reconciliationMismatches": reconciliation_mismatches,
+            },
+            details={
+                "evidencePolicy": {
+                    "promotionSource": "continuous-live-forward-closed-bar-v1",
+                },
+                "lifecyclePolicy": {
+                    "action": "PROMOTE",
+                    "targetStage": "before-live-small",
+                    "inputs": {
+                        "reconciliation_mismatches": reconciliation_mismatches,
+                    },
+                },
+            },
+        )
+        state.EvidenceStore(artifact_dir).save_paper(evidence)
+
+    def run_resume_scenario(
+        self,
+        artifact_payload: dict,
+        *,
+        evidence_artifact: dict | None = None,
+        evidence_options: dict | None = None,
+    ) -> tuple[dict, dict, dict]:
+        previous_artifact_dir = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_dir = Path(temp_dir)
+            os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
+            artifact_path = artifact_dir / "strategy.json"
+            artifact_path.write_text(
+                json.dumps(artifact_payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            if evidence_artifact is not None:
+                self.save_resume_evidence(
+                    artifact_dir,
+                    evidence_artifact,
+                    **(evidence_options or {}),
+                )
+            try:
+                with patch("live_trader.state.snapshot", return_value={}), patch(
+                    "live_trader.state.append_audit",
+                ):
+                    pause = state.set_strategy_lifecycle_status(
+                        artifact_payload["strategy_id"],
+                        "pause",
+                    )
+                    resume = state.set_strategy_lifecycle_status(
+                        artifact_payload["strategy_id"],
+                        "resume",
+                    )
+                registry_path = artifact_dir / "deployments" / "deployment-registry.json"
+                deployment = next(
+                    iter(
+                        json.loads(
+                            registry_path.read_text(encoding="utf-8")
+                        )["entries"].values()
+                    )
+                )
+            finally:
+                if previous_artifact_dir is None:
+                    os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+                else:
+                    os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact_dir
+        return pause, resume, deployment
+
     def test_order_and_risk_classes_come_from_shared_runtime(self) -> None:
         self.assertEqual(state.OrderIntent.__module__, "trading_runtime.order_management")
         self.assertEqual(state.PreTradeRiskGate.__module__, "trading_runtime.risk_engine")
         self.assertEqual(state.PreTradeContext.__module__, "trading_runtime.risk_engine")
         self.assertEqual(state.StrategyExecutionRunner.__module__, "trading_runtime.strategy_runner")
+
+    def test_strategy_broker_routing_prefers_explicit_artifact_contract(self) -> None:
+        self.assertEqual(
+            "upbit",
+            state.strategy_broker_id(
+                {
+                    "dataset": {"provider": "upbit"},
+                    "marketDataProvider": "binance",
+                    "brokerId": "binance",
+                    "symbol": "BTCUSDT",
+                    "asset": "CRYPTO",
+                }
+            ),
+        )
+        self.assertEqual(
+            "upbit",
+            state.strategy_broker_id(
+                {
+                    "dataset": {"provider": "yfinance"},
+                    "marketDataProvider": "upbit",
+                    "brokerId": "binance",
+                    "symbol": "BTCUSDT",
+                    "asset": "CRYPTO",
+                }
+            ),
+        )
+        self.assertEqual(
+            "upbit",
+            state.strategy_broker_id(
+                {
+                    "marketDataProvider": "yfinance",
+                    "brokerId": "upbit",
+                    "symbol": "BTCUSDT",
+                    "asset": "CRYPTO",
+                }
+            ),
+        )
+        self.assertEqual(
+            "upbit",
+            state.strategy_broker_id(
+                {
+                    "traderContract": {"scope": {"allowed_brokers": ["upbit"]}},
+                    "symbol": "BTCUSDT",
+                    "asset": "CRYPTO",
+                }
+            ),
+        )
+        self.assertEqual("upbit", state.strategy_broker_id({"symbol": "KRW-BTC", "asset": "CRYPTO"}))
+        self.assertEqual("binance", state.strategy_broker_id({"symbol": "BTCUSDT", "asset": "CRYPTO"}))
+        self.assertEqual("kis", state.strategy_broker_id({"symbol": "069500.KS", "asset": "KR-STOCK"}))
 
     def test_submitted_order_cancel_calls_broker_before_local_transition(self) -> None:
         order = {
@@ -175,6 +372,127 @@ class OrderGateTest(unittest.TestCase):
         self.assertTrue(reason)
         self.assertTrue(any(check.label == "거래소 세션" for check in report.checks))
 
+    def test_kis_us_symbol_uses_nyse_session_not_krx(self) -> None:
+        intent = state.OrderIntent(
+            strategy_id="us-session-test",
+            asset="US_STOCK",
+            symbol="AAPL",
+            side="BUY",
+            quantity=1,
+            reference_price=200,
+            mode=state.current_mode(),
+            reason="calendar route",
+            metadata={"broker_id": "kis"},
+        )
+        with patch.object(
+            state,
+            "market_session_state",
+            return_value={"orderable": True, "detail": "open"},
+        ) as market:
+            result = state.order_intent_market_session(intent)
+
+        self.assertTrue(result["orderable"])
+        market.assert_called_once_with(
+            "XNYS",
+            regular_open="09:30",
+            regular_close="16:00",
+        )
+
+    def test_kis_us_next_open_requires_fresh_quote_lifecycle(self) -> None:
+        intent = state.OrderIntent(
+            strategy_id="us-next-open-test",
+            asset="US_STOCK",
+            symbol="AAPL",
+            side="BUY",
+            quantity=1,
+            reference_price=200,
+            mode=state.current_mode(),
+            reason="closed bar",
+            metadata={
+                "broker_id": "kis",
+                "order_type": "00",
+                "execution_timing": "next-open-boundary",
+            },
+        )
+
+        error = state.kis_overseas_next_open_quote_error(intent)
+
+        self.assertIn("5초 이내 실시간 호가", error)
+
+    def test_native_market_payload_does_not_reuse_decision_close(self) -> None:
+        upbit_buy = state.OrderIntent(
+            strategy_id="upbit-buy",
+            asset="코인",
+            symbol="KRW-BTC",
+            side="BUY",
+            quantity=0.00005,
+            reference_price=100_000_000,
+            mode="SMALL_LIVE",
+            reason="unit",
+            metadata={"broker_id": "upbit", "order_type": "price"},
+        )
+        upbit_sell = state.OrderIntent(
+            strategy_id="upbit-sell",
+            asset="코인",
+            symbol="KRW-BTC",
+            side="SELL",
+            quantity=0.00005,
+            reference_price=100_000_000,
+            mode="SMALL_LIVE",
+            reason="unit",
+            metadata={"broker_id": "upbit", "order_type": "market"},
+        )
+        kis_domestic = state.OrderIntent(
+            strategy_id="kis-market",
+            asset="한국주식",
+            symbol="069500.KS",
+            side="BUY",
+            quantity=1,
+            reference_price=35_000,
+            mode="SMALL_LIVE",
+            reason="unit",
+            metadata={"broker_id": "kis", "order_type": "01"},
+        )
+        kis_overseas = state.OrderIntent(
+            strategy_id="kis-us-limit",
+            asset="미국주식",
+            symbol="AAPL",
+            side="BUY",
+            quantity=1,
+            reference_price=190,
+            mode="SMALL_LIVE",
+            reason="unit",
+            metadata={
+                "broker_id": "kis",
+                "order_type": "00",
+                "fresh_quote_verified": True,
+                "fresh_quote_price": 201.25,
+            },
+        )
+
+        buy_payload = state.live_broker_payload(
+            upbit_buy,
+            idempotency_key="buy-key",
+        )
+        sell_payload = state.live_broker_payload(
+            upbit_sell,
+            idempotency_key="sell-key",
+        )
+        kis_payload = state.live_broker_payload(
+            kis_domestic,
+            idempotency_key="kis-key",
+        )
+        kis_us_payload = state.live_broker_payload(
+            kis_overseas,
+            idempotency_key="kis-us-key",
+        )
+
+        self.assertEqual(upbit_buy.notional, buy_payload["price"])
+        self.assertEqual(0.0, sell_payload["price"])
+        self.assertEqual(0.0, kis_payload["price"])
+        self.assertEqual("01", kis_payload["order_type"])
+        self.assertEqual(201.25, kis_us_payload["price"])
+
     def test_order_gate_records_dry_run_without_broker_transmission(self) -> None:
         state.STATE["new_entries_blocked"] = False
 
@@ -238,6 +556,11 @@ class OrderGateTest(unittest.TestCase):
             reason="unit",
             metadata={"broker_id": "binance"},
         )
+        state.STATE["broker_reconciliation"]["positions"] = [{
+            "broker_id": "binance",
+            "symbol": "BTCUSDT",
+            "quantity": 1,
+        }]
 
         ok, order_state, queue_state, reason, report = state.evaluate_order_gate_with_report(checks, "BUY", True, buy_intent)
         sell_ok, sell_order_state, sell_queue_state, sell_reason, _ = state.evaluate_order_gate_with_report(checks, "SELL", True, sell_intent)
@@ -425,6 +748,108 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual("warn", kis["status"])
         self.assertGreater(kis["api_required_count"], 0)
 
+    def test_successful_kis_snapshot_attests_zero_overseas_position(self) -> None:
+        with patch("live_trader.state.live_position_rows", return_value={}), patch(
+            "live_trader.state.program_position_rows",
+            return_value={},
+        ), patch(
+            "live_trader.state.successful_position_brokers",
+            return_value={"kis"},
+        ), patch(
+            "live_trader.state.broker_reconciliation_errors",
+            return_value={},
+        ):
+            rows = state.positions()
+
+        spy = next(row for row in rows if row["broker_id"] == "kis" and row["symbol"] == "SPY")
+        self.assertEqual("pass", spy["status"])
+        self.assertEqual("일치", spy["status_label"])
+        self.assertEqual("0", spy["broker_qty"])
+
+        scoped = {
+            "positions": [
+                {"broker_id": "kis", "status": "pass"},
+                {"broker_id": "kis", "status": "pass"},
+            ],
+            "accounts": [{"broker_id": "kis", "status": "pass"}],
+        }
+        with patch("live_trader.state.reconciliation_snapshot", return_value=scoped), patch(
+            "live_trader.state.broker_reconciliation_errors",
+            return_value={},
+        ):
+            summary = state.reconciliation_summary_for_broker("kis")
+
+        self.assertEqual("pass", summary["status"])
+        self.assertEqual(0, summary["api_required_count"])
+        self.assertEqual(0, summary["capability_gap_count"])
+        self.assertEqual(0, summary["blocking_count"])
+
+    def test_kis_capability_gap_blocks_only_overseas_intent(self) -> None:
+        state.STATE["kill_switch"] = False
+        summary = {
+            "status": "warn",
+            "api_required_count": 0,
+            "capability_gap_count": 1,
+            "mismatch_count": 0,
+            "blocking_count": 0,
+        }
+        checks = {
+            "summary": {"blocker_count": 0, "warning_count": 1},
+            "strategies": [
+                {
+                    "strategy_id": "KIS-LIVE-SMALL",
+                    "symbol": "069500.KS",
+                    "asset": "kr-stock",
+                    "live_small_eligible": True,
+                }
+            ],
+            "brokers": [{"broker_id": "kis", "order_ready": True}],
+        }
+        domestic = state.OrderIntent(
+            strategy_id="KIS-LIVE-SMALL",
+            asset="kr-stock",
+            symbol="069500.KS",
+            side="BUY",
+            quantity=1,
+            reference_price=40000,
+            mode="SMALL_LIVE",
+            reason="unit",
+            metadata={"broker_id": "kis"},
+        )
+        overseas = state.OrderIntent(
+            strategy_id="KIS-US-LIVE-SMALL",
+            asset="us-stock",
+            symbol="SPY",
+            side="BUY",
+            quantity=1,
+            reference_price=600,
+            mode="SMALL_LIVE",
+            reason="unit",
+            metadata={"broker_id": "kis"},
+        )
+
+        with patch("live_trader.state.real_orders_enabled", return_value=True), patch(
+            "live_trader.state.checklist_rows",
+            return_value=[],
+        ), patch(
+            "live_trader.state.durable_control_snapshot",
+            return_value={"halted": False},
+        ), patch(
+            "live_trader.state.reconciliation_summary_for_broker",
+            return_value=summary,
+        ):
+            domestic_blockers = state.intent_readiness_blocker_count(checks, domestic, summary)
+            overseas_blockers = state.intent_readiness_blocker_count(checks, overseas, summary)
+            domestic_context = state.pre_trade_context(checks, domestic, dry_run=True)
+            overseas_context = state.pre_trade_context(checks, overseas, dry_run=True)
+
+        self.assertEqual(0, domestic_blockers)
+        self.assertEqual(1, overseas_blockers)
+        self.assertTrue(domestic_context.positions_matched)
+        self.assertEqual(0, domestic_context.readiness_blockers)
+        self.assertTrue(overseas_context.positions_matched)
+        self.assertEqual(1, overseas_context.readiness_blockers)
+
     def test_empty_broker_reconciliation_fails_closed(self) -> None:
         with patch(
             "live_trader.state.reconciliation_snapshot",
@@ -584,9 +1009,16 @@ class OrderGateTest(unittest.TestCase):
 
     def test_order_gate_holds_non_dry_run_until_adapter_is_verified(self) -> None:
         state.STATE["new_entries_blocked"] = False
+        checks = {"summary": {"blocker_count": 0}}
+        sell_intent = state.default_order_intent(checks, "SELL")
+        state.STATE["broker_reconciliation"]["positions"] = [{
+            "broker_id": str(sell_intent.metadata.get("broker_id") or ""),
+            "symbol": sell_intent.symbol,
+            "quantity": sell_intent.quantity,
+        }]
 
         ok, order_state, queue_state, reason = state.evaluate_order_gate(
-            {"summary": {"blocker_count": 0}},
+            checks,
             "SELL",
             dry_run=False,
         )
@@ -669,7 +1101,7 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(state.STATE["automation"]["stock"]["provider"], "kis")
         self.assertIn("kis만 허용", result["reason"])
 
-    def test_strategy_lifecycle_control_pauses_resumes_and_retires_artifact(self) -> None:
+    def test_strategy_lifecycle_control_resumes_non_live_stage_without_live_permission(self) -> None:
         previous_artifact_dir = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact_dir = Path(temp_dir)
@@ -683,14 +1115,14 @@ class OrderGateTest(unittest.TestCase):
                 "timeframe": "1h",
                 "plugin": "moving_average_cross",
                 "parameters": {"shortMa": 20, "longMa": 60},
-                "status": "before-live-small",
-                "lifecycleStatus": "before-live-small",
-                "promotionStage": "before-live-small",
-                "lifecycle": {"status": "before-live-small", "history": []},
-                "promotion": {"stage": "before-live-small", "history": []},
+                "status": "shadowed",
+                "lifecycleStatus": "shadowed",
+                "promotionStage": "shadowed",
+                "lifecycle": {"status": "shadowed", "history": []},
+                "promotion": {"stage": "shadowed", "history": []},
                 "permissions": {
                     "paper_trader_verified": True,
-                    "live_small_eligible": True,
+                    "live_small_eligible": False,
                     "live_eligible": False,
                     "live_allowed": False,
                     "fail_reasons": [],
@@ -724,15 +1156,127 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(immutable_source, immutable_after)
         self.assertEqual(paused_payload["lifecycle"], "paused")
         self.assertFalse(paused_payload["permissions"]["live_small_eligible"])
-        self.assertEqual(paused_payload["permissions"]["pausedFrom"], "before-live-small")
+        self.assertEqual(paused_payload["permissions"]["pausedFrom"], "shadowed")
         self.assertTrue(resume["ok"], resume["reason"])
-        self.assertEqual(resumed_payload["lifecycle"], "before-live-small")
-        self.assertTrue(resumed_payload["permissions"]["live_small_eligible"])
+        self.assertEqual(resumed_payload["lifecycle"], "shadowed")
+        self.assertFalse(resumed_payload["permissions"]["live_small_eligible"])
         self.assertTrue(retire["ok"])
         self.assertEqual(retired_payload["lifecycle"], "retired")
         self.assertFalse(retired_payload["permissions"]["live_small_eligible"])
 
-    def test_live_promotion_keeps_strategy_immutable_and_writes_live_evidence(self) -> None:
+    def test_legacy_before_live_small_resume_without_forward_evidence_downgrades_to_papered(self) -> None:
+        artifact = self.resume_artifact("RESUME-MISSING")
+
+        pause, resume, deployment = self.run_resume_scenario(artifact)
+
+        self.assertTrue(pause["ok"])
+        self.assertTrue(resume["ok"], resume["reason"])
+        self.assertEqual("papered", deployment["lifecycle"])
+        self.assertFalse(deployment["permissions"]["paper_trader_verified"])
+        self.assertFalse(deployment["permissions"]["live_small_eligible"])
+        self.assertFalse(deployment["permissions"]["live_eligible"])
+        self.assertFalse(deployment["permissions"]["live_allowed"])
+        self.assertIn("Paper Trader", resume["reason"])
+        self.assertIn(
+            "paper-live-forward-evidence-missing",
+            deployment["permissions"]["resumeEvidence"]["blockers"],
+        )
+
+    def test_before_live_small_resume_rejects_stale_revalidation(self) -> None:
+        artifact = self.resume_artifact(
+            "RESUME-STALE",
+            validated_until="2020-01-01T00:00:00+00:00",
+        )
+
+        _pause, resume, deployment = self.run_resume_scenario(
+            artifact,
+            evidence_artifact=artifact,
+        )
+
+        self.assertTrue(resume["ok"], resume["reason"])
+        self.assertEqual("papered", deployment["lifecycle"])
+        self.assertFalse(deployment["permissions"]["live_small_eligible"])
+        self.assertIn(
+            "current-revalidation-expired",
+            deployment["permissions"]["resumeEvidence"]["blockers"],
+        )
+
+    def test_before_live_small_resume_rejects_evidence_older_than_current_revalidation(self) -> None:
+        artifact = self.resume_artifact("RESUME-OLD-EVIDENCE")
+
+        _pause, resume, deployment = self.run_resume_scenario(
+            artifact,
+            evidence_artifact=artifact,
+            evidence_options={"ended_at": "2026-07-24T23:59:59+00:00"},
+        )
+
+        self.assertTrue(resume["ok"], resume["reason"])
+        self.assertEqual("papered", deployment["lifecycle"])
+        self.assertFalse(deployment["permissions"]["live_small_eligible"])
+        self.assertIn(
+            "paper-evidence-stale-before-current-revalidation",
+            deployment["permissions"]["resumeEvidence"]["blockers"],
+        )
+
+    def test_before_live_small_resume_rejects_artifact_hash_mismatch(self) -> None:
+        artifact = self.resume_artifact(
+            "RESUME-HASH",
+            artifact_hash="current-artifact-hash",
+        )
+        stale_artifact = self.resume_artifact(
+            "RESUME-HASH",
+            artifact_hash="stale-artifact-hash",
+        )
+
+        _pause, resume, deployment = self.run_resume_scenario(
+            artifact,
+            evidence_artifact=stale_artifact,
+        )
+
+        self.assertTrue(resume["ok"], resume["reason"])
+        self.assertEqual("papered", deployment["lifecycle"])
+        self.assertFalse(deployment["permissions"]["live_small_eligible"])
+        self.assertIn(
+            "paper-evidence-artifact-hash-mismatch",
+            deployment["permissions"]["resumeEvidence"]["blockers"],
+        )
+
+    def test_before_live_small_resume_restores_only_live_small_after_current_evidence(self) -> None:
+        artifact = self.resume_artifact("RESUME-CURRENT")
+
+        _pause, resume, deployment = self.run_resume_scenario(
+            artifact,
+            evidence_artifact=artifact,
+        )
+
+        self.assertTrue(resume["ok"], resume["reason"])
+        self.assertEqual("before-live-small", deployment["lifecycle"])
+        self.assertTrue(deployment["permissions"]["resumeEvidence"]["ready"])
+        self.assertTrue(deployment["permissions"]["paper_trader_verified"])
+        self.assertTrue(deployment["permissions"]["live_small_eligible"])
+        self.assertFalse(deployment["permissions"]["live_eligible"])
+        self.assertFalse(deployment["permissions"]["live_allowed"])
+
+    def test_live_resume_never_restores_full_live_permission_directly(self) -> None:
+        artifact = self.resume_artifact("RESUME-LIVE", lifecycle="live")
+
+        _pause, resume, deployment = self.run_resume_scenario(
+            artifact,
+            evidence_artifact=artifact,
+        )
+
+        self.assertTrue(resume["ok"], resume["reason"])
+        self.assertEqual("before-live-small", deployment["lifecycle"])
+        self.assertTrue(deployment["permissions"]["live_small_eligible"])
+        self.assertFalse(deployment["permissions"]["live_eligible"])
+        self.assertFalse(deployment["permissions"]["live_allowed"])
+        self.assertIn(
+            "resume-live-canary-repromotion-required",
+            deployment["permissions"]["fail_reasons"],
+        )
+        self.assertIn("소액 실거래 승급을 다시 요구", resume["reason"])
+
+    def test_live_promotion_requires_three_canary_fills_and_writes_live_evidence(self) -> None:
         previous_artifact_dir = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact_dir = Path(temp_dir)
@@ -759,17 +1303,59 @@ class OrderGateTest(unittest.TestCase):
             }
             artifact_path.write_text(json.dumps(artifact_payload, ensure_ascii=False), encoding="utf-8")
             immutable_source = artifact_path.read_bytes()
-            state.STATE["orders"] = [
-                {
+            ledger = self.use_temp_program_ledger(temp_dir)
+            scope = state.current_live_canary_scope(
+                "LIVE-PROMOTE-1",
+                materialize=True,
+            )
+            event_time = (
+                datetime.fromisoformat(
+                    scope["beforeLiveSmallAt"].replace("Z", "+00:00")
+                )
+                + timedelta(seconds=1)
+            ).isoformat()
+
+            def canary_order(index: int) -> dict:
+                return {
                     "strategy_id": "LIVE-PROMOTE-1",
-                    "state": "filled",
-                    "queue_state": "filled",
+                    "state": "acknowledged",
+                    "queue_state": "submitted",
                     "dry_run": False,
+                    "mode": "SMALL_LIVE",
+                    "broker_id": "binance",
+                    "order_id": f"LOCAL-{index}",
+                    "broker_order_id": f"BROKER-{index}",
+                    "created_at": event_time,
+                    "canary_scope": dict(scope),
                 }
+
+            def canary_event(index: int) -> dict:
+                return {
+                    "event_id": f"FILL-{index}",
+                    "broker_id": "binance",
+                    "order_id": f"LOCAL-{index}",
+                    "broker_order_id": f"BROKER-{index}",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "quantity": 0.001,
+                    "price": 100_000,
+                    "state": "filled",
+                    "occurred_at": event_time,
+                }
+
+            state.STATE["orders"] = [
+                canary_order(1),
+                canary_order(2),
             ]
+            ledger.record_execution_events(
+                [canary_event(1), canary_event(2)]
+            )
             readiness = {"operator_confirmed": True, "summary": {"blocker_count": 0}}
             try:
                 with patch("live_trader.state.snapshot", return_value=readiness):
+                    blocked = state.promote_strategy_to_live("LIVE-PROMOTE-1")
+                    state.STATE["orders"].append(canary_order(3))
+                    ledger.record_execution_events([canary_event(3)])
                     result = state.promote_strategy_to_live("LIVE-PROMOTE-1")
                 deployment = next(
                     iter(
@@ -787,13 +1373,169 @@ class OrderGateTest(unittest.TestCase):
                 else:
                     os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact_dir
 
+        self.assertFalse(blocked["ok"])
+        self.assertIn("2건", blocked["reason"])
+        self.assertIn("3건", blocked["reason"])
         self.assertTrue(result["ok"], result["reason"])
         self.assertEqual(immutable_source, immutable_after)
         self.assertEqual("live", deployment["lifecycle"])
         self.assertTrue(deployment["permissions"]["live_allowed"])
         self.assertEqual("live-execution", evidence["evidenceType"])
         self.assertEqual("PASS", evidence["result"])
+        self.assertEqual(3, evidence["successfulOrders"])
+        self.assertEqual(
+            scope["scopeId"],
+            evidence["details"]["canaryScope"]["scopeId"],
+        )
         self.assertTrue(evidence["integrity"]["contentHash"])
+
+    def test_local_filled_rows_without_broker_events_never_count_as_canary(self) -> None:
+        previous_artifact_dir = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_dir = Path(temp_dir)
+            os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
+            payload = {
+                "id": "LOCAL-FILL-NOT-CANARY",
+                "strategy_id": "LOCAL-FILL-NOT-CANARY",
+                "name": "Local Fill",
+                "symbol": "BTCUSDT",
+                "asset": "CRYPTO",
+                "timeframe": "5m",
+                "plugin": "moving_average_cross",
+                "lifecycle": {"status": "before-live-small"},
+                "permissions": {"live_small_eligible": True},
+            }
+            (artifact_dir / "strategy.json").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            self.use_temp_program_ledger(temp_dir)
+            scope = state.current_live_canary_scope(
+                "LOCAL-FILL-NOT-CANARY",
+                materialize=True,
+            )
+            state.STATE["orders"] = [
+                {
+                    "strategy_id": "LOCAL-FILL-NOT-CANARY",
+                    "state": "filled",
+                    "queue_state": "filled",
+                    "dry_run": False,
+                    "mode": "SMALL_LIVE",
+                    "broker_id": "binance",
+                    "order_id": f"LOCAL-{index}",
+                    "broker_order_id": f"BROKER-{index}",
+                    "created_at": scope["beforeLiveSmallAt"],
+                    "canary_scope": dict(scope),
+                }
+                for index in range(3)
+            ]
+            try:
+                summary = state.live_small_execution_summary(
+                    "LOCAL-FILL-NOT-CANARY"
+                )
+            finally:
+                if previous_artifact_dir is None:
+                    os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+                else:
+                    os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact_dir
+
+        self.assertEqual(0, summary["fills"])
+
+    def test_pause_resume_revision_invalidates_prior_canary_fills(self) -> None:
+        previous_artifact_dir = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_dir = Path(temp_dir)
+            os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
+            payload = {
+                "id": "CANARY-RESUME",
+                "strategy_id": "CANARY-RESUME",
+                "name": "Canary Resume",
+                "symbol": "BTCUSDT",
+                "asset": "CRYPTO",
+                "timeframe": "5m",
+                "plugin": "moving_average_cross",
+                "lifecycle": {"status": "before-live-small"},
+                "permissions": {"live_small_eligible": True},
+            }
+            (artifact_dir / "strategy.json").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            ledger = self.use_temp_program_ledger(temp_dir)
+            first_scope = state.current_live_canary_scope(
+                "CANARY-RESUME",
+                materialize=True,
+            )
+            event_time = (
+                datetime.fromisoformat(
+                    first_scope["beforeLiveSmallAt"].replace("Z", "+00:00")
+                )
+                + timedelta(seconds=1)
+            ).isoformat()
+            state.STATE["orders"] = []
+            events = []
+            for index in range(3):
+                state.STATE["orders"].append(
+                    {
+                        "strategy_id": "CANARY-RESUME",
+                        "state": "acknowledged",
+                        "queue_state": "submitted",
+                        "dry_run": False,
+                        "mode": "SMALL_LIVE",
+                        "broker_id": "binance",
+                        "order_id": f"LOCAL-{index}",
+                        "broker_order_id": f"BROKER-{index}",
+                        "created_at": event_time,
+                        "canary_scope": dict(first_scope),
+                    }
+                )
+                events.append(
+                    {
+                        "event_id": f"FILL-{index}",
+                        "broker_id": "binance",
+                        "order_id": f"LOCAL-{index}",
+                        "broker_order_id": f"BROKER-{index}",
+                        "symbol": "BTCUSDT",
+                        "quantity": 0.001,
+                        "price": 100_000,
+                        "state": "filled",
+                        "occurred_at": event_time,
+                    }
+                )
+            ledger.record_execution_events(events)
+            before = state.live_small_execution_summary("CANARY-RESUME")
+            store = DeploymentStore(artifact_dir)
+            current = store.list()[0]
+            permissions = dict(current.get("permissions") or {})
+            store.transition(
+                current["deploymentId"],
+                lifecycle="paused",
+                mode="MONITOR",
+                permissions=permissions,
+                actor="unit",
+                reason="pause",
+            )
+            resumed = store.transition(
+                current["deploymentId"],
+                lifecycle="before-live-small",
+                mode="MONITOR",
+                permissions=permissions,
+                actor="unit",
+                reason="resume",
+            )
+            after = state.live_small_execution_summary("CANARY-RESUME")
+            try:
+                self.assertEqual(3, before["fills"])
+                self.assertEqual(0, after["fills"])
+                self.assertGreater(
+                    resumed["revision"],
+                    first_scope["deploymentRevision"],
+                )
+            finally:
+                if previous_artifact_dir is None:
+                    os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+                else:
+                    os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact_dir
 
     def test_submit_test_intent_creates_dry_run_order_when_gate_passes(self) -> None:
         state.STATE["orders"] = []
@@ -1315,6 +2057,106 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(result["program_ledger"]["position_count"], 1)
         self.assertEqual(result["execution_events"]["synced_cash_count"], 1)
         self.assertEqual(result["execution_events"]["synced_position_count"], 1)
+        self.assertEqual(result["program_ledger"]["execution_event_count"], 0)
+
+    def test_idle_snapshot_poll_is_throttled_and_does_not_append_execution_events(self) -> None:
+        class FakeRouter:
+            def __init__(self):
+                self.calls = []
+
+            def poll_execution_events(self, broker_id):
+                self.calls.append(broker_id)
+                currency = "KRW" if broker_id in {"kis", "upbit"} else "USDT"
+                return {
+                    "broker_id": broker_id,
+                    "accounts": [
+                        {
+                            "broker_id": broker_id,
+                            "account": f"{broker_id}-account",
+                            "currency": currency,
+                            "broker_cash": 100.0,
+                        }
+                    ],
+                    "positions": [],
+                    "events": [
+                        {
+                            "event_id": f"{broker_id}:account:volatile",
+                            "state": "account_snapshot",
+                            "occurred_at": "2026-07-25 10:00:00",
+                        }
+                    ],
+                }
+
+        fake_router = FakeRouter()
+        state.STATE["broker_snapshot_poll"] = {
+            "brokers": {},
+            "last_summary_audit_monotonic": 0.0,
+            "last_summary_signature": "",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.use_temp_program_ledger(temp_dir)
+            try:
+                with patch("live_trader.state.LiveBrokerRouter", return_value=fake_router), patch.object(
+                    state.LIVE_EXECUTION_STREAMS,
+                    "drain",
+                    return_value=[],
+                ), patch.object(
+                    state.LIVE_EXECUTION_STREAMS,
+                    "snapshot",
+                    return_value={"running": False, "brokers": {}},
+                ), patch.object(
+                    state.LIVE_CONTINUOUS_CONTROLLER,
+                    "snapshot",
+                    return_value={"running": False, "profiles": {}},
+                ), patch(
+                    "live_trader.state.time.monotonic",
+                    side_effect=[100.0, 110.0],
+                ), patch(
+                    "live_trader.state.append_audit",
+                ), patch(
+                    "live_trader.state.snapshot",
+                    return_value={},
+                ):
+                    first = state.poll_execution_events("all", force_snapshot=False)
+                    second = state.poll_execution_events("all", force_snapshot=False)
+            finally:
+                self.restore_temp_program_ledger()
+
+        self.assertEqual(["kis", "binance", "upbit"], fake_router.calls)
+        self.assertEqual(0, first["program_ledger"]["execution_event_count"])
+        self.assertEqual(3, first["program_ledger"]["cash_count"])
+        self.assertEqual(0, second["execution_events"]["synced_cash_count"])
+        self.assertEqual(["binance", "kis", "upbit"], second["execution_events"]["snapshot_skipped_brokers"])
+
+    def test_snapshot_redacts_account_and_signed_request_material(self) -> None:
+        secret = "must-not-leak"
+        profile = {
+            "id": "stock",
+            "sample_request": {
+                "url": f"https://example.test/order?symbol=BTCUSDT&signature={secret}",
+                "headers": {
+                    "authorization": f"Bearer {secret}",
+                    "X-MBX-APIKEY": secret,
+                },
+                "body": {
+                    "CANO": "12345678",
+                    "symbol": "BTCUSDT",
+                },
+                "query": {"signature": secret, "timestamp": 1},
+            },
+        }
+        with patch("live_trader.state.automation_profiles", return_value=[profile]):
+            payload = state.snapshot()
+
+        serialized = json.dumps(payload, ensure_ascii=False)
+        sample = payload["automation_profiles"][0]["sample_request"]
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("12345678", serialized)
+        self.assertEqual("***", sample["body"]["CANO"])
+        self.assertEqual("***", sample["headers"]["authorization"])
+        self.assertEqual("***", sample["headers"]["X-MBX-APIKEY"])
+        self.assertEqual("***", sample["query"]["signature"])
+        self.assertIn("signature=%2A%2A%2A", sample["url"])
 
     def test_kis_poll_execution_events_returns_balance_snapshot_events(self) -> None:
         payload = {
@@ -1350,6 +2192,122 @@ class OrderGateTest(unittest.TestCase):
             )
         )
 
+    def test_kis_position_snapshot_includes_read_only_overseas_balance(self) -> None:
+        domestic = {
+            "rt_cd": "0",
+            "output1": [{"pdno": "005930", "hldg_qty": "1"}],
+            "output2": [{"dnca_tot_amt": "100000"}],
+        }
+        overseas = {
+            "rt_cd": "0",
+            "output1": [
+                {
+                    "ovrs_pdno": "SPY",
+                    "ovrs_item_name": "SPDR S&P 500 ETF",
+                    "ovrs_cblc_qty": "2",
+                    "pchs_avg_pric": "500.25",
+                    "now_pric2": "510.50",
+                    "ovrs_stck_evlu_amt": "1021.00",
+                    "tr_crcy_cd": "USD",
+                    "ovrs_excg_cd": "NASD",
+                }
+            ],
+            "output2": [],
+        }
+        with patch("live_trader.brokers.issue_kis_access_token", return_value="token"), patch(
+            "live_trader.brokers.send_prepared_request",
+            side_effect=[
+                {"ok": True, "json": domestic},
+                {"ok": True, "json": overseas, "trCont": ""},
+            ],
+        ) as send:
+            rows = LiveBrokerRouter().list_positions("kis")
+
+        self.assertEqual(["005930.KS", "SPY"], [row["symbol"] for row in rows])
+        spy = rows[1]
+        self.assertEqual("미국주식", spy["asset"])
+        self.assertEqual("USD", spy["currency"])
+        self.assertEqual(2.0, spy["broker_qty"])
+        self.assertEqual(1021.0, spy["broker_value"])
+        self.assertEqual(
+            "/uapi/overseas-stock/v1/trading/inquire-balance",
+            send.call_args_list[1].args[0].endpoint,
+        )
+        self.assertEqual("TTTS3012R", send.call_args_list[1].args[0].headers["tr_id"])
+
+    def test_kis_overseas_balance_consumes_every_continuation_page(self) -> None:
+        first = {
+            "ok": True,
+            "json": {
+                "rt_cd": "0",
+                "output1": [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "1"}],
+                "output2": [],
+                "ctx_area_fk200": "fk-next",
+                "ctx_area_nk200": "nk-next",
+            },
+            "trCont": "M",
+        }
+        second = {
+            "ok": True,
+            "json": {
+                "rt_cd": "0",
+                "output1": [{"ovrs_pdno": "SPY", "ovrs_cblc_qty": "2"}],
+                "output2": [],
+            },
+            "trCont": "",
+        }
+        with patch(
+            "live_trader.brokers.send_prepared_request",
+            side_effect=[first, second],
+        ) as send:
+            payload = fetch_kis_overseas_balance("token")
+
+        rows = parse_kis_overseas_positions(payload)
+        self.assertEqual(["AAPL", "SPY"], [row["symbol"] for row in rows])
+        second_request = send.call_args_list[1].args[0]
+        self.assertEqual("N", second_request.headers["tr_cont"])
+        self.assertEqual("fk-next", second_request.query["CTX_AREA_FK200"])
+        self.assertEqual("nk-next", second_request.query["CTX_AREA_NK200"])
+
+    def test_kis_overseas_balance_auth_and_api_errors_remain_fail_closed(self) -> None:
+        with patch(
+            "live_trader.brokers.send_prepared_request",
+            return_value={"ok": False, "statusCode": 401, "text": "unauthorized"},
+        ):
+            with self.assertRaisesRegex(BrokerNotReadyError, "인증 실패"):
+                fetch_kis_overseas_balance("expired-token")
+
+        with patch(
+            "live_trader.brokers.send_prepared_request",
+            return_value={
+                "ok": True,
+                "json": {
+                    "rt_cd": "1",
+                    "msg_cd": "APBK0919",
+                    "msg1": "조회 조건 오류",
+                },
+            },
+        ):
+            with self.assertRaisesRegex(BrokerNotReadyError, "API 조회 실패"):
+                fetch_kis_overseas_balance("token")
+
+        domestic = {
+            "rt_cd": "0",
+            "output1": [{"pdno": "005930", "hldg_qty": "1"}],
+            "output2": [],
+        }
+        with patch("live_trader.brokers.issue_kis_access_token", return_value="token"), patch(
+            "live_trader.brokers.send_prepared_request",
+            side_effect=[
+                {"ok": True, "json": domestic},
+                {"ok": False, "statusCode": 403, "text": "forbidden"},
+            ],
+        ):
+            # A valid domestic page must never be published as a complete KIS
+            # snapshot when the overseas half failed.
+            with self.assertRaisesRegex(BrokerNotReadyError, "인증 실패"):
+                LiveBrokerRouter().list_positions("kis")
+
     def test_binance_poll_execution_events_returns_balance_snapshot_events(self) -> None:
         payload = {
             "balances": [
@@ -1383,6 +2341,21 @@ class OrderGateTest(unittest.TestCase):
 
         self.assertEqual(0.00010441, state.broker_position_quantity("BTCUSDT"))
         self.assertEqual(0.09257, state.broker_position_quantity("XRPUSDT"))
+
+    def test_position_lookup_is_scoped_to_broker(self) -> None:
+        state.STATE["broker_reconciliation"]["positions"] = [
+            {"broker_id": "binance", "symbol": "BTC", "broker_qty": 0.01},
+            {"broker_id": "upbit", "symbol": "BTC", "broker_qty": 0.02},
+        ]
+
+        self.assertEqual(
+            0.01,
+            state.broker_position_quantity("BTCUSDT", "binance"),
+        )
+        self.assertEqual(
+            0.02,
+            state.broker_position_quantity("BTCUSDT", "upbit"),
+        )
 
     def test_upbit_poll_execution_events_returns_balance_snapshot_events(self) -> None:
         payload = [

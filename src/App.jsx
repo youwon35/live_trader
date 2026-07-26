@@ -65,6 +65,7 @@ import {
   runShadowLive,
   runRecoveryDrill,
 } from "./api";
+import { livePollingIntervals } from "./polling";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
 import { readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
@@ -1108,10 +1109,13 @@ function App() {
   const [acknowledgedNotifications, setAcknowledgedNotifications] = useState(() => readStoredValue(NOTIFICATION_ACK_STORAGE_KEY, ""));
   const workspaceRef = useRef(null);
   const notificationRef = useRef(null);
+  const backgroundRequestInFlightRef = useRef(false);
 
   useEditablePanels(workspaceRef);
 
   async function refresh() {
+    if (backgroundRequestInFlightRef.current) return;
+    backgroundRequestInFlightRef.current = true;
     try {
       const next = await getSnapshot();
       setSnapshot({ ...next, api_connected: true });
@@ -1120,39 +1124,49 @@ function App() {
       setSnapshot(fallbackSnapshot);
       setError(err instanceof Error ? err.message : "API 연결 실패");
     } finally {
+      backgroundRequestInFlightRef.current = false;
       setLoading(false);
     }
   }
 
+  const liveRuntimeActive = Boolean(
+    snapshot.continuous_runtime?.running || snapshot.execution_streams?.running,
+  );
+  const pollingIntervals = livePollingIntervals(liveRuntimeActive);
+
   useEffect(() => {
     refresh();
-    const timer = window.setInterval(refresh, 5000);
+    const refreshWhenVisible = () => {
+      if (document.visibilityState !== "hidden") refresh();
+    };
+    const timer = window.setInterval(refreshWhenVisible, pollingIntervals.snapshotMs);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [pollingIntervals.snapshotMs]);
 
   useEffect(() => {
     if (selectedNav !== "overview" || snapshot.api_connected !== true) return undefined;
     let stopped = false;
     let running = false;
     const refreshBrokerAccounts = async () => {
-      if (stopped || running) return;
+      if (stopped || running || backgroundRequestInFlightRef.current) return;
       running = true;
+      backgroundRequestInFlightRef.current = true;
       try {
-        await syncExecutionEvents("all");
-        const result = await runReconciliation();
+        const result = await syncExecutionEvents("all");
         if (!stopped && result?.snapshot) setSnapshot({ ...result.snapshot, api_connected: true });
       } catch {
         // Background account refresh stays quiet; the normal snapshot poll keeps connection status visible.
       } finally {
+        backgroundRequestInFlightRef.current = false;
         running = false;
       }
     };
-    const timer = window.setInterval(refreshBrokerAccounts, 10000);
+    const timer = window.setInterval(refreshBrokerAccounts, pollingIntervals.executionMs);
     return () => {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [selectedNav, snapshot.api_connected]);
+  }, [selectedNav, snapshot.api_connected, pollingIntervals.executionMs]);
 
   useEffect(() => {
     applyAppearance(appearance);
@@ -3577,6 +3591,12 @@ function LiveStrategySelectorPanel({
   );
   const isPaused = normalizedStage === "paused";
   const isRetired = normalizedStage === "retired";
+  const pausedFromLiveStage = strategyLifecycleRank(
+    selectedStrategy?.lifecycle?.pausedFrom || selectedStrategy?.pausedFrom,
+  ) >= strategyLifecycleRank("before-live-small");
+  const resumeRevalidationRequired = liveArtifactFailureReasons(selectedStrategy).some(
+    (reason) => reason.includes("resume-current-paper-live-forward-repromotion-required"),
+  );
   return (
     <section className="panel live-strategy-selector-panel">
       <PanelHeader title="활성 전략 선택" subtitle="Backtester/Paper Trader에서 검증된 artifact를 읽기 전용으로 확인합니다." />
@@ -3651,7 +3671,17 @@ function LiveStrategySelectorPanel({
               label="폐기/보관"
               onClick={() => onStrategyLifecycle?.(selectedStrategy.strategy_id, "retire")}
             />
-            <span>{isRetired ? "retired 상태라 신규 주문과 승급이 차단됩니다." : "상태 변경은 공유 전략 artifact lifecycle에 기록됩니다."}</span>
+            <span>
+              {isRetired
+                ? "retired 상태라 신규 주문과 승급이 차단됩니다."
+                : isPaused && pausedFromLiveStage
+                  ? "Live 단계 재개는 current-hash Paper live-forward 증거와 현재 Portfolio gate를 다시 통과해야 합니다."
+                  : isPaused
+                    ? "비-Live 단계로 안전 재개하며 실거래 권한은 복구하지 않습니다."
+                  : resumeRevalidationRequired
+                    ? "이전 Live 권한은 복구되지 않았습니다. Paper Trader에서 연속 관찰 증거로 다시 승급하세요."
+                    : "상태 변경은 공유 전략 artifact lifecycle에 기록됩니다."}
+            </span>
           </div>
           <div className="live-strategy-parameter-panel">
             <strong>Parameters</strong>

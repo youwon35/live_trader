@@ -12,6 +12,7 @@ from .live_adapters import (
     build_kis_cancel_order_request,
     build_kis_domestic_balance_request,
     build_kis_live_order_request,
+    build_kis_overseas_balance_request,
     build_upbit_accounts_request,
     build_upbit_cancel_order_request,
     build_upbit_order_chance_request,
@@ -75,8 +76,8 @@ BROKER_SPECS = (
         "docs": "KIS Open API 실전/모의투자 REST",
         "capabilities": (
             ("auth_token", "접근 토큰 발급", True, "KIS OAuth token 발급 요청 구현됨"),
-            ("account_balance", "계좌 잔고 조회", True, "국내 주식 잔고 조회 요청 구현됨"),
-            ("positions", "보유/체결 조회", True, "국내 주식 보유 잔고 조회 요청 구현됨"),
+            ("account_balance", "계좌 잔고 조회", True, "국내·해외 주식 잔고 조회 요청 구현됨"),
+            ("positions", "보유/체결 조회", True, "국내·해외 주식 보유 잔고 조회와 연속조회 구현됨"),
             ("place_order", "현금 주문 전송", True, "국내/해외 주식 실계좌 주문 요청 생성 구현됨"),
             ("cancel_order", "주문 취소/정정", True, "국내/해외 원주문번호 기반 전량 취소 요청 구현됨"),
         ),
@@ -310,7 +311,39 @@ def ensure_response_ok(broker_id: str, response: dict[str, object]) -> object:
             raise BrokerNotReadyError(f"{broker_id} 조회 차단: {', '.join(str(item) for item in reasons)}")
     status = response.get("statusCode") or response.get("status") or "unknown"
     text = str(response.get("text") or "")[:240]
-    raise BrokerNotReadyError(f"{broker_id} 조회 실패 ({status}): {text}")
+    if str(broker_id).lower() == "kis" and str(status) in {"401", "403"}:
+        raise BrokerNotReadyError(f"{broker_id} 인증 실패 ({status}): {text}")
+    raise BrokerNotReadyError(f"{broker_id} API 조회 실패 ({status}): {text}")
+
+
+def ensure_kis_payload_ok(response: dict[str, object], *, scope: str) -> dict[str, object]:
+    """Validate both HTTP and KIS' application-level result code."""
+
+    payload = ensure_response_ok("kis", response)
+    if not isinstance(payload, dict):
+        raise BrokerNotReadyError(f"kis {scope} API 응답 형식이 올바르지 않습니다.")
+    result_code = str(payload.get("rt_cd") or "0").strip()
+    if result_code == "0":
+        return payload
+    message_code = str(payload.get("msg_cd") or "").strip()
+    message = str(payload.get("msg1") or "KIS API 오류").strip()
+    auth_text = f"{message_code} {message}".lower()
+    auth_error = any(
+        token in auth_text
+        for token in (
+            "token",
+            "oauth",
+            "authorization",
+            "인증",
+            "접근토큰",
+            "egw00121",
+            "egw00122",
+            "egw00123",
+        )
+    )
+    error_kind = "인증 실패" if auth_error else "API 조회 실패"
+    detail = f"{message_code}: {message}" if message_code else message
+    raise BrokerNotReadyError(f"kis {scope} {error_kind}: {detail}")
 
 
 def kis_symbol(pdno: str) -> str:
@@ -375,6 +408,134 @@ def parse_kis_positions(payload: object) -> list[dict[str, object]]:
             }
         )
     return positions
+
+
+def parse_kis_overseas_positions(payload: object) -> list[dict[str, object]]:
+    data = payload if isinstance(payload, dict) else {}
+    output1 = data.get("output1")
+    rows = (
+        output1
+        if isinstance(output1, list)
+        else [output1]
+        if isinstance(output1, dict)
+        else []
+    )
+    positions: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        qty = first_numeric(row, "ovrs_cblc_qty", "ord_psbl_qty")
+        if qty <= 0:
+            continue
+        # The overseas endpoint's canonical field is ovrs_pdno.  Requiring it
+        # prevents a domestic-balance payload from being misclassified.
+        pdno = first_text(row, "ovrs_pdno", "OVRS_PDNO", default="").strip().upper()
+        if not pdno:
+            continue
+        currency = first_text(row, "tr_crcy_cd", default="USD").strip().upper() or "USD"
+        exchange = first_text(row, "ovrs_excg_cd", default="NASD").strip().upper() or "NASD"
+        positions.append(
+            {
+                "symbol": pdno,
+                "asset": "미국주식",
+                "broker_id": "kis",
+                "broker_name": "한국투자증권 Open API",
+                "currency": currency,
+                "broker_qty": qty,
+                "broker_value": first_numeric(
+                    row,
+                    "ovrs_stck_evlu_amt",
+                    "frcr_evlu_amt2",
+                    "frcr_pchs_amt1",
+                    default=0.0,
+                ),
+                "average_price": first_numeric(
+                    row,
+                    "pchs_avg_pric",
+                    "avg_unpr3",
+                    default=0.0,
+                ),
+                "current_price": first_numeric(row, "now_pric2", "last", default=0.0),
+                "exchange": exchange,
+                "detail": first_text(
+                    row,
+                    "ovrs_item_name",
+                    "prdt_name",
+                    default="KIS 해외주식 보유 종목",
+                ),
+            }
+        )
+    return positions
+
+
+def fetch_kis_overseas_balance(
+    access_token: str,
+    *,
+    exchange: str = "NASD",
+    currency: str = "USD",
+    max_pages: int = 10,
+) -> dict[str, object]:
+    """Fetch a complete read-only overseas balance snapshot.
+
+    Absence can only be interpreted as a zero position after every KIS
+    continuation page has been consumed.  Broken/repeated continuation keys
+    fail closed instead of publishing a partial snapshot.
+    """
+
+    output1: list[dict[str, object]] = []
+    output2: list[dict[str, object]] = []
+    context_fk200 = ""
+    context_nk200 = ""
+    continuation = ""
+    seen_keys: set[tuple[str, str]] = set()
+    for _ in range(max(1, int(max_pages))):
+        response = send_prepared_request(
+            build_kis_overseas_balance_request(
+                access_token=access_token,
+                exchange=exchange,
+                currency=currency,
+                context_fk200=context_fk200,
+                context_nk200=context_nk200,
+                continuation=continuation,
+            )
+        )
+        payload = ensure_kis_payload_ok(response, scope="해외주식 잔고")
+        page_positions = payload.get("output1")
+        for item in (
+            page_positions
+            if isinstance(page_positions, list)
+            else [page_positions]
+            if isinstance(page_positions, dict)
+            else []
+        ):
+            if isinstance(item, dict):
+                output1.append(dict(item))
+        page_summary = payload.get("output2")
+        for item in (
+            page_summary
+            if isinstance(page_summary, list)
+            else [page_summary]
+            if isinstance(page_summary, dict)
+            else []
+        ):
+            if isinstance(item, dict):
+                output2.append(dict(item))
+
+        tr_cont = str(response.get("trCont") or "").strip().upper()
+        if tr_cont not in {"M", "F"}:
+            return {"rt_cd": "0", "output1": output1, "output2": output2}
+        next_fk200 = str(payload.get("ctx_area_fk200") or payload.get("CTX_AREA_FK200") or "")
+        next_nk200 = str(payload.get("ctx_area_nk200") or payload.get("CTX_AREA_NK200") or "")
+        next_key = (next_fk200, next_nk200)
+        if not any(next_key) or next_key in seen_keys:
+            raise BrokerNotReadyError(
+                "kis 해외주식 잔고 API 조회 실패: 연속조회 키가 없거나 반복되어 전체 스냅샷을 증명할 수 없습니다."
+            )
+        seen_keys.add(next_key)
+        context_fk200, context_nk200, continuation = next_fk200, next_nk200, "N"
+    raise BrokerNotReadyError(
+        f"kis 해외주식 잔고 API 조회 실패: {max_pages}페이지 안에 연속조회가 끝나지 않았습니다."
+    )
 
 
 def broker_snapshot_events(accounts: list[dict[str, object]], positions: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -540,7 +701,10 @@ class LiveBrokerRouter:
         broker_id = broker_id.lower().strip()
         if broker_id == "kis":
             token = issue_kis_access_token()
-            payload = ensure_response_ok("kis", send_prepared_request(build_kis_domestic_balance_request(access_token=token)))
+            payload = ensure_kis_payload_ok(
+                send_prepared_request(build_kis_domestic_balance_request(access_token=token)),
+                scope="국내주식 잔고",
+            )
             return {"broker_id": "kis", "accounts": parse_kis_accounts(payload)}
         if broker_id == "binance":
             payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))
@@ -554,8 +718,15 @@ class LiveBrokerRouter:
         broker_id = broker_id.lower().strip()
         if broker_id == "kis":
             token = issue_kis_access_token()
-            payload = ensure_response_ok("kis", send_prepared_request(build_kis_domestic_balance_request(access_token=token)))
-            return parse_kis_positions(payload)
+            domestic_payload = ensure_kis_payload_ok(
+                send_prepared_request(build_kis_domestic_balance_request(access_token=token)),
+                scope="국내주식 잔고",
+            )
+            overseas_payload = fetch_kis_overseas_balance(token)
+            return [
+                *parse_kis_positions(domestic_payload),
+                *parse_kis_overseas_positions(overseas_payload),
+            ]
         if broker_id == "binance":
             payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))
             return parse_binance_positions(payload)
@@ -634,9 +805,16 @@ class LiveBrokerRouter:
         broker_id = broker_id.lower().strip()
         if broker_id == "kis":
             token = issue_kis_access_token()
-            payload = ensure_response_ok("kis", send_prepared_request(build_kis_domestic_balance_request(access_token=token)))
-            accounts = parse_kis_accounts(payload)
-            positions = parse_kis_positions(payload)
+            domestic_payload = ensure_kis_payload_ok(
+                send_prepared_request(build_kis_domestic_balance_request(access_token=token)),
+                scope="국내주식 잔고",
+            )
+            overseas_payload = fetch_kis_overseas_balance(token)
+            accounts = parse_kis_accounts(domestic_payload)
+            positions = [
+                *parse_kis_positions(domestic_payload),
+                *parse_kis_overseas_positions(overseas_payload),
+            ]
             return {
                 "broker_id": "kis",
                 "accounts": accounts,

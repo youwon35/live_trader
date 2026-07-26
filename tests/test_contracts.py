@@ -125,6 +125,50 @@ class StrategyContractTest(unittest.TestCase):
         self.assertEqual(artifact["verification"]["paper_trader"]["status"], "pass")
         self.assertEqual(artifact["verification"]["live"]["status"], "fail")
 
+    def test_strategy_normalization_preserves_broker_routing_contract(self) -> None:
+        artifact = normalize_strategy_artifact(
+            {
+                "id": "UPBIT-ROUTE",
+                "dataset": {
+                    "symbol": "KRW-BTC",
+                    "assetClass": "CRYPTO",
+                    "interval": "5m",
+                    "provider": "upbit",
+                },
+                "marketDataProvider": "upbit",
+                "brokerId": "upbit",
+                "traderContract": {
+                    "contract_version": "trader-strategy-contract-v2",
+                    "scope": {"allowed_brokers": ["upbit"]},
+                },
+            }
+        )
+
+        self.assertEqual("upbit", artifact["dataset_provider"])
+        self.assertEqual("upbit", artifact["market_data_provider"])
+        self.assertEqual("upbit", artifact["broker_id"])
+        self.assertEqual(["upbit"], artifact["allowed_brokers"])
+
+    def test_paused_lifecycle_exposes_deployment_resume_origin(self) -> None:
+        artifact = normalize_strategy_artifact(
+            {
+                "id": "PAUSED-ORIGIN",
+                "lifecycle": {"status": "backtested"},
+                "_deployment": {
+                    "lifecycle": "paused",
+                    "permissions": {
+                        "pausedFrom": "before-live-small",
+                        "live_small_eligible": False,
+                        "live_eligible": False,
+                        "live_allowed": False,
+                    },
+                },
+            }
+        )
+
+        self.assertEqual("paused", artifact["lifecycle_status"])
+        self.assertEqual("before-live-small", artifact["lifecycle"]["pausedFrom"])
+
     def test_unverified_backtester_artifact_stays_visible_with_verification_badges(self) -> None:
         artifact = normalize_strategy_artifact(
             {

@@ -5,6 +5,11 @@ release/
 build_pending/
 release_pending/
 qa/
+.playwright-cli/
+logs/
+output/
+release_backup/
+tmp/
 __pycache__/
 live_trader/__pycache__/
 .server.pid

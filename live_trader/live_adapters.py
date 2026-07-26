@@ -24,9 +24,11 @@ KIS_OVERSEAS_ORDER_ENDPOINT = "/uapi/overseas-stock/v1/trading/order"
 KIS_DOMESTIC_CANCEL_ENDPOINT = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 KIS_OVERSEAS_CANCEL_ENDPOINT = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 KIS_DOMESTIC_BALANCE_ENDPOINT = "/uapi/domestic-stock/v1/trading/inquire-balance"
+KIS_OVERSEAS_BALANCE_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-balance"
 KIS_DOMESTIC_TR_IDS = {"BUY": "TTTC0012U", "SELL": "TTTC0011U"}
 KIS_OVERSEAS_TR_IDS = {"BUY": "TTTT1002U", "SELL": "TTTT1006U"}
 KIS_DOMESTIC_BALANCE_TR_ID = "TTTC8434R"
+KIS_OVERSEAS_BALANCE_TR_ID = "TTTS3012R"
 
 BINANCE_BASE_URL = "https://api.binance.com"
 BINANCE_ORDER_ENDPOINT = "/api/v3/order"
@@ -356,6 +358,81 @@ def build_kis_domestic_balance_request(*, access_token: str = "") -> PreparedReq
             "appkey_configured": bool(app_key),
             "appsecret_configured": bool(app_secret),
             "tr_id": KIS_DOMESTIC_BALANCE_TR_ID,
+            "custtype": "P",
+        },
+        body=None,
+        query=query,
+        blocked_reasons=blocked,
+    )
+
+
+def build_kis_overseas_balance_request(
+    *,
+    access_token: str = "",
+    exchange: str = "NASD",
+    currency: str = "USD",
+    context_fk200: str = "",
+    context_nk200: str = "",
+    continuation: str = "",
+) -> PreparedRequest:
+    """Build the official read-only KIS live overseas balance request.
+
+    ``NASD`` means all US markets for a live account.  Continuation keys are
+    explicit so callers can prove that the position snapshot is complete
+    before treating an absent symbol as a zero balance.
+    """
+
+    required = ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE")
+    blocked = missing_env(*required)
+    app_key = env_value("KIS_APP_KEY")
+    app_secret = env_value("KIS_APP_SECRET")
+    account_no = env_value("KIS_ACCOUNT_NO")
+    product_code = env_value("KIS_ACCOUNT_PRODUCT_CODE")
+    base_url = env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL
+    cano, acnt_prdt_cd = split_kis_account(account_no, product_code)
+    normalized_exchange = str(exchange or "").strip().upper()
+    normalized_currency = str(currency or "").strip().upper()
+    normalized_continuation = str(continuation or "").strip().upper()
+    if not access_token:
+        blocked.append("access_token")
+    if not normalized_exchange:
+        blocked.append("exchange")
+    if not normalized_currency:
+        blocked.append("currency")
+    if normalized_continuation not in {"", "N"}:
+        blocked.append("continuation")
+    query: dict[str, object] = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": acnt_prdt_cd,
+        "OVRS_EXCG_CD": normalized_exchange,
+        "TR_CRCY_CD": normalized_currency,
+        "CTX_AREA_FK200": str(context_fk200 or ""),
+        "CTX_AREA_NK200": str(context_nk200 or ""),
+    }
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {access_token}" if access_token else "",
+        "appkey": app_key,
+        "appsecret": app_secret,
+        "tr_id": KIS_OVERSEAS_BALANCE_TR_ID,
+        "custtype": "P",
+    }
+    if normalized_continuation:
+        headers["tr_cont"] = normalized_continuation
+    encoded = urllib.parse.urlencode(query)
+    return PreparedRequest(
+        provider="kis",
+        method="GET",
+        url=f"{base_url.rstrip('/')}{KIS_OVERSEAS_BALANCE_ENDPOINT}?{encoded}",
+        endpoint=KIS_OVERSEAS_BALANCE_ENDPOINT,
+        headers=headers,
+        safe_headers={
+            "content-type": headers["content-type"],
+            "authorization_configured": bool(access_token),
+            "appkey_configured": bool(app_key),
+            "appsecret_configured": bool(app_secret),
+            "tr_id": KIS_OVERSEAS_BALANCE_TR_ID,
+            "tr_cont": normalized_continuation,
             "custtype": "P",
         },
         body=None,
@@ -750,10 +827,22 @@ def http_json(
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310 - official user-selected broker endpoints.
             text = response.read().decode("utf-8", errors="replace")
-            return {"ok": 200 <= int(response.status) < 400, "statusCode": int(response.status), "text": text, "json": parse_json(text)}
+            return {
+                "ok": 200 <= int(response.status) < 400,
+                "statusCode": int(response.status),
+                "text": text,
+                "json": parse_json(text),
+                "trCont": str(response.headers.get("tr_cont") or ""),
+            }
     except urllib.error.HTTPError as exc:
         text = exc.read().decode("utf-8", errors="replace")
-        return {"ok": False, "statusCode": int(exc.code), "text": text, "json": parse_json(text)}
+        return {
+            "ok": False,
+            "statusCode": int(exc.code),
+            "text": text,
+            "json": parse_json(text),
+            "trCont": str(exc.headers.get("tr_cont") or "") if exc.headers else "",
+        }
     except urllib.error.URLError as exc:
         return {"ok": False, "statusCode": 0, "text": str(exc.reason), "json": {}}
 

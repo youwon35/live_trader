@@ -10,6 +10,7 @@ from live_trader.live_adapters import (
     KIS_DOMESTIC_BALANCE_ENDPOINT,
     KIS_DOMESTIC_CANCEL_ENDPOINT,
     KIS_DOMESTIC_ORDER_ENDPOINT,
+    KIS_OVERSEAS_BALANCE_ENDPOINT,
     KIS_OVERSEAS_ORDER_ENDPOINT,
     UPBIT_ACCOUNTS_ENDPOINT,
     UPBIT_ORDER_ENDPOINT,
@@ -22,6 +23,7 @@ from live_trader.live_adapters import (
     build_kis_domestic_balance_request,
     build_kis_cancel_order_request,
     build_kis_live_order_request,
+    build_kis_overseas_balance_request,
     build_upbit_accounts_request,
     build_upbit_cancel_order_request,
     build_upbit_order_request,
@@ -136,6 +138,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertEqual(prepared.body["PDNO"], "005930")
         self.assertEqual(prepared.body["ORD_QTY"], "3")
         self.assertEqual(prepared.body["ORD_UNPR"], "71000")
+        self.assertEqual(prepared.body["ORD_DVSN"], "00")
 
     def test_kis_overseas_sell_order_request_uses_overseas_endpoint_and_tr_id(self) -> None:
         os.environ.update(
@@ -154,6 +157,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
                 "side": "SELL",
                 "quantity": 2,
                 "price": 199.125,
+                "order_type": "00",
             }
         )
 
@@ -164,6 +168,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertEqual(prepared.body["PDNO"], "AAPL")
         self.assertEqual(prepared.body["ORD_QTY"], "2")
         self.assertEqual(prepared.body["OVRS_ORD_UNPR"], "199.125")
+        self.assertEqual(prepared.body["ORD_DVSN"], "00")
 
     def test_binance_test_order_request_signs_query_without_leaking_secret_in_preview(self) -> None:
         os.environ.update(
@@ -299,6 +304,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
 
         with patch("live_trader.live_adapters.time.time", return_value=1700000000.123):
             kis = build_kis_domestic_balance_request(access_token="token-123")
+            kis_overseas = build_kis_overseas_balance_request(access_token="token-123")
             binance = build_binance_account_request()
             upbit = build_upbit_accounts_request()
 
@@ -307,6 +313,15 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertEqual(kis.endpoint, KIS_DOMESTIC_BALANCE_ENDPOINT)
         self.assertIn("CANO=12345678", kis.url)
         self.assertEqual(kis.safe_headers["authorization_configured"], True)
+
+        self.assertTrue(kis_overseas.can_send)
+        self.assertEqual("GET", kis_overseas.method)
+        self.assertEqual(KIS_OVERSEAS_BALANCE_ENDPOINT, kis_overseas.endpoint)
+        self.assertEqual("TTTS3012R", kis_overseas.headers["tr_id"])
+        self.assertEqual("NASD", kis_overseas.query["OVRS_EXCG_CD"])
+        self.assertEqual("USD", kis_overseas.query["TR_CRCY_CD"])
+        self.assertEqual("", kis_overseas.query["CTX_AREA_FK200"])
+        self.assertEqual("", kis_overseas.query["CTX_AREA_NK200"])
 
         self.assertTrue(binance.can_send)
         self.assertEqual(binance.method, "GET")
@@ -366,6 +381,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         binance = build_binance_spot_order_request({"symbol": "", "side": "BUY", "quantity": 0})
         upbit = build_upbit_order_request({"market": "", "side": "SELL", "quantity": 0})
         kis_balance = build_kis_domestic_balance_request()
+        kis_overseas_balance = build_kis_overseas_balance_request()
         binance_account = build_binance_account_request()
         upbit_accounts = build_upbit_accounts_request()
 
@@ -390,6 +406,8 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
 
         self.assertFalse(kis_balance.can_send)
         self.assertIn("access_token", kis_balance.blocked_reasons)
+        self.assertFalse(kis_overseas_balance.can_send)
+        self.assertIn("access_token", kis_overseas_balance.blocked_reasons)
         self.assertFalse(binance_account.can_send)
         self.assertIn("BINANCE_API_KEY", binance_account.blocked_reasons)
         self.assertFalse(upbit_accounts.can_send)

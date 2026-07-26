@@ -652,6 +652,19 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     final_test = _dict_value(artifact.get("finalTest") or artifact.get("final_test"))
     strategy_contract = _dict_value(artifact.get("strategy_contract") or artifact.get("strategyContract"))
     trader_contract = _dict_value(artifact.get("trader_contract") or artifact.get("traderContract"))
+    trader_scope = _dict_value(trader_contract.get("scope"))
+    raw_allowed_brokers = (
+        trader_scope.get("allowed_brokers")
+        or trader_scope.get("allowedBrokers")
+        or artifact.get("allowed_brokers")
+        or artifact.get("allowedBrokers")
+        or []
+    )
+    allowed_brokers = [
+        str(item).strip().lower()
+        for item in raw_allowed_brokers
+        if str(item).strip()
+    ] if isinstance(raw_allowed_brokers, (list, tuple, set)) else []
     deployment = _dict_value(artifact.get("_deployment"))
     custom_definition = _custom_definition_from_artifact(artifact, strategy_contract)
     plugin_id = _normalize_plugin_id(
@@ -777,6 +790,16 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "name": str(artifact.get("name") or artifact.get("strategyName") or strategy_id),
         "symbol": str(artifact.get("symbol") or dataset.get("symbol") or data_artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN"),
         "asset": str(artifact.get("asset") or dataset.get("assetClass") or data_artifact.get("assetClass") or artifact.get("assetClass") or "unknown"),
+        "dataset_provider": str(dataset.get("provider") or artifact.get("datasetProvider") or ""),
+        "market_data_provider": str(
+            artifact.get("marketDataProvider")
+            or artifact.get("market_data_provider")
+            or data_artifact.get("marketDataProvider")
+            or data_artifact.get("provider")
+            or ""
+        ),
+        "broker_id": str(artifact.get("brokerId") or artifact.get("broker_id") or trader_scope.get("brokerId") or ""),
+        "allowed_brokers": allowed_brokers,
         "instrument_id": str(data_artifact.get("instrumentId") or artifact.get("instrumentId") or artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN"),
         "market_type": market_type,
         "allow_short": allow_short and market_type in {"margin", "futures", "future", "perpetual"},
@@ -799,7 +822,12 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
             "label": str(lifecycle.get("label") or _promotion_stage_label(lifecycle_status)),
             "updatedAt": str(lifecycle.get("updatedAt") or artifact.get("updatedAt") or ""),
             "history": lifecycle.get("history") if isinstance(lifecycle.get("history"), list) else [],
-            "pausedFrom": str(lifecycle.get("pausedFrom") or artifact.get("pausedFrom") or ""),
+            "pausedFrom": str(
+                lifecycle.get("pausedFrom")
+                or permissions.get("pausedFrom")
+                or artifact.get("pausedFrom")
+                or ""
+            ),
         },
         "promotion_stage": promotion["stage"],
         "release_id": release["release_id"],

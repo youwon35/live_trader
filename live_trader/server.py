@@ -201,7 +201,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             self.send_json(state.run_final_preflight())
             return
         if parsed.path == "/api/upbit-smoke-preview":
-            self.send_json(state.preview_upbit_smoke_order(payload.get("notional_krw", 5000)))
+            self.send_json(
+                state.preview_upbit_smoke_order(
+                    str(payload.get("strategy_id", "")),
+                    payload.get("notional_krw", 5000),
+                )
+            )
             return
         if parsed.path == "/api/upbit-smoke-submit":
             self.send_json(

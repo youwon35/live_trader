@@ -1007,3 +1007,40 @@ API 없이 실제 실행한 기능:
 - KIS, Binance, Upbit execution stream에서 처음 들어온 `filled/done/executed` 이벤트만 Telegram으로 전송한다. 재시작이나 재동기화로 같은 체결을 다시 읽어도 broker event ID 기준으로 중복 발송하지 않는다.
 - 알림에는 브로커·운용 모드, 종목·방향·수량·가격·주문금액, 전략·포트폴리오, 동기화 후 현금·평가액·포지션 전후, 수수료·주문 ID·체결 시각·Kill Switch 상태가 포함된다.
 - Kill Switch, 심각 안전 경고, 포지션 불일치, 체결 스트림 이상도 별도 긴급 알림으로 보낸다. Telegram 네트워크 장애는 주문·감시 루프를 멈추지 않는다.
+
+## 2026-07-26 장시간 감시·복구·Telegram P0 재검증
+
+- 유휴 snapshot polling을 throttle하고 bounded audit/event 저장을 유지해 오래 켜 두어도 요청·메모리·로그가 무제한 늘지 않도록 했다.
+- KIS/Binance/Upbit 연결과 사설 체결 스트림은 정상→장애→복구 전이에서만 Telegram을 보내며 같은 상태의 반복 경고를 억제한다.
+- 체크포인트가 없거나 손상됐으면 시작 시 MONITOR, Dry Run, 신규 진입 차단으로 fail-closed하고 경고를 한 번만 보낸다.
+- snapshot 응답은 계좌·서명 요청 자료를 마스킹하며, 실거래 주문은 현재 Artifact hash의 Forward evidence, 최신 재검증, Before Live-Small, 브로커 대조와 1회용 운용자 확인을 모두 요구한다.
+- 최신 EXE 교체 전 `MONITOR + dry-run + 신규 진입 차단`, 주문 0건, continuous runtime 정지를 확인했다. 실행 중 감시는 유지한 채 `release_pending`에 빌드한 뒤 기존 EXE를 복구용으로 백업하고 교체했다.
+- 최신 `release\LiveTrader.exe` SHA-256은 `0A99A70D439DF922A0879D3BBDD14030BE9AD3A4DAD07F635667311DB3DB0CDD`다.
+- 재시작 뒤에도 MONITOR/Dry Run/신규 진입 차단/주문 0건을 유지했다. 20초 유휴 측정은 단일 코어 약 1.17%, working set 약 126.7MiB, memory·handle 증가 0이었다.
+- Python unittest 137개, Node polling 회귀 1개, Vite/PyInstaller와 100/125/150% 데스크톱 계약이 통과했다.
+- KIS, Binance, Upbit API 환경 변수는 존재하지만 `LIVE_TRADER_ENABLE_REAL_ORDERS=false`이고 현재 hash로 Before Live-Small에 도달한 새 전략이 없어 실주문은 정직하게 차단된 상태다.
+
+## 2026-07-26 브로커별 주문 계약과 KIS 해외주식 원자 대조
+
+- Binance는 현물 시장가 주문, Upbit는 원화 시장가 매수/수량 시장가 매도, KIS 국내는 시장가, KIS 미국주식은 최신 시세를 기준으로 한 지정가 계약을 각각 분리했다. 선택된 브로커·시장과 다른 주문형식은 실행 전에 차단한다.
+- 계좌와 포지션 대조를 broker scope로 분리해 한 브로커의 미지원 기능이나 오류가 다른 브로커의 정상 감시를 오염시키지 않는다.
+- KIS 해외주식은 공식 `TTTS3012R` 잔고 API를 사용하고 NASD/USD 전체 미국시장 조회와 연속조회 pagination을 처리한다. 국내·해외 중 하나라도 부분 응답, 반복 continuation key, 인증/API 오류가 나면 합쳐진 snapshot 전체를 fail-closed한다.
+- 새 실행 파일에서 읽기 전용 실제 대조를 수행해 계좌 3개와 포지션 7개, 총 10개 항목이 모두 일치했다. capability gap, mismatch, blocking issue, API required 항목은 각각 0건이며 주문 제출이나 계좌 변경은 수행하지 않았다.
+- Live Trader는 계속 `MONITOR`, dry-run, 운용자 미확인, 신규 주문 0건이다. 사용자의 자금 사용 승인은 주문 한도 권한이지만 Forward Shadow/Paper 승급 근거를 생략하는 권한은 아니므로, 실제 시간으로 쌓여야 하는 증거가 부족한 canonical 전략은 실거래로 올리지 않았다.
+- 최신 `release\LiveTrader.exe` SHA-256은 `C22DBDC0697B54203329A72AA114BC91DD802AC83A341B3DC3A54AFE4798F414`다. 재시작 뒤 실제 잔고 대조와 10개 화면 UI smoke, polling 회귀, Python 153개 테스트가 통과했다.
+
+## 2026-07-26 Live 승급·연속 실행 중지 안전성 통일
+
+- Before Live-Small에서 Live로 승급할 때 주문 전송 성공이 아니라 공용 정책의 실제 canary 체결 3건을 요구한다. 세 체결은 서로 다른 broker ledger fill이고 non-dry, 양수 수량, broker order/event ID를 가지며 현재 Strategy/Artifact ID·artifact/content hash·deployment ID/revision과 Before Live-Small 진입시각 뒤의 경계가 정확히 일치해야 한다. pause/resume 전 과거 체결은 인정하지 않으며 1~2건은 사유와 현재 건수를 표시하고 차단한다.
+- start/set_mode/stop은 하나의 공개 제어 잠금 순서를 사용한다. continuous runtime 중지는 엔진을 잠금 안에서 MONITOR로 전환한 뒤 잠금을 풀고 worker를 join하므로 due-bar flush가 operation lock을 기다리는 순간에도 교착하지 않는다.
+- supervisor가 `FAILED` 또는 `runtime-stop-timeout`을 반환하면 controller, 다중 profile manager, API 응답까지 `ok: false`를 보존한다. 아직 살아 있는 실패/timeout thread를 STOPPED로 덮거나 새 supervisor로 교체하지 않으며, 전역 profile은 fail-closed MONITOR로 동기화한다.
+- KIS/Binance/Upbit 주문 adapter와 place/cancel 라우팅은 구현되어 있다. 현재 `live_order_adapter_ready=false`인 직접 원인은 별도 배선 누락이 아니라 `LIVE_TRADER_ENABLE_REAL_ORDERS=false` 안전 플래그이며 이 작업에서는 변경하지 않았다.
+- 소스 안전성 수정 뒤 Live Trader unittest 163개와 공용 runtime 155개가 통과했다.
+
+## 2026-07-26 최종 실행 파일 교체와 실제 계좌 재대조
+
+- 최신 소스로 Vite production build, 100/125/150% 데스크톱 계약, PyInstaller 패키징과 `--help` 기동 smoke를 통과했다.
+- 교체 직전 기존 프로그램이 `MONITOR`, Dry Run, 운용자 미확인, 주문 큐 0건임을 확인하고 이전 EXE를 `release_backup`에 보존한 뒤 새 빌드로 교체했다.
+- 최신 `release\LiveTrader.exe`는 19,421,996 bytes이며 SHA-256은 `E871160921BAC9E1EECF41753CB81B1275F28CDBCDF8B51B3BC4727CF085AF9B`다.
+- 재기동 뒤에도 `MONITOR`, Dry Run, 운용자 미확인, Kill Switch OFF, 주문 0건을 유지했다. 읽기 전용 실제 브로커 대조를 다시 실행해 KIS·Binance·Upbit 계좌 3개와 포지션 7개가 모두 PASS였고 API 오류·불일치·차단 항목은 0건이었다.
+- Node polling 회귀와 Live Trader unittest 163개가 통과했다. 실제 주문은 현재 Artifact와 정확히 일치하는 자연 Shadow/Paper 및 canary 체결 근거가 부족해 생성하지 않았다.
