@@ -2905,14 +2905,22 @@ function TelegramConnectionPanel() {
     void refreshConnection();
   }, [refreshConnection]);
 
+  const notificationsMuted = connection.connected && connection.notificationsEnabled === false;
+  const statusLabel = connection.connected
+    ? notificationsMuted ? "MUTED" : "CONNECTED"
+    : connection.status === "checking" ? "CHECKING" : "CHECK";
+  const statusTone = connection.connected && !notificationsMuted
+    ? "success"
+    : connection.status === "error" ? "danger" : "warning";
+
   return (
     <section className="panel telegram-settings-panel">
       <PanelHeader
         title="Telegram 공통 알림"
         subtitle="메시지를 보내지 않고 Bot API와 채팅 접근 권한을 확인합니다."
         suffix={(
-          <StatusPill tone={connection.connected ? "success" : connection.status === "error" ? "danger" : "warning"}>
-            {connection.connected ? "CONNECTED" : connection.status === "checking" ? "CHECKING" : "CHECK"}
+          <StatusPill tone={statusTone}>
+            {statusLabel}
           </StatusPill>
         )}
       />

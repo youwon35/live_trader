@@ -1091,3 +1091,11 @@ API 없이 실제 실행한 기능:
 - 실제 저장 설정으로 봇 계정과 대상 채팅 접근을 확인했고, 브라우저 콘솔 오류 없이 `연결 정상` 상태가 표시됐다.
 - Telegram runtime unittest 10개, Live Trader Telegram unittest 12개, Vite production build와 실제 브라우저 화면 검증을 통과했다.
 - 최신 `release\LiveTrader.exe`는 19,445,286 bytes이며 SHA-256은 `A0707D133E5EE2F54CC97EA684D736CD2E4097C8AF0CF5F0FC8C62A3E18E4E66`다.
+
+## 2026-07-28 Telegram 네트워크 복구·알림 정책 전문화
+
+- 공용 상태 구성요소가 실제 `offline → online` 복구를 관찰했을 때만 Telegram 연결 검사를 한 번 자동 재실행한다. 중복 online 이벤트와 진행 중 검사와의 중복 호출은 차단한다.
+- Bot·채팅 연결과 Live Trader 알림 활성화 여부를 분리해, 연결은 정상이지만 알림이 꺼진 경우 상단 pill과 상태 상자를 `MUTED` 경고 상태로 표시한다.
+- 공통 마스터 알림 스위치가 앱별 설정보다 우선하도록 runtime 정책을 바로잡고, 연결 응답에서 불필요한 Bot/Chat 숫자 ID를 제거했다.
+- Live Telegram 12개 테스트, Vite production build, PyInstaller 패키징과 Telegram·실주문 비활성 `--help` 기동 smoke가 통과했다.
+- 최신 `release\LiveTrader.exe`는 19,448,453 bytes이며 SHA-256은 `87E55FCC8287DC1603FD939264783AF3FC058F4A0BA289BDB1AB3C27CF5069D1`다.
