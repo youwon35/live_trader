@@ -1077,3 +1077,9 @@ API 없이 실제 실행한 기능:
 - 실거래 준비의 자산 선택, 연결 브로커 선택, 자동화 자산 선택을 공용 `NestedTabs` 카드형으로 명시해 다른 앱의 실제 작업 영역 전환과 같은 시각·클릭 규칙을 사용하도록 했다.
 - 전체 Python unittest 176개, Vite production build, 100/125/150% 화면 배율·클릭 계약과 PyInstaller 패키징이 통과했다. 실주문과 Telegram은 비활성화했다.
 - 최신 `release\LiveTrader.exe`는 19,445,350 bytes, SHA-256 `9AAC9A54296D0BB3828EF21A0B1E5E3D1D25CC7F2466CA23D774F6186C1572C5`다.
+
+## 2026-07-28 휴지통 아이콘 공통 스타일
+
+- 저장된 전략 검색 조건을 지우는 아이콘 전용 버튼에 공용 `trash-icon-button`을 적용했다. 수집기·Paper Trader와 같은 빨간 배경, 회색 외곽선, 흰색 아이콘을 사용한다.
+- Vite production build, 100/125/150% 화면 계약, PyInstaller 패키징과 Telegram·실주문 비활성 `--help` 기동 smoke가 통과했다.
+- 최신 `release\LiveTrader.exe`는 19,443,640 bytes, SHA-256 `7A8E75ECEECA7312A1CF492C1C93C3B15E10FC465D1374AEA3C5574F282A8F92`다.

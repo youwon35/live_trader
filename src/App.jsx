@@ -3758,7 +3758,7 @@ function StrategyDiscoveryToolbar({
         </select>
         <input aria-label="검색 조건 이름" value={savedSearchName} onChange={(event) => onSavedSearchNameChange(event.target.value)} placeholder="검색 조건 이름" />
         <button className="secondary-button compact-button" type="button" disabled={!savedSearchName.trim()} onClick={onSavedSearchSave}><Save size={15} />조건 저장</button>
-        <button className="secondary-button compact-button icon-only" type="button" disabled={!savedSearchId} onClick={onSavedSearchDelete} aria-label="저장 검색 삭제"><Trash2 size={15} /></button>
+        <button className="secondary-button compact-button icon-only trash-icon-button" type="button" disabled={!savedSearchId} onClick={onSavedSearchDelete} aria-label="저장 검색 삭제"><Trash2 size={15} /></button>
       </div>
       <div className="artifact-quick-filters">
         {[
