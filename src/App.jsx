@@ -38,6 +38,7 @@ import {
   cancelOrder,
   getEnvSettings,
   getSnapshot,
+  getTelegramConnection,
   getUiSettings,
   loadArtifactMetadata,
   loadSharedSearchPresets,
@@ -72,6 +73,7 @@ import { readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/desig
 import { LAYOUT_RESIZE_DIRECTIONS } from "../../../packages/design/layout-editing.js";
 import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
+import { createTelegramConnectionStatus } from "../../../packages/design/telegram-connection-status.js";
 import {
   createEmptyState,
   createFormField,
@@ -94,6 +96,7 @@ import {
 const ActionButton = createActionButton(React);
 const BrokerAccountWorkspace = createBrokerAccountWorkspace(React);
 const StatusPill = createStatusPill(React);
+const TelegramConnectionStatus = createTelegramConnectionStatus(React);
 const EmptyState = createEmptyState(React);
 const FormField = createFormField(React);
 const IconButton = createIconButton(React);
@@ -1606,6 +1609,7 @@ function WorkspaceContent({
             resetWorkspaceLayout={resetWorkspaceLayout}
           />
           <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} onSave={onEnvSettings} />
+          <TelegramConnectionPanel />
         </div>
       </section>,
     );
@@ -2867,6 +2871,52 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
           연결 설정 저장
         </button>
       </div>
+    </section>
+  );
+}
+
+function TelegramConnectionPanel() {
+  const [connection, setConnection] = useState({
+    status: "idle",
+    connected: false,
+    detail: "Bot API와 채팅 접근 권한을 확인합니다.",
+  });
+
+  const refreshConnection = React.useCallback(async () => {
+    setConnection((current) => ({ ...current, status: "checking", connected: false }));
+    try {
+      const payload = await getTelegramConnection();
+      setConnection(payload.connection ?? {
+        status: "error",
+        connected: false,
+        detail: "Telegram 연결 응답이 비어 있습니다.",
+      });
+    } catch (error) {
+      setConnection({
+        status: "error",
+        connected: false,
+        checkedAt: new Date().toISOString(),
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshConnection();
+  }, [refreshConnection]);
+
+  return (
+    <section className="panel telegram-settings-panel">
+      <PanelHeader
+        title="Telegram 공통 알림"
+        subtitle="메시지를 보내지 않고 Bot API와 채팅 접근 권한을 확인합니다."
+        suffix={(
+          <StatusPill tone={connection.connected ? "success" : connection.status === "error" ? "danger" : "warning"}>
+            {connection.connected ? "CONNECTED" : connection.status === "checking" ? "CHECKING" : "CHECK"}
+          </StatusPill>
+        )}
+      />
+      <TelegramConnectionStatus connection={connection} onRefresh={refreshConnection} />
     </section>
   );
 }

@@ -2,6 +2,10 @@ export async function getSnapshot() {
   return request("/api/snapshot");
 }
 
+export async function getTelegramConnection() {
+  return request("/api/telegram/connection");
+}
+
 export async function getUiSettings() {
   return request("/api/ui-settings");
 }

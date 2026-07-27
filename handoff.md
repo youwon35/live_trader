@@ -1083,3 +1083,11 @@ API 없이 실제 실행한 기능:
 - 저장된 전략 검색 조건을 지우는 아이콘 전용 버튼에 공용 `trash-icon-button`을 적용했다. 수집기·Paper Trader와 같은 빨간 배경, 회색 외곽선, 흰색 아이콘을 사용한다.
 - Vite production build, 100/125/150% 화면 계약, PyInstaller 패키징과 Telegram·실주문 비활성 `--help` 기동 smoke가 통과했다.
 - 최신 `release\LiveTrader.exe`는 19,443,640 bytes, SHA-256 `7A8E75ECEECA7312A1CF492C1C93C3B15E10FC465D1374AEA3C5574F282A8F92`다.
+
+## 2026-07-28 Telegram 실연결 상태 표시
+
+- 설정 화면에 공용 Telegram 연결 상태 패널을 추가했다. 화면 진입 시 한 번 자동 확인하고 `다시 확인`으로 즉시 재검사할 수 있다.
+- 확인은 저장된 bot token과 chat ID로 Telegram `getMe`, `getChat`만 호출한다. 테스트 메시지나 거래 알림을 보내지 않으며 오류 메시지에서도 토큰을 제거한다.
+- 실제 저장 설정으로 봇 계정과 대상 채팅 접근을 확인했고, 브라우저 콘솔 오류 없이 `연결 정상` 상태가 표시됐다.
+- Telegram runtime unittest 10개, Live Trader Telegram unittest 12개, Vite production build와 실제 브라우저 화면 검증을 통과했다.
+- 최신 `release\LiveTrader.exe`는 19,445,286 bytes이며 SHA-256은 `A0707D133E5EE2F54CC97EA684D736CD2E4097C8AF0CF5F0FC8C62A3E18E4E66`다.

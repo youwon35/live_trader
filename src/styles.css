@@ -1,6 +1,10 @@
 @import "../../../packages/design/design-tokens.css";
 @import "../../../packages/design/interaction-standards.css";
 
+.telegram-settings-panel .telegram-connection-status {
+  margin: 12px;
+}
+
 :root {
   --accent-contrast-text: #ffffff;
   --placeholder-text: #94a3b8;

@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 from . import env_settings, state
 from trading_runtime.artifact_metadata import ArtifactMetadataStore
-from trading_runtime.telegram_notifications import save_shared_telegram_settings
+from trading_runtime.telegram_notifications import save_shared_telegram_settings, verify_telegram_connection
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -119,6 +119,17 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/telegram":
             self.send_json({"ok": True, "telegram": state.TELEGRAM_DISPATCHER.status()})
+            return
+        if parsed.path == "/api/telegram/connection":
+            self.send_json(
+                {
+                    "ok": True,
+                    "connection": verify_telegram_connection(
+                        state.TELEGRAM_DISPATCHER.settings,
+                        api_client=state.TELEGRAM_DISPATCHER.api_client,
+                    ),
+                }
+            )
             return
         self.serve_static(parsed.path)
 
