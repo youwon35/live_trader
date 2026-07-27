@@ -16,6 +16,30 @@ DEFAULT_HEARTBEAT_LEASE_SECONDS = 90.0
 
 
 def run_daemon(profiles: Iterable[str], mode: str = "MONITOR", poll_seconds: float = 30.0) -> int:
+    """Run the daemon without ever leaking an operational exception to PyInstaller."""
+
+    requested_profiles = tuple(profiles)
+    try:
+        return _run_daemon(requested_profiles, mode, poll_seconds)
+    except Exception as exc:  # PyInstaller process boundary; task scheduler handles the non-zero exit.
+        try:
+            status_path = default_runtime_data_root() / "logs" / "daemon_status.json"
+            _write_status(status_path, {
+                "schemaVersion": "live-trader-daemon-v2",
+                "phase": "FAILED",
+                "running": False,
+                "pid": os.getpid(),
+                "failedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": mode,
+                "profiles": list(requested_profiles),
+                "fatalError": _exception_detail(exc),
+            })
+        except Exception:
+            pass
+        return 1
+
+
+def _run_daemon(profiles: Iterable[str], mode: str, poll_seconds: float) -> int:
     """Run market and private execution monitors without a desktop window."""
     from . import state
 
@@ -47,8 +71,21 @@ def run_daemon(profiles: Iterable[str], mode: str = "MONITOR", poll_seconds: flo
         "mode": mode,
         "profiles": list(selected),
     })
-    stream_result = state.start_execution_streams("all")
-    runtime_results = {profile: state.start_continuous_runtime(profile, mode) for profile in selected}
+    stream_result: dict[str, object] = {
+        "ok": False,
+        "reason": "execution stream startup not attempted",
+    }
+    runtime_results: dict[str, dict[str, object]] = {
+        profile: {
+            "ok": False,
+            "reason": "continuous runtime startup not attempted",
+        }
+        for profile in selected
+    }
+    startup_attempts = {
+        "streams": 0,
+        "runtimes": {profile: 0 for profile in selected},
+    }
 
     def status_payload(
         *,
@@ -59,9 +96,10 @@ def run_daemon(profiles: Iterable[str], mode: str = "MONITOR", poll_seconds: flo
             for key, value in runtime_results.items()
         }
         all_started = stream_result.get("ok") is True and all(runtime_ok.values())
+        poll_ok = not last_execution_poll or last_execution_poll.get("ok") is not False
         return {
             "schemaVersion": "live-trader-daemon-v2",
-            "phase": "RUNNING" if all_started else "DEGRADED",
+            "phase": "RUNNING" if all_started and poll_ok else "DEGRADED",
             "running": True,
             "pid": os.getpid(),
             "startedAt": started_at,
@@ -69,31 +107,79 @@ def run_daemon(profiles: Iterable[str], mode: str = "MONITOR", poll_seconds: flo
             "heartbeatLeaseSeconds": heartbeat_lease_seconds,
             "mode": mode,
             "profiles": list(selected),
-            "runtime": state.LIVE_CONTINUOUS_CONTROLLER.snapshot(),
-            "executionStreams": state.LIVE_EXECUTION_STREAMS.snapshot(),
+            "runtime": _safe_dict_call(
+                "continuous runtime snapshot",
+                state.LIVE_CONTINUOUS_CONTROLLER.snapshot,
+            ),
+            "executionStreams": _safe_dict_call(
+                "execution stream snapshot",
+                state.LIVE_EXECUTION_STREAMS.snapshot,
+            ),
             "lastExecutionPoll": last_execution_poll or {},
             "startup": {
                 "streamsOk": stream_result.get("ok") is True,
                 "runtimes": runtime_ok,
+                "attempts": startup_attempts,
+                "details": {
+                    "streams": _result_summary(stream_result),
+                    "runtimes": {
+                        profile: _result_summary(result)
+                        for profile, result in runtime_results.items()
+                    },
+                },
             },
         }
 
-    _write_status(status_path, status_payload())
     try:
+        startup_attempts["streams"] = 1
+        stream_result = _safe_dict_call(
+            "execution stream startup",
+            lambda: state.start_execution_streams("all"),
+        )
+        for profile in selected:
+            startup_attempts["runtimes"][profile] = 1
+            runtime_results[profile] = _safe_dict_call(
+                f"{profile} continuous runtime startup",
+                lambda profile=profile: state.start_continuous_runtime(profile, mode),
+            )
+        last_poll_result: dict[str, object] | None = None
+        _write_status(status_path, status_payload())
         while not stop.wait(max(5.0, float(poll_seconds))):
-            poll_result = state.poll_execution_events("all")
+            poll_result = _safe_dict_call(
+                "execution event poll",
+                lambda: state.poll_execution_events("all"),
+            )
+            last_poll_result = _result_summary(poll_result)
+            if stream_result.get("ok") is not True:
+                startup_attempts["streams"] = int(startup_attempts["streams"]) + 1
+                stream_result = _safe_dict_call(
+                    "execution stream startup retry",
+                    lambda: state.start_execution_streams("all"),
+                )
+            for profile in selected:
+                if runtime_results[profile].get("ok") is True:
+                    continue
+                attempts = startup_attempts["runtimes"]
+                attempts[profile] = int(attempts[profile]) + 1
+                runtime_results[profile] = _safe_dict_call(
+                    f"{profile} continuous runtime startup retry",
+                    lambda profile=profile: state.start_continuous_runtime(profile, mode),
+                )
             _write_status(
                 status_path,
-                status_payload(
-                    last_execution_poll={
-                        "ok": poll_result.get("ok"),
-                        "reason": poll_result.get("reason"),
-                    }
-                ),
+                status_payload(last_execution_poll=last_poll_result),
             )
     finally:
-        state.stop_continuous_runtime("")
-        state.stop_execution_streams()
+        cleanup_results = {
+            "runtimes": _result_summary(_safe_dict_call(
+                "continuous runtime shutdown",
+                lambda: state.stop_continuous_runtime(""),
+            )),
+            "streams": _result_summary(_safe_dict_call(
+                "execution stream shutdown",
+                state.stop_execution_streams,
+            )),
+        }
         _write_status(status_path, {
             "schemaVersion": "live-trader-daemon-v2",
             "phase": "STOPPED",
@@ -104,6 +190,7 @@ def run_daemon(profiles: Iterable[str], mode: str = "MONITOR", poll_seconds: flo
             "heartbeatLeaseSeconds": heartbeat_lease_seconds,
             "mode": mode,
             "profiles": list(selected),
+            "cleanup": cleanup_results,
         })
     return 0
 
@@ -214,6 +301,62 @@ def process_is_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _safe_dict_call(
+    operation: str,
+    callback: Callable[[], object],
+) -> dict[str, object]:
+    try:
+        result = callback()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": _exception_detail(exc),
+            "operation": operation,
+            "errorType": type(exc).__name__,
+        }
+    if isinstance(result, dict):
+        return dict(result)
+    return {
+        "ok": False,
+        "reason": f"{operation} returned {type(result).__name__}, expected dict",
+        "operation": operation,
+        "errorType": "InvalidResult",
+    }
+
+
+def _result_summary(result: dict[str, object]) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "ok": result.get("ok"),
+        "reason": str(result.get("reason") or "")[:500],
+        **(
+            {"operation": str(result.get("operation") or "")[:100]}
+            if result.get("operation")
+            else {}
+        ),
+        **(
+            {"errorType": str(result.get("errorType") or "")[:100]}
+            if result.get("errorType")
+            else {}
+        ),
+    }
+    errors = result.get("errors")
+    if isinstance(errors, list):
+        summary["errors"] = [
+            {
+                "brokerId": str(error.get("broker_id") or "")[:50],
+                "detail": str(error.get("detail") or "")[:500],
+            }
+            for error in errors[:10]
+            if isinstance(error, dict)
+        ]
+    return summary
+
+
+def _exception_detail(exc: Exception) -> str:
+    detail = " ".join(str(exc).split())
+    return f"{type(exc).__name__}: {detail or 'no detail'}"[:500]
 
 
 def _write_status(path: Path, payload: dict[str, object]) -> None:

@@ -5193,8 +5193,8 @@ def poll_execution_events(
                     interval_seconds=poll_interval,
                 )
             record_connectivity_state("broker_api", selected_broker, healthy=True)
-        except (BrokerNotReadyError, RuntimeError) as exc:
-            detail = str(exc)
+        except Exception as exc:  # Broker boundary: one adapter must not stop all monitoring.
+            detail = f"{type(exc).__name__}: {exc}"[:500]
             errors.append({"broker_id": selected_broker, "detail": detail})
             mark_broker_snapshot_failure(
                 selected_broker,

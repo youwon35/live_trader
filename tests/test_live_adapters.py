@@ -27,6 +27,7 @@ from live_trader.live_adapters import (
     build_upbit_accounts_request,
     build_upbit_cancel_order_request,
     build_upbit_order_request,
+    http_json,
     issue_kis_access_token,
     normalize_binance_spot_intent,
     refresh_binance_time_offset,
@@ -68,6 +69,23 @@ class EnvRestoreMixin:
 
 
 class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
+    def test_response_read_timeout_returns_structured_failure(self) -> None:
+        with patch("live_trader.live_adapters.urllib.request.urlopen") as urlopen:
+            response = urlopen.return_value.__enter__.return_value
+            response.read.side_effect = TimeoutError("The read operation timed out")
+
+            result = http_json(
+                "GET",
+                "https://broker.example.test/account",
+                body=None,
+                headers={},
+                timeout_seconds=10,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(0, result["statusCode"])
+        self.assertEqual("The read operation timed out", result["text"])
+
     def test_cancel_request_builders_use_official_endpoints_and_identifiers(self) -> None:
         os.environ.update({
             "KIS_APP_KEY": "kis-app-key",

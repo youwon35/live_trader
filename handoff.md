@@ -1052,3 +1052,13 @@ API 없이 실제 실행한 기능:
 - 최신 EXE로 `TradingSystem-LiveTrader-Monitor` 예약 작업을 다시 설치했다. 30초 주기를 넘겨 PID가 살아 있고 heartbeat, execution poll, crypto runtime이 연속 갱신되는 것을 확인했다. stock profile은 실행 가능한 Portfolio/Strategy Artifact가 없어 `STOPPED`, 전체 daemon은 정직하게 `DEGRADED`로 표시된다.
 - 패키지가 저장된 KIS·Binance·Upbit 인증정보를 정상 인식했다. 실제 읽기 전용 대조에서 계좌 3개·포지션 7개가 모두 일치했고 API 필요·불일치·조회 오류는 0건이었다. 주문/취소는 호출하지 않았고 `LIVE_TRADER_ENABLE_REAL_ORDERS=false`, MONITOR 안전 잠금은 유지했다.
 - 전체 unittest 167개, Node polling, 5개 탭 × 2개 viewport UI smoke, production build와 실제 Windows 패키지를 확인했다. 최신 `release\LiveTrader.exe`는 19,425,916 bytes, SHA-256 `CF6D09CC9601D303C84101CFF98F87C1EE1104DB065E87D3FCBA098B2A85B135`다.
+
+## 2026-07-27 daemon HTTPS read timeout 복구
+
+- Windows의 `Unhandled exception in script` 창은 Live Trader 예약 작업이 브로커 HTTPS 응답 본문을 읽던 중 `TimeoutError: The read operation timed out`을 처리하지 못해 발생했다. 상태는 `STOPPED`였지만 PyInstaller 오류 창을 기다리는 자식 프로세스가 남아 작업 스케줄러만 `Running`으로 보였다.
+- `http_json()`은 `urlopen()` 연결 뒤 `response.read()`에서 발생하는 bare `TimeoutError`도 네트워크 실패 응답으로 변환한다. 브로커 폴링은 어댑터별 예외를 격리해 한 브로커 장애가 전체 감시를 종료하지 않는다.
+- daemon은 체결 스트림·profile runtime 시작, 주기적 체결 폴링, snapshot, 종료 작업을 안전 경계로 감싼다. 일시 실패 시 프로세스를 종료하지 않고 `DEGRADED`와 오류 유형을 기록하며 다음 주기에 실패한 시작만 자동 재시도한다. 예기치 않은 최상위 오류도 PyInstaller 대화상자로 빠뜨리지 않고 `FAILED`, 종료 코드 1로 기록해 예약 작업 재시작 정책에 맡긴다.
+- 상태 파일에는 계좌·포지션·인증정보를 복사하지 않고 브로커명과 최대 500자의 오류 상세만 남긴다. 회귀 테스트로 응답 읽기 timeout, poll 생존, startup retry와 민감정보 제외를 검증했다.
+- 전체 Live Python unittest 171개와 Node polling 회귀가 통과했다. 저장된 인증정보로 KIS·Binance·Upbit 읽기 전용 조회가 모두 성공했고 계좌 3개, 포지션 4개를 확인했다. 실제 주문·취소는 호출하지 않았다.
+- 최종 예약 작업은 `Running`, PID 생존, 오류 창 없음, 마지막 poll 오류 0건, KIS/Binance/Upbit execution stream 연결, crypto runtime `RUNNING`이다. 전체 `DEGRADED`는 실행 가능한 stock Strategy/Portfolio Artifact가 없기 때문이며 timeout 장애와는 무관하다.
+- production build, 100/125/150% desktop-scale, PyInstaller와 `--help` 기동 smoke를 통과했다. 최신 `release\LiveTrader.exe`는 19,428,106 bytes, SHA-256 `D4FC5DE54FC5F69577E39E830FC68028527EC9DAD547EB051A302CD2B7B6E292`다.

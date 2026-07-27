@@ -845,6 +845,10 @@ def http_json(
         }
     except urllib.error.URLError as exc:
         return {"ok": False, "statusCode": 0, "text": str(exc.reason), "json": {}}
+    except TimeoutError as exc:
+        # urlopen() may succeed and then time out while response.read() waits.
+        # That read timeout is a bare TimeoutError, not urllib.error.URLError.
+        return {"ok": False, "statusCode": 0, "text": str(exc), "json": {}}
 
 
 def parse_json(text: str) -> object:
