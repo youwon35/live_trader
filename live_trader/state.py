@@ -92,7 +92,10 @@ from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, 
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
 from trading_runtime.market_calendar import market_session_state
 from trading_runtime.artifact_metadata import ArtifactMetadataStore
-from trading_runtime.telegram_notifications import TelegramDispatcher, format_trade_notification
+from trading_runtime.telegram_notifications import (
+    TelegramDispatcher,
+    format_order_lifecycle_notification,
+)
 
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
@@ -4755,6 +4758,80 @@ def automatic_live_promotion_sweep(*, fresh_broker_ids: set[str] | None = None) 
     return results
 
 
+def live_order_message_key(
+    order: dict[str, Any] | None = None,
+    event: dict[str, Any] | None = None,
+) -> str:
+    order = order or {}
+    event = event or {}
+    broker_id = str(
+        order.get("broker_id")
+        or event.get("broker_id")
+        or broker_id_from_symbol(
+            str(order.get("symbol") or event.get("symbol") or ""),
+            str(order.get("asset") or event.get("asset") or ""),
+        )
+        or "broker"
+    ).lower()
+    identifier = str(
+        event.get("broker_order_id")
+        or order.get("broker_order_id")
+        or event.get("order_id")
+        or order.get("oms_order_id")
+        or order.get("order_id")
+        or order.get("idempotency_key")
+        or ""
+    ).strip()
+    if identifier in {"", "-"}:
+        identifier = hashlib.sha256(
+            (
+                f"{broker_id}|{order.get('strategy_id') or event.get('strategy_id') or ''}|"
+                f"{order.get('symbol') or event.get('symbol') or ''}|"
+                f"{order.get('side') or event.get('side') or ''}|"
+                f"{order.get('created_at') or event.get('occurred_at') or ''}"
+            ).encode("utf-8")
+        ).hexdigest()
+    return f"live-order:{broker_id}:{identifier}"
+
+
+def queue_live_order_lifecycle_notification(
+    order: dict[str, Any],
+    *,
+    status: str,
+    reason: str = "",
+    message_final: bool = False,
+) -> bool:
+    broker_id = str(
+        order.get("broker_id")
+        or broker_id_from_symbol(str(order.get("symbol") or ""), str(order.get("asset") or ""))
+        or "broker"
+    )
+    portfolio_gate = order.get("portfolio_gate") if isinstance(order.get("portfolio_gate"), dict) else {}
+    return TELEGRAM_DISPATCHER.send_async(
+        format_order_lifecycle_notification(
+            app_name="Live Trader",
+            environment=str(STATE.get("mode") or "LIVE"),
+            broker=broker_id.upper(),
+            status=status,
+            side=str(order.get("side") or ""),
+            symbol=str(order.get("symbol") or ""),
+            quantity=order.get("qty") or "-",
+            price=order.get("reference_price"),
+            strategy=str(order.get("strategy_id") or ""),
+            portfolio=str(portfolio_gate.get("portfolio_id") or ""),
+            order_id=str(order.get("broker_order_id") or order.get("order_id") or ""),
+            occurred_at=str(order.get("updated_at") or order.get("time") or ""),
+            reason=reason,
+        ),
+        dedupe_key=f"live-order-state:{order.get('order_id')}:{status}",
+        dedupe_seconds=604800,
+        severity="warning",
+        event_type="failure" if status in {"failed", "error", "rejected"} else "trade",
+        message_key=live_order_message_key(order),
+        message_final=message_final,
+    )
+
+
 def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[str]) -> int:
     positions_by_key = {
         (str(item.get("broker_id") or "").lower(), str(item.get("symbol") or "").upper()): item
@@ -4770,7 +4847,7 @@ def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[
         quantity = safe_float(event.get("quantity"), 0.0)
         if not event_id or event_id in existing_event_ids:
             continue
-        if state_name not in {"filled", "done", "executed"} or quantity <= 0:
+        if state_name not in {"partial", "partially_filled", "filled", "done", "executed"} or quantity <= 0:
             continue
         broker_id = str(event.get("broker_id") or "").lower()
         symbol = str(event.get("symbol") or "").upper()
@@ -4792,15 +4869,24 @@ def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[
         portfolio_gate = (order or {}).get("portfolio_gate") if isinstance((order or {}).get("portfolio_gate"), dict) else {}
         strategy_id = str((order or {}).get("strategy_id") or event.get("strategy_id") or "")
         price = safe_float(event.get("price"), 0.0)
-        message = format_trade_notification(
+        terminal_fill = state_name in {"filled", "done", "executed"}
+        notification_status = (
+            "closed"
+            if terminal_fill and side == "SELL" and position_after <= 0
+            else "filled"
+            if terminal_fill
+            else "partial"
+        )
+        message = format_order_lifecycle_notification(
             app_name="Live Trader",
             environment=str(STATE.get("mode") or "LIVE"),
             broker=broker_id.upper(),
+            status=notification_status,
             side=side or "FILL",
             symbol=symbol,
             quantity=f"{quantity:.12g}",
-            price=f"{price:,.12g}",
-            notional=f"{quantity * price:,.4f}" if price > 0 else None,
+            filled_quantity=f"{quantity:.12g}",
+            average_price=f"{price:,.12g}" if price > 0 else None,
             strategy=strategy_id,
             portfolio=str(portfolio_gate.get("portfolio_id") or ""),
             cash_after=cash_summary,
@@ -4813,11 +4899,6 @@ def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[
             position_after=f"{position_after:.12g}",
             order_id=str(event.get("broker_order_id") or event.get("order_id") or ""),
             occurred_at=str(event.get("occurred_at") or ""),
-            extra={
-                "수수료": event.get("fee"),
-                "원장 동기화": STATE.get("program_ledger", {}).get("last_event_sync", ""),
-                "Kill Switch": "ON" if STATE.get("kill_switch") else "OFF",
-            },
         )
         if TELEGRAM_DISPATCHER.send_async(
             message,
@@ -4825,6 +4906,8 @@ def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[
             dedupe_seconds=604800,
             severity="warning",
             event_type="trade",
+            message_key=live_order_message_key(order, event),
+            message_final=terminal_fill,
         ):
             sent += 1
     return sent
@@ -6758,6 +6841,20 @@ def submit_order_intent(
             runner_report=runner_report,
         ),
     )
+    if not dry_run and order.get("broker_id"):
+        state_name = str(order.get("state") or "").lower()
+        if state_name == "acknowledged":
+            queue_live_order_lifecycle_notification(
+                order,
+                status="acknowledged",
+            )
+        elif state_name in {"broker_rejected", "adapter_blocked", "unknown"}:
+            queue_live_order_lifecycle_notification(
+                order,
+                status="rejected" if state_name == "broker_rejected" else "error",
+                reason=str(order.get("reason") or reason),
+                message_final=True,
+            )
     return {"ok": ok, "reason": reason, "order": order, "snapshot": snapshot()}
 
 
@@ -7247,4 +7344,11 @@ def cancel_order(order_id: str) -> dict[str, Any]:
     order["next_retry_at"] = "-"
     order["reason"] = "브로커 주문과 로컬 큐를 취소했습니다." if submitted_to_broker else "운용자 요청으로 주문 큐 항목을 취소했습니다."
     append_audit("warn", "주문 취소", f"{order_id} {'브로커 주문 및 ' if submitted_to_broker else ''}주문 큐 항목을 취소했습니다.")
+    if submitted_to_broker:
+        queue_live_order_lifecycle_notification(
+            order,
+            status="cancelled",
+            reason=str(order["reason"]),
+            message_final=True,
+        )
     return {"ok": True, "reason": "order canceled", "snapshot": snapshot()}

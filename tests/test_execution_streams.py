@@ -128,6 +128,11 @@ class ExecutionStreamTest(unittest.TestCase):
         message = send.call_args.args[0]
         self.assertIn("BTCUSDT", message)
         self.assertIn("0.001 → 0.002", message)
+        self.assertEqual(
+            "live-order:binance:broker-1",
+            send.call_args.kwargs["message_key"],
+        )
+        self.assertTrue(send.call_args.kwargs["message_final"])
 
 
 if __name__ == "__main__":
