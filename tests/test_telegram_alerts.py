@@ -32,7 +32,7 @@ class LiveTelegramAuditAlertTests(unittest.TestCase):
         self.assertEqual("critical", send.call_args.kwargs["severity"])
         self.assertEqual(600, send.call_args.kwargs["dedupe_seconds"])
 
-    def test_recovery_and_safety_events_queue_warning_alerts(self) -> None:
+    def test_recovery_event_queues_warning_but_normal_watchdog_stays_quiet(self) -> None:
         with mock.patch.object(state, "persist_audit_event"), mock.patch.object(
             state.TELEGRAM_DISPATCHER,
             "send_async",
@@ -41,8 +41,20 @@ class LiveTelegramAuditAlertTests(unittest.TestCase):
             state.append_audit("info", "Recovery Drill", "복구 훈련 통과")
             state.append_audit("info", "Watchdog", "정상: critical 0 / warning 0")
 
-        self.assertEqual(2, send.call_count)
-        self.assertTrue(all(call.kwargs["severity"] == "warning" for call in send.call_args_list))
+        send.assert_called_once()
+        self.assertEqual("warning", send.call_args.kwargs["severity"])
+        self.assertEqual("safety", send.call_args.kwargs["event_type"])
+
+    def test_watchdog_warning_is_still_actionable(self) -> None:
+        with mock.patch.object(state, "persist_audit_event"), mock.patch.object(
+            state.TELEGRAM_DISPATCHER,
+            "send_async",
+            return_value=True,
+        ) as send:
+            state.append_audit("warn", "Watchdog", "체결 이벤트 동기화 지연")
+
+        send.assert_called_once()
+        self.assertEqual("warning", send.call_args.kwargs["severity"])
 
     def test_identical_alert_is_deduplicated_without_network(self) -> None:
         sent: list[str] = []

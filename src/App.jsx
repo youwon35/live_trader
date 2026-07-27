@@ -69,6 +69,7 @@ import { livePollingIntervals } from "./polling";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
 import { readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
+import { LAYOUT_RESIZE_DIRECTIONS } from "../../../packages/design/layout-editing.js";
 import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
 import {
@@ -239,7 +240,7 @@ const STRATEGY_SAVED_SEARCHES_KEY = "live-trader.strategySavedSearches.v1";
 const LAYOUT_RESET_EVENT = "live-trader-layout-reset";
 const LAYOUT_RESTORE_EVENT = "live-trader-layout-restore";
 const LAYOUT_SNAP_SIZE = 8;
-const LAYOUT_COLLISION_GAP = 8;
+const LAYOUT_COLLISION_GAP = 0;
 const LAYOUT_MAX_DIMENSION = 100000;
 const LAYOUT_MAX_OFFSET = 100000;
 const MIN_PANEL_WIDTH = 260;
@@ -799,11 +800,13 @@ function panelRectsOverlap(left, right, gap = LAYOUT_COLLISION_GAP) {
 }
 
 function panelOverlapsPeers(activePanel) {
-  const scope = activePanel.closest(".page-view") || activePanel.parentElement;
-  if (!scope) return false;
+  const layoutContainer = activePanel.parentElement;
+  if (!layoutContainer) return false;
   const activeRect = activePanel.getBoundingClientRect();
-  return Array.from(scope.querySelectorAll(".panel")).some((panel) => {
+  return Array.from(layoutContainer.children).some((panel) => {
     if (panel === activePanel || !(panel instanceof HTMLElement)) return false;
+    if (!panel.classList.contains("panel")) return false;
+    if (activePanel.contains(panel) || panel.contains(activePanel)) return false;
     const rect = panel.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0 && panelRectsOverlap(activeRect, rect);
   });
@@ -891,21 +894,26 @@ function ensurePanelHandles(panel) {
     clearPanelOffset(panel);
   });
 
-  if (panel.querySelector(":scope > .panel-resize-north-west")) return;
+  const existingDirections = new Set(
+    Array.from(panel.querySelectorAll(":scope > .panel-resize-edge, :scope > .panel-resize-corner"))
+      .map((handle) => handle.dataset.resizeDirection)
+      .filter(Boolean),
+  );
+  if (LAYOUT_RESIZE_DIRECTIONS.every((direction) => existingDirections.has(direction))) return;
   panel.querySelectorAll(":scope > .panel-resize-edge, :scope > .panel-resize-corner").forEach((handle) => handle.remove());
 
-  [
-    ["panel-resize-corner panel-resize-north-west", "vertical", "nw"],
-    ["panel-resize-corner panel-resize-north-east", "vertical", "ne"],
-    ["panel-resize-corner panel-resize-south-east", "vertical", "se"],
-    ["panel-resize-corner panel-resize-south-west", "vertical", "sw"],
-  ].forEach(([className, orientation, direction]) => {
+  const directionWords = { n: "north", e: "east", s: "south", w: "west" };
+  LAYOUT_RESIZE_DIRECTIONS.forEach((direction) => {
+    const directionClass = [...direction].map((part) => directionWords[part]).join("-");
+    const className = direction.length === 1
+      ? `panel-resize-edge panel-resize-${directionClass}`
+      : `panel-resize-corner panel-resize-${directionClass}`;
     const handle = document.createElement("span");
     handle.className = className;
     handle.dataset.resizeDirection = direction;
     handle.setAttribute("role", "separator");
-    handle.setAttribute("aria-orientation", orientation);
-    handle.setAttribute("aria-label", "패널 크기 조절");
+    handle.setAttribute("aria-orientation", direction === "e" || direction === "w" ? "vertical" : "horizontal");
+    handle.setAttribute("aria-label", `패널 ${direction} 방향 크기 조절`);
     panel.appendChild(handle);
   });
 }

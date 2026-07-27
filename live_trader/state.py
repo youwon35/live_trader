@@ -113,11 +113,13 @@ TELEGRAM_DISPATCHER = TelegramDispatcher(
 TELEGRAM_SAFETY_AUDIT_EVENTS = {
     "Kill Switch",
     "신규 진입 차단",
-    "Watchdog",
     "Watchdog Fail Closed",
-    "포지션/계좌 대조",
     "Recovery Drill",
     "Startup Recovery",
+}
+TELEGRAM_HEALTH_AUDIT_EVENTS = {
+    "Watchdog",
+    "포지션/계좌 대조",
 }
 TELEGRAM_CONNECTIVITY_AUDIT_EVENTS = {
     "체결 스트림",
@@ -3464,7 +3466,13 @@ def queue_live_audit_telegram(level: str, event: str, detail: str) -> bool:
     normalized_level = str(level or "").strip().lower()
     normalized_event = str(event or "").strip()
     is_critical = normalized_level in {"danger", "error", "critical"}
-    is_safety_event = normalized_event in TELEGRAM_SAFETY_AUDIT_EVENTS
+    is_safety_event = (
+        normalized_event in TELEGRAM_SAFETY_AUDIT_EVENTS
+        or (
+            normalized_event in TELEGRAM_HEALTH_AUDIT_EVENTS
+            and normalized_level in {"warn", "warning", "danger", "error", "critical"}
+        )
+    )
     is_connectivity_failure = (
         normalized_event in TELEGRAM_CONNECTIVITY_AUDIT_EVENTS
         and normalized_level in {"warn", "warning", "danger", "error", "critical"}
@@ -3480,17 +3488,24 @@ def queue_live_audit_telegram(level: str, event: str, detail: str) -> bool:
         return TELEGRAM_DISPATCHER.send_async(
             "\n".join(
                 [
-                    f"⚠️ <b>Live Trader - {html.escape(normalized_event)}</b>",
-                    f"운용 모드: {html.escape(str(STATE.get('mode') or 'MONITOR'))}",
-                    f"Kill Switch: {'ON' if STATE.get('kill_switch') else 'OFF'}",
-                    f"신규 진입: {'차단' if STATE.get('new_entries_blocked') else '허용'}",
+                    "⚠️ <b>[실전 트레이더] 확인 필요</b>",
+                    f"이벤트: {html.escape(normalized_event)}",
+                    f"운용 상태: {html.escape(str(STATE.get('mode') or 'MONITOR'))}",
+                    f"거래 영향: Kill Switch {'ON' if STATE.get('kill_switch') else 'OFF'} · 신규 진입 {'차단' if STATE.get('new_entries_blocked') else '허용'}",
                     "",
-                    html.escape(str(detail or "")[:1200]),
+                    f"내용: {html.escape(str(detail or '')[:1200])}",
                 ]
             ),
             dedupe_key=f"live-alert:{normalized_event}:{str(detail or '')[:120]}",
             dedupe_seconds=600,
             severity="critical" if is_critical else "warning",
+            event_type=(
+                "recovery"
+                if is_connectivity_recovery
+                else "failure"
+                if is_critical or is_connectivity_failure
+                else "safety"
+            ),
         )
     except Exception:
         # Telegram 관제 실패는 감사 기록이나 주문/운용 경로를 중단시키지 않는다.
@@ -4809,6 +4824,7 @@ def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[
             dedupe_key=f"live-fill:{broker_id}:{event_id}",
             dedupe_seconds=604800,
             severity="warning",
+            event_type="trade",
         ):
             sent += 1
     return sent
