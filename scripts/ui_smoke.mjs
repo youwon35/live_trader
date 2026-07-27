@@ -1,6 +1,6 @@
 import { chromium } from "playwright-core";
 
-const baseUrl = process.env.LIVE_TRADER_SMOKE_URL || "http://127.0.0.1:8795";
+const baseUrl = process.env.LIVE_TRADER_SMOKE_URL || "http://127.0.0.1:18795";
 const chromePath = process.env.CHROME_PATH || "";
 const viewports = [
   { name: "right-monitor", width: 1707, height: 960 },

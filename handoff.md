@@ -331,7 +331,7 @@ Server:
 
 - Standard-library `ThreadingHTTPServer`.
 - Default host: `127.0.0.1`.
-- Default port: `8795`.
+- Default port: `18795`.
 - Serves Vite `dist`.
 - Exposes JSON API endpoints.
 
@@ -1062,3 +1062,12 @@ API 없이 실제 실행한 기능:
 - 전체 Live Python unittest 171개와 Node polling 회귀가 통과했다. 저장된 인증정보로 KIS·Binance·Upbit 읽기 전용 조회가 모두 성공했고 계좌 3개, 포지션 4개를 확인했다. 실제 주문·취소는 호출하지 않았다.
 - 최종 예약 작업은 `Running`, PID 생존, 오류 창 없음, 마지막 poll 오류 0건, KIS/Binance/Upbit execution stream 연결, crypto runtime `RUNNING`이다. 전체 `DEGRADED`는 실행 가능한 stock Strategy/Portfolio Artifact가 없기 때문이며 timeout 장애와는 무관하다.
 - production build, 100/125/150% desktop-scale, PyInstaller와 `--help` 기동 smoke를 통과했다. 최신 `release\LiveTrader.exe`는 19,428,106 bytes, SHA-256 `D4FC5DE54FC5F69577E39E830FC68028527EC9DAD547EB051A302CD2B7B6E292`다.
+
+## 2026-07-28 Windows 소켓 10013 시작 오류 복구
+
+- Live Trader 실행 직후 발생한 `[WinError 10013] 액세스 권한에 의해 숨겨진 소켓에 액세스를 시도했습니다`를 동일 PC에서 재현했다. 기존 기본 포트 `127.0.0.1:8795`만 바인딩이 거부됐고 인접 포트와 운영체제 자동 할당 포트는 정상 동작했다.
+- 이 PC의 TCP 동적 포트 범위는 `1024-15000`으로 기존 `8795`를 포함한다. Live Trader 기본 포트를 현재 동적·제외 범위 밖에서 실제 바인딩을 확인한 `18795`로 옮기고 공용 앱 매니페스트와 UI smoke 주소도 함께 갱신했다.
+- 데스크톱 실행기는 기본 포트가 Windows 권한 거부(10013) 또는 이미 사용 중(10048)이어도 종료하지 않는다. 해당 경우 `port=0`으로 한 번 재시도해 운영체제가 안전한 로컬 포트를 정하고, WebView에는 실제 바인딩된 포트의 URL을 전달한다. 관계없는 소켓 오류는 숨기지 않고 그대로 실패시킨다.
+- 실제로 막힌 `8795`를 요청한 통합 smoke에서 자동 포트 `6420`으로 전환된 뒤 `/api/snapshot`이 HTTP 200을 반환했다. Live Trader 전체 Python unittest 176개가 통과했다.
+- Vite production build, 100/125/150% desktop-scale 계약과 PyInstaller 패키징을 통과했다. 최신 `release\LiveTrader.exe`를 `TELEGRAM_ENABLED=false`, `LIVE_TRADER_ENABLE_REAL_ORDERS=false`로 실행해 `18795`의 API 응답과 `MONITOR` 모드를 확인했다.
+- 검증용 LiveTrader PID 2개는 모두 종료했다. 최신 EXE는 19,444,188 bytes이며 SHA-256은 `E39E37DE5052F7BDE3A99B131B8101E76E9106EF4C370FE9DE940BEDDF618650`이다.

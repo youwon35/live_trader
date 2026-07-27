@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import math
 import mimetypes
@@ -19,7 +20,7 @@ from trading_runtime.telegram_notifications import save_shared_telegram_settings
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8795
+DEFAULT_PORT = 18795
 SETTINGS_DIR = Path(os.getenv("APPDATA") or Path.home()) / "LiveTrader"
 UI_SETTINGS_FILE = SETTINGS_DIR / "ui-settings.json"
 SHARED_SETTINGS_DIR = Path(os.getenv("APPDATA") or Path.home()) / "trading_programs"
@@ -366,7 +367,7 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def create_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
+def prepare_server_state() -> None:
     # A hard-killed or crashed background monitor cannot execute its finally
     # block. Reconcile the persisted lease before the desktop/API reports any
     # previous RUNNING state.
@@ -374,7 +375,34 @@ def create_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> Threadi
 
     read_daemon_status(persist=True)
     state.restore_runtime_from_checkpoint()
+
+
+def bind_server(host: str, port: int) -> ThreadingHTTPServer:
     return ThreadingHTTPServer((host, port), LiveTraderHandler)
+
+
+def create_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
+    prepare_server_state()
+    return bind_server(host, port)
+
+
+def is_recoverable_bind_error(exc: OSError) -> bool:
+    """Return whether the desktop can safely retry on an OS-assigned port."""
+    return getattr(exc, "winerror", None) in {10013, 10048} or exc.errno in {
+        errno.EACCES,
+        errno.EADDRINUSE,
+    }
+
+
+def create_desktop_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
+    """Bind the preferred desktop port, falling back when Windows blocks it."""
+    prepare_server_state()
+    try:
+        return bind_server(host, port)
+    except OSError as exc:
+        if port == 0 or not is_recoverable_bind_error(exc):
+            raise
+        return bind_server(host, 0)
 
 
 def watchdog_worker(interval_seconds: float = 15.0) -> None:
@@ -393,7 +421,7 @@ def start_watchdog_thread() -> threading.Thread:
 
 
 def start_in_thread(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tuple[ThreadingHTTPServer, str]:
-    server = create_server(host, port)
+    server = create_desktop_server(host, port)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     start_watchdog_thread()
