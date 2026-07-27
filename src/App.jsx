@@ -1826,6 +1826,7 @@ function LivePreparationPanel({
         className="internal-tabs prep-tabs"
         onChange={changeAssetTab}
         options={tabItems.map((item) => ({ id: item.id, label: item.label, detail: `전략 ${item.count}개`, title: item.detail }))}
+        variant="cards"
         value={assetTab}
       />
       <section className="content-grid">
@@ -2809,6 +2810,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         className="internal-tabs live-assistant-tabs"
         onChange={setActiveGroup}
         options={groups.map((group) => ({ id: group.id, label: group.label, title: group.detail }))}
+        variant="cards"
         value={activeGroup}
       />
       {broker && (
@@ -2924,6 +2926,7 @@ function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomati
         className="internal-tabs automation-profile-tabs"
         onChange={setAssetTab}
         options={tabs.map((tab) => ({ id: tab.id, label: tab.label, title: tab.detail }))}
+        variant="cards"
         value={assetTab}
       />
       <div className={`automation-card ${activeProfile.enabled ? "running" : ""}`}>

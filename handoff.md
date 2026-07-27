@@ -1071,3 +1071,9 @@ API 없이 실제 실행한 기능:
 - 실제로 막힌 `8795`를 요청한 통합 smoke에서 자동 포트 `6420`으로 전환된 뒤 `/api/snapshot`이 HTTP 200을 반환했다. Live Trader 전체 Python unittest 176개가 통과했다.
 - Vite production build, 100/125/150% desktop-scale 계약과 PyInstaller 패키징을 통과했다. 최신 `release\LiveTrader.exe`를 `TELEGRAM_ENABLED=false`, `LIVE_TRADER_ENABLE_REAL_ORDERS=false`로 실행해 `18795`의 API 응답과 `MONITOR` 모드를 확인했다.
 - 검증용 LiveTrader PID 2개는 모두 종료했다. 최신 EXE는 19,444,188 bytes이며 SHA-256은 `E39E37DE5052F7BDE3A99B131B8101E76E9106EF4C370FE9DE940BEDDF618650`이다.
+
+## 2026-07-28 중첩 탭 카드 규칙 적용
+
+- 실거래 준비의 자산 선택, 연결 브로커 선택, 자동화 자산 선택을 공용 `NestedTabs` 카드형으로 명시해 다른 앱의 실제 작업 영역 전환과 같은 시각·클릭 규칙을 사용하도록 했다.
+- 전체 Python unittest 176개, Vite production build, 100/125/150% 화면 배율·클릭 계약과 PyInstaller 패키징이 통과했다. 실주문과 Telegram은 비활성화했다.
+- 최신 `release\LiveTrader.exe`는 19,445,350 bytes, SHA-256 `9AAC9A54296D0BB3828EF21A0B1E5E3D1D25CC7F2466CA23D774F6186C1572C5`다.
