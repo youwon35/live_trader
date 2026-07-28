@@ -1099,3 +1099,11 @@ API 없이 실제 실행한 기능:
 - 공통 마스터 알림 스위치가 앱별 설정보다 우선하도록 runtime 정책을 바로잡고, 연결 응답에서 불필요한 Bot/Chat 숫자 ID를 제거했다.
 - Live Telegram 12개 테스트, Vite production build, PyInstaller 패키징과 Telegram·실주문 비활성 `--help` 기동 smoke가 통과했다.
 - 최신 `release\LiveTrader.exe`는 19,448,453 bytes이며 SHA-256은 `87E55FCC8287DC1603FD939264783AF3FC058F4A0BA289BDB1AB3C27CF5069D1`다.
+
+## 2026-07-29 직접 숏·인버스·provider 실거래 게이트
+
+- Live Trader가 공용 노출 계약을 강제한다. 인버스 ETF는 현물 long만 허용하고, 직접 숏은 margin/futures 가능 경로와 short 주문이 함께 충족되어야 한다.
+- 연구 데이터가 Yahoo/PyKRX인 전략은 KIS 봉 대조 결과가 없거나 기준을 통과하지 못하면 Live 승급과 실주문을 차단한다. Paper 운용은 계속 가능하다.
+- Binance/KIS/Upbit와 Telegram 보호 설정을 공용 Windows 사용자 범위 암호화 저장소에서 읽고, 기존 `.env` 평문은 마이그레이션 뒤 제거한다.
+- 외부 artifact 저장소, golden 전략 계약과 live gate 회귀를 포함한 Live unittest 193개, frontend build와 PyInstaller 패키징을 통과했다.
+- 최신 실행 파일은 Telegram·실주문 비활성 `--help` 기동 smoke를 exit 0으로 통과했다. `release\LiveTrader.exe`는 19,513,445 bytes, SHA-256 `192F46B57A3DA7B550E631FEC86C6ACEC5FB75E9B4253D72842989FF43E7D96C`다.

@@ -1,9 +1,6 @@
 import sys
 from pathlib import Path
 
-from .env_loader import load_local_env
-
-
 for parent in Path(__file__).resolve().parents:
     shared_runtime = parent / "packages" / "trading_runtime"
     if shared_runtime.exists():
@@ -11,6 +8,8 @@ for parent in Path(__file__).resolve().parents:
         if runtime_path not in sys.path:
             sys.path.insert(0, runtime_path)
         break
+
+from .env_loader import load_local_env  # noqa: E402
 
 load_local_env()
 

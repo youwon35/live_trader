@@ -33,6 +33,16 @@ from trading_runtime.lifecycle import (  # noqa: E402
     normalize_lifecycle_status,
 )
 from trading_runtime.professional_flow import validate_lineage_manifest  # noqa: E402
+from trading_runtime.exposure_contract import exposure_contract_from_artifact  # noqa: E402
+from trading_runtime.provider_reconciliation import (  # noqa: E402
+    provider_reconciliation_from_artifact,
+    provider_reconciliation_live_ready,
+)
+from trading_runtime.artifact_paths import (  # noqa: E402
+    artifact_read_roots,
+    migrate_artifact_tree,
+    shared_artifact_root,
+)
 
 
 ARTIFACT_SCHEMA_VERSION = "strategy-artifact-v2"
@@ -80,7 +90,8 @@ def resolve_trading_system_root() -> Path:
 
 
 TRADING_SYSTEM_ROOT = resolve_trading_system_root()
-PRIMARY_STRATEGY_ARTIFACT_DIR = TRADING_SYSTEM_ROOT / "packages" / "strategy-core"
+LEGACY_STRATEGY_ARTIFACT_DIR = TRADING_SYSTEM_ROOT / "packages" / "strategy-core"
+PRIMARY_STRATEGY_ARTIFACT_DIR = shared_artifact_root()
 IGNORED_STRATEGY_FILE_NAMES = {
     "package.json",
     "package-lock.json",
@@ -488,11 +499,13 @@ def strategy_artifact_dirs() -> list[Path]:
     configured = _env_paths("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", "TRADER_STRATEGY_ARTIFACT_DIR")
     if configured:
         return _dedupe_paths(configured)
+    try:
+        migrate_artifact_tree(LEGACY_STRATEGY_ARTIFACT_DIR, PRIMARY_STRATEGY_ARTIFACT_DIR)
+    except OSError:
+        pass
     return _dedupe_paths(
-        [
-            PRIMARY_STRATEGY_ARTIFACT_DIR,
-            _appdata_strategy_artifact_dir(),
-        ]
+        artifact_read_roots(TRADING_SYSTEM_ROOT)
+        + [_appdata_strategy_artifact_dir()]
     )
 
 
@@ -760,6 +773,47 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         capabilities["canSubmitOrder"] = False
         capabilities["blockingFailReasons"] = list(dict.fromkeys([*capabilities.get("blockingFailReasons", []), *lineage_reasons]))
         capabilities["failReasons"] = list(dict.fromkeys([*capabilities.get("failReasons", []), *lineage_reasons]))
+    release = _release_snapshot(artifact)
+    paper_portfolio_evidence = normalize_paper_portfolio_evidence(artifact)
+    execution_policy = _dict_value(artifact.get("executionPolicy") or artifact.get("execution_policy"))
+    market_type = str(artifact.get("marketType") or artifact.get("market_type") or data_artifact.get("marketType") or dataset.get("marketType") or "spot").lower()
+    exposure_contract = exposure_contract_from_artifact(artifact)
+    position_direction = str(exposure_contract.get("positionDirection") or "long")
+    exposure_blockers = [str(item) for item in exposure_contract.get("blockers") or [] if str(item)]
+    custom_direction = "short" if str(custom_definition.get("positionDirection") or "long").strip().lower() == "short" else "long"
+    if custom_definition and custom_direction != position_direction:
+        exposure_blockers.append("exposure-contract-custom-direction-mismatch")
+    if exposure_blockers:
+        exposure_reasons = [f"exposure-contract-invalid:{reason}" for reason in dict.fromkeys(exposure_blockers)]
+        normalized_permissions["live_small_eligible"] = False
+        normalized_permissions["live_eligible"] = False
+        normalized_permissions["live_allowed"] = False
+        normalized_permissions["fail_reasons"] = list(dict.fromkeys([*normalized_permissions["fail_reasons"], *exposure_reasons]))
+        capabilities["liveSmallEligible"] = False
+        capabilities["liveEligible"] = False
+        capabilities["canSubmitOrder"] = False
+        capabilities["blockingFailReasons"] = list(dict.fromkeys([*capabilities.get("blockingFailReasons", []), *exposure_reasons]))
+        capabilities["failReasons"] = list(dict.fromkeys([*capabilities.get("failReasons", []), *exposure_reasons]))
+    provider_reconciliation = provider_reconciliation_from_artifact(artifact)
+    if not provider_reconciliation_live_ready(provider_reconciliation):
+        provider_blockers = [
+            str(item)
+            for item in provider_reconciliation.get("blockers") or ["provider-reconciliation-not-passed"]
+            if str(item)
+        ]
+        provider_reasons = [
+            f"provider-reconciliation-invalid:{reason}"
+            for reason in dict.fromkeys(provider_blockers)
+        ]
+        normalized_permissions["live_small_eligible"] = False
+        normalized_permissions["live_eligible"] = False
+        normalized_permissions["live_allowed"] = False
+        normalized_permissions["fail_reasons"] = list(dict.fromkeys([*normalized_permissions["fail_reasons"], *provider_reasons]))
+        capabilities["liveSmallEligible"] = False
+        capabilities["liveEligible"] = False
+        capabilities["canSubmitOrder"] = False
+        capabilities["blockingFailReasons"] = list(dict.fromkeys([*capabilities.get("blockingFailReasons", []), *provider_reasons]))
+        capabilities["failReasons"] = list(dict.fromkeys([*capabilities.get("failReasons", []), *provider_reasons]))
     verification = {
         "backtester": _backtester_verification_badge(normalized_permissions, final_test_status),
         "paper_trader": _paper_verification_badge(artifact, normalized_permissions, lifecycle_status),
@@ -774,11 +828,6 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
                 "source_stage": "deployment-registry",
             }
         )
-    release = _release_snapshot(artifact)
-    paper_portfolio_evidence = normalize_paper_portfolio_evidence(artifact)
-    execution_policy = _dict_value(artifact.get("executionPolicy") or artifact.get("execution_policy"))
-    market_type = str(artifact.get("marketType") or artifact.get("market_type") or data_artifact.get("marketType") or dataset.get("marketType") or "spot").lower()
-    position_direction = "short" if str(custom_definition.get("positionDirection") or "long").strip().lower() == "short" else "long"
     allow_short_requested = bool(
         position_direction == "short"
         or execution_policy.get("allowShort") is True
@@ -810,6 +859,11 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "instrument_id": str(data_artifact.get("instrumentId") or artifact.get("instrumentId") or artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN"),
         "market_type": market_type,
         "position_direction": position_direction,
+        "exposure_contract": exposure_contract,
+        "economic_exposure": str(exposure_contract.get("economicExposure") or ""),
+        "signal_instrument": str(exposure_contract.get("signalInstrument") or ""),
+        "execution_instrument": str(exposure_contract.get("executionInstrument") or ""),
+        "provider_reconciliation": provider_reconciliation,
         "allow_short_requested": allow_short_requested,
         "allow_short": allow_short,
         "timeframe": str(artifact.get("timeframe") or dataset.get("interval") or data_artifact.get("interval") or artifact.get("interval") or "-"),

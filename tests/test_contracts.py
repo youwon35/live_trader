@@ -172,6 +172,111 @@ class StrategyContractTest(unittest.TestCase):
         self.assertTrue(futures["allow_short_requested"])
         self.assertTrue(futures["allow_short"])
 
+    def test_inverse_etf_uses_long_order_for_bearish_exposure(self) -> None:
+        artifact = normalize_strategy_artifact(
+            {
+                "id": "INVERSE-LONG",
+                "symbol": "251340.KS",
+                "name": "KODEX 코스닥150선물인버스",
+                "marketType": "etf",
+                "positionDirection": "long",
+                "brokerId": "kis",
+                "permissions": {
+                    "live_allowed": True,
+                    "live_small_eligible": True,
+                    "live_eligible": True,
+                },
+            }
+        )
+
+        self.assertEqual("long", artifact["position_direction"])
+        self.assertEqual("bearish", artifact["economic_exposure"])
+        self.assertEqual("BUY", artifact["exposure_contract"]["entrySide"])
+        self.assertEqual("KOSDAQ150_FUTURES", artifact["exposure_contract"]["underlyingBenchmark"])
+        self.assertFalse(
+            any(reason.startswith("exposure-contract-invalid") for reason in artifact["permissions"]["fail_reasons"])
+        )
+
+    def test_inverse_etf_short_contract_is_fail_closed(self) -> None:
+        artifact = normalize_strategy_artifact(
+            {
+                "id": "INVERSE-SHORT",
+                "symbol": "251340.KS",
+                "name": "KODEX 코스닥150선물인버스",
+                "marketType": "etf",
+                "positionDirection": "short",
+                "permissions": {
+                    "live_allowed": True,
+                    "live_small_eligible": True,
+                    "live_eligible": True,
+                },
+            }
+        )
+
+        self.assertFalse(artifact["live_small_eligible"])
+        self.assertFalse(artifact["live_eligible"])
+        self.assertIn(
+            "exposure-contract-invalid:inverse-etf-requires-long-position",
+            artifact["permissions"]["fail_reasons"],
+        )
+
+    def test_cross_provider_route_requires_reconciliation_before_live(self) -> None:
+        artifact = normalize_strategy_artifact(
+            {
+                "id": "YAHOO-KIS-PENDING",
+                "symbol": "251340.KS",
+                "name": "KODEX 코스닥150선물인버스",
+                "marketType": "etf",
+                "marketDataProvider": "yfinance",
+                "brokerId": "kis",
+                "positionDirection": "long",
+                "permissions": {
+                    "live_allowed": True,
+                    "live_small_eligible": True,
+                    "live_eligible": True,
+                },
+            }
+        )
+
+        self.assertEqual("pending", artifact["provider_reconciliation"]["status"])
+        self.assertFalse(artifact["live_small_eligible"])
+        self.assertIn(
+            "provider-reconciliation-invalid:provider-reconciliation-pending",
+            artifact["permissions"]["fail_reasons"],
+        )
+
+    def test_passed_cross_provider_reconciliation_is_accepted(self) -> None:
+        artifact = normalize_strategy_artifact(
+            {
+                "id": "YAHOO-KIS-PASS",
+                "symbol": "251340.KS",
+                "name": "KODEX 코스닥150선물인버스",
+                "marketType": "etf",
+                "marketDataProvider": "yfinance",
+                "brokerId": "kis",
+                "positionDirection": "long",
+                "providerReconciliation": {
+                    "schemaVersion": "provider-reconciliation-v1",
+                    "required": True,
+                    "status": "pass",
+                    "passed": True,
+                    "sourceProvider": "yahoo",
+                    "executionProvider": "kis",
+                    "blockers": [],
+                },
+                "permissions": {
+                    "live_allowed": True,
+                    "live_small_eligible": True,
+                    "live_eligible": True,
+                },
+            }
+        )
+
+        self.assertEqual("pass", artifact["provider_reconciliation"]["status"])
+        self.assertFalse(
+            any(reason.startswith("provider-reconciliation-invalid") for reason in artifact["permissions"]["fail_reasons"])
+        )
+
     def test_strategy_normalization_preserves_broker_routing_contract(self) -> None:
         artifact = normalize_strategy_artifact(
             {

@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from .env_loader import default_env_path
+from .env_loader import (
+    LIVE_TRADER_SECRET_KEYS,
+    default_env_path,
+    live_secret_name,
+    live_secret_store,
+)
 from .live_adapters import BINANCE_BASE_URL, BINANCE_FUTURES_BASE_URL, KIS_LIVE_BASE_URL, UPBIT_BASE_URL
 
 
@@ -51,7 +56,8 @@ ENV_SETTING_FIELDS = (
 )
 
 
-def read_env_file(path: Path = ENV_PATH) -> dict[str, str]:
+def read_env_file(path: Path | None = None) -> dict[str, str]:
+    path = path or ENV_PATH
     if not path.exists():
         return {}
     values: dict[str, str] = {}
@@ -66,9 +72,16 @@ def read_env_file(path: Path = ENV_PATH) -> dict[str, str]:
 
 def env_settings_snapshot() -> dict[str, Any]:
     file_values = read_env_file()
+    store = live_secret_store()
     fields: list[dict[str, Any]] = []
     for field in ENV_SETTING_FIELDS:
-        if field.key in file_values:
+        if field.kind == "secret":
+            value = (
+                file_values.get(field.key)
+                or os.getenv(field.key, "")
+                or store.get(live_secret_name(field.key))
+            )
+        elif field.key in file_values:
             value = file_values[field.key]
         else:
             value = os.getenv(field.key, "")
@@ -102,7 +115,21 @@ def env_settings_snapshot() -> dict[str, Any]:
 def save_env_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
     existing = read_env_file()
     field_map = {field.key: field for field in ENV_SETTING_FIELDS}
-    next_values = {key: existing.get(key, os.getenv(key, field.default)) for key, field in field_map.items()}
+    store = live_secret_store()
+    next_values = {
+        key: (
+            existing.get(key)
+            or os.getenv(key, "")
+            or store.get(live_secret_name(key))
+            or field.default
+        )
+        for key, field in field_map.items()
+    }
+
+    for key in LIVE_TRADER_SECRET_KEYS:
+        legacy = existing.get(key, "")
+        if legacy:
+            store.migrate_plaintext(live_secret_name(key), legacy)
 
     for key, raw_value in raw_values.items():
         field = field_map.get(str(key))
@@ -111,6 +138,8 @@ def save_env_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
         value = normalize_value(raw_value, field)
         if field.kind == "secret" and not value:
             continue
+        if field.kind == "secret":
+            store.set(live_secret_name(field.key), value)
         next_values[field.key] = value
 
     write_env_file(next_values, field_map)
@@ -119,7 +148,12 @@ def save_env_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
     return env_settings_snapshot()
 
 
-def write_env_file(values: dict[str, str], field_map: dict[str, EnvSettingField], path: Path = ENV_PATH) -> None:
+def write_env_file(
+    values: dict[str, str],
+    field_map: dict[str, EnvSettingField],
+    path: Path | None = None,
+) -> None:
+    path = path or ENV_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     managed_keys = set(field_map)
     existing_lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
@@ -133,7 +167,8 @@ def write_env_file(values: dict[str, str], field_map: dict[str, EnvSettingField]
             continue
         key = stripped.split("=", 1)[0].strip()
         if key in managed_keys:
-            output.append(f"{key}={quote_env_value(values.get(key, field_map[key].default))}")
+            serialized = "" if field_map[key].kind == "secret" else quote_env_value(values.get(key, field_map[key].default))
+            output.append(f"{key}={serialized}")
             seen.add(key)
         else:
             output.append(raw_line)
@@ -144,7 +179,8 @@ def write_env_file(values: dict[str, str], field_map: dict[str, EnvSettingField]
             output.append("")
         output.append("# Managed by Live Trader settings UI")
         for field in missing:
-            output.append(f"{field.key}={quote_env_value(values.get(field.key, field.default))}")
+            serialized = "" if field.kind == "secret" else quote_env_value(values.get(field.key, field.default))
+            output.append(f"{field.key}={serialized}")
 
     tmp_path = path.with_suffix(".tmp")
     tmp_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
