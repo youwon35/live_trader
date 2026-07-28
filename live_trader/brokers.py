@@ -8,6 +8,12 @@ from typing import Any, Callable, Literal
 from .live_adapters import (
     build_binance_account_request,
     build_binance_cancel_order_request,
+    build_binance_futures_account_request,
+    build_binance_futures_cancel_order_request,
+    build_binance_futures_order_request,
+    build_binance_futures_position_mode_request,
+    build_binance_futures_positions_request,
+    build_binance_futures_symbol_config_request,
     build_binance_spot_order_request,
     build_kis_cancel_order_request,
     build_kis_domestic_balance_request,
@@ -19,6 +25,7 @@ from .live_adapters import (
     build_upbit_order_detail_request,
     build_upbit_order_request,
     issue_kis_access_token,
+    normalize_binance_futures_intent,
     normalize_binance_spot_intent,
     refresh_binance_time_offset,
     send_prepared_request,
@@ -28,11 +35,15 @@ BrokerStatus = Literal["connected", "missing_credentials", "adapter_required", "
 CheckStatus = Literal["pass", "warn", "fail"]
 
 
-def send_binance_signed_request(builder: Callable[[], Any]) -> dict[str, object]:
+def send_binance_signed_request(
+    builder: Callable[[], Any],
+    *,
+    futures: bool = False,
+) -> dict[str, object]:
     response = send_prepared_request(builder())
     payload = response.get("json") if isinstance(response.get("json"), dict) else {}
     if int(payload.get("code") or 0) == -1021:
-        refresh_binance_time_offset()
+        refresh_binance_time_offset(futures=futures)
         response = send_prepared_request(builder())
     return response
 
@@ -100,6 +111,29 @@ BROKER_SPECS = (
         ),
         "automation_group": "crypto",
         "asset_scope": ("코인 현물",),
+    },
+    {
+        "broker_id": "binance-futures",
+        "name": "Binance USD-M Futures",
+        "role": "USDⓈ-M 무기한 선물 LONG/SHORT 실거래",
+        "required_env": ("BINANCE_API_KEY", "BINANCE_API_SECRET"),
+        "base_urls": (
+            "https://fapi.binance.com",
+            "wss://fstream.binance.com",
+        ),
+        "docs": "Binance USDⓈ-M Futures REST/User Data Stream",
+        "capabilities": (
+            ("account_balance", "선물 계정 조회", True, "GET /fapi/v3/account signed 조회 구현됨"),
+            ("positions", "부호 있는 선물 포지션", True, "GET /fapi/v3/positionRisk LONG/SHORT 대조 구현됨"),
+            ("position_mode", "One-way/Hedge 모드", True, "주문 전 현재 모드를 읽어 positionSide를 결정함"),
+            ("leverage_policy", "레버리지/증거금 검사", True, "계정 설정을 변경하지 않고 전략 한도와 불일치 시 차단함"),
+            ("place_order", "선물 주문 전송", True, "POST /fapi/v1/order signed 요청 구현됨"),
+            ("test_order", "매칭 없는 주문 검증", True, "POST /fapi/v1/order/test 구현됨"),
+            ("cancel_order", "선물 주문 취소", True, "DELETE /fapi/v1/order 구현됨"),
+            ("user_stream", "선물 체결 스트림", True, "ORDER_TRADE_UPDATE 정규화 경로 구현됨"),
+        ),
+        "automation_group": "crypto",
+        "asset_scope": ("코인 USD-M 선물", "LONG", "SHORT"),
     },
     {
         "broker_id": "upbit",
@@ -638,6 +672,211 @@ def parse_binance_positions(payload: object) -> list[dict[str, object]]:
     return positions
 
 
+def parse_binance_futures_accounts(
+    payload: object,
+) -> list[dict[str, object]]:
+    data = payload if isinstance(payload, dict) else {}
+    assets = data.get("assets")
+    rows = assets if isinstance(assets, list) else []
+    usdt = next(
+        (
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("asset") or "").upper() == "USDT"
+        ),
+        {},
+    )
+    available = first_numeric(
+        usdt,
+        "availableBalance",
+        "marginBalance",
+        "walletBalance",
+        default=first_numeric(
+            data,
+            "availableBalance",
+            "totalMarginBalance",
+            "totalWalletBalance",
+        ),
+    )
+    return [
+        {
+            "broker_id": "binance-futures",
+            "broker_name": "Binance USD-M Futures",
+            "account": "Binance USD-M Futures",
+            "currency": "USDT",
+            "broker_cash": available,
+            "wallet_balance": first_numeric(
+                usdt,
+                "walletBalance",
+                default=first_numeric(data, "totalWalletBalance"),
+            ),
+            "margin_balance": first_numeric(
+                usdt,
+                "marginBalance",
+                default=first_numeric(data, "totalMarginBalance"),
+            ),
+            "detail": "Binance Futures signed account endpoint 조회 결과입니다.",
+        }
+    ]
+
+
+def parse_binance_futures_positions(
+    payload: object,
+) -> list[dict[str, object]]:
+    if isinstance(payload, dict):
+        raw_positions = payload.get("positions")
+        rows = (
+            raw_positions
+            if isinstance(raw_positions, list)
+            else [payload]
+            if payload.get("symbol")
+            else []
+        )
+    else:
+        rows = payload if isinstance(payload, list) else []
+    positions: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = first_text(row, "symbol").strip().upper()
+        if not symbol:
+            continue
+        position_side = first_text(
+            row,
+            "positionSide",
+            default="BOTH",
+        ).strip().upper()
+        raw_quantity = first_numeric(row, "positionAmt")
+        if position_side == "SHORT":
+            quantity = -abs(raw_quantity)
+        elif position_side == "LONG":
+            quantity = abs(raw_quantity)
+        else:
+            quantity = raw_quantity
+        if abs(quantity) <= 1e-12:
+            continue
+        mark_price = first_numeric(row, "markPrice")
+        notional = first_numeric(row, "notional")
+        positions.append(
+            {
+                "symbol": symbol,
+                "asset": "코인 USD-M 선물",
+                "broker_id": "binance-futures",
+                "broker_name": "Binance USD-M Futures",
+                "currency": "USDT",
+                "broker_qty": quantity,
+                "broker_value": (
+                    abs(notional)
+                    if notional
+                    else abs(quantity * mark_price)
+                ),
+                "average_price": first_numeric(row, "entryPrice"),
+                "current_price": mark_price,
+                "position_side": position_side,
+                "unrealized_profit": first_numeric(
+                    row,
+                    "unRealizedProfit",
+                    "unrealizedProfit",
+                ),
+                "liquidation_price": first_numeric(
+                    row,
+                    "liquidationPrice",
+                ),
+                "leverage": first_numeric(row, "leverage"),
+                "margin_type": first_text(
+                    row,
+                    "marginType",
+                    default="",
+                ).upper(),
+                "detail": (
+                    f"Binance Futures {position_side} "
+                    f"positionAmt={quantity:g}"
+                ),
+            }
+        )
+    return positions
+
+
+def normalize_binance_futures_symbol_config(
+    payload: object,
+    symbol: str,
+) -> dict[str, object]:
+    rows = payload if isinstance(payload, list) else [payload]
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    row = next(
+        (
+            item
+            for item in rows
+            if isinstance(item, dict)
+            and str(item.get("symbol") or "").upper() == normalized_symbol
+        ),
+        {},
+    )
+    return {
+        "symbol": normalized_symbol,
+        "margin_type": first_text(
+            row,
+            "marginType",
+            default="",
+        ).upper(),
+        "leverage": first_numeric(row, "leverage"),
+        "max_notional": first_numeric(
+            row,
+            "maxNotionalValue",
+            "maxNotional",
+        ),
+    }
+
+
+def validate_binance_futures_execution_policy(
+    intent: dict[str, object],
+    symbol_config: dict[str, object],
+) -> None:
+    if intent.get("risk_reducing") is True:
+        return
+    maximum_leverage = max(
+        1.0,
+        numeric_value(
+            intent.get("max_leverage")
+            or intent.get("maxLeverage"),
+            1.0,
+        ),
+    )
+    current_leverage = numeric_value(
+        symbol_config.get("leverage"),
+        0.0,
+    )
+    if current_leverage <= 0:
+        raise BrokerNotReadyError(
+            "Binance Futures 현재 레버리지를 확인하지 못해 신규 진입을 차단했습니다."
+        )
+    if current_leverage > maximum_leverage + 1e-12:
+        raise BrokerNotReadyError(
+            "Binance Futures 현재 레버리지 "
+            f"{current_leverage:g}x가 전략 한도 "
+            f"{maximum_leverage:g}x를 초과합니다."
+        )
+    required_margin_type = str(
+        intent.get("required_margin_type")
+        or intent.get("requiredMarginType")
+        or "ISOLATED"
+    ).strip().upper()
+    current_margin_type = str(
+        symbol_config.get("margin_type") or ""
+    ).strip().upper()
+    if required_margin_type not in {"", "ANY"} and (
+        current_margin_type != required_margin_type
+    ):
+        raise BrokerNotReadyError(
+            "Binance Futures 증거금 방식이 전략 요구와 다릅니다: "
+            f"현재 {current_margin_type or 'UNKNOWN'}, "
+            f"요구 {required_margin_type}."
+        )
+
+
 def parse_upbit_accounts(payload: object) -> list[dict[str, object]]:
     rows = payload if isinstance(payload, list) else []
     krw = next((row for row in rows if isinstance(row, dict) and str(row.get("currency", "")).upper() == "KRW"), {})
@@ -709,6 +948,18 @@ class LiveBrokerRouter:
         if broker_id == "binance":
             payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))
             return {"broker_id": "binance", "accounts": parse_binance_accounts(payload)}
+        if broker_id == "binance-futures":
+            payload = ensure_response_ok(
+                "binance-futures",
+                send_binance_signed_request(
+                    build_binance_futures_account_request,
+                    futures=True,
+                ),
+            )
+            return {
+                "broker_id": "binance-futures",
+                "accounts": parse_binance_futures_accounts(payload),
+            }
         if broker_id == "upbit":
             payload = ensure_response_ok("upbit", send_prepared_request(build_upbit_accounts_request()))
             return {"broker_id": "upbit", "accounts": parse_upbit_accounts(payload)}
@@ -730,6 +981,15 @@ class LiveBrokerRouter:
         if broker_id == "binance":
             payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))
             return parse_binance_positions(payload)
+        if broker_id == "binance-futures":
+            payload = ensure_response_ok(
+                "binance-futures",
+                send_binance_signed_request(
+                    build_binance_futures_positions_request,
+                    futures=True,
+                ),
+            )
+            return parse_binance_futures_positions(payload)
         if broker_id == "upbit":
             payload = ensure_response_ok("upbit", send_prepared_request(build_upbit_accounts_request()))
             return parse_upbit_positions(payload)
@@ -748,9 +1008,102 @@ class LiveBrokerRouter:
             except RuntimeError as exc:
                 raise BrokerNotReadyError(str(exc)) from exc
             return send_binance_signed_request(lambda: build_binance_spot_order_request(normalized_intent))
+        if broker_id == "binance-futures":
+            try:
+                normalized_intent = normalize_binance_futures_intent(
+                    intent
+                )
+            except RuntimeError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
+            position_mode_payload = ensure_response_ok(
+                "binance-futures",
+                send_binance_signed_request(
+                    build_binance_futures_position_mode_request,
+                    futures=True,
+                ),
+            )
+            position_mode = (
+                position_mode_payload
+                if isinstance(position_mode_payload, dict)
+                else {}
+            )
+            symbol = str(normalized_intent.get("symbol") or "")
+            symbol_config_payload = ensure_response_ok(
+                "binance-futures",
+                send_binance_signed_request(
+                    lambda: build_binance_futures_symbol_config_request(
+                        symbol
+                    ),
+                    futures=True,
+                ),
+            )
+            validate_binance_futures_execution_policy(
+                normalized_intent,
+                normalize_binance_futures_symbol_config(
+                    symbol_config_payload,
+                    symbol,
+                ),
+            )
+            return send_binance_signed_request(
+                lambda: build_binance_futures_order_request(
+                    normalized_intent,
+                    hedge_mode=position_mode.get(
+                        "dualSidePosition"
+                    ) is True,
+                ),
+                futures=True,
+            )
         if broker_id == "upbit":
             return send_prepared_request(build_upbit_order_request(intent))
         raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
+
+    def test_binance_futures_order(
+        self,
+        intent: dict[str, object],
+    ) -> dict[str, object]:
+        """Validate a signed Futures order without matching-engine submission."""
+
+        try:
+            normalized_intent = normalize_binance_futures_intent(intent)
+        except RuntimeError as exc:
+            raise BrokerNotReadyError(str(exc)) from exc
+        position_mode_payload = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                build_binance_futures_position_mode_request,
+                futures=True,
+            ),
+        )
+        position_mode = (
+            position_mode_payload
+            if isinstance(position_mode_payload, dict)
+            else {}
+        )
+        symbol = str(normalized_intent.get("symbol") or "")
+        symbol_config_payload = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                lambda: build_binance_futures_symbol_config_request(
+                    symbol
+                ),
+                futures=True,
+            ),
+        )
+        validate_binance_futures_execution_policy(
+            normalized_intent,
+            normalize_binance_futures_symbol_config(
+                symbol_config_payload,
+                symbol,
+            ),
+        )
+        return send_binance_signed_request(
+            lambda: build_binance_futures_order_request(
+                normalized_intent,
+                hedge_mode=position_mode.get("dualSidePosition") is True,
+                test=True,
+            ),
+            futures=True,
+        )
 
     def get_upbit_order_chance(self, market: str) -> dict[str, object]:
         payload = ensure_response_ok(
@@ -786,6 +1139,17 @@ class LiveBrokerRouter:
                     client_order_id=bool(context.get("client_order_id")),
                 )
             )
+        if broker_id == "binance-futures":
+            return send_binance_signed_request(
+                lambda: build_binance_futures_cancel_order_request(
+                    str(context.get("symbol") or ""),
+                    broker_order_id,
+                    client_order_id=bool(
+                        context.get("client_order_id")
+                    ),
+                ),
+                futures=True,
+            )
         if broker_id == "upbit":
             return send_prepared_request(build_upbit_cancel_order_request(
                 broker_order_id,
@@ -795,7 +1159,12 @@ class LiveBrokerRouter:
 
     def stream_executions(self, broker_id: str) -> dict[str, object]:
         broker_id = broker_id.lower().strip()
-        if broker_id not in {"kis", "binance", "upbit"}:
+        if broker_id not in {
+            "kis",
+            "binance",
+            "binance-futures",
+            "upbit",
+        }:
             raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
         if self.execution_stream_manager is None:
             raise BrokerNotReadyError("ExecutionStreamManager를 LiveBrokerRouter에 연결해야 합니다.")
@@ -832,6 +1201,30 @@ class LiveBrokerRouter:
                 "positions": positions,
                 "events": broker_snapshot_events(accounts, positions),
                 "source": "binance_account_poll",
+            }
+        if broker_id == "binance-futures":
+            account_payload = ensure_response_ok(
+                "binance-futures",
+                send_binance_signed_request(
+                    build_binance_futures_account_request,
+                    futures=True,
+                ),
+            )
+            position_payload = ensure_response_ok(
+                "binance-futures",
+                send_binance_signed_request(
+                    build_binance_futures_positions_request,
+                    futures=True,
+                ),
+            )
+            accounts = parse_binance_futures_accounts(account_payload)
+            positions = parse_binance_futures_positions(position_payload)
+            return {
+                "broker_id": "binance-futures",
+                "accounts": accounts,
+                "positions": positions,
+                "events": broker_snapshot_events(accounts, positions),
+                "source": "binance_futures_account_poll",
             }
         if broker_id == "upbit":
             payload = ensure_response_ok("upbit", send_prepared_request(build_upbit_accounts_request()))

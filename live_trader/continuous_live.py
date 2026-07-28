@@ -341,7 +341,15 @@ class LiveContinuousController:
     @staticmethod
     def _standalone_spec(strategy: dict[str, Any]) -> RuntimeStrategySpec:
         symbol = str(strategy.get("symbol") or "").strip().upper()
-        provider, broker_id, instrument_id = infer_market_route(symbol)
+        market_type = str(
+            strategy.get("market_type")
+            or strategy.get("marketType")
+            or ""
+        ).strip().lower()
+        provider, broker_id, instrument_id = infer_market_route(
+            symbol,
+            market_type,
+        )
         provider = str(strategy.get("provider") or provider).strip().lower()
         broker_id = str(strategy.get("broker_id") or broker_id).strip().lower()
         strategy_id = str(strategy.get("strategy_id") or strategy.get("id") or "").strip()
@@ -494,6 +502,7 @@ class LiveContinuousController:
                 else self._order_quantity(spec, decision.bar.close)
             )
             market_type = self._market_type(spec)
+            futures_policy = self._futures_execution_policy(spec)
             intent = OrderIntent(
                 strategy_id=decision.strategy_id,
                 asset=state.asset_from_symbol(spec.symbol),
@@ -525,11 +534,19 @@ class LiveContinuousController:
                         is_short_entry
                         and self._artifact_short_requested(spec)
                     ),
-                    # The shipped live adapters are cash/spot routes. A
-                    # margin/futures adapter must explicitly attest signed
-                    # positions before the shared risk gate can allow entry.
-                    "broker_short_adapter_verified": False,
+                    "broker_short_adapter_verified": (
+                        spec.broker_id == "binance-futures"
+                        and market_type in {
+                            "future",
+                            "futures",
+                            "perpetual",
+                        }
+                    ),
                     "risk_reducing": is_short_cover or is_long_exit,
+                    "max_leverage": futures_policy["max_leverage"],
+                    "required_margin_type": futures_policy[
+                        "required_margin_type"
+                    ],
                     "runtime_evaluation_key": decision.evaluation_key,
                     "confirmed_bar_end": decision.bar.end_time,
                     "order_type": self._order_type_for_broker(
@@ -597,6 +614,34 @@ class LiveContinuousController:
             or execution_policy.get("allowShort") is True
         )
 
+    @classmethod
+    def _futures_execution_policy(
+        cls,
+        spec: Any,
+    ) -> dict[str, object]:
+        definition = cls._custom_definition(spec)
+        risk_rules = (
+            definition.get("riskRules")
+            if isinstance(definition.get("riskRules"), dict)
+            else {}
+        )
+        try:
+            maximum_leverage = max(
+                1.0,
+                float(risk_rules.get("maxLeverage") or 1.0),
+            )
+        except (TypeError, ValueError):
+            maximum_leverage = 1.0
+        required_margin_type = str(
+            risk_rules.get("requiredMarginType") or "ISOLATED"
+        ).strip().upper()
+        if required_margin_type not in {"ISOLATED", "CROSSED", "ANY"}:
+            required_margin_type = "ISOLATED"
+        return {
+            "max_leverage": maximum_leverage,
+            "required_margin_type": required_margin_type,
+        }
+
     @staticmethod
     def _order_quantity(spec: Any, price: float) -> float:
         override = spec.parameters.get("liveOrderQuantity")
@@ -605,7 +650,33 @@ class LiveContinuousController:
                 return max(0.0, float(override))
             except (TypeError, ValueError):
                 pass
-        if spec.broker_id == "binance":
+        if spec.broker_id == "binance-futures":
+            artifact = spec.artifact if isinstance(spec.artifact, dict) else {}
+            execution_sizing = (
+                artifact.get("executionSizing")
+                if isinstance(artifact.get("executionSizing"), dict)
+                else artifact.get("execution_sizing")
+                if isinstance(artifact.get("execution_sizing"), dict)
+                else {}
+            )
+            raw_fixed_quantity = (
+                execution_sizing.get("paperOrderQuantity")
+                or spec.parameters.get("paperOrderQuantity")
+            )
+            try:
+                fixed_quantity = max(0.0, float(raw_fixed_quantity or 0.0))
+            except (TypeError, ValueError):
+                fixed_quantity = 0.0
+            try:
+                notional_cap = max(
+                    0.0,
+                    float(spec.parameters.get("liveOrderNotionalUsdt", 100.0)),
+                )
+            except (TypeError, ValueError):
+                notional_cap = 100.0
+            capped_quantity = notional_cap / max(price, 1e-12)
+            return min(fixed_quantity, capped_quantity) if fixed_quantity > 0 else capped_quantity
+        if spec.broker_id in {"binance", "binance-futures"}:
             try:
                 notional = float(spec.parameters.get("liveOrderNotionalUsdt", 5.5))
             except (TypeError, ValueError):
@@ -630,7 +701,7 @@ class LiveContinuousController:
     ) -> str:
         normalized = str(broker_id or "").strip().lower()
         normalized_side = str(side or "BUY").strip().upper()
-        if normalized == "binance":
+        if normalized in {"binance", "binance-futures"}:
             return "MARKET"
         if normalized == "kis":
             text = str(symbol or "").strip().upper()

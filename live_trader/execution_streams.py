@@ -98,6 +98,62 @@ def parse_binance_execution_report(payload: Any) -> dict[str, Any] | None:
     }
 
 
+def parse_binance_futures_order_update(
+    payload: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    event = (
+        payload.get("data")
+        if isinstance(payload.get("data"), dict)
+        else payload
+    )
+    if str(event.get("e") or "") != "ORDER_TRADE_UPDATE":
+        return None
+    order = event.get("o") if isinstance(event.get("o"), dict) else {}
+    order_id = str(order.get("i") or "")
+    client_order_id = str(order.get("c") or "")
+    execution_type = str(order.get("x") or "").upper()
+    order_status = str(order.get("X") or "").upper()
+    state = {
+        "FILLED": "filled",
+        "PARTIALLY_FILLED": "partially_filled",
+        "CANCELED": "canceled",
+        "REJECTED": "rejected",
+        "EXPIRED": "expired",
+        "NEW": "accepted",
+    }.get(order_status, execution_type.lower() or "accepted")
+    quantity = _float(order.get("l") or 0)
+    price = _float(order.get("L") or order.get("ap") or 0)
+    trade_id = str(order.get("t") or "")
+    event_time = _float(event.get("E") or order.get("T") or 0)
+    return {
+        "event_id": (
+            f"binance-futures:{order_id}:"
+            f"{trade_id or execution_type}:{order_status}:{quantity}"
+        ),
+        "broker_id": "binance-futures",
+        "order_id": client_order_id,
+        "broker_order_id": order_id,
+        "symbol": str(order.get("s") or "").upper(),
+        "side": str(order.get("S") or "").upper(),
+        "position_side": str(order.get("ps") or "BOTH").upper(),
+        "reduce_only": order.get("R") is True,
+        "quantity": quantity,
+        "price": price,
+        "fee": _float(order.get("n") or 0),
+        "state": state,
+        "occurred_at": (
+            datetime.fromtimestamp(event_time / 1000).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            if event_time > 0
+            else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ),
+        "raw_type": "binance_futures_order_trade_update",
+    }
+
+
 def parse_kis_domestic_execution(fields: list[str]) -> dict[str, Any] | None:
     if len(fields) < 14:
         return None
@@ -166,7 +222,12 @@ class ExecutionStreamManager:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._threads: dict[str, threading.Thread] = {}
-        self._events: dict[str, deque[dict[str, Any]]] = {"kis": deque(maxlen=1000), "binance": deque(maxlen=1000), "upbit": deque(maxlen=1000)}
+        self._events: dict[str, deque[dict[str, Any]]] = {
+            "kis": deque(maxlen=1000),
+            "binance": deque(maxlen=1000),
+            "binance-futures": deque(maxlen=1000),
+            "upbit": deque(maxlen=1000),
+        }
         self._status: dict[str, dict[str, Any]] = {}
 
     def start(self, brokers: Iterable[str] = ("kis", "binance", "upbit")) -> dict[str, Any]:
@@ -174,7 +235,15 @@ class ExecutionStreamManager:
             self._stop.clear()
             for broker_id in brokers:
                 name = str(broker_id).lower().strip()
-                if name not in {"kis", "binance", "upbit"} or (name in self._threads and self._threads[name].is_alive()):
+                if name not in {
+                    "kis",
+                    "binance",
+                    "binance-futures",
+                    "upbit",
+                } or (
+                    name in self._threads
+                    and self._threads[name].is_alive()
+                ):
                     continue
                 thread = threading.Thread(target=self._run, args=(name,), daemon=True, name=f"{name}-execution-stream")
                 self._threads[name] = thread
@@ -212,6 +281,8 @@ class ExecutionStreamManager:
             try:
                 if broker_id == "upbit":
                     self._run_upbit()
+                elif broker_id == "binance-futures":
+                    self._run_binance_futures()
                 elif broker_id == "binance":
                     self._run_binance()
                 else:
@@ -290,6 +361,89 @@ class ExecutionStreamManager:
                     self._record("binance", event)
         finally:
             socket.close()
+
+    def _run_binance_futures(self) -> None:
+        import websocket  # type: ignore[import-not-found]
+
+        api_key = os.getenv("BINANCE_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "Binance Futures private stream credentials missing"
+            )
+        base_url = (
+            os.getenv("BINANCE_FUTURES_BASE_URL", "").strip()
+            or "https://fapi.binance.com"
+        ).rstrip("/")
+        listen_key_url = f"{base_url}/fapi/v1/listenKey"
+        request = urllib.request.Request(
+            listen_key_url,
+            data=b"",
+            headers={"X-MBX-APIKEY": api_key},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        listen_key = str(payload.get("listenKey") or "")
+        if not listen_key:
+            raise RuntimeError(
+                "Binance Futures listenKey 발급에 실패했습니다."
+            )
+        stream_base = os.getenv(
+            "BINANCE_FUTURES_STREAM_URL",
+            "wss://fstream.binance.com/ws",
+        ).rstrip("/")
+        socket = websocket.create_connection(
+            f"{stream_base}/{listen_key}",
+            timeout=20,
+        )
+        last_keepalive = time.monotonic()
+        with self._lock:
+            self._status["binance-futures"].update(
+                {"connected": True, "lastError": ""}
+            )
+        try:
+            while not self._stop.is_set():
+                if time.monotonic() - last_keepalive >= 30 * 60:
+                    keepalive = urllib.request.Request(
+                        listen_key_url,
+                        data=b"",
+                        headers={"X-MBX-APIKEY": api_key},
+                        method="PUT",
+                    )
+                    with urllib.request.urlopen(
+                        keepalive,
+                        timeout=10,
+                    ):
+                        pass
+                    last_keepalive = time.monotonic()
+                try:
+                    raw = socket.recv()
+                except Exception as exc:
+                    if type(exc).__name__ == "WebSocketTimeoutException":
+                        socket.ping()
+                        continue
+                    raise
+                payload = json.loads(
+                    raw.decode("utf-8")
+                    if isinstance(raw, bytes)
+                    else raw
+                )
+                event = parse_binance_futures_order_update(payload)
+                if event:
+                    self._record("binance-futures", event)
+        finally:
+            socket.close()
+            try:
+                close_request = urllib.request.Request(
+                    listen_key_url,
+                    data=b"",
+                    headers={"X-MBX-APIKEY": api_key},
+                    method="DELETE",
+                )
+                with urllib.request.urlopen(close_request, timeout=10):
+                    pass
+            except Exception:
+                pass
 
     def _run_kis(self) -> None:
         import websocket  # type: ignore[import-not-found]

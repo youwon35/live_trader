@@ -86,7 +86,7 @@ from .contracts import (
 from .audit_store import SQLiteAuditEventStore
 from .env_loader import default_runtime_data_root
 from .execution_streams import ExecutionStreamManager
-from .live_adapters import BINANCE_BASE_URL, build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request, env_value, http_json
+from .live_adapters import BINANCE_BASE_URL, build_binance_futures_order_request, build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request, env_value, http_json
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
@@ -1453,7 +1453,12 @@ def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers:
     brokers = brokers if brokers is not None else [broker.to_dict() for broker in broker_readiness()]
     broker_map = {str(broker["broker_id"]): broker for broker in brokers}
     stock_strategies = [strategy for strategy in strategies if strategy_broker_id(strategy) == "kis"]
-    crypto_strategies = [strategy for strategy in strategies if strategy_broker_id(strategy) in {"binance", "upbit"}]
+    crypto_strategies = [
+        strategy
+        for strategy in strategies
+        if strategy_broker_id(strategy)
+        in {"binance", "binance-futures", "upbit"}
+    ]
     stock_provider = str(STATE["automation"]["stock"].get("provider") or "kis")
     crypto_provider = str(STATE["automation"]["crypto"].get("provider") or "binance")
     return [
@@ -1478,9 +1483,19 @@ def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers:
             "id": "crypto",
             "title": "코인 자동화",
             "provider": crypto_provider,
-            "provider_label": "Binance API" if crypto_provider == "binance" else "Upbit API",
-            "broker_ids": ["binance", "upbit"],
-            "asset_scope": ["Binance 현물", "Upbit KRW 마켓"],
+            "provider_label": (
+                "Binance USD-M Futures"
+                if crypto_provider == "binance-futures"
+                else "Binance API"
+                if crypto_provider == "binance"
+                else "Upbit API"
+            ),
+            "broker_ids": ["binance", "binance-futures", "upbit"],
+            "asset_scope": [
+                "Binance 현물",
+                "Binance USD-M 선물",
+                "Upbit KRW 마켓",
+            ],
             "mode": str(STATE["automation"]["crypto"].get("mode") or "MONITOR"),
             "enabled": bool(STATE["automation"]["crypto"]["enabled"]),
             "last_action": STATE["automation"]["crypto"]["last_action"],
@@ -1500,6 +1515,12 @@ def broker_id_from_hint(value: object) -> str:
         return ""
     if "upbit" in text:
         return "upbit"
+    if "binance" in text and (
+        "future" in text
+        or "perpetual" in text
+        or "usd-m" in text
+    ):
+        return "binance-futures"
     if "binance" in text:
         return "binance"
     if text == "kis" or "korea investment" in text or "한국투자" in text:
@@ -1524,6 +1545,18 @@ def strategy_broker_id(strategy: dict[str, Any]) -> str:
         else {}
     )
     scope = trader_contract.get("scope") if isinstance(trader_contract.get("scope"), dict) else {}
+    market_type = str(
+        strategy.get("marketType")
+        or strategy.get("market_type")
+        or dataset.get("marketType")
+        or dataset.get("market_type")
+        or data_artifact.get("marketType")
+        or data_artifact.get("market_type")
+        or ""
+    ).strip().lower()
+    if market_type in {"future", "futures", "perpetual"}:
+        return "binance-futures"
+
     for hint in (
         dataset.get("provider"),
         strategy.get("dataset_provider"),
@@ -1568,11 +1601,22 @@ def strategy_broker_id(strategy: dict[str, Any]) -> str:
 
 def build_adapter_preview(provider: str, strategies: list[dict[str, Any]]) -> dict[str, Any]:
     strategy = next((item for item in strategies if item.get("live_allowed")), strategies[0] if strategies else {})
-    symbol = str(strategy.get("symbol") or ("BTCUSDT" if provider == "binance" else "KRW-BTC" if provider == "upbit" else "069500.KS"))
+    symbol = str(
+        strategy.get("symbol")
+        or (
+            "BTCUSDT.PERP"
+            if provider == "binance-futures"
+            else "BTCUSDT"
+            if provider == "binance"
+            else "KRW-BTC"
+            if provider == "upbit"
+            else "069500.KS"
+        )
+    )
     local_code = symbol.upper().removesuffix(".KS").removesuffix(".KQ")
     order_type = (
         "MARKET"
-        if provider == "binance"
+        if provider in {"binance", "binance-futures"}
         else "price"
         if provider == "upbit"
         else "01"
@@ -1591,7 +1635,7 @@ def build_adapter_preview(provider: str, strategies: list[dict[str, Any]]) -> di
             0
             if provider == "kis" and order_type == "01"
             else 1000
-            if provider != "binance"
+            if provider not in {"binance", "binance-futures"}
             else 1
         ),
         "order_type": order_type,
@@ -1600,6 +1644,15 @@ def build_adapter_preview(provider: str, strategies: list[dict[str, Any]]) -> di
         return build_kis_live_order_request(intent).preview()
     if provider == "upbit":
         return build_upbit_order_request(intent).preview()
+    if provider == "binance-futures":
+        return build_binance_futures_order_request(
+            {
+                **intent,
+                "position_direction": "short",
+            },
+            hedge_mode=False,
+            test=True,
+        ).preview()
     return build_binance_spot_order_request(intent, test=True).preview()
 
 
@@ -1900,7 +1953,7 @@ def _restore_account_scope(broker_id: str) -> str:
                 os.getenv("KIS_ACCOUNT_PRODUCT_CODE", ""),
             )
         )
-    elif normalized == "binance":
+    elif normalized in {"binance", "binance-futures"}:
         configured = os.getenv("BINANCE_API_KEY", "")
     elif normalized == "upbit":
         configured = os.getenv("UPBIT_ACCESS_KEY", "")
@@ -1920,7 +1973,7 @@ def _canonical_restore_instrument(broker_id: str, symbol: str) -> str:
         if "-" not in compact and compact.startswith("KRW") and len(compact) > 3:
             compact = f"KRW-{compact[3:]}"
         return compact
-    if normalized_broker == "binance":
+    if normalized_broker in {"binance", "binance-futures"}:
         compact = text.replace("-", "").replace("_", "")
         for quote in ("USDT", "USDC", "FDUSD", "BUSD", "TUSD", "BTC", "ETH"):
             if compact.endswith(quote) and len(compact) > len(quote):
@@ -1945,8 +1998,12 @@ def _restore_spec_route(spec: Any) -> dict[str, Any]:
                 or getattr(spec, "artifact", {}).get("exchange")
                 or "NASD"
             ).upper()
-    elif broker_id == "binance":
-        exchange = "BINANCE_SPOT"
+    elif broker_id in {"binance", "binance-futures"}:
+        exchange = (
+            "BINANCE_FUTURES"
+            if broker_id == "binance-futures"
+            else "BINANCE_SPOT"
+        )
     elif broker_id == "upbit":
         exchange = "UPBIT_SPOT"
     else:
@@ -2283,7 +2340,11 @@ def forced_restore_context_assessment(
             safe_float(row.get("quantity"), 0.0)
             for row in matching_ledger
         )
-        tolerance = 1e-12 if broker_id in {"binance", "upbit"} else 0.0
+        tolerance = (
+            1e-12
+            if broker_id in {"binance", "binance-futures", "upbit"}
+            else 0.0
+        )
         broker_flat = abs(broker_qty) <= tolerance
         ledger_flat = abs(ledger_qty) <= tolerance
         all_broker_flat = all_broker_flat and broker_flat
@@ -4389,8 +4450,16 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
         normalized_provider = provider.lower().strip()
         if profile_id == "stock" and normalized_provider != "kis":
             return {"ok": False, "reason": "주식/ETF 자동화 provider는 kis만 허용합니다.", "snapshot": snapshot()}
-        if profile_id == "crypto" and normalized_provider not in {"binance", "upbit"}:
-            return {"ok": False, "reason": "코인 자동화 provider는 binance 또는 upbit만 허용합니다.", "snapshot": snapshot()}
+        if profile_id == "crypto" and normalized_provider not in {
+            "binance",
+            "binance-futures",
+            "upbit",
+        }:
+            return {
+                "ok": False,
+                "reason": "코인 자동화 provider는 Binance 현물·선물 또는 Upbit만 허용합니다.",
+                "snapshot": snapshot(),
+            }
         STATE["automation"][profile_id]["provider"] = normalized_provider
 
     next_mode = str(mode or ("SMALL_LIVE" if enabled else "MONITOR")).strip().upper()
@@ -4552,7 +4621,7 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
         "successful_account_brokers": [],
         "successful_position_brokers": [],
     }
-    for broker_id in ("kis", "binance", "upbit"):
+    for broker_id in ("kis", "binance", "binance-futures", "upbit"):
         try:
             account_snapshot = router.get_account_snapshot(broker_id)
             accounts = account_snapshot.get("accounts", []) if isinstance(account_snapshot, dict) else []
@@ -5200,7 +5269,14 @@ def poll_execution_events(
     *,
     force_snapshot: bool | None = None,
 ) -> dict[str, Any]:
-    broker_ids = ("kis", "binance", "upbit") if broker_id.strip().lower() in {"", "all"} else (broker_id.strip().lower(),)
+    broker_ids = (
+        "kis",
+        "binance",
+        "binance-futures",
+        "upbit",
+    ) if broker_id.strip().lower() in {"", "all"} else (
+        broker_id.strip().lower(),
+    )
     force = len(broker_ids) == 1 if force_snapshot is None else bool(force_snapshot)
     router = LiveBrokerRouter()
     events: list[dict[str, Any]] = []
@@ -6078,7 +6154,7 @@ def order_intent_market_session(intent: OrderIntent) -> dict[str, object] | None
     ).strip().lower()
     asset = str(intent.asset or "").strip().lower()
     symbol = str(intent.symbol or "").strip().upper()
-    if broker_id in {"binance", "upbit"} or any(
+    if broker_id in {"binance", "binance-futures", "upbit"} or any(
         token in asset for token in ("crypto", "코인")
     ):
         return None
@@ -6214,7 +6290,12 @@ def strategy_market_event(strategy: dict[str, Any]) -> MarketEvent:
         "price",
         "close",
         "close_price",
-        default=1.0 if strategy_broker_id(strategy) == "binance" else 1000.0,
+        default=(
+            1.0
+            if strategy_broker_id(strategy)
+            in {"binance", "binance-futures"}
+            else 1000.0
+        ),
     )
     symbol = str(strategy.get("symbol") or "UNKNOWN")
     provider = strategy_broker_id(strategy)
@@ -6261,7 +6342,12 @@ def select_strategies_for_profile(checks: dict[str, Any], profile_id: str) -> li
     else:
         matched = [strategy for strategy in strategies if strategy_broker_id(strategy) == provider]
         if not matched:
-            matched = [strategy for strategy in strategies if strategy_broker_id(strategy) in {"binance", "upbit"}]
+            matched = [
+                strategy
+                for strategy in strategies
+                if strategy_broker_id(strategy)
+                in {"binance", "binance-futures", "upbit"}
+            ]
     if len(matched) <= 1:
         return matched
     portfolio_ids = {
@@ -6298,10 +6384,15 @@ def strategy_executions_for_profile(checks: dict[str, Any], profile_id: str) -> 
                     "market_type": str(strategy.get("market_type") or "spot").lower(),
                     "position_direction": str(strategy.get("position_direction") or "long").lower(),
                     "short_entries_requested": strategy.get("allow_short_requested") is True,
-                    # The currently shipped KIS/Binance/Upbit adapters are all
-                    # cash/spot routes. A future margin/futures adapter must
-                    # attest this separately before a naked SELL is allowed.
-                    "broker_short_adapter_verified": False,
+                    "broker_short_adapter_verified": (
+                        strategy_broker_id(strategy) == "binance-futures"
+                        and str(
+                            strategy.get("market_type") or ""
+                        ).lower()
+                        in {"future", "futures", "perpetual"}
+                    ),
+                    "max_leverage": 1.0,
+                    "required_margin_type": "ISOLATED",
                 },
                 reason_prefix=f"{strategy.get('name') or strategy.get('strategy_id') or '전략'} live runner signal",
             ),
@@ -6338,7 +6429,14 @@ def intent_readiness_blocker_count(
         return int(checks.get("summary", {}).get("blocker_count", 0))
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     broker_id = str(metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset)).strip().lower()
-    profile_id = str(metadata.get("profile_id") or ("crypto" if broker_id in {"binance", "upbit"} else "stock"))
+    profile_id = str(
+        metadata.get("profile_id")
+        or (
+            "crypto"
+            if broker_id in {"binance", "binance-futures", "upbit"}
+            else "stock"
+        )
+    )
     scoped = reconciliation_summary or reconciliation_summary_for_broker(broker_id)
     blockers = profile_readiness_blocker_count(
         checks,
@@ -6607,6 +6705,18 @@ def live_broker_payload(
         "order_type": order_type,
         "identifier": idempotency_key,
         "exchange": str(metadata.get("exchange") or ""),
+        "position_direction": str(
+            metadata.get("position_direction") or "long"
+        ),
+        "market_type": str(metadata.get("market_type") or "spot"),
+        "risk_reducing": metadata.get("risk_reducing") is True,
+        "max_leverage": safe_float(
+            metadata.get("max_leverage"),
+            1.0,
+        ),
+        "required_margin_type": str(
+            metadata.get("required_margin_type") or "ISOLATED"
+        ),
     }
 
 
@@ -6929,7 +7039,14 @@ def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
 
 
 def start_execution_streams(broker_id: str = "all") -> dict[str, Any]:
-    brokers = ("kis", "binance", "upbit") if str(broker_id).lower().strip() in {"", "all"} else (str(broker_id).lower().strip(),)
+    brokers = (
+        "kis",
+        "binance",
+        "binance-futures",
+        "upbit",
+    ) if str(broker_id).lower().strip() in {"", "all"} else (
+        str(broker_id).lower().strip(),
+    )
     result = LIVE_EXECUTION_STREAMS.start(brokers)
     append_audit("info", "체결 스트림", f"실시간 체결 감시 시작: {', '.join(brokers)}")
     return {"ok": True, "reason": "execution streams started", "streams": result, "snapshot": snapshot()}
@@ -7240,7 +7357,12 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
 
 def broker_position_quantity(symbol: str, broker_id: str = "") -> float:
     positions = STATE.get("broker_reconciliation", {}).get("positions", [])
-    normalized_symbol = str(symbol or "").upper().replace("-", "")
+    normalized_symbol = (
+        str(symbol or "")
+        .upper()
+        .removesuffix(".PERP")
+        .replace("-", "")
+    )
     normalized_broker = str(broker_id or "").strip().lower()
     aliases = {normalized_symbol}
     for quote_currency in ("USDT", "USDC", "BUSD", "BTC", "ETH"):
@@ -7259,7 +7381,13 @@ def broker_position_quantity(symbol: str, broker_id: str = "") -> float:
             or str(item.get("broker_id") or "").strip().lower()
             == normalized_broker
         )
-        and str(item.get("symbol") or "").upper().replace("-", "") in aliases
+        and (
+            str(item.get("symbol") or "")
+            .upper()
+            .removesuffix(".PERP")
+            .replace("-", "")
+            in aliases
+        )
     )
 
 
@@ -7287,7 +7415,31 @@ def retry_order(order_id: str) -> dict[str, Any]:
         reference_price=float(order.get("reference_price", 1000) or 1000),
         mode=current_mode(),
         reason=f"{order_id} retry",
-        metadata={"broker_id": broker_id_from_symbol(str(order.get("symbol", "")), str(order.get("asset", "")))},
+        metadata={
+            "broker_id": str(
+                order.get("broker_id")
+                or broker_id_from_symbol(
+                    str(order.get("symbol", "")),
+                    str(order.get("asset", "")),
+                )
+            ),
+            **{
+                key: value
+                for key, value in (
+                    order.get("broker_request")
+                    if isinstance(order.get("broker_request"), dict)
+                    else {}
+                ).items()
+                if key
+                in {
+                    "position_direction",
+                    "market_type",
+                    "risk_reducing",
+                    "max_leverage",
+                    "required_margin_type",
+                }
+            },
+        },
     )
     ok, state_name, queue_state, reason, risk_report = evaluate_order_gate_with_report(
         checks,

@@ -1855,6 +1855,16 @@ class OrderGateTest(unittest.TestCase):
                             "detail": "fake binance account",
                         }
                     ],
+                    "binance-futures": [
+                        {
+                            "broker_id": "binance-futures",
+                            "broker_name": "Binance USD-M Futures",
+                            "account": "Binance Futures",
+                            "currency": "USDT",
+                            "broker_cash": 15.0,
+                            "detail": "fake binance futures account",
+                        }
+                    ],
                     "upbit": [
                         {
                             "broker_id": "upbit",
@@ -1894,6 +1904,7 @@ class OrderGateTest(unittest.TestCase):
                             "detail": "fake binance position",
                         }
                     ],
+                    "binance-futures": [],
                     "upbit": [],
                 }
                 return rows[broker_id]
@@ -1906,10 +1917,13 @@ class OrderGateTest(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         broker_data = state.STATE["broker_reconciliation"]
-        self.assertEqual(len(broker_data["accounts"]), 3)
+        self.assertEqual(len(broker_data["accounts"]), 4)
         self.assertEqual(len(broker_data["positions"]), 2)
         self.assertEqual(len(broker_data["errors"]), 0)
-        self.assertEqual(broker_data["successful_position_brokers"], ["kis", "binance", "upbit"])
+        self.assertEqual(
+            broker_data["successful_position_brokers"],
+            ["kis", "binance", "binance-futures", "upbit"],
+        )
         self.assertEqual(result["reconciliation"]["summary"]["error_count"], 0)
         self.assertGreaterEqual(result["reconciliation"]["summary"]["mismatch_count"], 1)
         self.assertTrue(
@@ -2122,11 +2136,17 @@ class OrderGateTest(unittest.TestCase):
             finally:
                 self.restore_temp_program_ledger()
 
-        self.assertEqual(["kis", "binance", "upbit"], fake_router.calls)
+        self.assertEqual(
+            ["kis", "binance", "binance-futures", "upbit"],
+            fake_router.calls,
+        )
         self.assertEqual(0, first["program_ledger"]["execution_event_count"])
-        self.assertEqual(3, first["program_ledger"]["cash_count"])
+        self.assertEqual(4, first["program_ledger"]["cash_count"])
         self.assertEqual(0, second["execution_events"]["synced_cash_count"])
-        self.assertEqual(["binance", "kis", "upbit"], second["execution_events"]["snapshot_skipped_brokers"])
+        self.assertEqual(
+            ["binance", "binance-futures", "kis", "upbit"],
+            second["execution_events"]["snapshot_skipped_brokers"],
+        )
 
     def test_snapshot_redacts_account_and_signed_request_material(self) -> None:
         secret = "must-not-leak"

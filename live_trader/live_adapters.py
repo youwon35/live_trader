@@ -36,6 +36,15 @@ BINANCE_TEST_ORDER_ENDPOINT = "/api/v3/order/test"
 BINANCE_ACCOUNT_ENDPOINT = "/api/v3/account"
 BINANCE_TIME_ENDPOINT = "/api/v3/time"
 BINANCE_EXCHANGE_INFO_ENDPOINT = "/api/v3/exchangeInfo"
+BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
+BINANCE_FUTURES_ORDER_ENDPOINT = "/fapi/v1/order"
+BINANCE_FUTURES_TEST_ORDER_ENDPOINT = "/fapi/v1/order/test"
+BINANCE_FUTURES_ACCOUNT_ENDPOINT = "/fapi/v3/account"
+BINANCE_FUTURES_POSITION_ENDPOINT = "/fapi/v3/positionRisk"
+BINANCE_FUTURES_POSITION_MODE_ENDPOINT = "/fapi/v1/positionSide/dual"
+BINANCE_FUTURES_SYMBOL_CONFIG_ENDPOINT = "/fapi/v1/symbolConfig"
+BINANCE_FUTURES_TIME_ENDPOINT = "/fapi/v1/time"
+BINANCE_FUTURES_EXCHANGE_INFO_ENDPOINT = "/fapi/v1/exchangeInfo"
 
 UPBIT_BASE_URL = "https://api.upbit.com"
 UPBIT_ORDER_ENDPOINT = "/v1/orders"
@@ -91,8 +100,21 @@ def binance_timestamp_ms() -> int:
     return int(time.time() * 1000) + offset_ms
 
 
-def refresh_binance_time_offset(*, timeout_seconds: float = 5.0) -> int:
-    base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
+def refresh_binance_time_offset(
+    *,
+    timeout_seconds: float = 5.0,
+    futures: bool = False,
+) -> int:
+    base_url = (
+        env_value("BINANCE_FUTURES_BASE_URL") or BINANCE_FUTURES_BASE_URL
+        if futures
+        else env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
+    )
+    time_endpoint = (
+        BINANCE_FUTURES_TIME_ENDPOINT
+        if futures
+        else BINANCE_TIME_ENDPOINT
+    )
     now = time.monotonic()
     with _BINANCE_TIME_LOCK:
         if (
@@ -104,7 +126,7 @@ def refresh_binance_time_offset(*, timeout_seconds: float = 5.0) -> int:
     started_ms = int(time.time() * 1000)
     response = http_json(
         "GET",
-        f"{base_url.rstrip('/')}{BINANCE_TIME_ENDPOINT}",
+        f"{base_url.rstrip('/')}{time_endpoint}",
         body=None,
         headers={},
         timeout_seconds=timeout_seconds,
@@ -135,18 +157,35 @@ def missing_env(*names: str) -> list[str]:
     return [name for name in names if not env_value(name)]
 
 
-def binance_symbol_rules(symbol: str, *, timeout_seconds: float = 5.0) -> dict[str, Decimal]:
-    normalized_symbol = str(symbol or "").strip().upper()
+def binance_symbol_rules(
+    symbol: str,
+    *,
+    timeout_seconds: float = 5.0,
+    futures: bool = False,
+) -> dict[str, Decimal]:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
     if not normalized_symbol:
         raise RuntimeError("Binance symbol이 비어 있습니다.")
     now = time.monotonic()
     with _BINANCE_SYMBOL_RULE_LOCK:
-        cached = _BINANCE_SYMBOL_RULE_CACHE.get(normalized_symbol)
+        cache_key = f"{'futures' if futures else 'spot'}:{normalized_symbol}"
+        cached = _BINANCE_SYMBOL_RULE_CACHE.get(cache_key)
         if cached and cached[0] > now:
             return dict(cached[1])
-    base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
+    base_url = (
+        env_value("BINANCE_FUTURES_BASE_URL") or BINANCE_FUTURES_BASE_URL
+        if futures
+        else env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
+    )
+    exchange_info_endpoint = (
+        BINANCE_FUTURES_EXCHANGE_INFO_ENDPOINT
+        if futures
+        else BINANCE_EXCHANGE_INFO_ENDPOINT
+    )
     url = (
-        f"{base_url.rstrip('/')}{BINANCE_EXCHANGE_INFO_ENDPOINT}?"
+        f"{base_url.rstrip('/')}{exchange_info_endpoint}?"
         + urllib.parse.urlencode({"symbol": normalized_symbol})
     )
     response = http_json("GET", url, body=None, headers={}, timeout_seconds=timeout_seconds)
@@ -171,7 +210,7 @@ def binance_symbol_rules(symbol: str, *, timeout_seconds: float = 5.0) -> dict[s
         "minNotional": Decimal(str(notional.get("minNotional") or "0")),
     }
     with _BINANCE_SYMBOL_RULE_LOCK:
-        _BINANCE_SYMBOL_RULE_CACHE[normalized_symbol] = (now + 1800.0, rules)
+        _BINANCE_SYMBOL_RULE_CACHE[cache_key] = (now + 1800.0, rules)
     return dict(rules)
 
 
@@ -208,6 +247,79 @@ def normalize_binance_spot_intent(intent: dict[str, object]) -> dict[str, object
         )
     normalized["quantity"] = normalize_decimal_text(quantity)
     normalized["qty"] = normalized["quantity"]
+    return normalized
+
+
+def normalize_binance_futures_intent(
+    intent: dict[str, object],
+) -> dict[str, object]:
+    normalized = dict(intent)
+    symbol = (
+        str(normalized.get("symbol") or "")
+        .strip()
+        .upper()
+        .removesuffix(".PERP")
+        .replace("-", "")
+    )
+    side = normalize_side(normalized.get("side"))
+    order_type = str(
+        normalized.get("order_type") or "MARKET"
+    ).strip().upper()
+    if order_type not in {"MARKET", "LIMIT"}:
+        raise RuntimeError(
+            "Binance Futures 자동 주문은 MARKET/LIMIT만 허용합니다."
+        )
+    rules = binance_symbol_rules(symbol, futures=True)
+    quantity = _decimal_or_zero(
+        normalized.get("quantity") or normalized.get("qty")
+    )
+    step = rules["stepSize"]
+    if step > 0:
+        quantity = (
+            (quantity / step).to_integral_value(rounding=ROUND_DOWN)
+            * step
+        )
+    if quantity <= 0 or (
+        rules["minQty"] > 0 and quantity < rules["minQty"]
+    ):
+        raise RuntimeError(
+            f"Binance Futures {symbol} 주문 수량이 최소 수량보다 작습니다."
+        )
+    if rules["maxQty"] > 0 and quantity > rules["maxQty"]:
+        raise RuntimeError(
+            f"Binance Futures {symbol} 주문 수량이 최대 수량을 초과합니다."
+        )
+    reference_price = _decimal_or_zero(normalized.get("price"))
+    if (
+        rules["minNotional"] > 0
+        and reference_price > 0
+        and quantity * reference_price < rules["minNotional"]
+    ):
+        raise RuntimeError(
+            f"Binance Futures {symbol} 최소 주문금액 "
+            f"{rules['minNotional']} USDT 미만입니다."
+        )
+    position_direction = (
+        "SHORT"
+        if str(
+            normalized.get("position_direction")
+            or normalized.get("positionDirection")
+            or ""
+        ).strip().lower() == "short"
+        else "LONG"
+    )
+    normalized.update(
+        {
+            "symbol": symbol,
+            "side": side,
+            "order_type": order_type,
+            "quantity": normalize_decimal_text(quantity),
+            "qty": normalize_decimal_text(quantity),
+            "position_direction": position_direction.lower(),
+            "risk_reducing": normalized.get("risk_reducing") is True
+            or normalized.get("reduce_only") is True,
+        }
+    )
     return normalized
 
 
@@ -548,6 +660,194 @@ def build_binance_account_request() -> PreparedRequest:
         safe_headers={"X-MBX-APIKEY_configured": bool(api_key)},
         body=None,
         query={**query, "signature": "***" if api_secret else ""},
+        blocked_reasons=blocked,
+    )
+
+
+def _build_binance_futures_signed_request(
+    method: str,
+    endpoint: str,
+    query: dict[str, object] | None = None,
+    *,
+    provider: str = "binance-futures",
+    blocked_reasons: list[str] | None = None,
+) -> PreparedRequest:
+    blocked = [
+        *missing_env("BINANCE_API_KEY", "BINANCE_API_SECRET"),
+        *(blocked_reasons or []),
+    ]
+    api_key = env_value("BINANCE_API_KEY")
+    api_secret = env_value("BINANCE_API_SECRET")
+    base_url = (
+        env_value("BINANCE_FUTURES_BASE_URL")
+        or BINANCE_FUTURES_BASE_URL
+    )
+    request_query = {
+        **(query or {}),
+        "timestamp": binance_timestamp_ms(),
+    }
+    signed_query = (
+        sign_binance_query(request_query, api_secret)
+        if api_secret
+        else urllib.parse.urlencode(request_query)
+    )
+    return PreparedRequest(
+        provider=provider,
+        method=method,
+        url=f"{base_url.rstrip('/')}{endpoint}?{signed_query}",
+        endpoint=endpoint,
+        headers={"X-MBX-APIKEY": api_key},
+        safe_headers={"X-MBX-APIKEY_configured": bool(api_key)},
+        body=None,
+        query={
+            **request_query,
+            "signature": "***" if api_secret else "",
+        },
+        blocked_reasons=list(dict.fromkeys(blocked)),
+    )
+
+
+def build_binance_futures_account_request() -> PreparedRequest:
+    return _build_binance_futures_signed_request(
+        "GET",
+        BINANCE_FUTURES_ACCOUNT_ENDPOINT,
+    )
+
+
+def build_binance_futures_positions_request(
+    symbol: str = "",
+) -> PreparedRequest:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    return _build_binance_futures_signed_request(
+        "GET",
+        BINANCE_FUTURES_POSITION_ENDPOINT,
+        {"symbol": normalized_symbol} if normalized_symbol else {},
+    )
+
+
+def build_binance_futures_position_mode_request() -> PreparedRequest:
+    return _build_binance_futures_signed_request(
+        "GET",
+        BINANCE_FUTURES_POSITION_MODE_ENDPOINT,
+    )
+
+
+def build_binance_futures_symbol_config_request(
+    symbol: str,
+) -> PreparedRequest:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    return _build_binance_futures_signed_request(
+        "GET",
+        BINANCE_FUTURES_SYMBOL_CONFIG_ENDPOINT,
+        {"symbol": normalized_symbol},
+        blocked_reasons=[] if normalized_symbol else ["symbol"],
+    )
+
+
+def build_binance_futures_order_request(
+    intent: dict[str, object],
+    *,
+    hedge_mode: bool,
+    test: bool = False,
+) -> PreparedRequest:
+    symbol = (
+        str(intent.get("symbol") or "")
+        .strip()
+        .upper()
+        .removesuffix(".PERP")
+        .replace("-", "")
+    )
+    side = normalize_side(intent.get("side"))
+    quantity = normalize_decimal_text(
+        intent.get("quantity") or intent.get("qty") or 0
+    )
+    order_type = str(
+        intent.get("order_type") or "MARKET"
+    ).strip().upper()
+    position_direction = (
+        "SHORT"
+        if str(
+            intent.get("position_direction")
+            or intent.get("positionDirection")
+            or ""
+        ).strip().lower() == "short"
+        else "LONG"
+    )
+    query: dict[str, object] = {
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "quantity": quantity,
+        "positionSide": position_direction if hedge_mode else "BOTH",
+    }
+    if not hedge_mode and (
+        intent.get("risk_reducing") is True
+        or intent.get("reduce_only") is True
+    ):
+        query["reduceOnly"] = "true"
+    identifier = str(
+        intent.get("identifier")
+        or intent.get("new_client_order_id")
+        or ""
+    ).strip()
+    if identifier:
+        query["newClientOrderId"] = identifier[:36]
+    if order_type == "LIMIT":
+        query["timeInForce"] = str(
+            intent.get("time_in_force") or "GTC"
+        ).strip().upper()
+        query["price"] = normalize_decimal_text(
+            intent.get("price") or 0
+        )
+    blocked: list[str] = []
+    if not symbol:
+        blocked.append("symbol")
+    if float(quantity or 0) <= 0:
+        blocked.append("quantity")
+    if order_type not in {"MARKET", "LIMIT"}:
+        blocked.append("order_type")
+    if order_type == "LIMIT" and float(query.get("price") or 0) <= 0:
+        blocked.append("price")
+    endpoint = (
+        BINANCE_FUTURES_TEST_ORDER_ENDPOINT
+        if test
+        else BINANCE_FUTURES_ORDER_ENDPOINT
+    )
+    return _build_binance_futures_signed_request(
+        "POST",
+        endpoint,
+        query,
+        blocked_reasons=blocked,
+    )
+
+
+def build_binance_futures_cancel_order_request(
+    symbol: str,
+    broker_order_id: str,
+    *,
+    client_order_id: bool = False,
+) -> PreparedRequest:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    normalized_order_id = str(broker_order_id or "").strip()
+    query: dict[str, object] = {"symbol": normalized_symbol}
+    query[
+        "origClientOrderId" if client_order_id else "orderId"
+    ] = normalized_order_id
+    blocked = []
+    if not normalized_symbol:
+        blocked.append("symbol")
+    if not normalized_order_id:
+        blocked.append("broker_order_id")
+    return _build_binance_futures_signed_request(
+        "DELETE",
+        BINANCE_FUTURES_ORDER_ENDPOINT,
+        query,
         blocked_reasons=blocked,
     )
 

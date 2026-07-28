@@ -78,6 +78,46 @@ class LiveContinuousControllerTest(unittest.TestCase):
             LiveContinuousController._order_quantity(spec, 4_000),
         )
 
+    def test_futures_fixed_quantity_is_preserved_with_live_notional_cap(self) -> None:
+        strategy = {
+            "strategy_id": "btc-futures-short",
+            "symbol": "BTCUSDT",
+            "timeframe": "1h",
+            "broker_id": "binance-futures",
+            "market_type": "futures",
+            "plugin": "strategy_builder_custom",
+            "executionSizing": {
+                "mode": "fixed_quantity",
+                "paperOrderQuantity": 0.001,
+                "fractionalAllowed": True,
+            },
+            "parameters": {
+                "paperOrderQuantity": 0.001,
+            },
+        }
+        spec = LiveContinuousController._standalone_spec(strategy)
+
+        self.assertEqual(
+            0.001,
+            LiveContinuousController._order_quantity(spec, 65_000),
+        )
+
+        oversized = LiveContinuousController._standalone_spec({
+            **strategy,
+            "executionSizing": {
+                **strategy["executionSizing"],
+                "paperOrderQuantity": 100,
+            },
+            "parameters": {
+                "paperOrderQuantity": 100,
+                "liveOrderNotionalUsdt": 100,
+            },
+        })
+        self.assertAlmostEqual(
+            100 / 65_000,
+            LiveContinuousController._order_quantity(oversized, 65_000),
+        )
+
     def test_short_direction_is_preserved_but_live_adapter_attestation_stays_off(self) -> None:
         strategy = {
             "strategy_id": "btc-short",

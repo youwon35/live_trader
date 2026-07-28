@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .env_loader import default_env_path
-from .live_adapters import BINANCE_BASE_URL, KIS_LIVE_BASE_URL, UPBIT_BASE_URL
+from .live_adapters import BINANCE_BASE_URL, BINANCE_FUTURES_BASE_URL, KIS_LIVE_BASE_URL, UPBIT_BASE_URL
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,9 +32,10 @@ ENV_SETTING_FIELDS = (
     EnvSettingField("KIS_ACCOUNT_PRODUCT_CODE", "KIS 상품 코드", "계좌번호 뒤 2자리입니다. 보통 01을 사용합니다.", "kis", "text", "01", True),
     EnvSettingField("KIS_BASE_URL", "KIS 실전 URL", "실전 서버 URL입니다. 모의투자 URL과 섞지 마세요.", "kis", "text", KIS_LIVE_BASE_URL),
     EnvSettingField("KIS_HTS_ID", "KIS HTS ID", "한국투자증권 로그인/HTS ID이며 일부 체결·시세 경로에서 사용합니다.", "kis", "secret"),
-    EnvSettingField("BINANCE_API_KEY", "Binance API key", "Binance Spot API key입니다.", "binance", "secret", required=True),
-    EnvSettingField("BINANCE_API_SECRET", "Binance API secret", "Binance Spot API secret입니다.", "binance", "secret", required=True),
-    EnvSettingField("BINANCE_BASE_URL", "Binance URL", "Binance REST base URL입니다.", "binance", "text", BINANCE_BASE_URL),
+    EnvSettingField("BINANCE_API_KEY", "Binance API key", "Binance Spot/Futures API key입니다. Futures 거래 권한은 Binance에서 별도로 활성화해야 합니다.", "binance", "secret", required=True),
+    EnvSettingField("BINANCE_API_SECRET", "Binance API secret", "Binance Spot/Futures API secret입니다.", "binance", "secret", required=True),
+    EnvSettingField("BINANCE_BASE_URL", "Binance Spot URL", "Binance Spot REST base URL입니다.", "binance", "text", BINANCE_BASE_URL),
+    EnvSettingField("BINANCE_FUTURES_BASE_URL", "Binance Futures URL", "Binance USD-M Futures REST base URL입니다.", "binance", "text", BINANCE_FUTURES_BASE_URL),
     EnvSettingField("UPBIT_ACCESS_KEY", "Upbit access key", "Upbit Open API access key입니다.", "upbit", "secret", required=True),
     EnvSettingField("UPBIT_SECRET_KEY", "Upbit secret key", "Upbit Open API secret key입니다.", "upbit", "secret", required=True),
     EnvSettingField("UPBIT_BASE_URL", "Upbit URL", "Upbit REST base URL입니다.", "upbit", "text", UPBIT_BASE_URL),
@@ -91,7 +92,7 @@ def env_settings_snapshot() -> dict[str, Any]:
         "fields": fields,
         "groups": [
             {"id": "kis", "label": "주식/ETF", "detail": "한국투자증권 Open API"},
-            {"id": "binance", "label": "Binance", "detail": "코인 현물"},
+            {"id": "binance", "label": "Binance", "detail": "코인 현물 · USD-M 선물"},
             {"id": "upbit", "label": "Upbit", "detail": "KRW 코인"},
             {"id": "live-lock", "label": "실거래 잠금", "detail": "실전 주문 라우트"},
         ],
