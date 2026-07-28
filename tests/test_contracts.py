@@ -125,6 +125,53 @@ class StrategyContractTest(unittest.TestCase):
         self.assertEqual(artifact["verification"]["paper_trader"]["status"], "pass")
         self.assertEqual(artifact["verification"]["live"]["status"], "fail")
 
+    def test_custom_short_strategy_requires_a_shortable_market_contract(self) -> None:
+        definition = {
+            "id": "custom-short",
+            "pluginId": "strategy_builder_custom",
+            "positionDirection": "short",
+            "entryRules": [
+                {
+                    "left": "close",
+                    "operator": "below",
+                    "right": "sma",
+                    "rightPeriod": 20,
+                }
+            ],
+            "exitRules": [
+                {
+                    "left": "close",
+                    "operator": "above",
+                    "right": "sma",
+                    "rightPeriod": 20,
+                }
+            ],
+        }
+        base = {
+            "id": "CUSTOM-SHORT",
+            "dataset": {
+                "symbol": "BTCUSDT",
+                "assetClass": "CRYPTO",
+                "interval": "1h",
+            },
+            "plugin": "strategy_builder_custom",
+            "strategyContract": {
+                "customStrategyDefinition": definition,
+            },
+        }
+
+        spot = normalize_strategy_artifact({**base, "marketType": "spot"})
+        futures = normalize_strategy_artifact(
+            {**base, "id": "CUSTOM-SHORT-FUTURES", "marketType": "futures"}
+        )
+
+        self.assertEqual("short", spot["position_direction"])
+        self.assertTrue(spot["allow_short_requested"])
+        self.assertFalse(spot["allow_short"])
+        self.assertEqual("short", futures["position_direction"])
+        self.assertTrue(futures["allow_short_requested"])
+        self.assertTrue(futures["allow_short"])
+
     def test_strategy_normalization_preserves_broker_routing_contract(self) -> None:
         artifact = normalize_strategy_artifact(
             {

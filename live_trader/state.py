@@ -6291,7 +6291,18 @@ def strategy_executions_for_profile(checks: dict[str, Any], profile_id: str) -> 
                 artifact=strategy, market_data=strategy_market_data(strategy), mode=current_mode(),
                 stream_id=f"live:{normalized_profile}:{strategy.get('strategy_id', 'unknown')}",
                 quantity=strategy_float(strategy, "order_quantity", "quantity", default=1.0),
-                metadata={"broker_id": strategy_broker_id(strategy), "profile_id": normalized_profile, "runner": "StrategyExecutionRunner"},
+                metadata={
+                    "broker_id": strategy_broker_id(strategy),
+                    "profile_id": normalized_profile,
+                    "runner": "StrategyExecutionRunner",
+                    "market_type": str(strategy.get("market_type") or "spot").lower(),
+                    "position_direction": str(strategy.get("position_direction") or "long").lower(),
+                    "short_entries_requested": strategy.get("allow_short_requested") is True,
+                    # The currently shipped KIS/Binance/Upbit adapters are all
+                    # cash/spot routes. A future margin/futures adapter must
+                    # attest this separately before a naked SELL is allowed.
+                    "broker_short_adapter_verified": False,
+                },
                 reason_prefix=f"{strategy.get('name') or strategy.get('strategy_id') or '전략'} live runner signal",
             ),
         )
@@ -6358,9 +6369,10 @@ def intent_requires_unavailable_capability(intent: OrderIntent, reconciliation_s
 
 def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool) -> PreTradeContext:
     settings = STATE["risk_settings"]
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     has_scoped_context = bool(checks.get("strategies")) and bool(checks.get("brokers"))
     if has_scoped_context:
-        broker_id = str((intent.metadata or {}).get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset))
+        broker_id = str(metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset))
         reconciliation_summary = reconciliation_summary_for_broker(broker_id)
     else:
         reconciliation = checks.get("reconciliation") if isinstance(checks.get("reconciliation"), dict) else {}
@@ -6387,9 +6399,15 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
         position_quantity=broker_position_quantity(
             intent.symbol,
             str(
-                (intent.metadata or {}).get("broker_id")
+                metadata.get("broker_id")
                 or broker_id_from_symbol(intent.symbol, intent.asset)
             ),
+        ),
+        risk_reducing_verified=metadata.get("risk_reducing") is True,
+        market_type=str(metadata.get("market_type") or "spot").lower(),
+        short_entries_allowed=(
+            metadata.get("short_entries_requested") is True
+            and metadata.get("broker_short_adapter_verified") is True
         ),
         recent_orders=recent_orders_for_risk(),
     )

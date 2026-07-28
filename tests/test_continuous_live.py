@@ -78,6 +78,122 @@ class LiveContinuousControllerTest(unittest.TestCase):
             LiveContinuousController._order_quantity(spec, 4_000),
         )
 
+    def test_short_direction_is_preserved_but_live_adapter_attestation_stays_off(self) -> None:
+        strategy = {
+            "strategy_id": "btc-short",
+            "instance_id": "si-btc-short",
+            "symbol": "BTCUSDT",
+            "timeframe": "1h",
+            "provider": "binance",
+            "broker_id": "binance",
+            "market_type": "futures",
+            "plugin": "strategy_builder_custom",
+            "parameters": {
+                "customStrategyDefinition": {
+                    "positionDirection": "short",
+                    "entryRules": [],
+                    "exitRules": [],
+                },
+                "liveOrderNotionalUsdt": 5.5,
+            },
+        }
+        runtime_spec = LiveContinuousController._standalone_spec(strategy)
+        controller = LiveContinuousController(Path("."))
+        controller.profile_id = "crypto"
+        controller.mode = "SMALL_LIVE"
+        controller.supervisor = MagicMock()
+        controller.supervisor.engine.specs = (runtime_spec,)
+        decision = SimpleNamespace(
+            strategy_id=runtime_spec.strategy_id,
+            strategy_instance_id=runtime_spec.strategy_instance_id,
+            signal="SELL",
+            reason="short entry",
+            evaluation_key="short-entry-1",
+            bar=SimpleNamespace(
+                close=100.0,
+                end_time="2026-07-26T00:00:00Z",
+            ),
+        )
+        original_state = copy.deepcopy(state.STATE)
+        try:
+            with (
+                patch.object(state, "broker_position_quantity", return_value=0),
+                patch.object(state, "snapshot", return_value={}),
+                patch.object(state, "append_audit"),
+                patch.object(
+                    state,
+                    "submit_order_intent",
+                    return_value={"ok": False, "reason": "short adapter blocked"},
+                ) as submit,
+            ):
+                controller._handle_cycle(SimpleNamespace(decisions=(decision,)))
+        finally:
+            state.STATE.clear()
+            state.STATE.update(original_state)
+
+        intent = submit.call_args.args[1]
+        self.assertEqual("short", intent.metadata["position_direction"])
+        self.assertEqual("futures", intent.metadata["market_type"])
+        self.assertTrue(intent.metadata["short_entries_requested"])
+        self.assertFalse(intent.metadata["broker_short_adapter_verified"])
+
+    def test_short_cover_uses_reconciled_position_quantity(self) -> None:
+        strategy = {
+            "strategy_id": "btc-short-cover",
+            "instance_id": "si-btc-short-cover",
+            "symbol": "BTCUSDT",
+            "timeframe": "1h",
+            "provider": "binance",
+            "broker_id": "binance",
+            "market_type": "futures",
+            "plugin": "strategy_builder_custom",
+            "parameters": {
+                "customStrategyDefinition": {
+                    "positionDirection": "short",
+                    "entryRules": [],
+                    "exitRules": [],
+                }
+            },
+        }
+        runtime_spec = LiveContinuousController._standalone_spec(strategy)
+        controller = LiveContinuousController(Path("."))
+        controller.profile_id = "crypto"
+        controller.mode = "SMALL_LIVE"
+        controller.supervisor = MagicMock()
+        controller.supervisor.engine.specs = (runtime_spec,)
+        decision = SimpleNamespace(
+            strategy_id=runtime_spec.strategy_id,
+            strategy_instance_id=runtime_spec.strategy_instance_id,
+            signal="BUY",
+            reason="short cover",
+            evaluation_key="short-cover-1",
+            bar=SimpleNamespace(
+                close=90.0,
+                end_time="2026-07-26T01:00:00Z",
+            ),
+        )
+        original_state = copy.deepcopy(state.STATE)
+        try:
+            with (
+                patch.object(state, "broker_position_quantity", return_value=-0.25),
+                patch.object(state, "snapshot", return_value={}),
+                patch.object(state, "append_audit"),
+                patch.object(
+                    state,
+                    "submit_order_intent",
+                    return_value={"ok": True, "reason": "cover"},
+                ) as submit,
+            ):
+                controller._handle_cycle(SimpleNamespace(decisions=(decision,)))
+        finally:
+            state.STATE.clear()
+            state.STATE.update(original_state)
+
+        intent = submit.call_args.args[1]
+        self.assertEqual("BUY", intent.side)
+        self.assertEqual(0.25, intent.quantity)
+        self.assertTrue(intent.metadata["risk_reducing"])
+
     def test_forced_restore_assessment_ignores_cache_and_requires_fresh_read(self) -> None:
         spec = LiveContinuousController._standalone_spec({
             "strategy_id": "btc-live-small",

@@ -468,7 +468,32 @@ class LiveContinuousController:
                 results.append({"strategyId": decision.strategy_id, "signal": decision.signal, "action": "MONITOR", "reason": decision.reason})
                 continue
             spec = next(item for item in self.supervisor.engine.specs if item.strategy_instance_id == decision.strategy_instance_id)  # type: ignore[union-attr]
-            quantity = self._order_quantity(spec, decision.bar.close)
+            current_position_quantity = state.broker_position_quantity(
+                spec.symbol,
+                spec.broker_id,
+            )
+            position_direction = self._position_direction(spec)
+            is_short_entry = (
+                position_direction == "short"
+                and decision.signal == "SELL"
+                and current_position_quantity >= 0
+            )
+            is_short_cover = (
+                position_direction == "short"
+                and decision.signal == "BUY"
+                and current_position_quantity < 0
+            )
+            is_long_exit = (
+                position_direction == "long"
+                and decision.signal == "SELL"
+                and current_position_quantity > 0
+            )
+            quantity = (
+                abs(current_position_quantity)
+                if is_short_cover or is_long_exit
+                else self._order_quantity(spec, decision.bar.close)
+            )
+            market_type = self._market_type(spec)
             intent = OrderIntent(
                 strategy_id=decision.strategy_id,
                 asset=state.asset_from_symbol(spec.symbol),
@@ -487,16 +512,24 @@ class LiveContinuousController:
                     "target_revision": max(1, int(datetime.fromisoformat(decision.bar.end_time.replace("Z", "+00:00")).timestamp())),
                     "order_purpose": "SIGNAL",
                     "current_weight": (
-                        spec.target_weight
-                        if state.broker_position_quantity(
-                            spec.symbol,
-                            spec.broker_id,
-                        ) > 0
+                        (-spec.target_weight if current_position_quantity < 0 else spec.target_weight)
+                        if abs(current_position_quantity) > 1e-12
                         else 0.0
                     ),
                     "portfolio_equity": max(1.0, float(state.STATE["risk_settings"]["strategy_capital_limit_krw"])),
                     "expected_alpha_bps": self._numeric_parameter(spec, "expectedAlphaBps", 0.0),
                     "expected_cost_bps": self._numeric_parameter(spec, "expectedCostBps", 5.0),
+                    "position_direction": position_direction,
+                    "market_type": market_type,
+                    "short_entries_requested": (
+                        is_short_entry
+                        and self._artifact_short_requested(spec)
+                    ),
+                    # The shipped live adapters are cash/spot routes. A
+                    # margin/futures adapter must explicitly attest signed
+                    # positions before the shared risk gate can allow entry.
+                    "broker_short_adapter_verified": False,
+                    "risk_reducing": is_short_cover or is_long_exit,
                     "runtime_evaluation_key": decision.evaluation_key,
                     "confirmed_bar_end": decision.bar.end_time,
                     "order_type": self._order_type_for_broker(
@@ -512,6 +545,57 @@ class LiveContinuousController:
             result = state.submit_order_intent(checks, intent, dry_run=bool(state.STATE["dry_run"]), audit_event="Continuous Runtime")
             results.append({"strategyId": decision.strategy_id, "signal": decision.signal, "action": result.get("reason"), "ok": result.get("ok")})
         return {"mode": self.mode, "profileId": self.profile_id, "results": results}
+
+    @staticmethod
+    def _custom_definition(spec: Any) -> dict[str, Any]:
+        artifact = spec.artifact if isinstance(spec.artifact, dict) else {}
+        settings = artifact.get("settings") if isinstance(artifact.get("settings"), dict) else {}
+        for candidate in (
+            spec.parameters.get("customStrategyDefinition"),
+            spec.parameters.get("custom_strategy_definition"),
+            artifact.get("customStrategyDefinition"),
+            artifact.get("custom_strategy_definition"),
+            settings.get("customStrategyDefinition"),
+        ):
+            if isinstance(candidate, dict):
+                return candidate
+        return {}
+
+    @classmethod
+    def _position_direction(cls, spec: Any) -> str:
+        artifact = spec.artifact if isinstance(spec.artifact, dict) else {}
+        definition = cls._custom_definition(spec)
+        value = (
+            definition.get("positionDirection")
+            or artifact.get("position_direction")
+            or artifact.get("positionDirection")
+            or "long"
+        )
+        return "short" if str(value).strip().lower() == "short" else "long"
+
+    @staticmethod
+    def _market_type(spec: Any) -> str:
+        artifact = spec.artifact if isinstance(spec.artifact, dict) else {}
+        return str(
+            artifact.get("market_type")
+            or artifact.get("marketType")
+            or "spot"
+        ).strip().lower()
+
+    @classmethod
+    def _artifact_short_requested(cls, spec: Any) -> bool:
+        artifact = spec.artifact if isinstance(spec.artifact, dict) else {}
+        execution_policy = (
+            artifact.get("executionPolicy")
+            if isinstance(artifact.get("executionPolicy"), dict)
+            else {}
+        )
+        return bool(
+            cls._position_direction(spec) == "short"
+            or artifact.get("allow_short_requested") is True
+            or artifact.get("allowShort") is True
+            or execution_policy.get("allowShort") is True
+        )
 
     @staticmethod
     def _order_quantity(spec: Any, price: float) -> float:
