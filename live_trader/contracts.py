@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,8 @@ def resolve_trading_system_root() -> Path:
 TRADING_SYSTEM_ROOT = resolve_trading_system_root()
 LEGACY_STRATEGY_ARTIFACT_DIR = TRADING_SYSTEM_ROOT / "packages" / "strategy-core"
 PRIMARY_STRATEGY_ARTIFACT_DIR = shared_artifact_root()
+_ARTIFACT_MIGRATION_LOCK = threading.Lock()
+_ARTIFACT_MIGRATION_KEY = ""
 IGNORED_STRATEGY_FILE_NAMES = {
     "package.json",
     "package-lock.json",
@@ -497,13 +500,27 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
 
 
 def strategy_artifact_dirs() -> list[Path]:
+    global _ARTIFACT_MIGRATION_KEY
+
     configured = _env_paths("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", "TRADER_STRATEGY_ARTIFACT_DIR")
     if configured:
         return _dedupe_paths(configured)
-    try:
-        migrate_artifact_tree(LEGACY_STRATEGY_ARTIFACT_DIR, PRIMARY_STRATEGY_ARTIFACT_DIR)
-    except OSError:
-        pass
+    migration_key = (
+        f"{LEGACY_STRATEGY_ARTIFACT_DIR.resolve(strict=False)}"
+        f"\0{PRIMARY_STRATEGY_ARTIFACT_DIR.resolve(strict=False)}"
+    )
+    if _ARTIFACT_MIGRATION_KEY != migration_key:
+        with _ARTIFACT_MIGRATION_LOCK:
+            if _ARTIFACT_MIGRATION_KEY != migration_key:
+                try:
+                    migrate_artifact_tree(LEGACY_STRATEGY_ARTIFACT_DIR, PRIMARY_STRATEGY_ARTIFACT_DIR)
+                except OSError:
+                    pass
+                # Artifact migration is a startup compatibility step. Re-hashing
+                # the entire legacy tree for every strategy normalized into a
+                # UI snapshot made a read-only /api/snapshot take several
+                # seconds and occasionally exceed the frontend health timeout.
+                _ARTIFACT_MIGRATION_KEY = migration_key
     return _dedupe_paths(
         artifact_read_roots(TRADING_SYSTEM_ROOT)
         + [_appdata_strategy_artifact_dir()]
@@ -647,8 +664,12 @@ def enrich_strategy_artifact_runtime(folder: Path, path: Path, artifact: dict[st
     return payload
 
 
-def load_strategy_artifacts(limit: int = 16) -> list[dict[str, Any]]:
+def load_strategy_artifacts(limit: int | None = None) -> list[dict[str, Any]]:
+    effective_limit = None if limit is None else max(0, int(limit))
+    if effective_limit == 0:
+        return []
     artifacts: list[dict[str, Any]] = []
+    seen_payloads: set[str] = set()
     for folder in strategy_artifact_dirs():
         if not folder.exists():
             continue
@@ -661,8 +682,14 @@ def load_strategy_artifacts(limit: int = 16) -> list[dict[str, Any]]:
                 continue
             if not isinstance(payload, dict):
                 continue
+            fingerprint = hashlib.sha256(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if fingerprint in seen_payloads:
+                continue
+            seen_payloads.add(fingerprint)
             artifacts.append(normalize_strategy_artifact(enrich_strategy_artifact_runtime(folder, path, payload)))
-            if len(artifacts) >= limit:
+            if effective_limit is not None and len(artifacts) >= effective_limit:
                 return artifacts
     return artifacts
 

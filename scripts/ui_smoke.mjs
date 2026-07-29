@@ -94,6 +94,9 @@ try {
         issues.push(`${viewport.name}/${tab}: legacy reconciliation summary is still visible`);
       }
       if (tab === "계좌·포지션") {
+        if (!await page.getByRole("heading", { name: "계좌 자본·포지션 노출", exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab}: account allocation visualization is missing`);
+        }
         if (!await page.getByRole("heading", { name: "내 계좌·보유 포지션", exact: true }).count()) {
           issues.push(`${viewport.name}/${tab}: account workspace is missing`);
         }

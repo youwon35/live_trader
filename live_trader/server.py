@@ -147,6 +147,14 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path == "/api/validation-small-live":
+            self.send_json(
+                {
+                    "ok": True,
+                    "validation": state.validation_small_live_snapshot(),
+                }
+            )
+            return
         self.serve_static(parsed.path)
 
     def do_POST(self) -> None:
@@ -202,7 +210,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             self.send_json(state.run_broker_check(str(payload.get("broker_id", ""))))
             return
         if parsed.path == "/api/reconcile":
-            self.send_json(state.run_reconciliation())
+            self.send_json(
+                state.run_reconciliation(
+                    refresh_brokers=payload.get("refresh_brokers") is not False,
+                    include_snapshot=payload.get("include_snapshot") is not False,
+                )
+            )
             return
         if parsed.path == "/api/program-ledger-baseline":
             if payload.get("confirmed") is not True:
@@ -217,7 +230,14 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             self.send_json(state.seed_program_ledger_from_broker_snapshot())
             return
         if parsed.path == "/api/execution-events":
-            self.send_json(state.poll_execution_events(str(payload.get("broker_id", "all"))))
+            force_snapshot = payload.get("force_snapshot")
+            self.send_json(
+                state.poll_execution_events(
+                    str(payload.get("broker_id", "all")),
+                    force_snapshot=force_snapshot if isinstance(force_snapshot, bool) else None,
+                    include_snapshot=payload.get("include_snapshot") is not False,
+                )
+            )
             return
         if parsed.path == "/api/execution-streams/start":
             self.send_json(state.start_execution_streams(str(payload.get("broker_id", "all"))))
@@ -288,6 +308,18 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/recovery-drill":
             self.send_json(state.run_recovery_drill())
+            return
+        if parsed.path == "/api/validation-small-live/evaluate":
+            self.send_json(
+                state.run_validation_small_live_once(
+                    str(
+                        payload.get(
+                            "validation_strategy_instance_id",
+                            "",
+                        )
+                    )
+                )
+            )
             return
         if parsed.path == "/api/strategy-cycle":
             self.send_json(state.run_strategy_cycle(str(payload.get("profile_id", "stock"))))

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import live_trader.contracts as contracts
 from live_trader.contracts import (
     can_live_use_artifact,
     enrich_strategy_artifact_runtime,
@@ -500,6 +501,84 @@ class StrategyContractTest(unittest.TestCase):
                 os.environ.pop("LIVE_TRADER_STRATEGY_PLUGIN_DIR", None)
             else:
                 os.environ["LIVE_TRADER_STRATEGY_PLUGIN_DIR"] = previous_plugin
+
+    def test_default_artifact_migration_runs_once_per_process_path(self) -> None:
+        previous_artifact = os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+        previous_trader_artifact = os.environ.pop("TRADER_STRATEGY_ARTIFACT_DIR", None)
+        previous_key = contracts._ARTIFACT_MIGRATION_KEY
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp) / "legacy"
+                target = Path(tmp) / "primary"
+                source.mkdir()
+                contracts._ARTIFACT_MIGRATION_KEY = ""
+                with patch.object(contracts, "LEGACY_STRATEGY_ARTIFACT_DIR", source), patch.object(
+                    contracts,
+                    "PRIMARY_STRATEGY_ARTIFACT_DIR",
+                    target,
+                ), patch.object(contracts, "migrate_artifact_tree") as migrate:
+                    strategy_artifact_dirs()
+                    strategy_artifact_dirs()
+                    strategy_plugin_dirs()
+
+                migrate.assert_called_once_with(source, target)
+        finally:
+            contracts._ARTIFACT_MIGRATION_KEY = previous_key
+            if previous_artifact is not None:
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact
+            if previous_trader_artifact is not None:
+                os.environ["TRADER_STRATEGY_ARTIFACT_DIR"] = previous_trader_artifact
+
+    def test_strategy_artifacts_load_beyond_legacy_limit_and_dedupe_mirrors(self) -> None:
+        previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                primary = Path(tmp) / "primary"
+                mirror = Path(tmp) / "mirror"
+                primary.mkdir(parents=True)
+                mirror.mkdir(parents=True)
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = os.pathsep.join(
+                    (str(primary), str(mirror))
+                )
+
+                for index in range(25):
+                    payload = {
+                        "artifactType": "strategy",
+                        "schemaVersion": "market-strategy-v1",
+                        "id": f"strategy-{index:02d}",
+                        "name": f"Strategy {index:02d}",
+                        "dataset": {
+                            "symbol": f"TEST{index:02d}",
+                            "interval": "1h",
+                        },
+                    }
+                    encoded = json.dumps(payload, ensure_ascii=False)
+                    (primary / f"strategy-{index:02d}.json").write_text(
+                        encoded,
+                        encoding="utf-8",
+                    )
+                    if index == 0:
+                        (mirror / "strategy-00.json").write_text(
+                            encoded,
+                            encoding="utf-8",
+                        )
+
+                strategies = load_strategy_artifacts()
+                limited = load_strategy_artifacts(limit=10)
+                empty = load_strategy_artifacts(limit=0)
+
+            self.assertEqual(len(strategies), 25)
+            self.assertEqual(
+                len({strategy["strategy_id"] for strategy in strategies}),
+                25,
+            )
+            self.assertEqual(len(limited), 10)
+            self.assertEqual(empty, [])
+        finally:
+            if previous_artifact is None:
+                os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+            else:
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact
 
     def test_portfolio_artifacts_load_from_shared_strategy_directory(self) -> None:
         previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")

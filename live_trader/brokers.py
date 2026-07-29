@@ -437,6 +437,12 @@ def parse_kis_accounts(payload: object) -> list[dict[str, object]]:
         "nass_amt",
         default=0.0,
     )
+    equity = first_numeric(
+        row,
+        "tot_evlu_amt",
+        "nass_amt",
+        default=cash,
+    )
     return [
         {
             "broker_id": "kis",
@@ -444,6 +450,8 @@ def parse_kis_accounts(payload: object) -> list[dict[str, object]]:
             "account": "KIS 실계좌",
             "currency": "KRW",
             "broker_cash": cash,
+            "broker_equity": equity,
+            "valuation_basis": "broker_equity",
             "detail": "KIS 국내 주식 잔고 조회 결과입니다.",
         }
     ]
@@ -474,6 +482,7 @@ def parse_kis_positions(payload: object) -> list[dict[str, object]]:
                 "broker_value": first_numeric(row, "evlu_amt", "pchs_amt", "pchs_avg_pric", default=0.0),
                 "average_price": first_numeric(row, "pchs_avg_pric", "avg_pric", default=0.0),
                 "current_price": first_numeric(row, "prpr", "stck_prpr", default=0.0),
+                "valuation_basis": "market_value",
                 "detail": first_text(row, "prdt_name", "prdt_name1", default="KIS 보유 종목"),
             }
         )
@@ -526,6 +535,7 @@ def parse_kis_overseas_positions(payload: object) -> list[dict[str, object]]:
                     default=0.0,
                 ),
                 "current_price": first_numeric(row, "now_pric2", "last", default=0.0),
+                "valuation_basis": "market_value",
                 "exchange": exchange,
                 "detail": first_text(
                     row,
@@ -683,6 +693,8 @@ def parse_binance_accounts(payload: object) -> list[dict[str, object]]:
             "account": "Binance Spot",
             "currency": "USDT",
             "broker_cash": cash,
+            "broker_equity": cash,
+            "valuation_basis": "cash_only",
             "detail": "Binance signed account endpoint 조회 결과입니다.",
         }
     ]
@@ -712,6 +724,7 @@ def parse_binance_positions(payload: object) -> list[dict[str, object]]:
                 "broker_value": 0.0,
                 "average_price": 0.0,
                 "current_price": 0.0,
+                "valuation_basis": "unavailable",
                 "detail": "Binance spot balance입니다.",
             }
         )
@@ -762,6 +775,18 @@ def parse_binance_futures_accounts(
                 "marginBalance",
                 default=first_numeric(data, "totalMarginBalance"),
             ),
+            "broker_equity": first_numeric(
+                usdt,
+                "marginBalance",
+                "walletBalance",
+                default=first_numeric(
+                    data,
+                    "totalMarginBalance",
+                    "totalWalletBalance",
+                    default=available,
+                ),
+            ),
+            "valuation_basis": "margin_balance",
             "detail": "Binance Futures signed account endpoint 조회 결과입니다.",
         }
     ]
@@ -819,6 +844,7 @@ def parse_binance_futures_positions(
                 ),
                 "average_price": first_numeric(row, "entryPrice"),
                 "current_price": mark_price,
+                "valuation_basis": "market_notional",
                 "position_side": position_side,
                 "positionSide": position_side,
                 "unrealized_profit": first_numeric(
@@ -935,6 +961,8 @@ def parse_upbit_accounts(payload: object) -> list[dict[str, object]]:
             "account": "Upbit KRW",
             "currency": "KRW",
             "broker_cash": cash,
+            "broker_equity": cash,
+            "valuation_basis": "cash_only",
             "detail": "Upbit 전체 계좌 조회 결과입니다.",
         }
     ]
@@ -964,6 +992,7 @@ def parse_upbit_positions(payload: object) -> list[dict[str, object]]:
                 "broker_value": first_numeric(row, "avg_buy_price") * qty,
                 "average_price": first_numeric(row, "avg_buy_price"),
                 "current_price": 0.0,
+                "valuation_basis": "cost_basis",
                 "detail": "Upbit 보유 자산입니다.",
             }
         )

@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1910,6 +1911,13 @@ class OrderGateTest(unittest.TestCase):
                 }
                 return rows[broker_id]
 
+            def poll_execution_events(self, broker_id):
+                return {
+                    **self.get_account_snapshot(broker_id),
+                    "positions": self.list_positions(broker_id),
+                    "events": [],
+                }
+
         with patch("live_trader.state.LiveBrokerRouter", return_value=FakeRouter()), patch(
             "live_trader.state.automatic_live_promotion_sweep",
             return_value=[],
@@ -1932,16 +1940,63 @@ class OrderGateTest(unittest.TestCase):
                 row["broker_id"] == "kis"
                 and row["currency"] == "KRW"
                 and row["broker_cash"].startswith("100,000")
+                and row["broker_cash_value"] == 100000.0
+                and row["broker_equity_value"] == 100000.0
                 and row["status"] == "api_required"
                 for row in result["reconciliation"]["accounts"]
             )
         )
         self.assertTrue(
             any(
-                row["broker_id"] == "binance" and row["symbol"] == "BTC" and row["status"] == "mismatch"
+                row["broker_id"] == "binance"
+                and row["symbol"] == "BTC"
+                and row["broker_qty_value"] == 0.1
+                and row["broker_value"] == 0.0
+                and row["status"] == "mismatch"
                 for row in result["reconciliation"]["positions"]
             )
         )
+
+    def test_cached_reconciliation_skips_duplicate_broker_io_and_snapshot(self) -> None:
+        with patch(
+            "live_trader.state.refresh_broker_reconciliation",
+        ) as refresh, patch(
+            "live_trader.state.automatic_live_promotion_sweep",
+            return_value=[],
+        ), patch(
+            "live_trader.state.snapshot",
+        ) as snapshot_mock:
+            result = state.run_reconciliation(
+                refresh_brokers=False,
+                include_snapshot=False,
+            )
+
+        refresh.assert_not_called()
+        snapshot_mock.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertNotIn("snapshot", result)
+
+    def test_final_preflight_returns_a_fresh_snapshot(self) -> None:
+        preflight_snapshot = {
+            "launch_report": {
+                "hard_stop_count": 0,
+                "warning_count": 0,
+                "lock_reason": "ready",
+            }
+        }
+        final_snapshot = {"generated_at": "after-preflight"}
+        with patch(
+            "live_trader.state.snapshot",
+            side_effect=[preflight_snapshot, final_snapshot],
+        ), patch(
+            "live_trader.state.persist_doctor_diagnostic_snapshot",
+            return_value={"latest": {}},
+        ), patch(
+            "live_trader.state.append_audit",
+        ):
+            result = state.run_final_preflight()
+
+        self.assertEqual(final_snapshot, result["snapshot"])
 
     def test_program_ledger_baseline_turns_broker_cash_into_reconciled_cash(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2401,6 +2456,96 @@ class OrderGateTest(unittest.TestCase):
             ["binance", "binance-futures", "kis", "upbit"],
             second["execution_events"]["snapshot_skipped_brokers"],
         )
+
+    def test_aggregate_broker_poll_runs_provider_reads_concurrently(self) -> None:
+        class ConcurrentRouter:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.release = threading.Event()
+                self.active = 0
+                self.max_active = 0
+                self.calls = []
+
+            def poll_execution_events(self, broker_id):
+                with self.lock:
+                    self.calls.append(broker_id)
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                    if self.active == 4:
+                        self.release.set()
+                self.release.wait(0.5)
+                with self.lock:
+                    self.active -= 1
+                currency = "KRW" if broker_id in {"kis", "upbit"} else "USDT"
+                return {
+                    "broker_id": broker_id,
+                    "accounts": [
+                        {
+                            "broker_id": broker_id,
+                            "account": f"{broker_id}-account",
+                            "currency": currency,
+                            "broker_cash": 100.0,
+                        }
+                    ],
+                    "positions": [],
+                    "events": [],
+                }
+
+        fake_router = ConcurrentRouter()
+        state.STATE["broker_snapshot_poll"] = {
+            "brokers": {},
+            "last_summary_audit_monotonic": 0.0,
+            "last_summary_signature": "",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.use_temp_program_ledger(temp_dir)
+            try:
+                with patch("live_trader.state.LiveBrokerRouter", return_value=fake_router), patch.object(
+                    state.LIVE_EXECUTION_STREAMS,
+                    "drain",
+                    return_value=[],
+                ), patch.object(
+                    state.LIVE_EXECUTION_STREAMS,
+                    "snapshot",
+                    return_value={"running": False, "brokers": {}},
+                ), patch.object(
+                    state.LIVE_CONTINUOUS_CONTROLLER,
+                    "snapshot",
+                    return_value={"running": False, "profiles": {}},
+                ), patch(
+                    "live_trader.state.append_audit",
+                ):
+                    result = state.poll_execution_events(
+                        "all",
+                        force_snapshot=True,
+                        include_snapshot=False,
+                    )
+            finally:
+                self.restore_temp_program_ledger()
+
+        self.assertEqual(
+            {"kis", "binance", "binance-futures", "upbit"},
+            set(fake_router.calls),
+        )
+        self.assertGreaterEqual(fake_router.max_active, 2)
+        self.assertNotIn("snapshot", result)
+        self.assertEqual(4, result["execution_events"]["observed_cash_count"])
+
+    def test_overlapping_broker_poll_returns_cached_state_without_waiting(self) -> None:
+        acquired = state.BROKER_POLL_LOCK.acquire(blocking=False)
+        self.assertTrue(acquired)
+        try:
+            result = state.poll_execution_events(
+                "all",
+                force_snapshot=True,
+                include_snapshot=False,
+            )
+        finally:
+            state.BROKER_POLL_LOCK.release()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["coalesced"])
+        self.assertNotIn("snapshot", result)
 
     def test_snapshot_redacts_account_and_signed_request_material(self) -> None:
         secret = "must-not-leak"

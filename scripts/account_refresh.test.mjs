@@ -8,6 +8,8 @@ import {
 assert.equal(ACCOUNT_REFRESH_INTERVAL_MS, 10_000);
 
 const order = [];
+const syncOptions = [];
+const reconciliationOptions = [];
 let releaseSync;
 const syncGate = new Promise((resolve) => {
   releaseSync = resolve;
@@ -15,13 +17,15 @@ const syncGate = new Promise((resolve) => {
 let syncCalls = 0;
 let reconciliationCalls = 0;
 const coordinator = createAccountRefreshCoordinator({
-  syncExecutionEvents: async (brokerId) => {
+  syncExecutionEvents: async (brokerId, options) => {
     syncCalls += 1;
+    syncOptions.push(options);
     order.push(`sync:${brokerId}`);
     await syncGate;
   },
-  runReconciliation: async () => {
+  runReconciliation: async (options) => {
     reconciliationCalls += 1;
+    reconciliationOptions.push(options);
     order.push("reconcile");
     return { ok: true, snapshot: { reconciled: true } };
   },
@@ -37,6 +41,8 @@ assert.deepEqual(await automaticTimerTick, { ok: true, snapshot: { reconciled: t
 assert.deepEqual(order, ["sync:all", "reconcile"]);
 assert.equal(syncCalls, 1);
 assert.equal(reconciliationCalls, 1);
+assert.deepEqual(syncOptions[0], { forceSnapshot: true, includeSnapshot: false });
+assert.deepEqual(reconciliationOptions[0], { refreshBrokers: false, includeSnapshot: true });
 assert.equal(coordinator.isRunning(), false);
 
 // A later manual refresh starts one new sync and one new reconciliation.

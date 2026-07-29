@@ -1,3 +1,22 @@
+export const API_DEFAULT_TIMEOUT_MS = 15_000;
+export const BROKER_REFRESH_TIMEOUT_MS = 45_000;
+
+export class ApiRequestError extends Error {
+  constructor(message, code, options = {}) {
+    super(message, options);
+    this.name = "ApiRequestError";
+    this.code = code;
+  }
+}
+
+export function isApiRequestTimeout(error) {
+  return error?.code === "TIMEOUT";
+}
+
+export function isApiConnectionFailure(error) {
+  return error?.code === "NETWORK";
+}
+
 export async function getSnapshot() {
   return request("/api/snapshot");
 }
@@ -74,16 +93,31 @@ export async function runBrokerCheck(brokerId) {
   return request("/api/broker-check", { method: "POST", body: { broker_id: brokerId } });
 }
 
-export async function runReconciliation() {
-  return request("/api/reconcile", { method: "POST", body: {} });
+export async function runReconciliation(options = {}) {
+  return request("/api/reconcile", {
+    method: "POST",
+    body: {
+      refresh_brokers: options.refreshBrokers !== false,
+      include_snapshot: options.includeSnapshot !== false,
+    },
+    timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
+  });
 }
 
 export async function seedProgramLedgerBaseline(confirmed = false) {
   return request("/api/program-ledger-baseline", { method: "POST", body: { confirmed } });
 }
 
-export async function syncExecutionEvents(brokerId = "all") {
-  return request("/api/execution-events", { method: "POST", body: { broker_id: brokerId } });
+export async function syncExecutionEvents(brokerId = "all", options = {}) {
+  return request("/api/execution-events", {
+    method: "POST",
+    body: {
+      broker_id: brokerId,
+      force_snapshot: options.forceSnapshot,
+      include_snapshot: options.includeSnapshot !== false,
+    },
+    timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
+  });
 }
 
 export async function runFinalPreflight() {
@@ -128,6 +162,20 @@ export async function runRecoveryDrill() {
   return request("/api/recovery-drill", { method: "POST", body: {} });
 }
 
+export async function getValidationSmallLive() {
+  return request("/api/validation-small-live", { timeoutMs: 15000 });
+}
+
+export async function evaluateValidationSmallLive(validationStrategyInstanceId) {
+  return request("/api/validation-small-live/evaluate", {
+    method: "POST",
+    body: {
+      validation_strategy_instance_id: validationStrategyInstanceId,
+    },
+    timeoutMs: 30000,
+  });
+}
+
 export async function runStrategyCycle(profileId) {
   return request("/api/strategy-cycle", { method: "POST", body: { profile_id: profileId } });
 }
@@ -152,9 +200,10 @@ export async function runWatchdog() {
   return request("/api/watchdog", { method: "POST", body: {} });
 }
 
-async function request(path, options = {}) {
+export async function request(path, options = {}) {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs ?? 10000);
+  const timeoutMs = options.timeoutMs ?? API_DEFAULT_TIMEOUT_MS;
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(path, {
       method: options.method ?? "GET",
@@ -165,12 +214,24 @@ async function request(path, options = {}) {
     const contentType = response.headers.get("content-type") ?? "";
     const result = contentType.includes("application/json") ? await response.json() : null;
     if (!response.ok) {
-      throw new Error(result?.reason || result?.message || `요청 실패 (${response.status})`);
+      throw new ApiRequestError(
+        result?.reason || result?.message || `요청 실패 (${response.status})`,
+        "HTTP",
+      );
     }
-    if (!result) throw new Error("API가 올바른 JSON 응답을 반환하지 않았습니다.");
+    if (!result) {
+      throw new ApiRequestError("API가 올바른 JSON 응답을 반환하지 않았습니다.", "INVALID_RESPONSE");
+    }
     return result;
   } catch (error) {
-    if (error?.name === "AbortError") throw new Error("API 응답 시간이 10초를 초과했습니다.");
+    if (error?.name === "AbortError") {
+      const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+      throw new ApiRequestError(`API 응답 시간이 ${seconds}초를 초과했습니다.`, "TIMEOUT", { cause: error });
+    }
+    if (error instanceof ApiRequestError) throw error;
+    if (error instanceof TypeError) {
+      throw new ApiRequestError("API 서버에 연결할 수 없습니다.", "NETWORK", { cause: error });
+    }
     throw error;
   } finally {
     window.clearTimeout(timeout);

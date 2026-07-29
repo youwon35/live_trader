@@ -8,6 +8,7 @@ import json
 import secrets
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -123,6 +124,7 @@ BINANCE_FUTURES_CANARY_LOCK = threading.RLock()
 # closed-bar cycle.  Public calls acquire this lock before manager/controller
 # locks; they never hold RUNTIME_MODE_LOCK while entering the manager.
 RUNTIME_CONTROL_LOCK = threading.RLock()
+BROKER_POLL_LOCK = threading.Lock()
 RUNTIME_MODE_RANK = {"MONITOR": 0, "SMALL_LIVE": 1, "FULL_LIVE": 2}
 PROFESSIONAL_PROMOTION_POLICY = PromotionPolicy()
 
@@ -2863,6 +2865,14 @@ def positions() -> list[dict[str, str]]:
                 ),
                 "program_qty": format_quantity(program_qty),
                 "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "미지원" if capability_unavailable else "API 필요",
+                "program_qty_value": program_qty,
+                "broker_qty_value": float(broker_qty) if broker_qty is not None else None,
+                "broker_value": safe_float(broker_row.get("broker_value"), 0.0) if broker_row else None,
+                "average_price": safe_float(broker_row.get("average_price"), 0.0) if broker_row else None,
+                "current_price": safe_float(broker_row.get("current_price"), 0.0) if broker_row else None,
+                "unrealized_profit": safe_float(broker_row.get("unrealized_profit"), 0.0) if broker_row else None,
+                "leverage": safe_float(broker_row.get("leverage"), 0.0) if broker_row else None,
+                "valuation_basis": str(broker_row.get("valuation_basis") or "unavailable") if broker_row else "unavailable",
                 "broker_value_display": format_money(broker_row.get("broker_value"), str(item["currency"])) if broker_row and safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
                 "average_price_display": format_money(broker_row.get("average_price"), str(item["currency"])) if broker_row and safe_float(broker_row.get("average_price"), 0.0) > 0 else "-",
                 "current_price_display": format_money(broker_row.get("current_price"), str(item["currency"])) if broker_row and safe_float(broker_row.get("current_price"), 0.0) > 0 else "-",
@@ -2924,6 +2934,14 @@ def positions() -> list[dict[str, str]]:
                 "position_side": position_side,
                 "program_qty": format_quantity(program_qty),
                 "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "API 필요",
+                "program_qty_value": program_qty,
+                "broker_qty_value": float(broker_qty) if broker_qty is not None else None,
+                "broker_value": safe_float(broker_row.get("broker_value"), 0.0) if broker_row else None,
+                "average_price": safe_float(broker_row.get("average_price"), 0.0) if broker_row else None,
+                "current_price": safe_float(broker_row.get("current_price"), 0.0) if broker_row else None,
+                "unrealized_profit": safe_float(broker_row.get("unrealized_profit"), 0.0) if broker_row else None,
+                "leverage": safe_float(broker_row.get("leverage"), 0.0) if broker_row else None,
+                "valuation_basis": str(broker_row.get("valuation_basis") or "unavailable") if broker_row else "unavailable",
                 "broker_value_display": format_money(broker_row.get("broker_value"), str(ledger_row.get("currency") or "")) if broker_row and safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
                 "average_price_display": format_money(broker_row.get("average_price"), str(ledger_row.get("currency") or "")) if broker_row and safe_float(broker_row.get("average_price"), 0.0) > 0 else "-",
                 "current_price_display": format_money(broker_row.get("current_price"), str(ledger_row.get("currency") or "")) if broker_row and safe_float(broker_row.get("current_price"), 0.0) > 0 else "-",
@@ -2957,6 +2975,14 @@ def positions() -> list[dict[str, str]]:
                 "position_side": position_side,
                 "program_qty": "0",
                 "broker_qty": format_quantity(broker_qty),
+                "program_qty_value": 0.0,
+                "broker_qty_value": broker_qty,
+                "broker_value": safe_float(broker_row.get("broker_value"), 0.0),
+                "average_price": safe_float(broker_row.get("average_price"), 0.0),
+                "current_price": safe_float(broker_row.get("current_price"), 0.0),
+                "unrealized_profit": safe_float(broker_row.get("unrealized_profit"), 0.0),
+                "leverage": safe_float(broker_row.get("leverage"), 0.0),
+                "valuation_basis": str(broker_row.get("valuation_basis") or "unavailable"),
                 "broker_value_display": format_money(broker_row.get("broker_value"), str(broker_row.get("currency") or "")) if safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
                 "average_price_display": format_money(broker_row.get("average_price"), str(broker_row.get("currency") or "")) if safe_float(broker_row.get("average_price"), 0.0) > 0 else "-",
                 "current_price_display": format_money(broker_row.get("current_price"), str(broker_row.get("currency") or "")) if safe_float(broker_row.get("current_price"), 0.0) > 0 else "-",
@@ -2988,6 +3014,7 @@ def account_reconciliation_rows() -> list[dict[str, str]]:
         live_account = live_accounts.get(str(item["broker_id"]), {})
         ledger_account = ledger_accounts.get(str(item["broker_id"]))
         broker_cash = live_account.get("broker_cash", item["broker_cash"])
+        broker_equity = live_account.get("broker_equity", broker_cash)
         program_cash = ledger_account.get("cash") if ledger_account else item["program_cash"]
         currency = str(live_account.get("currency") or item["currency"])
         if broker_cash is None:
@@ -3016,6 +3043,11 @@ def account_reconciliation_rows() -> list[dict[str, str]]:
                 "currency": currency,
                 "program_cash": format_money(program_cash, currency) if program_cash is not None else "대조 대기",
                 "broker_cash": format_money(broker_cash, currency) if broker_cash is not None else "API 필요",
+                "broker_equity": format_money(broker_equity, currency) if broker_equity is not None else "평가 대기",
+                "program_cash_value": float(program_cash) if program_cash is not None else None,
+                "broker_cash_value": float(broker_cash) if broker_cash is not None else None,
+                "broker_equity_value": float(broker_equity) if broker_equity is not None else None,
+                "valuation_basis": str(live_account.get("valuation_basis") or "cash_only"),
                 "delta_cash": delta_cash,
                 "status": status,
                 "status_label": status_label,
@@ -5280,8 +5312,45 @@ def run_broker_check(broker_id: str) -> dict[str, Any]:
     }
 
 
+def fetch_broker_snapshots(
+    router: LiveBrokerRouter,
+    broker_ids: tuple[str, ...] | list[str],
+) -> dict[str, dict[str, object] | Exception]:
+    """Fetch independent broker snapshots concurrently.
+
+    Broker REST calls are blocking by design. Running them serially lets one
+    slow provider multiply the total account refresh time by every configured
+    provider. The HTTP server is threaded, and this helper keeps that isolation
+    inside the aggregate refresh as well.
+    """
+
+    selected = tuple(dict.fromkeys(str(item).strip().lower() for item in broker_ids if str(item).strip()))
+    if not selected:
+        return {}
+    if len(selected) == 1:
+        broker_id = selected[0]
+        try:
+            return {broker_id: router.poll_execution_events(broker_id)}
+        except Exception as exc:  # Broker boundary is reported as structured data.
+            return {broker_id: exc}
+
+    results: dict[str, dict[str, object] | Exception] = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(selected)), thread_name_prefix="live-broker-read") as executor:
+        futures = {
+            broker_id: executor.submit(router.poll_execution_events, broker_id)
+            for broker_id in selected
+        }
+        for broker_id in selected:
+            try:
+                results[broker_id] = futures[broker_id].result()
+            except Exception as exc:  # Broker boundary is reported as structured data.
+                results[broker_id] = exc
+    return results
+
+
 def refresh_broker_reconciliation() -> dict[str, Any]:
     router = LiveBrokerRouter()
+    broker_ids = ("kis", "binance", "binance-futures", "upbit")
     data: dict[str, Any] = {
         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "accounts": [],
@@ -5290,23 +5359,19 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
         "successful_account_brokers": [],
         "successful_position_brokers": [],
     }
-    for broker_id in ("kis", "binance", "binance-futures", "upbit"):
-        try:
-            account_snapshot = router.get_account_snapshot(broker_id)
-            accounts = account_snapshot.get("accounts", []) if isinstance(account_snapshot, dict) else []
-            if isinstance(accounts, list):
-                data["accounts"].extend(accounts)
-                data["successful_account_brokers"].append(broker_id)
-        except (BrokerNotReadyError, RuntimeError) as exc:
-            data["errors"].append({"broker_id": broker_id, "scope": "account", "detail": str(exc)})
-
-        try:
-            positions_snapshot = router.list_positions(broker_id)
-            if isinstance(positions_snapshot, list):
-                data["positions"].extend(positions_snapshot)
-                data["successful_position_brokers"].append(broker_id)
-        except (BrokerNotReadyError, RuntimeError) as exc:
-            data["errors"].append({"broker_id": broker_id, "scope": "positions", "detail": str(exc)})
+    for broker_id, result in fetch_broker_snapshots(router, broker_ids).items():
+        if isinstance(result, Exception):
+            detail = f"{type(result).__name__}: {result}"[:500]
+            data["errors"].append({"broker_id": broker_id, "scope": "snapshot", "detail": detail})
+            continue
+        accounts = result.get("accounts", [])
+        positions_snapshot = result.get("positions", [])
+        if isinstance(accounts, list):
+            data["accounts"].extend(item for item in accounts if isinstance(item, dict))
+            data["successful_account_brokers"].append(broker_id)
+        if isinstance(positions_snapshot, list):
+            data["positions"].extend(item for item in positions_snapshot if isinstance(item, dict))
+            data["successful_position_brokers"].append(broker_id)
     STATE["broker_reconciliation"] = data
     return data
 
@@ -6357,10 +6422,11 @@ def should_append_execution_sync_audit(
     return should_append
 
 
-def poll_execution_events(
+def _poll_execution_events_unlocked(
     broker_id: str = "all",
     *,
     force_snapshot: bool | None = None,
+    include_snapshot: bool = True,
 ) -> dict[str, Any]:
     broker_ids = (
         "kis",
@@ -6402,65 +6468,6 @@ def poll_execution_events(
                     "instrument_id": normalized.instrument_id,
                     "raw": normalized.raw,
                 })
-            if not broker_snapshot_is_due(selected_broker, now_monotonic, force=force):
-                skipped_snapshot_brokers.add(selected_broker)
-                continue
-            attempted_snapshot_brokers.add(selected_broker)
-            result = router.poll_execution_events(selected_broker)
-            rows = result.get("events", []) if isinstance(result, dict) else result
-            if isinstance(rows, list):
-                for row in rows:
-                    if isinstance(row, dict):
-                        row_state = str(row.get("state") or row.get("status") or "").strip().lower()
-                        if row_state in {"account_snapshot", "position_snapshot"}:
-                            continue
-                        normalized = normalize_broker_execution(selected_broker, row)
-                        events.append({
-                            "broker_id": selected_broker,
-                            "event_id": normalized.event_id,
-                            "order_id": normalized.client_order_id,
-                            "broker_order_id": normalized.broker_order_id,
-                            "symbol": normalized.symbol,
-                            "side": str(row.get("side") or ""),
-                            "quantity": normalized.filled_quantity,
-                            "price": normalized.fill_price,
-                            "fee": normalized.fee,
-                            "state": normalized.status,
-                            "occurred_at": normalized.occurred_at,
-                            "instrument_id": normalized.instrument_id,
-                            "raw": normalized.raw,
-                        })
-            accounts = result.get("accounts", []) if isinstance(result, dict) else []
-            positions_data = result.get("positions", []) if isinstance(result, dict) else []
-            account_rows: list[dict[str, Any]] = []
-            position_rows: list[dict[str, Any]] = []
-            received_snapshot = isinstance(result, dict) and (
-                "accounts" in result or "positions" in result
-            )
-            if isinstance(accounts, list):
-                account_rows = [item for item in accounts if isinstance(item, dict)]
-                snapshot_accounts.extend(account_rows)
-            if isinstance(positions_data, list):
-                position_rows = [item for item in positions_data if isinstance(item, dict)]
-                snapshot_positions.extend(position_rows)
-            if received_snapshot:
-                successful_snapshot_brokers.add(selected_broker)
-                digest = stable_broker_snapshot_digest(selected_broker, account_rows, position_rows)
-                if mark_broker_snapshot_success(
-                    selected_broker,
-                    now_monotonic,
-                    digest,
-                    interval_seconds=poll_interval,
-                ):
-                    changed_snapshot_brokers.add(selected_broker)
-            else:
-                mark_broker_snapshot_success(
-                    selected_broker,
-                    now_monotonic,
-                    stable_broker_snapshot_digest(selected_broker, [], []),
-                    interval_seconds=poll_interval,
-                )
-            record_connectivity_state("broker_api", selected_broker, healthy=True)
         except Exception as exc:  # Broker boundary: one adapter must not stop all monitoring.
             detail = f"{type(exc).__name__}: {exc}"[:500]
             errors.append({"broker_id": selected_broker, "detail": detail})
@@ -6471,6 +6478,81 @@ def poll_execution_events(
                 interval_seconds=poll_interval,
             )
             record_connectivity_state("broker_api", selected_broker, healthy=False)
+            continue
+        if not broker_snapshot_is_due(selected_broker, now_monotonic, force=force):
+            skipped_snapshot_brokers.add(selected_broker)
+            continue
+        attempted_snapshot_brokers.add(selected_broker)
+
+    snapshot_results = fetch_broker_snapshots(
+        router,
+        [item for item in broker_ids if item in attempted_snapshot_brokers],
+    )
+    for selected_broker in broker_ids:
+        if selected_broker not in attempted_snapshot_brokers:
+            continue
+        result = snapshot_results.get(selected_broker)
+        if isinstance(result, Exception) or not isinstance(result, dict):
+            exc = result if isinstance(result, Exception) else RuntimeError("broker snapshot response must be an object")
+            detail = f"{type(exc).__name__}: {exc}"[:500]
+            errors.append({"broker_id": selected_broker, "detail": detail})
+            mark_broker_snapshot_failure(
+                selected_broker,
+                now_monotonic,
+                detail,
+                interval_seconds=poll_interval,
+            )
+            record_connectivity_state("broker_api", selected_broker, healthy=False)
+            continue
+
+        rows = result.get("events", [])
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    row_state = str(row.get("state") or row.get("status") or "").strip().lower()
+                    if row_state in {"account_snapshot", "position_snapshot"}:
+                        continue
+                    normalized = normalize_broker_execution(selected_broker, row)
+                    events.append({
+                        "broker_id": selected_broker,
+                        "event_id": normalized.event_id,
+                        "order_id": normalized.client_order_id,
+                        "broker_order_id": normalized.broker_order_id,
+                        "symbol": normalized.symbol,
+                        "side": str(row.get("side") or ""),
+                        "quantity": normalized.filled_quantity,
+                        "price": normalized.fill_price,
+                        "fee": normalized.fee,
+                        "state": normalized.status,
+                        "occurred_at": normalized.occurred_at,
+                        "instrument_id": normalized.instrument_id,
+                        "raw": normalized.raw,
+                    })
+        accounts = result.get("accounts", [])
+        positions_data = result.get("positions", [])
+        account_rows = [item for item in accounts if isinstance(item, dict)] if isinstance(accounts, list) else []
+        position_rows = [item for item in positions_data if isinstance(item, dict)] if isinstance(positions_data, list) else []
+        snapshot_accounts.extend(account_rows)
+        snapshot_positions.extend(position_rows)
+        received_snapshot = "accounts" in result or "positions" in result
+        if received_snapshot:
+            successful_snapshot_brokers.add(selected_broker)
+            digest = stable_broker_snapshot_digest(selected_broker, account_rows, position_rows)
+            if mark_broker_snapshot_success(
+                selected_broker,
+                now_monotonic,
+                digest,
+                interval_seconds=poll_interval,
+            ):
+                changed_snapshot_brokers.add(selected_broker)
+        else:
+            mark_broker_snapshot_success(
+                selected_broker,
+                now_monotonic,
+                stable_broker_snapshot_digest(selected_broker, [], []),
+                interval_seconds=poll_interval,
+            )
+        record_connectivity_state("broker_api", selected_broker, healthy=True)
     events = deduplicate_execution_events(events)
     existing_event_ids = PROGRAM_LEDGER.existing_execution_event_ids([
         str(event.get("event_id") or "") for event in events
@@ -6571,8 +6653,42 @@ def poll_execution_events(
         "local_order_update_count": local_order_updates,
         "telegram_fill_count": telegram_fill_count,
         "automatic_promotion": automatic_results,
-        "snapshot": snapshot(),
+        **({"snapshot": snapshot()} if include_snapshot else {}),
     }
+
+
+def poll_execution_events(
+    broker_id: str = "all",
+    *,
+    force_snapshot: bool | None = None,
+    include_snapshot: bool = True,
+) -> dict[str, Any]:
+    """Coalesce overlapping UI, daemon, and runtime broker polls.
+
+    A 10-second account refresh must not queue behind another aggregate broker
+    read or hold the frontend's API-health loop hostage. If a poll is already
+    running, callers receive the latest cached observation immediately.
+    """
+
+    if not BROKER_POLL_LOCK.acquire(blocking=False):
+        result = {
+            "ok": True,
+            "reason": "이미 실행 중인 계좌·체결 동기화를 공유합니다.",
+            "coalesced": True,
+            "program_ledger": program_ledger_snapshot(),
+            "execution_events": execution_event_snapshot(),
+        }
+        if include_snapshot:
+            result["snapshot"] = snapshot()
+        return result
+    try:
+        return _poll_execution_events_unlocked(
+            broker_id,
+            force_snapshot=force_snapshot,
+            include_snapshot=include_snapshot,
+        )
+    finally:
+        BROKER_POLL_LOCK.release()
 
 
 BINANCE_SMOKE_SYMBOL = "BTCUSDT"
@@ -7643,9 +7759,19 @@ def refresh_upbit_smoke_order() -> dict[str, Any]:
     return {"ok": True, "reason": detail_text, "order": dict(STATE["upbit_smoke_order"]), "snapshot": snapshot()}
 
 
-def run_reconciliation() -> dict[str, Any]:
+def run_reconciliation(
+    *,
+    refresh_brokers: bool = True,
+    include_snapshot: bool = True,
+) -> dict[str, Any]:
     STATE["reconciliation_last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    broker_data = refresh_broker_reconciliation()
+    broker_data = (
+        refresh_broker_reconciliation()
+        if refresh_brokers
+        else STATE.get("broker_reconciliation", {})
+    )
+    if not isinstance(broker_data, dict):
+        broker_data = refresh_broker_reconciliation()
     reconciliation = reconciliation_snapshot()
     summary = reconciliation["summary"]
     broker_truth = broker_position_truth_snapshot(reconciliation)
@@ -7671,7 +7797,7 @@ def run_reconciliation() -> dict[str, Any]:
         "reconciliation": reconciliation,
         "broker_position_truth": broker_truth,
         "automatic_promotion": automatic_results,
-        "snapshot": snapshot(),
+        **({"snapshot": snapshot()} if include_snapshot else {}),
     }
 
 
@@ -8720,6 +8846,68 @@ def start_continuous_runtime(profile_id: str, mode: str, portfolio_id: str = "")
     if portfolio_id and result.get("ok"):
         ArtifactMetadataStore().update(portfolio_id, "portfolio", mark_used=True)
     return result
+
+
+def validation_small_live_snapshot() -> dict[str, Any]:
+    """Read the immutable validation plan without changing live permissions."""
+
+    from .validation_small_live import validation_plan_snapshot
+
+    return validation_plan_snapshot()
+
+
+def run_validation_small_live_once(
+    validation_strategy_instance_id: str,
+) -> dict[str, Any]:
+    """Evaluate one confirmed bar in MONITOR with no OrderIntent path."""
+
+    from .validation_small_live import (
+        evaluate_validation_candidate_once,
+    )
+
+    candidate_id = str(validation_strategy_instance_id or "").strip()
+    if not candidate_id:
+        return {
+            "ok": False,
+            "reason": "검증 후보 ID가 필요합니다.",
+            "validation": validation_small_live_snapshot(),
+            "snapshot": snapshot(),
+        }
+    try:
+        result = evaluate_validation_candidate_once(candidate_id)
+    except Exception as exc:
+        reason = str(exc) or type(exc).__name__
+        append_audit(
+            "danger",
+            "Validation MONITOR",
+            f"{candidate_id} 1회 평가 차단: {reason}",
+        )
+        return {
+            "ok": False,
+            "reason": reason,
+            "validation": validation_small_live_snapshot(),
+            "snapshot": snapshot(),
+        }
+    decision = (
+        result.get("decision")
+        if isinstance(result.get("decision"), dict)
+        else {}
+    )
+    append_audit(
+        "info",
+        "Validation MONITOR",
+        (
+            f"{result.get('symbol')} {result.get('timeframe')} "
+            f"{decision.get('signal', 'HOLD')}: "
+            f"{decision.get('reason', '평가 완료')} · 주문 경로 없음"
+        ),
+    )
+    return {
+        **result,
+        "reason": "MONITOR 확정 봉 1회 평가 완료 · 주문 경로 없음",
+        "validation": validation_small_live_snapshot(),
+        "snapshot": snapshot(),
+    }
 
 
 def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:

@@ -35,10 +35,13 @@ import {
 } from "lucide-react";
 import {
   cancelOrder,
+  evaluateValidationSmallLive,
   getEnvSettings,
   getSnapshot,
   getTelegramConnection,
   getUiSettings,
+  getValidationSmallLive,
+  isApiConnectionFailure,
   loadArtifactMetadata,
   loadSharedSearchPresets,
   runFinalPreflight,
@@ -70,10 +73,24 @@ import {
   ACCOUNT_REFRESH_INTERVAL_MS,
   createAccountRefreshCoordinator,
 } from "./accountRefresh";
+import {
+  buildAccountVisualization,
+  formatAllocationValue,
+} from "./accountVisualization";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
 import { readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
-import { LAYOUT_RESIZE_DIRECTIONS } from "../../../packages/design/layout-editing.js";
+import {
+  LAYOUT_RESIZE_DIRECTIONS,
+  applyLayoutTransformOffset,
+  clearLayoutTransformOffset,
+  layoutAlignedOffset,
+  layoutDropTarget,
+  layoutElementOverlapsPeers,
+  layoutSwapDimensions,
+  layoutSwapOffsets,
+  readLayoutTransformOffset,
+} from "../../../packages/design/layout-editing.js";
 import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
 import { createTelegramConnectionStatus } from "../../../packages/design/telegram-connection-status.js";
@@ -798,70 +815,37 @@ function snapLayoutDimension(value, axis) {
   return clampNumber(snapped, min, LAYOUT_MAX_DIMENSION, min);
 }
 
+function snapStoredSlotDimension(value, axis) {
+  const snapped = Math.round(Number(value) / LAYOUT_SNAP_SIZE) * LAYOUT_SNAP_SIZE;
+  const min = axis === "width" ? 160 : 64;
+  return clampNumber(snapped, min, LAYOUT_MAX_DIMENSION, min);
+}
+
 function snapLayoutOffset(value, axis) {
   const snapped = Math.round(Number(value) / LAYOUT_SNAP_SIZE) * LAYOUT_SNAP_SIZE;
   return clampNumber(snapped, -LAYOUT_MAX_OFFSET, LAYOUT_MAX_OFFSET, 0);
 }
 
-function panelRectsOverlap(left, right, gap = LAYOUT_COLLISION_GAP) {
-  return (
-    left.left < right.right + gap &&
-    left.right + gap > right.left &&
-    left.top < right.bottom + gap &&
-    left.bottom + gap > right.top
-  );
-}
-
 function panelOverlapsPeers(activePanel) {
-  const layoutContainer = activePanel.parentElement;
-  if (!layoutContainer) return false;
-  const activeRect = activePanel.getBoundingClientRect();
-  return Array.from(layoutContainer.children).some((panel) => {
-    if (panel === activePanel || !(panel instanceof HTMLElement)) return false;
-    if (!panel.classList.contains("panel")) return false;
-    if (activePanel.contains(panel) || panel.contains(activePanel)) return false;
-    const rect = panel.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0 && panelRectsOverlap(activeRect, rect);
-  });
+  return layoutElementOverlapsPeers(activePanel, ".panel", LAYOUT_COLLISION_GAP);
 }
 
 function applyPanelOffset(panel, position = {}) {
-  const nextX = snapLayoutOffset(position.x, "x");
-  const nextY = snapLayoutOffset(position.y, "y");
-  panel.style.removeProperty("transform");
-  if (Math.abs(nextX) > 0) {
-    panel.dataset.layoutOffsetX = String(nextX);
-    panel.style.marginLeft = `${nextX}px`;
-  } else {
-    delete panel.dataset.layoutOffsetX;
-    panel.style.removeProperty("margin-left");
-  }
-  if (Math.abs(nextY) > 0) {
-    panel.dataset.layoutOffsetY = String(nextY);
-    panel.style.marginTop = `${nextY}px`;
-  } else {
-    delete panel.dataset.layoutOffsetY;
-    panel.style.removeProperty("margin-top");
-  }
+  return applyLayoutTransformOffset(panel, position.x, position.y, {
+    max: LAYOUT_MAX_OFFSET,
+    snap: LAYOUT_SNAP_SIZE,
+  });
 }
 
 function clearPanelOffset(panel) {
-  delete panel.dataset.layoutOffsetX;
-  delete panel.dataset.layoutOffsetY;
-  panel.style.removeProperty("transform");
-  panel.style.removeProperty("margin-left");
-  panel.style.removeProperty("margin-top");
+  clearLayoutTransformOffset(panel);
 }
 
 function currentPanelOffset(panel, storedPosition = {}) {
-  const inlineX = Number(String(panel.style.marginLeft || "0").replace("px", ""));
-  const inlineY = Number(String(panel.style.marginTop || "0").replace("px", ""));
-  const storedX = Number(storedPosition?.x);
-  const storedY = Number(storedPosition?.y);
-  return {
-    x: snapLayoutOffset(Number.isFinite(inlineX) && Math.abs(inlineX) > 0 ? inlineX : storedX, "x"),
-    y: snapLayoutOffset(Number.isFinite(inlineY) && Math.abs(inlineY) > 0 ? inlineY : storedY, "y"),
-  };
+  return readLayoutTransformOffset(panel, storedPosition, {
+    max: LAYOUT_MAX_OFFSET,
+    snap: LAYOUT_SNAP_SIZE,
+  });
 }
 
 function isInteractiveLayoutTarget(target) {
@@ -895,10 +879,10 @@ function ensurePanelHandles(panel) {
 
   panel.style.transform = "";
   if (size && Number.isFinite(size.width)) {
-    panel.style.width = `${snapLayoutDimension(size.width, "width")}px`;
+    panel.style.width = `${snapStoredSlotDimension(size.width, "width")}px`;
   }
   if (size && Number.isFinite(size.height)) {
-    panel.style.height = `${snapLayoutDimension(size.height, "height")}px`;
+    panel.style.height = `${snapStoredSlotDimension(size.height, "height")}px`;
   }
   applyPanelOffset(panel, position);
   window.requestAnimationFrame(() => {
@@ -1045,9 +1029,11 @@ function useEditablePanels(rootRef) {
       const key = panelLayoutKey(panel);
       const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
       const startOffset = currentPanelOffset(panel, positions[key]);
+      const startRect = panel.getBoundingClientRect();
       const startX = event.clientX;
       const startY = event.clientY;
       let lastValidOffset = startOffset;
+      let swapTarget = null;
       panel.classList.add("dragging-panel");
       document.body.classList.add("is-moving-layout");
 
@@ -1055,6 +1041,13 @@ function useEditablePanels(rootRef) {
         const nextX = snapLayoutOffset(startOffset.x + moveEvent.clientX - startX, "x");
         const nextY = snapLayoutOffset(startOffset.y + moveEvent.clientY - startY, "y");
         applyPanelOffset(panel, { x: nextX, y: nextY });
+        const nextSwapTarget = layoutDropTarget(panel, ".panel", { x: moveEvent.clientX, y: moveEvent.clientY });
+        if (swapTarget !== nextSwapTarget) {
+          swapTarget?.classList.remove("layout-swap-target");
+          swapTarget = nextSwapTarget;
+          swapTarget?.classList.add("layout-swap-target");
+        }
+        if (swapTarget) return;
         if (panelOverlapsPeers(panel)) {
           applyPanelOffset(panel, lastValidOffset);
           return;
@@ -1063,14 +1056,71 @@ function useEditablePanels(rootRef) {
       };
 
       const onUp = () => {
-        const nextOffset = currentPanelOffset(panel, positions[key]);
         const stored = readStoredMap(PANEL_POSITION_STORAGE_KEY);
-        if (Math.abs(nextOffset.x) > 0 || Math.abs(nextOffset.y) > 0) {
-          stored[key] = nextOffset;
+        const saveOffset = (storageKey, offset) => {
+          if (Math.abs(offset.x) > 0 || Math.abs(offset.y) > 0) stored[storageKey] = offset;
+          else delete stored[storageKey];
+        };
+        let nextOffset = lastValidOffset;
+        if (swapTarget?.isConnected) {
+          const targetKey = panelLayoutKey(swapTarget);
+          const targetOffset = currentPanelOffset(swapTarget, stored[targetKey]);
+          const targetRect = swapTarget.getBoundingClientRect();
+          const swap = layoutSwapOffsets({
+            activeOffset: startOffset,
+            activeRect: startRect,
+            max: LAYOUT_MAX_OFFSET,
+            snap: LAYOUT_SNAP_SIZE,
+            targetOffset,
+            targetRect,
+          });
+          const swappedDimensions = layoutSwapDimensions({
+            activeRect: startRect,
+            max: LAYOUT_MAX_DIMENSION,
+            minHeight: MIN_PANEL_HEIGHT,
+            minWidth: MIN_PANEL_WIDTH,
+            snap: LAYOUT_SNAP_SIZE,
+            targetRect,
+          });
+          if (swap && swappedDimensions) {
+            panel.style.width = `${swappedDimensions.active.width}px`;
+            panel.style.height = `${swappedDimensions.active.height}px`;
+            swapTarget.style.width = `${swappedDimensions.target.width}px`;
+            swapTarget.style.height = `${swappedDimensions.target.height}px`;
+            applyPanelOffset(panel, swap.active);
+            applyPanelOffset(swapTarget, swap.target);
+            const alignedActiveOffset = layoutAlignedOffset(panel, swap.active, targetRect, {
+              max: LAYOUT_MAX_OFFSET,
+              snap: LAYOUT_SNAP_SIZE,
+            });
+            const alignedTargetOffset = layoutAlignedOffset(swapTarget, swap.target, startRect, {
+              max: LAYOUT_MAX_OFFSET,
+              snap: LAYOUT_SNAP_SIZE,
+            });
+            applyPanelOffset(panel, alignedActiveOffset);
+            applyPanelOffset(swapTarget, alignedTargetOffset);
+            if (!panelOverlapsPeers(panel) && !panelOverlapsPeers(swapTarget)) {
+              nextOffset = alignedActiveOffset;
+              saveOffset(targetKey, alignedTargetOffset);
+              const sizeStore = readStoredMap(PANEL_SIZE_STORAGE_KEY);
+              sizeStore[key] = swappedDimensions.active;
+              sizeStore[targetKey] = swappedDimensions.target;
+              writeStoredMap(PANEL_SIZE_STORAGE_KEY, sizeStore);
+            } else {
+              panel.style.width = `${Math.round(startRect.width)}px`;
+              panel.style.height = `${Math.round(startRect.height)}px`;
+              swapTarget.style.width = `${Math.round(targetRect.width)}px`;
+              swapTarget.style.height = `${Math.round(targetRect.height)}px`;
+              applyPanelOffset(swapTarget, targetOffset);
+              applyPanelOffset(panel, lastValidOffset);
+            }
+          }
         } else {
-          delete stored[key];
+          applyPanelOffset(panel, lastValidOffset);
         }
+        saveOffset(key, nextOffset);
         writeStoredMap(PANEL_POSITION_STORAGE_KEY, stored);
+        swapTarget?.classList.remove("layout-swap-target");
         panel.classList.remove("dragging-panel");
         document.body.classList.remove("is-moving-layout");
         document.removeEventListener("pointermove", onMove, true);
@@ -1130,7 +1180,7 @@ function App() {
   const [acknowledgedNotifications, setAcknowledgedNotifications] = useState(() => readStoredValue(NOTIFICATION_ACK_STORAGE_KEY, ""));
   const workspaceRef = useRef(null);
   const notificationRef = useRef(null);
-  const backgroundRequestInFlightRef = useRef(false);
+  const snapshotRequestInFlightRef = useRef(false);
   const accountRefreshCoordinatorRef = useRef(null);
   if (!accountRefreshCoordinatorRef.current) {
     accountRefreshCoordinatorRef.current = createAccountRefreshCoordinator({
@@ -1142,17 +1192,17 @@ function App() {
   useEditablePanels(workspaceRef);
 
   async function refresh() {
-    if (backgroundRequestInFlightRef.current) return;
-    backgroundRequestInFlightRef.current = true;
+    if (snapshotRequestInFlightRef.current) return;
+    snapshotRequestInFlightRef.current = true;
     try {
       const next = await getSnapshot();
       setSnapshot({ ...next, api_connected: true });
       setError("");
     } catch (err) {
-      setSnapshot(fallbackSnapshot);
+      if (isApiConnectionFailure(err)) setSnapshot(fallbackSnapshot);
       setError(err instanceof Error ? err.message : "API 연결 실패");
     } finally {
-      backgroundRequestInFlightRef.current = false;
+      snapshotRequestInFlightRef.current = false;
       setLoading(false);
     }
   }
@@ -1175,15 +1225,12 @@ function App() {
     if (selectedNav !== "accounts" || snapshot.api_connected !== true) return undefined;
     let stopped = false;
     const refreshBrokerAccounts = async () => {
-      if (stopped || accountRefreshCoordinatorRef.current.isRunning() || backgroundRequestInFlightRef.current) return;
-      backgroundRequestInFlightRef.current = true;
+      if (stopped || accountRefreshCoordinatorRef.current.isRunning()) return;
       try {
         const result = await accountRefreshCoordinatorRef.current.run();
         if (!stopped && result?.snapshot) setSnapshot({ ...result.snapshot, api_connected: true });
       } catch {
         // Background account refresh stays quiet; the normal snapshot poll keeps connection status visible.
-      } finally {
-        backgroundRequestInFlightRef.current = false;
       }
     };
     void refreshBrokerAccounts();
@@ -1245,7 +1292,7 @@ function App() {
       return result;
     } catch (err) {
       const reason = err instanceof Error ? err.message : "요청 실패";
-      setSnapshot(fallbackSnapshot);
+      if (isApiConnectionFailure(err)) setSnapshot(fallbackSnapshot);
       setError(reason);
       return { ok: false, reason };
     } finally {
@@ -1448,6 +1495,7 @@ function App() {
           }
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
           onStrategyCycle={(profileId) => runAction(() => runStrategyCycle(profileId))}
+          onValidationEvaluate={(candidateId) => runAction(() => evaluateValidationSmallLive(candidateId))}
           onRuntimeStart={(profileId, mode) => runAction(() => startContinuousRuntime(profileId, mode))}
           onRuntimeStop={(profileId) => runAction(() => stopContinuousRuntime(profileId))}
           onPromoteLive={(strategyId) => runAction(() => promoteStrategyToLive(strategyId))}
@@ -1531,6 +1579,7 @@ function WorkspaceContent({
   onEntryBlock,
   onAutomation,
   onStrategyCycle,
+  onValidationEvaluate,
   onRuntimeStart,
   onRuntimeStop,
   onPromoteLive,
@@ -1568,6 +1617,7 @@ function WorkspaceContent({
             runnerState={snapshot.strategy_runner}
             onAutomation={onAutomation}
             onStrategyCycle={onStrategyCycle}
+            onValidationEvaluate={onValidationEvaluate}
             onRuntimeStart={onRuntimeStart}
             onRuntimeStop={onRuntimeStop}
             runtime={snapshot.continuous_runtime}
@@ -2998,9 +3048,23 @@ function clearSecretDrafts(fields, draft) {
   return next;
 }
 
-function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomation, onStrategyCycle, onRuntimeStart, onRuntimeStop, runtime }) {
+function AutomationLauncherPanel({
+  profiles,
+  strategies,
+  runnerState,
+  onAutomation,
+  onStrategyCycle,
+  onValidationEvaluate,
+  onRuntimeStart,
+  onRuntimeStop,
+  runtime,
+}) {
   const rows = profiles?.length ? profiles : fallbackSnapshot.automation_profiles;
   const [assetTab, setAssetTab] = useState(rows[0]?.id ?? "stock");
+  const [validation, setValidation] = useState(null);
+  const [validationLoading, setValidationLoading] = useState(false);
+  const [selectedValidationId, setSelectedValidationId] = useState("");
+  const [lastValidationResult, setLastValidationResult] = useState(null);
   const activeProfile = rows.find((profile) => profile.id === assetTab) ?? rows[0];
   const modes = [
     { id: "MONITOR", label: "MONITOR", icon: Power },
@@ -3012,6 +3076,59 @@ function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomati
     label: profile.id === "stock" ? "주식/ETF" : "코인",
     detail: `${profile.provider_label} · 전략 ${profile.strategy_count}개`,
   }));
+  const validationCandidates = (validation?.candidates ?? []).filter((candidate) => {
+    const broker = String(candidate.brokerHint ?? "").toLowerCase();
+    const symbol = String(candidate.symbol ?? "").toUpperCase();
+    const crypto = ["binance", "binance-futures", "upbit"].includes(broker)
+      || symbol.startsWith("KRW-")
+      || symbol.endsWith("USDT")
+      || symbol.endsWith("USDC");
+    return assetTab === "crypto" ? crypto : !crypto;
+  });
+  const selectedValidation = validationCandidates.find(
+    (candidate) => candidate.validationStrategyInstanceId === selectedValidationId,
+  ) ?? validationCandidates[0] ?? null;
+  const researchShort = validation?.researchShortBundle ?? null;
+
+  async function refreshValidationPlan() {
+    setValidationLoading(true);
+    try {
+      const response = await getValidationSmallLive();
+      setValidation(response?.validation ?? null);
+    } catch (error) {
+      setValidation({
+        ok: false,
+        reason: error instanceof Error ? error.message : "검증 plan 조회 실패",
+        candidates: [],
+      });
+    } finally {
+      setValidationLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refreshValidationPlan();
+  }, []);
+
+  useEffect(() => {
+    const nextId = validationCandidates[0]?.validationStrategyInstanceId ?? "";
+    if (!validationCandidates.some((item) => item.validationStrategyInstanceId === selectedValidationId)) {
+      setSelectedValidationId(nextId);
+      setLastValidationResult(null);
+    }
+  }, [assetTab, validation, selectedValidationId]);
+
+  async function evaluateSelectedValidation() {
+    if (!selectedValidation?.runtimeEvaluationReady || validationLoading) return;
+    setValidationLoading(true);
+    try {
+      const result = await onValidationEvaluate(selectedValidation.validationStrategyInstanceId);
+      setLastValidationResult(result);
+      if (result?.validation) setValidation(result.validation);
+    } finally {
+      setValidationLoading(false);
+    }
+  }
 
   if (!activeProfile) {
     return (
@@ -3151,6 +3268,108 @@ function AutomationLauncherPanel({ profiles, strategies, runnerState, onAutomati
           {profileRuntime?.lastError && <small>{profileRuntime.lastError}</small>}
         </div>
       </div>
+      <section className="validation-monitor-card">
+        <PanelHeader
+          title="검증 전용 MONITOR"
+          subtitle="Backtest·Portfolio 후보를 표준 lifecycle 승급 없이 실제 지표 코드로 1회 평가합니다. 이 경로에는 OrderIntent 생성과 브로커 주문 전송이 없습니다."
+          suffix={(
+            <button className="mini-button" type="button" disabled={validationLoading} onClick={refreshValidationPlan}>
+              <RefreshCcw size={14} />
+              새로고침
+            </button>
+          )}
+        />
+        <div className="validation-monitor-metrics">
+          <MetricCard label="일반 통합 Smoke" value={`${validation?.generalSmokeCandidateCount ?? 0}개`} tone="info" />
+          <MetricCard label="Futures SHORT 정식 후보" value={`${validation?.futuresShortCandidateCount ?? 0}개`} tone={(validation?.futuresShortCandidateCount ?? 0) > 0 ? "success" : "warning"} />
+          <MetricCard label="승급 차단 SHORT" value={`${validation?.blockedFuturesShortCount ?? 0}개`} tone={(validation?.blockedFuturesShortCount ?? 0) > 0 ? "warning" : "success"} />
+          <MetricCard label="실제 평가 가능" value={`${validation?.runtimeEvaluationReadyCount ?? 0}개`} tone="success" />
+          <MetricCard label="주문 가능" value="0개" tone="success" />
+        </div>
+        <div className="validation-candidate-selector">
+          <label>
+            <span>{assetTab === "crypto" ? "코인" : "주식/ETF"} 검증 후보</span>
+            <select
+              value={selectedValidation?.validationStrategyInstanceId ?? ""}
+              onChange={(event) => {
+                setSelectedValidationId(event.currentTarget.value);
+                setLastValidationResult(null);
+              }}
+            >
+              {validationCandidates.map((candidate) => (
+                <option key={candidate.validationStrategyInstanceId} value={candidate.validationStrategyInstanceId}>
+                  {candidate.symbol} · {candidate.timeframe} · {candidate.positionDirection === "short" ? "SHORT" : "LONG"} · {candidate.runtimeEvaluationReady ? "평가 가능" : "canonical 재발행 필요"}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            className="ts-action-button"
+            type="button"
+            disabled={!selectedValidation?.runtimeEvaluationReady || validationLoading}
+            onClick={evaluateSelectedValidation}
+          >
+            <Play size={16} />
+            <span>{validationLoading ? "확정 봉 로딩 중" : "1회 MONITOR 평가"}</span>
+          </button>
+        </div>
+        {selectedValidation ? (
+          <div className="validation-candidate-detail">
+            <div>
+              <strong>{selectedValidation.strategyName || selectedValidation.strategyId}</strong>
+              <span>
+                {selectedValidation.brokerHint} · {selectedValidation.marketType} · {selectedValidation.plugin}
+              </span>
+            </div>
+            <StatusPill tone={selectedValidation.runtimeEvaluationReady ? "success" : "warning"}>
+              {selectedValidation.runtimeEvaluationReady ? "CANONICAL · MONITOR ONLY" : "LEGACY · 목록 전용"}
+            </StatusPill>
+          </div>
+        ) : (
+          <EmptyRow text="이 자산군에 검증 plan 후보가 없습니다." />
+        )}
+        {lastValidationResult?.ok && (
+          <div className="validation-evaluation-result">
+            <StatusPill tone={lastValidationResult.decision?.signal === "HOLD" ? "neutral" : "info"}>
+              {lastValidationResult.decision?.signal ?? "HOLD"}
+            </StatusPill>
+            <div>
+              <strong>{lastValidationResult.symbol} · {lastValidationResult.timeframe} 확정 봉 평가 완료</strong>
+              <span>{lastValidationResult.decision?.reason}</span>
+            </div>
+            <small>MONITOR · 주문 경로 없음 · 최대 주문금액 0</small>
+          </div>
+        )}
+        {lastValidationResult?.ok === false && (
+          <div className="validation-evaluation-error">{lastValidationResult.reason}</div>
+        )}
+        <p className="validation-monitor-note">
+          지속 감시는 현재 표준 Portfolio runner와 별도 연결하지 않았습니다. 후보 plan을 우회해 장시간 runtime을 시작하지 않으며, 표준 SMALL/FULL LIVE 권한도 변경하지 않습니다.
+        </p>
+        {researchShort && (
+          <div className="research-short-summary">
+            <div>
+              <strong>Binance Futures SHORT 연구 bundle</strong>
+              <span>
+                {researchShort.strategyCount ?? 0}개 전략 · Portfolio 실행 계약 {researchShort.portfolioExecutionPassed ? "PASS" : "CHECK"} · Shadow/Paper {researchShort.paperPassedStrategyCount ?? 0}/{researchShort.strategyCount ?? 0}
+              </span>
+            </div>
+            <StatusPill tone={researchShort.functionalPass ? "success" : "warning"}>
+              {researchShort.functionalPass ? "기능 검증 PASS · 승급 불가" : "검증 확인 필요"}
+            </StatusPill>
+            <div className="research-short-strategies">
+              {(researchShort.strategies ?? []).map((strategy) => (
+                <span key={strategy.strategyId}>
+                  {strategy.symbol} {strategy.timeframe} · SELL 진입 / BUY reduce-only 청산
+                </span>
+              ))}
+            </div>
+            <small>
+              researchOnly · 실제 주문 0 · 기존 holdout 재사용으로 production 승급과 Live 권한 부여는 차단됩니다.
+            </small>
+          </div>
+        )}
+      </section>
     </section>
   );
 }
@@ -3448,6 +3667,161 @@ function numericDisplayValue(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function compactAllocationValue(value, currency) {
+  const numeric = Number(value || 0);
+  const unit = String(currency || "").toUpperCase();
+  if (unit === "KRW") {
+    if (numeric >= 100_000_000) return `${(numeric / 100_000_000).toFixed(1)}억`;
+    if (numeric >= 10_000) return `${(numeric / 10_000).toFixed(numeric >= 1_000_000 ? 0 : 1)}만`;
+    return Math.round(numeric).toLocaleString("ko-KR");
+  }
+  if (numeric >= 1_000_000) return `${(numeric / 1_000_000).toFixed(1)}M`;
+  if (numeric >= 1_000) return `${(numeric / 1_000).toFixed(1)}K`;
+  return numeric.toLocaleString("ko-KR", { maximumFractionDigits: 2 });
+}
+
+function AllocationDonut({ group }) {
+  const visibleItems = group.items.filter((item) => item.ratio > 0);
+  return (
+    <div className="account-allocation-donut">
+      <svg aria-label={`${group.currency} 계좌 자본 배분`} role="img" viewBox="0 0 120 120">
+        <circle className="account-allocation-donut__track" cx="60" cy="60" r="46" pathLength="100" />
+        {visibleItems.map((item) => (
+          <circle
+            className="account-allocation-donut__segment"
+            cx="60"
+            cy="60"
+            key={item.id}
+            pathLength="100"
+            r="46"
+            stroke={item.color}
+            strokeDasharray={`${item.ratio * 100} ${100 - item.ratio * 100}`}
+            strokeDashoffset={-item.offset * 100}
+          />
+        ))}
+      </svg>
+      <div className="account-allocation-donut__center">
+        <strong>{compactAllocationValue(group.total, group.currency)}</strong>
+        <span>{group.currency}</span>
+      </div>
+    </div>
+  );
+}
+
+function AllocationLegend({ currency, items }) {
+  return (
+    <div className="account-allocation-legend">
+      {items.map((item) => (
+        <div key={item.id}>
+          <span className="account-allocation-legend__marker" style={{ backgroundColor: item.color }} />
+          <span className="account-allocation-legend__name">
+            <strong>{item.label}</strong>
+            <small>{item.basis}</small>
+          </span>
+          <span className="account-allocation-legend__value">
+            <strong>{(item.ratio * 100).toFixed(item.ratio >= 0.1 ? 1 : 2)}%</strong>
+            <small>{formatAllocationValue(item.value, currency)}</small>
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PositionExposureCard({ group }) {
+  return (
+    <article className="position-exposure-card">
+      <header>
+        <div>
+          <strong>{group.brokerLabel}</strong>
+          <span>{group.currency} 기준</span>
+        </div>
+        <strong>{formatAllocationValue(group.total, group.currency)}</strong>
+      </header>
+      {group.items.length ? (
+        <>
+          <div className="position-exposure-bar" aria-label={`${group.brokerLabel} 포지션 비중`}>
+            {group.items.map((item) => (
+              <span
+                key={item.id}
+                style={{ backgroundColor: item.color, width: `${Math.max(item.ratio * 100, 0.7)}%` }}
+                title={`${item.label} ${(item.ratio * 100).toFixed(1)}%`}
+              />
+            ))}
+          </div>
+          <AllocationLegend currency={group.currency} items={group.items} />
+        </>
+      ) : (
+        <div className="account-visual-empty">평가 가능한 포지션 금액이 없습니다.</div>
+      )}
+      {group.pendingCount ? (
+        <p className="position-exposure-card__pending">현재가가 없어 평가 대기 중인 포지션 {group.pendingCount}개는 비중 계산에서 제외했습니다.</p>
+      ) : null}
+    </article>
+  );
+}
+
+function AccountAllocationOverview({ accounts, positions }) {
+  const model = useMemo(
+    () => buildAccountVisualization(accounts, positions),
+    [accounts, positions],
+  );
+  return (
+    <section className="panel account-visual-overview">
+      <PanelHeader
+        title="계좌 자본·포지션 노출"
+        subtitle="환율을 임의 추정하지 않고 통화별 자본 배분과 계좌별 포지션 집중도를 분리해 표시합니다."
+      />
+      <div className="account-visual-summary">
+        <div><span>연결 계좌</span><strong>{model.accountCount}개</strong></div>
+        <div><span>보유 포지션</span><strong>{model.positionCount}개</strong></div>
+        <div><span>기준 통화</span><strong>{model.capitalGroups.length}개</strong></div>
+        <div className={model.missingValuationCount ? "is-warning" : ""}>
+          <span>평가 대기</span>
+          <strong>{model.missingValuationCount}개</strong>
+        </div>
+      </div>
+      <div className="account-visual-section">
+        <div className="account-visual-section__heading">
+          <div>
+            <h3>계좌 자본 배분</h3>
+            <p>KRW·USD·USDT를 섞지 않고 브로커가 제공한 총 평가 또는 현금성 잔고를 사용합니다.</p>
+          </div>
+        </div>
+        {model.capitalGroups.length ? (
+          <div className="account-allocation-grid">
+            {model.capitalGroups.map((group) => (
+              <article className="account-allocation-card" key={group.currency}>
+                <AllocationDonut group={group} />
+                <AllocationLegend currency={group.currency} items={group.items} />
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="account-visual-empty">계좌를 갱신하면 자본 배분을 표시합니다.</div>
+        )}
+      </div>
+      <div className="account-visual-section">
+        <div className="account-visual-section__heading">
+          <div>
+            <h3>계좌별 포지션 집중도</h3>
+            <p>현물은 평가금액, 선물은 지갑 자본과 분리된 명목 노출 기준입니다.</p>
+          </div>
+        </div>
+        {model.exposureGroups.length ? (
+          <div className="position-exposure-grid">
+            {model.exposureGroups.map((group) => (
+              <PositionExposureCard group={group} key={`${group.brokerId}:${group.currency}`} />
+            ))}
+          </div>
+        ) : (
+          <div className="account-visual-empty">평가 가능한 보유 포지션이 없습니다.</div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function UnifiedBrokerAccountPanel({
   accounts,
   executionEvents,
@@ -3462,9 +3836,9 @@ function UnifiedBrokerAccountPanel({
     provider: account.broker_id,
     providerLabel: account.broker_name,
     accountLabel: `${account.account} · ${account.currency}`,
-    balance: account.broker_cash,
+    balance: account.broker_equity ?? account.broker_cash,
     available: account.broker_cash,
-    total: account.broker_cash,
+    total: account.broker_equity ?? account.broker_cash,
     detail: account.detail,
     statusLabel: account.status_label,
     tone: statusTone(account.status),
@@ -3485,10 +3859,16 @@ function UnifiedBrokerAccountPanel({
         evaluation: position.broker_value_display || "평가 대기",
         profitLoss: position.status === "pass" ? "원장 일치" : `대조 Δ ${position.delta_qty}`,
         profitLossTone: position.status === "pass" ? "success" : "danger",
+        brokerValue: position.broker_value,
+        brokerQuantity: position.broker_qty_value,
+        currency: position.currency,
+        positionSide,
+        valuationBasis: position.valuation_basis,
       };
     });
   return (
     <>
+      <AccountAllocationOverview accounts={accounts} positions={positions} />
       <BrokerAccountWorkspace
         accounts={accountRows}
         autoRefreshLabel="10초 자동 갱신·대조"

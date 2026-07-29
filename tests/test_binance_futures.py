@@ -211,6 +211,8 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
         )
 
         self.assertEqual(91.5, accounts[0]["broker_cash"])
+        self.assertEqual(99.0, accounts[0]["broker_equity"])
+        self.assertEqual("margin_balance", accounts[0]["valuation_basis"])
         self.assertIsNotNone(event)
         self.assertEqual("filled", event["state"])
         self.assertEqual("SHORT", event["position_side"])

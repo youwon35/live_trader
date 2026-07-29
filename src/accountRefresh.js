@@ -21,11 +21,20 @@ export function createAccountRefreshCoordinator({
         .then(async () => {
           let syncWarning = "";
           try {
-            await syncExecutionEvents("all");
+            await syncExecutionEvents("all", {
+              forceSnapshot: true,
+              includeSnapshot: false,
+            });
           } catch {
             syncWarning = "체결 동기화에 실패했지만 계좌·포지션 대조는 실행했습니다.";
           }
-          const reconciled = await runReconciliation();
+          // The execution-event refresh already fetched one authoritative
+          // account/position snapshot per broker. Reconcile that cache instead
+          // of issuing the same signed broker reads a second time.
+          const reconciled = await runReconciliation({
+            refreshBrokers: false,
+            includeSnapshot: true,
+          });
           return syncWarning && reconciled && typeof reconciled === "object"
             ? { ...reconciled, syncWarning }
             : reconciled;
