@@ -105,6 +105,7 @@ import {
   createStatusCard,
   createStatusRow,
   createToggleSwitch,
+  semanticSurfaceProps,
 } from "../../../packages/design/ui-primitives.js";
 import designTokens from "../../../packages/design/design_tokens.json";
 import {
@@ -2091,7 +2092,10 @@ function PortfolioArtifactPanel({
             const artifactId = portfolio.id || portfolio.source_path;
             const metadata = metadataItems[artifactMetadataKey(artifactId, "portfolio")];
             return (
-              <article className="portfolio-artifact-item" key={portfolio.id || portfolio.source_path}>
+              <article
+                {...semanticSurfaceProps(liveReady ? "success" : "danger", "portfolio-artifact-item")}
+                key={portfolio.id || portfolio.source_path}
+              >
                 <div>
                   <strong>{metadata?.favorite && <Star size={13} fill="currentColor" />}{portfolio.name || portfolio.id}</strong>
                   <span>{strategyCount} 전략 · {targetCount} target · {portfolio.lifecycle_status}</span>
@@ -2920,7 +2924,12 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         value={activeGroup}
       />
       {broker && (
-        <div className="live-assistant-summary">
+        <div
+          {...semanticSurfaceProps(
+            broker.order_ready ? "success" : broker.status === "missing_credentials" ? "danger" : "warning",
+            "live-assistant-summary",
+          )}
+        >
           <strong>{broker.name}</strong>
           <span>{broker.detail}</span>
           <StatusPill tone={broker.order_ready ? "success" : broker.status === "missing_credentials" ? "danger" : "warning"}>{broker.order_ready ? "READY" : broker.status}</StatusPill>
@@ -2937,9 +2946,16 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         {visibleFields.map((field) => {
           const value = draft[field.key] ?? "";
           const status = assistantFieldStatus(field, value);
+          const fieldTone = status === "done" ? "success" : status === "block" ? "danger" : "neutral";
           const boolChecked = field.kind === "bool" && settingsBooleanValue(value);
           return (
-            <label className={`live-assistant-field ${field.kind} ${boolChecked ? "active" : ""}`} key={field.key}>
+            <label
+              {...semanticSurfaceProps(
+                fieldTone,
+                `live-assistant-field ${field.kind} ${boolChecked ? "active" : ""}`,
+              )}
+              key={field.key}
+            >
               <div>
                 <strong>{field.label}</strong>
                 <span>{field.detail}</span>
@@ -2960,7 +2976,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
                   value={String(value)}
                 />
               )}
-              <StatusPill tone={status === "done" ? "success" : status === "block" ? "danger" : "info"}>{status === "done" ? "DONE" : status === "block" ? "BLOCK" : "WAIT"}</StatusPill>
+              <StatusPill tone={fieldTone}>{status === "done" ? "DONE" : status === "block" ? "BLOCK" : "WAIT"}</StatusPill>
             </label>
           );
         })}
@@ -3144,6 +3160,9 @@ function AutomationLauncherPanel({
   const profileRuntime = runtime?.profiles?.[activeProfile.id] || runtime;
   const runtimeForProfile = profileRuntime?.profileId === activeProfile.id;
   const runtimeRunning = Boolean(profileRuntime?.running && runtimeForProfile);
+  const runtimeTone = runtimeRunning
+    ? profileRuntime.phase === "DEGRADED" ? "warning" : "success"
+    : profileRuntime?.phase === "FAILED" ? "danger" : "neutral";
 
   return (
     <section className="panel automation-panel">
@@ -3156,7 +3175,12 @@ function AutomationLauncherPanel({
         variant="cards"
         value={assetTab}
       />
-      <div className={`automation-card ${activeProfile.enabled ? "running" : ""}`}>
+      <div
+        {...semanticSurfaceProps(
+          activeProfile.enabled ? "success" : activeProfile.ready ? "info" : "danger",
+          `automation-card ${activeProfile.enabled ? "running" : ""}`,
+        )}
+      >
         <div className="automation-card-head">
           <div>
             <strong>{activeProfile.title}</strong>
@@ -3260,12 +3284,12 @@ function AutomationLauncherPanel({
             <span>1회 진단</span>
           </button>
         </div>
-        <div className="continuous-runtime-status">
-          <StatusPill tone={runtimeRunning ? (profileRuntime.phase === "DEGRADED" ? "warning" : "success") : profileRuntime?.phase === "FAILED" ? "danger" : "neutral"}>
+        <div {...semanticSurfaceProps(runtimeTone, "continuous-runtime-status")}>
+          <StatusPill tone={runtimeTone}>
             {runtimeRunning ? `${profileRuntime.mode} RUNNING` : profileRuntime?.phase || "STOPPED"}
           </StatusPill>
           <span>시세는 계속 수신하고 전략은 확정 봉마다 1회만 평가합니다. HOLD 후에도 다음 봉에서 자동으로 다시 판단합니다.</span>
-          {profileRuntime?.lastError && <small>{profileRuntime.lastError}</small>}
+          {profileRuntime?.lastError && <small data-ts-semantic-preserve="true">{profileRuntime.lastError}</small>}
         </div>
       </div>
       <section className="validation-monitor-card">
@@ -3314,7 +3338,12 @@ function AutomationLauncherPanel({
           </button>
         </div>
         {selectedValidation ? (
-          <div className="validation-candidate-detail">
+          <div
+            {...semanticSurfaceProps(
+              selectedValidation.runtimeEvaluationReady ? "success" : "warning",
+              "validation-candidate-detail",
+            )}
+          >
             <div>
               <strong>{selectedValidation.strategyName || selectedValidation.strategyId}</strong>
               <span>
@@ -3329,7 +3358,12 @@ function AutomationLauncherPanel({
           <EmptyRow text="이 자산군에 검증 plan 후보가 없습니다." />
         )}
         {lastValidationResult?.ok && (
-          <div className="validation-evaluation-result">
+          <div
+            {...semanticSurfaceProps(
+              lastValidationResult.decision?.signal === "HOLD" ? "neutral" : "info",
+              "validation-evaluation-result",
+            )}
+          >
             <StatusPill tone={lastValidationResult.decision?.signal === "HOLD" ? "neutral" : "info"}>
               {lastValidationResult.decision?.signal ?? "HOLD"}
             </StatusPill>
@@ -3341,13 +3375,18 @@ function AutomationLauncherPanel({
           </div>
         )}
         {lastValidationResult?.ok === false && (
-          <div className="validation-evaluation-error">{lastValidationResult.reason}</div>
+          <div {...semanticSurfaceProps("danger", "validation-evaluation-error")}>{lastValidationResult.reason}</div>
         )}
         <p className="validation-monitor-note">
           지속 감시는 현재 표준 Portfolio runner와 별도 연결하지 않았습니다. 후보 plan을 우회해 장시간 runtime을 시작하지 않으며, 표준 SMALL/FULL LIVE 권한도 변경하지 않습니다.
         </p>
         {researchShort && (
-          <div className="research-short-summary">
+          <div
+            {...semanticSurfaceProps(
+              researchShort.functionalPass ? "success" : "warning",
+              "research-short-summary",
+            )}
+          >
             <div>
               <strong>Binance Futures SHORT 연구 bundle</strong>
               <span>
@@ -3411,7 +3450,7 @@ function BrokerAdapterContractPanel({ contract }) {
       <PanelHeader title="어댑터 인터페이스 계약" subtitle="KIS/Binance 어댑터가 공통으로 구현해야 할 메서드입니다." />
       <div className="compact-list">
         {contract.map((item) => (
-          <div className="compact-row" key={item.method}>
+          <div {...semanticSurfaceProps(statusTone(item.status), "compact-row")} key={item.method}>
             <strong>{item.method}</strong>
             <span>{item.purpose}</span>
             <StatusPill tone={statusTone(item.status)}>{item.status}</StatusPill>
@@ -3547,7 +3586,7 @@ function WatchdogPanel({ watchdog, onWatchdog }) {
       </div>
       <div className="queue-grid watchdog-metrics">
         {metrics.map((item) => (
-          <div className="queue-card" key={item.label}>
+          <div {...semanticSurfaceProps(item.tone, "queue-card")} key={item.label}>
             <span>{item.label}</span>
             <strong>{item.value}</strong>
             <span className={`summary-state ${item.tone}`}>{item.tone === "success" ? "정상" : "확인"}</span>
@@ -3584,7 +3623,7 @@ function OrderQueueSummaryPanel({ summary }) {
       <PanelHeader title="주문 큐 요약" subtitle="주문 의도의 현재 생명주기 상태입니다." />
       <div className="queue-grid">
         {items.map((item) => (
-          <div className="queue-card" key={item.label}>
+          <div {...semanticSurfaceProps(item.tone, "queue-card")} key={item.label}>
             <span>{item.label}</span>
             <strong>{item.value}</strong>
             <span className={`summary-state ${item.tone}`}>{item.tone === "success" ? "정상" : "확인"}</span>
@@ -3651,7 +3690,10 @@ function BrokerRequirementsPanel({ brokers }) {
       <PanelHeader title="브로커 준비 항목" subtitle="실제 주문 연결 전에 비어 있는 환경 값을 확인합니다." />
       <div className="compact-list">
         {brokers.map((broker) => (
-          <div className="compact-row" key={broker.broker_id}>
+          <div
+            {...semanticSurfaceProps(broker.order_ready ? "success" : "danger", "compact-row")}
+            key={broker.broker_id}
+          >
             <strong>{broker.name}</strong>
             <span>{broker.missing_env.length ? `${broker.missing_env.length}개 값 필요` : "환경 값 입력됨"}</span>
             <StatusPill tone={broker.order_ready ? "success" : "danger"}>{broker.order_ready ? "ready" : "blocked"}</StatusPill>
@@ -3901,7 +3943,7 @@ function OperationsReportPanel({ report }) {
       <PanelHeader title="운용 리포트" subtitle={`생성 시각 ${report.generated_at}`} />
       <div className="compact-list">
         {report.sections.map((section) => (
-          <div className="compact-row report-row" key={section.label}>
+          <div {...semanticSurfaceProps(statusTone(section.status), "compact-row report-row")} key={section.label}>
             <strong>{section.label}</strong>
             <span>{section.value} · {section.detail}</span>
             <StatusPill tone={statusTone(section.status)}>{section.status}</StatusPill>
@@ -4407,7 +4449,7 @@ function OrderPanel({ orders, onRetryOrder, onCancelOrder }) {
           <EmptyRow text="아직 주문 이벤트가 없습니다. 테스트 주문 게이트를 누르면 차단 이벤트가 생성됩니다." />
         ) : (
           orders.map((order) => (
-            <div className="order-ledger-row" key={order.order_id}>
+            <div {...semanticSurfaceProps(statusTone(order.state), "order-ledger-row")} key={order.order_id}>
               <div className="order-ledger-head">
                 <div>
                   <strong>{order.order_id}</strong>
@@ -4415,7 +4457,7 @@ function OrderPanel({ orders, onRetryOrder, onCancelOrder }) {
                 </div>
                 <StatusPill tone={statusTone(order.state)}>{order.state}</StatusPill>
               </div>
-              <div className="order-ledger-meta">
+              <div className="order-ledger-meta" data-ts-semantic-preserve="true">
                 <span>{order.symbol}</span>
                 <span className="side-buy">{order.side}</span>
                 <span>큐 {order.queue_state}</span>
@@ -4459,7 +4501,7 @@ function PositionPanel({ positions }) {
       <PanelHeader title="포지션 대조" subtitle="프로그램 포지션과 브로커 계좌 포지션 비교가 필요합니다." />
       <div className="position-list">
         {positions.map((position) => (
-          <div className="position-row" key={position.symbol}>
+          <div {...semanticSurfaceProps(statusTone(position.status), "position-row")} key={position.symbol}>
             <WalletCards size={16} />
             <div>
               <strong>{position.symbol}</strong>
