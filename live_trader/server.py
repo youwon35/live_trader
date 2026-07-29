@@ -131,6 +131,14 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path == "/api/binance-futures-canary/status":
+            self.send_json(
+                {
+                    "ok": True,
+                    "canary": state.binance_futures_canary_status(),
+                }
+            )
+            return
         self.serve_static(parsed.path)
 
     def do_POST(self) -> None:
@@ -237,6 +245,22 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/binance-smoke-submit":
             self.send_json(
                 state.submit_binance_smoke_order(
+                    payload.get("confirmation_token", ""),
+                    confirmed=payload.get("confirmed") is True,
+                )
+            )
+            return
+        if parsed.path == "/api/binance-futures-canary/preview":
+            self.send_json(
+                state.preview_binance_futures_canary(
+                    payload.get("strategy_id", ""),
+                    payload.get("notional_usdt", 6),
+                )
+            )
+            return
+        if parsed.path == "/api/binance-futures-canary/test":
+            self.send_json(
+                state.test_binance_futures_canary_order(
                     payload.get("confirmation_token", ""),
                     confirmed=payload.get("confirmed") is True,
                 )

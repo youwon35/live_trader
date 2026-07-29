@@ -6,10 +6,14 @@ from datetime import datetime
 from typing import Any, Callable, Literal
 
 from .live_adapters import (
+    BINANCE_FUTURES_TEST_ORDER_ENDPOINT,
     build_binance_account_request,
     build_binance_cancel_order_request,
     build_binance_futures_account_request,
+    build_binance_futures_account_config_request,
     build_binance_futures_cancel_order_request,
+    build_binance_futures_open_orders_request,
+    build_binance_futures_order_status_request,
     build_binance_futures_order_request,
     build_binance_futures_position_mode_request,
     build_binance_futures_positions_request,
@@ -1057,6 +1061,202 @@ class LiveBrokerRouter:
             return send_prepared_request(build_upbit_order_request(intent))
         raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
 
+    def list_open_orders(
+        self,
+        broker_id: str,
+        *,
+        symbol: str = "",
+    ) -> list[dict[str, object]]:
+        broker_id = broker_id.lower().strip()
+        if broker_id != "binance-futures":
+            raise BrokerNotReadyError(
+                f"미체결 주문 조회를 지원하지 않는 broker_id입니다: {broker_id}"
+            )
+        payload = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                lambda: build_binance_futures_open_orders_request(symbol),
+                futures=True,
+            ),
+        )
+        if not isinstance(payload, list):
+            raise BrokerNotReadyError(
+                "Binance Futures 미체결 주문 응답 형식이 올바르지 않습니다."
+            )
+        return [
+            dict(item)
+            for item in payload
+            if isinstance(item, dict)
+        ]
+
+    def get_order_status(
+        self,
+        broker_id: str,
+        *,
+        symbol: str,
+        broker_order_id: str,
+        client_order_id: bool = False,
+    ) -> dict[str, object]:
+        broker_id = broker_id.lower().strip()
+        if broker_id != "binance-futures":
+            raise BrokerNotReadyError(
+                f"주문 상태 조회를 지원하지 않는 broker_id입니다: {broker_id}"
+            )
+        payload = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                lambda: build_binance_futures_order_status_request(
+                    symbol,
+                    broker_order_id,
+                    client_order_id=client_order_id,
+                ),
+                futures=True,
+            ),
+        )
+        if not isinstance(payload, dict):
+            raise BrokerNotReadyError(
+                "Binance Futures 주문 상태 응답 형식이 올바르지 않습니다."
+            )
+        return dict(payload)
+
+    def get_binance_futures_canary_observation(
+        self,
+        symbol: str,
+    ) -> dict[str, object]:
+        """Read the fresh account facts required by a Futures canary gate.
+
+        The return value deliberately excludes request URLs, headers, API
+        credentials, signatures, broker order payloads, and raw responses.
+        """
+
+        normalized_symbol = (
+            str(symbol or "")
+            .strip()
+            .upper()
+            .removesuffix(".PERP")
+            .replace("-", "")
+        )
+        if not normalized_symbol:
+            raise BrokerNotReadyError(
+                "Binance Futures canary symbol이 필요합니다."
+            )
+        account_payload = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                build_binance_futures_account_request,
+                futures=True,
+            ),
+        )
+        account_config_payload = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                build_binance_futures_account_config_request,
+                futures=True,
+            ),
+        )
+        position_mode_payload = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                build_binance_futures_position_mode_request,
+                futures=True,
+            ),
+        )
+        positions_payload = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                build_binance_futures_positions_request,
+                futures=True,
+            ),
+        )
+        symbol_config_payload = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                lambda: build_binance_futures_symbol_config_request(
+                    normalized_symbol
+                ),
+                futures=True,
+            ),
+        )
+        open_orders = self.list_open_orders("binance-futures")
+        if not isinstance(account_payload, dict):
+            raise BrokerNotReadyError(
+                "Binance Futures account 응답 형식이 올바르지 않습니다."
+            )
+        if not isinstance(account_config_payload, dict):
+            raise BrokerNotReadyError(
+                "Binance Futures accountConfig 응답 형식이 올바르지 않습니다."
+            )
+        if not isinstance(position_mode_payload, dict):
+            raise BrokerNotReadyError(
+                "Binance Futures position mode 응답 형식이 올바르지 않습니다."
+            )
+        if not isinstance(positions_payload, list):
+            raise BrokerNotReadyError(
+                "Binance Futures position 응답 형식이 올바르지 않습니다."
+            )
+        assets = (
+            account_payload.get("assets")
+            if isinstance(account_payload.get("assets"), list)
+            else []
+        )
+        usdt = next(
+            (
+                item
+                for item in assets
+                if isinstance(item, dict)
+                and str(item.get("asset") or "").upper() == "USDT"
+            ),
+            {},
+        )
+        available_known = (
+            isinstance(usdt, dict)
+            and "availableBalance" in usdt
+        )
+        available_usdt: float | None = None
+        if available_known:
+            try:
+                available_usdt = float(usdt.get("availableBalance"))
+            except (TypeError, ValueError):
+                available_known = False
+        position_count = 0
+        for item in positions_payload:
+            if not isinstance(item, dict):
+                continue
+            try:
+                quantity = float(item.get("positionAmt") or 0)
+            except (TypeError, ValueError):
+                raise BrokerNotReadyError(
+                    "Binance Futures positionAmt를 해석할 수 없습니다."
+                )
+            if abs(quantity) > 1e-12:
+                position_count += 1
+        can_trade = account_config_payload.get("canTrade")
+        return {
+            "account": {
+                "can_trade": (
+                    can_trade if isinstance(can_trade, bool) else None
+                ),
+                "available_usdt": available_usdt,
+                "available_usdt_known": available_known,
+            },
+            "position_mode": {
+                "dual_side_position": (
+                    position_mode_payload.get("dualSidePosition")
+                    if isinstance(
+                        position_mode_payload.get("dualSidePosition"),
+                        bool,
+                    )
+                    else None
+                ),
+            },
+            "symbol_config": normalize_binance_futures_symbol_config(
+                symbol_config_payload,
+                normalized_symbol,
+            ),
+            "position_count": position_count,
+            "open_order_count": len(open_orders),
+        }
+
     def test_binance_futures_order(
         self,
         intent: dict[str, object],
@@ -1096,12 +1296,25 @@ class LiveBrokerRouter:
                 symbol,
             ),
         )
-        return send_binance_signed_request(
-            lambda: build_binance_futures_order_request(
+
+        def build_test_request() -> Any:
+            prepared = build_binance_futures_order_request(
                 normalized_intent,
                 hedge_mode=position_mode.get("dualSidePosition") is True,
                 test=True,
-            ),
+            )
+            if (
+                prepared.method != "POST"
+                or prepared.endpoint
+                != BINANCE_FUTURES_TEST_ORDER_ENDPOINT
+            ):
+                raise BrokerNotReadyError(
+                    "Binance Futures test order endpoint 안전검사 실패"
+                )
+            return prepared
+
+        return send_binance_signed_request(
+            build_test_request,
             futures=True,
         )
 

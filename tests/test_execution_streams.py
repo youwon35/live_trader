@@ -76,6 +76,35 @@ class ExecutionStreamTest(unittest.TestCase):
         self.assertEqual("filled", event["state"])
         self.assertEqual("BUY", event["side"])
         self.assertEqual(0.1, event["quantity"])
+        self.assertEqual("cumulative", event["quantity_mode"])
+
+    def test_upbit_trade_exposes_delta_with_cumulative_watermarks(self) -> None:
+        event = parse_upbit_my_order({
+            "type": "myOrder",
+            "uuid": "broker-id",
+            "identifier": "client-id",
+            "code": "KRW-BTC",
+            "ask_bid": "BID",
+            "state": "trade",
+            "trade_uuid": "trade-2",
+            "volume": "0.1",
+            "remaining_volume": "0.1",
+            "executed_volume": "0.2",
+            "price": "200",
+            "avg_price": "150",
+            "trade_fee": "0.02",
+            "paid_fee": "0.03",
+        })
+
+        self.assertIsNotNone(event)
+        self.assertEqual("partially_filled", event["state"])
+        self.assertEqual("upbit:broker-id:trade-2:trade", event["event_id"])
+        self.assertEqual(0.1, event["quantity"])
+        self.assertEqual(0.02, event["fee"])
+        self.assertEqual("delta", event["quantity_mode"])
+        self.assertEqual("delta", event["fee_mode"])
+        self.assertEqual(0.2, event["cumulative_quantity"])
+        self.assertEqual(0.03, event["cumulative_fee"])
 
     def test_kis_domestic_execution_normalizes_fill(self) -> None:
         fields = ["customer", "account", "order-1", "", "02", "", "", "", "069500", "2", "35000", "090001", "N", "2"]

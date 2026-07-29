@@ -15,6 +15,7 @@ from live_trader.brokers import (
     parse_kis_overseas_positions,
 )
 from live_trader.audit_store import SQLiteAuditEventStore
+from live_trader.execution_streams import parse_upbit_my_order
 from live_trader.program_ledger import ProgramLedger
 from trading_runtime import DeploymentStore, build_paper_portfolio_evidence
 
@@ -2017,10 +2018,208 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(result["program_ledger"]["execution_event_count"], 1)
         self.assertEqual(result["program_ledger"]["execution_events"][0]["symbol"], "BTCUSDT")
         self.assertEqual(result["program_ledger"]["execution_events"][0]["trace_id"], trace_id)
+        self.assertEqual(result["local_order_update_count"], 1)
+        self.assertEqual(state.STATE["orders"][0]["state"], "filled")
+        self.assertEqual(state.STATE["orders"][0]["queue_state"], "completed")
+        self.assertEqual(state.STATE["orders"][0]["filled_quantity"], 0.01)
+        self.assertEqual(state.STATE["orders"][0]["average_fill_price"], 65000.0)
+        self.assertEqual(state.open_order_count(), 0)
         self.assertEqual(
             [item["eventType"] for item in state.DECISION_TRACE_STORE.trace(trace_id)],
             ["FILLED", "POSITION_APPLIED"],
         )
+
+    def test_upbit_partial_fills_and_duplicate_event_apply_only_the_delta(self) -> None:
+        state.STATE["orders"] = [
+            {
+                "order_id": "UPBIT-CLIENT-1",
+                "broker_order_id": "UPBIT-BROKER-1",
+                "state": "acknowledged",
+                "queue_state": "submitted",
+                "dry_run": False,
+            }
+        ]
+        first = parse_upbit_my_order({
+            "type": "myOrder",
+            "uuid": "UPBIT-BROKER-1",
+            "identifier": "UPBIT-CLIENT-1",
+            "code": "KRW-BTC",
+            "ask_bid": "BID",
+            "state": "trade",
+            "trade_uuid": "UPBIT-TRADE-1",
+            "volume": "0.1",
+            "remaining_volume": "0.2",
+            "executed_volume": "0.1",
+            "price": "100",
+            "avg_price": "100",
+            "trade_fee": "0.01",
+            "paid_fee": "0.01",
+        })
+        second = parse_upbit_my_order({
+            "type": "myOrder",
+            "uuid": "UPBIT-BROKER-1",
+            "identifier": "UPBIT-CLIENT-1",
+            "code": "KRW-BTC",
+            "ask_bid": "BID",
+            "state": "trade",
+            "trade_uuid": "UPBIT-TRADE-2",
+            "volume": "0.1",
+            "remaining_volume": "0.1",
+            "executed_volume": "0.2",
+            "price": "200",
+            "avg_price": "150",
+            "trade_fee": "0.02",
+            "paid_fee": "0.03",
+        })
+        terminal = parse_upbit_my_order({
+            "type": "myOrder",
+            "uuid": "UPBIT-BROKER-1",
+            "identifier": "UPBIT-CLIENT-1",
+            "code": "KRW-BTC",
+            "ask_bid": "BID",
+            "state": "done",
+            "executed_volume": "0.2",
+            "avg_price": "150",
+            "paid_fee": "0.03",
+            "trades_count": 2,
+        })
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertIsNotNone(terminal)
+
+        class FakeRouter:
+            def poll_execution_events(self, broker_id):
+                return {
+                    "broker_id": broker_id,
+                    "accounts": [],
+                    "positions": [],
+                    "events": [],
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.use_temp_program_ledger(temp_dir)
+            try:
+                with patch(
+                    "live_trader.state.LiveBrokerRouter",
+                    return_value=FakeRouter(),
+                ), patch.object(
+                    state.LIVE_EXECUTION_STREAMS,
+                    "drain",
+                    return_value=[
+                        first,
+                        second,
+                        dict(second),
+                        terminal,
+                    ],
+                ), patch(
+                    "live_trader.state.notify_new_live_fills",
+                    return_value=0,
+                ), patch(
+                    "live_trader.state.automatic_live_promotion_sweep",
+                    return_value=[],
+                ):
+                    result = state.poll_execution_events(
+                        "upbit",
+                        force_snapshot=True,
+                    )
+            finally:
+                self.restore_temp_program_ledger()
+
+        order = state.STATE["orders"][0]
+        self.assertTrue(result["ok"])
+        self.assertEqual(3, result["execution_events"]["event_count"])
+        self.assertEqual(3, result["program_ledger"]["execution_event_count"])
+        self.assertEqual(3, result["local_order_update_count"])
+        self.assertAlmostEqual(0.2, order["filled_quantity"])
+        self.assertAlmostEqual(150.0, order["average_fill_price"])
+        self.assertAlmostEqual(0.03, order["fee"])
+        self.assertEqual("filled", order["state"])
+        self.assertEqual("completed", order["queue_state"])
+        ledger_events = result["program_ledger"]["execution_events"]
+        self.assertAlmostEqual(
+            0.2,
+            sum(float(item["quantity"]) for item in ledger_events),
+        )
+        self.assertAlmostEqual(
+            0.03,
+            sum(float(item["raw"]["fee"]) for item in ledger_events),
+        )
+        terminal_event = next(
+            item
+            for item in ledger_events
+            if str(item["state"]).lower() == "filled"
+        )
+        self.assertEqual(0.0, terminal_event["quantity"])
+        self.assertEqual(
+            0.2,
+            terminal_event["raw"]["reported_cumulative_quantity"],
+        )
+
+    def test_binance_execution_contract_remains_incremental(self) -> None:
+        quantity, price, fee = state.execution_event_increment(
+            {
+                "broker_id": "binance",
+                "quantity": 0.02,
+                "price": 65_000.0,
+                "fee": 0.5,
+                "raw": {
+                    "quantity_mode": "cumulative",
+                    "cumulative_quantity": 0.03,
+                },
+            },
+            {
+                "filled_quantity": 0.01,
+                "average_fill_price": 64_000.0,
+                "fee": 0.25,
+            },
+            None,
+        )
+
+        self.assertEqual(0.02, quantity)
+        self.assertEqual(65_000.0, price)
+        self.assertEqual(0.5, fee)
+
+    def test_upbit_cumulative_snapshot_recovers_only_missing_fill(self) -> None:
+        quantity, price, fee = state.execution_event_increment(
+            {
+                "broker_id": "upbit",
+                "quantity": 0.2,
+                "price": 150.0,
+                "fee": 0.03,
+                "raw": {
+                    "quantity_mode": "cumulative",
+                    "fee_mode": "cumulative",
+                    "cumulative_quantity": 0.2,
+                    "cumulative_fee": 0.03,
+                    "cumulative_average_price": 150.0,
+                },
+            },
+            {
+                "filled_quantity": 0.1,
+                "average_fill_price": 100.0,
+                "fee": 0.01,
+            },
+            None,
+        )
+
+        self.assertAlmostEqual(0.1, quantity)
+        self.assertAlmostEqual(200.0, price)
+        self.assertAlmostEqual(0.02, fee)
+
+    def test_open_order_count_excludes_blocked_rejected_and_completed_orders(self) -> None:
+        state.STATE["orders"] = [
+            {"state": "acknowledged", "queue_state": "submitted"},
+            {"state": "unknown", "queue_state": "reconcile_required"},
+            {"state": "partially_filled", "queue_state": "submitted"},
+            {"state": "risk_blocked", "queue_state": "blocked"},
+            {"state": "adapter_blocked", "queue_state": "held"},
+            {"state": "broker_rejected", "queue_state": "failed"},
+            {"state": "expired", "queue_state": "failed"},
+            {"state": "filled", "queue_state": "completed"},
+            {"state": "canceled", "queue_state": "canceled"},
+        ]
+
+        self.assertEqual(state.open_order_count(), 3)
 
     def test_execution_event_poll_syncs_broker_snapshot_to_program_ledger(self) -> None:
         class FakeRouter:

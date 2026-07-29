@@ -86,7 +86,24 @@ from .contracts import (
 from .audit_store import SQLiteAuditEventStore
 from .env_loader import default_runtime_data_root
 from .execution_streams import ExecutionStreamManager
-from .live_adapters import BINANCE_BASE_URL, build_binance_futures_order_request, build_binance_spot_order_request, build_kis_live_order_request, build_upbit_order_request, env_value, http_json
+from .live_adapters import (
+    BINANCE_BASE_URL,
+    BINANCE_FUTURES_BASE_URL,
+    BINANCE_FUTURES_TEST_ORDER_ENDPOINT,
+    binance_symbol_rules,
+    build_binance_futures_order_request,
+    build_binance_spot_order_request,
+    build_kis_live_order_request,
+    build_upbit_order_request,
+    env_value,
+    http_json,
+)
+from .futures_canary import (
+    build_futures_canary_test_intents,
+    derive_canary_quantity,
+    evaluate_futures_canary_preflight,
+    normalize_usdm_symbol,
+)
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
@@ -101,6 +118,7 @@ from trading_runtime.telegram_notifications import (
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
 CheckStatus = Literal["pass", "warn", "fail"]
 RUNTIME_MODE_LOCK = threading.RLock()
+BINANCE_FUTURES_CANARY_LOCK = threading.RLock()
 # Serializes public runtime control operations without participating in a
 # closed-bar cycle.  Public calls acquire this lock before manager/controller
 # locks; they never hold RUNTIME_MODE_LOCK while entering the manager.
@@ -453,6 +471,14 @@ STATE: dict[str, Any] = {
         "expires_at": "",
         "used": False,
         "detail": "전략 신호와 분리된 브로커 제출 경로 점검 주문입니다.",
+    },
+    "binance_futures_canary": {
+        "status": "idle",
+        "evaluated": False,
+        "ready_for_test": False,
+        "test_blockers": [],
+        "start_blockers": ["live-start-not-implemented"],
+        "detail": "계정·증거금·포지션·미체결 주문을 fresh 조회한 뒤 test order만 허용합니다.",
     },
     "recovery_status": {"verified": False, "safeMode": True, "generation": 0, "detail": "복구 훈련 미실행"},
     "automatic_promotion_signatures": {},
@@ -1431,9 +1457,21 @@ def live_small_execution_summary(
         if occurred_at is None or occurred_at < boundary:
             continue
         state_name = str(event.get("state") or "").strip().lower()
+        raw_event = (
+            event.get("raw")
+            if isinstance(event.get("raw"), dict)
+            else {}
+        )
+        filled_quantity = max(
+            safe_float(event.get("quantity"), 0.0),
+            safe_float(
+                raw_event.get("reported_cumulative_quantity"),
+                0.0,
+            ),
+        )
         if (
             state_name in {"filled", "done", "executed"}
-            and safe_float(event.get("quantity"), 0.0) > 0
+            and filled_quantity > 0
         ):
             # Count one canary per broker order, even when a broker emits
             # multiple partial-fill/update events for the same order.
@@ -2043,6 +2081,7 @@ def _restore_order_is_pending_or_unknown(order: dict[str, Any]) -> bool:
         "filled",
         "canceled",
         "cancelled",
+        "expired",
         "retry_exhausted",
         "adapter_blocked",
         "risk_blocked",
@@ -2054,6 +2093,8 @@ def _restore_order_is_pending_or_unknown(order: dict[str, Any]) -> bool:
         "filled",
         "canceled",
         "cancelled",
+        "completed",
+        "expired",
         "failed",
         "blocked",
         "risk_blocked",
@@ -3430,6 +3471,7 @@ def snapshot() -> dict[str, Any]:
         "execution_events": execution_event_snapshot(),
         "upbit_smoke_order": dict(STATE.get("upbit_smoke_order", {})),
         "binance_smoke_order": dict(STATE.get("binance_smoke_order", {})),
+        "binance_futures_canary": binance_futures_canary_status(),
         "execution_calibration": execution_calibration_snapshot(),
         "policy_replays": list(STATE.get("policy_replays", [])),
         "shadow_live": {"brokerSubmissionBlocked": True, "evidence": list(STATE.get("shadow_evidence", []))[:20], "count": len(STATE.get("shadow_evidence", []))},
@@ -4749,6 +4791,398 @@ def record_new_execution_traces(events: list[dict[str, Any]], existing_event_ids
             )
 
 
+def deduplicate_execution_events(
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep the first broker event for each stable event id."""
+
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in events:
+        event_id = str(event.get("event_id") or "").strip()
+        if event_id and event_id in seen:
+            continue
+        if event_id:
+            seen.add(event_id)
+        result.append(event)
+    return result
+
+
+def _event_contract_value(
+    event: dict[str, Any],
+    raw: dict[str, Any],
+    key: str,
+) -> Any:
+    if key in raw:
+        return raw.get(key)
+    return event.get(key)
+
+
+def _positive_watermark_delta(total: float, previous: float) -> float:
+    difference = total - previous
+    tolerance = max(1e-12, abs(total) * 1e-12)
+    return difference if difference > tolerance else 0.0
+
+
+def execution_event_increment(
+    event: dict[str, Any],
+    order: dict[str, Any],
+    managed: Any,
+) -> tuple[float, float, float]:
+    """Resolve a broker event to an incremental fill quantity, price and fee.
+
+    Binance execution reports already carry the last-fill delta and therefore
+    pass through unchanged.  Upbit MyOrder carries order-level cumulative
+    watermarks even when it also includes per-trade values.  The watermarks
+    cap the applied delta so a terminal snapshot, reconnect replay, or
+    out-of-order trade cannot book the same fill twice.
+    """
+
+    raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
+    quantity = max(0.0, safe_float(event.get("quantity"), 0.0))
+    price = max(0.0, safe_float(event.get("price"), 0.0))
+    fee = max(0.0, safe_float(event.get("fee"), 0.0))
+    if str(event.get("broker_id") or "").strip().lower() != "upbit":
+        return quantity, price, fee
+
+    previous_quantity = max(
+        0.0,
+        safe_float(
+            managed.filled_quantity
+            if managed is not None
+            else order.get("filled_quantity"),
+            0.0,
+        ),
+    )
+    previous_average_price = max(
+        0.0,
+        safe_float(
+            managed.average_fill_price
+            if managed is not None
+            else order.get("average_fill_price"),
+            0.0,
+        ),
+    )
+    previous_fee = max(
+        0.0,
+        safe_float(
+            managed.fee
+            if managed is not None
+            else order.get("fee"),
+            0.0,
+        ),
+    )
+
+    quantity_mode = str(
+        _event_contract_value(event, raw, "quantity_mode") or "delta"
+    ).strip().lower()
+    cumulative_quantity_value = _event_contract_value(
+        event,
+        raw,
+        "cumulative_quantity",
+    )
+    if cumulative_quantity_value not in {None, ""}:
+        cumulative_quantity = max(
+            0.0,
+            safe_float(cumulative_quantity_value, 0.0),
+        )
+        watermark_delta = _positive_watermark_delta(
+            cumulative_quantity,
+            previous_quantity,
+        )
+        if quantity_mode == "cumulative":
+            quantity = watermark_delta
+            cumulative_average_price = max(
+                0.0,
+                safe_float(
+                    _event_contract_value(
+                        event,
+                        raw,
+                        "cumulative_average_price",
+                    ),
+                    0.0,
+                ),
+            )
+            if quantity > 0 and cumulative_average_price > 0:
+                cumulative_notional = (
+                    cumulative_quantity * cumulative_average_price
+                )
+                previous_notional = (
+                    previous_quantity * previous_average_price
+                )
+                delta_notional = cumulative_notional - previous_notional
+                if delta_notional > 0:
+                    price = delta_notional / quantity
+        else:
+            quantity = min(quantity, watermark_delta)
+
+    fee_mode = str(
+        _event_contract_value(event, raw, "fee_mode") or "delta"
+    ).strip().lower()
+    cumulative_fee_value = _event_contract_value(
+        event,
+        raw,
+        "cumulative_fee",
+    )
+    if cumulative_fee_value not in {None, ""}:
+        cumulative_fee = max(
+            0.0,
+            safe_float(cumulative_fee_value, 0.0),
+        )
+        fee_watermark_delta = _positive_watermark_delta(
+            cumulative_fee,
+            previous_fee,
+        )
+        fee = (
+            fee_watermark_delta
+            if fee_mode == "cumulative"
+            else min(fee, fee_watermark_delta)
+        )
+
+    return quantity, price, fee
+
+
+def apply_execution_events_to_local_orders(
+    events: list[dict[str, Any]],
+    existing_event_ids: set[str] | None = None,
+) -> int:
+    """Advance the local order/OMS state from deduplicated broker events."""
+
+    known_event_ids = set(existing_event_ids or ())
+    updated = 0
+    for event in events:
+        event_id = str(event.get("event_id") or "").strip()
+        if not event_id or event_id in known_event_ids:
+            continue
+        known_event_ids.add(event_id)
+        identifiers = {
+            str(event.get("order_id") or "").strip(),
+            str(event.get("broker_order_id") or "").strip(),
+            str((event.get("raw") or {}).get("identifier") or "").strip()
+            if isinstance(event.get("raw"), dict)
+            else "",
+        } - {"", "-"}
+        order = next(
+            (
+                item
+                for item in STATE.get("orders", [])
+                if identifiers.intersection(
+                    {
+                        str(item.get("order_id") or "").strip(),
+                        str(item.get("oms_order_id") or "").strip(),
+                        str(item.get("broker_order_id") or "").strip(),
+                        str(item.get("idempotency_key") or "").strip(),
+                    }
+                    - {"", "-"}
+                )
+            ),
+            None,
+        )
+        if order is None:
+            continue
+        broker_order_id = str(
+            event.get("broker_order_id")
+            or order.get("broker_order_id")
+            or ""
+        ).strip()
+        if broker_order_id:
+            order["broker_order_id"] = broker_order_id
+        state_name = str(
+            event.get("state")
+            or event.get("status")
+            or ""
+        ).strip().lower()
+        raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
+        raw_state_name = str(
+            raw.get("state")
+            or raw.get("status")
+            or ""
+        ).strip().lower()
+        if state_name == "unknown" and raw_state_name:
+            state_name = raw_state_name
+        fill_states = {
+            "partial",
+            "partially_filled",
+            "partially-filled",
+            "filled",
+            "done",
+            "executed",
+        }
+        oms_order_id = str(order.get("oms_order_id") or "")
+        managed = LIVE_OMS.orders.get(oms_order_id)
+        quantity, price, fee = execution_event_increment(
+            event,
+            order,
+            managed,
+        )
+        if str(event.get("broker_id") or "").strip().lower() == "upbit":
+            event["reported_quantity"] = safe_float(
+                event.get("quantity"),
+                0.0,
+            )
+            event["reported_fee"] = safe_float(event.get("fee"), 0.0)
+            event["reported_cumulative_quantity"] = _event_contract_value(
+                event,
+                raw,
+                "cumulative_quantity",
+            )
+            event["reported_cumulative_fee"] = _event_contract_value(
+                event,
+                raw,
+                "cumulative_fee",
+            )
+            event["quantity"] = quantity
+            event["price"] = price
+            event["fee"] = fee
+            event["applied_quantity_mode"] = "incremental"
+        final_fill = state_name in {
+            "filled",
+            "done",
+            "executed",
+        }
+        has_fill_delta = quantity > 0 and price > 0
+        if state_name in fill_states and (has_fill_delta or final_fill):
+            previous_quantity = safe_float(order.get("filled_quantity"), 0.0)
+            previous_notional = (
+                safe_float(order.get("average_fill_price"), 0.0)
+                * previous_quantity
+            )
+            if has_fill_delta:
+                next_quantity = previous_quantity + quantity
+                order["filled_quantity"] = next_quantity
+                order["average_fill_price"] = (
+                    previous_notional + quantity * price
+                ) / next_quantity
+                order["fee"] = safe_float(order.get("fee"), 0.0) + fee
+            if managed is not None:
+                try:
+                    if managed.status == "SUBMITTING" and broker_order_id:
+                        LIVE_OMS.acknowledge(
+                            oms_order_id,
+                            broker_order_id,
+                        )
+                    remaining = max(
+                        0.0,
+                        managed.intent.quantity
+                        - managed.filled_quantity,
+                    )
+                    applied_quantity = min(quantity, remaining)
+                    if has_fill_delta and applied_quantity > 0:
+                        managed = LIVE_OMS.apply_fill(
+                            oms_order_id,
+                            quantity=applied_quantity,
+                            price=price,
+                            fee=fee,
+                            broker_order_id=broker_order_id,
+                        )
+                except ValueError as exc:
+                    order["reconciliation_warning"] = str(exc)
+                order["filled_quantity"] = managed.filled_quantity
+                order["average_fill_price"] = managed.average_fill_price
+                order["fee"] = managed.fee
+            fill_quantity_mismatch = False
+            if (
+                managed is not None
+                and final_fill
+                and managed.status != "FILLED"
+            ):
+                fill_quantity_mismatch = True
+                order["state"] = "unknown"
+                order["queue_state"] = "reconcile_required"
+                order["reason"] = "broker-final-fill-quantity-mismatch"
+                order["reconciliation_warning"] = (
+                    "브로커는 FILLED를 보고했지만 누적 체결 수량이 "
+                    "원 주문 수량과 일치하지 않습니다."
+                )
+                if not managed.terminal and managed.status != "UNKNOWN":
+                    try:
+                        managed = LIVE_OMS.mark_unknown(
+                            oms_order_id,
+                            "broker final fill quantity mismatch",
+                        )
+                    except ValueError as exc:
+                        order["reconciliation_warning"] = str(exc)
+                final_fill = False
+            order["state"] = (
+                "filled"
+                if final_fill
+                else "unknown"
+                if fill_quantity_mismatch
+                else "partially_filled"
+            )
+            order["queue_state"] = (
+                "completed"
+                if final_fill
+                else "reconcile_required"
+                if fill_quantity_mismatch
+                else "submitted"
+            )
+            order["reason"] = (
+                "broker-filled"
+                if final_fill
+                else "broker-final-fill-quantity-mismatch"
+                if fill_quantity_mismatch
+                else "broker-partially-filled"
+            )
+        elif state_name in {"accepted", "acknowledged", "new", "open"}:
+            if managed is not None and not managed.terminal:
+                try:
+                    if managed.status == "SUBMITTING":
+                        managed = LIVE_OMS.acknowledge(
+                            oms_order_id,
+                            broker_order_id,
+                        )
+                    elif managed.status == "UNKNOWN":
+                        managed = LIVE_OMS.reconcile_unknown(
+                            oms_order_id,
+                            {
+                                "brokerOrderId": broker_order_id,
+                                "status": "ACKNOWLEDGED",
+                            },
+                        )
+                except ValueError as exc:
+                    order["reconciliation_warning"] = str(exc)
+            order["state"] = "acknowledged"
+            order["queue_state"] = "submitted"
+            order["reason"] = "broker-acknowledged"
+        elif state_name in {"rejected", "expired", "failed", "canceled"}:
+            target = {
+                "rejected": "REJECTED",
+                "failed": "REJECTED",
+                "expired": "EXPIRED",
+                "canceled": "CANCELED",
+            }[state_name]
+            if managed is not None and not managed.terminal:
+                try:
+                    managed = LIVE_OMS.transition(
+                        oms_order_id,
+                        target,
+                        f"broker event {state_name}",
+                        {"eventId": event_id},
+                    )
+                except ValueError as exc:
+                    order["reconciliation_warning"] = str(exc)
+            order["state"] = (
+                "broker_rejected"
+                if state_name in {"rejected", "failed"}
+                else state_name
+            )
+            order["queue_state"] = (
+                "canceled"
+                if state_name == "canceled"
+                else "failed"
+            )
+            order["reason"] = f"broker-{state_name}"
+        else:
+            continue
+        if managed is not None:
+            order["oms_status"] = managed.status
+        order["updated_at"] = now_text()
+        order["last_execution_event_id"] = event_id
+        updated += 1
+    return updated
+
+
 def automatic_live_promotion_sweep(*, fresh_broker_ids: set[str] | None = None) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     reconciliation = reconciliation_snapshot()
@@ -5378,15 +5812,20 @@ def poll_execution_events(
                 interval_seconds=poll_interval,
             )
             record_connectivity_state("broker_api", selected_broker, healthy=False)
+    events = deduplicate_execution_events(events)
     existing_event_ids = PROGRAM_LEDGER.existing_execution_event_ids([
         str(event.get("event_id") or "") for event in events
     ])
-    record_new_execution_traces(events, existing_event_ids)
     new_events = [
         event
         for event in events
         if str(event.get("event_id") or "") not in existing_event_ids
     ]
+    local_order_updates = apply_execution_events_to_local_orders(
+        new_events,
+        existing_event_ids,
+    )
+    record_new_execution_traces(new_events, existing_event_ids)
     recorded = PROGRAM_LEDGER.record_execution_events(new_events)
     changed_accounts = [
         item for item in snapshot_accounts
@@ -5418,6 +5857,7 @@ def poll_execution_events(
         "errors": errors,
         "event_count": len(events),
         "recorded_count": recorded,
+        "local_order_update_count": local_order_updates,
         "synced_cash_count": int(synced.get("cash_count", 0)),
         "synced_position_count": int(synced.get("position_count", 0)),
         "snapshot_changed_brokers": sorted(changed_snapshot_brokers),
@@ -5466,6 +5906,7 @@ def poll_execution_events(
         "errors": errors,
         "program_ledger": program_ledger_snapshot(),
         "execution_events": execution_event_snapshot(),
+        "local_order_update_count": local_order_updates,
         "telegram_fill_count": telegram_fill_count,
         "automatic_promotion": automatic_results,
         "snapshot": snapshot(),
@@ -5477,6 +5918,598 @@ BINANCE_SMOKE_QUANTITY = 0.0001
 BINANCE_SMOKE_MIN_USDT = 5.0
 BINANCE_SMOKE_MAX_USDT = 10.0
 BINANCE_SMOKE_PREVIEW_TTL_SECONDS = 600
+BINANCE_FUTURES_CANARY_TEST_TTL_SECONDS = 300
+
+
+def binance_futures_canary_status() -> dict[str, Any]:
+    with BINANCE_FUTURES_CANARY_LOCK:
+        current = dict(STATE.get("binance_futures_canary", {}))
+    current.pop("confirmation_token", None)
+    current.pop("test_context", None)
+    current.pop("test_requests", None)
+    return current
+
+
+def _binance_futures_ticker_price(symbol: str) -> float:
+    normalized_symbol = normalize_usdm_symbol(symbol)
+    base_url = (
+        env_value("BINANCE_FUTURES_BASE_URL")
+        or BINANCE_FUTURES_BASE_URL
+    )
+    response = http_json(
+        "GET",
+        (
+            f"{base_url.rstrip('/')}/fapi/v1/ticker/price?"
+            f"symbol={normalized_symbol}"
+        ),
+        body=None,
+        headers={},
+        timeout_seconds=10.0,
+    )
+    payload = (
+        response.get("json")
+        if isinstance(response.get("json"), dict)
+        else {}
+    )
+    price = safe_float(payload.get("price"), 0.0)
+    if response.get("ok") is not True or price <= 0:
+        raise RuntimeError(
+            "Binance Futures 현재가를 확인하지 못했습니다."
+        )
+    return price
+
+
+def _artifact_custom_definition(strategy: dict[str, Any]) -> dict[str, Any]:
+    parameters = (
+        strategy.get("parameters")
+        if isinstance(strategy.get("parameters"), dict)
+        else {}
+    )
+    contract = (
+        strategy.get("strategyContract")
+        if isinstance(strategy.get("strategyContract"), dict)
+        else strategy.get("strategy_contract")
+        if isinstance(strategy.get("strategy_contract"), dict)
+        else {}
+    )
+    for candidate in (
+        parameters.get("customStrategyDefinition"),
+        parameters.get("custom_strategy_definition"),
+        strategy.get("customStrategyDefinition"),
+        strategy.get("custom_strategy_definition"),
+        contract.get("customStrategyDefinition"),
+    ):
+        if isinstance(candidate, dict):
+            return candidate
+    return {}
+
+
+def _evaluate_binance_futures_canary(
+    strategy_id: object,
+    notional_usdt: object = 6.0,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    selected_id = str(strategy_id or "").strip()
+    strategies = strategy_rows()
+    strategy = next(
+        (
+            item
+            for item in strategies
+            if str(item.get("strategy_id") or item.get("id") or "")
+            == selected_id
+        ),
+        None,
+    )
+    symbol = normalize_usdm_symbol(
+        (strategy or {}).get("symbol") or "BTCUSDT"
+    )
+    definition = _artifact_custom_definition(strategy or {})
+    direction = str(
+        definition.get("positionDirection")
+        or (strategy or {}).get("position_direction")
+        or (strategy or {}).get("positionDirection")
+        or "long"
+    ).strip().lower()
+    lifecycle = normalize_lifecycle_status(
+        (strategy or {}).get("lifecycleStatus")
+        or (strategy or {}).get("status")
+        or (
+            (strategy or {}).get("lifecycle", {}).get("status")
+            if isinstance((strategy or {}).get("lifecycle"), dict)
+            else ""
+        )
+    )
+    scope = (
+        current_live_canary_scope(selected_id, materialize=False)
+        if strategy is not None
+        else {}
+    )
+    broker_id = strategy_broker_id(strategy) if strategy is not None else ""
+    market_type = str(
+        (strategy or {}).get("market_type")
+        or (strategy or {}).get("marketType")
+        or ""
+    ).strip().lower()
+    strategy_gate = {
+        "found": strategy is not None,
+        "broker_id": broker_id,
+        "symbol": symbol,
+        "symbol_matches": bool(symbol),
+        "market_type": market_type,
+        "position_direction": direction,
+        "short_authorized": (
+            strategy is not None
+            and direction == "short"
+            and broker_id == "binance-futures"
+            and market_type
+            in {"future", "futures", "perpetual", "swap"}
+        ),
+        "lifecycle_status": lifecycle,
+        "live_small_eligible": (
+            (strategy or {}).get("live_small_eligible") is True
+        ),
+        "deployment_provenance_ok": bool(
+            scope.get("deploymentId")
+            and scope.get("strategyArtifactHash")
+            and scope.get("strategyId")
+        ),
+        "canary_scope_ok": scope.get("eligible") is True,
+    }
+    observation: dict[str, Any] = {
+        "account": {},
+        "position_mode": {},
+        "symbol_config": {},
+        "position_count": None,
+        "open_order_count": None,
+    }
+    observation_errors: list[str] = []
+    price: float | None = None
+    rules: dict[str, Any] = {}
+    try:
+        observation = (
+            LiveBrokerRouter()
+            .get_binance_futures_canary_observation(symbol)
+        )
+    except (BrokerNotReadyError, RuntimeError):
+        observation_errors.extend(
+            (
+                "account-observation-failed",
+                "position-mode-observation-failed",
+                "symbol-config-observation-failed",
+                "positions-observation-failed",
+                "open-orders-observation-failed",
+            )
+        )
+    try:
+        price = _binance_futures_ticker_price(symbol)
+    except RuntimeError:
+        observation_errors.append("ticker-observation-failed")
+    try:
+        rules = binance_symbol_rules(symbol, futures=True)
+    except RuntimeError:
+        observation_errors.append("exchange-rules-observation-failed")
+    quantity_result = derive_canary_quantity(
+        target_notional_usdt=notional_usdt,
+        price=price,
+        min_qty=rules.get("minQty"),
+        max_qty=rules.get("maxQty"),
+        step_size=rules.get("stepSize"),
+        exchange_min_notional=rules.get("minNotional"),
+    )
+    report = evaluate_futures_canary_preflight(
+        strategy_gate=strategy_gate,
+        account=(
+            observation.get("account")
+            if isinstance(observation.get("account"), dict)
+            else {}
+        ),
+        position_mode=(
+            observation.get("position_mode")
+            if isinstance(observation.get("position_mode"), dict)
+            else {}
+        ),
+        symbol_config=(
+            observation.get("symbol_config")
+            if isinstance(observation.get("symbol_config"), dict)
+            else {}
+        ),
+        position_count=(
+            int(observation["position_count"])
+            if isinstance(observation.get("position_count"), int)
+            else None
+        ),
+        open_order_count=(
+            int(observation["open_order_count"])
+            if isinstance(observation.get("open_order_count"), int)
+            else None
+        ),
+        requested_notional_usdt=notional_usdt,
+        quantity_result=quantity_result,
+        real_orders_enabled=real_orders_enabled(),
+        observation_errors=tuple(dict.fromkeys(observation_errors)),
+    )
+    report["strategy"] = {
+        "strategy_id": selected_id,
+        "symbol": symbol,
+        "broker_id": broker_id,
+        "market_type": market_type,
+        "position_direction": direction,
+        "lifecycle_status": lifecycle,
+        "short_authorized": strategy_gate["short_authorized"],
+    }
+    report["detail"] = (
+        "test order 사전점검 통과"
+        if report["ready_for_test"]
+        else "차단: " + ", ".join(report["test_blockers"])
+    )
+    context = {
+        "strategy_id": selected_id,
+        "symbol": symbol,
+        "requested_notional_usdt": str(notional_usdt),
+        "quantity": str(
+            report.get("order_plan", {}).get("quantity") or ""
+        ),
+        "estimated_notional_usdt": str(
+            report.get("order_plan", {}).get(
+                "estimated_notional_usdt"
+            )
+            or ""
+        ),
+        "scope_id": str(scope.get("scopeId") or ""),
+    }
+    return report, context
+
+
+def preview_binance_futures_canary(
+    strategy_id: object,
+    notional_usdt: object = 6.0,
+) -> dict[str, Any]:
+    with BINANCE_FUTURES_CANARY_LOCK:
+        report, context = _evaluate_binance_futures_canary(
+            strategy_id,
+            notional_usdt,
+        )
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(
+            seconds=BINANCE_FUTURES_CANARY_TEST_TTL_SECONDS
+        )
+        token = (
+            secrets.token_urlsafe(32)
+            if report["ready_for_test"]
+            else ""
+        )
+        stored = {
+            **report,
+            "confirmation_token": token,
+            "expires_at": (
+                expires.isoformat().replace("+00:00", "Z")
+                if token
+                else ""
+            ),
+            "expires_epoch": expires.timestamp() if token else 0.0,
+            "used": False,
+            "test_context": context if token else {},
+            "test_result": {},
+        }
+        STATE["binance_futures_canary"] = stored
+    append_audit(
+        "info" if report["ready_for_test"] else "warn",
+        "Binance Futures canary 사전점검",
+        (
+            f"{context.get('strategy_id') or '-'} "
+            f"{context.get('symbol') or '-'} · "
+            f"test blockers {len(report['test_blockers'])}개 · "
+            f"start blockers {len(report['start_blockers'])}개"
+        ),
+    )
+    return {
+        "ok": report["ready_for_test"],
+        "reason": report["detail"],
+        "canary": binance_futures_canary_status(),
+        "test_authorization": (
+            {
+                "confirmation_token": token,
+                "expires_at": stored["expires_at"],
+            }
+            if token
+            else {}
+        ),
+    }
+
+
+def _sanitize_binance_futures_test_leg(
+    leg: str,
+    intent: dict[str, object],
+    response: dict[str, object],
+) -> dict[str, object]:
+    payload = (
+        response.get("json")
+        if isinstance(response.get("json"), dict)
+        else {}
+    )
+    exchange_code = payload.get("code")
+    message = str(payload.get("msg") or "")[:160]
+    return {
+        "leg": leg,
+        "side": str(intent.get("side") or ""),
+        "position_side": "SHORT",
+        "risk_reducing": intent.get("risk_reducing") is True,
+        "ok": response.get("ok") is True,
+        "status_code": int(
+            safe_float(response.get("statusCode"), 0.0)
+        ),
+        "exchange_code": (
+            str(exchange_code)[:40]
+            if exchange_code not in (None, "")
+            else None
+        ),
+        "message": message,
+    }
+
+
+def _binance_futures_test_result(
+    *,
+    status: str,
+    context: dict[str, str],
+    legs: list[dict[str, object]] | None = None,
+    reason_id: str = "",
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "endpoint": BINANCE_FUTURES_TEST_ORDER_ENDPOINT,
+        "submitted_to_matching_engine": False,
+        "strategy_id": context.get("strategy_id", ""),
+        "symbol": context.get("symbol", ""),
+        "quantity": context.get("quantity", ""),
+        "estimated_notional_usdt": context.get(
+            "estimated_notional_usdt",
+            "",
+        ),
+        "reason_id": reason_id,
+        "legs": list(legs or []),
+        "validated_at": (
+            datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        ),
+    }
+
+
+def test_binance_futures_canary_order(
+    confirmation_token: object,
+    *,
+    confirmed: bool,
+) -> dict[str, Any]:
+    token = str(confirmation_token or "")
+    with BINANCE_FUTURES_CANARY_LOCK:
+        current = dict(STATE.get("binance_futures_canary", {}))
+        stored_token = str(current.get("confirmation_token") or "")
+        if (
+            not confirmed
+            or not token
+            or not stored_token
+            or not secrets.compare_digest(token, stored_token)
+        ):
+            return {
+                "ok": False,
+                "reason": (
+                    "정확한 Binance Futures test order 미리보기의 "
+                    "1회 확인 토큰이 필요합니다."
+                ),
+                "canary": binance_futures_canary_status(),
+            }
+        if (
+            current.get("ready_for_test") is not True
+            or current.get("status") != "test_ready"
+            or current.get("used") is True
+        ):
+            return {
+                "ok": False,
+                "reason": "이미 사용되었거나 test order 가능한 미리보기가 아닙니다.",
+                "canary": binance_futures_canary_status(),
+            }
+        if (
+            safe_float(current.get("expires_epoch"), 0.0)
+            <= datetime.now(timezone.utc).timestamp()
+        ):
+            current.update(
+                {
+                    "status": "expired",
+                    "used": True,
+                    "confirmation_token": "",
+                    "detail": (
+                        "test order 미리보기가 만료되었습니다. "
+                        "다시 사전점검하세요."
+                    ),
+                }
+            )
+            STATE["binance_futures_canary"] = current
+            return {
+                "ok": False,
+                "reason": current["detail"],
+                "canary": binance_futures_canary_status(),
+            }
+        context = (
+            dict(current.get("test_context", {}))
+            if isinstance(current.get("test_context"), dict)
+            else {}
+        )
+        if not all(
+            context.get(key)
+            for key in (
+                "strategy_id",
+                "symbol",
+                "requested_notional_usdt",
+                "quantity",
+                "scope_id",
+            )
+        ):
+            current.update(
+                {
+                    "status": "blocked",
+                    "used": True,
+                    "confirmation_token": "",
+                    "detail": "test order 미리보기 문맥이 완전하지 않습니다.",
+                }
+            )
+            STATE["binance_futures_canary"] = current
+            return {
+                "ok": False,
+                "reason": current["detail"],
+                "canary": binance_futures_canary_status(),
+            }
+
+        # Consume before any action-time broker observation or signed POST.
+        # A timeout or partial validation must never make the token reusable.
+        current.update(
+            {
+                "status": "test_validating",
+                "used": True,
+                "confirmation_token": "",
+                "detail": "action-time 사전점검 재검증 중",
+            }
+        )
+        STATE["binance_futures_canary"] = current
+
+        fresh_report, fresh_context = _evaluate_binance_futures_canary(
+            context["strategy_id"],
+            context["requested_notional_usdt"],
+        )
+        bound_fields = (
+            "strategy_id",
+            "symbol",
+            "requested_notional_usdt",
+            "quantity",
+            "scope_id",
+        )
+        context_matches = all(
+            fresh_context.get(key) == context.get(key)
+            for key in bound_fields
+        )
+        if fresh_report.get("ready_for_test") is not True or not context_matches:
+            reason_id = (
+                "preview-context-changed"
+                if fresh_report.get("ready_for_test") is True
+                else "action-time-preflight-blocked"
+            )
+            if reason_id not in fresh_report["test_blockers"]:
+                fresh_report["test_blockers"].append(reason_id)
+            if reason_id not in fresh_report["start_blockers"]:
+                fresh_report["start_blockers"].append(reason_id)
+            test_result = _binance_futures_test_result(
+                status="blocked",
+                context=context,
+                reason_id=reason_id,
+            )
+            fresh_report.update(
+                {
+                    "status": "blocked",
+                    "ready_for_test": False,
+                    "used": True,
+                    "confirmation_token": "",
+                    "expires_at": current.get("expires_at", ""),
+                    "expires_epoch": current.get("expires_epoch", 0.0),
+                    "test_context": context,
+                    "test_result": test_result,
+                    "detail": (
+                        "action-time 사전점검이 변경되어 test order를 "
+                        "전송하지 않았습니다."
+                    ),
+                }
+            )
+            STATE["binance_futures_canary"] = fresh_report
+            append_audit(
+                "warn",
+                "Binance Futures test order",
+                (
+                    f"{context['strategy_id']} {context['symbol']} · "
+                    f"{reason_id} · matching engine 전송 없음"
+                ),
+            )
+            return {
+                "ok": False,
+                "reason": fresh_report["detail"],
+                "test": test_result,
+                "canary": binance_futures_canary_status(),
+            }
+
+        fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        entry, cover = build_futures_canary_test_intents(
+            strategy_id=context["strategy_id"],
+            symbol=context["symbol"],
+            quantity=context["quantity"],
+            token_fingerprint=fingerprint,
+        )
+        router = LiveBrokerRouter()
+        legs: list[dict[str, object]] = []
+        for leg_name, intent in (("entry", entry), ("cover", cover)):
+            try:
+                response = router.test_binance_futures_order(intent)
+                leg_result = _sanitize_binance_futures_test_leg(
+                    leg_name,
+                    intent,
+                    response,
+                )
+            except (BrokerNotReadyError, RuntimeError):
+                leg_result = {
+                    "leg": leg_name,
+                    "side": str(intent.get("side") or ""),
+                    "position_side": "SHORT",
+                    "risk_reducing": (
+                        intent.get("risk_reducing") is True
+                    ),
+                    "ok": False,
+                    "status_code": 0,
+                    "exchange_code": None,
+                    "message": "Binance Futures test order 사전검사 실패",
+                }
+            legs.append(leg_result)
+            if leg_result["ok"] is not True:
+                break
+
+        succeeded = len(legs) == 2 and all(
+            leg.get("ok") is True for leg in legs
+        )
+        test_result = _binance_futures_test_result(
+            status="validated" if succeeded else "failed",
+            context=context,
+            legs=legs,
+            reason_id="" if succeeded else "broker-test-rejected",
+        )
+        fresh_report.update(
+            {
+                "status": (
+                    "test_validated" if succeeded else "test_failed"
+                ),
+                "used": True,
+                "confirmation_token": "",
+                "expires_at": current.get("expires_at", ""),
+                "expires_epoch": current.get("expires_epoch", 0.0),
+                "test_context": context,
+                "test_result": test_result,
+                "detail": (
+                    "SELL/BUY SHORT test order 검증 통과 · "
+                    "matching engine 전송 없음"
+                    if succeeded
+                    else "Binance Futures test order 검증 실패"
+                ),
+            }
+        )
+        STATE["binance_futures_canary"] = fresh_report
+        append_audit(
+            "info" if succeeded else "warn",
+            "Binance Futures test order",
+            (
+                f"{context['strategy_id']} {context['symbol']} · "
+                f"{len(legs)}/2 legs · "
+                "matching engine 전송 없음"
+            ),
+        )
+        return {
+            "ok": succeeded,
+            "reason": fresh_report["detail"],
+            "test": test_result,
+            "canary": binance_futures_canary_status(),
+        }
 
 
 def _binance_smoke_order_view(**updates: Any) -> dict[str, Any]:
@@ -6590,7 +7623,11 @@ def broker_ready_for_intent(checks: dict[str, Any], intent: OrderIntent) -> bool
 
 
 def open_order_count() -> int:
-    return sum(1 for order in STATE["orders"] if order.get("state") not in FINAL_ORDER_STATES and order.get("queue_state") != "canceled")
+    return sum(
+        1
+        for order in STATE["orders"]
+        if _restore_order_is_pending_or_unknown(order)
+    )
 
 
 def recent_orders_for_risk() -> tuple[RecentOrder, ...]:

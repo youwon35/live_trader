@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 from live_trader.server import (
+    LiveTraderHandler,
     create_desktop_server,
     is_recoverable_bind_error,
     json_safe_value,
@@ -15,6 +16,34 @@ from live_trader.server import (
 
 
 class ServerSafetyTests(unittest.TestCase):
+    def test_futures_test_route_accepts_only_confirmation_contract(
+        self,
+    ) -> None:
+        handler = object.__new__(LiveTraderHandler)
+        handler.path = "/api/binance-futures-canary/test"
+        handler.read_json = Mock(
+            return_value={
+                "confirmation_token": "one-time-token",
+                "confirmed": True,
+                "symbol": "CLIENT-MUST-NOT-CONTROL",
+                "quantity": "999",
+            }
+        )
+        handler.send_json = Mock()
+        expected = {"ok": True, "test": {"status": "validated"}}
+
+        with patch(
+            "live_trader.server.state.test_binance_futures_canary_order",
+            return_value=expected,
+        ) as test_order:
+            handler.do_POST()
+
+        test_order.assert_called_once_with(
+            "one-time-token",
+            confirmed=True,
+        )
+        handler.send_json.assert_called_once_with(expected)
+
     def test_non_finite_metrics_are_serialized_as_null(self) -> None:
         payload = {
             "finite": 12.5,

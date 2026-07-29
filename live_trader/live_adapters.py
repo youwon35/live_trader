@@ -38,8 +38,10 @@ BINANCE_TIME_ENDPOINT = "/api/v3/time"
 BINANCE_EXCHANGE_INFO_ENDPOINT = "/api/v3/exchangeInfo"
 BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
 BINANCE_FUTURES_ORDER_ENDPOINT = "/fapi/v1/order"
+BINANCE_FUTURES_OPEN_ORDERS_ENDPOINT = "/fapi/v1/openOrders"
 BINANCE_FUTURES_TEST_ORDER_ENDPOINT = "/fapi/v1/order/test"
 BINANCE_FUTURES_ACCOUNT_ENDPOINT = "/fapi/v3/account"
+BINANCE_FUTURES_ACCOUNT_CONFIG_ENDPOINT = "/fapi/v1/accountConfig"
 BINANCE_FUTURES_POSITION_ENDPOINT = "/fapi/v3/positionRisk"
 BINANCE_FUTURES_POSITION_MODE_ENDPOINT = "/fapi/v1/positionSide/dual"
 BINANCE_FUTURES_SYMBOL_CONFIG_ENDPOINT = "/fapi/v1/symbolConfig"
@@ -724,6 +726,53 @@ def build_binance_futures_positions_request(
         "GET",
         BINANCE_FUTURES_POSITION_ENDPOINT,
         {"symbol": normalized_symbol} if normalized_symbol else {},
+    )
+
+
+def build_binance_futures_account_config_request() -> PreparedRequest:
+    return _build_binance_futures_signed_request(
+        "GET",
+        BINANCE_FUTURES_ACCOUNT_CONFIG_ENDPOINT,
+    )
+
+
+def build_binance_futures_open_orders_request(
+    symbol: str = "",
+) -> PreparedRequest:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    return _build_binance_futures_signed_request(
+        "GET",
+        BINANCE_FUTURES_OPEN_ORDERS_ENDPOINT,
+        {"symbol": normalized_symbol} if normalized_symbol else {},
+    )
+
+
+def build_binance_futures_order_status_request(
+    symbol: str,
+    broker_order_id: str,
+    *,
+    client_order_id: bool = False,
+) -> PreparedRequest:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    normalized_order_id = str(broker_order_id or "").strip()
+    query: dict[str, object] = {"symbol": normalized_symbol}
+    query[
+        "origClientOrderId" if client_order_id else "orderId"
+    ] = normalized_order_id
+    blocked: list[str] = []
+    if not normalized_symbol:
+        blocked.append("symbol")
+    if not normalized_order_id:
+        blocked.append("broker_order_id")
+    return _build_binance_futures_signed_request(
+        "GET",
+        BINANCE_FUTURES_ORDER_ENDPOINT,
+        query,
+        blocked_reasons=blocked,
     )
 
 

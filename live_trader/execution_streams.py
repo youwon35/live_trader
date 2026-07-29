@@ -43,21 +43,118 @@ def parse_upbit_my_order(payload: Any) -> dict[str, Any] | None:
     order_uuid = str(payload.get("uuid") or "")
     market = str(payload.get("code") or payload.get("market") or "").upper()
     state = str(payload.get("state") or "").lower()
-    executed = float(payload.get("executed_volume") or payload.get("executedVolume") or payload.get("trade_volume") or 0)
-    price = float(payload.get("trade_price") or payload.get("price") or 0)
+    executed_value = next(
+        (
+            payload.get(key)
+            for key in ("executed_volume", "executedVolume")
+            if payload.get(key) not in {None, ""}
+        ),
+        None,
+    )
+    paid_fee_value = next(
+        (
+            payload.get(key)
+            for key in ("paid_fee", "paidFee")
+            if payload.get(key) not in {None, ""}
+        ),
+        None,
+    )
+    executed = _float(executed_value)
+    paid_fee = _float(paid_fee_value)
+    trade_volume_value = next(
+        (
+            payload.get(key)
+            for key in ("volume", "trade_volume", "tradeVolume")
+            if payload.get(key) not in {None, ""}
+        ),
+        None,
+    )
+    trade_fee_value = next(
+        (
+            payload.get(key)
+            for key in ("trade_fee", "tradeFee")
+            if payload.get(key) not in {None, ""}
+        ),
+        None,
+    )
+    is_trade_delta = (
+        state == "trade"
+        and bool(trade_uuid)
+        and trade_volume_value is not None
+    )
+    quantity = _float(trade_volume_value) if is_trade_delta else executed
+    fee_is_delta = is_trade_delta and trade_fee_value is not None
+    fee = _float(trade_fee_value) if fee_is_delta else paid_fee
+    remaining_value = payload.get("remaining_volume")
+    if remaining_value in {None, ""}:
+        remaining_value = payload.get("remainingVolume")
+    remaining_volume = (
+        _float(remaining_value)
+        if remaining_value not in {None, ""}
+        else None
+    )
+    normalized_state = {
+        "done": "filled",
+        "cancel": "canceled",
+        "wait": "accepted",
+        "watch": "accepted",
+    }.get(state, state or "accepted")
+    if state == "trade":
+        normalized_state = (
+            "filled"
+            if remaining_volume is not None and remaining_volume <= 0
+            else "partially_filled"
+        )
+    price = _float(
+        payload.get("trade_price")
+        or payload.get("tradePrice")
+        or (
+            payload.get("price")
+            if is_trade_delta
+            else payload.get("avg_price")
+            or payload.get("avgPrice")
+            or payload.get("price")
+        )
+        or 0
+    )
+    event_component = (
+        f"{trade_uuid}:{state}"
+        if trade_uuid
+        else (
+            f"{state}:{executed:.16g}:{paid_fee:.16g}:"
+            f"{payload.get('trades_count') or payload.get('tradesCount') or 0}"
+        )
+    )
     return {
-        "event_id": trade_uuid or f"upbit:{order_uuid}:{state}:{executed}",
+        "event_id": f"upbit:{order_uuid}:{event_component}",
         "broker_id": "upbit",
         "order_id": str(payload.get("identifier") or ""),
         "broker_order_id": order_uuid,
         "symbol": market,
         "side": "BUY" if str(payload.get("ask_bid") or payload.get("side") or "").upper() in {"BID", "BUY"} else "SELL",
-        "quantity": executed,
+        "quantity": quantity,
         "price": price,
-        "fee": float(payload.get("paid_fee") or payload.get("paidFee") or 0),
-        "state": "filled" if state == "done" else state or "accepted",
+        "fee": fee,
+        "state": normalized_state,
         "occurred_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "raw_type": "upbit_my_order",
+        # Upbit exposes order-level cumulative watermarks alongside an
+        # execution-level volume/fee.  Keeping both contracts explicit lets
+        # the state layer suppress replayed/out-of-order fills without
+        # changing Binance's already-incremental execution contract.
+        "quantity_mode": "delta" if is_trade_delta else "cumulative",
+        "fee_mode": "delta" if fee_is_delta else "cumulative",
+        "cumulative_quantity": (
+            executed if executed_value is not None else None
+        ),
+        "cumulative_fee": (
+            paid_fee if paid_fee_value is not None else None
+        ),
+        "cumulative_average_price": _float(
+            payload.get("avg_price")
+            or payload.get("avgPrice")
+            or 0
+        ),
     }
 
 
