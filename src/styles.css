@@ -93,7 +93,9 @@ body {
 }
 
 button,
-input {
+input,
+select,
+textarea {
   font: inherit;
 }
 
@@ -1618,7 +1620,7 @@ button {
 
 .strategy-discovery-primary {
   display: grid;
-  grid-template-columns: minmax(240px, 1.5fr) repeat(4, minmax(120px, 0.8fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
   gap: 10px;
   min-width: 0;
   max-width: 100%;
@@ -1639,6 +1641,7 @@ button {
 .strategy-discovery-search {
   position: relative;
   align-content: end;
+  grid-column: 1 / -1;
 }
 
 .strategy-discovery-search svg {
@@ -1666,7 +1669,7 @@ button {
 }
 
 .strategy-discovery-search input {
-  padding-left: 34px;
+  padding-left: 34px !important;
 }
 
 .strategy-discovery-primary input:focus,
@@ -1782,8 +1785,21 @@ button {
 
 .live-strategy-summary-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
+}
+
+.live-strategy-summary-grid .ts-metric-card__body {
+  min-width: 0;
+}
+
+.live-strategy-summary-grid :is(.ts-metric-card__value, .ts-metric-card__detail) {
+  overflow: visible;
+  max-width: 100%;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
 }
 
 .live-strategy-readonly-note,
@@ -1846,7 +1862,10 @@ button {
   max-height: 170px;
   margin: 0;
   color: var(--text-soft);
+  font-family: var(--font-family);
   font-size: var(--font-size-small);
+  font-weight: 500;
+  letter-spacing: 0;
   line-height: 1.5;
   white-space: pre-wrap;
 }
@@ -1903,6 +1922,74 @@ button {
   gap: 7px;
 }
 
+.portfolio-pagination-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 42px;
+  padding: 7px 2px 0;
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-medium);
+  flex-wrap: wrap;
+}
+
+.portfolio-pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.portfolio-pagination-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-bold);
+}
+
+.portfolio-pagination-controls select,
+.portfolio-pagination-controls button {
+  min-height: 32px;
+  color: var(--text);
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-bold);
+}
+
+.portfolio-pagination-controls select {
+  min-width: 76px;
+  padding: 0 28px 0 10px;
+}
+
+.portfolio-pagination-controls button {
+  min-width: 32px;
+  padding: 0 10px;
+}
+
+.portfolio-pagination-controls button:not(:disabled):hover {
+  border-color: var(--primary-border);
+  background: var(--button-hover);
+}
+
+.portfolio-pagination-controls button.active {
+  color: var(--accent-contrast-text);
+  background: var(--primary);
+  border-color: var(--primary-border);
+}
+
+.portfolio-pagination-gap {
+  padding: 0 2px;
+  color: var(--text-muted);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-bold);
+}
+
 .strategy-lifecycle-timeline {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
@@ -1933,6 +2020,14 @@ button {
   font-weight: 800;
 }
 
+.strategy-lifecycle-timeline article > div {
+  display: flex;
+  align-items: baseline;
+  gap: 3px 7px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
 .strategy-lifecycle-timeline strong,
 .promotion-checklist strong {
   overflow: hidden;
@@ -1953,6 +2048,27 @@ button {
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.strategy-lifecycle-timeline strong {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.strategy-lifecycle-timeline em {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: -webkit-box;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .strategy-lifecycle-timeline article.done {
@@ -4416,9 +4532,19 @@ body {
   .summary-grid,
   .queue-grid,
   .metric-grid,
+  .live-strategy-summary-grid,
   .risk-grid,
   .workflow-strip {
     grid-template-columns: 1fr;
+  }
+
+  .portfolio-pagination-footer {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .portfolio-pagination-controls {
+    width: 100%;
   }
 
   .strategy-discovery-primary,
@@ -4892,4 +5018,60 @@ body {
 .artifact-metadata-editor textarea {
   min-height: 64px;
   resize: vertical;
+}
+
+/* Dedicated broker account/position workspace. */
+.doctor-page-layout,
+.accounts-page-layout {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.accounts-page-layout .ts-account-position-table-wrap.is-compact {
+  max-height: min(60vh, 720px);
+}
+
+.account-baseline-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 13px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.account-baseline-toolbar > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.account-baseline-toolbar strong {
+  color: var(--text);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-bold);
+}
+
+.account-baseline-toolbar span {
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+  line-height: 1.4;
+}
+
+.account-baseline-toolbar button {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 760px) {
+  .account-baseline-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .account-baseline-toolbar button {
+    width: 100%;
+  }
 }

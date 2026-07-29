@@ -5,7 +5,6 @@ import {
   Bell,
   CircleStop,
   Clock3,
-  DatabaseZap,
   Download,
   FileClock,
   LayoutDashboard,
@@ -49,7 +48,6 @@ import {
   stopContinuousRuntime,
   runWatchdog,
   promoteStrategyToLive,
-  seedProgramLedgerBaseline,
   retryOrder,
   setFlag,
   setStrategyLifecycle,
@@ -59,6 +57,7 @@ import {
   setRiskSetting,
   saveUiSettings,
   saveSharedSearchPresets,
+  seedProgramLedgerBaseline,
   updateArtifactMetadata,
   saveEnvSettings,
   submitTestIntent,
@@ -67,6 +66,10 @@ import {
   runRecoveryDrill,
 } from "./api";
 import { livePollingIntervals } from "./polling";
+import {
+  ACCOUNT_REFRESH_INTERVAL_MS,
+  createAccountRefreshCoordinator,
+} from "./accountRefresh";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
 import { readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
@@ -111,6 +114,7 @@ const ToggleSwitch = createToggleSwitch(React);
 
 const navItems = [
   { id: "overview", label: "사전점검", icon: LayoutDashboard },
+  { id: "accounts", label: "계좌·포지션", icon: WalletCards },
   { id: "gate", label: "실거래 준비", icon: ListChecks },
   { id: "automation", label: "자동화", icon: Power },
   { id: "audit", label: "로그", icon: FileClock },
@@ -122,6 +126,11 @@ const pageProfiles = {
     title: "사전점검",
     eyebrow: "Live Doctor",
     summary: "실거래 전 API, 리스크, 체크리스트, 대조 상태를 한 번에 점검합니다.",
+  },
+  accounts: {
+    title: "계좌·포지션",
+    eyebrow: "브로커 자산 현황",
+    summary: "모든 브로커의 실제 계좌 잔고와 보유 포지션을 한눈에 확인합니다.",
   },
   gate: {
     title: "실거래 준비",
@@ -593,13 +602,14 @@ function buildSearchResults(snapshot, queryValue) {
   });
 
   (snapshot.positions ?? []).forEach((position) => {
+    const positionSide = String(position.position_side || position.positionSide || "").toUpperCase();
     addSearchResult(results, query, {
-      id: `position-${position.symbol}`,
+      id: `position-${position.broker_id}-${position.symbol}-${positionSide || "NET"}`,
       type: "포지션",
-      label: position.symbol,
+      label: `${position.symbol}${positionSide ? ` · ${positionSide}` : ""}`,
       detail: `${position.status_label} · ${position.broker_name}`,
       meta: [position.asset, position.currency, position.detail].join(" "),
-      targetNav: "overview",
+      targetNav: "accounts",
       tone: statusTone(position.status),
     });
   });
@@ -611,7 +621,7 @@ function buildSearchResults(snapshot, queryValue) {
       label: account.account,
       detail: `${account.status_label} · ${account.broker_name}`,
       meta: [account.currency, account.detail].join(" "),
-      targetNav: "overview",
+      targetNav: "accounts",
       tone: statusTone(account.status),
     });
   });
@@ -734,7 +744,7 @@ function buildNotificationItems(snapshot, error) {
       tone: statusTone(snapshot.reconciliation.summary.status),
       title: `포지션·계좌 대조 ${snapshot.reconciliation.summary.status_label}`,
       detail: `API 필요 ${snapshot.reconciliation.summary.api_required_count}개, 불일치 ${snapshot.reconciliation.summary.mismatch_count}개`,
-      targetNav: "overview",
+      targetNav: "accounts",
     });
   }
 
@@ -1105,7 +1115,7 @@ applyAppearance(readAppearance());
 applyLayoutMode(readLayoutMode());
 
 const LIVE_FLOW_STORAGE_KEY = "live_trader.guidedFlow.v1";
-const LIVE_FLOW_IDS = ["overview", "gate", "automation", "audit"];
+const LIVE_FLOW_IDS = ["overview", "accounts", "gate", "automation", "audit"];
 
 function App() {
   const [snapshot, setSnapshot] = useState(fallbackSnapshot);
@@ -1121,6 +1131,13 @@ function App() {
   const workspaceRef = useRef(null);
   const notificationRef = useRef(null);
   const backgroundRequestInFlightRef = useRef(false);
+  const accountRefreshCoordinatorRef = useRef(null);
+  if (!accountRefreshCoordinatorRef.current) {
+    accountRefreshCoordinatorRef.current = createAccountRefreshCoordinator({
+      syncExecutionEvents,
+      runReconciliation,
+    });
+  }
 
   useEditablePanels(workspaceRef);
 
@@ -1155,29 +1172,27 @@ function App() {
   }, [pollingIntervals.snapshotMs]);
 
   useEffect(() => {
-    if (selectedNav !== "overview" || snapshot.api_connected !== true) return undefined;
+    if (selectedNav !== "accounts" || snapshot.api_connected !== true) return undefined;
     let stopped = false;
-    let running = false;
     const refreshBrokerAccounts = async () => {
-      if (stopped || running || backgroundRequestInFlightRef.current) return;
-      running = true;
+      if (stopped || accountRefreshCoordinatorRef.current.isRunning() || backgroundRequestInFlightRef.current) return;
       backgroundRequestInFlightRef.current = true;
       try {
-        const result = await syncExecutionEvents("all");
+        const result = await accountRefreshCoordinatorRef.current.run();
         if (!stopped && result?.snapshot) setSnapshot({ ...result.snapshot, api_connected: true });
       } catch {
         // Background account refresh stays quiet; the normal snapshot poll keeps connection status visible.
       } finally {
         backgroundRequestInFlightRef.current = false;
-        running = false;
       }
     };
-    const timer = window.setInterval(refreshBrokerAccounts, pollingIntervals.executionMs);
+    void refreshBrokerAccounts();
+    const timer = window.setInterval(refreshBrokerAccounts, ACCOUNT_REFRESH_INTERVAL_MS);
     return () => {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [selectedNav, snapshot.api_connected, pollingIntervals.executionMs]);
+  }, [selectedNav, snapshot.api_connected]);
 
   useEffect(() => {
     applyAppearance(appearance);
@@ -1326,8 +1341,6 @@ function App() {
                   >
                     <Icon size={17} />
                     <span>{item.label}</span>
-                    {item.id === "overview" && snapshot.summary.blocker_count > 0 && <span className="nav-item-badge is-danger" aria-hidden="true">{snapshot.summary.blocker_count}</span>}
-                    {item.id === "audit" && unreadNotificationCount > 0 && <span className="nav-item-badge" aria-hidden="true">{Math.min(unreadNotificationCount, 9)}</span>}
                   </button>
                 );
               })}
@@ -1447,14 +1460,13 @@ function App() {
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
           onReconcile={() => runAction(runReconciliation)}
           onPreflight={() => runAction(runFinalPreflight)}
+          onAccountRefresh={() => runAction(() => accountRefreshCoordinatorRef.current.run())}
           onProgramLedgerBaseline={() =>
-            confirmSafetyChange("현재 브로커 잔고와 포지션을 프로그램 원장의 새 기준으로 저장하시겠습니까? 기존 기준이 바뀝니다.", () => seedProgramLedgerBaseline(true))
+            confirmSafetyChange(
+              "현재 브로커 잔고와 포지션을 프로그램 원장의 새 기준으로 승인하시겠습니까? 외부 주문·입출금 차이가 모두 현재 값으로 재설정됩니다.",
+              () => seedProgramLedgerBaseline(true),
+            )
           }
-          onExecutionEvents={(brokerId) => runAction(() => syncExecutionEvents(brokerId))}
-          onAccountRefresh={() => runAction(async () => {
-            await syncExecutionEvents("all");
-            return runReconciliation();
-          })}
           onEnvSettings={(values, confirmed) => runAction(() => saveEnvSettings(values, confirmed))}
           appearance={appearance}
           updateAppearance={updateAppearance}
@@ -1531,9 +1543,8 @@ function WorkspaceContent({
   onCancelOrder,
   onReconcile,
   onPreflight,
-  onProgramLedgerBaseline,
-  onExecutionEvents,
   onAccountRefresh,
+  onProgramLedgerBaseline,
   onEnvSettings,
   appearance,
   updateAppearance,
@@ -1589,6 +1600,22 @@ function WorkspaceContent({
     );
   }
 
+  if (selectedNav === "accounts") {
+    return renderPage(
+      <section className="accounts-page-layout">
+        <UnifiedBrokerAccountPanel
+          accounts={snapshot.accounts ?? []}
+          executionEvents={snapshot.execution_events}
+          onBaseline={onProgramLedgerBaseline}
+          onRefresh={onAccountRefresh}
+          positions={snapshot.positions ?? []}
+          reconciledAt={snapshot.reconciliation?.summary?.last_run}
+          refreshDisabled={snapshot.api_connected !== true}
+        />
+      </section>,
+    );
+  }
+
   if (selectedNav === "audit") {
     return renderPage(
       <section className="audit-page-layout">
@@ -1616,36 +1643,14 @@ function WorkspaceContent({
   }
 
   return renderPage(
-    <section className="content-grid">
-      <div className="content-column">
-        <PreTradeDoctorPanel
-          snapshot={snapshot}
-          onNavigate={onNavigate}
-          onReconcile={onReconcile}
-          onPreflight={onPreflight}
-          onWatchdog={onWatchdog}
-        />
-      </div>
-      <div className="content-column">
-        <ReconciliationSummaryPanel
-          apiConnected={snapshot.api_connected === true}
-          brokerTruth={snapshot.broker_position_truth}
-          reconciliation={snapshot.reconciliation}
-          programLedger={snapshot.program_ledger}
-          executionEvents={snapshot.execution_events}
-          recoveryPlan={snapshot.restart_recovery_plan}
-          onReconcile={onReconcile}
-          onProgramLedgerBaseline={onProgramLedgerBaseline}
-          onExecutionEvents={onExecutionEvents}
-        />
-        <UnifiedBrokerAccountPanel
-          accounts={snapshot.accounts ?? []}
-          executionEvents={snapshot.execution_events}
-          onRefresh={onAccountRefresh}
-          positions={snapshot.positions ?? []}
-          refreshDisabled={snapshot.api_connected !== true}
-        />
-      </div>
+    <section className="doctor-page-layout">
+      <PreTradeDoctorPanel
+        snapshot={snapshot}
+        onNavigate={onNavigate}
+        onReconcile={onReconcile}
+        onPreflight={onPreflight}
+        onWatchdog={onWatchdog}
+      />
     </section>,
   );
 }
@@ -1924,6 +1929,8 @@ function PortfolioArtifactPanel({
   const [replayRunning, setReplayRunning] = useState(false);
   const [operationResult, setOperationResult] = useState(null);
   const [filters, setFilters] = useState({ query: "", failure: "all", quick: "all" });
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
   const failureOptions = uniqueStrategyDiscoveryValues(portfolios.flatMap((portfolio) => liveArtifactFailureReasons(portfolio)));
   const visiblePortfolios = portfolios.filter((portfolio) => {
     const artifactId = portfolio.id || portfolio.source_path;
@@ -1941,6 +1948,21 @@ function PortfolioArtifactPanel({
       && (filters.failure === "all" || liveArtifactFailureReasons(portfolio).includes(filters.failure))
       && artifactMatchesQuickFilter(metadata, filters.quick, liveArtifactRunning(continuousRuntime, artifactId));
   });
+  const totalPages = Math.max(1, Math.ceil(visiblePortfolios.length / pageSize));
+  const currentPage = Math.min(Math.max(page, 1), totalPages);
+  const pageStart = (currentPage - 1) * pageSize;
+  const pageEnd = Math.min(visiblePortfolios.length, pageStart + pageSize);
+  const pagedPortfolios = visiblePortfolios.slice(pageStart, pageEnd);
+  const pageNumbers = paginationNumbers(currentPage, totalPages);
+
+  useEffect(() => {
+    setPage(1);
+  }, [filters.query, filters.failure, filters.quick, pageSize]);
+
+  useEffect(() => {
+    setPage((current) => Math.min(Math.max(current, 1), totalPages));
+  }, [totalPages]);
+
   async function replayPolicy() {
     setReplayRunning(true);
     try {
@@ -2011,7 +2033,7 @@ function PortfolioArtifactPanel({
       </div>
       <div className="portfolio-artifact-list">
         {visiblePortfolios.length ? (
-          visiblePortfolios.map((portfolio) => {
+          pagedPortfolios.map((portfolio) => {
             const permissions = portfolio.permissions ?? {};
             const targetCount = portfolio.target_portfolio?.length ?? 0;
             const strategyCount = portfolio.strategy_instances?.length ?? 0;
@@ -2033,6 +2055,36 @@ function PortfolioArtifactPanel({
         ) : (
           <EmptyRow text={portfolios.length ? "검색 조건에 맞는 portfolio artifact가 없습니다." : "저장된 portfolio artifact가 없습니다. 없을 때는 기존 단일 전략 게이트를 사용합니다."} />
         )}
+      </div>
+      <div className="portfolio-pagination-footer">
+        <span>
+          검색 결과 {visiblePortfolios.length.toLocaleString()}개
+          {visiblePortfolios.length ? ` · ${pageStart + 1}-${pageEnd}` : ""}
+        </span>
+        <div className="portfolio-pagination-controls" aria-label="포트폴리오 Artifact 페이지">
+          <label>
+            <span>페이지당</span>
+            <select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}>
+              {[10, 20, 50].map((size) => <option key={size} value={size}>{size}개</option>)}
+            </select>
+          </label>
+          <button disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)} type="button">이전</button>
+          {pageNumbers.map((pageNumber, index) => (
+            pageNumber === "gap" ? (
+              <span className="portfolio-pagination-gap" key={`gap-${index}`}>...</span>
+            ) : (
+              <button
+                className={pageNumber === currentPage ? "active" : ""}
+                key={pageNumber}
+                onClick={() => setPage(pageNumber)}
+                type="button"
+              >
+                {pageNumber}
+              </button>
+            )
+          ))}
+          <button disabled={currentPage >= totalPages} onClick={() => setPage(currentPage + 1)} type="button">다음</button>
+        </div>
       </div>
     </section>
   );
@@ -2101,8 +2153,8 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, o
     setHasRun(true);
     try {
       await onReconcile();
-      await onPreflight();
       await onWatchdog();
+      await onPreflight();
     } finally {
       setRunning(false);
     }
@@ -2192,7 +2244,7 @@ function buildDoctorItems(snapshot) {
       ["운영 체크리스트", "API 연결 후 현재 체크 상태를 확인합니다.", "gate"],
       ["리스크 한도", "API 연결 후 현재 리스크 한도를 확인합니다.", "gate"],
       ["전략 lifecycle eligibility", "API 연결 후 전략 승인 상태를 확인합니다.", "gate"],
-      ["포지션·계좌 대조", "API 연결 후 브로커 대조 상태를 확인합니다.", "overview"],
+      ["포지션·계좌 대조", "API 연결 후 브로커 대조 상태를 확인합니다.", "accounts"],
       ["Live Watchdog", "API 연결 후 Watchdog 상태를 확인합니다.", "automation"],
       ["최종 Preflight", "API 연결 후 최종 점검을 실행합니다.", "overview"],
     ];
@@ -2309,7 +2361,7 @@ function buildDoctorItems(snapshot) {
       detail: reconciliation.mismatch_count ? `불일치 ${reconciliation.mismatch_count}개가 있습니다.` : reconciliation.api_required_count ? `API 조회 필요 ${reconciliation.api_required_count}건이 있습니다.` : "계좌/포지션 대조가 정상입니다.",
       tone: reconciliation.mismatch_count ? "danger" : reconciliation.api_required_count ? "warning" : "success",
       status: reconciliation.mismatch_count ? "조치" : reconciliation.api_required_count ? "API" : "통과",
-      targetNav: "overview",
+      targetNav: "accounts",
       details: reconciliationDetails,
     },
     {
@@ -3391,98 +3443,20 @@ function BrokerRequirementsPanel({ brokers }) {
   );
 }
 
-function ReconciliationSummaryPanel({ apiConnected, brokerTruth, reconciliation, programLedger, executionEvents, recoveryPlan, onReconcile, onProgramLedgerBaseline, onExecutionEvents }) {
-  const summary = reconciliation?.summary ?? fallbackSnapshot.reconciliation.summary;
-  const actions = reconciliation?.next_actions ?? [];
-  const items = [
-    { label: "상태", value: summary.status_label, tone: statusTone(summary.status) },
-    { label: "포지션", value: summary.position_count, tone: "info" },
-    { label: "계좌", value: summary.account_count, tone: "info" },
-    { label: "API 필요", value: summary.api_required_count, tone: summary.api_required_count ? "warning" : "success" },
-    { label: "불일치", value: summary.mismatch_count, tone: summary.mismatch_count ? "danger" : "success" },
-    { label: "조회 오류", value: summary.error_count ?? 0, tone: summary.error_count ? "danger" : "success" },
-  ];
-  const ledger = programLedger ?? fallbackSnapshot.program_ledger;
-  const events = executionEvents ?? fallbackSnapshot.execution_events;
-  const truth = brokerTruth ?? fallbackSnapshot.broker_position_truth;
-  const recovery = recoveryPlan ?? fallbackSnapshot.restart_recovery_plan;
-  const ledgerItems = [
-    { label: "원장 현금", value: ledger.cash_count ?? 0, tone: ledger.cash_count ? "success" : "warning" },
-    { label: "원장 포지션", value: ledger.position_count ?? 0, tone: ledger.position_count ? "success" : "warning" },
-    { label: "체결 이벤트", value: ledger.execution_event_count ?? 0, tone: events.errors?.length ? "warning" : "info" },
-  ];
-  return (
-    <section className="panel reconciliation-panel">
-      <PanelHeader title="포지션·계좌 대조 요약" subtitle={`마지막 대조 ${summary.last_run}`} />
-      <div className="panel-action-line">
-        <StatusPill tone={statusTone(summary.status)}>{summary.status_label}</StatusPill>
-        <button className="mini-button" type="button" disabled={!apiConnected} onClick={onReconcile}>
-          <RefreshCcw size={14} />
-          대조 실행
-        </button>
-        <button className="mini-button" type="button" disabled={!apiConnected} onClick={onProgramLedgerBaseline}>
-          <DatabaseZap size={14} />
-          원장 기준 저장
-        </button>
-        <button className="mini-button" type="button" disabled={!apiConnected} onClick={() => onExecutionEvents("all")}>
-          <FileClock size={14} />
-          체결 동기화
-        </button>
-      </div>
-      <MetricGrid className="metric-grid">
-        {[...items, ...ledgerItems].map((item) => (
-          <MetricCard
-            className="metric-card"
-            detail={item.tone === "success" ? "정상" : "확인"}
-            detailClassName={`summary-state ${item.tone}`}
-            key={item.label}
-            label={item.label}
-            tone={item.tone}
-            value={item.value}
-          />
-        ))}
-      </MetricGrid>
-      <div className="next-actions">
-        {actions.map((action) => (
-          <span key={action}>{action}</span>
-        ))}
-      </div>
-      <div className="ledger-footnote">
-        <span>포지션 진실 원본: {truth.sourceOfTruth ?? "broker"} · {truth.newEntriesBlocked ? "신규 진입 차단" : "일치"}</span>
-        <span>프로그램 원장: {ledger.path ?? "-"}</span>
-        <span>마지막 체결 동기화: {events.last_poll ?? "미실행"}</span>
-        {events.errors?.length ? <span>이벤트 어댑터 확인 필요 {events.errors.length}건</span> : null}
-      </div>
-      <details className="operations-trace-disclosure">
-        <summary>
-          체결 Trace · 재시작 복구
-          <StatusPill tone={recovery.canResume ? "success" : "warning"}>{recovery.canResume ? "RESUME READY" : "MONITOR ONLY"}</StatusPill>
-        </summary>
-        <div className="operations-trace-list">
-          {(events.recent ?? []).slice(0, 6).map((event) => (
-            <article key={event.event_id}>
-              <strong>{event.symbol || event.broker_id} · {event.state}</strong>
-              <span>{event.trace_id || "legacy/no-trace"}</span>
-              <em>{event.occurred_at}</em>
-            </article>
-          ))}
-          {!(events.recent ?? []).length && <p>아직 체결 trace가 없습니다.</p>}
-          <p>
-            복구: {(recovery.actions ?? []).join(" · ")}
-            {(recovery.blockers ?? []).length ? ` / 차단 ${recovery.blockers.join(", ")}` : ""}
-          </p>
-        </div>
-      </details>
-    </section>
-  );
-}
-
 function numericDisplayValue(value) {
   const parsed = Number(String(value ?? "").replaceAll(",", "").replace(/[^0-9.+-]/g, ""));
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function UnifiedBrokerAccountPanel({ accounts, executionEvents, onRefresh, positions, refreshDisabled }) {
+function UnifiedBrokerAccountPanel({
+  accounts,
+  executionEvents,
+  onBaseline,
+  onRefresh,
+  positions,
+  reconciledAt,
+  refreshDisabled,
+}) {
   const accountRows = accounts.map((account) => ({
     id: account.broker_id,
     provider: account.broker_id,
@@ -3496,54 +3470,48 @@ function UnifiedBrokerAccountPanel({ accounts, executionEvents, onRefresh, posit
     tone: statusTone(account.status),
   }));
   const positionRows = positions
-    .filter((position) => numericDisplayValue(position.broker_qty) > 0 || numericDisplayValue(position.program_qty) > 0)
-    .map((position) => ({
-      id: `${position.broker_id}:${position.symbol}`,
-      provider: position.broker_id,
-      providerLabel: position.broker_name,
-      symbol: position.symbol,
-      name: position.asset,
-      quantity: position.broker_qty,
-      averagePrice: position.average_price_display || "조회 정보 없음",
-      currentPrice: position.current_price_display || "조회 정보 없음",
-      evaluation: position.broker_value_display || "평가 대기",
-      profitLoss: position.status === "pass" ? "원장 일치" : `대조 Δ ${position.delta_qty}`,
-      profitLossTone: position.status === "pass" ? "success" : "danger",
-    }));
+    .filter((position) => Math.abs(numericDisplayValue(position.broker_qty)) > 0 || Math.abs(numericDisplayValue(position.program_qty)) > 0)
+    .map((position) => {
+      const positionSide = String(position.position_side || position.positionSide || "").toUpperCase();
+      return {
+        id: `${position.broker_id}:${position.symbol}:${positionSide || "NET"}`,
+        provider: position.broker_id,
+        providerLabel: position.broker_name,
+        symbol: position.symbol,
+        name: `${position.asset}${positionSide ? ` · ${positionSide}` : ""}`,
+        quantity: position.broker_qty,
+        averagePrice: position.average_price_display || "조회 정보 없음",
+        currentPrice: position.current_price_display || "조회 정보 없음",
+        evaluation: position.broker_value_display || "평가 대기",
+        profitLoss: position.status === "pass" ? "원장 일치" : `대조 Δ ${position.delta_qty}`,
+        profitLossTone: position.status === "pass" ? "success" : "danger",
+      };
+    });
   return (
-    <BrokerAccountWorkspace
-      accounts={accountRows}
-      autoRefreshLabel="10초 자동 갱신"
-      className="live-unified-account-panel"
-      emptyMessage="KIS·Binance·Upbit에 현재 보유 포지션이 없습니다."
-      onRefresh={onRefresh}
-      positions={positionRows}
-      refreshDisabled={refreshDisabled}
-      subtitle="KIS·Binance·Upbit의 실제 계좌 잔고와 보유 포지션을 같은 형식으로 표시합니다."
-      title="내 계좌·보유 포지션"
-      updatedAt={executionEvents?.last_poll ?? "미조회"}
-    />
-  );
-}
-
-function AccountReconciliationPanel({ accounts }) {
-  return (
-    <section className="panel account-panel">
-      <PanelHeader title="계좌 현금 대조" subtitle="프로그램 원장과 브로커 계좌 현금성 잔고를 비교합니다." />
-      <div className="account-list">
-        {accounts.map((account) => (
-          <div className="account-row" key={account.broker_id}>
-            <WalletCards size={16} />
-            <div>
-              <strong>{account.account}</strong>
-              <span>{account.broker_name} · {account.currency}</span>
-            </div>
-            <em>{account.program_cash} / {account.broker_cash}</em>
-            <StatusPill tone={statusTone(account.status)}>{account.status_label}</StatusPill>
-          </div>
-        ))}
+    <>
+      <BrokerAccountWorkspace
+        accounts={accountRows}
+        autoRefreshLabel="10초 자동 갱신·대조"
+        className="live-unified-account-panel"
+        emptyMessage="KIS·Binance Spot/Futures·Upbit에 현재 보유 포지션이 없습니다."
+        onRefresh={onRefresh}
+        positions={positionRows}
+        refreshDisabled={refreshDisabled}
+        subtitle="KIS·Binance Spot/Futures·Upbit의 실제 계좌 잔고와 보유 포지션을 같은 형식으로 표시합니다."
+        title="내 계좌·보유 포지션"
+        updatedAt={reconciledAt ?? executionEvents?.last_poll ?? "미조회"}
+      />
+      <div className="account-baseline-toolbar">
+        <div>
+          <strong>프로그램 기준 원장</strong>
+          <span>자동 갱신은 원장을 덮어쓰지 않습니다. 확인한 현재 계좌를 새 기준으로 삼을 때만 승인하세요.</span>
+        </div>
+        <button className="secondary-button" disabled={refreshDisabled} onClick={onBaseline} type="button">
+          <ShieldCheck size={15} />
+          현재 계좌를 기준 원장으로 승인
+        </button>
       </div>
-    </section>
+    </>
   );
 }
 
@@ -3847,6 +3815,22 @@ function StrategyDiscoveryToolbar({
 
 function artifactMetadataKey(artifactId, artifactType = "strategy") {
   return `${artifactType === "portfolio" ? "portfolio" : "strategy"}:${String(artifactId || "").trim()}`;
+}
+
+function paginationNumbers(currentPage, totalPages) {
+  if (totalPages <= 7) {
+    return Array.from({ length: totalPages }, (_, index) => index + 1);
+  }
+  const pages = [1];
+  const start = Math.max(2, currentPage - 1);
+  const end = Math.min(totalPages - 1, currentPage + 1);
+  if (start > 2) pages.push("gap");
+  for (let page = start; page <= end; page += 1) {
+    pages.push(page);
+  }
+  if (end < totalPages - 1) pages.push("gap");
+  pages.push(totalPages);
+  return pages;
 }
 
 function liveArtifactFailureReasons(artifact) {

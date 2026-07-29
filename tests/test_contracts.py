@@ -551,6 +551,44 @@ class StrategyContractTest(unittest.TestCase):
             else:
                 os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact
 
+    def test_portfolio_artifacts_load_beyond_legacy_limit_and_dedupe_mirrors(self) -> None:
+        previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                primary = Path(tmp) / "primary"
+                mirror = Path(tmp) / "mirror"
+                primary_portfolios = primary / "portfolios"
+                mirror_portfolios = mirror / "portfolios"
+                primary_portfolios.mkdir(parents=True)
+                mirror_portfolios.mkdir(parents=True)
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = os.pathsep.join((str(primary), str(mirror)))
+
+                for index in range(25):
+                    payload = {
+                        "artifactType": "portfolio",
+                        "schemaVersion": "portfolio-artifact-v1",
+                        "id": f"portfolio-{index:02d}",
+                        "name": f"Portfolio {index:02d}",
+                    }
+                    encoded = json.dumps(payload, ensure_ascii=False)
+                    (primary_portfolios / f"portfolio-{index:02d}.json").write_text(encoded, encoding="utf-8")
+                    if index == 0:
+                        (mirror_portfolios / "portfolio-00.json").write_text(encoded, encoding="utf-8")
+
+                portfolios = load_portfolio_artifacts()
+                limited = load_portfolio_artifacts(limit=10)
+                empty = load_portfolio_artifacts(limit=0)
+
+            self.assertEqual(len(portfolios), 25)
+            self.assertEqual(len({portfolio["id"] for portfolio in portfolios}), 25)
+            self.assertEqual(len(limited), 10)
+            self.assertEqual(empty, [])
+        finally:
+            if previous_artifact is None:
+                os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
+            else:
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact
+
 
 if __name__ == "__main__":
     unittest.main()

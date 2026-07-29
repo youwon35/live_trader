@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -533,8 +534,12 @@ def portfolio_artifact_dirs() -> list[Path]:
     return _dedupe_paths([folder / "portfolios" for folder in strategy_artifact_dirs()])
 
 
-def load_portfolio_artifacts(limit: int = 16) -> list[dict[str, Any]]:
+def load_portfolio_artifacts(limit: int | None = None) -> list[dict[str, Any]]:
+    effective_limit = None if limit is None else max(0, int(limit))
+    if effective_limit == 0:
+        return []
     artifacts: list[dict[str, Any]] = []
+    seen_payloads: set[str] = set()
     for folder in portfolio_artifact_dirs():
         if not folder.exists():
             continue
@@ -549,9 +554,15 @@ def load_portfolio_artifacts(limit: int = 16) -> list[dict[str, Any]]:
                 continue
             if payload.get("artifactType") != "portfolio" and payload.get("schemaVersion") != "portfolio-artifact-v1":
                 continue
+            fingerprint = hashlib.sha256(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if fingerprint in seen_payloads:
+                continue
+            seen_payloads.add(fingerprint)
             payload["_source_path"] = str(path)
             artifacts.append(normalize_portfolio_artifact(payload))
-            if len(artifacts) >= limit:
+            if effective_limit is not None and len(artifacts) >= effective_limit:
                 return artifacts
     return artifacts
 

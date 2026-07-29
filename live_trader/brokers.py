@@ -183,18 +183,41 @@ def spec_by_id(broker_id: str) -> dict[str, object] | None:
     return next((spec for spec in BROKER_SPECS if spec["broker_id"] == broker_id), None)
 
 
+def broker_order_adapter_implemented(spec: dict[str, object]) -> bool:
+    """Return whether the broker's signed place-order capability exists.
+
+    The real-order environment switch is a runtime lock, not evidence about
+    whether adapter code has been implemented.  Keeping those concepts
+    separate prevents Doctor from reporting a false "adapter missing" error
+    merely because the operator has left the route disabled.
+    """
+
+    capabilities = spec.get("capabilities")
+    if not isinstance(capabilities, tuple):
+        return False
+    return any(
+        str(capability[0]) == "place_order" and capability[2] is True
+        for capability in capabilities
+        if isinstance(capability, tuple) and len(capability) >= 3
+    )
+
+
 def broker_readiness() -> list[BrokerReadiness]:
     rows: list[BrokerReadiness] = []
     adapter_enabled = real_orders_enabled()
     for spec in BROKER_SPECS:
         required = tuple(spec["required_env"])
         missing = tuple(name for name in required if not os.getenv(name, "").strip())
+        adapter_implemented = broker_order_adapter_implemented(spec)
         if missing:
             status: BrokerStatus = "missing_credentials"
             detail = "실거래 API 키/계좌 환경 변수가 비어 있습니다."
         elif not adapter_enabled:
+            status = "disabled"
+            detail = "주문 어댑터는 구현되어 있지만 LIVE_TRADER_ENABLE_REAL_ORDERS 잠금이 꺼져 있습니다."
+        elif not adapter_implemented:
             status = "adapter_required"
-            detail = "환경 변수는 준비될 수 있지만 LIVE_TRADER_ENABLE_REAL_ORDERS=true와 실제 주문 어댑터 검증이 필요합니다."
+            detail = "실주문 서명/전송 어댑터 구현이 필요합니다."
         else:
             status = "connected"
             detail = "주문 요청 생성 어댑터가 준비되었습니다. 계좌/포지션 대조와 운영 게이트를 통과해야 전송됩니다."
@@ -206,7 +229,7 @@ def broker_readiness() -> list[BrokerReadiness]:
                 status=status,
                 required_env=required,
                 missing_env=missing,
-                live_order_adapter_ready=not missing and adapter_enabled,
+                live_order_adapter_ready=adapter_implemented,
                 detail=detail,
             )
         )
@@ -219,6 +242,7 @@ def broker_diagnostics(broker_id: str | None = None) -> list[dict[str, Any]]:
     adapter_enabled = real_orders_enabled()
     for spec in selected:
         required = tuple(spec["required_env"])
+        adapter_implemented = broker_order_adapter_implemented(spec)
         env_rows = [
             {
                 "name": name,
@@ -255,19 +279,27 @@ def broker_diagnostics(broker_id: str | None = None) -> list[dict[str, Any]]:
             {
                 "key": "adapter_code",
                 "label": "주문 어댑터",
-                "status": "pass" if adapter_enabled else "fail",
-                "detail": "주문 요청 생성 어댑터가 활성화되어 있습니다." if adapter_enabled else "실제 주문 어댑터는 LIVE_TRADER_ENABLE_REAL_ORDERS=true일 때만 활성화됩니다.",
+                "status": "pass" if adapter_implemented else "fail",
+                "detail": "서명된 주문 요청 생성·전송 어댑터가 구현되어 있습니다." if adapter_implemented else "실주문 서명/전송 어댑터 구현이 필요합니다.",
             },
             {
                 "key": "network_probe",
-                "label": "네트워크 Probe",
-                "status": "warn",
-                "detail": "실제 HTTP/WebSocket Probe는 서명 어댑터 구현 후 수행합니다.",
+                "label": "실계좌 Read-only Probe",
+                "status": "info",
+                "detail": "실제 연결 성공 여부는 Doctor의 계좌·포지션 새로고침/대조 evidence로 판정합니다. 주문 제출은 별도 canary와 lifecycle 게이트를 통과해야 합니다.",
             },
         ]
         fail_count = sum(1 for step in steps if step["status"] == "fail")
         warn_count = sum(1 for step in steps if step["status"] == "warn")
-        status: BrokerStatus = "missing_credentials" if missing else "connected" if adapter_enabled else "adapter_required"
+        status: BrokerStatus = (
+            "missing_credentials"
+            if missing
+            else "adapter_required"
+            if not adapter_implemented
+            else "connected"
+            if adapter_enabled
+            else "disabled"
+        )
         rows.append(
             {
                 "broker_id": spec["broker_id"],
@@ -606,11 +638,19 @@ def broker_snapshot_events(accounts: list[dict[str, object]], positions: list[di
     for position in positions:
         broker_id = str(position.get("broker_id") or "kis")
         symbol = str(position.get("symbol") or "")
+        position_side = str(
+            position.get("position_side")
+            or position.get("positionSide")
+            or ""
+        ).strip().upper()
         qty = numeric_value(position.get("broker_qty"), 0.0)
         value = numeric_value(position.get("broker_value"), 0.0)
         events.append(
             {
-                "event_id": f"{broker_id}:position:{symbol}:{occurred_at}",
+                "event_id": (
+                    f"{broker_id}:position:{symbol}:"
+                    f"{position_side or 'NET'}:{occurred_at}"
+                ),
                 "broker_id": broker_id,
                 "order_id": "",
                 "broker_order_id": "",
@@ -622,6 +662,8 @@ def broker_snapshot_events(accounts: list[dict[str, object]], positions: list[di
                 "occurred_at": occurred_at,
                 "asset": position.get("asset", ""),
                 "currency": position.get("currency", ""),
+                "position_side": position_side,
+                "positionSide": position_side,
                 "detail": position.get("detail", ""),
             }
         )
@@ -778,6 +820,7 @@ def parse_binance_futures_positions(
                 "average_price": first_numeric(row, "entryPrice"),
                 "current_price": mark_price,
                 "position_side": position_side,
+                "positionSide": position_side,
                 "unrealized_profit": first_numeric(
                     row,
                     "unRealizedProfit",

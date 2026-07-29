@@ -139,6 +139,14 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path == "/api/doctor-diagnostics":
+            self.send_json(
+                {
+                    "ok": True,
+                    "doctor_diagnostics": state.doctor_diagnostics_document(),
+                }
+            )
+            return
         self.serve_static(parsed.path)
 
     def do_POST(self) -> None:

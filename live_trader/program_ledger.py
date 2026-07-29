@@ -19,6 +19,18 @@ def numeric_value(value: object, default: float = 0.0) -> float:
         return default
 
 
+def normalized_position_side(row: dict[str, Any]) -> str:
+    broker_id = str(row.get("broker_id") or "").strip().lower()
+    if broker_id != "binance-futures":
+        return ""
+    value = str(
+        row.get("position_side")
+        or row.get("positionSide")
+        or ""
+    ).strip().upper()
+    return value if value in {"BOTH", "LONG", "SHORT"} else ""
+
+
 class ProgramLedger:
     """Small local ledger for live account/position/event reconciliation."""
 
@@ -61,16 +73,76 @@ class ProgramLedger:
                 CREATE TABLE IF NOT EXISTS positions (
                     broker_id TEXT NOT NULL,
                     symbol TEXT NOT NULL,
+                    position_side TEXT NOT NULL DEFAULT '',
                     asset TEXT NOT NULL,
                     currency TEXT NOT NULL,
                     quantity REAL NOT NULL,
                     value REAL NOT NULL,
                     updated_at TEXT NOT NULL,
                     source TEXT NOT NULL,
-                    PRIMARY KEY (broker_id, symbol)
+                    PRIMARY KEY (broker_id, symbol, position_side)
                 )
                 """
             )
+            position_columns = {
+                str(row[1]): int(row[5] or 0)
+                for row in conn.execute(
+                    "PRAGMA table_info(positions)"
+                ).fetchall()
+            }
+            position_primary_key = [
+                name
+                for name, _ in sorted(
+                    (
+                        (str(row[1]), int(row[5] or 0))
+                        for row in conn.execute(
+                            "PRAGMA table_info(positions)"
+                        ).fetchall()
+                        if int(row[5] or 0) > 0
+                    ),
+                    key=lambda item: item[1],
+                )
+            ]
+            if (
+                "position_side" not in position_columns
+                or position_primary_key
+                != ["broker_id", "symbol", "position_side"]
+            ):
+                side_expression = (
+                    "COALESCE(position_side, '')"
+                    if "position_side" in position_columns
+                    else "''"
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE positions_position_side_v2 (
+                        broker_id TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        position_side TEXT NOT NULL DEFAULT '',
+                        asset TEXT NOT NULL,
+                        currency TEXT NOT NULL,
+                        quantity REAL NOT NULL,
+                        value REAL NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        PRIMARY KEY (broker_id, symbol, position_side)
+                    )
+                    """
+                )
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO positions_position_side_v2
+                    (broker_id, symbol, position_side, asset, currency,
+                     quantity, value, updated_at, source)
+                    SELECT broker_id, symbol, {side_expression}, asset,
+                           currency, quantity, value, updated_at, source
+                    FROM positions
+                    """
+                )
+                conn.execute("DROP TABLE positions")
+                conn.execute(
+                    "ALTER TABLE positions_position_side_v2 RENAME TO positions"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS execution_events (
@@ -108,9 +180,10 @@ class ProgramLedger:
         with self.connection() as conn:
             rows = conn.execute(
                 """
-                SELECT broker_id, symbol, asset, currency, quantity, value, updated_at, source
+                SELECT broker_id, symbol, position_side, asset, currency,
+                       quantity, value, updated_at, source
                 FROM positions
-                ORDER BY broker_id, symbol
+                ORDER BY broker_id, symbol, position_side
                 """
             ).fetchall()
         return [dict(row) for row in rows]
@@ -201,7 +274,7 @@ class ProgramLedger:
 
     def replace_position_rows(self, rows: list[dict[str, Any]], source: str) -> int:
         updated_at = now_text()
-        prepared: list[tuple[str, str, str, str, float, float, str, str]] = []
+        prepared: list[tuple[str, str, str, str, str, float, float, str, str]] = []
         for row in rows:
             broker_id = str(row.get("broker_id") or "").strip()
             symbol = str(row.get("symbol") or "").strip()
@@ -211,6 +284,7 @@ class ProgramLedger:
                 (
                     broker_id,
                     symbol,
+                    normalized_position_side(row),
                     str(row.get("asset") or ""),
                     str(row.get("currency") or ""),
                     numeric_value(row.get("broker_qty", row.get("quantity", 0.0))),
@@ -224,8 +298,9 @@ class ProgramLedger:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO positions
-                (broker_id, symbol, asset, currency, quantity, value, updated_at, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (broker_id, symbol, position_side, asset, currency, quantity,
+                 value, updated_at, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 prepared,
             )
@@ -234,7 +309,7 @@ class ProgramLedger:
     def sync_position_rows(self, rows: list[dict[str, Any]], broker_ids: list[str], source: str) -> int:
         updated_at = now_text()
         selected_brokers = [broker_id for broker_id in {str(item).strip() for item in broker_ids} if broker_id]
-        prepared: list[tuple[str, str, str, str, float, float, str, str]] = []
+        prepared: list[tuple[str, str, str, str, str, float, float, str, str]] = []
         for row in rows:
             broker_id = str(row.get("broker_id") or "").strip()
             symbol = str(row.get("symbol") or "").strip()
@@ -244,6 +319,7 @@ class ProgramLedger:
                 (
                     broker_id,
                     symbol,
+                    normalized_position_side(row),
                     str(row.get("asset") or ""),
                     str(row.get("currency") or ""),
                     numeric_value(row.get("broker_qty", row.get("quantity", 0.0))),
@@ -260,8 +336,9 @@ class ProgramLedger:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO positions
-                (broker_id, symbol, asset, currency, quantity, value, updated_at, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (broker_id, symbol, position_side, asset, currency, quantity,
+                 value, updated_at, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 prepared,
             )

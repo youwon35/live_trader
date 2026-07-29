@@ -149,6 +149,32 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
         self.assertEqual(-0.02, positions[0]["broker_qty"])
         self.assertEqual(1280.0, positions[0]["broker_value"])
         self.assertEqual("binance-futures", positions[0]["broker_id"])
+        self.assertEqual("SHORT", positions[0]["position_side"])
+        self.assertEqual("SHORT", positions[0]["positionSide"])
+
+    def test_hedge_mode_long_and_short_legs_keep_distinct_sides(self) -> None:
+        positions = parse_binance_futures_positions(
+            [
+                {
+                    "symbol": "BTCUSDT",
+                    "positionSide": "LONG",
+                    "positionAmt": "0.03",
+                    "entryPrice": "64000",
+                    "markPrice": "65000",
+                },
+                {
+                    "symbol": "BTCUSDT",
+                    "positionSide": "SHORT",
+                    "positionAmt": "0.02",
+                    "entryPrice": "66000",
+                    "markPrice": "65000",
+                },
+            ]
+        )
+
+        self.assertEqual(2, len(positions))
+        self.assertEqual(["LONG", "SHORT"], [row["position_side"] for row in positions])
+        self.assertEqual([0.03, -0.02], [row["broker_qty"] for row in positions])
 
     def test_account_and_execution_update_are_normalized(self) -> None:
         accounts = parse_binance_futures_accounts(

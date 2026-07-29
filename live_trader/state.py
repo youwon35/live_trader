@@ -240,6 +240,10 @@ CHECKLIST_ITEMS: tuple[dict[str, object], ...] = (
         "required": True,
     },
 )
+MACHINE_VERIFIABLE_CHECKLIST_KEYS = {
+    "api_keys_reviewed",
+    "position_reconcile_reviewed",
+}
 
 RETRY_POLICY_META: dict[str, dict[str, object]] = {
     "max_attempts": {
@@ -340,6 +344,15 @@ ACCOUNT_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
         "detail": "Binance signed account endpoint가 연결되어야 현금성 잔고를 대조합니다.",
     },
     {
+        "broker_id": "binance-futures",
+        "broker_name": "Binance USD-M Futures",
+        "account": "Binance Futures",
+        "currency": "USDT",
+        "program_cash": None,
+        "broker_cash": None,
+        "detail": "Binance USD-M Futures signed account endpoint가 연결되어야 선물 지갑 잔고를 대조합니다.",
+    },
+    {
         "broker_id": "upbit",
         "broker_name": "Upbit",
         "account": "Upbit KRW",
@@ -352,11 +365,20 @@ ACCOUNT_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
 
 FINAL_ORDER_STATES = {"dry_run", "sent", "filled", "canceled", "retry_exhausted"}
 AUDIT_LOG_LIMIT = 500
+DOCTOR_DIAGNOSTIC_HISTORY_LIMIT = 50
 BROKER_SNAPSHOT_ACTIVE_INTERVAL_SECONDS = 30.0
 BROKER_SNAPSHOT_IDLE_INTERVAL_SECONDS = 300.0
 BROKER_SNAPSHOT_MAX_BACKOFF_SECONDS = 1800.0
 EXECUTION_SUMMARY_AUDIT_INTERVAL_SECONDS = 900.0
 APP_DATA_ROOT = default_runtime_data_root()
+DOCTOR_DIAGNOSTICS_PATH = Path(
+    os.environ.get("LIVE_TRADER_DOCTOR_DIAGNOSTICS")
+    or APP_DATA_ROOT / "logs" / "doctor-diagnostics.json"
+)
+OPERATOR_CHECKLIST_PATH = Path(
+    os.environ.get("LIVE_TRADER_OPERATOR_CHECKLIST")
+    or APP_DATA_ROOT / "logs" / "operator-checklist.json"
+)
 AUDIT_DB_PATH = Path(os.environ.get("LIVE_TRADER_AUDIT_DB") or APP_DATA_ROOT / "logs" / "live_trader_audit.sqlite3")
 AUDIT_STORE = SQLiteAuditEventStore(AUDIT_DB_PATH)
 PROGRAM_LEDGER_PATH = Path(
@@ -372,6 +394,51 @@ DEFAULT_WATCHDOG_SETTINGS: dict[str, float] = {
     "max_retryable_orders": 3.0,
     "max_blocked_orders": 5.0,
 }
+DOCTOR_DIAGNOSTICS_LOCK = threading.RLock()
+OPERATOR_CHECKLIST_LOCK = threading.RLock()
+
+
+def read_json_document(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def write_json_document(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically persist a strict JSON document in the runtime data root."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def load_operator_checklist_values() -> dict[str, bool]:
+    with OPERATOR_CHECKLIST_LOCK:
+        payload = read_json_document(OPERATOR_CHECKLIST_PATH)
+    values = payload.get("values") if isinstance(payload.get("values"), dict) else {}
+    return {
+        str(item["key"]): bool(values.get(str(item["key"]), False))
+        for item in CHECKLIST_ITEMS
+    }
+
+
+def persist_operator_checklist_values(values: dict[str, object]) -> None:
+    document = {
+        "schema_version": 1,
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "values": {
+            str(item["key"]): bool(values.get(str(item["key"]), False))
+            for item in CHECKLIST_ITEMS
+        },
+    }
+    with OPERATOR_CHECKLIST_LOCK:
+        write_json_document(OPERATOR_CHECKLIST_PATH, document)
 
 
 @dataclass(frozen=True)
@@ -393,7 +460,7 @@ STATE: dict[str, Any] = {
     "manual_new_entries_blocked": False,
     "operator_confirmed": False,
     "risk_settings": dict(DEFAULT_RISK_SETTINGS),
-    "checklist": {str(item["key"]): False for item in CHECKLIST_ITEMS},
+    "checklist": load_operator_checklist_values(),
     "retry_policy": dict(DEFAULT_RETRY_POLICY),
     "automation": {
         "stock": {"enabled": False, "provider": "kis", "mode": "MONITOR", "last_action": "대기"},
@@ -437,6 +504,8 @@ STATE: dict[str, Any] = {
         "recorded_count": 0,
         "synced_cash_count": 0,
         "synced_position_count": 0,
+        "observed_cash_count": 0,
+        "observed_position_count": 0,
         "snapshot_changed_brokers": [],
         "snapshot_skipped_brokers": [],
     },
@@ -485,9 +554,9 @@ STATE: dict[str, Any] = {
     "audit": [
         {
             "time": "08:57:04",
-            "level": "warn",
-            "event": "실거래 주문 어댑터 대기",
-            "detail": "KIS/Binance signed order adapter가 구현/검증되기 전까지 모든 주문은 차단됩니다.",
+            "level": "info",
+            "event": "실거래 안전 게이트",
+            "detail": "서명 주문 어댑터는 구현되어 있으며 환경 잠금·전략 승인·대조·리스크 게이트를 모두 통과해야 전송됩니다.",
         },
         {
             "time": "08:55:42",
@@ -1712,10 +1781,9 @@ def readiness_checks(
 ) -> list[Check]:
     live_ready_count = sum(1 for strategy in strategies if strategy.get("live_allowed") is True)
     full_live_ready_count = sum(1 for strategy in strategies if strategy.get("live_eligible") is True)
-    full_live_ready_count = sum(1 for strategy in strategies if strategy.get("live_eligible") is True)
     missing_brokers = [broker for broker in brokers if broker["status"] == "missing_credentials"]
     adapter_blocked = [broker for broker in brokers if broker["live_order_adapter_ready"] is not True]
-    checklist = checklist_rows()
+    checklist = checklist_rows(reconciliation_summary)
     checklist_missing = [item for item in checklist if item["required"] and not item["checked"]]
     reconcile_blocking = int(reconciliation_summary["api_required_count"]) + int(reconciliation_summary["mismatch_count"])
     central_control = durable_control_snapshot()
@@ -1789,6 +1857,32 @@ def risk_checks(reconciliation_summary: dict[str, Any] | None = None) -> list[di
         reconciliation_summary = reconciliation_snapshot()["summary"]
     reconcile_status = str(reconciliation_summary["status"])
     reconcile_risk_status = "pass" if reconcile_status == "pass" else "fail" if reconcile_status == "fail" else "warn"
+    active_live = live_exposure_active()
+    market_data_age = seconds_since(STATE["strategy_runner"].get("last_run"))
+    stale_limit = int(
+        float(
+            STATE["watchdog"].get("settings", DEFAULT_WATCHDOG_SETTINGS).get(
+                "market_data_stale_sec",
+                DEFAULT_WATCHDOG_SETTINGS["market_data_stale_sec"],
+            )
+        )
+    )
+    if not active_live:
+        data_delay_status: CheckStatus = "pass"
+        data_delay_value = "MONITOR"
+        data_delay_detail = "실거래 자동화가 비활성이라 데이터 신선도 경고를 적용하지 않습니다."
+    elif market_data_age is None:
+        data_delay_status = "warn"
+        data_delay_value = "미실행"
+        data_delay_detail = "활성 자동화의 최근 완료 봉 처리 이력이 없습니다."
+    elif market_data_age > stale_limit:
+        data_delay_status = "fail"
+        data_delay_value = f"{market_data_age}초"
+        data_delay_detail = f"시장 데이터가 허용 지연 {stale_limit}초를 넘었습니다."
+    else:
+        data_delay_status = "pass"
+        data_delay_value = f"{market_data_age}초"
+        data_delay_detail = f"시장 데이터가 허용 지연 {stale_limit}초 안에 있습니다."
     return [
         {
             "label": "일일 손실 한도",
@@ -1808,7 +1902,12 @@ def risk_checks(reconciliation_summary: dict[str, Any] | None = None) -> list[di
             "status": "pass",
             "detail": "같은 전략/심볼/방향 주문 반복을 차단합니다.",
         },
-        {"label": "데이터 지연", "value": "15초", "status": "warn", "detail": "실시간 시세 WebSocket 연결 후 실제 지연 시간을 측정해야 합니다."},
+        {
+            "label": "데이터 지연",
+            "value": data_delay_value,
+            "status": data_delay_status,
+            "detail": data_delay_detail,
+        },
         {
             "label": "슬리피지 한도",
             "value": f"{settings['max_slippage_bps']:.0f} bps",
@@ -1850,12 +1949,42 @@ def live_account_rows() -> dict[str, dict[str, object]]:
     return {str(item.get("broker_id")): item for item in rows if isinstance(item, dict)}
 
 
-def live_position_rows() -> dict[tuple[str, str], dict[str, object]]:
+def normalized_reconciliation_position_side(
+    item: dict[str, Any],
+    *,
+    source: str,
+) -> str:
+    broker_id = str(item.get("broker_id") or "").strip().lower()
+    if broker_id != "binance-futures":
+        return ""
+    value = str(
+        item.get("position_side")
+        or item.get("positionSide")
+        or ""
+    ).strip().upper()
+    if value in {"BOTH", "LONG", "SHORT"}:
+        return value
+    return "LEGACY" if source == "program" else "UNSPECIFIED"
+
+
+def position_reconciliation_key(
+    item: dict[str, Any],
+    *,
+    source: str,
+) -> tuple[str, str, str]:
+    return (
+        str(item.get("broker_id") or ""),
+        str(item.get("symbol") or ""),
+        normalized_reconciliation_position_side(item, source=source),
+    )
+
+
+def live_position_rows() -> dict[tuple[str, str, str], dict[str, object]]:
     rows = STATE.get("broker_reconciliation", {}).get("positions", [])
     if not isinstance(rows, list):
         return {}
     return {
-        (str(item.get("broker_id")), str(item.get("symbol"))): item
+        position_reconciliation_key(item, source="broker"): item
         for item in rows
         if isinstance(item, dict) and item.get("broker_id") and item.get("symbol")
     }
@@ -1865,9 +1994,9 @@ def program_cash_rows() -> dict[str, dict[str, Any]]:
     return {str(item.get("broker_id")): item for item in PROGRAM_LEDGER.cash_rows() if item.get("broker_id")}
 
 
-def program_position_rows() -> dict[tuple[str, str], dict[str, Any]]:
+def program_position_rows() -> dict[tuple[str, str, str], dict[str, Any]]:
     return {
-        (str(item.get("broker_id")), str(item.get("symbol"))): item
+        position_reconciliation_key(item, source="program"): item
         for item in PROGRAM_LEDGER.position_rows()
         if item.get("broker_id") and item.get("symbol")
     }
@@ -1893,6 +2022,8 @@ def execution_event_snapshot() -> dict[str, Any]:
         "recorded_count": int(state.get("recorded_count", 0)),
         "synced_cash_count": int(state.get("synced_cash_count", 0)),
         "synced_position_count": int(state.get("synced_position_count", 0)),
+        "observed_cash_count": int(state.get("observed_cash_count", 0)),
+        "observed_position_count": int(state.get("observed_position_count", 0)),
         "snapshot_changed_brokers": list(state.get("snapshot_changed_brokers", [])),
         "snapshot_skipped_brokers": list(state.get("snapshot_skipped_brokers", [])),
         "snapshot_poll": redact_sensitive_payload(STATE.get("broker_snapshot_poll", {})),
@@ -1902,10 +2033,15 @@ def execution_event_snapshot() -> dict[str, Any]:
 
 
 def broker_position_truth_snapshot(reconciliation: dict[str, Any] | None = None) -> dict[str, Any]:
+    def truth_symbol(item: dict[str, Any], source: str) -> str:
+        symbol = str(item.get("symbol") or "")
+        side = normalized_reconciliation_position_side(item, source=source)
+        return f"{symbol}::{side}" if side else symbol
+
     expected = [
         PositionTruth(
             broker_id=str(item.get("broker_id") or ""),
-            symbol=str(item.get("symbol") or ""),
+            symbol=truth_symbol(item, "program"),
             quantity=safe_float(item.get("quantity"), 0.0),
             captured_at=str(item.get("updated_at") or ""),
         )
@@ -1915,7 +2051,7 @@ def broker_position_truth_snapshot(reconciliation: dict[str, Any] | None = None)
     broker = [
         PositionTruth(
             broker_id=str(item.get("broker_id") or ""),
-            symbol=str(item.get("symbol") or ""),
+            symbol=truth_symbol(item, "broker"),
             quantity=safe_float(item.get("broker_qty", item.get("quantity")), 0.0),
             captured_at=str(item.get("updated_at") or STATE.get("broker_reconciliation", {}).get("fetched_at") or ""),
         )
@@ -2208,6 +2344,10 @@ def _publish_forced_restore_positions(
                     [
                         {
                             "symbol": str(row.get("symbol") or ""),
+                            "positionSide": normalized_reconciliation_position_side(
+                                row,
+                                source="broker",
+                            ),
                             "quantity": _restore_quantity(row),
                             "averagePrice": safe_float(
                                 row.get("average_price"),
@@ -2216,7 +2356,10 @@ def _publish_forced_restore_positions(
                         }
                         for row in rows
                     ],
-                    key=lambda item: item["symbol"],
+                    key=lambda item: (
+                        item["symbol"],
+                        item["positionSide"],
+                    ),
                 ),
             }),
         }
@@ -2376,6 +2519,25 @@ def forced_restore_context_assessment(
                 str(event.get("symbol") or ""),
             ) == canonical
         ]
+        active_broker_sides = {
+            normalized_reconciliation_position_side(
+                row,
+                source="broker",
+            )
+            for row in matching_broker
+            if abs(_restore_quantity(row)) > 1e-12
+        }
+        dual_side_ambiguous = (
+            broker_id == "binance-futures"
+            and len(active_broker_sides) > 1
+        )
+        if dual_side_ambiguous:
+            error = (
+                "binance-futures:dual-side-position-ambiguous:"
+                f"{canonical}:{','.join(sorted(active_broker_sides))}"
+            )
+            if error not in errors:
+                errors.append(error)
         broker_qty = sum(_restore_quantity(row) for row in matching_broker)
         ledger_qty = sum(
             safe_float(row.get("quantity"), 0.0)
@@ -2386,7 +2548,10 @@ def forced_restore_context_assessment(
             if broker_id in {"binance", "binance-futures", "upbit"}
             else 0.0
         )
-        broker_flat = abs(broker_qty) <= tolerance
+        broker_flat = (
+            abs(broker_qty) <= tolerance
+            and not dual_side_ambiguous
+        )
         ledger_flat = abs(ledger_qty) <= tolerance
         all_broker_flat = all_broker_flat and broker_flat
         all_ledger_flat = all_ledger_flat and ledger_flat
@@ -2437,6 +2602,10 @@ def forced_restore_context_assessment(
                 "accountScope": route["accountScope"],
                 "exchange": route["exchange"],
                 "canonicalInstrument": canonical,
+                "positionSide": normalized_reconciliation_position_side(
+                    row,
+                    source="broker",
+                ),
                 "quantity": _restore_quantity(row),
                 "averagePrice": safe_float(row.get("average_price"), 0.0),
             }
@@ -2446,6 +2615,10 @@ def forced_restore_context_assessment(
             {
                 "brokerId": broker_id,
                 "canonicalInstrument": canonical,
+                "positionSide": normalized_reconciliation_position_side(
+                    row,
+                    source="program",
+                ),
                 "quantity": safe_float(row.get("quantity"), 0.0),
                 "value": safe_float(row.get("value"), 0.0),
                 "updatedAt": str(row.get("updated_at") or ""),
@@ -2485,6 +2658,7 @@ def forced_restore_context_assessment(
                     "occurredAt": str(latest_fill.get("occurred_at") or ""),
                 },
                 "positionContextComplete": position_context_complete,
+                "dualSideAmbiguous": dual_side_ambiguous,
             }
         )
 
@@ -2494,6 +2668,7 @@ def forced_restore_context_assessment(
             key=lambda item: (
                 item["brokerId"],
                 item["canonicalInstrument"],
+                item["positionSide"],
                 item["quantity"],
             ),
         )
@@ -2505,6 +2680,7 @@ def forced_restore_context_assessment(
                 key=lambda item: (
                     item["brokerId"],
                     item["canonicalInstrument"],
+                    item["positionSide"],
                 ),
             ),
             "fills": sorted(
@@ -2641,7 +2817,7 @@ def positions() -> list[dict[str, str]]:
     errors = broker_reconciliation_errors()
     successful_brokers = successful_position_brokers()
     for item in POSITION_RECONCILIATION_BOOK:
-        key = (str(item["broker_id"]), str(item["symbol"]))
+        key = (str(item["broker_id"]), str(item["symbol"]), "")
         broker_row = broker_rows.pop(key, None)
         ledger_row = ledger_rows.pop(key, None)
         broker_qty = broker_row.get("broker_qty") if broker_row else item["broker_qty"]
@@ -2681,6 +2857,10 @@ def positions() -> list[dict[str, str]]:
                 "broker_id": str(item["broker_id"]),
                 "broker_name": str(item["broker_name"]),
                 "currency": str(item["currency"]),
+                "position_side": normalized_reconciliation_position_side(
+                    broker_row or ledger_row or item,
+                    source="broker" if broker_row else "program",
+                ),
                 "program_qty": format_quantity(program_qty),
                 "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "미지원" if capability_unavailable else "API 필요",
                 "broker_value_display": format_money(broker_row.get("broker_value"), str(item["currency"])) if broker_row and safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
@@ -2696,10 +2876,33 @@ def positions() -> list[dict[str, str]]:
     for key, ledger_row in sorted(ledger_rows.items()):
         broker_row = broker_rows.pop(key, None)
         broker_qty = broker_row.get("broker_qty") if broker_row else None
-        if broker_qty is None and str(ledger_row.get("broker_id")) in successful_brokers:
+        position_side = normalized_reconciliation_position_side(
+            ledger_row,
+            source="program",
+        )
+        legacy_side = (
+            str(ledger_row.get("broker_id") or "").strip().lower()
+            == "binance-futures"
+            and position_side == "LEGACY"
+        )
+        if (
+            broker_qty is None
+            and str(ledger_row.get("broker_id")) in successful_brokers
+            and not legacy_side
+        ):
             broker_qty = 0.0
         program_qty = float(ledger_row.get("quantity") or 0.0)
-        if broker_qty is None:
+        if legacy_side:
+            status = "mismatch"
+            status_label = "불일치"
+            delta_qty = "-"
+            detail = (
+                "레거시 프로그램 원장에 position side가 없어 Binance "
+                "Futures Hedge Mode LONG/SHORT 포지션과 안전하게 대조할 수 "
+                "없습니다. 계좌·포지션을 새로 갱신해 원장을 side별로 "
+                "재구성해야 합니다."
+            )
+        elif broker_qty is None:
             status = "api_required"
             status_label = "API 필요"
             delta_qty = "-"
@@ -2718,6 +2921,7 @@ def positions() -> list[dict[str, str]]:
                 "broker_id": str(ledger_row.get("broker_id")),
                 "broker_name": str(ledger_row.get("broker_id")),
                 "currency": str(ledger_row.get("currency") or ""),
+                "position_side": position_side,
                 "program_qty": format_quantity(program_qty),
                 "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "API 필요",
                 "broker_value_display": format_money(broker_row.get("broker_value"), str(ledger_row.get("currency") or "")) if broker_row and safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
@@ -2730,10 +2934,19 @@ def positions() -> list[dict[str, str]]:
                 "detail": detail,
             }
         )
-    for (_, _), broker_row in sorted(broker_rows.items()):
+    for (_, _, _), broker_row in sorted(broker_rows.items()):
         broker_qty = float(broker_row.get("broker_qty") or 0.0)
-        if broker_qty <= 0:
+        if abs(broker_qty) <= 0.000000000001:
             continue
+        position_side = normalized_reconciliation_position_side(
+            broker_row,
+            source="broker",
+        )
+        side_unspecified = (
+            str(broker_row.get("broker_id") or "").strip().lower()
+            == "binance-futures"
+            and position_side == "UNSPECIFIED"
+        )
         rows.append(
             {
                 "symbol": str(broker_row.get("symbol")),
@@ -2741,6 +2954,7 @@ def positions() -> list[dict[str, str]]:
                 "broker_id": str(broker_row.get("broker_id")),
                 "broker_name": str(broker_row.get("broker_name") or broker_row.get("broker_id")),
                 "currency": str(broker_row.get("currency") or ""),
+                "position_side": position_side,
                 "program_qty": "0",
                 "broker_qty": format_quantity(broker_qty),
                 "broker_value_display": format_money(broker_row.get("broker_value"), str(broker_row.get("currency") or "")) if safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
@@ -2750,7 +2964,16 @@ def positions() -> list[dict[str, str]]:
                 "status": "mismatch",
                 "status_label": "불일치",
                 "program_source": "missing",
-                "detail": f"브로커에는 보유 수량이 있지만 프로그램 포지션 원장에는 없습니다. {broker_row.get('detail', '')}".strip(),
+                "detail": (
+                    "Binance Futures 포지션 side가 없어 LONG/SHORT를 구분할 "
+                    "수 없습니다. 신규 진입을 차단하고 계정의 positionSide를 "
+                    "다시 조회해야 합니다."
+                    if side_unspecified
+                    else (
+                        "브로커에는 보유 수량이 있지만 프로그램 포지션 "
+                        f"원장에는 없습니다. {broker_row.get('detail', '')}"
+                    ).strip()
+                ),
             }
         )
     return rows
@@ -2911,18 +3134,113 @@ def risk_setting_rows() -> list[dict[str, object]]:
     return rows
 
 
-def checklist_rows() -> list[dict[str, object]]:
-    values = STATE["checklist"]
-    return [
-        {
-            "key": str(item["key"]),
-            "label": str(item["label"]),
-            "detail": str(item["detail"]),
-            "required": bool(item["required"]),
-            "checked": bool(values.get(str(item["key"]), False)),
-        }
-        for item in CHECKLIST_ITEMS
+def automatic_checklist_evidence(
+    reconciliation_summary: dict[str, Any] | None = None,
+) -> dict[str, tuple[bool, str]]:
+    """Return objective checklist facts that can be verified by the runtime.
+
+    Human acknowledgements (risk-plan review and manual takeover readiness)
+    intentionally remain manual.  API/account and reconciliation checks are
+    derived from fresh broker evidence so a restart cannot turn a completed
+    machine-verifiable check red.
+    """
+
+    broker_rows = [broker.to_dict() for broker in broker_readiness()]
+    credentials_ready = bool(broker_rows) and all(
+        not broker.get("missing_env")
+        for broker in broker_rows
+    )
+    broker_cache = STATE.get("broker_reconciliation", {})
+    successful_accounts = {
+        str(item)
+        for item in (
+            broker_cache.get("successful_account_brokers", [])
+            if isinstance(broker_cache, dict)
+            else []
+        )
+    }
+    expected_accounts = {"kis", "binance", "binance-futures", "upbit"}
+    account_errors = [
+        item
+        for item in (
+            broker_cache.get("errors", [])
+            if isinstance(broker_cache, dict)
+            and isinstance(broker_cache.get("errors"), list)
+            else []
+        )
+        if str(item.get("scope") or "") in {"account", "snapshot"}
     ]
+    account_verified = (
+        credentials_ready
+        and expected_accounts.issubset(successful_accounts)
+        and not account_errors
+    )
+
+    summary = (
+        reconciliation_summary
+        if isinstance(reconciliation_summary, dict)
+        else reconciliation_snapshot().get("summary", {})
+    )
+    reconciliation_verified = (
+        str(summary.get("status")) == "pass"
+        and int(summary.get("blocking_count") or 0) == 0
+        and str(summary.get("last_run") or "") not in {"", "미실행"}
+    )
+    return {
+        "api_keys_reviewed": (
+            account_verified,
+            (
+                "필수 인증정보와 KIS·Binance Spot/Futures·Upbit 실계좌 조회를 확인했습니다."
+                if account_verified
+                else "필수 인증정보와 4개 실계좌 조회가 모두 성공해야 자동 확인됩니다."
+            ),
+        ),
+        "position_reconcile_reviewed": (
+            reconciliation_verified,
+            (
+                f"최근 자동 대조가 정상입니다: {summary.get('last_run')}."
+                if reconciliation_verified
+                else "최근 계좌·포지션 자동 대조가 정상이어야 자동 확인됩니다."
+            ),
+        ),
+    }
+
+
+def checklist_rows(
+    reconciliation_summary: dict[str, Any] | None = None,
+) -> list[dict[str, object]]:
+    values = STATE["checklist"]
+    automatic = automatic_checklist_evidence(reconciliation_summary)
+    rows: list[dict[str, object]] = []
+    for item in CHECKLIST_ITEMS:
+        key = str(item["key"])
+        manual_checked = bool(values.get(key, False))
+        automatic_checked, evidence = automatic.get(key, (False, ""))
+        machine_verifiable = key in MACHINE_VERIFIABLE_CHECKLIST_KEYS
+        checked = automatic_checked if machine_verifiable else manual_checked
+        source = (
+            "automatic"
+            if machine_verifiable and automatic_checked
+            else "failed"
+            if machine_verifiable
+            else "manual"
+            if manual_checked
+            else "pending"
+        )
+        rows.append(
+            {
+                "key": key,
+                "label": str(item["label"]),
+                "detail": evidence if machine_verifiable and evidence else str(item["detail"]),
+                "required": bool(item["required"]),
+                "checked": checked,
+                "manual_checked": manual_checked,
+                "automatic_checked": automatic_checked,
+                "source": source,
+                "evidence": evidence,
+            }
+        )
+    return rows
 
 
 def retry_policy_rows() -> list[dict[str, object]]:
@@ -3028,12 +3346,20 @@ def watchdog_snapshot(
     heartbeat_timeout = int(float(settings.get("heartbeat_timeout_sec", DEFAULT_WATCHDOG_SETTINGS["heartbeat_timeout_sec"])))
     heartbeat_age = seconds_since(STATE["watchdog"].get("last_run"), current)
     if heartbeat_age is None:
-        heartbeat_status: CheckStatus = "fail" if active_live else "warn"
-        heartbeat_detail = "Watchdog 점검 이력이 없습니다. 자동화 전 첫 점검이 필요합니다."
+        heartbeat_status: CheckStatus = "fail" if active_live else "pass"
+        heartbeat_detail = (
+            "Watchdog 점검 이력이 없습니다. 활성 자동화는 시작할 수 없습니다."
+            if active_live
+            else "MONITOR 상태에서는 Watchdog heartbeat 미실행을 경고로 계산하지 않습니다."
+        )
         heartbeat_value = "미실행"
     elif heartbeat_age > heartbeat_timeout:
-        heartbeat_status = "fail" if active_live else "warn"
-        heartbeat_detail = f"마지막 Watchdog 점검이 {heartbeat_age}초 전입니다. 허용 {heartbeat_timeout}초를 넘었습니다."
+        heartbeat_status = "fail" if active_live else "pass"
+        heartbeat_detail = (
+            f"마지막 Watchdog 점검이 {heartbeat_age}초 전이며 활성 운용 한도 {heartbeat_timeout}초를 넘었습니다."
+            if active_live
+            else f"MONITOR 상태이므로 {heartbeat_age}초 전 heartbeat를 운용 경고로 계산하지 않습니다."
+        )
         heartbeat_value = f"{heartbeat_age}초"
     else:
         heartbeat_status = "pass"
@@ -3071,8 +3397,8 @@ def watchdog_snapshot(
         data_detail = f"최근 전략/시장 데이터가 {runner_age}초 전입니다. 허용 {stale_limit}초를 넘었습니다."
         data_value = f"{runner_age}초"
     elif runner_age is None:
-        data_status = "warn"
-        data_detail = "아직 전략 사이클이 실행되지 않았습니다. 자동화 전 신호 경로를 점검하세요."
+        data_status = "pass"
+        data_detail = "MONITOR 상태에서는 전략 사이클 미실행을 시장 데이터 경고로 계산하지 않습니다."
         data_value = "미실행"
     else:
         data_status = "pass"
@@ -3093,8 +3419,12 @@ def watchdog_snapshot(
         broker_value = f"{len(blocked) - len(unavailable)}/{len(blocked)}"
     else:
         unavailable = [broker for broker in brokers if not broker.get("order_ready")]
-        broker_status = "warn" if unavailable else "pass"
-        broker_detail = "활성 자동화 라우트는 없지만 준비되지 않은 브로커가 있습니다." if unavailable else "비활성 상태이며 브로커 준비 경고가 없습니다."
+        broker_status = "pass"
+        broker_detail = (
+            "활성 자동화 라우트가 없어 브로커 주문 준비 상태를 운용 경고로 계산하지 않습니다."
+            if unavailable
+            else "비활성 상태이며 브로커 준비 경고가 없습니다."
+        )
         broker_value = "비활성"
     checks.append(watchdog_check("브로커/API 상태", broker_status, broker_detail, broker_value))
 
@@ -3312,13 +3642,13 @@ def final_preflight_checks(
     brokers: list[dict[str, object]],
     reconciliation: dict[str, Any],
 ) -> list[dict[str, str]]:
-    checklist = checklist_rows()
+    reconcile_summary = reconciliation["summary"]
+    checklist = checklist_rows(reconcile_summary)
     checklist_missing = [item for item in checklist if item["required"] and not item["checked"]]
     live_ready_count = sum(1 for strategy in strategies if strategy.get("live_allowed") is True)
     full_live_ready_count = sum(1 for strategy in strategies if strategy.get("live_eligible") is True)
     adapter_blocked = [broker for broker in brokers if broker["live_order_adapter_ready"] is not True]
     missing_brokers = [broker for broker in brokers if broker["status"] == "missing_credentials"]
-    reconcile_summary = reconciliation["summary"]
     queue = order_queue_summary()
     return [
         {
@@ -3398,7 +3728,293 @@ def launch_report(preflight: list[dict[str, str]]) -> dict[str, Any]:
         "full_live_status": full_live_status,
         "lock_reason": lock_reason,
         "next_actions": [check["label"] for check in hard_stops[:6]] or [check["label"] for check in warnings[:6]] or ["SMALL_LIVE 소액 승인 검토"],
+        "hard_stops": hard_stops,
+        "warnings": warnings,
     }
+
+
+DOCTOR_ISSUE_META: dict[tuple[str, str], tuple[str, str, str]] = {
+    ("preflight", "실거래 환경 변수"): (
+        "PREFLIGHT_REAL_ORDER_ROUTE_DISABLED",
+        "settings",
+        "설정에서 실거래 라우트를 명시적으로 확인해 활성화하고 프로그램을 다시 점검하세요.",
+    ),
+    ("preflight", "브로커 API 키"): (
+        "PREFLIGHT_BROKER_CREDENTIALS_MISSING",
+        "settings",
+        "누락된 브로커 인증정보를 보호 저장소에 저장한 뒤 계좌 조회를 다시 실행하세요.",
+    ),
+    ("preflight", "브로커 주문 어댑터"): (
+        "PREFLIGHT_BROKER_ADAPTER_UNAVAILABLE",
+        "settings",
+        "해당 브로커의 서명 주문 어댑터 구현·테스트 상태를 확인하세요.",
+    ),
+    ("preflight", "포지션·계좌 대조"): (
+        "PREFLIGHT_RECONCILIATION_BLOCKED",
+        "accounts",
+        "계좌와 보유 포지션을 새로고침해 자동 대조하고 불일치 또는 조회 오류를 해소하세요.",
+    ),
+    ("preflight", "전략 승인"): (
+        "PREFLIGHT_STRATEGY_LIFECYCLE_INELIGIBLE",
+        "gate",
+        "Shadow와 Paper의 전진 검증 evidence를 충족한 전략만 Live-Small 단계로 승격하세요.",
+    ),
+    ("preflight", "필수 운영 체크리스트"): (
+        "PREFLIGHT_OPERATOR_CHECKLIST_INCOMPLETE",
+        "gate",
+        "자동 확인되지 않는 운용자 검토 항목을 실제 절차 수행 후 직접 확인하세요.",
+    ),
+    ("preflight", "Kill Switch"): (
+        "PREFLIGHT_KILL_SWITCH_ACTIVE",
+        "overview",
+        "차단 원인을 확인하고 안전할 때만 Kill Switch를 해제하세요.",
+    ),
+    ("preflight", "운용자 확인"): (
+        "PREFLIGHT_OPERATOR_CONFIRMATION_REQUIRED",
+        "gate",
+        "첫 실주문 전 운용 범위와 손실 한도를 확인하고 운용자 확인을 완료하세요.",
+    ),
+    ("preflight", "Dry Run 보호"): (
+        "PREFLIGHT_DRY_RUN_DISABLED",
+        "gate",
+        "실제 제출이 필요하지 않은 점검 중에는 Dry Run을 유지하세요.",
+    ),
+    ("preflight", "주문 큐 잔여"): (
+        "PREFLIGHT_RETRYABLE_ORDERS_PENDING",
+        "logs",
+        "재시도 주문의 원인과 현재 브로커 상태를 확인한 뒤 재시도 또는 취소하세요.",
+    ),
+    ("risk", "데이터 지연"): (
+        "RISK_MARKET_DATA_STALE",
+        "automation",
+        "활성 전략 런타임의 완료 봉 처리와 feed heartbeat를 복구하세요.",
+    ),
+    ("risk", "포지션 불일치"): (
+        "RISK_POSITION_TRUTH_UNVERIFIED",
+        "accounts",
+        "브로커 계좌·포지션을 새로고침하고 프로그램 원장과 자동 대조하세요.",
+    ),
+    ("watchdog", "Watchdog heartbeat"): (
+        "WATCHDOG_HEARTBEAT_STALE",
+        "automation",
+        "Watchdog를 다시 실행하고 백그라운드 감시 스레드가 정상인지 확인하세요.",
+    ),
+    ("watchdog", "시장 데이터 신선도"): (
+        "WATCHDOG_MARKET_DATA_STALE",
+        "automation",
+        "전략 런타임과 완료 봉 feed를 시작하거나 마지막 오류를 해결하세요.",
+    ),
+    ("watchdog", "브로커/API 상태"): (
+        "WATCHDOG_BROKER_ROUTE_UNAVAILABLE",
+        "settings",
+        "활성 자동화에 선택한 브로커의 인증정보·계좌 조회·라우트 잠금을 확인하세요.",
+    ),
+    ("watchdog", "체결 이벤트 동기화"): (
+        "WATCHDOG_EXECUTION_SYNC_STALE",
+        "accounts",
+        "사설 체결 스트림 또는 read-only 폴링을 복구한 뒤 계좌 대조를 다시 실행하세요.",
+    ),
+}
+
+
+def doctor_issue_metadata(
+    source: str,
+    label: str,
+) -> tuple[str, str, str]:
+    configured = DOCTOR_ISSUE_META.get((source, label))
+    if configured:
+        return configured
+    digest = hashlib.sha256(f"{source}:{label}".encode("utf-8")).hexdigest()[:10].upper()
+    related_tab = "automation" if source == "watchdog" else "gate"
+    return (
+        f"{source.upper()}_{digest}",
+        related_tab,
+        "세부 evidence를 확인하고 관련 탭에서 원인을 해소한 뒤 Doctor를 다시 실행하세요.",
+    )
+
+
+def make_doctor_issue(
+    *,
+    source: str,
+    label: str,
+    status: str,
+    evidence: str,
+    problem: str | None = None,
+    issue_code: str | None = None,
+    related_tab: str | None = None,
+    remediation: str | None = None,
+) -> dict[str, str]:
+    configured_code, configured_tab, configured_remediation = doctor_issue_metadata(source, label)
+    normalized = str(status).lower()
+    return {
+        "issue_code": issue_code or configured_code,
+        "severity": "hard_stop" if normalized == "fail" else "warning",
+        "source": source,
+        "problem": problem or label,
+        "evidence": audit_clip(evidence, 1000),
+        "remediation": remediation or configured_remediation,
+        "related_tab": related_tab or configured_tab,
+    }
+
+
+def build_doctor_diagnostic_snapshot(data: dict[str, Any]) -> dict[str, Any]:
+    issues: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(issue: dict[str, str]) -> None:
+        code = issue["issue_code"]
+        if code in seen:
+            return
+        seen.add(code)
+        issues.append(issue)
+
+    for check in data.get("final_preflight", []):
+        if not isinstance(check, dict) or check.get("status") not in {"fail", "warn"}:
+            continue
+        add(
+            make_doctor_issue(
+                source="preflight",
+                label=str(check.get("label") or "최종 점검"),
+                status=str(check.get("status")),
+                problem=f"{check.get('label')}: 점검을 통과하지 못했습니다.",
+                evidence=str(check.get("detail") or ""),
+            )
+        )
+
+    for item in data.get("checklist", []):
+        if not isinstance(item, dict) or item.get("checked") is True:
+            continue
+        required = item.get("required") is True
+        label = str(item.get("label") or item.get("key") or "운영 체크리스트")
+        key = str(item.get("key") or "unknown").upper()
+        add(
+            make_doctor_issue(
+                source="checklist",
+                label=label,
+                status="fail" if required else "warn",
+                problem=f"{label}: {'필수 확인이 남았습니다.' if required else '선택 확인이 남았습니다.'}",
+                evidence=str(item.get("evidence") or item.get("detail") or ""),
+                issue_code=f"CHECKLIST_{key}_PENDING",
+                related_tab="gate",
+                remediation=(
+                    "자동 확인 대상은 계좌를 새로고침하고, 운용자 판단 대상은 실제 절차를 수행한 뒤 체크하세요."
+                ),
+            )
+        )
+
+    for check in data.get("risk_checks", []):
+        if not isinstance(check, dict) or check.get("status") not in {"fail", "warn"}:
+            continue
+        add(
+            make_doctor_issue(
+                source="risk",
+                label=str(check.get("label") or "리스크 점검"),
+                status=str(check.get("status")),
+                problem=f"{check.get('label')}: 리스크 점검이 필요합니다.",
+                evidence=f"{check.get('detail') or ''} 현재 값: {check.get('value') or '-'}",
+            )
+        )
+
+    watchdog = data.get("watchdog") if isinstance(data.get("watchdog"), dict) else {}
+    for check in watchdog.get("checks", []):
+        if not isinstance(check, dict) or check.get("status") not in {"fail", "warn"}:
+            continue
+        add(
+            make_doctor_issue(
+                source="watchdog",
+                label=str(check.get("label") or "Watchdog"),
+                status=str(check.get("status")),
+                problem=f"{check.get('label')}: 감시 상태를 확인해야 합니다.",
+                evidence=f"{check.get('detail') or ''} 관측값: {check.get('value') or '-'}",
+            )
+        )
+
+    reconciliation = data.get("reconciliation") if isinstance(data.get("reconciliation"), dict) else {}
+    for index, error in enumerate(reconciliation.get("errors", [])):
+        if not isinstance(error, dict):
+            continue
+        broker_id = str(error.get("broker_id") or "unknown")
+        scope = str(error.get("scope") or "snapshot")
+        add(
+            make_doctor_issue(
+                source="reconciliation",
+                label=f"{broker_id} {scope}",
+                status="fail",
+                problem=f"{broker_id} 계좌·포지션 조회 오류",
+                evidence=str(error.get("detail") or "브로커 조회 오류"),
+                issue_code=f"RECONCILIATION_{broker_id.upper().replace('-', '_')}_{scope.upper()}_{index + 1}",
+                related_tab="accounts",
+                remediation="브로커 권한·네트워크·계정 범위를 확인하고 계좌를 다시 새로고침하세요.",
+            )
+        )
+
+    issues.sort(key=lambda issue: (0 if issue["severity"] == "hard_stop" else 1, issue["issue_code"]))
+    hard_stop_count = sum(1 for issue in issues if issue["severity"] == "hard_stop")
+    warning_count = len(issues) - hard_stop_count
+    generated_at = datetime.now().astimezone().isoformat(timespec="microseconds")
+    digest = hashlib.sha256(
+        json.dumps(issues, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    reconciliation_summary = reconciliation.get("summary") if isinstance(reconciliation.get("summary"), dict) else {}
+    return {
+        "schema_version": 1,
+        "run_id": f"{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{digest[:10]}",
+        "generated_at": generated_at,
+        "summary": {
+            "status": "blocked" if hard_stop_count else "warning" if warning_count else "pass",
+            "hard_stop_count": hard_stop_count,
+            "warning_count": warning_count,
+            "issue_count": len(issues),
+        },
+        "context": {
+            "mode": str(data.get("mode") or "MONITOR"),
+            "dry_run": bool(data.get("dry_run", True)),
+            "real_orders_enabled": real_orders_enabled(),
+            "reconciliation_status": str(reconciliation_summary.get("status") or "unknown"),
+            "reconciliation_last_run": str(reconciliation_summary.get("last_run") or "미실행"),
+            "live_strategy_count": int(data.get("summary", {}).get("live_strategy_count") or 0),
+            "full_live_strategy_count": int(data.get("summary", {}).get("full_live_strategy_count") or 0),
+        },
+        "issues": issues,
+    }
+
+
+def doctor_diagnostics_document(*, include_history: bool = True) -> dict[str, Any]:
+    with DOCTOR_DIAGNOSTICS_LOCK:
+        payload = read_json_document(DOCTOR_DIAGNOSTICS_PATH)
+    history = payload.get("history") if isinstance(payload.get("history"), list) else []
+    latest = payload.get("latest") if isinstance(payload.get("latest"), dict) else None
+    return {
+        "schema_version": 1,
+        "path": str(DOCTOR_DIAGNOSTICS_PATH),
+        "history_limit": DOCTOR_DIAGNOSTIC_HISTORY_LIMIT,
+        "history_count": len(history),
+        "latest": latest,
+        "history": history if include_history else [],
+    }
+
+
+def persist_doctor_diagnostic_snapshot(data: dict[str, Any]) -> dict[str, Any]:
+    report = build_doctor_diagnostic_snapshot(data)
+    with DOCTOR_DIAGNOSTICS_LOCK:
+        current = read_json_document(DOCTOR_DIAGNOSTICS_PATH)
+        history = current.get("history") if isinstance(current.get("history"), list) else []
+        history = [
+            item
+            for item in history
+            if isinstance(item, dict) and item.get("run_id") != report["run_id"]
+        ]
+        history.append(report)
+        history = history[-DOCTOR_DIAGNOSTIC_HISTORY_LIMIT:]
+        document = {
+            "schema_version": 1,
+            "updated_at": report["generated_at"],
+            "latest": report,
+            "history": history,
+        }
+        safe_document = redact_sensitive_payload(document)
+        write_json_document(DOCTOR_DIAGNOSTICS_PATH, safe_document)
+    return doctor_diagnostics_document()
 
 
 def snapshot() -> dict[str, Any]:
@@ -3442,7 +4058,7 @@ def snapshot() -> dict[str, Any]:
         "watchdog": watchdog,
         "risk_checks": risk_checks(reconciliation["summary"]),
         "risk_settings": risk_setting_rows(),
-        "checklist": checklist_rows(),
+        "checklist": checklist_rows(reconciliation["summary"]),
         "retry_policy": retry_policy_rows(),
         "order_queue": queue,
         "brokers": brokers,
@@ -3484,6 +4100,7 @@ def snapshot() -> dict[str, Any]:
         "operation_report": report,
         "final_preflight": preflight,
         "launch_report": launch,
+        "doctor_diagnostics": doctor_diagnostics_document(include_history=False),
         "audit": list(reversed(STATE["audit"][-30:])),
     }
     return redact_sensitive_payload(payload)  # type: ignore[return-value]
@@ -4609,7 +5226,17 @@ def set_checklist_item(name: str, value: bool) -> dict[str, Any]:
     item = keys.get(name)
     if not item:
         return {"ok": False, "reason": "unknown checklist item", "snapshot": snapshot()}
+    previous = bool(STATE["checklist"].get(name, False))
     STATE["checklist"][name] = bool(value)
+    try:
+        persist_operator_checklist_values(STATE["checklist"])
+    except OSError as exc:
+        STATE["checklist"][name] = previous
+        return {
+            "ok": False,
+            "reason": f"체크리스트 저장에 실패했습니다: {exc}",
+            "snapshot": snapshot(),
+        }
     append_audit("info" if value else "warn", "운영 체크리스트", f"{item['label']} 확인 값이 {bool(value)}(으)로 변경되었습니다.")
     return {"ok": True, "reason": "checklist changed", "snapshot": snapshot()}
 
@@ -5337,7 +5964,14 @@ def queue_live_order_lifecycle_notification(
 
 def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[str]) -> int:
     positions_by_key = {
-        (str(item.get("broker_id") or "").lower(), str(item.get("symbol") or "").upper()): item
+        (
+            str(item.get("broker_id") or "").lower(),
+            str(item.get("symbol") or "").upper(),
+            normalized_reconciliation_position_side(
+                item,
+                source="program",
+            ),
+        ): item
         for item in PROGRAM_LEDGER.position_rows()
     }
     cash_by_broker: dict[str, list[dict[str, Any]]] = {}
@@ -5355,7 +5989,24 @@ def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[
         broker_id = str(event.get("broker_id") or "").lower()
         symbol = str(event.get("symbol") or "").upper()
         side = str(event.get("side") or (event.get("raw") or {}).get("side") or "").upper()
-        position = positions_by_key.get((broker_id, symbol), {})
+        event_position_side = normalized_reconciliation_position_side(
+            {
+                "broker_id": broker_id,
+                "position_side": (
+                    event.get("position_side")
+                    or event.get("positionSide")
+                    or (event.get("raw") or {}).get("position_side")
+                    or (event.get("raw") or {}).get("positionSide")
+                ),
+            },
+            source="broker",
+        )
+        position = positions_by_key.get(
+            (broker_id, symbol, event_position_side),
+            {},
+        )
+        if not position and broker_id != "binance-futures":
+            position = positions_by_key.get((broker_id, symbol, ""), {})
         position_after = safe_float(position.get("quantity"), 0.0)
         if side == "BUY":
             position_before = max(0.0, position_after - quantity)
@@ -5570,13 +6221,21 @@ def stable_broker_snapshot_digest(
             [
                 {
                     "symbol": str(item.get("symbol") or ""),
+                    "position_side": normalized_reconciliation_position_side(
+                        item,
+                        source="broker",
+                    ),
                     "currency": str(item.get("currency") or ""),
                     "quantity": safe_float(item.get("broker_qty", item.get("quantity")), 0.0),
                     "value": safe_float(item.get("broker_value", item.get("value")), 0.0),
                 }
                 for item in positions_data
             ],
-            key=lambda item: (item["symbol"], item["currency"]),
+            key=lambda item: (
+                item["symbol"],
+                item["position_side"],
+                item["currency"],
+            ),
         ),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -5835,16 +6494,16 @@ def poll_execution_events(
         item for item in snapshot_positions
         if str(item.get("broker_id") or "") in changed_snapshot_brokers
     ]
-    synced = (
-        PROGRAM_LEDGER.sync_broker_snapshot(
-            changed_accounts,
-            changed_positions,
-            sorted(changed_snapshot_brokers),
-            source="event_poll",
-        )
-        if changed_snapshot_brokers
-        else {"cash_count": 0, "position_count": 0}
-    )
+    # Broker snapshots are observations, not program-ledger truth.  Copying a
+    # changed broker snapshot into the expected ledger here makes the
+    # reconciliation that immediately follows compare the broker with its own
+    # just-copied values, hiding deposits, manual orders, or other drift.
+    # Establishing a broker-derived baseline remains an explicit operator
+    # action through seed_program_ledger_from_broker_snapshot().
+    observed = {
+        "cash_count": len(changed_accounts),
+        "position_count": len(changed_positions),
+    }
     merge_broker_reconciliation_cache(
         snapshot_accounts,
         snapshot_positions,
@@ -5858,8 +6517,10 @@ def poll_execution_events(
         "event_count": len(events),
         "recorded_count": recorded,
         "local_order_update_count": local_order_updates,
-        "synced_cash_count": int(synced.get("cash_count", 0)),
-        "synced_position_count": int(synced.get("position_count", 0)),
+        "synced_cash_count": 0,
+        "synced_position_count": 0,
+        "observed_cash_count": int(observed["cash_count"]),
+        "observed_position_count": int(observed["position_count"]),
         "snapshot_changed_brokers": sorted(changed_snapshot_brokers),
         "snapshot_skipped_brokers": sorted(skipped_snapshot_brokers),
     }
@@ -5891,7 +6552,8 @@ def poll_execution_events(
             (
                 f"신규 체결 이벤트 {new_event_count}건, "
                 f"변경된 계좌 snapshot {len(changed_snapshot_brokers)}개 broker, "
-                f"원장 현금 {synced.get('cash_count', 0)}개/포지션 {synced.get('position_count', 0)}개 동기화, "
+                f"브로커 현금 {observed['cash_count']}개/포지션 {observed['position_count']}개 관측"
+                "(프로그램 원장 미변경), "
                 f"오류 {len(errors)}건"
             ),
         )
@@ -7018,6 +7680,7 @@ def run_final_preflight() -> dict[str, Any]:
     data = snapshot()
     hard_stop_count = int(data["launch_report"]["hard_stop_count"])
     warning_count = int(data["launch_report"]["warning_count"])
+    doctor_diagnostics = persist_doctor_diagnostic_snapshot(data)
     append_audit(
         "danger" if hard_stop_count else "warn" if warning_count else "info",
         "최종 Preflight",
@@ -7026,6 +7689,7 @@ def run_final_preflight() -> dict[str, Any]:
     return {
         "ok": True,
         "reason": f"최종 점검 완료: hard stop {hard_stop_count}개, warning {warning_count}개",
+        "doctor_diagnostics": doctor_diagnostics,
         "snapshot": snapshot(),
     }
 
@@ -7532,6 +8196,19 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
             str(
                 metadata.get("broker_id")
                 or broker_id_from_symbol(intent.symbol, intent.asset)
+            ),
+            str(
+                metadata.get("position_side")
+                or metadata.get("positionSide")
+                or (
+                    "SHORT"
+                    if str(metadata.get("position_direction") or "").lower()
+                    == "short"
+                    else "LONG"
+                    if str(metadata.get("position_direction") or "").lower()
+                    == "long"
+                    else ""
+                )
             ),
         ),
         risk_reducing_verified=metadata.get("risk_reducing") is True,
@@ -8392,7 +9069,11 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
     }
 
 
-def broker_position_quantity(symbol: str, broker_id: str = "") -> float:
+def broker_position_quantity(
+    symbol: str,
+    broker_id: str = "",
+    position_side: str = "",
+) -> float:
     positions = STATE.get("broker_reconciliation", {}).get("positions", [])
     normalized_symbol = (
         str(symbol or "")
@@ -8406,11 +9087,8 @@ def broker_position_quantity(symbol: str, broker_id: str = "") -> float:
         if normalized_symbol.endswith(quote_currency) and len(normalized_symbol) > len(quote_currency):
             aliases.add(normalized_symbol[: -len(quote_currency)])
             break
-    return sum(
-        safe_float(
-            item.get("quantity"),
-            safe_float(item.get("qty"), safe_float(item.get("broker_qty"), 0.0)),
-        )
+    matching_positions = [
+        item
         for item in positions
         if isinstance(item, dict)
         and (
@@ -8425,6 +9103,61 @@ def broker_position_quantity(symbol: str, broker_id: str = "") -> float:
             .replace("-", "")
             in aliases
         )
+    ]
+    if normalized_broker == "binance-futures":
+        requested_side = str(position_side or "").strip().upper()
+        if requested_side in {"LONG", "SHORT", "BOTH"}:
+            exact = [
+                item
+                for item in matching_positions
+                if normalized_reconciliation_position_side(
+                    item,
+                    source="broker",
+                )
+                == requested_side
+            ]
+            if exact:
+                matching_positions = exact
+            else:
+                one_way = [
+                    item
+                    for item in matching_positions
+                    if normalized_reconciliation_position_side(
+                        item,
+                        source="broker",
+                    )
+                    == "BOTH"
+                ]
+                matching_positions = one_way
+        else:
+            active_sides = {
+                normalized_reconciliation_position_side(
+                    item,
+                    source="broker",
+                )
+                for item in matching_positions
+                if abs(
+                    safe_float(
+                        item.get("quantity"),
+                        safe_float(
+                            item.get("qty"),
+                            safe_float(item.get("broker_qty"), 0.0),
+                        ),
+                    )
+                )
+                > 1e-12
+            }
+            if len(active_sides) > 1:
+                raise RuntimeError(
+                    "dual-side-position-ambiguous:"
+                    f"{normalized_symbol}:{','.join(sorted(active_sides))}"
+                )
+    return sum(
+        safe_float(
+            item.get("quantity"),
+            safe_float(item.get("qty"), safe_float(item.get("broker_qty"), 0.0)),
+        )
+        for item in matching_positions
     )
 
 

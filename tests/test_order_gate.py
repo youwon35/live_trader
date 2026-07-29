@@ -2221,7 +2221,7 @@ class OrderGateTest(unittest.TestCase):
 
         self.assertEqual(state.open_order_count(), 3)
 
-    def test_execution_event_poll_syncs_broker_snapshot_to_program_ledger(self) -> None:
+    def test_execution_event_poll_observes_snapshot_without_overwriting_program_ledger(self) -> None:
         class FakeRouter:
             def poll_execution_events(self, broker_id):
                 return {
@@ -2258,19 +2258,73 @@ class OrderGateTest(unittest.TestCase):
                 }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            self.use_temp_program_ledger(temp_dir)
+            ledger = self.use_temp_program_ledger(temp_dir)
             try:
+                ledger.seed_from_broker_snapshot(
+                    [
+                        {
+                            "broker_id": "kis",
+                            "account": "KIS 실계좌",
+                            "currency": "KRW",
+                            "broker_cash": 100000.0,
+                        }
+                    ],
+                    [
+                        {
+                            "broker_id": "kis",
+                            "symbol": "005930.KS",
+                            "asset": "한국주식",
+                            "currency": "KRW",
+                            "broker_qty": 1.0,
+                            "broker_value": 70000.0,
+                        }
+                    ],
+                )
                 with patch("live_trader.state.LiveBrokerRouter", return_value=FakeRouter()):
                     result = state.poll_execution_events("kis")
+                ledger_cash = ledger.cash_rows()
+                ledger_positions = ledger.position_rows()
+                reconciliation = state.reconciliation_snapshot()
             finally:
                 self.restore_temp_program_ledger()
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["program_ledger"]["cash_count"], 1)
         self.assertEqual(result["program_ledger"]["position_count"], 1)
-        self.assertEqual(result["execution_events"]["synced_cash_count"], 1)
-        self.assertEqual(result["execution_events"]["synced_position_count"], 1)
+        self.assertEqual(result["execution_events"]["synced_cash_count"], 0)
+        self.assertEqual(result["execution_events"]["synced_position_count"], 0)
+        self.assertEqual(result["execution_events"]["observed_cash_count"], 1)
+        self.assertEqual(result["execution_events"]["observed_position_count"], 1)
         self.assertEqual(result["program_ledger"]["execution_event_count"], 0)
+        self.assertEqual(ledger_cash[0]["cash"], 100000.0)
+        self.assertEqual(ledger_positions[0]["quantity"], 1.0)
+        self.assertEqual(
+            state.STATE["broker_reconciliation"]["accounts"][0]["broker_cash"],
+            123456.0,
+        )
+        self.assertEqual(
+            state.STATE["broker_reconciliation"]["positions"][0]["broker_qty"],
+            3.0,
+        )
+        self.assertTrue(
+            any(
+                row["broker_id"] == "kis"
+                and row["status"] == "mismatch"
+                and row["program_cash"].startswith("100,000")
+                and row["broker_cash"].startswith("123,456")
+                for row in reconciliation["accounts"]
+            )
+        )
+        self.assertTrue(
+            any(
+                row["broker_id"] == "kis"
+                and row["symbol"] == "005930.KS"
+                and row["status"] == "mismatch"
+                and row["program_qty"] == "1"
+                and row["broker_qty"] == "3"
+                for row in reconciliation["positions"]
+            )
+        )
 
     def test_idle_snapshot_poll_is_throttled_and_does_not_append_execution_events(self) -> None:
         class FakeRouter:
@@ -2340,7 +2394,8 @@ class OrderGateTest(unittest.TestCase):
             fake_router.calls,
         )
         self.assertEqual(0, first["program_ledger"]["execution_event_count"])
-        self.assertEqual(4, first["program_ledger"]["cash_count"])
+        self.assertEqual(0, first["program_ledger"]["cash_count"])
+        self.assertEqual(4, first["execution_events"]["observed_cash_count"])
         self.assertEqual(0, second["execution_events"]["synced_cash_count"])
         self.assertEqual(
             ["binance", "binance-futures", "kis", "upbit"],

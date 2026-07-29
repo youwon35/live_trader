@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
     "package:desktop": "powershell -ExecutionPolicy Bypass -File build_exe.ps1",
+    "test:accounts": "node scripts/account_refresh.test.mjs",
     "test:polling": "node scripts/polling.test.mjs",
     "ui:smoke": "node scripts/ui_smoke.mjs"
   },

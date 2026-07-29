@@ -6,7 +6,7 @@ const viewports = [
   { name: "right-monitor", width: 1707, height: 960 },
   { name: "compact-desktop", width: 1280, height: 800 },
 ];
-const tabs = ["사전점검", "실거래 준비", "자동화", "로그", "설정"];
+const tabs = ["사전점검", "계좌·포지션", "실거래 준비", "자동화", "로그", "설정"];
 const issues = [];
 const views = [];
 const browser = await chromium.launch(chromePath
@@ -27,6 +27,9 @@ try {
     if (!response?.ok()) issues.push(`${viewport.name}: app response ${response?.status() || "missing"}`);
     if (await page.locator(".api-connection-banner").count()) {
       issues.push(`${viewport.name}: Python API connection banner is visible`);
+    }
+    if (await page.locator(".nav-item-badge").count()) {
+      issues.push(`${viewport.name}: sidebar numeric badges are still visible`);
     }
 
     for (const tab of tabs) {
@@ -86,6 +89,20 @@ try {
       if (!layout.pageTextLength) issues.push(`${viewport.name}/${tab}: empty page view`);
       if (layout.escapedControls.length) {
         issues.push(`${viewport.name}/${tab}: controls outside viewport (${layout.escapedControls.join(", ")})`);
+      }
+      if (tab === "사전점검" && await page.getByText("포지션·계좌 대조 요약", { exact: true }).count()) {
+        issues.push(`${viewport.name}/${tab}: legacy reconciliation summary is still visible`);
+      }
+      if (tab === "계좌·포지션") {
+        if (!await page.getByRole("heading", { name: "내 계좌·보유 포지션", exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab}: account workspace is missing`);
+        }
+        if (!await page.getByText("10초 자동 갱신·대조", { exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab}: automatic refresh/reconciliation label is missing`);
+        }
+        if (!await page.getByRole("button", { name: "현재 계좌를 기준 원장으로 승인", exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab}: explicit program-ledger baseline action is missing`);
+        }
       }
       views.push({ viewport: viewport.name, tab, ...layout });
     }

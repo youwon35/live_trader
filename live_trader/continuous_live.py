@@ -141,6 +141,11 @@ class LiveContinuousController:
                     lambda spec: state.broker_position_quantity(
                         spec.symbol,
                         spec.broker_id,
+                        (
+                            "SHORT"
+                            if self._position_direction(spec) == "short"
+                            else "LONG"
+                        ),
                     )
                 ),
                 cycle_handler=self._handle_cycle,
@@ -476,11 +481,12 @@ class LiveContinuousController:
                 results.append({"strategyId": decision.strategy_id, "signal": decision.signal, "action": "MONITOR", "reason": decision.reason})
                 continue
             spec = next(item for item in self.supervisor.engine.specs if item.strategy_instance_id == decision.strategy_instance_id)  # type: ignore[union-attr]
+            position_direction = self._position_direction(spec)
             current_position_quantity = state.broker_position_quantity(
                 spec.symbol,
                 spec.broker_id,
+                "SHORT" if position_direction == "short" else "LONG",
             )
-            position_direction = self._position_direction(spec)
             is_short_entry = (
                 position_direction == "short"
                 and decision.signal == "SELL"
