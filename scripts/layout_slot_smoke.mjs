@@ -46,6 +46,11 @@ try {
     await page.mouse.up();
   }
 
+  // The safeguards panel can sit just below the initial viewport.  A real
+  // operator scrolls it into view before grabbing its header; mouse
+  // coordinates outside the viewport do not emit pointer events in Chromium.
+  await active.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(100);
   const activeBefore = await active.boundingBox();
   const targetBefore = await target.boundingBox();
   observations.before = { active: activeBefore, target: targetBefore };
@@ -126,6 +131,11 @@ try {
       if (!stored.positions[activeKey] || !stored.positions[targetKey]) issues.push("두 패널 위치가 모두 저장되지 않았습니다.");
       if (!stored.sizes[activeKey] || !stored.sizes[targetKey]) issues.push("두 패널 슬롯 크기가 모두 저장되지 않았습니다.");
 
+      const afterScroll = await page.evaluate(() => ({
+        x: window.scrollX,
+        y: window.scrollY,
+        pageY: document.querySelector(".page-view")?.scrollTop || 0,
+      }));
       await page.reload({ waitUntil: "domcontentloaded" });
       await page.getByRole("button", { name: /^실거래 준비/ }).click();
       await page.locator(".operational-safeguards-panel").waitFor({ state: "visible" });
@@ -134,16 +144,26 @@ try {
       const targetReloaded = await page.locator(".panel").filter({
         has: page.getByRole("heading", { name: "리스크 한도 설정", exact: true }),
       }).boundingBox();
-      observations.reloaded = { active: activeReloaded, target: targetReloaded };
+      const reloadedScroll = await page.evaluate(() => ({
+        x: window.scrollX,
+        y: window.scrollY,
+        pageY: document.querySelector(".page-view")?.scrollTop || 0,
+      }));
+      observations.reloaded = {
+        active: activeReloaded,
+        target: targetReloaded,
+        afterScroll,
+        reloadedScroll,
+      };
       if (
         !activeReloaded
         || !targetReloaded
-        || !closeEnough(activeReloaded.x, activeAfter.x)
-        || !closeEnough(activeReloaded.y, activeAfter.y)
+        || !closeEnough(activeReloaded.x + reloadedScroll.x, activeAfter.x + afterScroll.x)
+        || !closeEnough(activeReloaded.y + reloadedScroll.y + reloadedScroll.pageY, activeAfter.y + afterScroll.y + afterScroll.pageY)
         || !closeEnough(activeReloaded.width, activeAfter.width)
         || !closeEnough(activeReloaded.height, activeAfter.height)
-        || !closeEnough(targetReloaded.x, targetAfter.x)
-        || !closeEnough(targetReloaded.y, targetAfter.y)
+        || !closeEnough(targetReloaded.x + reloadedScroll.x, targetAfter.x + afterScroll.x)
+        || !closeEnough(targetReloaded.y + reloadedScroll.y + reloadedScroll.pageY, targetAfter.y + afterScroll.y + afterScroll.pageY)
         || !closeEnough(targetReloaded.width, targetAfter.width)
         || !closeEnough(targetReloaded.height, targetAfter.height)
       ) {

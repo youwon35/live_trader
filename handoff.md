@@ -1107,3 +1107,22 @@ API 없이 실제 실행한 기능:
 - Binance/KIS/Upbit와 Telegram 보호 설정을 공용 Windows 사용자 범위 암호화 저장소에서 읽고, 기존 `.env` 평문은 마이그레이션 뒤 제거한다.
 - 외부 artifact 저장소, golden 전략 계약과 live gate 회귀를 포함한 Live unittest 193개, frontend build와 PyInstaller 패키징을 통과했다.
 - 최신 실행 파일은 Telegram·실주문 비활성 `--help` 기동 smoke를 exit 0으로 통과했다. `release\LiveTrader.exe`는 19,513,445 bytes, SHA-256 `192F46B57A3DA7B550E631FEC86C6ACEC5FB75E9B4253D72842989FF43E7D96C`다.
+
+## 2026-07-30 승급 준비 큐·확정 봉 카운트다운·5시간 무인 Soak
+
+- 전략·포트폴리오 화면에 공용 `promotion-readiness` 판정을 연결해 현재 단계, 다음 단계의 필수 근거, 완료 수, 남은 수와 차단 사유를 보여 주는 `승급 준비 큐`를 추가했다. 실제 승급 정책은 바꾸지 않았고, 브로커가 최종 확인한 non-dry `FILLED`만 canary 체결 수로 인정한다.
+- 주식/ETF와 코인 지속 감시에 시장·주기·마지막 확정 봉 기준 `다음 확정 봉까지 남은 시간`을 표시했다. UI 카운트다운은 미완성 봉을 평가하지 않으며 전략 엔진은 기존처럼 확정 봉마다 정확히 한 번만 판단한다.
+- 자동화 화면에 5시간 무인 Soak 상태와 최신 보고서를 표시한다. 보고서는 heartbeat, 프로필 상태, 재연결, 확정 봉·판단·주문·체결·차단·오류, 최대 CPU·메모리, 최종 포지션과 일일 리스크를 SQLite 우선으로 집계하고 JSON·HTML을 원자 저장한다.
+- 중간의 DEGRADED/FAILED/CRASHED/STALE 상태를 회복 뒤 숨기지 않도록 비정상 구간을 latch한다. MONITOR Soak는 실제 주문 0건이어야 하며, 5시간을 모두 채우기 전에는 최종 PASS가 아니다.
+- Windows에서 살아 있는 daemon을 `os.kill(pid, 0)`으로 오판하던 부분을 Win32 process handle 기반 조회로 교체했다. 자동 시작은 오래된 부적격 Portfolio를 건너뛰고, 유효한 backtested 단일 전략이 있으면 MONITOR 감시를 시작하되 SMALL/FULL LIVE 권한을 만들지는 않는다.
+- 현재 주문 없는 5시간 MONITOR Soak가 stock·crypto 두 프로필로 진행 중이다. real-order 환경은 꺼져 있으며, 중간 상태가 정상이어도 종료 보고서가 나오기 전에는 완료로 기록하지 않는다.
+
+## 2026-07-30 계좌 기준 리스크 예산과 Binance USD-M Futures 체결 검증기
+
+- 1회 주문 상한은 고정 숫자가 아니라 주문 직전 Binance USD-M Futures의 사용 가능 잔액 전부를 상한으로 계산한다. 상한이 전액이라는 뜻이지 매 주문마다 전액을 소진한다는 뜻은 아니며, 연결 검증 주문은 거래소 최소 계약을 만족하는 작은 수량을 우선한다.
+- 일일 손실 한도는 로컬 거래일 시작 equity 대비 `-10%`로 영속 저장한다. 프로세스를 재시작해도 당일 기준 equity, 실현·미실현 손익과 차단 latch를 복원하고, 한도 도달 뒤에는 당일 신규 진입을 fail-closed한다.
+- 전용 Futures 체결 검증기는 5시간 동안 ETHUSDT 최소 주문을 사용해 진입·청산 3회 왕복, 즉 최종 포지션을 0으로 끝내는 브로커 확인 체결 6건을 목표로 한다. 정확히 3건만 체결해 포지션을 남기는 방식은 사용하지 않는다.
+- 실행 전 읽기 전용 Preview가 계정 권한, hedge mode, `ISOLATED 1x`, 사용 가능 잔액, 기존 포지션·미체결 주문, 최소 수량과 일일 손실 예산을 다시 확인한다. Preview token은 짧은 만료시간·1회 사용이며 실제 시작 전에 UI의 별도 명시 확인이 필요하다.
+- 매 주문 뒤 브로커 주문 상태와 포지션을 순차 대조하고, 하나의 주문·포지션만 허용한다. 정지·오류 때는 세션이 만든 주문과 추적 수량만 취소·청산하며 다른 포지션을 건드리지 않는다. 최종 감사 JSON은 SHA-256으로 봉인하지만 전략 성과나 승급 근거로 사용하지 않는다.
+- 현재 실제 체결은 실행하지 않았다. USD-M Futures의 주문 가능 잔액과 `ISOLATED 1x` 전제조건이 충족되지 않아 Preview가 안전 차단 중이며, Spot 자산 이체나 margin/leverage 변경을 프로그램이 임의로 수행하지 않았다.
+- 관련 상태·Preview·Start·Stop·최신 Soak 보고 API와 실거래 준비 UI를 추가했다. 격리된 Live Python 회귀 275개, 공용 runtime 194개, 공용 design 테스트 9개와 Vite production build가 통과했다.

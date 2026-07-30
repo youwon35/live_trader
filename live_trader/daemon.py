@@ -86,6 +86,20 @@ def _run_daemon(profiles: Iterable[str], mode: str, poll_seconds: float) -> int:
         "streams": 0,
         "runtimes": {profile: 0 for profile in selected},
     }
+    soak_session = None
+    soak_finish_reason = "daemon-stop"
+    if str(mode).strip().upper() == "MONITOR":
+        try:
+            from .soak_monitor import LiveDaemonSoakSession
+
+            soak_session = LiveDaemonSoakSession(
+                log_dir=status_path.parent,
+                state_module=state,
+                profiles=selected,
+                heartbeat_gap_limit_seconds=heartbeat_lease_seconds,
+            )
+        except Exception:
+            soak_session = None
 
     def status_payload(
         *,
@@ -143,7 +157,18 @@ def _run_daemon(profiles: Iterable[str], mode: str, poll_seconds: float) -> int:
                 lambda profile=profile: state.start_continuous_runtime(profile, mode),
             )
         last_poll_result: dict[str, object] | None = None
-        _write_status(status_path, status_payload())
+        initial_payload = status_payload()
+        if soak_session is not None:
+            try:
+                initial_payload["soakReport"] = soak_session.sample(initial_payload)
+                from .soak_monitor import should_auto_stop_soak
+
+                if should_auto_stop_soak(initial_payload["soakReport"]):
+                    soak_finish_reason = "target-duration-complete"
+                    stop.set()
+            except Exception as exc:
+                initial_payload["soakReportError"] = _exception_detail(exc)
+        _write_status(status_path, initial_payload)
         while not stop.wait(max(5.0, float(poll_seconds))):
             poll_result = _safe_dict_call(
                 "execution event poll",
@@ -165,10 +190,24 @@ def _run_daemon(profiles: Iterable[str], mode: str, poll_seconds: float) -> int:
                     f"{profile} continuous runtime startup retry",
                     lambda profile=profile: state.start_continuous_runtime(profile, mode),
                 )
-            _write_status(
-                status_path,
-                status_payload(last_execution_poll=last_poll_result),
+            heartbeat_payload = status_payload(
+                last_execution_poll=last_poll_result
             )
+            if soak_session is not None:
+                try:
+                    heartbeat_payload["soakReport"] = soak_session.sample(
+                        heartbeat_payload
+                    )
+                    from .soak_monitor import should_auto_stop_soak
+
+                    if should_auto_stop_soak(
+                        heartbeat_payload["soakReport"]
+                    ):
+                        soak_finish_reason = "target-duration-complete"
+                        stop.set()
+                except Exception as exc:
+                    heartbeat_payload["soakReportError"] = _exception_detail(exc)
+            _write_status(status_path, heartbeat_payload)
     finally:
         cleanup_results = {
             "runtimes": _result_summary(_safe_dict_call(
@@ -180,7 +219,7 @@ def _run_daemon(profiles: Iterable[str], mode: str, poll_seconds: float) -> int:
                 state.stop_execution_streams,
             )),
         }
-        _write_status(status_path, {
+        stopped_payload = {
             "schemaVersion": "live-trader-daemon-v2",
             "phase": "STOPPED",
             "running": False,
@@ -191,7 +230,23 @@ def _run_daemon(profiles: Iterable[str], mode: str, poll_seconds: float) -> int:
             "mode": mode,
             "profiles": list(selected),
             "cleanup": cleanup_results,
-        })
+        }
+        if soak_session is not None:
+            try:
+                stopped_payload["soakReport"] = soak_session.finish(
+                    stopped_payload,
+                    reason=soak_finish_reason,
+                    failed=any(
+                        result.get("ok") is False
+                        for result in (
+                            cleanup_results["streams"],
+                            cleanup_results["runtimes"],
+                        )
+                    ),
+                )
+            except Exception as exc:
+                stopped_payload["soakReportError"] = _exception_detail(exc)
+        _write_status(status_path, stopped_payload)
     return 0
 
 
@@ -294,6 +349,49 @@ def read_daemon_status(
 def process_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        # ``os.kill(pid, 0)`` is not a reliable existence probe on Windows:
+        # it can report a live venv child process as missing. Query the
+        # process handle and exit code without signalling or mutating it.
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            process_query_limited_information = 0x1000
+            still_active = 259
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            )
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = (
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.DWORD),
+            )
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(
+                process_query_limited_information,
+                False,
+                pid,
+            )
+            if not handle:
+                return False
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(
+                    handle,
+                    ctypes.byref(exit_code),
+                ):
+                    return False
+                return int(exit_code.value) == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
     try:
         os.kill(pid, 0)
     except PermissionError:

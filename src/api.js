@@ -124,6 +124,30 @@ export async function runFinalPreflight() {
   return request("/api/preflight", { method: "POST", body: {} });
 }
 
+export async function previewBinanceFuturesFillSoak(symbol = "ETHUSDT") {
+  return request("/api/binance-futures-fill-soak/preview", {
+    method: "POST",
+    body: { symbol },
+    timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
+  });
+}
+
+export async function startBinanceFuturesFillSoak(confirmationToken, confirmed = false) {
+  return request("/api/binance-futures-fill-soak/start", {
+    method: "POST",
+    body: { confirmation_token: confirmationToken, confirmed },
+    timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
+  });
+}
+
+export async function stopBinanceFuturesFillSoak() {
+  return request("/api/binance-futures-fill-soak/stop", {
+    method: "POST",
+    body: {},
+    timeoutMs: 15000,
+  });
+}
+
 export async function previewUpbitSmokeOrder(strategyId, notionalKrw = 5000) {
   return request("/api/upbit-smoke-preview", {
     method: "POST",

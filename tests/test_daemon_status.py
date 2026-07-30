@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 
-from live_trader.daemon import read_daemon_status
+from live_trader.daemon import process_is_alive, read_daemon_status
 
 
 class DaemonStatusTest(unittest.TestCase):
+    def test_process_probe_recognizes_current_process(self) -> None:
+        self.assertTrue(process_is_alive(os.getpid()))
+
     def test_fresh_running_lease_requires_live_process(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "daemon_status.json"

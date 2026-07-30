@@ -56,6 +56,8 @@ UPBIT_ORDER_DETAIL_ENDPOINT = "/v1/order"
 
 _KIS_TOKEN_CACHE: dict[str, object] = {"key": "", "token": "", "expires_at": 0.0}
 _KIS_TOKEN_LOCK = threading.Lock()
+_KIS_REQUEST_LOCK = threading.Lock()
+_KIS_REQUEST_LAST_MONOTONIC = 0.0
 _BINANCE_TIME_CACHE: dict[str, object] = {"base_url": "", "offset_ms": 0, "expires_at": 0.0}
 _BINANCE_TIME_LOCK = threading.Lock()
 _BINANCE_SYMBOL_RULE_CACHE: dict[str, tuple[float, dict[str, Decimal]]] = {}
@@ -1125,7 +1127,7 @@ def issue_kis_access_token(*, timeout_seconds: float = 10.0) -> str:
         ):
             return str(_KIS_TOKEN_CACHE["token"])
 
-        response = http_json(
+        response = _send_kis_http_json(
             "POST",
             base_url + KIS_TOKEN_ENDPOINT,
             body={
@@ -1157,9 +1159,113 @@ def _clear_kis_access_token_cache() -> None:
         _KIS_TOKEN_CACHE.update({"key": "", "token": "", "expires_at": 0.0})
 
 
+def kis_request_min_interval_seconds() -> float:
+    """Return the conservative spacing used for every KIS REST request.
+
+    KIS rejects bursts with EGW00201/EGW00215.  Balance reconciliation needs
+    both a domestic and an overseas request, so serializing only each helper is
+    insufficient: every KIS REST call in this process shares this one pacer.
+    The default intentionally favors a stable live monitor over a one-second
+    faster account refresh.  Operators may raise, but not lower, the safety
+    floor through the environment.
+    """
+
+    try:
+        configured = float(
+            os.environ.get("KIS_REQUEST_MIN_INTERVAL_SECONDS") or 2.1
+        )
+    except (TypeError, ValueError):
+        configured = 2.1
+    return max(2.0, configured)
+
+
+def _kis_rate_limited(response: dict[str, object]) -> bool:
+    payload = (
+        response.get("json")
+        if isinstance(response.get("json"), dict)
+        else {}
+    )
+    code = str(payload.get("msg_cd") or payload.get("msgCode") or "").upper()
+    message = str(
+        payload.get("msg1")
+        or payload.get("message")
+        or response.get("text")
+        or ""
+    )
+    return code in {"EGW00201", "EGW00215"} or (
+        "초당" in message and "거래건수" in message
+    )
+
+
+def kis_read_rate_limit_retries() -> int:
+    try:
+        configured = int(
+            os.environ.get("KIS_READ_RATE_LIMIT_RETRIES") or 2
+        )
+    except (TypeError, ValueError):
+        configured = 2
+    return min(3, max(0, configured))
+
+
+def _send_kis_http_json(
+    method: str,
+    url: str,
+    *,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> dict[str, object]:
+    """Serialize and pace KIS HTTP traffic, including token issuance."""
+
+    global _KIS_REQUEST_LAST_MONOTONIC
+    with _KIS_REQUEST_LOCK:
+        interval = kis_request_min_interval_seconds()
+        elapsed = time.monotonic() - _KIS_REQUEST_LAST_MONOTONIC
+        remaining = interval - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+        retry_count = (
+            kis_read_rate_limit_retries()
+            if method.strip().upper() == "GET"
+            else 0
+        )
+        for attempt in range(retry_count + 1):
+            response = http_json(
+                method,
+                url,
+                body=body,
+                headers=headers,
+                timeout_seconds=timeout_seconds,
+            )
+            _KIS_REQUEST_LAST_MONOTONIC = time.monotonic()
+            if not _kis_rate_limited(response) or attempt >= retry_count:
+                return response
+            # A read-only balance query is safe to repeat.  Orders and token
+            # POSTs never enter this retry path because their result can be
+            # ambiguous even when the client only sees a transport failure.
+            time.sleep(max(2.1, interval * (2 ** attempt)))
+        return response
+
+
+def _reset_kis_request_pacer() -> None:
+    """Reset process-local pacing state for isolated tests."""
+
+    global _KIS_REQUEST_LAST_MONOTONIC
+    with _KIS_REQUEST_LOCK:
+        _KIS_REQUEST_LAST_MONOTONIC = 0.0
+
+
 def send_prepared_request(prepared: PreparedRequest, *, timeout_seconds: float = 10.0) -> dict[str, object]:
     if not prepared.can_send:
         return {"ok": False, "status": "blocked", "preview": prepared.preview()}
+    if prepared.provider.strip().lower() == "kis":
+        return _send_kis_http_json(
+            prepared.method,
+            prepared.url,
+            body=prepared.body,
+            headers=prepared.headers,
+            timeout_seconds=timeout_seconds,
+        )
     return http_json(prepared.method, prepared.url, body=prepared.body, headers=prepared.headers, timeout_seconds=timeout_seconds)
 
 

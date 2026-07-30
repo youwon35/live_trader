@@ -1,4 +1,5 @@
 import copy
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -568,6 +569,56 @@ class LiveContinuousControllerTest(unittest.TestCase):
 
         self.assertIsNone(blocked)
         self.assertEqual("portfolio-btc", allowed["id"])
+
+    def test_auto_runtime_portfolio_skips_invalid_legacy_lock(self) -> None:
+        controller = LiveContinuousController(Path("."))
+        with tempfile.TemporaryDirectory() as temporary:
+            legacy_path = Path(temporary) / "legacy.json"
+            trusted_path = Path(temporary) / "trusted.json"
+            legacy_path.write_text("{}", encoding="utf-8")
+            trusted_path.write_text("{}", encoding="utf-8")
+            candidates = [
+                {"id": "legacy", "source_path": str(legacy_path)},
+                {"id": "trusted", "source_path": str(trusted_path)},
+            ]
+            with (
+                patch.object(
+                    controller,
+                    "_portfolio_candidates",
+                    return_value=candidates,
+                ),
+                patch(
+                    "live_trader.continuous_live.load_portfolio_runtime_path",
+                    side_effect=[ValueError("legacy lock"), object()],
+                ),
+            ):
+                selected = controller._select_runtime_portfolio(
+                    "stock",
+                    "",
+                    "MONITOR",
+                )
+
+        self.assertEqual("trusted", selected["id"])
+
+    def test_monitor_standalone_accepts_verified_backtested_strategy(
+        self,
+    ) -> None:
+        controller = LiveContinuousController(Path("."))
+        strategy = {
+            "strategy_id": "stock-monitor",
+            "symbol": "251340",
+            "lifecycle_status": "backtested",
+            "backtester_verified": True,
+            "live_small_eligible": False,
+            "live_eligible": False,
+        }
+        with patch.object(state, "strategy_rows", return_value=[strategy]):
+            selected = controller._select_standalone_strategy(
+                "stock",
+                "MONITOR",
+            )
+
+        self.assertEqual("stock-monitor", selected["strategy_id"])
 
     def test_running_monitor_runtime_keeps_mode_when_restore_transition_is_blocked(self) -> None:
         strategy = {

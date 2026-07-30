@@ -103,7 +103,14 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/snapshot":
-            self.send_json(state.snapshot())
+            from .soak_monitor import latest_live_soak_report
+
+            self.send_json(
+                {
+                    **state.snapshot(),
+                    "soak_report": latest_live_soak_report(),
+                }
+            )
             return
         if parsed.path == "/api/ui-settings":
             self.send_json({"ok": True, "settings": read_ui_settings()})
@@ -139,6 +146,14 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path == "/api/binance-futures-fill-soak/status":
+            self.send_json(
+                {
+                    "ok": True,
+                    "fill_soak": state.binance_futures_fill_soak_status(),
+                }
+            )
+            return
         if parsed.path == "/api/doctor-diagnostics":
             self.send_json(
                 {
@@ -152,6 +167,16 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "validation": state.validation_small_live_snapshot(),
+                }
+            )
+            return
+        if parsed.path == "/api/soak-report/latest":
+            from .soak_monitor import latest_live_soak_report
+
+            self.send_json(
+                {
+                    "ok": True,
+                    "soak_report": latest_live_soak_report(),
                 }
             )
             return
@@ -293,6 +318,24 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                     confirmed=payload.get("confirmed") is True,
                 )
             )
+            return
+        if parsed.path == "/api/binance-futures-fill-soak/preview":
+            self.send_json(
+                state.preview_binance_futures_fill_soak(
+                    payload.get("symbol", "ETHUSDT"),
+                )
+            )
+            return
+        if parsed.path == "/api/binance-futures-fill-soak/start":
+            self.send_json(
+                state.start_binance_futures_fill_soak(
+                    payload.get("confirmation_token", ""),
+                    confirmed=payload.get("confirmed") is True,
+                )
+            )
+            return
+        if parsed.path == "/api/binance-futures-fill-soak/stop":
+            self.send_json(state.stop_binance_futures_fill_soak())
             return
         if parsed.path == "/api/audit-export":
             self.send_json(state.export_audit(str(payload.get("format", "csv"))))

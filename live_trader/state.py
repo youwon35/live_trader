@@ -85,6 +85,11 @@ from .contracts import (
     strategy_revalidation_status,
 )
 from .audit_store import SQLiteAuditEventStore
+from .account_risk import (
+    broker_account_risk,
+    load_account_risk_budget,
+    update_account_risk_budget,
+)
 from .env_loader import default_runtime_data_root
 from .execution_streams import ExecutionStreamManager
 from .live_adapters import (
@@ -105,6 +110,12 @@ from .futures_canary import (
     evaluate_futures_canary_preflight,
     normalize_usdm_symbol,
 )
+from .futures_fill_soak import (
+    BinanceFuturesFillSoakSession,
+    FillSoakConfig,
+    LiveOrderAuthorization,
+    default_report_directory as futures_fill_soak_report_directory,
+)
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
@@ -120,6 +131,7 @@ Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
 CheckStatus = Literal["pass", "warn", "fail"]
 RUNTIME_MODE_LOCK = threading.RLock()
 BINANCE_FUTURES_CANARY_LOCK = threading.RLock()
+BINANCE_FUTURES_FILL_SOAK_LOCK = threading.RLock()
 # Serializes public runtime control operations without participating in a
 # closed-bar cycle.  Public calls acquire this lock before manager/controller
 # locks; they never hold RUNTIME_MODE_LOCK while entering the manager.
@@ -202,7 +214,7 @@ RISK_SETTING_META: dict[str, dict[str, object]] = {
 }
 
 DEFAULT_RISK_SETTINGS: dict[str, float] = {
-    "daily_loss_limit_pct": -2.0,
+    "daily_loss_limit_pct": -10.0,
     "strategy_capital_limit_krw": 20000000.0,
     "duplicate_order_cooldown_sec": 180.0,
     "max_slippage_bps": 50.0,
@@ -381,6 +393,14 @@ OPERATOR_CHECKLIST_PATH = Path(
     os.environ.get("LIVE_TRADER_OPERATOR_CHECKLIST")
     or APP_DATA_ROOT / "logs" / "operator-checklist.json"
 )
+RISK_SETTINGS_PATH = Path(
+    os.environ.get("LIVE_TRADER_RISK_SETTINGS")
+    or APP_DATA_ROOT / "logs" / "risk-settings.json"
+)
+ACCOUNT_RISK_BUDGET_PATH = Path(
+    os.environ.get("LIVE_TRADER_ACCOUNT_RISK_BUDGET")
+    or APP_DATA_ROOT / "logs" / "account-risk-budget.json"
+)
 AUDIT_DB_PATH = Path(os.environ.get("LIVE_TRADER_AUDIT_DB") or APP_DATA_ROOT / "logs" / "live_trader_audit.sqlite3")
 AUDIT_STORE = SQLiteAuditEventStore(AUDIT_DB_PATH)
 PROGRAM_LEDGER_PATH = Path(
@@ -398,6 +418,8 @@ DEFAULT_WATCHDOG_SETTINGS: dict[str, float] = {
 }
 DOCTOR_DIAGNOSTICS_LOCK = threading.RLock()
 OPERATOR_CHECKLIST_LOCK = threading.RLock()
+RISK_SETTINGS_LOCK = threading.RLock()
+ACCOUNT_RISK_BUDGET_LOCK = threading.RLock()
 
 
 def read_json_document(path: Path) -> dict[str, Any]:
@@ -443,6 +465,34 @@ def persist_operator_checklist_values(values: dict[str, object]) -> None:
         write_json_document(OPERATOR_CHECKLIST_PATH, document)
 
 
+def load_risk_setting_values() -> dict[str, float]:
+    with RISK_SETTINGS_LOCK:
+        payload = read_json_document(RISK_SETTINGS_PATH)
+    values = payload.get("values") if isinstance(payload.get("values"), dict) else {}
+    result = dict(DEFAULT_RISK_SETTINGS)
+    for key, meta in RISK_SETTING_META.items():
+        try:
+            numeric = float(values.get(key))
+        except (TypeError, ValueError):
+            continue
+        if float(meta["min"]) <= numeric <= float(meta["max"]):
+            result[key] = float(int(numeric)) if key == "max_open_orders" else numeric
+    return result
+
+
+def persist_risk_setting_values(values: dict[str, object]) -> None:
+    document = {
+        "schema_version": 1,
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "values": {
+            key: float(values.get(key, DEFAULT_RISK_SETTINGS[key]))
+            for key in RISK_SETTING_META
+        },
+    }
+    with RISK_SETTINGS_LOCK:
+        write_json_document(RISK_SETTINGS_PATH, document)
+
+
 @dataclass(frozen=True)
 class Check:
     label: str
@@ -459,9 +509,12 @@ STATE: dict[str, Any] = {
     "kill_switch": False,
     "new_entries_blocked": True,
     "broker_truth_blocked": True,
+    "daily_loss_gate_tripped": False,
+    "daily_loss_entries_blocked": False,
     "manual_new_entries_blocked": False,
     "operator_confirmed": False,
-    "risk_settings": dict(DEFAULT_RISK_SETTINGS),
+    "risk_settings": load_risk_setting_values(),
+    "account_risk": load_account_risk_budget(ACCOUNT_RISK_BUDGET_PATH),
     "checklist": load_operator_checklist_values(),
     "retry_policy": dict(DEFAULT_RETRY_POLICY),
     "automation": {
@@ -1855,6 +1908,13 @@ def readiness_checks(
 
 def risk_checks(reconciliation_summary: dict[str, Any] | None = None) -> list[dict[str, str]]:
     settings = STATE["risk_settings"]
+    futures_risk = broker_account_risk(
+        STATE.get("account_risk", {})
+        if isinstance(STATE.get("account_risk"), dict)
+        else {},
+        "binance-futures",
+        currency="USDT",
+    )
     if reconciliation_summary is None:
         reconciliation_summary = reconciliation_snapshot()["summary"]
     reconcile_status = str(reconciliation_summary["status"])
@@ -1889,8 +1949,27 @@ def risk_checks(reconciliation_summary: dict[str, Any] | None = None) -> list[di
         {
             "label": "일일 손실 한도",
             "value": f"{settings['daily_loss_limit_pct']:.1f}%",
-            "status": "pass" if settings["daily_loss_limit_pct"] < 0 else "fail",
-            "detail": "한도 도달 시 신규 진입과 FULL LIVE를 차단합니다.",
+            "status": (
+                "fail"
+                if settings["daily_loss_limit_pct"] >= 0
+                or (
+                    futures_risk.get("known") is True
+                    and safe_float(futures_risk.get("daily_pnl_pct"), 0.0)
+                    <= settings["daily_loss_limit_pct"]
+                )
+                else "warn"
+                if futures_risk.get("known") is not True
+                else "pass"
+            ),
+            "detail": (
+                (
+                    "Binance Futures 현재 "
+                    f"{safe_float(futures_risk.get('daily_pnl_pct'), 0.0):.2f}% · "
+                    f"가용 {safe_float(futures_risk.get('available_cash'), 0.0):.2f} USDT"
+                )
+                if futures_risk.get("known") is True
+                else "실계좌를 새로고침하면 현재 자산 기준 손실률을 계산합니다."
+            ),
         },
         {
             "label": "전략별 자본 한도",
@@ -4090,6 +4169,9 @@ def snapshot() -> dict[str, Any]:
         "watchdog": watchdog,
         "risk_checks": risk_checks(reconciliation["summary"]),
         "risk_settings": risk_setting_rows(),
+        "account_risk": redact_sensitive_payload(
+            STATE.get("account_risk", {})
+        ),
         "checklist": checklist_rows(reconciliation["summary"]),
         "retry_policy": retry_policy_rows(),
         "order_queue": queue,
@@ -4120,6 +4202,7 @@ def snapshot() -> dict[str, Any]:
         "upbit_smoke_order": dict(STATE.get("upbit_smoke_order", {})),
         "binance_smoke_order": dict(STATE.get("binance_smoke_order", {})),
         "binance_futures_canary": binance_futures_canary_status(),
+        "binance_futures_fill_soak": binance_futures_fill_soak_status(),
         "execution_calibration": execution_calibration_snapshot(),
         "policy_replays": list(STATE.get("policy_replays", [])),
         "shadow_live": {"brokerSubmissionBlocked": True, "evidence": list(STATE.get("shadow_evidence", []))[:20], "count": len(STATE.get("shadow_evidence", []))},
@@ -5248,7 +5331,17 @@ def set_risk_setting(name: str, value: object) -> dict[str, Any]:
         return {"ok": False, "reason": f"{meta['label']} 값은 {minimum:g}~{maximum:g} 범위여야 합니다.", "snapshot": snapshot()}
     if name == "max_open_orders":
         numeric = float(int(numeric))
+    previous = float(STATE["risk_settings"][name])
     STATE["risk_settings"][name] = numeric
+    try:
+        persist_risk_setting_values(STATE["risk_settings"])
+    except OSError as exc:
+        STATE["risk_settings"][name] = previous
+        return {
+            "ok": False,
+            "reason": f"리스크 한도 저장에 실패했습니다: {exc}",
+            "snapshot": snapshot(),
+        }
     append_audit("warn", "리스크 한도 변경", f"{meta['label']} 값이 {numeric:g}{meta['unit']}(으)로 변경되었습니다.")
     return {"ok": True, "reason": "risk setting changed", "snapshot": snapshot()}
 
@@ -5373,7 +5466,67 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
             data["positions"].extend(item for item in positions_snapshot if isinstance(item, dict))
             data["successful_position_brokers"].append(broker_id)
     STATE["broker_reconciliation"] = data
+    refresh_account_risk_budget(data["accounts"])
     return data
+
+
+def refresh_account_risk_budget(
+    accounts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Update the durable account-equity baseline used by live order gates."""
+
+    try:
+        with ACCOUNT_RISK_BUDGET_LOCK:
+            budget = update_account_risk_budget(
+                ACCOUNT_RISK_BUDGET_PATH,
+                accounts,
+            )
+    except OSError as exc:
+        previous = (
+            dict(STATE.get("account_risk", {}))
+            if isinstance(STATE.get("account_risk"), dict)
+            else {}
+        )
+        budget = {
+            **previous,
+            "error": f"{type(exc).__name__}: {exc}"[:240],
+        }
+    STATE["account_risk"] = budget
+    budget_rows = (
+        budget.get("budgets")
+        if isinstance(budget.get("budgets"), dict)
+        else {}
+    )
+    loss_limit = float(STATE["risk_settings"]["daily_loss_limit_pct"])
+    tripped = any(
+        isinstance(item, dict)
+        and safe_float(
+            item.get("minimum_daily_pnl_pct"),
+            safe_float(item.get("daily_pnl_pct"), 0.0),
+        )
+        <= loss_limit
+        for item in budget_rows.values()
+    )
+    previously_tripped = bool(STATE.get("daily_loss_gate_tripped"))
+    STATE["daily_loss_gate_tripped"] = tripped
+    if tripped:
+        STATE["daily_loss_entries_blocked"] = True
+        STATE["new_entries_blocked"] = True
+        if not previously_tripped:
+            append_audit(
+                "danger",
+                "일일 손실 차단",
+                f"실계좌 손실률이 {loss_limit:.1f}% 한도에 도달해 신규 진입을 차단했습니다.",
+            )
+    elif STATE.get("daily_loss_entries_blocked"):
+        STATE["daily_loss_entries_blocked"] = False
+        if (
+            not STATE.get("kill_switch")
+            and not STATE.get("manual_new_entries_blocked")
+            and not STATE.get("broker_truth_blocked")
+        ):
+            STATE["new_entries_blocked"] = False
+    return budget
 
 
 def seed_program_ledger_from_broker_snapshot(refresh_if_empty: bool = True) -> dict[str, Any]:
@@ -6395,6 +6548,14 @@ def merge_broker_reconciliation_cache(
     cache["successful_account_brokers"] = sorted(account_success)
     cache["successful_position_brokers"] = sorted(position_success)
     cache["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if accounts:
+        refresh_account_risk_budget(
+            [
+                item
+                for item in cache["accounts"]
+                if isinstance(item, dict)
+            ]
+        )
 
 
 def should_append_execution_sync_audit(
@@ -6697,6 +6858,424 @@ BINANCE_SMOKE_MIN_USDT = 5.0
 BINANCE_SMOKE_MAX_USDT = 10.0
 BINANCE_SMOKE_PREVIEW_TTL_SECONDS = 600
 BINANCE_FUTURES_CANARY_TEST_TTL_SECONDS = 300
+BINANCE_FUTURES_FILL_SOAK_TTL_SECONDS = 300
+BINANCE_FUTURES_FILL_SOAK_DURATION_SECONDS = 5 * 60 * 60
+BINANCE_FUTURES_FILL_SOAK_NOTIONAL_USDT = 5.0
+
+BINANCE_FUTURES_FILL_SOAK_SESSION_FACTORY = BinanceFuturesFillSoakSession
+BINANCE_FUTURES_FILL_SOAK_SESSION: BinanceFuturesFillSoakSession | None = None
+BINANCE_FUTURES_FILL_SOAK_THREAD: threading.Thread | None = None
+BINANCE_FUTURES_FILL_SOAK_INTERNAL: dict[str, Any] = {
+    "phase": "idle",
+    "status": "IDLE",
+    "session_id": "",
+    "symbol": "ETHUSDT",
+    "duration_seconds": BINANCE_FUTURES_FILL_SOAK_DURATION_SECONDS,
+    "target_round_trips": 3,
+    "target_fill_count": 6,
+    "target_notional_usdt": str(BINANCE_FUTURES_FILL_SOAK_NOTIONAL_USDT),
+    "daily_drawdown_limit_pct": "10",
+    "single_order_cap_mode": "initial_available_usdt_100_percent",
+    "confirmation_token_hash": "",
+    "confirmation_issued_epoch": 0.0,
+    "confirmation_expires_epoch": 0.0,
+    "confirmation_used": False,
+    "preview": {},
+    "final_report": {},
+    "report_path": "",
+    "detail": (
+        "읽기 전용 사전점검 후 최소 주문으로 SHORT 진입·청산을 "
+        "3회 반복하고, 남은 시간은 평탄 상태로 감시합니다."
+    ),
+}
+
+
+def _binance_futures_fill_soak_report_summary(
+    report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(report, dict) or not report:
+        return {}
+    progress = (
+        report.get("progress")
+        if isinstance(report.get("progress"), dict)
+        else {}
+    )
+    final_checks = (
+        report.get("final_checks")
+        if isinstance(report.get("final_checks"), dict)
+        else {}
+    )
+    risk = (
+        report.get("risk")
+        if isinstance(report.get("risk"), dict)
+        else {}
+    )
+    return {
+        "schema_version": report.get("schema_version"),
+        "session_id": report.get("session_id"),
+        "status": report.get("status"),
+        "started_at": report.get("started_at"),
+        "finished_at": report.get("finished_at"),
+        "reason_ids": list(report.get("reason_ids") or []),
+        "round_trips_completed": progress.get("round_trips_completed"),
+        "fill_count": progress.get("fill_count"),
+        "max_drawdown_pct": risk.get("max_drawdown_pct"),
+        "flat": final_checks.get("flat"),
+        "open_orders_clear": final_checks.get("open_orders_clear"),
+        "duration_complete": final_checks.get("duration_complete"),
+        "report_path": report.get("report_path"),
+        "strategy_promotion_authorized": False,
+    }
+
+
+def _latest_binance_futures_fill_soak_report() -> dict[str, Any]:
+    directory = futures_fill_soak_report_directory()
+    try:
+        candidates = sorted(
+            directory.glob("bfsoak-*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return {}
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            payload.setdefault("report_path", str(path))
+            return _binance_futures_fill_soak_report_summary(payload)
+    return {}
+
+
+def binance_futures_fill_soak_status() -> dict[str, Any]:
+    with BINANCE_FUTURES_FILL_SOAK_LOCK:
+        current = dict(BINANCE_FUTURES_FILL_SOAK_INTERNAL)
+        session = BINANCE_FUTURES_FILL_SOAK_SESSION
+        thread = BINANCE_FUTURES_FILL_SOAK_THREAD
+    current.pop("confirmation_token_hash", None)
+    current.pop("confirmation_issued_epoch", None)
+    current.pop("confirmation_expires_epoch", None)
+    current["active"] = bool(thread and thread.is_alive())
+    current["session"] = session.status() if session is not None else {}
+    current["final_report"] = _binance_futures_fill_soak_report_summary(
+        current.get("final_report")
+        if isinstance(current.get("final_report"), dict)
+        else {}
+    )
+    if not current["final_report"]:
+        current["latest_durable_report"] = (
+            _latest_binance_futures_fill_soak_report()
+        )
+    else:
+        current["latest_durable_report"] = current["final_report"]
+    return redact_sensitive_payload(current)  # type: ignore[return-value]
+
+
+def preview_binance_futures_fill_soak(
+    symbol: object = "ETHUSDT",
+) -> dict[str, Any]:
+    global BINANCE_FUTURES_FILL_SOAK_SESSION
+
+    normalized_symbol = normalize_usdm_symbol(symbol or "ETHUSDT")
+    session_id = (
+        "bfsoak-"
+        + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        + "-"
+        + secrets.token_hex(4)
+    )
+    with BINANCE_FUTURES_FILL_SOAK_LOCK:
+        running = BINANCE_FUTURES_FILL_SOAK_THREAD
+        if running is not None and running.is_alive():
+            return {
+                "ok": False,
+                "reason": "이미 Binance Futures 실체결 soak가 실행 중입니다.",
+                "fill_soak": binance_futures_fill_soak_status(),
+            }
+        BINANCE_FUTURES_FILL_SOAK_INTERNAL.update(
+            {
+                "phase": "previewing",
+                "status": "PREVIEWING",
+                "session_id": session_id,
+                "symbol": normalized_symbol,
+                "confirmation_token_hash": "",
+                "confirmation_issued_epoch": 0.0,
+                "confirmation_expires_epoch": 0.0,
+                "confirmation_used": False,
+                "preview": {},
+                "final_report": {},
+                "report_path": "",
+                "detail": "실계좌·포지션·미체결 주문·최소 주문을 읽기 전용으로 확인 중입니다.",
+            }
+        )
+
+    try:
+        config = FillSoakConfig(
+            session_id=session_id,
+            symbol=normalized_symbol,
+            duration_seconds=BINANCE_FUTURES_FILL_SOAK_DURATION_SECONDS,
+            target_round_trips=3,
+            target_notional_usdt=BINANCE_FUTURES_FILL_SOAK_NOTIONAL_USDT,
+            daily_drawdown_limit_pct=10,
+        )
+        session = BINANCE_FUTURES_FILL_SOAK_SESSION_FACTORY(config)
+        preview = session.preview()
+    except (BrokerNotReadyError, RuntimeError, ValueError) as exc:
+        preview = {
+            "schema_version": "binance-usdm-fill-soak-v1",
+            "session_id": session_id,
+            "symbol": normalized_symbol,
+            "ready": False,
+            "blockers": ["preview-observation-failed"],
+            "detail": str(exc)[:240],
+        }
+        session = None
+
+    ready = preview.get("ready") is True
+    token = secrets.token_urlsafe(32) if ready else ""
+    token_hash = (
+        hashlib.sha256(token.encode("utf-8")).hexdigest()
+        if token
+        else ""
+    )
+    now_epoch = time.time()
+    expires_epoch = (
+        now_epoch + BINANCE_FUTURES_FILL_SOAK_TTL_SECONDS
+        if token
+        else 0.0
+    )
+    with BINANCE_FUTURES_FILL_SOAK_LOCK:
+        if BINANCE_FUTURES_FILL_SOAK_INTERNAL.get("session_id") != session_id:
+            return {
+                "ok": False,
+                "reason": "더 최근 사전점검이 시작되어 현재 결과를 폐기했습니다.",
+                "fill_soak": binance_futures_fill_soak_status(),
+            }
+        BINANCE_FUTURES_FILL_SOAK_SESSION = session
+        BINANCE_FUTURES_FILL_SOAK_INTERNAL.update(
+            {
+                "phase": "ready" if ready else "blocked",
+                "status": "READY" if ready else "BLOCKED",
+                "confirmation_token_hash": token_hash,
+                "confirmation_issued_epoch": now_epoch if token else 0.0,
+                "confirmation_expires_epoch": expires_epoch,
+                "confirmation_used": False,
+                "preview": preview,
+                "detail": (
+                    "실행 직전 동일 조건을 다시 확인하는 1회 확인 토큰을 발급했습니다."
+                    if ready
+                    else "사전점검 차단: "
+                    + ", ".join(
+                        str(item)
+                        for item in preview.get("blockers", [])
+                    )
+                ),
+            }
+        )
+    append_audit(
+        "info" if ready else "warn",
+        "Binance Futures 실체결 soak 사전점검",
+        (
+            f"{normalized_symbol} · ready {ready} · "
+            f"blockers {len(preview.get('blockers', []))}개 · "
+            "주문 전송 없음"
+        ),
+    )
+    return {
+        "ok": ready,
+        "reason": BINANCE_FUTURES_FILL_SOAK_INTERNAL["detail"],
+        "fill_soak": binance_futures_fill_soak_status(),
+        "authorization": (
+            {
+                "confirmation_token": token,
+                "expires_at": datetime.fromtimestamp(
+                    expires_epoch,
+                    tz=timezone.utc,
+                ).isoformat().replace("+00:00", "Z"),
+            }
+            if token
+            else {}
+        ),
+    }
+
+
+def _run_binance_futures_fill_soak(
+    session: BinanceFuturesFillSoakSession,
+    authorization: LiveOrderAuthorization,
+) -> None:
+    try:
+        report = session.run(authorization)
+    except Exception as exc:
+        report = {
+            "schema_version": "binance-usdm-fill-soak-v1",
+            "session_id": session.config.session_id,
+            "status": "FAIL",
+            "reason_ids": ["session-unhandled-error"],
+            "detail": str(exc)[:240],
+            "strategy_promotion_authorized": False,
+        }
+    summary = _binance_futures_fill_soak_report_summary(report)
+    with BINANCE_FUTURES_FILL_SOAK_LOCK:
+        BINANCE_FUTURES_FILL_SOAK_INTERNAL.update(
+            {
+                "phase": "finished",
+                "status": str(report.get("status") or "FAIL"),
+                "final_report": report,
+                "report_path": str(report.get("report_path") or ""),
+                "detail": (
+                    "실체결 soak를 통과했습니다. 이 결과는 전략 승급 증거로 자동 사용하지 않습니다."
+                    if report.get("status") == "PASS"
+                    else "실체결 soak가 실패 또는 안전 중단되었습니다."
+                ),
+            }
+        )
+    append_audit(
+        "info" if report.get("status") == "PASS" else "danger",
+        "Binance Futures 실체결 soak 종료",
+        (
+            f"{summary.get('session_id') or '-'} · "
+            f"{summary.get('status') or 'FAIL'} · "
+            f"fills {summary.get('fill_count') or 0} · "
+            f"flat {summary.get('flat') is True}"
+        ),
+    )
+
+
+def start_binance_futures_fill_soak(
+    confirmation_token: object,
+    *,
+    confirmed: bool,
+) -> dict[str, Any]:
+    global BINANCE_FUTURES_FILL_SOAK_THREAD
+
+    token = str(confirmation_token or "")
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with BINANCE_FUTURES_FILL_SOAK_LOCK:
+        session = BINANCE_FUTURES_FILL_SOAK_SESSION
+        current = BINANCE_FUTURES_FILL_SOAK_INTERNAL
+        running = BINANCE_FUTURES_FILL_SOAK_THREAD
+        if running is not None and running.is_alive():
+            return {
+                "ok": False,
+                "reason": "이미 실체결 soak가 실행 중입니다.",
+                "fill_soak": binance_futures_fill_soak_status(),
+            }
+        if (
+            confirmed is not True
+            or not token
+            or not current.get("confirmation_token_hash")
+            or not secrets.compare_digest(
+                token_hash,
+                str(current.get("confirmation_token_hash") or ""),
+            )
+        ):
+            return {
+                "ok": False,
+                "reason": "정확한 1회 확인 토큰과 명시 확인이 필요합니다.",
+                "fill_soak": binance_futures_fill_soak_status(),
+            }
+        if (
+            session is None
+            or current.get("phase") != "ready"
+            or current.get("confirmation_used") is True
+            or safe_float(
+                current.get("confirmation_expires_epoch"),
+                0.0,
+            )
+            <= time.time()
+        ):
+            current.update(
+                {
+                    "phase": "expired",
+                    "status": "EXPIRED",
+                    "confirmation_token_hash": "",
+                    "confirmation_used": True,
+                    "detail": "사전점검이 만료되었거나 실행 가능한 상태가 아닙니다.",
+                }
+            )
+            return {
+                "ok": False,
+                "reason": current["detail"],
+                "fill_soak": binance_futures_fill_soak_status(),
+            }
+
+        issued_epoch = safe_float(
+            current.get("confirmation_issued_epoch"),
+            0.0,
+        )
+        expires_epoch = safe_float(
+            current.get("confirmation_expires_epoch"),
+            0.0,
+        )
+        # Consume before starting the worker. A timeout, crash, or broker
+        # ambiguity must never make the authorization reusable.
+        current.update(
+            {
+                "phase": "starting",
+                "status": "STARTING",
+                "confirmation_token_hash": "",
+                "confirmation_used": True,
+                "detail": "실행 직전 사전점검 재검증을 시작합니다.",
+            }
+        )
+        authorization = LiveOrderAuthorization(
+            confirmed=True,
+            token_fingerprint=token_hash,
+            issued_at_epoch=issued_epoch,
+            expires_at_epoch=expires_epoch,
+        )
+        thread = threading.Thread(
+            target=_run_binance_futures_fill_soak,
+            args=(session, authorization),
+            daemon=True,
+            name=f"binance-futures-fill-soak-{session.config.session_id}",
+        )
+        BINANCE_FUTURES_FILL_SOAK_THREAD = thread
+        thread.start()
+    append_audit(
+        "warn",
+        "Binance Futures 실체결 soak 시작",
+        (
+            f"{session.config.session_id} · 최소 주문 SHORT 왕복 3회 · "
+            "5시간 · 초기 사용 가능 USDT 100% 상한 · 일일 손실 10%"
+        ),
+    )
+    return {
+        "ok": True,
+        "reason": "실체결 soak를 시작했습니다.",
+        "fill_soak": binance_futures_fill_soak_status(),
+    }
+
+
+def stop_binance_futures_fill_soak() -> dict[str, Any]:
+    with BINANCE_FUTURES_FILL_SOAK_LOCK:
+        session = BINANCE_FUTURES_FILL_SOAK_SESSION
+        running = BINANCE_FUTURES_FILL_SOAK_THREAD
+        if session is None or running is None or not running.is_alive():
+            return {
+                "ok": False,
+                "reason": "실행 중인 실체결 soak가 없습니다.",
+                "fill_soak": binance_futures_fill_soak_status(),
+            }
+        session.request_stop()
+        BINANCE_FUTURES_FILL_SOAK_INTERNAL.update(
+            {
+                "phase": "stopping",
+                "status": "STOPPING",
+                "detail": "중단 요청을 보냈습니다. 활성 주문을 정리하고 평탄 상태를 확인합니다.",
+            }
+        )
+    append_audit(
+        "warn",
+        "Binance Futures 실체결 soak 중단 요청",
+        str(session.config.session_id),
+    )
+    return {
+        "ok": True,
+        "reason": "안전 중단을 요청했습니다.",
+        "fill_soak": binance_futures_fill_soak_status(),
+    }
 
 
 def binance_futures_canary_status() -> dict[str, Any]:
@@ -8288,6 +8867,74 @@ def intent_requires_unavailable_capability(intent: OrderIntent, reconciliation_s
     return not (domestic_asset or domestic_symbol)
 
 
+def account_risk_for_intent(
+    intent: OrderIntent,
+    *,
+    maximum_age_seconds: float = 120.0,
+) -> dict[str, Any]:
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    requested_currency = str(
+        metadata.get("quote_currency")
+        or metadata.get("currency")
+        or (
+            "USDT"
+            if broker_id in {"binance", "binance-futures"}
+            and str(intent.symbol).upper().replace("-", "").endswith("USDT")
+            else "KRW"
+            if broker_id in {"kis", "upbit"}
+            else ""
+        )
+    ).strip().upper()
+    snapshot_value = (
+        STATE.get("account_risk")
+        if isinstance(STATE.get("account_risk"), dict)
+        else {}
+    )
+    return broker_account_risk(
+        snapshot_value,
+        broker_id,
+        currency=requested_currency,
+        maximum_age_seconds=maximum_age_seconds,
+    )
+
+
+def broker_symbol_exposure(intent: OrderIntent) -> float:
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    normalized_symbol = (
+        str(intent.symbol or "")
+        .strip()
+        .upper()
+        .removesuffix(".PERP")
+        .replace("-", "")
+    )
+    total = 0.0
+    rows = STATE.get("broker_reconciliation", {}).get("positions", [])
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        row_symbol = (
+            str(row.get("symbol") or "")
+            .strip()
+            .upper()
+            .removesuffix(".PERP")
+            .replace("-", "")
+        )
+        if (
+            str(row.get("broker_id") or "").strip().lower() == broker_id
+            and row_symbol == normalized_symbol
+        ):
+            total += abs(safe_float(row.get("broker_value"), 0.0))
+    return total
+
+
 def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool) -> PreTradeContext:
     settings = STATE["risk_settings"]
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
@@ -8299,6 +8946,44 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
         reconciliation = checks.get("reconciliation") if isinstance(checks.get("reconciliation"), dict) else {}
         reconciliation_summary = reconciliation.get("summary") if isinstance(reconciliation.get("summary"), dict) else {}
     positions_matched = reconciliation_blocker_count(reconciliation_summary) == 0
+    account_risk = account_risk_for_intent(intent)
+    live_account_required = (
+        not dry_run
+        and intent.mode in {"SMALL_LIVE", "FULL_LIVE"}
+    )
+    account_known = account_risk.get("known") is True
+    account_fresh = account_risk.get("fresh") is True
+    available_cash = (
+        safe_float(account_risk.get("available_cash"), 0.0)
+        if account_known
+        else None
+    )
+    account_equity = (
+        safe_float(account_risk.get("current_equity"), 0.0)
+        if account_known
+        else None
+    )
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    # Futures notionals are denominated in USDT, so a KRW setting must never
+    # be compared to them. For USD-M the user's configured one-order cap is
+    # the currently available USDT balance; strategy/portfolio gates may
+    # still impose a smaller bound.
+    if broker_id == "binance-futures" and available_cash is not None:
+        maximum_order_value = max(0.0, available_cash)
+        strategy_capital_limit = max(0.0, available_cash)
+    else:
+        maximum_order_value = float(settings["strategy_capital_limit_krw"])
+        strategy_capital_limit = float(settings["strategy_capital_limit_krw"])
+    symbol_exposure = broker_symbol_exposure(intent)
+    broker_open_orders = metadata.get("broker_open_order_count")
+    effective_open_order_count = (
+        int(safe_float(broker_open_orders, 0.0))
+        if broker_open_orders is not None
+        else open_order_count()
+    )
     return PreTradeContext(
         mode=intent.mode,
         dry_run=dry_run,
@@ -8308,14 +8993,33 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
         readiness_warnings=int(checks.get("summary", {}).get("warning_count", 0)),
         real_orders_enabled=real_orders_enabled(),
         live_order_adapter_verified=broker_ready_for_intent(checks, intent),
-        max_order_value=float(settings["strategy_capital_limit_krw"]),
+        max_order_value=maximum_order_value,
         cooldown_seconds=int(float(settings["duplicate_order_cooldown_sec"])),
         max_symbol_weight_pct=float(settings["max_symbol_exposure_pct"]),
         daily_loss_limit_pct=float(settings["daily_loss_limit_pct"]),
-        strategy_capital_limit=float(settings["strategy_capital_limit_krw"]),
+        symbol_exposure=symbol_exposure,
+        portfolio_equity=account_equity,
+        daily_pnl_pct=safe_float(
+            account_risk.get("minimum_daily_pnl_pct"),
+            safe_float(account_risk.get("daily_pnl_pct"), 0.0),
+        ),
+        strategy_exposure=symbol_exposure,
+        strategy_capital_limit=strategy_capital_limit,
+        available_cash=available_cash,
+        api_healthy=(
+            account_known and account_fresh
+            if live_account_required
+            else True
+        ),
+        data_latency_seconds=int(
+            safe_float(account_risk.get("age_seconds"), 0.0)
+            if account_known
+            else 0.0
+        ),
+        max_data_latency_seconds=120,
         max_slippage_bps=float(settings["max_slippage_bps"]),
         max_open_orders=int(float(settings["max_open_orders"])),
-        open_order_count=open_order_count(),
+        open_order_count=effective_open_order_count,
         positions_matched=positions_matched,
         position_quantity=broker_position_quantity(
             intent.symbol,

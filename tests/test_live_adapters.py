@@ -17,6 +17,7 @@ from live_trader.live_adapters import (
     UPBIT_ORDER_DETAIL_ENDPOINT,
     _clear_binance_time_offset_cache,
     _clear_kis_access_token_cache,
+    _reset_kis_request_pacer,
     build_binance_account_request,
     build_binance_cancel_order_request,
     build_binance_spot_order_request,
@@ -31,6 +32,7 @@ from live_trader.live_adapters import (
     issue_kis_access_token,
     normalize_binance_spot_intent,
     refresh_binance_time_offset,
+    send_prepared_request,
     sign_binance_query,
 )
 
@@ -41,6 +43,8 @@ ADAPTER_ENV_KEYS = (
     "KIS_ACCOUNT_NO",
     "KIS_ACCOUNT_PRODUCT_CODE",
     "KIS_BASE_URL",
+    "KIS_REQUEST_MIN_INTERVAL_SECONDS",
+    "KIS_READ_RATE_LIMIT_RETRIES",
     "BINANCE_API_KEY",
     "BINANCE_API_SECRET",
     "BINANCE_BASE_URL",
@@ -55,12 +59,14 @@ class EnvRestoreMixin:
         self.previous_env = {key: os.environ.get(key) for key in ADAPTER_ENV_KEYS}
         _clear_binance_time_offset_cache()
         _clear_kis_access_token_cache()
+        _reset_kis_request_pacer()
         for key in ADAPTER_ENV_KEYS:
             os.environ.pop(key, None)
 
     def tearDown(self) -> None:
         _clear_binance_time_offset_cache()
         _clear_kis_access_token_cache()
+        _reset_kis_request_pacer()
         for key, value in self.previous_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -364,7 +370,8 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         response = {"json": {"access_token": "token-123", "expires_in": 3600}}
 
         with patch("live_trader.live_adapters.http_json", return_value=response) as request, patch(
-            "live_trader.live_adapters.time.monotonic", side_effect=[100.0, 101.0]
+            "live_trader.live_adapters.time.monotonic",
+            side_effect=[100.0, 100.0, 100.0, 101.0],
         ):
             first = issue_kis_access_token()
             second = issue_kis_access_token()
@@ -372,6 +379,97 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertEqual(first, "token-123")
         self.assertEqual(second, "token-123")
         request.assert_called_once()
+
+    def test_kis_requests_share_one_serial_pacer(self) -> None:
+        os.environ.update(
+            {
+                "KIS_APP_KEY": "kis-app-key",
+                "KIS_APP_SECRET": "kis-app-secret",
+                "KIS_ACCOUNT_NO": "12345678-01",
+                "KIS_ACCOUNT_PRODUCT_CODE": "01",
+                "KIS_REQUEST_MIN_INTERVAL_SECONDS": "2.1",
+            }
+        )
+        prepared = build_kis_domestic_balance_request(
+            access_token="token-123"
+        )
+        response = {"ok": True, "json": {"rt_cd": "0"}}
+
+        with patch(
+            "live_trader.live_adapters.http_json",
+            return_value=response,
+        ) as request, patch(
+            "live_trader.live_adapters.time.monotonic",
+            side_effect=[100.0, 100.0, 100.2, 102.1],
+        ), patch("live_trader.live_adapters.time.sleep") as sleep:
+            first = send_prepared_request(prepared)
+            second = send_prepared_request(prepared)
+
+        self.assertEqual(response, first)
+        self.assertEqual(response, second)
+        self.assertEqual(2, request.call_count)
+        sleep.assert_called_once()
+        self.assertAlmostEqual(1.9, sleep.call_args.args[0], places=9)
+
+    def test_kis_read_rate_limit_is_retried_but_post_is_not(self) -> None:
+        os.environ.update(
+            {
+                "KIS_APP_KEY": "kis-app-key",
+                "KIS_APP_SECRET": "kis-app-secret",
+                "KIS_ACCOUNT_NO": "12345678-01",
+                "KIS_ACCOUNT_PRODUCT_CODE": "01",
+                "KIS_REQUEST_MIN_INTERVAL_SECONDS": "2.1",
+            }
+        )
+        read_request = build_kis_domestic_balance_request(
+            access_token="token-123"
+        )
+        rate_limited = {
+            "ok": False,
+            "statusCode": 500,
+            "json": {
+                "rt_cd": "1",
+                "msg_cd": "EGW00215",
+                "msg1": "원장에서 허용 가능한 초당 거래건수를 초과하였습니다.",
+            },
+        }
+        recovered = {"ok": True, "json": {"rt_cd": "0"}}
+
+        with patch(
+            "live_trader.live_adapters.http_json",
+            side_effect=[rate_limited, recovered],
+        ) as request, patch(
+            "live_trader.live_adapters.time.monotonic",
+            side_effect=[100.0, 100.0, 102.1],
+        ), patch("live_trader.live_adapters.time.sleep") as sleep:
+            result = send_prepared_request(read_request)
+
+        self.assertEqual(recovered, result)
+        self.assertEqual(2, request.call_count)
+        sleep.assert_called_once_with(2.1)
+
+        order_request = build_kis_live_order_request(
+            {
+                "symbol": "005930.KS",
+                "side": "BUY",
+                "quantity": 1,
+                "price": 70000,
+            },
+            access_token="token-123",
+        )
+        _reset_kis_request_pacer()
+        with patch(
+            "live_trader.live_adapters.http_json",
+            return_value=rate_limited,
+        ) as request, patch(
+            "live_trader.live_adapters.time.monotonic",
+            side_effect=[200.0, 200.0],
+        ), patch("live_trader.live_adapters.time.sleep") as sleep:
+            result = send_prepared_request(order_request)
+
+        self.assertEqual(rate_limited, result)
+        request.assert_called_once()
+        sleep.assert_not_called()
 
     def test_binance_server_time_offset_is_applied_to_signed_requests(self) -> None:
         os.environ.update(

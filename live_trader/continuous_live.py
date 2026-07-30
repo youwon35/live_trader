@@ -100,7 +100,11 @@ class LiveContinuousController:
                     f"{normalized_profile} runtime {previous_mode} → {normalized_mode} 무중단 전환",
                 )
                 return {"ok": True, "reason": "continuous runtime mode transitioned", "runtime": self.snapshot(), "snapshot": state.snapshot()}
-            portfolio = self._select_portfolio(normalized_profile, portfolio_id, normalized_mode)
+            portfolio = self._select_runtime_portfolio(
+                normalized_profile,
+                portfolio_id,
+                normalized_mode,
+            )
             loaded = None
             if portfolio is not None:
                 source_path = str(portfolio.get("source_path") or "")
@@ -268,6 +272,51 @@ class LiveContinuousController:
         portfolio_id: str,
         mode: str = "MONITOR",
     ) -> dict[str, Any] | None:
+        candidates = self._portfolio_candidates(
+            profile_id,
+            portfolio_id,
+            mode,
+        )
+        return candidates[0] if candidates else None
+
+    def _select_runtime_portfolio(
+        self,
+        profile_id: str,
+        portfolio_id: str,
+        mode: str = "MONITOR",
+    ) -> dict[str, Any] | None:
+        """Choose the newest loadable artifact for an automatic start.
+
+        An explicit ID remains fail-closed so the caller sees its integrity
+        error. Automatic MONITOR startup can skip legacy portfolio locks and
+        fall back to another trusted portfolio or a verified standalone
+        strategy.
+        """
+
+        candidates = self._portfolio_candidates(
+            profile_id,
+            portfolio_id,
+            mode,
+        )
+        if portfolio_id:
+            return candidates[0] if candidates else None
+        for candidate in candidates:
+            source_path = str(candidate.get("source_path") or "")
+            if not source_path or not Path(source_path).is_file():
+                continue
+            try:
+                load_portfolio_runtime_path(source_path)
+            except (OSError, ValueError):
+                continue
+            return candidate
+        return None
+
+    def _portfolio_candidates(
+        self,
+        profile_id: str,
+        portfolio_id: str,
+        mode: str = "MONITOR",
+    ) -> list[dict[str, Any]]:
         from . import state
 
         strategy_rows = state.strategy_rows([])
@@ -289,7 +338,7 @@ class LiveContinuousController:
             ):
                 candidates.append(portfolio)
         # contracts.load_portfolio_artifacts() returns newest artifacts first.
-        return candidates[0] if candidates else None
+        return candidates
 
     @staticmethod
     def _portfolio_components_eligible(
@@ -334,10 +383,26 @@ class LiveContinuousController:
     def _select_standalone_strategy(self, profile_id: str, mode: str) -> dict[str, Any] | None:
         from . import state
 
-        required = "live_eligible" if mode == "FULL_LIVE" else "live_small_eligible"
         for strategy in state.strategy_rows():
-            if strategy.get(required) is not True:
-                continue
+            lifecycle = state.normalize_lifecycle_status(
+                strategy.get("lifecycle_status")
+            )
+            if mode == "MONITOR":
+                if (
+                    lifecycle in {"paused", "retired"}
+                    or state.lifecycle_rank(lifecycle)
+                    < state.lifecycle_rank("backtested")
+                    or strategy.get("backtester_verified") is not True
+                ):
+                    continue
+            else:
+                required = (
+                    "live_eligible"
+                    if mode == "FULL_LIVE"
+                    else "live_small_eligible"
+                )
+                if strategy.get(required) is not True:
+                    continue
             symbol = str(strategy.get("symbol") or "")
             if self._symbol_matches_profile(symbol, profile_id):
                 return strategy

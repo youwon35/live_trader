@@ -44,11 +44,14 @@ import {
   isApiConnectionFailure,
   loadArtifactMetadata,
   loadSharedSearchPresets,
+  previewBinanceFuturesFillSoak,
   runFinalPreflight,
   runReconciliation,
   runStrategyCycle,
   startContinuousRuntime,
+  startBinanceFuturesFillSoak,
   stopContinuousRuntime,
+  stopBinanceFuturesFillSoak,
   runWatchdog,
   promoteStrategyToLive,
   retryOrder,
@@ -79,6 +82,10 @@ import {
 } from "./accountVisualization";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
+import {
+  formatBarCountdown,
+  nextClosedBarSummary,
+} from "../../../packages/design/bar-schedule.js";
 import { readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
 import {
   LAYOUT_RESIZE_DIRECTIONS,
@@ -92,6 +99,11 @@ import {
   readLayoutTransformOffset,
 } from "../../../packages/design/layout-editing.js";
 import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
+import {
+  buildPromotionReadinessQueue,
+  normalizePromotionLifecycle,
+  promotionQueueSummary,
+} from "../../../packages/design/promotion-readiness.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
 import { createTelegramConnectionStatus } from "../../../packages/design/telegram-connection-status.js";
 import {
@@ -284,6 +296,95 @@ const DEFAULT_STRATEGY_DISCOVERY_FILTERS = {
   quick: "all",
   sort: "updated-desc",
 };
+const MIN_LIVE_CANARY_FILLS = 3;
+
+function liveStrategyBarSchedule(strategy, fallbackProvider = "") {
+  if (!strategy) return null;
+  const symbol = String(strategy.symbol || strategy.instrument_id || "").trim();
+  const timeframe = String(strategy.timeframe || strategy.interval || "").trim();
+  if (!symbol || !timeframe) return null;
+  return {
+    asset: strategy.asset || strategy.asset_class || "",
+    market: strategy.market || strategy.market_id || "",
+    provider: strategy.market_data_provider
+      || strategy.provider
+      || strategy.broker_id
+      || fallbackProvider,
+    symbol,
+    timeframe,
+    timeZone: strategy.timezone || strategy.time_zone || "",
+  };
+}
+
+function useLiveClosedBarCountdown(schedules, enabled = true) {
+  const scheduleKey = useMemo(
+    () => schedules
+      .map((schedule) => [
+        schedule.market || "",
+        schedule.provider || "",
+        schedule.symbol || "",
+        schedule.timeframe || "",
+        schedule.timeZone || "",
+      ].join(":"))
+      .sort()
+      .join("|"),
+    [schedules],
+  );
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!enabled || !scheduleKey) return undefined;
+    let timer = 0;
+    const tick = () => setNow(Date.now());
+    const scheduleTimer = () => {
+      window.clearInterval(timer);
+      tick();
+      timer = window.setInterval(tick, document.hidden ? 15_000 : 1_000);
+    };
+    scheduleTimer();
+    document.addEventListener("visibilitychange", scheduleTimer);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", scheduleTimer);
+    };
+  }, [enabled, scheduleKey]);
+
+  return useMemo(
+    () => nextClosedBarSummary(schedules, new Date(now)),
+    [now, scheduleKey, schedules],
+  );
+}
+
+function LiveClosedBarCountdown({ schedules = [] }) {
+  const countdown = useLiveClosedBarCountdown(schedules, schedules.length > 0);
+  if (!countdown) {
+    return (
+      <div className="closed-bar-countdown unavailable">
+        <Clock3 size={17} aria-hidden="true" />
+        <div>
+          <span>다음 확정 봉</span>
+          <strong>주기 정보 대기</strong>
+          <em>실행 전략의 provider·symbol·timeframe을 확인하세요.</em>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="closed-bar-countdown" aria-live="off">
+      <Clock3 size={17} aria-hidden="true" />
+      <div>
+        <span>다음 확정 봉까지</span>
+        <strong>{formatBarCountdown(countdown.secondsRemaining)}</strong>
+        <em>
+          {countdown.schedule.symbol || "Portfolio"} · {countdown.schedule.timeframe}
+          {" · "}{countdown.timeZone}
+          {countdown.scheduleCount > 1 ? ` · ${countdown.scheduleCount}개 일정 중 가장 빠른 봉` : ""}
+          {countdown.isSessionEstimate ? " · 주말 반영, 공휴일·조기폐장 전 예상" : ""}
+        </em>
+      </div>
+    </div>
+  );
+}
 
 function readStoredValue(key, fallback = null) {
   try {
@@ -1622,6 +1723,7 @@ function WorkspaceContent({
             onRuntimeStart={onRuntimeStart}
             onRuntimeStop={onRuntimeStop}
             runtime={snapshot.continuous_runtime}
+            soakReport={snapshot.soakReport || snapshot.soak_report}
           />
         </div>
         <div className="content-column">
@@ -1912,6 +2014,17 @@ function LivePreparationPanel({
               setSavedSearchId("");
             }}
           />
+          <LivePromotionReadinessQueue
+            onSelect={(strategyId) => {
+              setSelectedStrategyId(strategyId);
+              saveArtifactMetadata(strategyId, "strategy", { markUsed: true }).catch(() => undefined);
+            }}
+            operatorConfirmed={Boolean(snapshot.operator_confirmed)}
+            orders={snapshot.orders ?? []}
+            runtime={snapshot.continuous_runtime}
+            strategies={filteredStrategies}
+            summary={snapshot.summary ?? {}}
+          />
           <LiveStrategySelectorPanel
             automaticPromotion={snapshot.automatic_promotion}
             strategies={filteredStrategies}
@@ -1955,10 +2068,187 @@ function LivePreparationPanel({
           />
         </div>
         <div className="content-column">
+          <FuturesFillSoakPanel
+            snapshot={snapshot.binance_futures_fill_soak}
+          />
           <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
           <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
         </div>
       </section>
+    </section>
+  );
+}
+
+const FUTURES_FILL_SOAK_BLOCKER_LABELS = {
+  "account-cannot-trade": "선물 계정 거래 권한이 없습니다.",
+  "position-mode-not-hedge": "포지션 모드를 Hedge Mode로 설정해야 합니다.",
+  "margin-type-not-isolated": "검증 종목을 격리(ISOLATED) 마진으로 설정해야 합니다.",
+  "leverage-not-1x": "검증 종목 레버리지를 1배로 설정해야 합니다.",
+  "preflight-position-not-flat": "기존 선물 포지션을 먼저 평탄화해야 합니다.",
+  "preflight-open-orders-present": "기존 미체결 선물 주문을 먼저 정리해야 합니다.",
+  "available-usdt-invalid": "USD-M Futures 지갑에 주문 가능한 USDT가 없습니다.",
+  "initial-equity-invalid": "USD-M Futures 계좌 equity를 확인할 수 없습니다.",
+  "minimum-order-exceeds-available-usdt": "거래소 최소 주문 금액보다 Futures 가용 USDT가 적습니다.",
+  "minimum-order-derivation-failed": "현재 종목은 5~10 USDT 안전 주문 범위로 수량을 만들 수 없습니다.",
+  "real-orders-disabled": "실주문 환경 잠금이 비활성화되어 있습니다.",
+  "immutable-report-path-unavailable": "덮어쓰기 방지 리포트 경로를 준비할 수 없습니다.",
+  "preview-observation-failed": "실계좌 읽기 전용 조회에 실패했습니다.",
+};
+
+function FuturesFillSoakPanel({ snapshot = {} }) {
+  const [view, setView] = useState(snapshot || {});
+  const [authorizationToken, setAuthorizationToken] = useState("");
+  const [busy, setBusy] = useState("");
+  const [message, setMessage] = useState("");
+  const current = view?.session_id ? view : snapshot || {};
+  const preview = current.preview || {};
+  const blockers = Array.isArray(preview.blockers) ? preview.blockers : [];
+  const active = current.active === true;
+  const ready = current.status === "READY" && Boolean(authorizationToken);
+  const finalReport = current.final_report || current.latest_durable_report || {};
+
+  useEffect(() => {
+    if (!snapshot || typeof snapshot !== "object") return;
+    if (
+      snapshot.active
+      || snapshot.status === "PASS"
+      || snapshot.status === "FAIL"
+      || !view?.session_id
+      || snapshot.session_id === view.session_id
+    ) {
+      setView(snapshot);
+    }
+  }, [snapshot, view?.session_id]);
+
+  async function previewSession() {
+    setBusy("preview");
+    setMessage("");
+    try {
+      const response = await previewBinanceFuturesFillSoak("ETHUSDT");
+      setView(response.fill_soak || {});
+      setAuthorizationToken(response.authorization?.confirmation_token || "");
+      setMessage(response.reason || "");
+    } catch (error) {
+      setMessage(error?.message || "사전점검 요청에 실패했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function startSession() {
+    if (!authorizationToken) return;
+    const confirmed = window.confirm(
+      "실제 Binance USD-M 주문을 시작합니다.\n\n"
+      + "ETHUSDT SHORT 진입·청산 3회(총 6체결), 주문당 5~10 USDT, "
+      + "초기 가용 USDT 100% 상한, 10% 손실 즉시 중단, 최종 평탄화 조건입니다.\n\n"
+      + "계속하시겠습니까?",
+    );
+    if (!confirmed) return;
+    setBusy("start");
+    setMessage("");
+    try {
+      const response = await startBinanceFuturesFillSoak(
+        authorizationToken,
+        true,
+      );
+      setAuthorizationToken("");
+      setView(response.fill_soak || {});
+      setMessage(response.reason || "");
+    } catch (error) {
+      setAuthorizationToken("");
+      setMessage(error?.message || "실체결 soak 시작에 실패했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function stopSession() {
+    if (!window.confirm("신규 주문을 중단하고 세션 소유 포지션의 안전 평탄화를 요청하시겠습니까?")) return;
+    setBusy("stop");
+    setMessage("");
+    try {
+      const response = await stopBinanceFuturesFillSoak();
+      setView(response.fill_soak || {});
+      setMessage(response.reason || "");
+    } catch (error) {
+      setMessage(error?.message || "안전 중단 요청에 실패했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  const statusTone = (
+    current.status === "PASS"
+      ? "success"
+      : current.status === "FAIL" || current.status === "BLOCKED"
+        ? "danger"
+        : active || current.status === "READY"
+          ? "warning"
+          : "info"
+  );
+
+  return (
+    <section className="panel futures-fill-soak-panel">
+      <PanelHeader
+        title="Binance USD-M 실체결 Soak"
+        subtitle="전략 승급과 분리된 브로커 경로 검증입니다. 결과는 자동 승급 증거로 사용하지 않습니다."
+        suffix={<StatusPill tone={statusTone}>{current.status || "IDLE"}</StatusPill>}
+      />
+      <MetricGrid columns={4}>
+        <MetricCard label="검증 종목" value={current.symbol || "ETHUSDT"} detail="HEDGE · ISOLATED · 1x" />
+        <MetricCard label="실체결 목표" value="왕복 3회" detail="진입·청산 총 6 FILLED" />
+        <MetricCard label="주문·자본 상한" value="5~10 USDT" detail="최초 가용 USDT 100% 이내" />
+        <MetricCard label="손실·시간" value="10% · 5시간" detail="손실 즉시 중단 · 최종 flat" />
+      </MetricGrid>
+      {preview.minimum_order && (
+        <div className="futures-fill-soak-observation">
+          <span>가용 <strong>{preview.available_usdt ?? "-"} USDT</strong></span>
+          <span>예상 주문 <strong>{preview.minimum_order.estimated_notional_usdt ?? "-"} USDT</strong></span>
+          <span>마진 <strong>{preview.margin_type || "-"} · {preview.leverage ?? "-"}x</strong></span>
+          <span>포지션/미체결 <strong>{preview.positions?.length ?? 0}/{preview.open_orders?.length ?? 0}</strong></span>
+        </div>
+      )}
+      {blockers.length > 0 && (
+        <div className="futures-fill-soak-blockers" role="status">
+          {blockers.map((blocker) => (
+            <div {...semanticSurfaceProps("danger", "futures-fill-soak-blocker")} key={blocker}>
+              <ShieldAlert size={15} />
+              <span>{FUTURES_FILL_SOAK_BLOCKER_LABELS[blocker] || blocker}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {finalReport?.session_id && (
+        <div {...semanticSurfaceProps(finalReport.status === "PASS" ? "success" : "danger", "futures-fill-soak-final")}>
+          <strong>{finalReport.status}</strong>
+          <span>체결 {finalReport.fill_count ?? 0} · 왕복 {finalReport.round_trips_completed ?? 0} · flat {finalReport.flat === true ? "확인" : "미확인"}</span>
+          {finalReport.report_path && <small>{finalReport.report_path}</small>}
+        </div>
+      )}
+      <div className="operator-actions">
+        <ActionButton
+          className="secondary-button"
+          disabled={Boolean(busy) || active}
+          label={busy === "preview" ? "점검 중" : "읽기 전용 사전점검"}
+          onClick={previewSession}
+          status={busy === "preview" ? "pending" : undefined}
+        />
+        <ActionButton
+          className="danger-button"
+          disabled={!ready || Boolean(busy) || active}
+          label={busy === "start" ? "시작 중" : "확인 후 실체결 시작"}
+          onClick={startSession}
+          status={busy === "start" ? "pending" : undefined}
+        />
+        <ActionButton
+          className="secondary-button"
+          disabled={!active || Boolean(busy)}
+          label={busy === "stop" ? "중단 중" : "안전 중단"}
+          onClick={stopSession}
+          status={busy === "stop" ? "pending" : undefined}
+        />
+        {message && <span className="inline-state">{message}</span>}
+      </div>
     </section>
   );
 }
@@ -2642,9 +2932,12 @@ function liveSmallExecutionSummaryForStrategy(strategyId, orders) {
   (orders || []).forEach((order) => {
     if (!strategyId || String(order.strategy_id) !== String(strategyId)) return;
     if (order.dry_run) return;
+    if (String(order.mode || "").toUpperCase() !== "SMALL_LIVE") return;
+    if (!order.canary_scope || typeof order.canary_scope !== "object") return;
+    if (!String(order.broker_order_id || "").trim() || String(order.broker_order_id) === "-") return;
     const state = String(order.state || "").toLowerCase();
     const queueState = String(order.queue_state || "").toLowerCase();
-    if (["sent", "filled"].includes(state) || ["sent", "filled"].includes(queueState)) successful += 1;
+    if (state === "filled" || queueState === "filled") successful += 1;
     if (["risk_blocked", "adapter_blocked", "failed", "rejected"].includes(state) || ["blocked", "risk_blocked", "failed", "rejected"].includes(queueState)) blocked += 1;
   });
   return { successful, blocked };
@@ -2678,9 +2971,11 @@ function buildLivePromotionChecklist(strategy, normalizedStage, execution, summa
     ...evidenceItem,
     {
       label: "소액 실거래",
-      detail: execution.successful > 0 ? `실제 성공 주문 ${execution.successful}건을 확인했습니다.` : "SMALL_LIVE 실제 성공 주문 1건 이상이 필요합니다.",
-      status: execution.successful > 0 ? "PASS" : "WAIT",
-      tone: execution.successful > 0 ? "success" : "warning",
+      detail: execution.successful >= MIN_LIVE_CANARY_FILLS
+        ? `브로커 체결 원장 ${execution.successful}건을 확인했습니다.`
+        : `SMALL_LIVE broker-confirmed FILLED ${execution.successful}/${MIN_LIVE_CANARY_FILLS}건`,
+      status: execution.successful >= MIN_LIVE_CANARY_FILLS ? "PASS" : "WAIT",
+      tone: execution.successful >= MIN_LIVE_CANARY_FILLS ? "success" : "warning",
     },
     {
       label: "차단 주문",
@@ -3064,6 +3359,64 @@ function clearSecretDrafts(fields, draft) {
   return next;
 }
 
+function formatProcessMemory(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return "-";
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`;
+  return `${(value / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function UnattendedSoakReportCard({ report }) {
+  const status = String(report?.status || "IDLE").toUpperCase();
+  const verdict = String(report?.verdict || "IDLE").toUpperCase();
+  const running = ["RUNNING", "STARTING"].includes(status);
+  const failed = ["FAIL", "FAILED", "ERROR", "ABORTED"].includes(verdict)
+    || ["FAILED", "ERROR", "CRASHED"].includes(status);
+  const tone = failed ? "danger" : running ? "info" : verdict === "PASS" ? "success" : "neutral";
+  const progress = Math.max(0, Math.min(100, Number(report?.progressPct || 0)));
+  const heartbeat = report?.heartbeat || {};
+  const counts = report?.counts || {};
+  const resources = report?.resources || {};
+  const criteria = Array.isArray(report?.criteria) ? report.criteria : [];
+  const failedCriteria = criteria.filter((item) => item?.passed === false);
+  const durationSeconds = Math.max(0, Number(report?.durationSeconds || 0));
+  const targetDurationSeconds = Math.max(0, Number(report?.targetDurationSeconds || 0));
+  return (
+    <section {...semanticSurfaceProps(tone, "unattended-soak-card")}>
+      <div className="unattended-soak-heading">
+        <div>
+          <strong>무인 모니터 Soak</strong>
+          <span>장시간 실행의 heartbeat, 재연결, 오류와 프로세스 자원을 한 리포트로 확인합니다.</span>
+        </div>
+        <StatusPill tone={tone}>{running ? status : verdict}</StatusPill>
+      </div>
+      <div className="unattended-soak-progress" aria-label={`Soak 진행률 ${progress.toFixed(0)}%`}>
+        <i style={{ width: `${progress}%` }} />
+      </div>
+      <div className="unattended-soak-metrics">
+        <div><span>진행</span><strong>{progress.toFixed(0)}%</strong><em>{Math.round(durationSeconds / 60)} / {Math.round(targetDurationSeconds / 60) || "-"}분</em></div>
+        <div><span>Heartbeat gap</span><strong>{Number(heartbeat.maxGapSeconds || 0).toFixed(1)}초</strong><em>{Number(heartbeat.gapCount || 0)}건 · 기준 {Number(heartbeat.limitSeconds || 0)}초</em></div>
+        <div><span>재연결 / 오류</span><strong>{Number(counts.reconnectCount || 0)} / {Number(counts.errorCount || 0)}</strong><em>차단 {Number(counts.blockCount || 0)}건</em></div>
+        <div><span>봉 / 판단 / 체결</span><strong>{Number(counts.barCount || 0)} / {Number(counts.decisionCount || 0)} / {Number(counts.fillCount || 0)}</strong><em>실주문 {Number(counts.realOrderCount || 0)}건</em></div>
+        <div><span>Peak CPU</span><strong>{Number(resources.peakProcessCpuPercent || 0).toFixed(1)}%</strong><em>프로세스 기준</em></div>
+        <div><span>Peak 메모리</span><strong>{formatProcessMemory(resources.peakProcessMemoryBytes)}</strong><em>프로세스 RSS</em></div>
+      </div>
+      <div className="unattended-soak-footer">
+        <span>
+          {status === "IDLE"
+            ? "아직 생성된 soak run이 없습니다."
+            : failedCriteria.length
+              ? `${failedCriteria[0].label || failedCriteria[0].id || "기준"} 실패 · ${failedCriteria.length}개 기준 확인 필요`
+              : `${criteria.filter((item) => item?.passed === true).length}/${criteria.length || 0} 기준 통과`}
+        </span>
+        <code title={report?.viewPath || report?.exportPath || ""}>
+          {report?.viewPath || report?.exportPath || "리포트 경로 대기"}
+        </code>
+      </div>
+    </section>
+  );
+}
+
 function AutomationLauncherPanel({
   profiles,
   strategies,
@@ -3074,6 +3427,7 @@ function AutomationLauncherPanel({
   onRuntimeStart,
   onRuntimeStop,
   runtime,
+  soakReport,
 }) {
   const rows = profiles?.length ? profiles : fallbackSnapshot.automation_profiles;
   const [assetTab, setAssetTab] = useState(rows[0]?.id ?? "stock");
@@ -3156,6 +3510,9 @@ function AutomationLauncherPanel({
   }
 
   const routeStrategies = strategies.filter((strategy) => (activeProfile.id === "stock" ? !isCryptoStrategy(strategy) : isCryptoStrategy(strategy)));
+  const routeSchedules = routeStrategies
+    .map((strategy) => liveStrategyBarSchedule(strategy, activeProfile.provider))
+    .filter(Boolean);
   const runnerText = runnerState?.last_profile === activeProfile.id ? runnerState.last_action : activeProfile.last_action;
   const profileRuntime = runtime?.profiles?.[activeProfile.id] || runtime;
   const runtimeForProfile = profileRuntime?.profileId === activeProfile.id;
@@ -3284,6 +3641,7 @@ function AutomationLauncherPanel({
             <span>1회 진단</span>
           </button>
         </div>
+        <LiveClosedBarCountdown schedules={routeSchedules} />
         <div {...semanticSurfaceProps(runtimeTone, "continuous-runtime-status")}>
           <StatusPill tone={runtimeTone}>
             {runtimeRunning ? `${profileRuntime.mode} RUNNING` : profileRuntime?.phase || "STOPPED"}
@@ -3292,6 +3650,7 @@ function AutomationLauncherPanel({
           {profileRuntime?.lastError && <small data-ts-semantic-preserve="true">{profileRuntime.lastError}</small>}
         </div>
       </div>
+      <UnattendedSoakReportCard report={soakReport} />
       <section className="validation-monitor-card">
         <PanelHeader
           title="검증 전용 MONITOR"
@@ -4017,6 +4376,152 @@ function LaunchReportPanel({ report }) {
   );
 }
 
+function LivePromotionReadinessQueue({
+  operatorConfirmed,
+  onSelect,
+  orders = [],
+  runtime = {},
+  strategies = [],
+  summary = {},
+}) {
+  const [filter, setFilter] = useState("all");
+  const rows = useMemo(
+    () => buildPromotionReadinessQueue(strategies.map((strategy) => {
+      const stage = normalizePromotionLifecycle(
+        strategy?.lifecycle?.status
+        || strategy?.promotion?.stage
+        || strategy?.promotion_stage
+        || strategy?.lifecycle_status,
+      );
+      const execution = liveSmallExecutionSummaryForStrategy(strategy.strategy_id, orders);
+      const rawFailureReasons = liveArtifactFailureReasons(strategy);
+      const expectedCanaryReasons = stage === "before-live-small"
+        ? rawFailureReasons.filter((reason) => /live-activation-required|소액 실거래|canary/i.test(reason))
+        : [];
+      const blockers = rawFailureReasons.filter((reason) => !expectedCanaryReasons.includes(reason));
+      const warnings = [];
+      warnings.push(...expectedCanaryReasons);
+      let nextAction = "";
+      if (stage === "before-live-small") {
+        if (strategy.live_small_eligible !== true) {
+          blockers.push("live_small_eligible 권한이 없습니다.");
+        }
+        if (execution.blocked > 0) {
+          blockers.push(`현재 canary scope에서 차단·실패 주문 ${execution.blocked}건을 해소해야 합니다.`);
+        }
+        if (Number(summary?.blocker_count || 0) > 0) {
+          blockers.push(`운영 readiness blocker ${Number(summary.blocker_count)}개가 남아 있습니다.`);
+        }
+        if (execution.successful < MIN_LIVE_CANARY_FILLS) {
+          warnings.push(`현재 hash·deployment scope의 실제 체결 ${execution.successful}/${MIN_LIVE_CANARY_FILLS}건`);
+        }
+        if (!operatorConfirmed) {
+          warnings.push("운용자 확인이 필요합니다.");
+        }
+        nextAction = execution.successful < MIN_LIVE_CANARY_FILLS
+          ? `SMALL LIVE canary 체결을 ${MIN_LIVE_CANARY_FILLS - execution.successful}건 더 확인하세요.`
+          : "운용자 확인과 최종 preflight 후 정식 Live 승급을 검토하세요.";
+      } else if (stage === "papered") {
+        nextAction = "Paper Trader에서 current hash의 Live-Small 전 승급 evidence를 확정하세요.";
+      } else if (stage === "live") {
+        nextAction = "승급 완료 상태입니다. 무인 모니터와 정기 재검증을 계속하세요.";
+      }
+      return {
+        blockers,
+        detail: `${strategy.symbol || "-"} · ${strategy.timeframe || "-"} · ${strategy.plugin_label || strategy.plugin || "전략"}`,
+        id: strategy.strategy_id,
+        name: strategy.name || strategy.strategy_id,
+        nextAction,
+        running: liveArtifactRunning(runtime, strategy.strategy_id),
+        stage,
+        warnings,
+      };
+    })),
+    [operatorConfirmed, orders, runtime, strategies, summary],
+  );
+  const queueSummary = promotionQueueSummary(rows);
+  const visibleRows = rows
+    .filter((row) => {
+      if (filter === "ready") return ["READY", "OBSERVING"].includes(row.status);
+      if (filter === "check") return row.status === "CHECK";
+      if (filter === "block") return row.status === "BLOCK";
+      return true;
+    })
+    .slice(0, 10);
+
+  return (
+    <section className="panel promotion-readiness-queue">
+      <PanelHeader
+        title="승급 준비 큐"
+        subtitle="후보·차단 근거·다음 작업을 모아 봅니다. 표준 lifecycle, preflight와 current-hash evidence를 건너뛰지 않습니다."
+        suffix={(
+          <StatusPill tone={queueSummary.block ? "warning" : queueSummary.total ? "success" : "neutral"}>
+            {queueSummary.ready + queueSummary.observing} READY · {queueSummary.block} BLOCK
+          </StatusPill>
+        )}
+      />
+      <div className="promotion-readiness-toolbar" role="group" aria-label="승급 준비 큐 필터">
+        {[
+          ["all", `전체 ${queueSummary.total}`],
+          ["ready", `준비 ${queueSummary.ready + queueSummary.observing}`],
+          ["check", `확인 ${queueSummary.check}`],
+          ["block", `차단 ${queueSummary.block}`],
+        ].map(([value, label]) => (
+          <button
+            aria-pressed={filter === value}
+            className={filter === value ? "active" : ""}
+            key={value}
+            onClick={() => setFilter(value)}
+            type="button"
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <div className="promotion-readiness-list">
+        {visibleRows.map((row) => {
+          const issues = [...row.blockers, ...row.warnings];
+          return (
+            <article
+              {...semanticSurfaceProps(row.tone, `promotion-readiness-row ${row.status.toLowerCase()}`)}
+              key={row.id}
+            >
+              <div className="promotion-readiness-identity">
+                <StatusPill tone={row.tone}>{row.status}</StatusPill>
+                <div>
+                  <strong>{row.name}</strong>
+                  <span>{row.id} · {row.detail}</span>
+                </div>
+              </div>
+              <div className="promotion-readiness-stage">
+                <span>{row.stageLabel}</span>
+                <strong>→ {row.nextStageLabel}</strong>
+              </div>
+              <div className="promotion-readiness-blockers">
+                <span>차단·확인 근거</span>
+                <strong>{issues[0] || "현재 확인된 차단 근거 없음"}</strong>
+                {issues.length > 1 && <em>외 {issues.length - 1}건</em>}
+              </div>
+              <div className="promotion-readiness-action">
+                <span>다음 작업</span>
+                <strong>{row.nextAction}</strong>
+              </div>
+              <button
+                className="secondary-button compact-button"
+                onClick={() => onSelect(row.id)}
+                type="button"
+              >
+                Artifact 보기
+              </button>
+            </article>
+          );
+        })}
+        {!visibleRows.length && <EmptyRow text="이 상태에 해당하는 승급 후보가 없습니다." />}
+      </div>
+    </section>
+  );
+}
+
 function LiveStrategySelectorPanel({
   automaticPromotion,
   strategies,
@@ -4042,7 +4547,7 @@ function LiveStrategySelectorPanel({
     selectedStrategy
       && normalizedStage === "before-live-small"
       && selectedStrategy.live_small_eligible
-      && execution.successful > 0
+      && execution.successful >= MIN_LIVE_CANARY_FILLS
       && execution.blocked === 0
       && operatorConfirmed
       && Number(summary?.blocker_count || 0) === 0
