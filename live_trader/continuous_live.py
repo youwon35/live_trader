@@ -15,6 +15,7 @@ from trading_runtime import (
     RuntimeStrategySpec,
     artifact_content_hash,
     feeds_for_specs,
+    futures_execution_policy_from_artifact,
     infer_market_route,
     load_portfolio_runtime_path,
     required_warmup_bars,
@@ -460,6 +461,15 @@ class LiveContinuousController:
         if mode == "MONITOR":
             return True
         artifact = spec.artifact if isinstance(spec.artifact, dict) else {}
+        market_type = str(
+            artifact.get("market_type")
+            or artifact.get("marketType")
+            or ""
+        ).strip().lower()
+        if market_type in {"future", "futures", "perpetual"}:
+            policy = futures_execution_policy_from_artifact(artifact)
+            if policy.get("valid") is not True:
+                return False
         permissions = artifact.get("portfolioPermissions") if isinstance(artifact.get("portfolioPermissions"), dict) else {}
         if not permissions:
             permissions = artifact.get("permissions") if isinstance(artifact.get("permissions"), dict) else {}
@@ -618,6 +628,15 @@ class LiveContinuousController:
                     "required_margin_type": futures_policy[
                         "required_margin_type"
                     ],
+                    "futures_execution_policy": futures_policy["canonical"],
+                    "futures_policy_valid": futures_policy["valid"],
+                    "futures_policy_blockers": futures_policy["blockers"],
+                    "per_trade_risk_pct": futures_policy[
+                        "per_trade_risk_pct"
+                    ],
+                    "max_notional_pct": futures_policy[
+                        "max_notional_pct"
+                    ],
                     "runtime_evaluation_key": decision.evaluation_key,
                     "confirmed_bar_end": decision.bar.end_time,
                     "order_type": self._order_type_for_broker(
@@ -690,27 +709,17 @@ class LiveContinuousController:
         cls,
         spec: Any,
     ) -> dict[str, object]:
-        definition = cls._custom_definition(spec)
-        risk_rules = (
-            definition.get("riskRules")
-            if isinstance(definition.get("riskRules"), dict)
-            else {}
-        )
-        try:
-            maximum_leverage = max(
-                1.0,
-                float(risk_rules.get("maxLeverage") or 1.0),
-            )
-        except (TypeError, ValueError):
-            maximum_leverage = 1.0
-        required_margin_type = str(
-            risk_rules.get("requiredMarginType") or "ISOLATED"
-        ).strip().upper()
-        if required_margin_type not in {"ISOLATED", "CROSSED", "ANY"}:
-            required_margin_type = "ISOLATED"
+        artifact = spec.artifact if isinstance(spec.artifact, dict) else {}
+        policy = futures_execution_policy_from_artifact(artifact)
         return {
-            "max_leverage": maximum_leverage,
-            "required_margin_type": required_margin_type,
+            "schema_version": policy.get("schemaVersion"),
+            "valid": policy.get("valid") is True,
+            "blockers": list(policy.get("blockers") or []),
+            "max_leverage": float(policy.get("maxLeverageMultiplier") or 1.0),
+            "required_margin_type": str(policy.get("marginMode") or "ISOLATED"),
+            "per_trade_risk_pct": float(policy.get("perTradeRiskPercent") or 0.5),
+            "max_notional_pct": float(policy.get("maxNotionalPercent") or 10.0),
+            "canonical": policy,
         }
 
     @staticmethod

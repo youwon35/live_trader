@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
@@ -164,6 +165,64 @@ class ProgramLedger:
             columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(execution_events)").fetchall()}
             if "trace_id" not in columns:
                 conn.execute("ALTER TABLE execution_events ADD COLUMN trace_id TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS order_gate_events (
+                    event_id TEXT PRIMARY KEY,
+                    order_id TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    broker_id TEXT NOT NULL,
+                    broker_order_id TEXT NOT NULL DEFAULT '',
+                    mode TEXT NOT NULL DEFAULT '',
+                    dry_run INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    canary_scope_json TEXT NOT NULL
+                )
+                """
+            )
+            gate_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(order_gate_events)"
+                ).fetchall()
+            }
+            if "broker_order_id" not in gate_columns:
+                conn.execute(
+                    "ALTER TABLE order_gate_events "
+                    "ADD COLUMN broker_order_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "mode" not in gate_columns:
+                conn.execute(
+                    "ALTER TABLE order_gate_events "
+                    "ADD COLUMN mode TEXT NOT NULL DEFAULT ''"
+                )
+            if "dry_run" not in gate_columns:
+                conn.execute(
+                    "ALTER TABLE order_gate_events "
+                    "ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0"
+                )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS order_dispatch_journal (
+                    order_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    broker_id TEXT NOT NULL,
+                    broker_order_id TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    order_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                    order_dispatch_journal_state_updated_idx
+                ON order_dispatch_journal (state, updated_at)
+                """
+            )
 
     def cash_rows(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -209,6 +268,236 @@ class ProgramLedger:
                 item["raw"] = {}
             result.append(item)
         return result
+
+    def record_order_gate_event(self, order: dict[str, Any]) -> None:
+        """Append a local gate outcome without overwriting earlier evidence."""
+
+        order_id = str(order.get("order_id") or "").strip()
+        if not order_id:
+            return
+        occurred_at = str(
+            order.get("updated_at")
+            or order.get("created_at")
+            or order.get("time")
+            or now_text()
+        )
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO order_gate_events
+                (event_id, order_id, strategy_id, broker_id, broker_order_id,
+                 mode, dry_run, state, occurred_at, canary_scope_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        f"order-gate:{order_id}:"
+                        f"{str(order.get('state') or 'event')}:"
+                        f"{uuid.uuid4().hex}"
+                    ),
+                    order_id,
+                    str(order.get("strategy_id") or ""),
+                    str(order.get("broker_id") or ""),
+                    str(order.get("broker_order_id") or ""),
+                    str(order.get("mode") or ""),
+                    1 if bool(order.get("dry_run")) else 0,
+                    str(order.get("state") or ""),
+                    occurred_at,
+                    json.dumps(
+                        order.get("canary_scope")
+                        if isinstance(order.get("canary_scope"), dict)
+                        else {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                ),
+            )
+
+    def order_gate_event_rows(self, limit: int = 5000) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_id, order_id, strategy_id, broker_id, state,
+                       broker_order_id, mode, dry_run, occurred_at,
+                       canary_scope_json
+                FROM order_gate_events
+                ORDER BY occurred_at DESC, event_id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["canary_scope"] = json.loads(
+                    str(item.pop("canary_scope_json") or "{}")
+                )
+            except json.JSONDecodeError:
+                item["canary_scope"] = {}
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _dispatch_order_from_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        try:
+            order = json.loads(str(item.get("order_json") or "{}"))
+        except json.JSONDecodeError:
+            order = {}
+        if not isinstance(order, dict):
+            order = {}
+        order.setdefault("order_id", str(item.get("order_id") or ""))
+        order.setdefault(
+            "idempotency_key",
+            str(item.get("idempotency_key") or ""),
+        )
+        order.setdefault("broker_id", str(item.get("broker_id") or ""))
+        order.setdefault(
+            "broker_order_id",
+            str(item.get("broker_order_id") or ""),
+        )
+        order["state"] = str(item.get("state") or order.get("state") or "")
+        order.setdefault("created_at", str(item.get("created_at") or ""))
+        order["updated_at"] = str(
+            item.get("updated_at") or order.get("updated_at") or ""
+        )
+        return order
+
+    def checkpoint_order_dispatch(
+        self,
+        order: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Durably reserve an idempotency key before any broker side effect."""
+
+        order_id = str(order.get("order_id") or "").strip()
+        idempotency_key = str(order.get("idempotency_key") or "").strip()
+        broker_id = str(order.get("broker_id") or "").strip().lower()
+        if not order_id or not idempotency_key or not broker_id:
+            raise ValueError(
+                "order_id, idempotency_key, and broker_id are required"
+            )
+        created_at = str(
+            order.get("created_at")
+            or order.get("time")
+            or now_text()
+        )
+        updated_at = str(order.get("updated_at") or created_at)
+        payload = json.dumps(
+            order,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        with self.connection() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO order_dispatch_journal
+                    (order_id, idempotency_key, broker_id, broker_order_id,
+                     state, created_at, updated_at, order_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        order_id,
+                        idempotency_key,
+                        broker_id,
+                        str(order.get("broker_order_id") or ""),
+                        str(order.get("state") or "dispatch_pending"),
+                        created_at,
+                        updated_at,
+                        payload,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                row = conn.execute(
+                    """
+                    SELECT order_id, idempotency_key, broker_id,
+                           broker_order_id, state, created_at, updated_at,
+                           order_json
+                    FROM order_dispatch_journal
+                    WHERE order_id = ? OR idempotency_key = ?
+                    LIMIT 1
+                    """,
+                    (order_id, idempotency_key),
+                ).fetchone()
+                return {
+                    "created": False,
+                    "order": (
+                        self._dispatch_order_from_row(row)
+                        if row is not None
+                        else {}
+                    ),
+                }
+        return {"created": True, "order": dict(order)}
+
+    def update_order_dispatch(self, order: dict[str, Any]) -> bool:
+        """Persist the post-dispatch state; never creates missing evidence."""
+
+        order_id = str(order.get("order_id") or "").strip()
+        idempotency_key = str(order.get("idempotency_key") or "").strip()
+        if not order_id or not idempotency_key:
+            return False
+        updated_at = str(order.get("updated_at") or now_text())
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE order_dispatch_journal
+                SET broker_order_id = ?, state = ?, updated_at = ?,
+                    order_json = ?
+                WHERE order_id = ? AND idempotency_key = ?
+                """,
+                (
+                    str(order.get("broker_order_id") or ""),
+                    str(order.get("state") or ""),
+                    updated_at,
+                    json.dumps(
+                        order,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    order_id,
+                    idempotency_key,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def order_dispatch_for_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        normalized = str(idempotency_key or "").strip()
+        if not normalized:
+            return None
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT order_id, idempotency_key, broker_id, broker_order_id,
+                       state, created_at, updated_at, order_json
+                FROM order_dispatch_journal
+                WHERE idempotency_key = ?
+                LIMIT 1
+                """,
+                (normalized,),
+            ).fetchone()
+        return (
+            self._dispatch_order_from_row(row)
+            if row is not None
+            else None
+        )
+
+    def order_dispatch_rows(self, limit: int = 5000) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT order_id, idempotency_key, broker_id, broker_order_id,
+                       state, created_at, updated_at, order_json
+                FROM order_dispatch_journal
+                ORDER BY updated_at DESC, order_id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [self._dispatch_order_from_row(row) for row in rows]
 
     def existing_execution_event_ids(self, event_ids: list[str]) -> set[str]:
         unique_ids = list(dict.fromkeys(str(item) for item in event_ids if str(item)))

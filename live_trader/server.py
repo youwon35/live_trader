@@ -336,6 +336,11 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if parsed.path == "/api/binance-futures-risk/preview":
+            self.send_json(
+                state.preview_binance_futures_order_risk(payload)
+            )
+            return
         if parsed.path == "/api/binance-futures-settings/apply":
             self.send_json(
                 state.apply_binance_futures_settings(

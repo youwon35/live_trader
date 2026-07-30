@@ -5,7 +5,9 @@ import csv
 import html
 import hashlib
 import json
+import math
 import secrets
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +58,7 @@ from trading_runtime import (
     ExecutionSample,
     assess_recovery_drill,
     calibrate_execution,
+    compare_futures_policy_to_broker,
     AutomaticPromotionDecision,
     DecisionTraceStore,
     PositionTruth,
@@ -64,6 +67,8 @@ from trading_runtime import (
     build_restart_recovery_plan,
     build_trace_id,
     evaluate_automatic_promotion,
+    futures_execution_policy_from_artifact,
+    normalize_futures_execution_policy,
     reconcile_broker_truth,
     record_flight_event,
 )
@@ -116,6 +121,8 @@ from .futures_fill_soak import (
     LiveOrderAuthorization,
     default_report_directory as futures_fill_soak_report_directory,
 )
+from .capital_rollout import build_capital_rollout, capital_cap_for_mode
+from .futures_risk import simulate_futures_order_risk
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
@@ -129,6 +136,7 @@ from trading_runtime.telegram_notifications import (
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
 CheckStatus = Literal["pass", "warn", "fail"]
+LIVE_BROKER_DISPATCH_MODES = frozenset({"SMALL_LIVE", "FULL_LIVE"})
 RUNTIME_MODE_LOCK = threading.RLock()
 BINANCE_FUTURES_CANARY_LOCK = threading.RLock()
 BINANCE_FUTURES_FILL_SOAK_LOCK = threading.RLock()
@@ -1399,6 +1407,71 @@ def _live_deployment_id(normalized: dict[str, Any]) -> str:
     )
 
 
+def _deployment_event_rows(
+    strategy_dir: Path,
+) -> list[dict[str, Any]]:
+    event_path = strategy_dir / "deployments" / "deployment-events.jsonl"
+    if not event_path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        with event_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    rows.append(payload)
+    except OSError:
+        return []
+    return rows
+
+
+def _before_live_small_entry(
+    deployment: dict[str, Any],
+    *,
+    strategy_dir: Path | None,
+    deployment_events: list[dict[str, Any]] | None,
+) -> tuple[int, str]:
+    deployment_id = str(deployment.get("deploymentId") or "")
+    current_revision = int(safe_float(deployment.get("revision"), 0.0))
+    lifecycle = normalize_lifecycle_status(deployment.get("lifecycle"))
+    events = (
+        deployment_events
+        if deployment_events is not None
+        else _deployment_event_rows(strategy_dir)
+        if strategy_dir is not None
+        else []
+    )
+    candidates = [
+        item
+        for item in events
+        if isinstance(item, dict)
+        and str(item.get("deploymentId") or "") == deployment_id
+        and normalize_lifecycle_status(item.get("toLifecycle"))
+        == "before-live-small"
+        and 0 < int(safe_float(item.get("revision"), 0.0))
+        <= current_revision
+        and _canary_datetime(item.get("occurredAt")) is not None
+    ]
+    if candidates:
+        selected = max(
+            candidates,
+            key=lambda item: int(safe_float(item.get("revision"), 0.0)),
+        )
+        return (
+            int(safe_float(selected.get("revision"), 0.0)),
+            str(selected.get("occurredAt") or ""),
+        )
+    # A legacy registry can safely use its current timestamp only while it is
+    # still at the entry stage. Once promoted, the live timestamp is not the
+    # canary boundary and must never be substituted.
+    if lifecycle == "before-live-small":
+        return current_revision, str(deployment.get("updatedAt") or "")
+    return 0, ""
+
+
 def current_live_canary_scope(
     strategy_id: str,
     *,
@@ -1406,28 +1479,31 @@ def current_live_canary_scope(
     strategy_payload: dict[str, Any] | None = None,
     normalized: dict[str, Any] | None = None,
     deployment: dict[str, Any] | None = None,
+    deployment_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     target = str(strategy_id or "").strip()
     strategy_dir: Path | None = None
     payload = strategy_payload
     normalized_payload = normalized
-    if payload is None or normalized_payload is None:
+    if normalized_payload is not None:
+        source_path = Path(
+            str(normalized_payload.get("artifact_source_path") or "")
+        )
+        if str(source_path) and source_path.parent != source_path:
+            strategy_dir = source_path.parent
+    if normalized_payload is None or strategy_dir is None:
         (
-            strategy_dir,
+            resolved_strategy_dir,
             _artifact_path,
             resolved_payload,
             resolved_normalized,
         ) = find_strategy_artifact_payload(target)
+        strategy_dir = strategy_dir or resolved_strategy_dir
         payload = payload or resolved_payload
         normalized_payload = normalized_payload or resolved_normalized
-    elif target:
-        strategy_dir, _path, _payload, _normalized = find_strategy_artifact_payload(
-            target
-        )
     if (
         not target
         or strategy_dir is None
-        or not isinstance(payload, dict)
         or not isinstance(normalized_payload, dict)
     ):
         return {
@@ -1455,17 +1531,28 @@ def current_live_canary_scope(
             "issues": ["live-deployment-missing"],
         }
 
-    current_reference = artifact_reference(payload)
+    current_reference = (
+        dict(normalized_payload.get("artifact_reference"))
+        if isinstance(normalized_payload.get("artifact_reference"), dict)
+        else artifact_reference(payload)
+        if isinstance(payload, dict)
+        else {}
+    )
     deployed_reference = (
         current_deployment.get("strategyArtifact")
         if isinstance(current_deployment.get("strategyArtifact"), dict)
         else {}
     )
-    revision = int(safe_float(current_deployment.get("revision"), 0.0))
-    entered_at = str(current_deployment.get("updatedAt") or "")
+    revision, entered_at = _before_live_small_entry(
+        current_deployment,
+        strategy_dir=strategy_dir,
+        deployment_events=deployment_events,
+    )
     issues: list[str] = []
-    if normalize_lifecycle_status(current_deployment.get("lifecycle")) != "before-live-small":
-        issues.append("deployment-not-before-live-small")
+    if normalize_lifecycle_status(
+        current_deployment.get("lifecycle")
+    ) not in {"before-live-small", "live"}:
+        issues.append("deployment-not-live-rollout")
     if revision <= 0:
         issues.append("deployment-revision-missing")
     if _canary_datetime(entered_at) is None:
@@ -1523,12 +1610,16 @@ def live_small_execution_summary(
     strategy_payload: dict[str, Any] | None = None,
     normalized: dict[str, Any] | None = None,
     deployment: dict[str, Any] | None = None,
+    deployment_events: list[dict[str, Any]] | None = None,
+    execution_events: list[dict[str, Any]] | None = None,
+    order_gate_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     scope = current_live_canary_scope(
         strategy_id,
         strategy_payload=strategy_payload,
         normalized=normalized,
         deployment=deployment,
+        deployment_events=deployment_events,
     )
     empty = {
         "successful": 0,
@@ -1543,6 +1634,15 @@ def live_small_execution_summary(
         return empty
 
     scoped_orders: dict[tuple[str, str], dict[str, Any]] = {}
+    blocked_order_ids: set[str] = set()
+    blocked_states = {
+        "risk_blocked",
+        "adapter_blocked",
+        "broker_rejected",
+        "failed",
+        "retry_exhausted",
+        "canceled",
+    }
     for order in STATE["orders"]:
         if (
             str(order.get("strategy_id") or "") != str(strategy_id)
@@ -1556,18 +1656,53 @@ def live_small_execution_summary(
         created_at = _canary_datetime(
             order.get("created_at") or order.get("time")
         )
+        if created_at is None or created_at < boundary:
+            continue
+        order_id = str(order.get("order_id") or "").strip()
+        if str(order.get("state") or "").strip().lower() in blocked_states:
+            blocked_order_ids.add(order_id or f"local:{id(order)}")
+        if broker_id and broker_order_id not in {"", "-"}:
+            scoped_orders[(broker_id, broker_order_id)] = order
+
+    durable_gate_events = (
+        order_gate_events
+        if order_gate_events is not None
+        else PROGRAM_LEDGER.order_gate_event_rows(5000)
+    )
+    for event in durable_gate_events:
         if (
-            not broker_id
-            or broker_order_id in {"", "-"}
-            or created_at is None
-            or created_at < boundary
+            str(event.get("strategy_id") or "") != str(strategy_id)
+            or not _canary_scope_matches(event.get("canary_scope"), scope)
         ):
             continue
-        scoped_orders[(broker_id, broker_order_id)] = order
+        occurred_at = _canary_datetime(event.get("occurred_at"))
+        if occurred_at is None or occurred_at < boundary:
+            continue
+        event_order_id = str(event.get("order_id") or "").strip()
+        event_state = str(event.get("state") or "").strip().lower()
+        if event_order_id and event_state in blocked_states:
+            blocked_order_ids.add(event_order_id)
+        event_broker_id = str(
+            event.get("broker_id") or ""
+        ).strip().lower()
+        event_broker_order_id = str(
+            event.get("broker_order_id") or ""
+        ).strip()
+        if (
+            event_broker_id
+            and event_broker_order_id not in {"", "-"}
+        ):
+            scoped_orders[
+                (event_broker_id, event_broker_order_id)
+            ] = event
 
     fill_identities: set[tuple[str, str]] = set()
-    rejected_identities: set[tuple[str, str]] = set()
-    for event in PROGRAM_LEDGER.execution_event_rows(5000):
+    durable_execution_events = (
+        execution_events
+        if execution_events is not None
+        else PROGRAM_LEDGER.execution_event_rows(5000)
+    )
+    for event in durable_execution_events:
         event_id = str(event.get("event_id") or "").strip()
         broker_id = str(event.get("broker_id") or "").strip().lower()
         broker_order_id = str(event.get("broker_order_id") or "").strip()
@@ -1602,10 +1737,17 @@ def live_small_execution_summary(
             # multiple partial-fill/update events for the same order.
             fill_identities.add(identity)
         elif state_name in {"rejected", "expired", "failed", "canceled"}:
-            rejected_identities.add(identity)
+            matched_order = scoped_orders.get(identity, {})
+            matched_order_id = str(
+                matched_order.get("order_id") or ""
+            ).strip()
+            blocked_order_ids.add(
+                matched_order_id
+                or f"broker:{identity[0]}:{identity[1]}"
+            )
     return {
         "successful": len(fill_identities),
-        "blocked": len(rejected_identities),
+        "blocked": len(blocked_order_ids),
         "fills": len(fill_identities),
         "scope": scope,
     }
@@ -3171,9 +3313,11 @@ def reconciliation_snapshot() -> dict[str, Any]:
     }
 
 
-def reconciliation_summary_for_broker(broker_id: str) -> dict[str, Any]:
+def _reconciliation_summary_for_broker_snapshot(
+    data: dict[str, Any],
+    broker_id: str,
+) -> dict[str, Any]:
     normalized = str(broker_id or "").strip().lower()
-    data = reconciliation_snapshot()
     rows = [
         item
         for item in [*data["positions"], *data["accounts"]]
@@ -3200,6 +3344,13 @@ def reconciliation_summary_for_broker(broker_id: str) -> dict[str, Any]:
         "broker_id": normalized,
         "broker_error": broker_error,
     }
+
+
+def reconciliation_summary_for_broker(broker_id: str) -> dict[str, Any]:
+    return _reconciliation_summary_for_broker_snapshot(
+        reconciliation_snapshot(),
+        broker_id,
+    )
 
 
 def reconciliation_next_actions(api_required_count: int, mismatch_count: int, capability_gap_count: int = 0) -> list[str]:
@@ -3368,15 +3519,15 @@ def retry_policy_rows() -> list[dict[str, object]]:
     return rows
 
 
-def can_retry_order(order: dict[str, Any]) -> bool:
-    if str(order.get("oms_status") or "").upper() in {"SUBMITTING", "ACKNOWLEDGED", "PARTIALLY_FILLED", "CANCEL_PENDING", "UNKNOWN"}:
-        return False
-    if order.get("state") in FINAL_ORDER_STATES:
-        return False
-    if order.get("queue_state") == "canceled":
-        return False
-    max_attempts = int(float(STATE["retry_policy"]["max_attempts"]))
-    return int(order.get("attempts", 0)) < max_attempts
+def can_retry_order(_order: dict[str, Any]) -> bool:
+    """Existing orders are never resubmitted from stale stored inputs.
+
+    A new closed-bar decision must create a fresh intent, trace,
+    idempotency key, and pre-dispatch journal entry through
+    ``submit_order_intent``.
+    """
+
+    return False
 
 
 def order_rows() -> list[dict[str, Any]]:
@@ -4129,6 +4280,165 @@ def persist_doctor_diagnostic_snapshot(data: dict[str, Any]) -> dict[str, Any]:
     return doctor_diagnostics_document()
 
 
+def lineage_flow_snapshot(
+    strategies: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    rows = strategies if strategies is not None else strategy_rows()
+    stage_labels = {
+        "dataset": "Scraper 데이터셋",
+        "backtest": "Backtester",
+        "paper": "Paper Trader",
+        "live": "Live Trader",
+    }
+    flows: list[dict[str, Any]] = []
+    for strategy in rows:
+        lineage = (
+            strategy.get("lineage")
+            if isinstance(strategy.get("lineage"), dict)
+            else {}
+        )
+        lifecycle = normalize_lifecycle_status(
+            strategy.get("lifecycle_status")
+        )
+        lifecycle_body = (
+            strategy.get("lifecycle")
+            if isinstance(strategy.get("lifecycle"), dict)
+            else {}
+        )
+        terminal_lifecycles = {"paused", "retired"}
+        reached_lifecycles = (
+            []
+            if lifecycle in terminal_lifecycles
+            else [lifecycle]
+        )
+        paused_from = normalize_lifecycle_status(
+            lifecycle_body.get("pausedFrom")
+        )
+        if paused_from not in terminal_lifecycles:
+            reached_lifecycles.append(paused_from)
+        for history_entry in lifecycle_body.get("history") or []:
+            if not isinstance(history_entry, dict):
+                continue
+            for key in ("to", "toLifecycle", "status", "stage"):
+                candidate = normalize_lifecycle_status(history_entry.get(key))
+                if candidate not in terminal_lifecycles:
+                    reached_lifecycles.append(candidate)
+        highest_lifecycle_rank = max(
+            (lifecycle_rank(item) for item in reached_lifecycles),
+            default=lifecycle_rank("draft"),
+        )
+        required = {
+            "dataset": True,
+            "backtest": True,
+            "paper": highest_lifecycle_rank >= lifecycle_rank("papered"),
+            "live": highest_lifecycle_rank >= lifecycle_rank("live"),
+        }
+        stages: list[dict[str, Any]] = []
+        broken: list[str] = []
+        for stage_id in ("dataset", "backtest", "paper", "live"):
+            body = (
+                lineage.get(stage_id)
+                if isinstance(lineage.get(stage_id), dict)
+                else {}
+            )
+            valid = body.get("valid") is True
+            legacy = body.get("legacy") is True
+            issues = [str(item) for item in body.get("issues") or []]
+            if required[stage_id] and not valid:
+                broken.append(f"{stage_id}:missing-or-invalid")
+            stages.append(
+                {
+                    "id": stage_id,
+                    "label": stage_labels[stage_id],
+                    "required": required[stage_id],
+                    "valid": valid,
+                    "legacy": legacy,
+                    "status": (
+                        "PASS"
+                        if valid
+                        else "BLOCK"
+                        if required[stage_id]
+                        else "WAIT"
+                    ),
+                    "contentHash": str(body.get("contentHash") or ""),
+                    "producer": str(body.get("producer") or ""),
+                    "createdAt": str(body.get("createdAt") or ""),
+                    "issues": issues,
+                    "metadata": (
+                        {
+                            "schemaVersion": str(
+                                body.get("schemaVersion") or ""
+                            ),
+                            "tracked": body.get("tracked") is True,
+                            "datasetId": str(
+                                body.get("datasetId") or ""
+                            ),
+                            "lineageRunId": str(
+                                body.get("lineageRunId") or ""
+                            ),
+                            "sourceStage": str(
+                                body.get("sourceStage") or ""
+                            ),
+                            "stageRevisionId": str(
+                                body.get("stageRevisionId") or ""
+                            ),
+                            "parentStageRevisionId": str(
+                                body.get("parentStageRevisionId") or ""
+                            ),
+                            "dependencyStageRevisionIds": [
+                                str(item)
+                                for item in body.get(
+                                    "dependencyStageRevisionIds"
+                                )
+                                or []
+                                if str(item)
+                            ],
+                            "rawContentSha256": str(
+                                body.get("rawContentSha256") or ""
+                            ),
+                            "rawMetadataSha256": str(
+                                body.get("rawMetadataSha256") or ""
+                            ),
+                            "transformationId": str(
+                                body.get("transformationId") or ""
+                            ),
+                            "parent": (
+                                dict(body.get("parent"))
+                                if isinstance(body.get("parent"), dict)
+                                else {}
+                            ),
+                        }
+                        if stage_id == "dataset"
+                        else {}
+                    ),
+                }
+            )
+        broken.extend(str(item) for item in lineage.get("blockingIssues") or [])
+        flows.append(
+            {
+                "strategyId": str(strategy.get("strategy_id") or ""),
+                "name": str(
+                    strategy.get("name")
+                    or strategy.get("strategy_id")
+                    or ""
+                ),
+                "symbol": str(strategy.get("symbol") or ""),
+                "timeframe": str(strategy.get("timeframe") or ""),
+                "lifecycle": lifecycle,
+                "complete": not broken,
+                "brokenLinks": list(dict.fromkeys(broken)),
+                "stages": stages,
+            }
+        )
+    return {
+        "schemaVersion": "professional-lineage-dashboard-v1",
+        "flowCount": len(flows),
+        "completeCount": sum(1 for flow in flows if flow["complete"]),
+        "brokenCount": sum(1 for flow in flows if not flow["complete"]),
+        "flows": flows,
+    }
+
+
 def snapshot() -> dict[str, Any]:
     brokers = [broker.to_dict() for broker in broker_readiness()]
     portfolios = portfolio_rows()
@@ -4205,6 +4515,16 @@ def snapshot() -> dict[str, Any]:
         "binance_futures_canary": binance_futures_canary_status(),
         "binance_futures_settings": binance_futures_settings_status(),
         "binance_futures_fill_soak": binance_futures_fill_soak_status(),
+        "capital_rollout": futures_capital_rollout_snapshot(
+            strategies,
+            reconciliation_summary=(
+                _reconciliation_summary_for_broker_snapshot(
+                    reconciliation,
+                    "binance-futures",
+                )
+            ),
+        ),
+        "lineage_flow": lineage_flow_snapshot(strategies),
         "execution_calibration": execution_calibration_snapshot(),
         "policy_replays": list(STATE.get("policy_replays", [])),
         "shadow_live": {"brokerSubmissionBlocked": True, "evidence": list(STATE.get("shadow_evidence", []))[:20], "count": len(STATE.get("shadow_evidence", []))},
@@ -6965,6 +7285,208 @@ def binance_futures_settings_status() -> dict[str, Any]:
     return redact_sensitive_payload(current)  # type: ignore[return-value]
 
 
+def preview_binance_futures_order_risk(
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    request = dict(payload or {})
+    normalized_symbol = normalize_usdm_symbol(
+        request.get("symbol") or "ETHUSDT"
+    )
+    strategy_id = str(request.get("strategy_id") or "").strip()
+    selected_strategy = next(
+        (
+            row
+            for row in strategy_rows()
+            if str(row.get("strategy_id") or "") == strategy_id
+        ),
+        None,
+    )
+    policy = (
+        dict(selected_strategy.get("futures_execution_policy") or {})
+        if isinstance(selected_strategy, dict)
+        else futures_execution_policy_from_artifact({})
+    )
+    route_blockers: list[str] = []
+    if not normalized_symbol:
+        route_blockers.append("symbol-invalid")
+    if strategy_id and selected_strategy is None:
+        route_blockers.append("strategy-artifact-missing")
+    if selected_strategy is not None:
+        strategy_symbol = normalize_usdm_symbol(
+            selected_strategy.get("symbol")
+        )
+        if strategy_symbol and strategy_symbol != normalized_symbol:
+            route_blockers.append("strategy-symbol-mismatch")
+        if strategy_broker_id(selected_strategy) != "binance-futures":
+            route_blockers.append("strategy-route-not-binance-futures")
+
+    if route_blockers:
+        return {
+            "ok": False,
+            "reason": "선물 위험 계산 입력 차단: " + ", ".join(route_blockers),
+            "risk": {
+                "status": "BLOCKED",
+                "blockers": route_blockers,
+                "warnings": [],
+                "policy": policy,
+            },
+        }
+
+    router = BINANCE_FUTURES_SETTINGS_ROUTER_FACTORY()
+    try:
+        raw_observation = router.get_binance_futures_canary_observation(
+            normalized_symbol
+        )
+        observation = _binance_futures_settings_summary(raw_observation)
+        market = router.get_binance_futures_risk_inputs(
+            normalized_symbol,
+            notional_usdt=request.get("notional_usdt"),
+        )
+        account_snapshot = router.get_account_snapshot("binance-futures")
+        account_rows = (
+            account_snapshot.get("accounts")
+            if isinstance(account_snapshot.get("accounts"), list)
+            else []
+        )
+        account = (
+            account_rows[0]
+            if account_rows and isinstance(account_rows[0], dict)
+            else {}
+        )
+    except (
+        BrokerNotReadyError,
+        OSError,
+        RuntimeError,
+        TimeoutError,
+        ValueError,
+    ) as exc:
+        reason = (
+            "Binance Futures 읽기 전용 위험 입력 조회 실패: "
+            + str(exc)[:240]
+        )
+        append_audit(
+            "warn",
+            "Binance Futures 주문 위험 계산",
+            reason,
+        )
+        return {
+            "ok": False,
+            "reason": reason,
+            "risk": {
+                "status": "BLOCKED",
+                "blockers": ["broker-risk-inputs-unavailable"],
+                "warnings": [],
+                "policy": policy,
+            },
+        }
+
+    current_leverage = safe_float(observation.get("leverage"), 0.0)
+    requested_leverage = safe_float(
+        request.get("leverage"),
+        current_leverage,
+    )
+    account_equity = safe_float(
+        account.get("broker_equity"),
+        safe_float(account.get("margin_balance"), 0.0),
+    )
+    available_usdt = safe_float(
+        observation.get("available_usdt"),
+        safe_float(account.get("broker_cash"), 0.0),
+    )
+    risk = simulate_futures_order_risk(
+        {
+            **request,
+            "symbol": normalized_symbol,
+            "margin_type": observation.get("margin_type"),
+            "account_equity_usdt": account_equity,
+            "available_usdt": available_usdt,
+            "entry_price": market.get("mark_price"),
+            "leverage": requested_leverage,
+            "maintenance_margin_rate": market.get(
+                "maintenance_margin_rate"
+            ),
+            "taker_fee_rate": market.get("taker_fee_rate"),
+            "funding_rate": market.get("funding_rate"),
+        },
+        policy=policy,
+    )
+    drift = compare_futures_policy_to_broker(
+        policy,
+        {
+            "marginType": observation.get("margin_type"),
+            "leverage": observation.get("leverage"),
+        },
+    )
+    extra_blockers = [
+        str(item)
+        for item in drift.get("blockers") or []
+        if str(item)
+    ]
+    if (
+        requested_leverage <= 0
+        or abs(requested_leverage - current_leverage) > 1e-12
+    ):
+        extra_blockers.append("requested-leverage-broker-mismatch")
+    risk["blockers"] = list(
+        dict.fromkeys([*risk.get("blockers", []), *extra_blockers])
+    )
+    risk["status"] = (
+        "BLOCKED"
+        if risk["blockers"]
+        else "WARNING"
+        if risk.get("warnings")
+        else "READY"
+    )
+    risk["broker"] = {
+        "margin_type": observation.get("margin_type"),
+        "leverage": current_leverage,
+        "position_count": observation.get("position_count"),
+        "open_order_count": observation.get("open_order_count"),
+        "policy_drift": drift,
+    }
+    risk["market"] = {
+        "mark_price": market.get("mark_price"),
+        "index_price": market.get("index_price"),
+        "funding_rate": market.get("funding_rate"),
+        "next_funding_time": market.get("next_funding_time"),
+        "maintenance_margin_rate": market.get(
+            "maintenance_margin_rate"
+        ),
+        "notional_floor": market.get("notional_floor"),
+        "notional_cap": market.get("notional_cap"),
+        "initial_leverage_limit": market.get(
+            "initial_leverage_limit"
+        ),
+        "maker_fee_rate": market.get("maker_fee_rate"),
+        "taker_fee_rate": market.get("taker_fee_rate"),
+        "source": "Binance USD-M read-only endpoints",
+    }
+    risk["strategy"] = {
+        "strategy_id": strategy_id,
+        "name": (
+            str(selected_strategy.get("name") or "")
+            if isinstance(selected_strategy, dict)
+            else ""
+        ),
+    }
+    append_audit(
+        "info" if risk["status"] == "READY" else "warn",
+        "Binance Futures 주문 위험 계산",
+        (
+            f"{normalized_symbol} · {request.get('direction') or 'LONG'} · "
+            f"{safe_float(request.get('notional_usdt'), 0.0):g} USDT · "
+            f"{requested_leverage:g}x · {risk['status']} · 주문 전송 없음"
+        ),
+    )
+    return {
+        "ok": True,
+        "reason": (
+            "주문 전송 없이 현재 브로커 설정과 Artifact 정책으로 계산했습니다."
+        ),
+        "risk": redact_sensitive_payload(risk),
+    }
+
+
 def preview_binance_futures_settings(
     symbol: object = "ETHUSDT",
     margin_type: object = "ISOLATED",
@@ -8825,6 +9347,340 @@ def strategy_for_order_intent(checks: dict[str, Any], intent: OrderIntent) -> di
     return next((strategy for strategy in strategies if str(strategy.get("strategy_id")) == intent.strategy_id), {})
 
 
+def futures_risk_reducing_verified(
+    checks: dict[str, Any],
+    intent: OrderIntent,
+) -> bool:
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    if metadata.get("risk_reducing") is not True:
+        return False
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    if broker_id != "binance-futures":
+        return True
+    strategy = strategy_for_order_intent(checks, intent)
+    if not strategy or strategy_broker_id(strategy) != "binance-futures":
+        return False
+    direction = str(
+        strategy.get("position_direction") or ""
+    ).strip().lower()
+    if direction not in {"long", "short"}:
+        return False
+    try:
+        position_quantity = broker_position_quantity(
+            intent.symbol,
+            "binance-futures",
+            "SHORT" if direction == "short" else "LONG",
+        )
+    except RuntimeError:
+        return False
+    tolerance = max(1e-12, abs(position_quantity) * 1e-9)
+    if direction == "short":
+        return (
+            position_quantity < 0
+            and intent.side == "BUY"
+            and intent.quantity
+            <= abs(position_quantity) + tolerance
+        )
+    return (
+        position_quantity > 0
+        and intent.side == "SELL"
+        and intent.quantity <= position_quantity + tolerance
+    )
+
+
+def _intersect_futures_execution_policies(
+    policies: list[dict[str, Any]],
+) -> dict[str, Any]:
+    normalized = [
+        normalize_futures_execution_policy(policy)
+        for policy in policies
+        if isinstance(policy, dict)
+    ]
+    if not normalized:
+        result = normalize_futures_execution_policy(None)
+        result["valid"] = False
+        result["blockers"] = ["futures-policy-missing"]
+        return result
+    margins = {
+        str(item.get("marginMode") or "")
+        for item in normalized
+        if str(item.get("marginMode") or "")
+    }
+    blockers = [
+        str(blocker)
+        for item in normalized
+        for blocker in item.get("blockers") or []
+        if str(blocker)
+    ]
+    if len(margins) != 1:
+        blockers.append("futures-policy-margin-conflict")
+    strict = normalize_futures_execution_policy(
+        {
+            "marginMode": next(iter(margins), "ISOLATED"),
+            "maxLeverageMultiplier": min(
+                safe_float(item.get("maxLeverageMultiplier"), 1.0)
+                for item in normalized
+            ),
+            "perTradeRiskPercent": min(
+                safe_float(item.get("perTradeRiskPercent"), 0.5)
+                for item in normalized
+            ),
+            "maxNotionalPercent": min(
+                safe_float(item.get("maxNotionalPercent"), 10.0)
+                for item in normalized
+            ),
+        }
+    )
+    blockers.extend(
+        str(item) for item in strict.get("blockers") or [] if str(item)
+    )
+    strict["blockers"] = list(dict.fromkeys(blockers))
+    strict["valid"] = not strict["blockers"]
+    strict["source"] = "strict-policy-intersection"
+    return strict
+
+
+def _intent_futures_execution_policy(
+    strategy: dict[str, Any],
+    intent: OrderIntent,
+) -> dict[str, Any]:
+    artifact_policy = (
+        strategy.get("futures_execution_policy")
+        if isinstance(strategy.get("futures_execution_policy"), dict)
+        else futures_execution_policy_from_artifact(strategy)
+    )
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    intent_policy = (
+        metadata.get("futures_execution_policy")
+        if isinstance(metadata.get("futures_execution_policy"), dict)
+        and metadata.get("futures_execution_policy")
+        else None
+    )
+    return _intersect_futures_execution_policies(
+        [
+            dict(artifact_policy),
+            *([dict(intent_policy)] if isinstance(intent_policy, dict) else []),
+        ]
+    )
+
+
+def _strategy_stop_loss_percent(strategy: dict[str, Any]) -> float:
+    parameters = (
+        strategy.get("parameters")
+        if isinstance(strategy.get("parameters"), dict)
+        else {}
+    )
+    settings = (
+        strategy.get("settings")
+        if isinstance(strategy.get("settings"), dict)
+        else {}
+    )
+    definitions = [
+        strategy.get("customStrategyDefinition"),
+        strategy.get("custom_strategy_definition"),
+        parameters.get("customStrategyDefinition"),
+        parameters.get("custom_strategy_definition"),
+        settings.get("customStrategyDefinition"),
+        settings.get("custom_strategy_definition"),
+    ]
+    candidates: list[object] = [
+        strategy.get("stopLossPct"),
+        strategy.get("stop_loss_pct"),
+        parameters.get("stopLossPct"),
+        parameters.get("stop_loss_pct"),
+        settings.get("stopLossPct"),
+        settings.get("stop_loss_pct"),
+    ]
+    for definition in definitions:
+        if not isinstance(definition, dict):
+            continue
+        risk_rules = (
+            definition.get("riskRules")
+            if isinstance(definition.get("riskRules"), dict)
+            else definition.get("risk_rules")
+            if isinstance(definition.get("risk_rules"), dict)
+            else {}
+        )
+        candidates.extend(
+            [
+                risk_rules.get("stopLossPct"),
+                risk_rules.get("stop_loss_pct"),
+            ]
+        )
+    for value in candidates:
+        percent = safe_float(value, 0.0)
+        if 0.0 < percent < 100.0:
+            return percent
+    return 0.0
+
+
+def _binance_futures_live_order_risk(
+    checks: dict[str, Any],
+    intent: OrderIntent,
+) -> dict[str, Any]:
+    strategy = strategy_for_order_intent(checks, intent)
+    if not strategy:
+        return {
+            "status": "BLOCKED",
+            "blockers": ["strategy-artifact-missing"],
+            "warnings": [],
+        }
+    integrity = (
+        strategy.get("artifact_integrity")
+        if isinstance(strategy.get("artifact_integrity"), dict)
+        else {}
+    )
+    if integrity.get("valid") is not True:
+        return {
+            "status": "BLOCKED",
+            "blockers": ["strategy-artifact-integrity-unverified"],
+            "warnings": [],
+            "artifactIntegrity": integrity,
+        }
+    symbol = normalize_usdm_symbol(intent.symbol)
+    if (
+        not symbol
+        or normalize_usdm_symbol(strategy.get("symbol")) != symbol
+        or strategy_broker_id(strategy) != "binance-futures"
+    ):
+        return {
+            "status": "BLOCKED",
+            "blockers": ["strategy-futures-route-mismatch"],
+            "warnings": [],
+        }
+    policy = _intent_futures_execution_policy(strategy, intent)
+    stop_loss_percent = _strategy_stop_loss_percent(strategy)
+    if stop_loss_percent <= 0:
+        return {
+            "status": "BLOCKED",
+            "blockers": ["protective-stop-policy-missing"],
+            "warnings": [],
+            "policy": policy,
+        }
+    router = BINANCE_FUTURES_SETTINGS_ROUTER_FACTORY()
+    try:
+        raw_observation = router.get_binance_futures_canary_observation(
+            symbol
+        )
+        observation = _binance_futures_settings_summary(raw_observation)
+        market = router.get_binance_futures_risk_inputs(
+            symbol,
+            notional_usdt=intent.notional,
+        )
+        account_snapshot = router.get_account_snapshot("binance-futures")
+        account_rows = (
+            account_snapshot.get("accounts")
+            if isinstance(account_snapshot.get("accounts"), list)
+            else []
+        )
+        account = (
+            account_rows[0]
+            if account_rows and isinstance(account_rows[0], dict)
+            else {}
+        )
+    except (
+        BrokerNotReadyError,
+        OSError,
+        RuntimeError,
+        TimeoutError,
+        ValueError,
+    ) as exc:
+        return {
+            "status": "BLOCKED",
+            "blockers": ["broker-risk-inputs-unavailable"],
+            "warnings": [],
+            "detail": str(exc)[:240],
+            "policy": policy,
+        }
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    direction = (
+        "SHORT"
+        if str(
+            metadata.get("position_direction")
+            or strategy.get("position_direction")
+            or ""
+        ).strip().lower()
+        == "short"
+        else "LONG"
+    )
+    mark_price = safe_float(market.get("mark_price"), 0.0)
+    current_notional = max(0.0, intent.quantity * mark_price)
+    stop_price = (
+        mark_price * (1.0 + stop_loss_percent / 100.0)
+        if direction == "SHORT"
+        else mark_price * (1.0 - stop_loss_percent / 100.0)
+    )
+    account_equity = safe_float(
+        account.get("broker_equity"),
+        safe_float(account.get("margin_balance"), 0.0),
+    )
+    available_usdt = safe_float(
+        observation.get("available_usdt"),
+        safe_float(account.get("broker_cash"), 0.0),
+    )
+    risk = simulate_futures_order_risk(
+        {
+            "symbol": symbol,
+            "direction": direction,
+            "margin_type": observation.get("margin_type"),
+            "account_equity_usdt": account_equity,
+            "available_usdt": available_usdt,
+            "entry_price": mark_price,
+            "notional_usdt": current_notional,
+            "leverage": observation.get("leverage"),
+            "maintenance_margin_rate": market.get(
+                "maintenance_margin_rate"
+            ),
+            "taker_fee_rate": market.get("taker_fee_rate"),
+            "funding_rate": market.get("funding_rate"),
+            "funding_intervals": 1,
+            "stop_price": stop_price,
+        },
+        policy=policy,
+    )
+    drift = compare_futures_policy_to_broker(
+        policy,
+        {
+            "marginType": observation.get("margin_type"),
+            "leverage": observation.get("leverage"),
+        },
+    )
+    risk["blockers"] = list(
+        dict.fromkeys(
+            [
+                *risk.get("blockers", []),
+                *[
+                    str(item)
+                    for item in drift.get("blockers") or []
+                    if str(item)
+                ],
+                # The adapter does not yet create and acknowledge an
+                # exchange-native reduce-only STOP_MARKET order atomically
+                # with the entry. A strategy-side bar stop is not equivalent
+                # protection, so risk-increasing live entry stays fail-closed.
+                "protective-stop-order-not-implemented",
+            ]
+        )
+    )
+    risk["status"] = (
+        "BLOCKED"
+        if risk["blockers"]
+        else "WARNING"
+        if risk.get("warnings")
+        else "READY"
+    )
+    risk["protective_stop"] = {
+        "source": "immutable-strategy-riskRules.stopLossPct",
+        "percent": stop_loss_percent,
+        "price": stop_price,
+    }
+    risk["broker_policy_drift"] = drift
+    return risk
+
+
 def evaluate_order_gate_with_report(
     checks: dict[str, Any],
     side: str,
@@ -8888,6 +9744,70 @@ def evaluate_order_gate_with_report(
         report = PreTradeRiskReport(
             report.checked_at,
             (*report.checks, RiskCheck("거래소 세션", calendar_status, str(calendar_state.get("detail") or "시장 일정 확인 실패"))),
+        )
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    verified_risk_reducing = futures_risk_reducing_verified(
+        checks,
+        intent,
+    )
+    if (
+        not dry_run
+        and intent.mode in {"SMALL_LIVE", "FULL_LIVE"}
+        and broker_id == "binance-futures"
+        and metadata.get("multi_strategy") is True
+        and not verified_risk_reducing
+    ):
+        report = PreTradeRiskReport(
+            report.checked_at,
+            (
+                *report.checks,
+                RiskCheck(
+                    "Multi-Strategy Futures 증거",
+                    "fail",
+                    (
+                        "multi-strategy-futures-rollout-evidence-not-implemented: "
+                        "모든 sleeve의 artifact lineage·배포 scope·soak·실체결 "
+                        "증거를 함께 집계하기 전에는 신규 선물 진입을 차단합니다."
+                    ),
+                ),
+            ),
+        )
+    if (
+        report.can_submit
+        and not dry_run
+        and intent.mode in {"SMALL_LIVE", "FULL_LIVE"}
+        and broker_id == "binance-futures"
+        and not verified_risk_reducing
+    ):
+        futures_risk = _binance_futures_live_order_risk(checks, intent)
+        futures_status: CheckStatus = (
+            "fail"
+            if futures_risk.get("blockers")
+            else "warn"
+            if futures_risk.get("warnings")
+            else "pass"
+        )
+        risk_detail = (
+            "차단: " + ", ".join(futures_risk.get("blockers") or [])
+            if futures_risk.get("blockers")
+            else "주의: " + ", ".join(futures_risk.get("warnings") or [])
+            if futures_risk.get("warnings")
+            else "immutable 정책·보호손절·현재 계좌/마진 위험 계산 통과"
+        )
+        report = PreTradeRiskReport(
+            report.checked_at,
+            (
+                *report.checks,
+                RiskCheck(
+                    "Binance Futures 주문 위험",
+                    futures_status,
+                    risk_detail,
+                ),
+            ),
         )
     if report.can_submit:
         if dry_run:
@@ -9134,35 +10054,86 @@ def strategy_executions_for_profile(checks: dict[str, Any], profile_id: str) -> 
         return []
     normalized_profile = "stock" if profile_id == "stock" else "crypto"
     runner = StrategyExecutionRunner(lambda _plugin_id: LiveArtifactSignalProvider())
-    return [
-        (
-            strategy,
-            runner.run(
-                artifact=strategy, market_data=strategy_market_data(strategy), mode=current_mode(),
-                stream_id=f"live:{normalized_profile}:{strategy.get('strategy_id', 'unknown')}",
-                quantity=strategy_float(strategy, "order_quantity", "quantity", default=1.0),
-                metadata={
-                    "broker_id": strategy_broker_id(strategy),
-                    "profile_id": normalized_profile,
-                    "runner": "StrategyExecutionRunner",
-                    "market_type": str(strategy.get("market_type") or "spot").lower(),
-                    "position_direction": str(strategy.get("position_direction") or "long").lower(),
-                    "short_entries_requested": strategy.get("allow_short_requested") is True,
-                    "broker_short_adapter_verified": (
-                        strategy_broker_id(strategy) == "binance-futures"
-                        and str(
-                            strategy.get("market_type") or ""
-                        ).lower()
-                        in {"future", "futures", "perpetual"}
-                    ),
-                    "max_leverage": 1.0,
-                    "required_margin_type": "ISOLATED",
-                },
-                reason_prefix=f"{strategy.get('name') or strategy.get('strategy_id') or '전략'} live runner signal",
-            ),
+    executions: list[tuple[dict[str, Any], StrategyExecutionResult]] = []
+    for strategy in strategies:
+        broker_id = strategy_broker_id(strategy)
+        futures_policy = (
+            strategy.get("futures_execution_policy")
+            if isinstance(strategy.get("futures_execution_policy"), dict)
+            else futures_execution_policy_from_artifact(strategy)
         )
-        for strategy in strategies
-    ]
+        metadata = {
+            "broker_id": broker_id,
+            "profile_id": normalized_profile,
+            "runner": "StrategyExecutionRunner",
+            "market_type": str(
+                strategy.get("market_type") or "spot"
+            ).lower(),
+            "position_direction": str(
+                strategy.get("position_direction") or "long"
+            ).lower(),
+            "short_entries_requested": (
+                strategy.get("allow_short_requested") is True
+            ),
+            "broker_short_adapter_verified": (
+                broker_id == "binance-futures"
+                and str(strategy.get("market_type") or "").lower()
+                in {"future", "futures", "perpetual"}
+            ),
+        }
+        if broker_id == "binance-futures":
+            metadata.update(
+                {
+                    "futures_execution_policy": dict(futures_policy),
+                    "futures_policy_valid": (
+                        futures_policy.get("valid") is True
+                    ),
+                    "futures_policy_blockers": list(
+                        futures_policy.get("blockers") or []
+                    ),
+                    "max_leverage": safe_float(
+                        futures_policy.get("maxLeverageMultiplier"),
+                        1.0,
+                    ),
+                    "required_margin_type": str(
+                        futures_policy.get("marginMode") or "ISOLATED"
+                    ),
+                    "per_trade_risk_pct": safe_float(
+                        futures_policy.get("perTradeRiskPercent"),
+                        0.5,
+                    ),
+                    "max_notional_pct": safe_float(
+                        futures_policy.get("maxNotionalPercent"),
+                        10.0,
+                    ),
+                }
+            )
+        executions.append(
+            (
+                strategy,
+                runner.run(
+                    artifact=strategy,
+                    market_data=strategy_market_data(strategy),
+                    mode=current_mode(),
+                    stream_id=(
+                        f"live:{normalized_profile}:"
+                        f"{strategy.get('strategy_id', 'unknown')}"
+                    ),
+                    quantity=strategy_float(
+                        strategy,
+                        "order_quantity",
+                        "quantity",
+                        default=1.0,
+                    ),
+                    metadata=metadata,
+                    reason_prefix=(
+                        f"{strategy.get('name') or strategy.get('strategy_id') or '전략'} "
+                        "live runner signal"
+                    ),
+                ),
+            )
+        )
+    return executions
 
 
 def default_order_intent(checks: dict[str, Any], side: str) -> OrderIntent:
@@ -9264,6 +10235,406 @@ def account_risk_for_intent(
     )
 
 
+FUTURES_ROLLOUT_MIN_SOAK_SECONDS = 5 * 60 * 60
+FUTURES_ROLLOUT_SOAK_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def _accepted_futures_soak_report(
+    report: dict[str, Any],
+    scope: dict[str, Any],
+) -> dict[str, Any]:
+    blockers: list[str] = []
+    metadata = (
+        report.get("metadata")
+        if isinstance(report.get("metadata"), dict)
+        else {}
+    )
+    profiles = {
+        str(item).strip().lower()
+        for item in metadata.get("profiles") or []
+        if str(item).strip()
+    }
+    if "crypto" not in profiles:
+        blockers.append("soak-crypto-profile-missing")
+    if str(report.get("status") or "").upper() != "STOPPED":
+        blockers.append("soak-not-terminal")
+    verdict = str(report.get("verdict") or "").upper()
+    if verdict not in {"PASS", "PASS_WITH_WARNING"}:
+        blockers.append("soak-verdict-not-accepted")
+    duration = safe_float(report.get("durationSeconds"), float("nan"))
+    target_duration = safe_float(
+        report.get("targetDurationSeconds"),
+        float("nan"),
+    )
+    if not math.isfinite(duration) or duration < 0:
+        blockers.append("soak-duration-invalid")
+        duration = 0.0
+    if not math.isfinite(target_duration) or target_duration < 0:
+        blockers.append("soak-target-duration-invalid")
+        target_duration = FUTURES_ROLLOUT_MIN_SOAK_SECONDS
+    if (
+        duration < FUTURES_ROLLOUT_MIN_SOAK_SECONDS
+        or duration < target_duration
+    ):
+        blockers.append("soak-minimum-duration-not-met")
+    ended_at = _canary_datetime(
+        report.get("endedAt") or report.get("updatedAt")
+    )
+    if ended_at is None:
+        blockers.append("soak-ended-at-missing")
+    elif (
+        datetime.now(timezone.utc) - ended_at
+    ).total_seconds() > FUTURES_ROLLOUT_SOAK_MAX_AGE_SECONDS:
+        blockers.append("soak-report-stale")
+    scopes = (
+        metadata.get("strategyScopes")
+        if isinstance(metadata.get("strategyScopes"), list)
+        else []
+    )
+    if not any(
+        isinstance(candidate, dict)
+        and all(
+            str(candidate.get(field) or "")
+            == str(scope.get(field) or "")
+            for field in CANARY_SCOPE_FIELDS
+        )
+        for candidate in scopes
+    ):
+        blockers.append("soak-strategy-deployment-scope-mismatch")
+    accepted = not blockers
+    clean_observation_hours = (
+        duration / 3600.0
+        if accepted and verdict == "PASS"
+        else 0.0
+    )
+    return {
+        "accepted": accepted,
+        "verdict": verdict if accepted else "NOT_ACCEPTED",
+        "blockers": list(dict.fromkeys(blockers)),
+        "runId": str(report.get("runId") or ""),
+        "durationSeconds": duration,
+        "cleanObservationHours": clean_observation_hours,
+        "endedAt": str(report.get("endedAt") or ""),
+    }
+
+
+def _strategy_rollout_context_key(strategy: dict[str, Any]) -> tuple[str, str]:
+    source = Path(str(strategy.get("artifact_source_path") or ""))
+    root = str(source.parent) if source.parent != source else ""
+    return root, str(strategy.get("deployment_id") or "")
+
+
+def _build_futures_rollout_evidence_context(
+    strategies: list[dict[str, Any]],
+    *,
+    soak_report: dict[str, Any] | None = None,
+    include_order_evidence: bool = True,
+) -> dict[str, Any]:
+    roots = {
+        root
+        for strategy in strategies
+        if (root := _strategy_rollout_context_key(strategy)[0])
+    }
+    deployment_index: dict[tuple[str, str], dict[str, Any]] = {}
+    deployment_events: dict[str, list[dict[str, Any]]] = {}
+    for root in roots:
+        root_path = Path(root)
+        for deployment in DeploymentStore(root_path).list():
+            deployment_index[
+                (root, str(deployment.get("deploymentId") or ""))
+            ] = deployment
+        deployment_events[root] = _deployment_event_rows(root_path)
+    if soak_report is None:
+        try:
+            from .soak_monitor import latest_live_soak_report
+
+            soak_report = latest_live_soak_report()
+        except (OSError, RuntimeError, ValueError):
+            soak_report = {}
+    context = {
+        "deployment_index": deployment_index,
+        "deployment_events": deployment_events,
+        "soak_report": soak_report or {},
+    }
+    if include_order_evidence:
+        context["execution_events"] = PROGRAM_LEDGER.execution_event_rows(5000)
+        context["order_gate_events"] = PROGRAM_LEDGER.order_gate_event_rows(
+            5000
+        )
+    return context
+
+
+def live_soak_strategy_scopes(
+    profiles: tuple[str, ...] | list[str],
+) -> list[dict[str, Any]]:
+    normalized_profiles = {
+        str(item).strip().lower()
+        for item in profiles
+        if str(item).strip()
+    }
+    if "crypto" not in normalized_profiles:
+        return []
+    strategies = [
+        row
+        for row in strategy_rows()
+        if strategy_broker_id(row) == "binance-futures"
+    ]
+    context = _build_futures_rollout_evidence_context(
+        strategies,
+        soak_report={},
+        include_order_evidence=False,
+    )
+    deployment_index = context["deployment_index"]
+    events_by_root = context["deployment_events"]
+    scopes: list[dict[str, Any]] = []
+    for strategy in strategies:
+        context_key = _strategy_rollout_context_key(strategy)
+        scope = current_live_canary_scope(
+            str(strategy.get("strategy_id") or ""),
+            normalized=strategy,
+            deployment=deployment_index.get(context_key),
+            deployment_events=events_by_root.get(context_key[0]),
+        )
+        if scope.get("eligible") is True:
+            scopes.append(
+                {
+                    field: scope.get(field)
+                    for field in CANARY_SCOPE_FIELDS
+                }
+            )
+    return scopes
+
+
+def _futures_capital_rollout_for_strategy(
+    strategy: dict[str, Any],
+    *,
+    account_risk: dict[str, Any],
+    reconciliation_fresh: bool,
+    soak_report: dict[str, Any] | None = None,
+    policy_override: dict[str, Any] | None = None,
+    evidence_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    policy = (
+        policy_override
+        if isinstance(policy_override, dict)
+        else strategy.get("futures_execution_policy")
+        if isinstance(strategy.get("futures_execution_policy"), dict)
+        else futures_execution_policy_from_artifact(strategy)
+    )
+    lineage = (
+        strategy.get("lineage")
+        if isinstance(strategy.get("lineage"), dict)
+        else {}
+    )
+    lineage_valid = (
+        not lineage.get("blockingIssues")
+        and all(
+            isinstance(lineage.get(stage), dict)
+            and lineage.get(stage, {}).get("valid") is True
+            for stage in ("dataset", "backtest", "paper")
+        )
+    )
+    context = evidence_context or {}
+    context_key = _strategy_rollout_context_key(strategy)
+    deployment_index = (
+        context.get("deployment_index")
+        if isinstance(context.get("deployment_index"), dict)
+        else {}
+    )
+    events_by_root = (
+        context.get("deployment_events")
+        if isinstance(context.get("deployment_events"), dict)
+        else {}
+    )
+    execution = live_small_execution_summary(
+        str(strategy.get("strategy_id") or ""),
+        normalized=strategy,
+        deployment=deployment_index.get(context_key),
+        deployment_events=events_by_root.get(context_key[0]),
+        execution_events=(
+            context.get("execution_events")
+            if isinstance(context.get("execution_events"), list)
+            else None
+        ),
+        order_gate_events=(
+            context.get("order_gate_events")
+            if isinstance(context.get("order_gate_events"), list)
+            else None
+        ),
+    )
+    if isinstance(context.get("soak_report"), dict):
+        soak = context["soak_report"]
+    elif soak_report is None:
+        try:
+            from .soak_monitor import latest_live_soak_report
+
+            soak = latest_live_soak_report()
+        except (OSError, RuntimeError, ValueError):
+            soak = {}
+    else:
+        soak = soak_report
+    soak_assessment = _accepted_futures_soak_report(
+        soak,
+        execution.get("scope")
+        if isinstance(execution.get("scope"), dict)
+        else {},
+    )
+    rollout = build_capital_rollout(
+        account_equity=account_risk.get("current_equity"),
+        available_cash=account_risk.get("available_cash"),
+        max_notional_percent=policy.get("maxNotionalPercent"),
+        canary_fills=execution.get("fills"),
+        blocked_orders=execution.get("blocked"),
+        observation_hours=soak_assessment.get(
+            "cleanObservationHours",
+            0.0,
+        ),
+        reconciliation_fresh=reconciliation_fresh,
+        lineage_valid=lineage_valid,
+        policy_valid=policy.get("valid") is True,
+        soak_status=soak_assessment.get("verdict"),
+    )
+    rollout.update(
+        {
+            "strategyId": str(strategy.get("strategy_id") or ""),
+            "strategyName": str(
+                strategy.get("name")
+                or strategy.get("strategy_id")
+                or ""
+            ),
+            "symbol": str(strategy.get("symbol") or ""),
+            "timeframe": str(strategy.get("timeframe") or ""),
+            "policy": policy,
+            "lineageValid": lineage_valid,
+            "accountRiskKnown": account_risk.get("known") is True,
+            "accountRiskFresh": account_risk.get("fresh") is True,
+            "soakRunId": str(soak.get("runId") or ""),
+            "soakAssessment": soak_assessment,
+        }
+    )
+    return rollout
+
+
+def futures_capital_rollout_for_intent(
+    checks: dict[str, Any],
+    intent: OrderIntent,
+    *,
+    account_risk: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    if broker_id != "binance-futures":
+        return {}
+    strategy = strategy_for_order_intent(checks, intent)
+    if not strategy:
+        return {
+            "schemaVersion": "capital-rollout-v1",
+            "strategyId": intent.strategy_id,
+            "decision": {
+                "stage": "CANARY",
+                "ready": False,
+                "maxNotional": 0.0,
+                "blockers": ["strategy-artifact-missing"],
+            },
+        }
+    if (
+        metadata.get("multi_strategy") is True
+        and not futures_risk_reducing_verified(checks, intent)
+    ):
+        return {
+            "schemaVersion": "capital-rollout-v1",
+            "strategyId": intent.strategy_id,
+            "decision": {
+                "stage": "CANARY",
+                "ready": False,
+                "maxNotional": 0.0,
+                "blockers": [
+                    "multi-strategy-futures-rollout-evidence-not-implemented"
+                ],
+            },
+        }
+    scoped_reconciliation = reconciliation_summary_for_broker(
+        "binance-futures"
+    )
+    account = account_risk or account_risk_for_intent(intent)
+    rollout = _futures_capital_rollout_for_strategy(
+        strategy,
+        account_risk=account,
+        reconciliation_fresh=(
+            account.get("fresh") is True
+            and reconciliation_blocker_count(scoped_reconciliation) == 0
+        ),
+        policy_override=_intent_futures_execution_policy(
+            strategy,
+            intent,
+        ),
+    )
+    rollout["decision"] = capital_cap_for_mode(rollout, intent.mode)
+    return rollout
+
+
+def futures_capital_rollout_snapshot(
+    strategies: list[dict[str, Any]] | None = None,
+    *,
+    reconciliation_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    rows = strategies if strategies is not None else strategy_rows()
+    account = broker_account_risk(
+        STATE.get("account_risk", {}),
+        "binance-futures",
+        currency="USDT",
+        maximum_age_seconds=120.0,
+    )
+    reconciliation = (
+        reconciliation_summary
+        if isinstance(reconciliation_summary, dict)
+        else reconciliation_summary_for_broker("binance-futures")
+    )
+    fresh = (
+        account.get("fresh") is True
+        and reconciliation_blocker_count(reconciliation) == 0
+    )
+    candidates = [
+        row
+        for row in rows
+        if strategy_broker_id(row) == "binance-futures"
+        or str(row.get("market_type") or "").lower()
+        in {"future", "futures", "perpetual"}
+    ]
+    try:
+        from .soak_monitor import latest_live_soak_report
+
+        soak = latest_live_soak_report()
+    except (OSError, RuntimeError, ValueError):
+        soak = {}
+    evidence_context = _build_futures_rollout_evidence_context(
+        candidates,
+        soak_report=soak,
+    )
+    rollout_rows = [
+        _futures_capital_rollout_for_strategy(
+            row,
+            account_risk=account,
+            reconciliation_fresh=fresh,
+            evidence_context=evidence_context,
+        )
+        for row in candidates
+    ]
+    return {
+        "schemaVersion": "capital-rollout-dashboard-v1",
+        "accountKnown": account.get("known") is True,
+        "accountFresh": account.get("fresh") is True,
+        "accountEquity": account.get("current_equity"),
+        "availableCash": account.get("available_cash"),
+        "reconciliationFresh": fresh,
+        "strategyCount": len(rollout_rows),
+        "strategies": rollout_rows,
+    }
+
+
 def broker_symbol_exposure(intent: OrderIntent) -> float:
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     broker_id = str(
@@ -9329,13 +10700,41 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
         metadata.get("broker_id")
         or broker_id_from_symbol(intent.symbol, intent.asset)
     ).strip().lower()
+    verified_risk_reducing = futures_risk_reducing_verified(
+        checks,
+        intent,
+    )
     # Futures notionals are denominated in USDT, so a KRW setting must never
-    # be compared to them. For USD-M the user's configured one-order cap is
-    # the currently available USDT balance; strategy/portfolio gates may
-    # still impose a smaller bound.
+    # be compared to them. USD-M additionally receives a fail-closed staged
+    # rollout cap from the immutable Artifact policy and current evidence.
     if broker_id == "binance-futures" and available_cash is not None:
-        maximum_order_value = max(0.0, available_cash)
-        strategy_capital_limit = max(0.0, available_cash)
+        rollout = (
+            metadata.get("capital_rollout")
+            if isinstance(metadata.get("capital_rollout"), dict)
+            else futures_capital_rollout_for_intent(
+                checks,
+                intent,
+                account_risk=account_risk,
+            )
+        )
+        decision = (
+            rollout.get("decision")
+            if isinstance(rollout.get("decision"), dict)
+            else {}
+        )
+        rollout_cap = max(
+            0.0,
+            safe_float(decision.get("maxNotional"), 0.0),
+        )
+        if verified_risk_reducing:
+            rollout_cap = max(0.0, available_cash)
+        elif decision.get("ready") is not True:
+            rollout_cap = 0.0
+        maximum_order_value = min(
+            max(0.0, available_cash),
+            rollout_cap,
+        )
+        strategy_capital_limit = maximum_order_value
     else:
         maximum_order_value = float(settings["strategy_capital_limit_krw"])
         strategy_capital_limit = float(settings["strategy_capital_limit_krw"])
@@ -9403,7 +10802,7 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
                 )
             ),
         ),
-        risk_reducing_verified=metadata.get("risk_reducing") is True,
+        risk_reducing_verified=verified_risk_reducing,
         market_type=str(metadata.get("market_type") or "spot").lower(),
         short_entries_allowed=(
             metadata.get("short_entries_requested") is True
@@ -9540,7 +10939,53 @@ def next_order_id(state_name: str, dry_run: bool) -> str:
         prefix = "LIVE-CXL"
     else:
         prefix = "LIVE-BLOCK"
-    return f"{prefix}-{len(STATE['orders']) + 1:04d}"
+    # Preserve the public prefix while replacing the process-local
+    # len(orders)+1 counter with a restart-safe opaque identifier.
+    return f"{prefix}-{secrets.token_hex(16).upper()}"
+
+
+def stable_target_revision(
+    metadata: dict[str, Any],
+    *,
+    trace_id: str,
+    bar_time: str,
+    intent: OrderIntent,
+) -> int:
+    raw_revision = metadata.get("target_revision")
+    try:
+        revision = int(raw_revision)
+    except (TypeError, ValueError, OverflowError):
+        revision = 0
+    if revision > 0:
+        return revision
+    digest = hashlib.sha256(
+        "|".join(
+            (
+                trace_id,
+                bar_time,
+                intent.strategy_id,
+                intent.symbol,
+                intent.side,
+                f"{intent.quantity:.12g}",
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    return int(digest[:15], 16)
+
+
+def live_broker_dispatch_allowed(
+    intent: OrderIntent,
+    *,
+    dry_run: bool,
+) -> tuple[bool, str]:
+    if dry_run:
+        return False, "dry-run-broker-dispatch-forbidden"
+    normalized_mode = str(intent.mode or "").strip().upper()
+    if normalized_mode not in LIVE_BROKER_DISPATCH_MODES:
+        return False, "non-live-intent-broker-dispatch-forbidden"
+    if current_mode() not in LIVE_BROKER_DISPATCH_MODES:
+        return False, "non-live-runtime-broker-dispatch-forbidden"
+    return True, ""
 
 
 def order_gate_audit_record(
@@ -9623,7 +11068,347 @@ def live_broker_payload(
         "required_margin_type": str(
             metadata.get("required_margin_type") or "ISOLATED"
         ),
+        "per_trade_risk_pct": safe_float(
+            metadata.get("per_trade_risk_pct"),
+            0.5,
+        ),
+        "max_notional_pct": safe_float(
+            metadata.get("max_notional_pct"),
+            10.0,
+        ),
+        "futures_execution_policy": (
+            dict(metadata.get("futures_execution_policy"))
+            if isinstance(metadata.get("futures_execution_policy"), dict)
+            else {}
+        ),
     }
+
+
+def dispatch_live_order_with_checkpoint(
+    order: dict[str, Any],
+    intent: OrderIntent,
+    managed_order: Any,
+    *,
+    trace_id: str,
+) -> tuple[bool, str]:
+    """Checkpoint an intent before dispatch and durably close its outcome."""
+
+    dispatch_allowed, invariant_reason = live_broker_dispatch_allowed(
+        intent,
+        dry_run=bool(order.get("dry_run")),
+    )
+    if not dispatch_allowed:
+        LIVE_OMS.transition(
+            managed_order.order_id,
+            "REJECTED",
+            invariant_reason,
+        )
+        order.update(
+            {
+                "state": "risk_blocked",
+                "queue_state": "blocked",
+                "reason": invariant_reason,
+                "next_retry_at": "-",
+                "updated_at": now_text(),
+            }
+        )
+        return False, invariant_reason
+
+    broker_payload = live_broker_payload(
+        intent,
+        idempotency_key=str(order.get("idempotency_key") or ""),
+    )
+    broker_id = str(broker_payload["broker_id"])
+    order.update(
+        {
+            "broker_id": broker_id,
+            "broker_request": dict(broker_payload),
+            "state": "dispatch_pending",
+            "queue_state": "reconcile_required",
+            "reason": "broker-dispatch-pending",
+            "next_retry_at": "-",
+            "updated_at": now_text(),
+        }
+    )
+    try:
+        checkpoint = PROGRAM_LEDGER.checkpoint_order_dispatch(order)
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        reason = "durable-dispatch-checkpoint-failed"
+        LIVE_OMS.transition(managed_order.order_id, "REJECTED", reason)
+        order.update(
+            {
+                "state": "adapter_blocked",
+                "queue_state": "held",
+                "reason": reason,
+                "dispatch_checkpoint_error": (
+                    f"{type(exc).__name__}:{str(exc)[:200]}"
+                ),
+                "updated_at": now_text(),
+            }
+        )
+        return False, reason
+    if checkpoint.get("created") is not True:
+        existing = (
+            checkpoint.get("order")
+            if isinstance(checkpoint.get("order"), dict)
+            else {}
+        )
+        reason = "durable-dispatch-idempotency-key-exists"
+        LIVE_OMS.mark_unknown(
+            managed_order.order_id,
+            "durable pending/terminal dispatch already exists",
+        )
+        order.update(
+            {
+                "state": "unknown",
+                "queue_state": "reconcile_required",
+                "reason": reason,
+                "duplicate_dispatch_order_id": str(
+                    existing.get("order_id") or ""
+                ),
+                "updated_at": now_text(),
+            }
+        )
+        return False, reason
+
+    # The SQLite dispatch journal is the primary pre-side-effect checkpoint.
+    # Mirror it to the recovery journal so older recovery readers also retain
+    # the pending intent and idempotency key.
+    try:
+        recovery_payload = recovery_state_payload()
+        recovery_payload["orders"] = [
+            dict(order),
+            *[
+                dict(item)
+                for item in STATE.get("orders", [])
+                if str(item.get("order_id") or "")
+                != str(order.get("order_id") or "")
+            ],
+        ][:50]
+        recovery_keys = [
+            str(item.get("idempotency_key") or "")
+            for item in recovery_payload["orders"]
+            if str(item.get("idempotency_key") or "")
+        ]
+        RECOVERY_JOURNAL.save(
+            recovery_payload,
+            reason="dispatch-pending",
+            idempotency_keys=recovery_keys,
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        append_audit(
+            "warn",
+            "Dispatch Journal",
+            (
+                "보조 recovery checkpoint 저장 실패; SQLite pending "
+                f"journal은 유지됨: {type(exc).__name__}"
+            ),
+        )
+
+    try:
+        # Re-check at the final side-effect boundary.  A PAPER/SHADOW/MONITOR
+        # intent can never reach place_order even if an earlier gate is mocked
+        # or a mode changes between evaluation and dispatch preparation.
+        dispatch_allowed, invariant_reason = live_broker_dispatch_allowed(
+            intent,
+            dry_run=bool(order.get("dry_run")),
+        )
+        if not dispatch_allowed:
+            LIVE_OMS.mark_unknown(
+                managed_order.order_id,
+                invariant_reason,
+            )
+            order.update(
+                {
+                    "state": "unknown",
+                    "queue_state": "reconcile_required",
+                    "reason": invariant_reason,
+                }
+            )
+            return False, invariant_reason
+
+        LIVE_OMS.transition(
+            managed_order.order_id,
+            "SUBMITTING",
+            "broker request dispatch",
+        )
+        broker_response = LiveBrokerRouter().place_order(broker_payload)
+        if not isinstance(broker_response, dict):
+            broker_response = {}
+        order["broker_response"] = broker_response
+        response_ok = broker_response.get("ok") is True
+        response_payload = (
+            broker_response.get("json")
+            if isinstance(broker_response.get("json"), dict)
+            else {}
+        )
+        broker_order_id = str(
+            response_payload.get("uuid")
+            or response_payload.get("orderId")
+            or response_payload.get("clientOrderId")
+            or (response_payload.get("output") or {}).get("ODNO")
+            or ""
+        )
+        if response_ok and broker_order_id:
+            LIVE_OMS.acknowledge(
+                managed_order.order_id,
+                broker_order_id,
+            )
+            order.update(
+                {
+                    "state": "acknowledged",
+                    "queue_state": "submitted",
+                    "broker_order_id": broker_order_id,
+                    "reason": "broker-acknowledged",
+                    "next_retry_at": "-",
+                }
+            )
+            reason = "broker-acknowledged"
+            ok = True
+            DECISION_TRACE_STORE.append(
+                trace_id=trace_id,
+                stage="BROKER_ACKNOWLEDGED",
+                decision="ACKNOWLEDGED",
+                output_payload={
+                    "brokerId": broker_id,
+                    "brokerOrderId": broker_order_id,
+                },
+            )
+        elif response_ok:
+            reason = "broker-response-missing-order-id"
+            LIVE_OMS.mark_unknown(
+                managed_order.order_id,
+                "broker response missing order id",
+            )
+            order.update(
+                {
+                    "state": "unknown",
+                    "queue_state": "reconcile_required",
+                    "reason": reason,
+                    "next_retry_at": "-",
+                }
+            )
+            ok = False
+            DECISION_TRACE_STORE.append(
+                trace_id=trace_id,
+                stage="BLOCKED",
+                decision="UNKNOWN",
+                reasons=(reason,),
+                output_payload={"brokerId": broker_id},
+            )
+        elif int(
+            safe_float(broker_response.get("statusCode"), 0.0)
+        ) == 0:
+            reason = "network-outcome-unknown"
+            LIVE_OMS.mark_unknown(
+                managed_order.order_id,
+                "network outcome unknown; reconcile before retry",
+            )
+            order.update(
+                {
+                    "state": "unknown",
+                    "queue_state": "reconcile_required",
+                    "reason": reason,
+                    "next_retry_at": "-",
+                }
+            )
+            ok = False
+            DECISION_TRACE_STORE.append(
+                trace_id=trace_id,
+                stage="BLOCKED",
+                decision="UNKNOWN",
+                reasons=(reason,),
+                output_payload={"brokerId": broker_id},
+            )
+        else:
+            reason = str(
+                broker_response.get("text") or "broker-rejected"
+            )[:500]
+            LIVE_OMS.transition(
+                managed_order.order_id,
+                "REJECTED",
+                "broker rejected request",
+                {"response": broker_response},
+            )
+            order.update(
+                {
+                    "state": "broker_rejected",
+                    "queue_state": "failed",
+                    "reason": reason,
+                    "next_retry_at": "-",
+                }
+            )
+            ok = False
+            DECISION_TRACE_STORE.append(
+                trace_id=trace_id,
+                stage="BLOCKED",
+                decision="BROKER_REJECTED",
+                reasons=(reason,),
+                output_payload={"brokerId": broker_id},
+            )
+    except BrokerNotReadyError as exc:
+        reason = str(exc)
+        LIVE_OMS.transition(managed_order.order_id, "REJECTED", reason)
+        order.update(
+            {
+                "state": "adapter_blocked",
+                "queue_state": "failed",
+                "reason": reason,
+                "next_retry_at": "-",
+            }
+        )
+        ok = False
+        DECISION_TRACE_STORE.append(
+            trace_id=trace_id,
+            stage="BLOCKED",
+            decision="ADAPTER_BLOCKED",
+            reasons=(reason,),
+            output_payload={"brokerId": broker_id},
+        )
+    except Exception as exc:
+        # The broker may have accepted the request before the local exception.
+        # Never retry this idempotency key until broker reconciliation resolves
+        # the durable pending record.
+        reason = "broker-dispatch-outcome-unknown"
+        LIVE_OMS.mark_unknown(managed_order.order_id, reason)
+        order.update(
+            {
+                "state": "unknown",
+                "queue_state": "reconcile_required",
+                "reason": reason,
+                "dispatch_error_type": type(exc).__name__,
+                "next_retry_at": "-",
+            }
+        )
+        ok = False
+        DECISION_TRACE_STORE.append(
+            trace_id=trace_id,
+            stage="BLOCKED",
+            decision="UNKNOWN",
+            reasons=(reason,),
+            output_payload={"brokerId": broker_id},
+        )
+    finally:
+        order["updated_at"] = now_text()
+        try:
+            terminal_saved = PROGRAM_LEDGER.update_order_dispatch(order)
+        except (OSError, sqlite3.Error, ValueError):
+            terminal_saved = False
+        if not terminal_saved:
+            STATE["new_entries_blocked"] = True
+            order.update(
+                {
+                    "state": "unknown",
+                    "queue_state": "reconcile_required",
+                    "reason": "dispatch-terminal-checkpoint-failed",
+                }
+            )
+            ok = False
+            reason = "dispatch-terminal-checkpoint-failed"
+        order["oms_status"] = LIVE_OMS.orders[
+            managed_order.order_id
+        ].status
+    return ok, reason
 
 
 def submit_order_intent(
@@ -9636,20 +11421,61 @@ def submit_order_intent(
 ) -> dict[str, Any]:
     metadata = dict(intent.metadata) if isinstance(intent.metadata, dict) else {}
     bar_time = str(metadata.get("confirmed_bar_end") or datetime.now(timezone.utc).isoformat())
+    try:
+        trace_revision = int(metadata.get("target_revision") or 0)
+    except (TypeError, ValueError, OverflowError):
+        trace_revision = 0
     trace_id = str(metadata.get("trace_id") or metadata.get("traceId") or build_trace_id(
         strategy_instance_id=str(metadata.get("strategy_instance_id") or intent.strategy_id),
         instrument_id=str(metadata.get("instrument_id") or intent.symbol),
         bar_time=bar_time,
         deployment_id=str(metadata.get("portfolio_id") or "live-trader"),
-        revision=int(metadata.get("target_revision") or 0),
+        revision=trace_revision,
     ))
     metadata.update({"trace_id": trace_id, "traceId": trace_id})
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    if broker_id == "binance-futures":
+        claimed_risk_reducing = metadata.get("risk_reducing") is True
+        candidate_intent = replace(intent, metadata=dict(metadata))
+        verified_risk_reducing = futures_risk_reducing_verified(
+            checks,
+            candidate_intent,
+        )
+        metadata["risk_reducing"] = verified_risk_reducing
+        if claimed_risk_reducing and not verified_risk_reducing:
+            metadata["risk_reducing_claim_rejected"] = True
+    intent = replace(intent, metadata=metadata)
+    canary_scope = (
+        current_live_canary_scope(
+            intent.strategy_id,
+            materialize=True,
+        )
+        if (
+            broker_id == "binance-futures"
+            and not dry_run
+            and intent.mode == "SMALL_LIVE"
+        )
+        else {}
+    )
+    if broker_id == "binance-futures":
+        metadata["capital_rollout"] = futures_capital_rollout_for_intent(
+            checks,
+            intent,
+        )
     intent = replace(intent, metadata=metadata)
     RECOVERY_JOURNAL.save(recovery_state_payload(), reason="before-order", idempotency_keys=[str(item.get("idempotency_key") or "") for item in STATE.get("orders", [])])
     ok, order_state, queue_state, reason, risk_report = evaluate_order_gate_with_report(checks, intent.side, dry_run, intent)
     portfolio_gate = portfolio_gate_for_intent(checks, intent)
     retry_backoff = float(STATE["retry_policy"]["backoff_sec"])
-    target_revision = int(metadata.get("target_revision") or (len(STATE["orders"]) + 1))
+    target_revision = stable_target_revision(
+        metadata,
+        trace_id=trace_id,
+        bar_time=bar_time,
+        intent=intent,
+    )
     idempotency_key = build_idempotency_key(
         portfolio_id=str(metadata.get("portfolio_id") or portfolio_gate.get("portfolio_id") or "default-portfolio"),
         strategy_instance_id=str(metadata.get("strategy_instance_id") or intent.strategy_id),
@@ -9667,12 +11493,86 @@ def submit_order_intent(
             output_payload={"idempotencyKey": idempotency_key},
         )
         append_audit("warn", audit_event, f"재시작 이후 중복 주문 차단: idempotency_key={idempotency_key}")
-        return {"ok": existing is not None, "reason": "persistent-duplicate-idempotency-key", "order": existing or {}, "duplicate": True, "snapshot": snapshot()}
+        return {"ok": False, "reason": "persistent-duplicate-idempotency-key", "order": existing or {}, "duplicate": True, "snapshot": snapshot()}
+    dispatch_journal_error = ""
+    try:
+        durable_existing = PROGRAM_LEDGER.order_dispatch_for_idempotency_key(
+            idempotency_key
+        )
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        durable_existing = None
+        dispatch_journal_error = f"{type(exc).__name__}:{str(exc)[:200]}"
+    if durable_existing is not None:
+        DECISION_TRACE_STORE.append(
+            trace_id=trace_id,
+            stage="BLOCKED",
+            decision="DUPLICATE",
+            reasons=("durable-dispatch-idempotency-key-exists",),
+            output_payload={"idempotencyKey": idempotency_key},
+        )
+        append_audit(
+            "warn",
+            audit_event,
+            (
+                "영속 dispatch journal 중복 주문 차단: "
+                f"idempotency_key={idempotency_key}"
+            ),
+        )
+        return {
+            "ok": False,
+            "reason": "durable-dispatch-idempotency-key-exists",
+            "order": durable_existing,
+            "duplicate": True,
+            "snapshot": snapshot(),
+        }
+    dispatch_allowed, dispatch_invariant_reason = live_broker_dispatch_allowed(
+        intent,
+        dry_run=dry_run,
+    )
+    if not dry_run and not dispatch_allowed and ok:
+        if not any(
+            check.label == "Intent 실행 환경"
+            for check in risk_report.checks
+        ):
+            risk_report = PreTradeRiskReport(
+                risk_report.checked_at,
+                (
+                    *risk_report.checks,
+                    RiskCheck(
+                        "Intent 실행 환경",
+                        "fail",
+                        dispatch_invariant_reason,
+                    ),
+                ),
+            )
+        ok = False
+        order_state = "risk_blocked"
+        queue_state = "blocked"
+        reason = dispatch_invariant_reason
+    if not dry_run and dispatch_journal_error:
+        risk_report = PreTradeRiskReport(
+            risk_report.checked_at,
+            (
+                *risk_report.checks,
+                RiskCheck(
+                    "Dispatch Journal",
+                    "fail",
+                    (
+                        "durable-dispatch-journal-unavailable: "
+                        f"{dispatch_journal_error}"
+                    ),
+                ),
+            ),
+        )
+        ok = False
+        order_state = "adapter_blocked"
+        queue_state = "held"
+        reason = "durable-dispatch-journal-unavailable"
     managed_order, oms_created = LIVE_OMS.create(intent, idempotency_key)
     if not oms_created:
         existing = next((item for item in STATE.get("orders", []) if item.get("oms_order_id") == managed_order.order_id), None)
         append_audit("warn", audit_event, f"중복 주문 차단: idempotency_key={idempotency_key}")
-        return {"ok": existing is not None, "reason": "duplicate-idempotency-key", "order": existing or {}, "duplicate": True, "snapshot": snapshot()}
+        return {"ok": False, "reason": "duplicate-idempotency-key", "order": existing or {}, "duplicate": True, "snapshot": snapshot()}
     DECISION_TRACE_STORE.append(
         trace_id=trace_id,
         stage="BAR_CLOSED",
@@ -9700,14 +11600,6 @@ def submit_order_intent(
             LIVE_OMS.transition(managed_order.order_id, "RISK_APPROVED", "PreTradeRiskGate passed")
         else:
             LIVE_OMS.transition(managed_order.order_id, "REJECTED", reason)
-    canary_scope = (
-        current_live_canary_scope(
-            intent.strategy_id,
-            materialize=True,
-        )
-        if ok and not dry_run and intent.mode == "SMALL_LIVE"
-        else {}
-    )
     order = {
         "time": now_text(),
         "created_at": now_text(),
@@ -9729,6 +11621,7 @@ def submit_order_intent(
         "attempts": 1,
         "next_retry_at": future_text(retry_backoff) if order_state in {"risk_blocked", "adapter_blocked"} else "-",
         "broker_order_id": "-",
+        "broker_id": broker_id,
         "dry_run": dry_run,
         "mode": intent.mode,
         "canary_scope": (
@@ -9740,6 +11633,11 @@ def submit_order_intent(
         "trace_id": trace_id,
         "risk_report": risk_report.to_dict(),
         "portfolio_gate": portfolio_gate if portfolio_gate.get("active") else {},
+        "capital_rollout": (
+            metadata.get("capital_rollout")
+            if isinstance(metadata.get("capital_rollout"), dict)
+            else {}
+        ),
     }
     if runner_report is not None:
         order["runner_report"] = runner_report.to_dict()
@@ -9758,91 +11656,21 @@ def submit_order_intent(
         output_payload={"orderId": order["order_id"], "omsOrderId": order["oms_order_id"]},
     )
     if ok and not dry_run:
-        broker_payload = live_broker_payload(
+        ok, reason = dispatch_live_order_with_checkpoint(
+            order,
             intent,
-            idempotency_key=idempotency_key,
+            managed_order,
+            trace_id=trace_id,
         )
-        broker_id = str(broker_payload["broker_id"])
-        order["broker_id"] = broker_id
-        order["broker_request"] = dict(broker_payload)
-        try:
-            LIVE_OMS.transition(managed_order.order_id, "SUBMITTING", "broker request dispatch")
-            broker_response = LiveBrokerRouter().place_order(broker_payload)
-            order["broker_response"] = broker_response
-            response_ok = broker_response.get("ok") is True
-            response_payload = broker_response.get("json") if isinstance(broker_response.get("json"), dict) else {}
-            broker_order_id = str(
-                response_payload.get("uuid")
-                or response_payload.get("orderId")
-                or response_payload.get("clientOrderId")
-                or (response_payload.get("output") or {}).get("ODNO")
-                or ""
-            )
-            if response_ok and broker_order_id:
-                LIVE_OMS.acknowledge(managed_order.order_id, broker_order_id)
-                order.update({
-                    "state": "acknowledged",
-                    "queue_state": "submitted",
-                    "broker_order_id": broker_order_id,
-                    "reason": "broker-acknowledged",
-                    "next_retry_at": "-",
-                })
-                reason = "broker-acknowledged"
-                DECISION_TRACE_STORE.append(
-                    trace_id=trace_id,
-                    stage="BROKER_ACKNOWLEDGED",
-                    decision="ACKNOWLEDGED",
-                    output_payload={"brokerId": broker_id, "brokerOrderId": broker_order_id},
-                )
-            elif response_ok:
-                LIVE_OMS.mark_unknown(managed_order.order_id, "broker response missing order id")
-                order.update({"state": "unknown", "queue_state": "reconcile_required", "reason": "broker-response-missing-order-id", "next_retry_at": "-"})
-                reason = "broker-response-missing-order-id"
-                ok = False
-                DECISION_TRACE_STORE.append(
-                    trace_id=trace_id,
-                    stage="BLOCKED",
-                    decision="UNKNOWN",
-                    reasons=(reason,),
-                    output_payload={"brokerId": broker_id},
-                )
-            elif int(safe_float(broker_response.get("statusCode"), 0.0)) == 0:
-                LIVE_OMS.mark_unknown(managed_order.order_id, "network outcome unknown; reconcile before retry")
-                order.update({"state": "unknown", "queue_state": "reconcile_required", "reason": "network-outcome-unknown", "next_retry_at": "-"})
-                reason = "network-outcome-unknown"
-                ok = False
-                DECISION_TRACE_STORE.append(
-                    trace_id=trace_id,
-                    stage="BLOCKED",
-                    decision="UNKNOWN",
-                    reasons=(reason,),
-                    output_payload={"brokerId": broker_id},
-                )
-            else:
-                LIVE_OMS.transition(managed_order.order_id, "REJECTED", "broker rejected request", {"response": broker_response})
-                order.update({"state": "broker_rejected", "queue_state": "failed", "reason": str(broker_response.get("text") or "broker-rejected")[:500], "next_retry_at": "-"})
-                reason = str(order["reason"])
-                ok = False
-                DECISION_TRACE_STORE.append(
-                    trace_id=trace_id,
-                    stage="BLOCKED",
-                    decision="BROKER_REJECTED",
-                    reasons=(reason,),
-                    output_payload={"brokerId": broker_id},
-                )
-        except BrokerNotReadyError as exc:
-            LIVE_OMS.transition(managed_order.order_id, "REJECTED", str(exc))
-            order.update({"state": "adapter_blocked", "queue_state": "failed", "reason": str(exc), "next_retry_at": "-"})
-            reason = str(exc)
-            ok = False
-            DECISION_TRACE_STORE.append(
-                trace_id=trace_id,
-                stage="BLOCKED",
-                decision="ADAPTER_BLOCKED",
-                reasons=(reason,),
-                output_payload={"brokerId": broker_id},
-            )
-        order["oms_status"] = LIVE_OMS.orders[managed_order.order_id].status
+    order["updated_at"] = now_text()
+    try:
+        PROGRAM_LEDGER.record_order_gate_event(order)
+    except (OSError, sqlite3.Error) as exc:
+        append_audit(
+            "warn",
+            "Rollout evidence",
+            f"주문 게이트 evidence 저장 실패: {str(exc)[:240]}",
+        )
     STATE["orders"].insert(0, order)
     STATE["orders"] = STATE["orders"][:50]
     trace_index = STATE.setdefault("order_trace_index", {})
@@ -10068,10 +11896,70 @@ def run_recovery_drill() -> dict[str, Any]:
     return {"ok": assurance["status"] == "pass", "recovery": dict(STATE["recovery_status"]), "snapshot": snapshot()}
 
 
+def durable_dispatch_orders_for_restore() -> list[dict[str, Any]]:
+    try:
+        rows = PROGRAM_LEDGER.order_dispatch_rows(5000)
+    except (AttributeError, OSError, sqlite3.Error, ValueError):
+        return []
+    return [
+        dict(item)
+        for item in rows
+        if isinstance(item, dict)
+        and str(item.get("order_id") or "")
+        and str(item.get("idempotency_key") or "")
+    ]
+
+
+def merge_recovered_orders(
+    checkpoint_orders: object,
+    dispatch_orders: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for item in (
+        checkpoint_orders
+        if isinstance(checkpoint_orders, list)
+        else []
+    ):
+        if not isinstance(item, dict):
+            continue
+        order_id = str(item.get("order_id") or "")
+        if order_id:
+            merged[order_id] = dict(item)
+    # The SQLite dispatch journal is committed immediately before the broker
+    # call and is therefore newer/stronger than a recovery checkpoint.
+    for item in dispatch_orders:
+        order_id = str(item.get("order_id") or "")
+        if order_id:
+            merged[order_id] = dict(item)
+    return sorted(
+        merged.values(),
+        key=lambda item: str(
+            item.get("updated_at")
+            or item.get("created_at")
+            or item.get("time")
+            or ""
+        ),
+        reverse=True,
+    )[:50]
+
+
 def restore_runtime_from_checkpoint() -> dict[str, Any]:
     loaded = RECOVERY_JOURNAL.load_latest()
     generation = int(loaded.get("generation") or 0)
+    durable_dispatch_orders = durable_dispatch_orders_for_restore()
+    durable_idempotency_keys = [
+        str(item.get("idempotency_key") or "")
+        for item in durable_dispatch_orders
+        if str(item.get("idempotency_key") or "")
+    ]
     if generation <= 0:
+        STATE["orders"] = merge_recovered_orders(
+            [],
+            durable_dispatch_orders,
+        )
+        STATE["persisted_idempotency_keys"] = list(
+            dict.fromkeys(durable_idempotency_keys)
+        )
         STATE["mode"] = "MONITOR"
         STATE["dry_run"] = True
         STATE["new_entries_blocked"] = True
@@ -10085,11 +11973,25 @@ def restore_runtime_from_checkpoint() -> dict[str, Any]:
         append_audit("warn", "Startup Recovery", STATE["recovery_status"]["detail"])
         return dict(STATE["recovery_status"])
     recovered = loaded.get("state") if isinstance(loaded.get("state"), dict) else {}
-    STATE["orders"] = list(recovered.get("orders", []))[:50] if isinstance(recovered.get("orders"), list) else []
+    STATE["orders"] = merge_recovered_orders(
+        recovered.get("orders"),
+        durable_dispatch_orders,
+    )
     STATE["order_trace_index"] = dict(recovered.get("order_trace_index", {})) if isinstance(recovered.get("order_trace_index"), dict) else {}
     if isinstance(recovered.get("strategy_runner"), dict):
         STATE["strategy_runner"].update(recovered["strategy_runner"])
-    STATE["persisted_idempotency_keys"] = list(dict.fromkeys(str(item) for item in loaded.get("idempotencyKeys", []) if item))
+    STATE["persisted_idempotency_keys"] = list(
+        dict.fromkeys(
+            [
+                *[
+                    str(item)
+                    for item in loaded.get("idempotencyKeys", [])
+                    if str(item)
+                ],
+                *durable_idempotency_keys,
+            ]
+        )
+    )
     STATE["mode"] = "MONITOR"
     STATE["dry_run"] = True
     STATE["new_entries_blocked"] = True
@@ -10279,6 +12181,54 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
         lead_signal = preferred_signal or next(signal for signal in signals if signal.instrument_id == plan.instrument_id)
         strategy, execution = execution_by_instance[lead_signal.strategy_instance_id]
         source_intent = execution.intent or default_order_intent(checks, plan.side)
+        contributing_strategies = [
+            execution_by_instance[instance_id][0]
+            for instance_id in plan.sleeve_targets
+            if instance_id in execution_by_instance
+        ]
+        futures_policy = (
+            _intersect_futures_execution_policies(
+                [
+                    dict(
+                        item.get("futures_execution_policy")
+                        if isinstance(
+                            item.get("futures_execution_policy"),
+                            dict,
+                        )
+                        else futures_execution_policy_from_artifact(item)
+                    )
+                    for item in contributing_strategies
+                ]
+            )
+            if strategy_broker_id(strategy) == "binance-futures"
+            else {}
+        )
+        futures_metadata = (
+            {
+                "futures_execution_policy": futures_policy,
+                "futures_policy_valid": futures_policy.get("valid") is True,
+                "futures_policy_blockers": list(
+                    futures_policy.get("blockers") or []
+                ),
+                "max_leverage": safe_float(
+                    futures_policy.get("maxLeverageMultiplier"),
+                    1.0,
+                ),
+                "required_margin_type": str(
+                    futures_policy.get("marginMode") or "ISOLATED"
+                ),
+                "per_trade_risk_pct": safe_float(
+                    futures_policy.get("perTradeRiskPercent"),
+                    0.5,
+                ),
+                "max_notional_pct": safe_float(
+                    futures_policy.get("maxNotionalPercent"),
+                    10.0,
+                ),
+            }
+            if futures_policy
+            else {}
+        )
         intent = replace(
             source_intent,
             strategy_id=str(strategy.get("strategy_id") or execution.artifact_id),
@@ -10290,6 +12240,11 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
                 "multi_strategy": True,
                 "strategy_instance_id": f"net:{plan.instrument_id}",
                 "strategy_instance_ids": list(plan.sleeve_targets),
+                "contributing_strategy_ids": [
+                    str(item.get("strategy_id") or "")
+                    for item in contributing_strategies
+                    if str(item.get("strategy_id") or "")
+                ],
                 "sleeve_targets": plan.sleeve_targets,
                 "target_revision": plan.target_revision,
                 "instrument_id": plan.instrument_id,
@@ -10299,6 +12254,7 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
                 "expected_cost_bps": 5.0,
                 "risk_reducing": abs(plan.target_weight) < abs(plan.current_weight),
                 "shortable": plan.shortable,
+                **futures_metadata,
             },
             reason=f"multi-strategy net target: {len(plan.sleeve_targets)} sleeves",
         )
@@ -10423,76 +12379,21 @@ def retry_order(order_id: str) -> dict[str, Any]:
     order = find_order(order_id)
     if not order:
         return {"ok": False, "reason": "order not found", "snapshot": snapshot()}
-    if not can_retry_order(order):
-        append_audit("warn", "주문 재시도 차단", f"{order_id} 주문은 재시도 대상이 아닙니다.")
-        return {"ok": False, "reason": "order is not retryable", "snapshot": snapshot()}
-
-    order["attempts"] = int(order.get("attempts", 0)) + 1
-    order["updated_at"] = now_text()
-    checks = snapshot()
-    retry_intent = OrderIntent(
-        strategy_id=str(order.get("strategy_id", "manual-retry")),
-        asset=str(order.get("asset") or asset_from_symbol(str(order.get("symbol", "")))),
-        symbol=str(order.get("symbol", "")),
-        side="SELL" if str(order.get("side", "")).upper() == "SELL" else "BUY",
-        quantity=float(order.get("qty", 1) or 1),
-        reference_price=float(order.get("reference_price", 1000) or 1000),
-        mode=current_mode(),
-        reason=f"{order_id} retry",
-        metadata={
-            "broker_id": str(
-                order.get("broker_id")
-                or broker_id_from_symbol(
-                    str(order.get("symbol", "")),
-                    str(order.get("asset", "")),
-                )
-            ),
-            **{
-                key: value
-                for key, value in (
-                    order.get("broker_request")
-                    if isinstance(order.get("broker_request"), dict)
-                    else {}
-                ).items()
-                if key
-                in {
-                    "position_direction",
-                    "market_type",
-                    "risk_reducing",
-                    "max_leverage",
-                    "required_margin_type",
-                }
-            },
-        },
+    reason = (
+        "기존 주문은 자동 재제출하지 않습니다. 다음 확정봉에서 새 주문 "
+        "intent·trace·멱등성 키를 생성해 전체 주문 게이트를 다시 통과해야 합니다."
     )
-    ok, state_name, queue_state, reason, risk_report = evaluate_order_gate_with_report(
-        checks,
-        str(order.get("side", "BUY")),
-        bool(order.get("dry_run", STATE["dry_run"])),
-        retry_intent,
-    )
-    if not ok and order["attempts"] >= int(float(STATE["retry_policy"]["max_attempts"])):
-        state_name = "retry_exhausted"
-        queue_state = "failed"
-        reason = f"재시도 {order['attempts']}회가 모두 소진되었습니다. 마지막 사유: {reason}"
-    order["state"] = state_name
-    order["queue_state"] = queue_state
-    order["reason"] = reason
-    order["risk_report"] = risk_report.to_dict()
-    order["next_retry_at"] = future_text(float(STATE["retry_policy"]["backoff_sec"])) if can_retry_order(order) else "-"
     append_audit(
-        "info" if ok else "warn",
-        "주문 재시도",
-        order_gate_audit_detail(order, reason, risk_report),
-        audit_record=order_gate_audit_record(
-            source="주문 재시도",
-            intent=retry_intent,
-            order=order,
-            risk_report=risk_report,
-            retry=True,
-        ),
+        "warn",
+        "주문 재시도 차단",
+        f"{order_id}: {reason}",
     )
-    return {"ok": ok, "reason": reason, "snapshot": snapshot()}
+    return {
+        "ok": False,
+        "reason": reason,
+        "requires_new_confirmed_bar_intent": True,
+        "snapshot": snapshot(),
+    }
 
 
 def cancel_order(order_id: str) -> dict[str, Any]:

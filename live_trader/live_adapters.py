@@ -49,6 +49,9 @@ BINANCE_FUTURES_LEVERAGE_ENDPOINT = "/fapi/v1/leverage"
 BINANCE_FUTURES_MARGIN_TYPE_ENDPOINT = "/fapi/v1/marginType"
 BINANCE_FUTURES_TIME_ENDPOINT = "/fapi/v1/time"
 BINANCE_FUTURES_EXCHANGE_INFO_ENDPOINT = "/fapi/v1/exchangeInfo"
+BINANCE_FUTURES_PREMIUM_INDEX_ENDPOINT = "/fapi/v1/premiumIndex"
+BINANCE_FUTURES_LEVERAGE_BRACKET_ENDPOINT = "/fapi/v1/leverageBracket"
+BINANCE_FUTURES_COMMISSION_RATE_ENDPOINT = "/fapi/v1/commissionRate"
 
 UPBIT_BASE_URL = "https://api.upbit.com"
 UPBIT_ORDER_ENDPOINT = "/v1/orders"
@@ -796,6 +799,61 @@ def build_binance_futures_symbol_config_request(
     return _build_binance_futures_signed_request(
         "GET",
         BINANCE_FUTURES_SYMBOL_CONFIG_ENDPOINT,
+        {"symbol": normalized_symbol},
+        blocked_reasons=[] if normalized_symbol else ["symbol"],
+    )
+
+
+def build_binance_futures_premium_index_request(
+    symbol: str,
+) -> PreparedRequest:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    base_url = (
+        env_value("BINANCE_FUTURES_BASE_URL")
+        or BINANCE_FUTURES_BASE_URL
+    )
+    query = {"symbol": normalized_symbol}
+    return PreparedRequest(
+        provider="binance-futures",
+        method="GET",
+        url=(
+            f"{base_url.rstrip('/')}{BINANCE_FUTURES_PREMIUM_INDEX_ENDPOINT}?"
+            + urllib.parse.urlencode(query)
+        ),
+        endpoint=BINANCE_FUTURES_PREMIUM_INDEX_ENDPOINT,
+        headers={},
+        safe_headers={},
+        body=None,
+        query=query,
+        blocked_reasons=[] if normalized_symbol else ["symbol"],
+    )
+
+
+def build_binance_futures_leverage_bracket_request(
+    symbol: str,
+) -> PreparedRequest:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    return _build_binance_futures_signed_request(
+        "GET",
+        BINANCE_FUTURES_LEVERAGE_BRACKET_ENDPOINT,
+        {"symbol": normalized_symbol},
+        blocked_reasons=[] if normalized_symbol else ["symbol"],
+    )
+
+
+def build_binance_futures_commission_rate_request(
+    symbol: str,
+) -> PreparedRequest:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    return _build_binance_futures_signed_request(
+        "GET",
+        BINANCE_FUTURES_COMMISSION_RATE_ENDPOINT,
         {"symbol": normalized_symbol},
         blocked_reasons=[] if normalized_symbol else ["symbol"],
     )

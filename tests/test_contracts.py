@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import live_trader.contracts as contracts
 from live_trader.contracts import (
+    can_live_small_use_artifact,
     can_live_use_artifact,
     enrich_strategy_artifact_runtime,
     load_portfolio_artifacts,
@@ -15,15 +16,142 @@ from live_trader.contracts import (
     normalize_portfolio_artifact,
     normalize_strategy_artifact,
     resolve_trading_system_root,
+    sample_strategy_artifacts,
     strategy_artifact_dirs,
     strategy_plugin_dirs,
     strategy_plugin_status,
 )
-from trading_runtime.artifact_governance import DeploymentStore, EvidenceStore, build_paper_portfolio_evidence
+from trading_runtime.artifact_governance import (
+    DeploymentStore,
+    EvidenceStore,
+    build_paper_portfolio_evidence,
+    seal_portfolio_artifact,
+    seal_strategy_artifact,
+)
 from trading_runtime.professional_flow import build_lineage_manifest
 
 
 class StrategyContractTest(unittest.TestCase):
+    def test_ui_demo_sample_strategies_are_never_live_candidates(self) -> None:
+        samples = sample_strategy_artifacts()
+
+        self.assertTrue(samples)
+        for sample in samples:
+            self.assertTrue(sample["ui_demo_only"])
+            self.assertEqual(
+                contracts.UI_DEMO_ARTIFACT_ORIGIN,
+                sample["artifact_origin"],
+            )
+            self.assertFalse(can_live_small_use_artifact(sample))
+            self.assertFalse(can_live_use_artifact(sample))
+
+            forged_permissions = {
+                **sample.get("permissions", {}),
+                "live_small_eligible": True,
+                "live_eligible": True,
+                "live_allowed": True,
+            }
+            forged_sample = {
+                **sample,
+                "permissions": forged_permissions,
+                "live_small_eligible": True,
+                "live_eligible": True,
+                "live_allowed": True,
+            }
+            self.assertFalse(can_live_small_use_artifact(forged_sample))
+            self.assertFalse(can_live_use_artifact(forged_sample))
+
+            legacy_sample = {
+                key: value
+                for key, value in forged_sample.items()
+                if key not in {"artifact_origin", "ui_demo_only"}
+            }
+            legacy_sample["source_path"] = "sample"
+            self.assertFalse(can_live_small_use_artifact(legacy_sample))
+            self.assertFalse(can_live_use_artifact(legacy_sample))
+
+    def test_dataset_lineage_requires_tracked_revision_and_preserves_metadata(
+        self,
+    ) -> None:
+        parent = {
+            "stage": "dataset",
+            "contentHash": "rev-adjusted-123",
+            "schemaVersion": "dataset-lineage-v1",
+            "tracked": True,
+            "datasetId": "ds-123",
+            "lineageRunId": "run-123",
+            "sourceStage": "adjusted",
+            "stageRevisionId": "rev-adjusted-123",
+            "parentStageRevisionId": "rev-processed-123",
+            "dependencyStageRevisionIds": ["rev-daily-123"],
+            "rawContentSha256": "a" * 64,
+            "rawMetadataSha256": "b" * 64,
+            "transformationId": "stock-data-scraper/adjusted/v1",
+        }
+        lineage = build_lineage_manifest(
+            stage="backtest",
+            producer="backtester",
+            inputs={
+                "datasetHash": "rev-adjusted-123",
+                "strategyCodeHash": "code",
+                "parameterHash": "params",
+                "costModelHash": "cost",
+            },
+            parent=parent,
+        )
+        normalized = normalize_strategy_artifact(
+            {
+                "id": "LINEAGE-STRICT",
+                "lineageManifest": lineage,
+            }
+        )
+
+        dataset = normalized["lineage"]["dataset"]
+        self.assertTrue(dataset["valid"], dataset["issues"])
+        self.assertEqual("dataset-lineage-v1", dataset["schemaVersion"])
+        self.assertTrue(dataset["tracked"])
+        self.assertEqual(
+            ["rev-daily-123"],
+            dataset["dependencyStageRevisionIds"],
+        )
+        self.assertEqual("a" * 64, dataset["rawContentSha256"])
+        self.assertEqual(parent, dataset["parent"])
+
+        mismatched = dict(parent)
+        mismatched["contentHash"] = "some-other-hash"
+        blocked = normalize_strategy_artifact(
+            {
+                "id": "LINEAGE-MISMATCH",
+                "lifecycle": {"status": "live"},
+                "finalTest": {"status": "pass"},
+                "permissions": {
+                    "paper_trader_verified": True,
+                    "live_small_eligible": True,
+                    "live_eligible": True,
+                    "live_allowed": True,
+                },
+                "lineageManifest": build_lineage_manifest(
+                    stage="backtest",
+                    producer="backtester",
+                    inputs={
+                        "datasetHash": "some-other-hash",
+                        "strategyCodeHash": "code",
+                        "parameterHash": "params",
+                        "costModelHash": "cost",
+                    },
+                    parent=mismatched,
+                ),
+            }
+        )
+        self.assertFalse(blocked["lineage"]["dataset"]["valid"])
+        self.assertFalse(blocked["live_small_eligible"])
+        self.assertTrue(
+            any(
+                "content-hash-stage-revision-mismatch" in issue
+                for issue in blocked["lineage"]["blockingIssues"]
+            )
+        )
+
     def test_frozen_executable_resolves_workspace_strategy_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trading_system = Path(tmp) / "trading-system"
@@ -76,11 +204,13 @@ class StrategyContractTest(unittest.TestCase):
     def test_legacy_candidate_is_explicitly_grandfathered_and_portfolio_policy_is_normalized(self) -> None:
         strategy = normalize_strategy_artifact({"id": "LEGACY", "permissions": {}})
         portfolio = normalize_portfolio_artifact(
-            {
+            seal_portfolio_artifact({
+                "artifactType": "portfolio",
+                "schemaVersion": "portfolio-artifact-v1",
                 "id": "P1",
                 "portfolioPolicy": {"policyHash": "policy-hash", "allocations": []},
                 "advancedOperations": {"contentHash": "advanced-hash", "automaticDeRisk": {"capitalMultiplier": 0.5}},
-            }
+            })
         )
 
         self.assertTrue(strategy["portfolio_candidate"]["legacyGrandfathered"])
@@ -385,7 +515,7 @@ class StrategyContractTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 artifact_dir = Path(tmp)
                 os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
-                strategy_payload = {
+                strategy_payload = seal_strategy_artifact({
                     "id": "STRAT-EXT-1",
                     "strategy_id": "STRAT-EXT-1",
                     "name": "Immutable Strategy",
@@ -398,8 +528,23 @@ class StrategyContractTest(unittest.TestCase):
                         stage="backtest",
                         producer="backtester",
                         inputs={"datasetHash": "dataset", "strategyCodeHash": "code", "parameterHash": "params", "costModelHash": "cost"},
+                        parent={
+                            "stage": "dataset",
+                            "contentHash": "dataset",
+                            "schemaVersion": "dataset-lineage-v1",
+                            "tracked": True,
+                            "datasetId": "dataset-ext-1",
+                            "lineageRunId": "run-ext-1",
+                            "sourceStage": "adjusted",
+                            "stageRevisionId": "dataset",
+                            "parentStageRevisionId": "processed-ext-1",
+                            "dependencyStageRevisionIds": [],
+                            "rawContentSha256": "a" * 64,
+                            "rawMetadataSha256": "b" * 64,
+                            "transformationId": "stock-data-scraper/adjusted/v1",
+                        },
                     ),
-                }
+                })
                 portfolio_payload = {
                     "artifactType": "portfolio",
                     "schemaVersion": "portfolio-artifact-v1",
@@ -590,7 +735,7 @@ class StrategyContractTest(unittest.TestCase):
                 os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
                 (portfolio_dir / "portfolio.json").write_text(
                     json.dumps(
-                        {
+                        seal_portfolio_artifact({
                             "artifactType": "portfolio",
                             "schemaVersion": "portfolio-artifact-v1",
                             "id": "portfolio-live-1",
@@ -611,7 +756,7 @@ class StrategyContractTest(unittest.TestCase):
                                 "riskChecks": [{"label": "unit", "status": "pass"}],
                             },
                             "riskPolicy": {"maxSingleSymbolWeight": 0.25, "maxStrategyWeight": 0.5},
-                        },
+                        }),
                         ensure_ascii=False,
                     ),
                     encoding="utf-8",
@@ -624,11 +769,245 @@ class StrategyContractTest(unittest.TestCase):
             self.assertEqual(portfolios[0]["lifecycle_status"], "before-live-small")
             self.assertTrue(portfolios[0]["permissions"]["live_small_allowed"])
             self.assertEqual(portfolios[0]["target_portfolio"][0]["targetWeight"], 0.2)
+            self.assertTrue(portfolios[0]["artifact_integrity"]["valid"])
+            self.assertTrue(portfolios[0]["live_usable"])
         finally:
             if previous_artifact is None:
                 os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
             else:
                 os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact
+
+    def test_unsealed_portfolio_remains_visible_but_is_live_blocked(self) -> None:
+        previous_artifact = os.environ.get(
+            "LIVE_TRADER_STRATEGY_ARTIFACT_DIR"
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                artifact_dir = Path(tmp)
+                portfolio_dir = artifact_dir / "portfolios"
+                portfolio_dir.mkdir()
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(
+                    artifact_dir
+                )
+                payload = {
+                    "artifactType": "portfolio",
+                    "schemaVersion": "portfolio-artifact-v1",
+                    "id": "legacy-unsealed",
+                    "name": "Legacy Unsealed",
+                    "lifecycle": {"status": "live"},
+                    "permissions": {
+                        "live_small_allowed": True,
+                        "live_allowed": True,
+                    },
+                    "strategyInstances": [
+                        {
+                            "strategyId": "STRAT-1",
+                            "symbol": "BTCUSDT",
+                            "allocation": {"normalizedWeight": 1.0},
+                        }
+                    ],
+                    "framework": {
+                        "targetPortfolio": [
+                            {
+                                "strategyId": "STRAT-1",
+                                "symbol": "BTCUSDT",
+                                "targetWeight": 1.0,
+                            }
+                        ],
+                        "riskChecks": [
+                            {"label": "forged-pass", "status": "pass"}
+                        ],
+                    },
+                    "riskPolicy": {"maxSingleSymbolWeight": 1.0},
+                    "portfolioPolicy": {
+                        "policyHash": "untrusted",
+                        "allocations": [],
+                    },
+                    "advancedOperations": {
+                        "contentHash": "untrusted",
+                        "automaticDeRisk": {"capitalMultiplier": 1.0},
+                    },
+                }
+                (portfolio_dir / "legacy-unsealed.json").write_text(
+                    json.dumps(payload, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+                portfolios = load_portfolio_artifacts()
+
+            self.assertEqual(1, len(portfolios))
+            portfolio = portfolios[0]
+            self.assertEqual("legacy-unsealed", portfolio["id"])
+            self.assertFalse(portfolio["artifact_integrity"]["valid"])
+            self.assertTrue(
+                portfolio["artifact_integrity"]["requiresRepublication"]
+            )
+            self.assertIn(
+                "canonical-lock-missing",
+                portfolio["artifact_integrity"]["issues"],
+            )
+            self.assertFalse(
+                portfolio["permissions"]["live_small_allowed"]
+            )
+            self.assertFalse(portfolio["permissions"]["live_allowed"])
+            self.assertFalse(portfolio["live_usable"])
+            self.assertEqual(
+                [{"strategyId": "STRAT-1", "symbol": "BTCUSDT"}],
+                portfolio["strategy_instances"],
+            )
+            self.assertEqual([], portfolio["target_portfolio"])
+            self.assertEqual({}, portfolio["risk_policy"])
+            self.assertEqual({}, portfolio["portfolio_policy"])
+            self.assertEqual({}, portfolio["advanced_operations"])
+            self.assertEqual(
+                "fail",
+                portfolio["risk_checks"][0]["status"],
+            )
+            self.assertTrue(
+                any(
+                    "artifact-integrity:canonical-lock-missing" in reason
+                    for reason in portfolio["permissions"]["fail_reasons"]
+                )
+            )
+        finally:
+            if previous_artifact is None:
+                os.environ.pop(
+                    "LIVE_TRADER_STRATEGY_ARTIFACT_DIR",
+                    None,
+                )
+            else:
+                os.environ[
+                    "LIVE_TRADER_STRATEGY_ARTIFACT_DIR"
+                ] = previous_artifact
+
+    def test_tampered_sealed_portfolio_cannot_supply_live_controls(
+        self,
+    ) -> None:
+        previous_artifact = os.environ.get(
+            "LIVE_TRADER_STRATEGY_ARTIFACT_DIR"
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                artifact_dir = Path(tmp)
+                portfolio_dir = artifact_dir / "portfolios"
+                portfolio_dir.mkdir()
+                os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(
+                    artifact_dir
+                )
+                payload = seal_portfolio_artifact(
+                    {
+                        "artifactType": "portfolio",
+                        "schemaVersion": "portfolio-artifact-v1",
+                        "id": "portfolio-tampered",
+                        "lifecycle": {"status": "live"},
+                        "permissions": {
+                            "live_small_allowed": True,
+                            "live_allowed": True,
+                        },
+                        "strategyInstances": [
+                            {
+                                "strategyId": "STRAT-1",
+                                "symbol": "BTCUSDT",
+                                "allocation": {"normalizedWeight": 0.1},
+                            }
+                        ],
+                        "framework": {
+                            "targetPortfolio": [
+                                {
+                                    "strategyId": "STRAT-1",
+                                    "symbol": "BTCUSDT",
+                                    "targetWeight": 0.1,
+                                }
+                            ]
+                        },
+                        "riskPolicy": {
+                            "maxSingleSymbolWeight": 0.1
+                        },
+                    }
+                )
+                payload["framework"]["targetPortfolio"][0][
+                    "targetWeight"
+                ] = 1.0
+                (portfolio_dir / "portfolio-tampered.json").write_text(
+                    json.dumps(payload, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+                portfolios = load_portfolio_artifacts()
+
+            self.assertEqual(1, len(portfolios))
+            portfolio = portfolios[0]
+            self.assertFalse(portfolio["artifact_integrity"]["valid"])
+            self.assertIn(
+                "canonical-lock-content-hash-mismatch",
+                portfolio["artifact_integrity"]["issues"],
+            )
+            self.assertFalse(portfolio["permissions"]["live_allowed"])
+            self.assertFalse(
+                portfolio["permissions"]["live_small_allowed"]
+            )
+            self.assertEqual([], portfolio["target_portfolio"])
+            self.assertEqual({}, portfolio["risk_policy"])
+        finally:
+            if previous_artifact is None:
+                os.environ.pop(
+                    "LIVE_TRADER_STRATEGY_ARTIFACT_DIR",
+                    None,
+                )
+            else:
+                os.environ[
+                    "LIVE_TRADER_STRATEGY_ARTIFACT_DIR"
+                ] = previous_artifact
+
+    def test_legacy_v1_portfolio_lock_is_display_only(self) -> None:
+        payload = seal_portfolio_artifact(
+            {
+                "artifactType": "portfolio",
+                "schemaVersion": "portfolio-artifact-v1",
+                "id": "portfolio-legacy-lock",
+                "lifecycle": {"status": "live"},
+                "permissions": {
+                    "live_small_allowed": True,
+                    "live_allowed": True,
+                },
+                "strategyInstances": [
+                    {
+                        "strategyId": "STRAT-LEGACY",
+                        "symbol": "BTCUSDT",
+                        "allocation": {"normalizedWeight": 0.25},
+                    }
+                ],
+                "riskPolicy": {"maxSingleSymbolWeight": 0.25},
+            }
+        )
+        payload["artifactLock"][
+            "schemaVersion"
+        ] = "portfolio-artifact-lock-v1"
+
+        portfolio = normalize_portfolio_artifact(payload)
+
+        self.assertEqual("portfolio-legacy-lock", portfolio["id"])
+        self.assertFalse(portfolio["artifact_integrity"]["valid"])
+        self.assertTrue(
+            portfolio["artifact_integrity"]["requiresRepublication"]
+        )
+        self.assertIn(
+            "canonical-lock-schema-mismatch:"
+            "portfolio-artifact-lock-v1->portfolio-artifact-lock-v2",
+            portfolio["artifact_integrity"]["issues"],
+        )
+        self.assertFalse(portfolio["live_usable"])
+        self.assertFalse(portfolio["permissions"]["live_allowed"])
+        self.assertEqual(
+            [
+                {
+                    "strategyId": "STRAT-LEGACY",
+                    "symbol": "BTCUSDT",
+                }
+            ],
+            portfolio["strategy_instances"],
+        )
+        self.assertEqual({}, portfolio["risk_policy"])
 
     def test_portfolio_artifacts_load_beyond_legacy_limit_and_dedupe_mirrors(self) -> None:
         previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
@@ -643,12 +1022,12 @@ class StrategyContractTest(unittest.TestCase):
                 os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = os.pathsep.join((str(primary), str(mirror)))
 
                 for index in range(25):
-                    payload = {
+                    payload = seal_portfolio_artifact({
                         "artifactType": "portfolio",
                         "schemaVersion": "portfolio-artifact-v1",
                         "id": f"portfolio-{index:02d}",
                         "name": f"Portfolio {index:02d}",
-                    }
+                    })
                     encoded = json.dumps(payload, ensure_ascii=False)
                     (primary_portfolios / f"portfolio-{index:02d}.json").write_text(encoded, encoding="utf-8")
                     if index == 0:

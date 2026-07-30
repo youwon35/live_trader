@@ -147,6 +147,14 @@ export async function applyBinanceFuturesSettings(
   });
 }
 
+export async function previewBinanceFuturesOrderRisk(payload = {}) {
+  return request("/api/binance-futures-risk/preview", {
+    method: "POST",
+    body: payload,
+    timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
+  });
+}
+
 export async function previewBinanceFuturesFillSoak(symbol = "ETHUSDT") {
   return request("/api/binance-futures-fill-soak/preview", {
     method: "POST",

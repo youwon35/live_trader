@@ -18,7 +18,11 @@ from live_trader.brokers import (
 from live_trader.audit_store import SQLiteAuditEventStore
 from live_trader.execution_streams import parse_upbit_my_order
 from live_trader.program_ledger import ProgramLedger
-from trading_runtime import DeploymentStore, build_paper_portfolio_evidence
+from trading_runtime import (
+    DeploymentStore,
+    build_paper_portfolio_evidence,
+    seal_strategy_artifact,
+)
 
 
 class OrderGateTest(unittest.TestCase):
@@ -1114,7 +1118,7 @@ class OrderGateTest(unittest.TestCase):
             artifact_dir = Path(temp_dir)
             os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
             artifact_path = artifact_dir / "strategy.json"
-            artifact_payload = {
+            artifact_payload = seal_strategy_artifact({
                 "strategy_id": "LIFE-1",
                 "name": "Lifecycle Test",
                 "symbol": "BTCUSDT",
@@ -1141,7 +1145,7 @@ class OrderGateTest(unittest.TestCase):
                     "failReasons": [],
                     "blockingFailReasons": [],
                 },
-            }
+            })
             artifact_path.write_text(json.dumps(artifact_payload, ensure_ascii=False), encoding="utf-8")
             immutable_source = artifact_path.read_bytes()
             try:
@@ -1289,7 +1293,7 @@ class OrderGateTest(unittest.TestCase):
             artifact_dir = Path(temp_dir)
             os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
             artifact_path = artifact_dir / "strategy.json"
-            artifact_payload = {
+            artifact_payload = seal_strategy_artifact({
                 "id": "LIVE-PROMOTE-1",
                 "strategy_id": "LIVE-PROMOTE-1",
                 "name": "Immutable Live Candidate",
@@ -1307,7 +1311,7 @@ class OrderGateTest(unittest.TestCase):
                     "live_allowed": False,
                     "fail_reasons": [],
                 },
-            }
+            })
             artifact_path.write_text(json.dumps(artifact_payload, ensure_ascii=False), encoding="utf-8")
             immutable_source = artifact_path.read_bytes()
             ledger = self.use_temp_program_ledger(temp_dir)
@@ -1364,6 +1368,13 @@ class OrderGateTest(unittest.TestCase):
                     state.STATE["orders"].append(canary_order(3))
                     ledger.record_execution_events([canary_event(3)])
                     result = state.promote_strategy_to_live("LIVE-PROMOTE-1")
+                self.assertTrue(result["ok"], result["reason"])
+                post_promotion_scope = state.current_live_canary_scope(
+                    "LIVE-PROMOTE-1"
+                )
+                post_promotion_summary = state.live_small_execution_summary(
+                    "LIVE-PROMOTE-1"
+                )
                 deployment = next(
                     iter(
                         json.loads(
@@ -1394,6 +1405,8 @@ class OrderGateTest(unittest.TestCase):
             scope["scopeId"],
             evidence["details"]["canaryScope"]["scopeId"],
         )
+        self.assertEqual(scope["scopeId"], post_promotion_scope["scopeId"])
+        self.assertEqual(3, post_promotion_summary["fills"])
         self.assertTrue(evidence["integrity"]["contentHash"])
 
     def test_local_filled_rows_without_broker_events_never_count_as_canary(self) -> None:
@@ -1560,7 +1573,10 @@ class OrderGateTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(state.STATE["orders"]), 1)
         order = state.STATE["orders"][0]
-        self.assertEqual(order["order_id"], "LIVE-DRY-0001")
+        self.assertRegex(
+            order["order_id"],
+            r"^LIVE-DRY-[0-9A-F]{32}$",
+        )
         self.assertEqual(order["state"], "dry_run")
         self.assertEqual(order["queue_state"], "simulated")
         self.assertTrue(order["dry_run"])
@@ -1568,7 +1584,7 @@ class OrderGateTest(unittest.TestCase):
         self.assertIn("risk_report", order)
         self.assertTrue(order["risk_report"]["can_submit"])
         audit_detail = state.STATE["audit"][-1]["detail"]
-        self.assertIn("LIVE-DRY-0001", audit_detail)
+        self.assertIn(order["order_id"], audit_detail)
         self.assertIn("BTCUSDT BUY dry_run/simulated", audit_detail)
         self.assertIn("risk pass", audit_detail)
         self.assertIn("제출 허용", audit_detail)
@@ -1603,7 +1619,10 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual("주문 게이트", event["source"])
         self.assertEqual("allow", event["decision"])
         self.assertEqual("dry_run", event["state"])
-        self.assertEqual("LIVE-DRY-0001", event["order_id"])
+        self.assertRegex(
+            event["order_id"],
+            r"^LIVE-DRY-[0-9A-F]{32}$",
+        )
         self.assertEqual("LIVE-AUDIT", event["strategy_id"])
         self.assertEqual("BTCUSDT", event["symbol"])
         self.assertTrue(event["payload"]["risk_report"]["can_submit"])
@@ -1650,15 +1669,74 @@ class OrderGateTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(len(state.STATE["orders"]), 1)
         order = state.STATE["orders"][0]
-        self.assertEqual(order["order_id"], "LIVE-BLOCK-0001")
+        self.assertRegex(
+            order["order_id"],
+            r"^LIVE-BLOCK-[0-9A-F]{32}$",
+        )
         self.assertEqual(order["state"], "adapter_blocked")
         self.assertEqual(order["queue_state"], "held")
         self.assertFalse(order["dry_run"])
         audit_detail = state.STATE["audit"][-1]["detail"]
-        self.assertIn("LIVE-BLOCK-0001", audit_detail)
+        self.assertIn(order["order_id"], audit_detail)
         self.assertIn("adapter_blocked/held", audit_detail)
         self.assertIn("risk pass", audit_detail)
         self.assertIn("제출 차단", audit_detail)
+
+    def test_existing_order_retry_requires_new_confirmed_bar_intent(
+        self,
+    ) -> None:
+        original_order = {
+            "order_id": "LIVE-BLOCK-RETRY-1",
+            "strategy_id": "STRAT-1",
+            "asset": "CRYPTO",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "qty": 0.01,
+            "reference_price": 100,
+            "state": "adapter_blocked",
+            "queue_state": "held",
+            "attempts": 0,
+            "dry_run": False,
+        }
+        state.STATE["orders"] = [copy.deepcopy(original_order)]
+        state.STATE["audit"] = []
+
+        with (
+            patch.object(state, "snapshot", return_value={}),
+            patch.object(
+                state,
+                "evaluate_order_gate_with_report",
+            ) as evaluate_gate,
+            patch.object(
+                state,
+                "submit_order_intent",
+            ) as submit,
+            patch.object(
+                state.LiveBrokerRouter,
+                "place_order",
+            ) as place_order,
+        ):
+            result = state.retry_order(original_order["order_id"])
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            result["requires_new_confirmed_bar_intent"]
+        )
+        self.assertIn("다음 확정봉", result["reason"])
+        self.assertEqual(
+            original_order,
+            state.STATE["orders"][0],
+        )
+        self.assertFalse(
+            state.order_rows()[0]["retryable"]
+        )
+        self.assertEqual(
+            "주문 재시도 차단",
+            state.STATE["audit"][-1]["event"],
+        )
+        evaluate_gate.assert_not_called()
+        submit.assert_not_called()
+        place_order.assert_not_called()
 
     def test_strategy_cycle_without_signal_records_no_order(self) -> None:
         state.STATE["orders"] = []

@@ -459,6 +459,310 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
         ):
             self.assertNotIn(secret_fragment, serialized)
 
+    @staticmethod
+    def futures_risk_brackets(
+        *,
+        notional_coef: object = "2",
+        omit_cum: bool = False,
+        second_floor: object = "1000",
+    ) -> dict[str, object]:
+        first = {
+            "bracket": 1,
+            "initialLeverage": "20",
+            "notionalFloor": "0",
+            "notionalCap": "1000",
+            "maintMarginRatio": "0.005",
+            "cum": "0",
+        }
+        second = {
+            "bracket": 2,
+            "initialLeverage": "10",
+            "notionalFloor": second_floor,
+            "notionalCap": "2000",
+            "maintMarginRatio": "0.01",
+            "cum": "5",
+        }
+        if omit_cum:
+            second.pop("cum")
+        return {
+            "symbol": "BTCUSDT",
+            "notionalCoef": notional_coef,
+            "brackets": [first, second],
+        }
+
+    def test_risk_inputs_select_bracket_from_existing_plus_new_notional(
+        self,
+    ) -> None:
+        premium_response = {
+            "ok": True,
+            "status": 200,
+            "json": {
+                "symbol": "BTCUSDT",
+                "markPrice": "100",
+                "indexPrice": "99.5",
+                "lastFundingRate": "0.0001",
+                "nextFundingTime": 123,
+            },
+            "text": "",
+        }
+        signed_responses = [
+            {
+                "ok": True,
+                "status": 200,
+                "json": [self.futures_risk_brackets()],
+                "text": "",
+            },
+            {
+                "ok": True,
+                "status": 200,
+                "json": {
+                    "symbol": "BTCUSDT",
+                    "makerCommissionRate": "0.0002",
+                    "takerCommissionRate": "0.0005",
+                },
+                "text": "",
+            },
+            {
+                "ok": True,
+                "status": 200,
+                "json": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionAmt": "19",
+                        "notional": "1900",
+                    },
+                    {
+                        "symbol": "ETHUSDT",
+                        "positionAmt": "3",
+                        "notional": "900",
+                    },
+                ],
+                "text": "",
+            },
+        ]
+        with (
+            patch(
+                "live_trader.brokers.send_prepared_request",
+                return_value=premium_response,
+            ),
+            patch(
+                "live_trader.brokers.send_binance_signed_request",
+                side_effect=signed_responses,
+            ),
+        ):
+            risk = LiveBrokerRouter().get_binance_futures_risk_inputs(
+                "BTCUSDT.PERP",
+                notional_usdt="200",
+            )
+
+        self.assertEqual(1900.0, risk["existing_position_notional_usdt"])
+        self.assertEqual(2100.0, risk["combined_notional_usdt"])
+        self.assertEqual(2.0, risk["notional_coef"])
+        self.assertEqual(2000.0, risk["notional_floor"])
+        self.assertEqual(4000.0, risk["notional_cap"])
+        self.assertEqual(10.0, risk["maintenance_margin_cum"])
+        self.assertEqual(11.0, risk["maintenance_margin_amount"])
+        self.assertEqual(0.01, risk["maintenance_margin_rate"])
+
+    def test_risk_inputs_can_use_explicit_existing_position_notional(
+        self,
+    ) -> None:
+        premium_response = {
+            "ok": True,
+            "status": 200,
+            "json": {"markPrice": "100", "indexPrice": "100"},
+            "text": "",
+        }
+        signed_responses = [
+            {
+                "ok": True,
+                "status": 200,
+                "json": [
+                    {
+                        **self.futures_risk_brackets(),
+                        "notionalCoef": None,
+                    }
+                ],
+                "text": "",
+            },
+            {
+                "ok": True,
+                "status": 200,
+                "json": {
+                    "makerCommissionRate": "0.0002",
+                    "takerCommissionRate": "0.0005",
+                },
+                "text": "",
+            },
+        ]
+        with (
+            patch(
+                "live_trader.brokers.send_prepared_request",
+                return_value=premium_response,
+            ),
+            patch(
+                "live_trader.brokers.send_binance_signed_request",
+                side_effect=signed_responses,
+            ) as signed,
+        ):
+            risk = LiveBrokerRouter().get_binance_futures_risk_inputs(
+                "BTCUSDT",
+                notional_usdt=100,
+                existing_position_notional_usdt=100,
+            )
+
+        self.assertEqual(2, signed.call_count)
+        self.assertEqual(1.0, risk["notional_coef"])
+        self.assertEqual(200.0, risk["combined_notional_usdt"])
+        self.assertEqual(1000.0, risk["notional_cap"])
+
+    def test_risk_inputs_fail_closed_on_missing_cum(self) -> None:
+        signed_responses = [
+            {
+                "ok": True,
+                "status": 200,
+                "json": [
+                    self.futures_risk_brackets(omit_cum=True)
+                ],
+                "text": "",
+            },
+            {
+                "ok": True,
+                "status": 200,
+                "json": {
+                    "makerCommissionRate": "0.0002",
+                    "takerCommissionRate": "0.0005",
+                },
+                "text": "",
+            },
+        ]
+        with (
+            patch(
+                "live_trader.brokers.send_prepared_request",
+                return_value={
+                    "ok": True,
+                    "status": 200,
+                    "json": {"markPrice": "100", "indexPrice": "100"},
+                    "text": "",
+                },
+            ),
+            patch(
+                "live_trader.brokers.send_binance_signed_request",
+                side_effect=signed_responses,
+            ),
+            self.assertRaisesRegex(BrokerNotReadyError, "cum"),
+        ):
+            LiveBrokerRouter().get_binance_futures_risk_inputs(
+                "BTCUSDT",
+                notional_usdt=100,
+                existing_position_notional_usdt=0,
+            )
+
+    def test_risk_inputs_fail_closed_on_invalid_notional_coefficient(
+        self,
+    ) -> None:
+        signed_responses = [
+            {
+                "ok": True,
+                "status": 200,
+                "json": [
+                    self.futures_risk_brackets(notional_coef="NaN")
+                ],
+                "text": "",
+            },
+            {
+                "ok": True,
+                "status": 200,
+                "json": {
+                    "makerCommissionRate": "0.0002",
+                    "takerCommissionRate": "0.0005",
+                },
+                "text": "",
+            },
+        ]
+        with (
+            patch(
+                "live_trader.brokers.send_prepared_request",
+                return_value={
+                    "ok": True,
+                    "status": 200,
+                    "json": {"markPrice": "100", "indexPrice": "100"},
+                    "text": "",
+                },
+            ),
+            patch(
+                "live_trader.brokers.send_binance_signed_request",
+                side_effect=signed_responses,
+            ),
+            self.assertRaisesRegex(BrokerNotReadyError, "notionalCoef"),
+        ):
+            LiveBrokerRouter().get_binance_futures_risk_inputs(
+                "BTCUSDT",
+                notional_usdt=100,
+                existing_position_notional_usdt=0,
+            )
+
+    def test_risk_inputs_fail_closed_on_bracket_gap_or_overflow(
+        self,
+    ) -> None:
+        for brackets, notional, expected in (
+            (
+                self.futures_risk_brackets(second_floor="1100"),
+                100,
+                "연속적이지",
+            ),
+            (
+                self.futures_risk_brackets(),
+                4000,
+                "범위를 초과",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                signed_responses = [
+                    {
+                        "ok": True,
+                        "status": 200,
+                        "json": [brackets],
+                        "text": "",
+                    },
+                    {
+                        "ok": True,
+                        "status": 200,
+                        "json": {
+                            "makerCommissionRate": "0.0002",
+                            "takerCommissionRate": "0.0005",
+                        },
+                        "text": "",
+                    },
+                ]
+                with (
+                    patch(
+                        "live_trader.brokers.send_prepared_request",
+                        return_value={
+                            "ok": True,
+                            "status": 200,
+                            "json": {
+                                "markPrice": "100",
+                                "indexPrice": "100",
+                            },
+                            "text": "",
+                        },
+                    ),
+                    patch(
+                        "live_trader.brokers.send_binance_signed_request",
+                        side_effect=signed_responses,
+                    ),
+                    self.assertRaisesRegex(
+                        BrokerNotReadyError,
+                        expected,
+                    ),
+                ):
+                    LiveBrokerRouter().get_binance_futures_risk_inputs(
+                        "BTCUSDT",
+                        notional_usdt=notional,
+                        existing_position_notional_usdt=0,
+                    )
+
     def test_router_test_order_is_pinned_to_non_matching_endpoint(
         self,
     ) -> None:

@@ -183,6 +183,12 @@ class LiveRiskStateIntegrationTest(unittest.TestCase):
                 "position_direction": "short",
                 "short_entries_requested": True,
                 "broker_short_adapter_verified": True,
+                "capital_rollout": {
+                    "decision": {
+                        "ready": True,
+                        "maxNotional": 84,
+                    }
+                },
             },
         )
 

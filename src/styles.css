@@ -5770,6 +5770,190 @@ body {
   gap: 12px;
 }
 
+.futures-risk-panel,
+.capital-rollout-panel,
+.lineage-flow-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.futures-risk-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.futures-risk-controls label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-semibold);
+}
+
+.futures-risk-controls label:first-child {
+  grid-column: 1 / -1;
+}
+
+.futures-risk-controls input,
+.futures-risk-controls select {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--ink);
+  background: var(--panel);
+  font: inherit;
+}
+
+.futures-risk-metrics,
+.capital-rollout-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.futures-risk-metrics > div,
+.capital-rollout-summary > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel-muted, rgb(148 163 184 / 8%));
+}
+
+.futures-risk-metrics span,
+.capital-rollout-summary span {
+  color: var(--muted);
+  font-size: var(--font-size-caption);
+}
+
+.futures-risk-metrics strong,
+.capital-rollout-summary strong {
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: var(--font-size-small);
+}
+
+.futures-risk-blockers {
+  display: grid;
+  gap: 6px;
+}
+
+.futures-risk-blocker,
+.lineage-flow-warning {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 10px;
+  border: 1px solid var(--semantic-border, var(--line));
+  border-radius: 9px;
+  color: var(--semantic-ink, var(--ink));
+  background: var(--semantic-background, var(--panel));
+  font-size: var(--font-size-caption);
+}
+
+.futures-risk-disclaimer {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
+}
+
+.capital-rollout-stages,
+.lineage-stage-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: stretch;
+  gap: 7px;
+}
+
+.lineage-stage-grid {
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+}
+
+.capital-rollout-stage,
+.lineage-stage-card {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--semantic-border, var(--line));
+  border-radius: 10px;
+  color: var(--semantic-ink, var(--ink));
+  background: var(--semantic-background, var(--panel));
+}
+
+.capital-rollout-stage span,
+.lineage-stage-card span {
+  font-size: var(--font-size-caption);
+  font-weight: var(--font-weight-semibold);
+}
+
+.capital-rollout-stage strong,
+.lineage-stage-card strong {
+  overflow-wrap: anywhere;
+  font-size: var(--font-size-small);
+}
+
+.capital-rollout-stage small,
+.lineage-stage-card small {
+  overflow-wrap: anywhere;
+  color: color-mix(in srgb, currentColor 70%, transparent);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.lineage-stage-details {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.lineage-stage-details small {
+  min-width: 0;
+}
+
+.capital-rollout-arrow,
+.lineage-stage-arrow {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.lineage-flow-identity {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.lineage-flow-identity > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.lineage-flow-identity strong {
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: var(--font-size-small);
+}
+
+.lineage-flow-identity span {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: var(--font-size-caption);
+}
+
 .futures-settings-controls {
   display: grid;
   grid-template-columns: minmax(160px, 1fr) minmax(170px, 1fr) minmax(150px, 0.8fr);
@@ -5878,5 +6062,33 @@ body {
 
   .futures-fill-soak-observation {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .futures-risk-metrics,
+  .capital-rollout-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .capital-rollout-stages,
+  .lineage-stage-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .capital-rollout-arrow,
+  .lineage-stage-arrow {
+    min-height: 14px;
+    transform: rotate(90deg);
+  }
+}
+
+@media (max-width: 620px) {
+  .futures-risk-controls,
+  .futures-risk-metrics,
+  .capital-rollout-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .futures-risk-controls label:first-child {
+    grid-column: auto;
   }
 }

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Literal
+
+from trading_runtime import compare_futures_policy_to_broker
 
 from .live_adapters import (
     BINANCE_FUTURES_TEST_ORDER_ENDPOINT,
@@ -12,12 +15,15 @@ from .live_adapters import (
     build_binance_futures_account_request,
     build_binance_futures_account_config_request,
     build_binance_futures_cancel_order_request,
+    build_binance_futures_commission_rate_request,
+    build_binance_futures_leverage_bracket_request,
     build_binance_futures_leverage_change_request,
     build_binance_futures_margin_type_change_request,
     build_binance_futures_open_orders_request,
     build_binance_futures_order_status_request,
     build_binance_futures_order_request,
     build_binance_futures_position_mode_request,
+    build_binance_futures_premium_index_request,
     build_binance_futures_positions_request,
     build_binance_futures_symbol_config_request,
     build_binance_spot_order_request,
@@ -365,6 +371,234 @@ def numeric_value(value: object, default: float = 0.0) -> float:
         return float(str(value or "").replace(",", "").strip())
     except (TypeError, ValueError):
         return default
+
+
+def _strict_finite_number(
+    value: object,
+    *,
+    label: str,
+    minimum: float | None = None,
+    strictly_positive: bool = False,
+) -> float:
+    try:
+        number = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        raise BrokerNotReadyError(
+            f"Binance Futures {label} 값을 해석할 수 없습니다."
+        )
+    if not math.isfinite(number):
+        raise BrokerNotReadyError(
+            f"Binance Futures {label} 값이 유한수가 아닙니다."
+        )
+    if strictly_positive and number <= 0:
+        raise BrokerNotReadyError(
+            f"Binance Futures {label} 값은 0보다 커야 합니다."
+        )
+    if minimum is not None and number < minimum:
+        raise BrokerNotReadyError(
+            f"Binance Futures {label} 값은 {minimum} 이상이어야 합니다."
+        )
+    return number
+
+
+def _existing_futures_position_notional(
+    positions_payload: object,
+    symbol: str,
+) -> float:
+    if not isinstance(positions_payload, list):
+        raise BrokerNotReadyError(
+            "Binance Futures position 응답 형식이 올바르지 않습니다."
+        )
+    total = 0.0
+    for row in positions_payload:
+        if not isinstance(row, dict):
+            raise BrokerNotReadyError(
+                "Binance Futures position 행 형식이 올바르지 않습니다."
+            )
+        if str(row.get("symbol") or "").strip().upper() != symbol:
+            continue
+        quantity = _strict_finite_number(
+            row.get("positionAmt"),
+            label=f"{symbol} positionAmt",
+        )
+        if abs(quantity) <= 1e-12:
+            continue
+        raw_notional = row.get("notional")
+        if raw_notional not in (None, ""):
+            position_notional = abs(
+                _strict_finite_number(
+                    raw_notional,
+                    label=f"{symbol} position notional",
+                )
+            )
+        else:
+            mark_price = _strict_finite_number(
+                row.get("markPrice"),
+                label=f"{symbol} position markPrice",
+                strictly_positive=True,
+            )
+            position_notional = abs(quantity) * mark_price
+        if position_notional <= 0:
+            raise BrokerNotReadyError(
+                f"Binance Futures {symbol} 보유 포지션 명목금액이 "
+                "0보다 커야 합니다."
+            )
+        total += position_notional
+    return total
+
+
+def _select_futures_maintenance_bracket(
+    symbol_brackets: dict[str, object],
+    *,
+    combined_notional_usdt: float,
+) -> dict[str, float]:
+    raw_coef = symbol_brackets.get("notionalCoef")
+    # Binance documents this field as optional and only returns it for an
+    # account whose symbol brackets were adjusted.
+    notional_coef = (
+        1.0
+        if raw_coef in (None, "")
+        else _strict_finite_number(
+            raw_coef,
+            label="notionalCoef",
+            strictly_positive=True,
+        )
+    )
+    raw_brackets = symbol_brackets.get("brackets")
+    if not isinstance(raw_brackets, list) or not raw_brackets:
+        raise BrokerNotReadyError(
+            "Binance Futures 유지증거금 bracket이 비어 있습니다."
+        )
+
+    brackets: list[dict[str, float]] = []
+    for index, raw in enumerate(raw_brackets, start=1):
+        if not isinstance(raw, dict):
+            raise BrokerNotReadyError(
+                f"Binance Futures bracket {index} 형식이 올바르지 않습니다."
+            )
+        required = (
+            "notionalFloor",
+            "notionalCap",
+            "maintMarginRatio",
+            "initialLeverage",
+            "cum",
+        )
+        missing = [key for key in required if raw.get(key) in (None, "")]
+        if missing:
+            raise BrokerNotReadyError(
+                f"Binance Futures bracket {index} 필수 필드 누락: "
+                f"{', '.join(missing)}"
+            )
+        raw_floor = _strict_finite_number(
+            raw.get("notionalFloor"),
+            label=f"bracket {index} notionalFloor",
+            minimum=0.0,
+        )
+        raw_cap = _strict_finite_number(
+            raw.get("notionalCap"),
+            label=f"bracket {index} notionalCap",
+            strictly_positive=True,
+        )
+        if raw_cap <= raw_floor:
+            raise BrokerNotReadyError(
+                f"Binance Futures bracket {index} 범위가 올바르지 않습니다."
+            )
+        bracket = {
+            "notional_floor": raw_floor * notional_coef,
+            "notional_cap": raw_cap * notional_coef,
+            "maintenance_margin_rate": _strict_finite_number(
+                raw.get("maintMarginRatio"),
+                label=f"bracket {index} maintMarginRatio",
+                strictly_positive=True,
+            ),
+            "initial_leverage_limit": _strict_finite_number(
+                raw.get("initialLeverage"),
+                label=f"bracket {index} initialLeverage",
+                strictly_positive=True,
+            ),
+            # cum is a notional-denominated continuity adjustment, so the
+            # account-specific bracket multiplier must scale it as well.
+            "maintenance_margin_cum": (
+                _strict_finite_number(
+                    raw.get("cum"),
+                    label=f"bracket {index} cum",
+                    minimum=0.0,
+                )
+                * notional_coef
+            ),
+        }
+        brackets.append(bracket)
+
+    brackets.sort(key=lambda item: item["notional_floor"])
+    expected_floor = 0.0
+    previous_maintenance_at_cap: float | None = None
+    for index, bracket in enumerate(brackets, start=1):
+        floor = bracket["notional_floor"]
+        cap = bracket["notional_cap"]
+        tolerance = max(1e-9, abs(expected_floor) * 1e-12)
+        if abs(floor - expected_floor) > tolerance:
+            raise BrokerNotReadyError(
+                f"Binance Futures bracket {index} 범위가 연속적이지 않습니다."
+            )
+        maintenance_at_floor = (
+            floor * bracket["maintenance_margin_rate"]
+            - bracket["maintenance_margin_cum"]
+        )
+        if maintenance_at_floor < -1e-9:
+            raise BrokerNotReadyError(
+                f"Binance Futures bracket {index} cum 계산 결과가 "
+                "음수입니다."
+            )
+        if previous_maintenance_at_cap is not None:
+            continuity_tolerance = max(
+                1e-8,
+                abs(previous_maintenance_at_cap) * 1e-9,
+            )
+            if (
+                abs(
+                    maintenance_at_floor
+                    - previous_maintenance_at_cap
+                )
+                > continuity_tolerance
+            ):
+                raise BrokerNotReadyError(
+                    f"Binance Futures bracket {index} cum이 유지증거금 "
+                    "연속성을 만족하지 않습니다."
+                )
+        previous_maintenance_at_cap = (
+            cap * bracket["maintenance_margin_rate"]
+            - bracket["maintenance_margin_cum"]
+        )
+        expected_floor = cap
+    selected = next(
+        (
+            bracket
+            for bracket in brackets
+            if bracket["notional_floor"]
+            <= combined_notional_usdt
+            < bracket["notional_cap"]
+        ),
+        None,
+    )
+    if selected is None:
+        raise BrokerNotReadyError(
+            "Binance Futures 합산 명목금액이 제공된 유지증거금 bracket "
+            "범위를 초과했습니다."
+        )
+    maintenance_margin = (
+        combined_notional_usdt
+        * selected["maintenance_margin_rate"]
+        - selected["maintenance_margin_cum"]
+    )
+    if maintenance_margin < -1e-9:
+        raise BrokerNotReadyError(
+            "Binance Futures bracket cum 계산 결과가 음수입니다."
+        )
+    return {
+        **selected,
+        "notional_coef": notional_coef,
+        "maintenance_margin_amount": max(0.0, maintenance_margin),
+    }
 
 
 def first_numeric(row: dict[str, object], *keys: str, default: float = 0.0) -> float:
@@ -921,43 +1155,42 @@ def validate_binance_futures_execution_policy(
 ) -> None:
     if intent.get("risk_reducing") is True:
         return
-    maximum_leverage = max(
-        1.0,
-        numeric_value(
-            intent.get("max_leverage")
-            or intent.get("maxLeverage"),
-            1.0,
-        ),
+    raw_policy = intent.get("futures_execution_policy")
+    policy = (
+        dict(raw_policy)
+        if isinstance(raw_policy, dict)
+        else {
+            "marginMode": str(
+                intent.get("required_margin_type")
+                or intent.get("requiredMarginType")
+                or "ISOLATED"
+            ),
+            "maxLeverageMultiplier": numeric_value(
+                intent.get("max_leverage") or intent.get("maxLeverage"),
+                1.0,
+            ),
+            "perTradeRiskPercent": numeric_value(
+                intent.get("per_trade_risk_pct"),
+                0.5,
+            ),
+            "maxNotionalPercent": numeric_value(
+                intent.get("max_notional_pct"),
+                10.0,
+            ),
+        }
     )
-    current_leverage = numeric_value(
-        symbol_config.get("leverage"),
-        0.0,
+    assessment = compare_futures_policy_to_broker(
+        policy,
+        {
+            "marginType": symbol_config.get("margin_type"),
+            "leverage": symbol_config.get("leverage"),
+        },
     )
-    if current_leverage <= 0:
+    if assessment.get("compliant") is not True:
         raise BrokerNotReadyError(
-            "Binance Futures 현재 레버리지를 확인하지 못해 신규 진입을 차단했습니다."
-        )
-    if current_leverage > maximum_leverage + 1e-12:
-        raise BrokerNotReadyError(
-            "Binance Futures 현재 레버리지 "
-            f"{current_leverage:g}x가 전략 한도 "
-            f"{maximum_leverage:g}x를 초과합니다."
-        )
-    required_margin_type = str(
-        intent.get("required_margin_type")
-        or intent.get("requiredMarginType")
-        or "ISOLATED"
-    ).strip().upper()
-    current_margin_type = str(
-        symbol_config.get("margin_type") or ""
-    ).strip().upper()
-    if required_margin_type not in {"", "ANY"} and (
-        current_margin_type != required_margin_type
-    ):
-        raise BrokerNotReadyError(
-            "Binance Futures 증거금 방식이 전략 요구와 다릅니다: "
-            f"현재 {current_margin_type or 'UNKNOWN'}, "
-            f"요구 {required_margin_type}."
+            "Binance Futures 현재 설정이 Artifact 정책과 일치하지 않아 "
+            "신규 진입을 차단했습니다: "
+            + ", ".join(str(item) for item in assessment.get("blockers") or [])
         )
 
 
@@ -1338,6 +1571,151 @@ class LiveBrokerRouter:
             ),
             "position_count": position_count,
             "open_order_count": len(open_orders),
+        }
+
+    def get_binance_futures_risk_inputs(
+        self,
+        symbol: str,
+        *,
+        notional_usdt: object = 0,
+        existing_position_notional_usdt: object | None = None,
+    ) -> dict[str, object]:
+        """Read mark/funding, maintenance bracket and commission facts.
+
+        This is a read-only USER_DATA/market-data bundle. It deliberately
+        returns only the inputs needed by the local risk simulator.
+        """
+
+        normalized_symbol = (
+            str(symbol or "")
+            .strip()
+            .upper()
+            .removesuffix(".PERP")
+            .replace("-", "")
+        )
+        if not normalized_symbol:
+            raise BrokerNotReadyError(
+                "Binance Futures risk simulator symbol이 필요합니다."
+            )
+        premium = ensure_response_ok(
+            "binance-futures",
+            send_prepared_request(
+                build_binance_futures_premium_index_request(
+                    normalized_symbol
+                )
+            ),
+        )
+        brackets_payload = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                lambda: build_binance_futures_leverage_bracket_request(
+                    normalized_symbol
+                ),
+                futures=True,
+            ),
+        )
+        commission = ensure_response_ok(
+            "binance-futures",
+            send_binance_signed_request(
+                lambda: build_binance_futures_commission_rate_request(
+                    normalized_symbol
+                ),
+                futures=True,
+            ),
+        )
+        if existing_position_notional_usdt is None:
+            positions_payload = ensure_response_ok(
+                "binance-futures",
+                send_binance_signed_request(
+                    build_binance_futures_positions_request,
+                    futures=True,
+                ),
+            )
+            existing_notional = _existing_futures_position_notional(
+                positions_payload,
+                normalized_symbol,
+            )
+        else:
+            existing_notional = _strict_finite_number(
+                existing_position_notional_usdt,
+                label="기존 포지션 명목금액",
+                minimum=0.0,
+            )
+        if not isinstance(premium, dict):
+            raise BrokerNotReadyError(
+                "Binance Futures mark/funding 응답 형식이 올바르지 않습니다."
+            )
+        if not isinstance(commission, dict):
+            raise BrokerNotReadyError(
+                "Binance Futures commission 응답 형식이 올바르지 않습니다."
+            )
+        bracket_rows = (
+            brackets_payload
+            if isinstance(brackets_payload, list)
+            else [brackets_payload]
+            if isinstance(brackets_payload, dict)
+            else []
+        )
+        symbol_brackets = next(
+            (
+                item
+                for item in bracket_rows
+                if isinstance(item, dict)
+                and str(item.get("symbol") or "").upper()
+                == normalized_symbol
+            ),
+            {},
+        )
+        if not symbol_brackets:
+            raise BrokerNotReadyError(
+                "Binance Futures 요청 종목의 유지증거금 bracket을 "
+                "찾을 수 없습니다."
+            )
+        requested_notional = _strict_finite_number(
+            notional_usdt,
+            label="신규 주문 명목금액",
+            minimum=0.0,
+        )
+        combined_notional = existing_notional + requested_notional
+        selected_bracket = _select_futures_maintenance_bracket(
+            symbol_brackets,
+            combined_notional_usdt=combined_notional,
+        )
+        return {
+            "symbol": normalized_symbol,
+            "mark_price": numeric_value(premium.get("markPrice"), 0.0),
+            "index_price": numeric_value(premium.get("indexPrice"), 0.0),
+            "funding_rate": numeric_value(
+                premium.get("lastFundingRate"),
+                0.0,
+            ),
+            "next_funding_time": str(premium.get("nextFundingTime") or ""),
+            "requested_notional_usdt": requested_notional,
+            "existing_position_notional_usdt": existing_notional,
+            "combined_notional_usdt": combined_notional,
+            "notional_coef": selected_bracket["notional_coef"],
+            "maintenance_margin_rate": selected_bracket[
+                "maintenance_margin_rate"
+            ],
+            "maintenance_margin_cum": selected_bracket[
+                "maintenance_margin_cum"
+            ],
+            "maintenance_margin_amount": selected_bracket[
+                "maintenance_margin_amount"
+            ],
+            "notional_floor": selected_bracket["notional_floor"],
+            "notional_cap": selected_bracket["notional_cap"],
+            "initial_leverage_limit": selected_bracket[
+                "initial_leverage_limit"
+            ],
+            "maker_fee_rate": numeric_value(
+                commission.get("makerCommissionRate"),
+                0.0,
+            ),
+            "taker_fee_rate": numeric_value(
+                commission.get("takerCommissionRate"),
+                0.0,
+            ),
         }
 
     def configure_binance_futures_symbol(

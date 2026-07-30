@@ -13,6 +13,7 @@
     "test:layout-slot": "node scripts/layout_slot_smoke.mjs",
     "test:polling": "node scripts/polling.test.mjs",
     "test:api-resilience": "node scripts/api_resilience.test.mjs",
+    "test:futures-risk-ui": "node scripts/futures_risk_simulator.test.mjs",
     "ui:smoke": "node scripts/ui_smoke.mjs"
   },
   "dependencies": {

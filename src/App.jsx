@@ -45,6 +45,7 @@ import {
   loadArtifactMetadata,
   loadSharedSearchPresets,
   applyBinanceFuturesSettings,
+  previewBinanceFuturesOrderRisk,
   previewBinanceFuturesSettings,
   previewBinanceFuturesFillSoak,
   runFinalPreflight,
@@ -73,6 +74,12 @@ import {
   runShadowLive,
   runRecoveryDrill,
 } from "./api";
+import {
+  futuresRiskLeverageOptions,
+  futuresRiskStrategyDefaults,
+  isFuturesRiskStrategy,
+  shouldHydrateRiskStrategy,
+} from "./futuresRiskSimulator";
 import { livePollingIntervals } from "./polling";
 import {
   ACCOUNT_REFRESH_INTERVAL_MS,
@@ -937,7 +944,10 @@ function panelOverlapsPeers(activePanel) {
 function applyPanelOffset(panel, position = {}) {
   return applyLayoutTransformOffset(panel, position.x, position.y, {
     max: LAYOUT_MAX_OFFSET,
-    snap: LAYOUT_SNAP_SIZE,
+    // Pointer movement is snapped before this call.  Slot exchanges can need
+    // a one-pixel alignment correction after a CSS grid reflow, so do not
+    // quantize persisted transforms a second time here.
+    snap: 1,
   });
 }
 
@@ -948,8 +958,51 @@ function clearPanelOffset(panel) {
 function currentPanelOffset(panel, storedPosition = {}) {
   return readLayoutTransformOffset(panel, storedPosition, {
     max: LAYOUT_MAX_OFFSET,
-    snap: LAYOUT_SNAP_SIZE,
+    snap: 1,
   });
+}
+
+function resolvePanelCollision(panel) {
+  const workspace = panel.closest(".page-view") ?? panel.parentElement;
+  if (!workspace) return null;
+  const panelRect = panel.getBoundingClientRect();
+  const currentOffset = currentPanelOffset(panel);
+  const overlappingPeers = Array.from(workspace.querySelectorAll(".panel"))
+    .filter((peer) => (
+      peer !== panel
+      && !panel.contains(peer)
+      && !peer.contains(panel)
+      && peer.getBoundingClientRect().width > 0
+      && peer.getBoundingClientRect().height > 0
+    ))
+    .filter((peer) => {
+      const peerRect = peer.getBoundingClientRect();
+      return panelRect.left < peerRect.right
+        && panelRect.right > peerRect.left
+        && panelRect.top < peerRect.bottom
+        && panelRect.bottom > peerRect.top;
+    });
+  if (!overlappingPeers.length) return currentOffset;
+
+  const candidates = overlappingPeers.flatMap((peer) => {
+    const peerRect = peer.getBoundingClientRect();
+    return [
+      { x: currentOffset.x + Math.floor(peerRect.left - panelRect.right), y: currentOffset.y },
+      { x: currentOffset.x + Math.ceil(peerRect.right - panelRect.left), y: currentOffset.y },
+      { x: currentOffset.x, y: currentOffset.y + Math.floor(peerRect.top - panelRect.bottom) },
+      { x: currentOffset.x, y: currentOffset.y + Math.ceil(peerRect.bottom - panelRect.top) },
+    ];
+  }).sort((left, right) => (
+    Math.abs(left.x - currentOffset.x) + Math.abs(left.y - currentOffset.y)
+    - Math.abs(right.x - currentOffset.x) - Math.abs(right.y - currentOffset.y)
+  ));
+
+  for (const candidate of candidates) {
+    const applied = applyPanelOffset(panel, candidate);
+    if (!panelOverlapsPeers(panel)) return applied;
+  }
+  applyPanelOffset(panel, currentOffset);
+  return null;
 }
 
 function isInteractiveLayoutTarget(target) {
@@ -1195,17 +1248,24 @@ function useEditablePanels(rootRef) {
             applyPanelOffset(swapTarget, swap.target);
             const alignedActiveOffset = layoutAlignedOffset(panel, swap.active, targetRect, {
               max: LAYOUT_MAX_OFFSET,
-              snap: LAYOUT_SNAP_SIZE,
+              snap: 1,
             });
             const alignedTargetOffset = layoutAlignedOffset(swapTarget, swap.target, startRect, {
               max: LAYOUT_MAX_OFFSET,
-              snap: LAYOUT_SNAP_SIZE,
+              snap: 1,
             });
             applyPanelOffset(panel, alignedActiveOffset);
             applyPanelOffset(swapTarget, alignedTargetOffset);
-            if (!panelOverlapsPeers(panel) && !panelOverlapsPeers(swapTarget)) {
-              nextOffset = alignedActiveOffset;
-              saveOffset(targetKey, alignedTargetOffset);
+            const collisionFreeActiveOffset = resolvePanelCollision(panel);
+            const collisionFreeTargetOffset = resolvePanelCollision(swapTarget);
+            if (
+              collisionFreeActiveOffset
+              && collisionFreeTargetOffset
+              && !panelOverlapsPeers(panel)
+              && !panelOverlapsPeers(swapTarget)
+            ) {
+              nextOffset = collisionFreeActiveOffset;
+              saveOffset(targetKey, collisionFreeTargetOffset);
               const sizeStore = readStoredMap(PANEL_SIZE_STORAGE_KEY);
               sizeStore[key] = swappedDimensions.active;
               sizeStore[targetKey] = swappedDimensions.target;
@@ -2027,6 +2087,10 @@ function LivePreparationPanel({
             strategies={filteredStrategies}
             summary={snapshot.summary ?? {}}
           />
+          <LineageFlowPanel
+            snapshot={snapshot.lineage_flow}
+            selectedStrategyId={selectedStrategy?.strategy_id}
+          />
           <LiveStrategySelectorPanel
             automaticPromotion={snapshot.automatic_promotion}
             strategies={filteredStrategies}
@@ -2073,6 +2137,13 @@ function LivePreparationPanel({
           <FuturesSettingsPanel
             snapshot={snapshot.binance_futures_settings}
           />
+          <FuturesRiskSimulatorPanel
+            strategies={snapshot.strategies ?? []}
+          />
+          <CapitalRolloutPanel
+            snapshot={snapshot.capital_rollout}
+            selectedStrategyId={selectedStrategy?.strategy_id}
+          />
           <FuturesFillSoakPanel
             snapshot={snapshot.binance_futures_fill_soak}
           />
@@ -2099,6 +2170,290 @@ const FUTURES_FILL_SOAK_BLOCKER_LABELS = {
   "immutable-report-path-unavailable": "덮어쓰기 방지 리포트 경로를 준비할 수 없습니다.",
   "preview-observation-failed": "실계좌 읽기 전용 조회에 실패했습니다.",
 };
+
+const FUTURES_RISK_BLOCKER_LABELS = {
+  "account-equity-invalid": "계좌 equity를 확인할 수 없습니다.",
+  "available-usdt-invalid": "주문 가능한 USDT가 없습니다.",
+  "broker-risk-inputs-unavailable": "Binance 위험 입력 조회에 실패했습니다.",
+  "entry-price-invalid": "현재 mark price를 확인할 수 없습니다.",
+  "futures-margin-mode-drift": "현재 마진 방식이 Artifact 정책과 다릅니다.",
+  "futures-margin-mode-crossed-not-allowed": "공유 증거금(CROSSED)은 신규 자동 진입 정책에서 허용하지 않습니다.",
+  "futures-leverage-limit-drift": "현재 레버리지가 Artifact 상한을 초과합니다.",
+  "leverage-policy-drift": "입력 레버리지가 Artifact 상한을 초과합니다.",
+  "margin-type-policy-drift": "현재 마진 방식이 전략 정책과 다릅니다.",
+  "max-notional-policy-exceeded": "주문 명목금액이 계좌 대비 Artifact 상한을 초과합니다.",
+  "notional-invalid": "주문 명목금액을 0보다 크게 입력하세요.",
+  "per-trade-risk-policy-exceeded": "손절 시 예상 손실이 거래당 위험 한도를 초과합니다.",
+  "protective-stop-direction-invalid": "LONG 손절은 진입가 아래, SHORT 손절은 진입가 위여야 합니다.",
+  "protective-stop-missing": "보호 손절가가 필요합니다.",
+  "requested-leverage-broker-mismatch": "계산 레버리지와 현재 Binance 설정이 다릅니다.",
+  "required-margin-exceeds-available": "초기 증거금과 진입 수수료가 가용 USDT를 초과합니다.",
+  "strategy-artifact-missing": "선택한 전략 Artifact를 찾을 수 없습니다.",
+  "strategy-route-not-binance-futures": "선택 전략은 Binance USD-M 실행 경로가 아닙니다.",
+  "strategy-symbol-mismatch": "전략 종목과 계산 종목이 다릅니다.",
+};
+
+const CAPITAL_ROLLOUT_BLOCKER_LABELS = {
+  "account-equity-invalid": "계좌 equity 확인 필요",
+  "available-cash-invalid": "가용 현금 확인 필요",
+  "blocked-orders-present": "차단·실패 주문 해소 필요",
+  "canary-cap-unavailable": "Canary 주문 한도 없음",
+  "full-live-requires-clean-soak-pass": "경고 없는 clean PASS Soak 필요",
+  "futures-policy-invalid": "Futures 정책 무결성 실패",
+  "lineage-invalid": "데이터·검증 계보 불완전",
+  "minimum-canary-fills-not-met": "동일 scope 실제 체결 3건 필요",
+  "minimum-full-live-fills-not-met": "Full Live 실제 체결 20건 필요",
+  "minimum-full-live-observation-not-met": "무인 관찰 7일 필요",
+  "reconciliation-not-fresh": "최신 계좌·포지션 대조 필요",
+  "small-live-cap-unavailable": "Small Live 주문 한도 없음",
+  "soak-not-accepted": "PASS 또는 PASS_WITH_WARNING Soak 필요",
+};
+
+function displayNumber(value, digits = 2) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toLocaleString("ko-KR", { maximumFractionDigits: digits }) : "-";
+}
+
+function LineageFlowPanel({ snapshot = {}, selectedStrategyId = "" }) {
+  const flows = Array.isArray(snapshot?.flows) ? snapshot.flows : [];
+  const flow = flows.find((item) => item.strategyId === selectedStrategyId) || flows[0];
+  return (
+    <section className="panel lineage-flow-panel">
+      <PanelHeader
+        title="데이터·전략 계보"
+        subtitle="Scraper 원천부터 Backtest, Paper, Live 증거까지 같은 전략 체인을 읽기 전용으로 추적합니다."
+        suffix={(
+          <StatusPill tone={snapshot?.brokenCount ? "warning" : flows.length ? "success" : "neutral"}>
+            {snapshot?.completeCount || 0} COMPLETE · {snapshot?.brokenCount || 0} BROKEN
+          </StatusPill>
+        )}
+      />
+      {flow ? (
+        <>
+          <div className="lineage-flow-identity">
+            <div>
+              <strong>{flow.name}</strong>
+              <span>{flow.strategyId} · {flow.symbol} · {flow.timeframe}</span>
+            </div>
+            <StatusPill tone={flow.complete ? "success" : "danger"}>
+              {flow.complete ? "CHAIN OK" : "CHAIN BLOCKED"}
+            </StatusPill>
+          </div>
+          <div className="lineage-stage-grid">
+            {(flow.stages || []).map((stage, index) => (
+              <React.Fragment key={stage.id}>
+                <article {...semanticSurfaceProps(stage.status === "PASS" ? "success" : stage.status === "BLOCK" ? "danger" : "neutral", "lineage-stage-card")}>
+                  <span>{stage.label}</span>
+                  <strong>{stage.status}</strong>
+                  <div className="lineage-stage-details">
+                    {stage.id === "dataset" && stage.metadata?.datasetId && <small>dataset · {stage.metadata.datasetId}</small>}
+                    {stage.id === "dataset" && stage.metadata?.lineageRunId && <small>run · {stage.metadata.lineageRunId}</small>}
+                    {stage.id === "dataset" && stage.metadata?.sourceStage && <small>stage · {stage.metadata.sourceStage}</small>}
+                    {stage.id === "dataset" && stage.metadata?.stageRevisionId && <small>revision · {stage.metadata.stageRevisionId}</small>}
+                    {stage.id === "dataset" && stage.metadata?.transformationId && <small>transform · {stage.metadata.transformationId}</small>}
+                    <small>
+                      {stage.contentHash
+                        ? `hash · ${stage.contentHash.slice(0, 12)}…`
+                        : stage.required
+                          ? "증거 없음"
+                          : "아직 미진행"}
+                    </small>
+                  </div>
+                </article>
+                {index < (flow.stages || []).length - 1 && <span className="lineage-stage-arrow">→</span>}
+              </React.Fragment>
+            ))}
+          </div>
+          {!flow.complete && (
+            <div {...semanticSurfaceProps("danger", "lineage-flow-warning")}>
+              <ShieldAlert size={15} />
+              <span>{(flow.brokenLinks || [])[0] || "계보 연결을 확인하세요."}</span>
+            </div>
+          )}
+        </>
+      ) : <EmptyRow text="표시할 전략 계보가 없습니다." />}
+    </section>
+  );
+}
+
+function CapitalRolloutPanel({ snapshot = {}, selectedStrategyId = "" }) {
+  const rows = Array.isArray(snapshot?.strategies) ? snapshot.strategies : [];
+  const rollout = rows.find((item) => item.strategyId === selectedStrategyId) || rows[0];
+  return (
+    <section className="panel capital-rollout-panel">
+      <PanelHeader
+        title="단계별 자본 확대"
+        subtitle="최소 Canary → Small Live → Full Live 순서로만 상한이 커집니다. 실제 주문 게이트에도 같은 한도를 적용합니다."
+        suffix={(
+          <StatusPill tone={snapshot?.accountFresh && snapshot?.reconciliationFresh ? "success" : "warning"}>
+            {snapshot?.accountFresh && snapshot?.reconciliationFresh ? "ACCOUNT FRESH" : "REFRESH NEEDED"}
+          </StatusPill>
+        )}
+      />
+      {rollout ? (
+        <>
+          <div className="capital-rollout-summary">
+            <div><span>전략</span><strong>{rollout.strategyName}</strong></div>
+            <div><span>계좌 equity</span><strong>{displayNumber(rollout.accountEquity)} USDT</strong></div>
+            <div><span>정책 상한</span><strong>{displayNumber(rollout.policyMaxNotionalPercent)}%</strong></div>
+            <div><span>Canary 체결</span><strong>{rollout.canaryFills || 0}건</strong></div>
+          </div>
+          <div className="capital-rollout-stages">
+            {(rollout.stages || []).map((stage, index) => (
+              <React.Fragment key={stage.id}>
+                <article {...semanticSurfaceProps(stage.ready ? "success" : "warning", "capital-rollout-stage")}>
+                  <span>{stage.label}</span>
+                  <strong>≤ {displayNumber(stage.maxNotional)} USDT</strong>
+                  <small>{stage.ready ? "현재 증거 충족" : CAPITAL_ROLLOUT_BLOCKER_LABELS[stage.blockers?.[0]] || stage.blockers?.[0] || "확인 필요"}</small>
+                </article>
+                {index < (rollout.stages || []).length - 1 && <span className="capital-rollout-arrow">→</span>}
+              </React.Fragment>
+            ))}
+          </div>
+        </>
+      ) : <EmptyRow text="Binance USD-M 전략이 없어 자본 확대 단계를 계산하지 않았습니다." />}
+    </section>
+  );
+}
+
+function FuturesRiskSimulatorPanel({ strategies = [] }) {
+  const futuresStrategies = useMemo(
+    () => strategies.filter(isFuturesRiskStrategy),
+    [strategies],
+  );
+  const [strategyId, setStrategyId] = useState("");
+  const [symbol, setSymbol] = useState("ETHUSDT");
+  const [direction, setDirection] = useState("SHORT");
+  const [notional, setNotional] = useState("5");
+  const [leverage, setLeverage] = useState("1");
+  const [stopPrice, setStopPrice] = useState("");
+  const [fundingIntervals, setFundingIntervals] = useState("3");
+  const [result, setResult] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const hydratedStrategyIdRef = useRef(null);
+  const initialStrategySelectedRef = useRef(false);
+
+  useEffect(() => {
+    const selectedStillExists = futuresStrategies.some(
+      (strategy) => strategy.strategy_id === strategyId,
+    );
+    if (strategyId && !selectedStillExists) {
+      const replacementId = futuresStrategies[0]?.strategy_id || "";
+      initialStrategySelectedRef.current = Boolean(replacementId);
+      setStrategyId(replacementId);
+      return;
+    }
+    if (
+      !strategyId
+      && !initialStrategySelectedRef.current
+      && futuresStrategies[0]?.strategy_id
+    ) {
+      initialStrategySelectedRef.current = true;
+      setStrategyId(futuresStrategies[0].strategy_id);
+    }
+  }, [futuresStrategies, strategyId]);
+
+  useEffect(() => {
+    if (!shouldHydrateRiskStrategy(hydratedStrategyIdRef.current, strategyId)) {
+      return;
+    }
+    hydratedStrategyIdRef.current = strategyId;
+    if (!strategyId) {
+      setResult(null);
+      return;
+    }
+    const selected = futuresStrategies.find((item) => item.strategy_id === strategyId);
+    if (!selected) return;
+    const defaults = futuresRiskStrategyDefaults(selected);
+    setSymbol(defaults.symbol);
+    setDirection(defaults.direction);
+    setLeverage(defaults.leverage);
+    setResult(null);
+  }, [futuresStrategies, strategyId]);
+
+  const selectedStrategy = futuresStrategies.find(
+    (item) => item.strategy_id === strategyId,
+  );
+  const leverageOptions = futuresRiskLeverageOptions(
+    selectedStrategy?.futures_execution_policy?.maxLeverageMultiplier,
+    leverage,
+  );
+
+  async function calculateRisk() {
+    setBusy(true);
+    setMessage("");
+    try {
+      const response = await previewBinanceFuturesOrderRisk({
+        strategy_id: strategyId,
+        symbol,
+        direction,
+        notional_usdt: Number(notional),
+        leverage: Number(leverage),
+        stop_price: Number(stopPrice),
+        funding_intervals: Number(fundingIntervals),
+      });
+      setResult(response.risk || null);
+      setMessage(response.reason || "");
+    } catch (error) {
+      setResult(null);
+      setMessage(error?.message || "위험 계산에 실패했습니다.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const estimate = result?.estimate || {};
+  const blockers = Array.isArray(result?.blockers) ? result.blockers : [];
+  const tone = result?.status === "READY" ? "success" : result?.status === "WARNING" ? "warning" : result ? "danger" : "neutral";
+  return (
+    <section className="panel futures-risk-panel">
+      <PanelHeader
+        title="주문 직전 위험 시뮬레이터"
+        subtitle="현재 Binance mark·funding·maintenance bracket·수수료와 Artifact 정책으로 계산합니다. 주문이나 계정 설정은 변경하지 않습니다."
+        suffix={<StatusPill tone={tone}>{result?.status || "READ ONLY"}</StatusPill>}
+      />
+      <div className="futures-risk-controls">
+        <label><span>전략 Artifact</span><select value={strategyId} onChange={(event) => setStrategyId(event.target.value)}><option value="">안전 기본 정책</option>{futuresStrategies.map((item) => <option key={item.strategy_id} value={item.strategy_id}>{item.name} · {item.symbol}</option>)}</select></label>
+        <label><span>종목</span><input value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))} /></label>
+        <label><span>방향</span><select value={direction} onChange={(event) => setDirection(event.target.value)}><option value="LONG">LONG</option><option value="SHORT">SHORT</option></select></label>
+        <label><span>명목금액 (USDT)</span><input type="number" min="0" step="0.1" value={notional} onChange={(event) => setNotional(event.target.value)} /></label>
+        <label><span>계산 레버리지 (x)</span><select value={leverage} onChange={(event) => setLeverage(event.target.value)}>{leverageOptions.map((value) => <option key={value} value={value}>{value}x</option>)}</select></label>
+        <label><span>보호 손절가</span><input type="number" min="0" step="any" value={stopPrice} onChange={(event) => setStopPrice(event.target.value)} placeholder="필수" /></label>
+        <label><span>예상 펀딩 횟수</span><input type="number" min="0" max="90" value={fundingIntervals} onChange={(event) => setFundingIntervals(event.target.value)} /></label>
+      </div>
+      <div className="operator-actions">
+        <ActionButton className="secondary-button" disabled={busy} label={busy ? "조회·계산 중" : "현재값으로 계산"} onClick={calculateRisk} status={busy ? "pending" : undefined} />
+        {message && <span className="inline-state">{message}</span>}
+      </div>
+      {result && (
+        <>
+          <div className="futures-risk-metrics">
+            <div><span>Mark price</span><strong>{displayNumber(result.market?.mark_price, 6)}</strong></div>
+            <div><span>초기 증거금</span><strong>{displayNumber(estimate.initial_margin_usdt, 4)} USDT</strong></div>
+            <div><span>추정 청산가</span><strong>{estimate.liquidation_price == null ? "CROSS 산출 불가" : displayNumber(estimate.liquidation_price, 6)}</strong></div>
+            <div><span>청산 여유</span><strong>{estimate.liquidation_buffer_pct == null ? "-" : `${displayNumber(estimate.liquidation_buffer_pct)}%`}</strong></div>
+            <div><span>왕복 수수료</span><strong>{displayNumber(estimate.round_trip_fee_usdt, 6)} USDT</strong></div>
+            <div><span>예상 펀딩 비용</span><strong>{displayNumber(estimate.estimated_funding_cost_usdt, 6)} USDT</strong></div>
+            <div><span>손절 예상 손실</span><strong>{displayNumber(estimate.estimated_loss_at_stop_usdt, 6)} USDT</strong></div>
+            <div><span>계좌 위험률</span><strong>{displayNumber(estimate.risk_pct_of_equity, 3)}%</strong></div>
+          </div>
+          {blockers.length > 0 && (
+            <div className="futures-risk-blockers">
+              {blockers.map((blocker) => (
+                <div {...semanticSurfaceProps("danger", "futures-risk-blocker")} key={blocker}>
+                  <ShieldAlert size={14} />
+                  <span>{FUTURES_RISK_BLOCKER_LABELS[blocker] || blocker}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <p className="futures-risk-disclaimer">{result.disclaimer}</p>
+        </>
+      )}
+    </section>
+  );
+}
 
 const FUTURES_SETTINGS_BLOCKER_LABELS = {
   "account-cannot-trade": "선물 계정 거래 권한을 확인할 수 없습니다.",

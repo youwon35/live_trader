@@ -26,6 +26,8 @@ from trading_runtime.artifact_governance import (  # noqa: E402
     DeploymentStore,
     EvidenceStore,
     artifact_reference,
+    verify_portfolio_artifact,
+    verify_strategy_artifact,
 )
 from trading_runtime.lifecycle import (  # noqa: E402
     ACTIVE_REVALIDATION_STAGES,
@@ -40,6 +42,9 @@ from trading_runtime.provider_reconciliation import (  # noqa: E402
     provider_reconciliation_from_artifact,
     provider_reconciliation_live_ready,
 )
+from trading_runtime.futures_execution_policy import (  # noqa: E402
+    futures_execution_policy_from_artifact,
+)
 from trading_runtime.artifact_paths import (  # noqa: E402
     artifact_read_roots,
     migrate_artifact_tree,
@@ -50,6 +55,7 @@ from trading_runtime.artifact_paths import (  # noqa: E402
 ARTIFACT_SCHEMA_VERSION = "strategy-artifact-v2"
 SHARED_STRATEGY_SCHEMA_VERSION = "market-strategy-v1"
 TRADER_STRATEGY_CONTRACT_VERSION = "trader-strategy-contract-v2"
+UI_DEMO_ARTIFACT_ORIGIN = "live-trader-ui-demo"
 
 
 PLUGIN_ALIASES = {
@@ -114,8 +120,103 @@ def _dict_value(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _dataset_lineage_snapshot(
+    backtest_lineage: dict[str, Any],
+    *,
+    dataset: dict[str, Any],
+    data_artifact: dict[str, Any],
+    artifact: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and preserve the immutable dataset parent of a backtest.
+
+    A hash-shaped string alone is not provenance.  New professional backtest
+    manifests must point to a tracked Stock Data Scraper revision and bind the
+    parent content hash to that exact revision identifier.
+    """
+
+    parent = _dict_value(backtest_lineage.get("parent"))
+    schema_version = str(parent.get("schemaVersion") or "")
+    dataset_id = str(parent.get("datasetId") or "")
+    lineage_run_id = str(parent.get("lineageRunId") or "")
+    source_stage = str(parent.get("sourceStage") or "")
+    stage_revision_id = str(parent.get("stageRevisionId") or "")
+    transformation_id = str(parent.get("transformationId") or "")
+    content_hash = str(parent.get("contentHash") or "")
+    dependencies = (
+        [
+            str(item)
+            for item in parent.get("dependencyStageRevisionIds") or []
+            if str(item)
+        ]
+        if isinstance(parent.get("dependencyStageRevisionIds"), list)
+        else []
+    )
+    issues: list[str] = []
+    if schema_version != "dataset-lineage-v1":
+        issues.append("dataset-schema-version-invalid")
+    if parent.get("tracked") is not True:
+        issues.append("dataset-tracked-not-true")
+    if not dataset_id:
+        issues.append("dataset-id-missing")
+    if not lineage_run_id:
+        issues.append("dataset-lineage-run-id-missing")
+    if not source_stage:
+        issues.append("dataset-source-stage-missing")
+    if not stage_revision_id:
+        issues.append("dataset-stage-revision-id-missing")
+    if not transformation_id:
+        issues.append("dataset-transformation-id-missing")
+    if not content_hash or content_hash != stage_revision_id:
+        issues.append("dataset-content-hash-stage-revision-mismatch")
+    return {
+        "valid": not issues,
+        "legacy": not bool(backtest_lineage),
+        "issues": issues,
+        "schemaVersion": schema_version,
+        "tracked": parent.get("tracked") is True,
+        "contentHash": content_hash,
+        "producer": str(
+            parent.get("producer")
+            or dataset.get("provider")
+            or artifact.get("datasetProvider")
+            or ""
+        ),
+        "datasetId": dataset_id,
+        "lineageRunId": lineage_run_id,
+        "sourceStage": source_stage,
+        "stageRevisionId": stage_revision_id,
+        "parentStageRevisionId": str(
+            parent.get("parentStageRevisionId") or ""
+        ),
+        "dependencyStageRevisionIds": dependencies,
+        "rawContentSha256": str(parent.get("rawContentSha256") or ""),
+        "rawMetadataSha256": str(parent.get("rawMetadataSha256") or ""),
+        "transformationId": transformation_id,
+        "datasetVersionId": str(
+            parent.get("datasetVersionId")
+            or _dict_value(data_artifact.get("version")).get("id")
+            or ""
+        ),
+        "parent": parent,
+    }
+
+
 def _status_pass(value: Any) -> bool:
     return str(value or "").strip().lower() in {"pass", "passed", "ok", "success"}
+
+
+def _is_ui_demo_artifact(artifact: dict[str, Any]) -> bool:
+    source_markers = {
+        str(artifact.get("artifact_origin") or "").strip().lower(),
+        str(artifact.get("source_path") or "").strip().lower(),
+        str(artifact.get("artifact_source_path") or "").strip().lower(),
+    }
+    return (
+        artifact.get("ui_demo_only") is True
+        or artifact.get("sample") is True
+        or UI_DEMO_ARTIFACT_ORIGIN in source_markers
+        or "sample" in source_markers
+    )
 
 
 def _evidence_passed(evidence: dict[str, Any], key: str) -> bool:
@@ -208,6 +309,8 @@ def can_trader_use_artifact(artifact: dict[str, Any]) -> bool:
 
 
 def can_live_use_artifact(artifact: dict[str, Any]) -> bool:
+    if _is_ui_demo_artifact(artifact):
+        return False
     if _dict_value(artifact.get("revalidation")).get("expired") is True or artifact.get("revalidation_expired") is True:
         return False
     capabilities = _dict_value(artifact.get("capabilities"))
@@ -222,6 +325,8 @@ def can_live_use_artifact(artifact: dict[str, Any]) -> bool:
 
 
 def can_live_small_use_artifact(artifact: dict[str, Any]) -> bool:
+    if _is_ui_demo_artifact(artifact):
+        return False
     if _dict_value(artifact.get("revalidation")).get("expired") is True or artifact.get("revalidation_expired") is True:
         return False
     capabilities = _dict_value(artifact.get("capabilities"))
@@ -551,6 +656,52 @@ def portfolio_artifact_dirs() -> list[Path]:
     return _dedupe_paths([folder / "portfolios" for folder in strategy_artifact_dirs()])
 
 
+def _portfolio_artifact_integrity(
+    artifact: dict[str, Any],
+) -> dict[str, Any]:
+    verification_payload = {
+        key: value
+        for key, value in artifact.items()
+        if key not in {"_artifact_integrity", "_source_path"}
+    }
+    verification = verify_portfolio_artifact(verification_payload)
+    return {
+        "valid": verification.valid,
+        "schemaVersion": verification.schema_version,
+        "declaredHash": verification.declared_hash,
+        "computedHash": verification.computed_hash,
+        "issues": list(verification.issues),
+        "requiresRepublication": verification.requires_republication,
+    }
+
+
+def _blocked_portfolio_strategy_identity(
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep display/matching identity without trusting allocation controls."""
+
+    strategy_id = str(
+        item.get("strategyId")
+        or item.get("strategy_id")
+        or item.get("sourceStrategyId")
+        or ""
+    )
+    instance_id = str(
+        item.get("instanceId")
+        or item.get("strategyInstanceId")
+        or ""
+    )
+    symbol = str(item.get("symbol") or item.get("qualifiedSymbol") or "")
+    identity: dict[str, Any] = {}
+    if strategy_id:
+        identity["strategyId"] = strategy_id
+    if instance_id:
+        identity["instanceId"] = instance_id
+    if symbol:
+        identity["symbol"] = symbol
+    return identity
+
+
 def load_portfolio_artifacts(limit: int | None = None) -> list[dict[str, Any]]:
     effective_limit = None if limit is None else max(0, int(limit))
     if effective_limit == 0:
@@ -587,13 +738,96 @@ def load_portfolio_artifacts(limit: int | None = None) -> list[dict[str, Any]]:
 def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     lifecycle = _dict_value(artifact.get("lifecycle"))
     framework = _dict_value(artifact.get("framework"))
-    permissions = _dict_value(artifact.get("permissions"))
-    strategy_instances = artifact.get("strategyInstances") if isinstance(artifact.get("strategyInstances"), list) else []
-    target_portfolio = framework.get("targetPortfolio") if isinstance(framework.get("targetPortfolio"), list) else []
-    risk_checks = framework.get("riskChecks") if isinstance(framework.get("riskChecks"), list) else []
-    portfolio_policy = _dict_value(artifact.get("portfolioPolicy") or _dict_value(artifact.get("evidence")).get("portfolioPolicy"))
-    advanced_operations = _dict_value(artifact.get("advancedOperations") or _dict_value(artifact.get("evidence")).get("advancedOperations"))
-    operational_bundle = _dict_value(artifact.get("operationalReadinessBundle") or _dict_value(artifact.get("evidence")).get("operationalReadinessBundle"))
+    raw_permissions = _dict_value(artifact.get("permissions"))
+    raw_strategy_instances = (
+        artifact.get("strategyInstances")
+        if isinstance(artifact.get("strategyInstances"), list)
+        else []
+    )
+    raw_target_portfolio = (
+        framework.get("targetPortfolio")
+        if isinstance(framework.get("targetPortfolio"), list)
+        else []
+    )
+    raw_risk_checks = (
+        framework.get("riskChecks")
+        if isinstance(framework.get("riskChecks"), list)
+        else []
+    )
+    integrity = _portfolio_artifact_integrity(artifact)
+    integrity_valid = integrity.get("valid") is True
+    integrity_reasons = [
+        f"artifact-integrity:{issue}"
+        for issue in integrity.get("issues") or [
+            "canonical-verification-failed"
+        ]
+    ]
+    permissions = (
+        raw_permissions
+        if integrity_valid
+        else {
+            "paper_export_allowed": False,
+            "live_small_allowed": False,
+            "live_small_eligible": False,
+            "live_allowed": False,
+            "live_export_allowed": False,
+            "fail_reasons": list(
+                dict.fromkeys(
+                    [
+                        *_reason_list(raw_permissions.get("fail_reasons")),
+                        *integrity_reasons,
+                    ]
+                )
+            ),
+        }
+    )
+    if integrity_valid:
+        strategy_instances = [
+            item for item in raw_strategy_instances if isinstance(item, dict)
+        ]
+        target_portfolio = [
+            item for item in raw_target_portfolio if isinstance(item, dict)
+        ]
+        risk_checks = [
+            item for item in raw_risk_checks if isinstance(item, dict)
+        ]
+        portfolio_policy = _dict_value(
+            artifact.get("portfolioPolicy")
+            or _dict_value(artifact.get("evidence")).get("portfolioPolicy")
+        )
+        advanced_operations = _dict_value(
+            artifact.get("advancedOperations")
+            or _dict_value(artifact.get("evidence")).get("advancedOperations")
+        )
+        operational_bundle = _dict_value(
+            artifact.get("operationalReadinessBundle")
+            or _dict_value(artifact.get("evidence")).get(
+                "operationalReadinessBundle"
+            )
+        )
+        risk_policy = _dict_value(
+            artifact.get("riskPolicy") or artifact.get("risk_policy")
+        )
+    else:
+        strategy_instances = [
+            identity
+            for item in raw_strategy_instances
+            if isinstance(item, dict)
+            and (identity := _blocked_portfolio_strategy_identity(item))
+        ]
+        target_portfolio = []
+        risk_checks = [
+            {
+                "id": "artifact-integrity",
+                "label": "Portfolio artifact integrity",
+                "status": "fail",
+                "detail": ", ".join(integrity.get("issues") or []),
+            }
+        ]
+        portfolio_policy = {}
+        advanced_operations = {}
+        operational_bundle = {}
+        risk_policy = {}
     lifecycle_status = normalize_lifecycle_status(
         lifecycle.get("status")
         or artifact.get("lifecycleStatus")
@@ -620,16 +854,18 @@ def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
             "live_export_allowed": permissions.get("live_export_allowed") is True or permissions.get("live_allowed") is True,
             "fail_reasons": _reason_list(permissions.get("fail_reasons") or artifact.get("fail_reasons")),
         },
-        "strategy_instances": [item for item in strategy_instances if isinstance(item, dict)],
-        "target_portfolio": [item for item in target_portfolio if isinstance(item, dict)],
-        "risk_policy": _dict_value(artifact.get("riskPolicy") or artifact.get("risk_policy")),
-        "risk_checks": [item for item in risk_checks if isinstance(item, dict)],
+        "strategy_instances": strategy_instances,
+        "target_portfolio": target_portfolio,
+        "risk_policy": risk_policy,
+        "risk_checks": risk_checks,
         "portfolio_policy": portfolio_policy,
         "portfolio_policy_hash": str(portfolio_policy.get("policyHash") or ""),
         "advanced_operations": advanced_operations,
         "advanced_operations_hash": str(advanced_operations.get("contentHash") or ""),
         "operational_readiness_bundle": operational_bundle,
         "operational_readiness_hash": str(operational_bundle.get("contentHash") or ""),
+        "artifact_integrity": integrity,
+        "live_usable": integrity_valid,
         "source_path": str(artifact.get("_source_path") or ""),
     }
 
@@ -640,6 +876,16 @@ def enrich_strategy_artifact_runtime(folder: Path, path: Path, artifact: dict[st
         reference = artifact_reference(payload)
     except ValueError:
         reference = {"artifactId": "", "artifactHash": ""}
+    integrity = verify_strategy_artifact(payload)
+    payload["_artifact_integrity"] = {
+        "valid": integrity.valid,
+        "schemaVersion": integrity.schema_version,
+        "declaredHash": integrity.declared_hash,
+        "computedHash": integrity.computed_hash,
+        "issues": list(integrity.issues),
+        "requiresRepublication": integrity.requires_republication,
+    }
+    payload["_artifact_reference"] = dict(reference)
     deployments = [
         item
         for item in DeploymentStore(folder).list()
@@ -761,11 +1007,48 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "paper_trader_verified": permissions.get("paper_trader_verified") is True,
         "fail_reasons": _reason_list(permissions.get("fail_reasons") or artifact.get("fail_reasons")),
     }
+    artifact_integrity = (
+        dict(artifact.get("_artifact_integrity"))
+        if isinstance(artifact.get("_artifact_integrity"), dict)
+        else {}
+    )
+    if artifact_integrity and artifact_integrity.get("valid") is not True:
+        integrity_reasons = [
+            f"artifact-integrity:{item}"
+            for item in artifact_integrity.get("issues") or [
+                "canonical-verification-failed"
+            ]
+        ]
+        normalized_permissions.update(
+            {
+                "live_small_eligible": False,
+                "live_eligible": False,
+                "live_allowed": False,
+                "fail_reasons": list(
+                    dict.fromkeys(
+                        [
+                            *normalized_permissions.get("fail_reasons", []),
+                            *integrity_reasons,
+                        ]
+                    )
+                ),
+            }
+        )
     capabilities = _artifact_capabilities(artifact, normalized_permissions, lifecycle_status, final_test_status)
     raw_capabilities = _dict_value(artifact.get("capabilities"))
-    if raw_capabilities.get("liveSmallEligible") is True:
+    integrity_allows_capability_override = (
+        not artifact_integrity
+        or artifact_integrity.get("valid") is True
+    )
+    if (
+        integrity_allows_capability_override
+        and raw_capabilities.get("liveSmallEligible") is True
+    ):
         capabilities["liveSmallEligible"] = True
-    if raw_capabilities.get("liveEligible") is True:
+    if (
+        integrity_allows_capability_override
+        and raw_capabilities.get("liveEligible") is True
+    ):
         capabilities["liveEligible"] = True
         capabilities["liveSmallEligible"] = True
     if revalidation["expired"]:
@@ -791,11 +1074,26 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         capabilities["failReasons"] = list(dict.fromkeys([*capabilities.get("failReasons", []), candidate_reason, *candidate_blockers]))
     backtest_lineage = _dict_value(artifact.get("lineageManifest"))
     backtest_lineage_assessment = validate_lineage_manifest(backtest_lineage, expected_stage="backtest")
+    dataset_lineage = _dataset_lineage_snapshot(
+        backtest_lineage,
+        dataset=dataset,
+        data_artifact=data_artifact,
+        artifact=artifact,
+    )
     external_paper_evidence = _dict_value(artifact.get("_external_paper_evidence"))
     paper_details = _dict_value(external_paper_evidence.get("details"))
     paper_lineage = _dict_value(paper_details.get("lineageManifest"))
     paper_lineage_assessment = validate_lineage_manifest(paper_lineage, expected_stage="paper")
     lineage_issues = []
+    if (
+        backtest_lineage_assessment.valid
+        and not backtest_lineage_assessment.legacy
+        and not dataset_lineage["valid"]
+    ):
+        lineage_issues.extend(
+            f"dataset:{issue}"
+            for issue in dataset_lineage["issues"]
+        )
     if not backtest_lineage_assessment.valid and not backtest_lineage_assessment.legacy:
         lineage_issues.extend(f"backtest:{issue}" for issue in backtest_lineage_assessment.issues)
     if not paper_lineage_assessment.valid and not paper_lineage_assessment.legacy:
@@ -815,6 +1113,44 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     paper_portfolio_evidence = normalize_paper_portfolio_evidence(artifact)
     execution_policy = _dict_value(artifact.get("executionPolicy") or artifact.get("execution_policy"))
     market_type = str(artifact.get("marketType") or artifact.get("market_type") or data_artifact.get("marketType") or dataset.get("marketType") or "spot").lower()
+    futures_execution_policy = futures_execution_policy_from_artifact(artifact)
+    if (
+        market_type in {"future", "futures", "perpetual"}
+        and futures_execution_policy.get("valid") is not True
+    ):
+        futures_policy_reasons = [
+            f"futures-policy-invalid:{reason}"
+            for reason in futures_execution_policy.get("blockers") or [
+                "futures-policy-invalid"
+            ]
+        ]
+        normalized_permissions["live_small_eligible"] = False
+        normalized_permissions["live_eligible"] = False
+        normalized_permissions["live_allowed"] = False
+        normalized_permissions["fail_reasons"] = list(
+            dict.fromkeys(
+                [
+                    *normalized_permissions["fail_reasons"],
+                    *futures_policy_reasons,
+                ]
+            )
+        )
+        capabilities["liveSmallEligible"] = False
+        capabilities["liveEligible"] = False
+        capabilities["canSubmitOrder"] = False
+        capabilities["blockingFailReasons"] = list(
+            dict.fromkeys(
+                [
+                    *capabilities.get("blockingFailReasons", []),
+                    *futures_policy_reasons,
+                ]
+            )
+        )
+        capabilities["failReasons"] = list(
+            dict.fromkeys(
+                [*capabilities.get("failReasons", []), *futures_policy_reasons]
+            )
+        )
     exposure_contract = exposure_contract_from_artifact(artifact)
     position_direction = str(exposure_contract.get("positionDirection") or "long")
     exposure_blockers = [str(item) for item in exposure_contract.get("blockers") or [] if str(item)]
@@ -876,6 +1212,13 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "strategy_id": strategy_id,
+        "artifact_source_path": str(artifact.get("_source_path") or ""),
+        "artifact_reference": dict(
+            artifact.get("_artifact_reference")
+            if isinstance(artifact.get("_artifact_reference"), dict)
+            else {}
+        ),
+        "artifact_integrity": artifact_integrity,
         "deployment_id": str(deployment.get("deploymentId") or ""),
         "deployment_revision": _safe_int(deployment.get("revision")),
         "deployment_environment": str(deployment.get("environment") or ""),
@@ -902,6 +1245,7 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "signal_instrument": str(exposure_contract.get("signalInstrument") or ""),
         "execution_instrument": str(exposure_contract.get("executionInstrument") or ""),
         "provider_reconciliation": provider_reconciliation,
+        "futures_execution_policy": futures_execution_policy,
         "allow_short_requested": allow_short_requested,
         "allow_short": allow_short,
         "timeframe": str(artifact.get("timeframe") or dataset.get("interval") or data_artifact.get("interval") or artifact.get("interval") or "-"),
@@ -948,8 +1292,31 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "verification": verification,
         "paper_portfolio_evidence": paper_portfolio_evidence,
         "lineage": {
-            "backtest": {"valid": backtest_lineage_assessment.valid, "legacy": backtest_lineage_assessment.legacy, "issues": list(backtest_lineage_assessment.issues), "contentHash": str(backtest_lineage.get("contentHash") or "")},
-            "paper": {"valid": paper_lineage_assessment.valid, "legacy": paper_lineage_assessment.legacy, "issues": list(paper_lineage_assessment.issues), "contentHash": str(paper_lineage.get("contentHash") or "")},
+            "dataset": dataset_lineage,
+            "backtest": {
+                "valid": backtest_lineage_assessment.valid,
+                "legacy": backtest_lineage_assessment.legacy,
+                "issues": list(backtest_lineage_assessment.issues),
+                "contentHash": str(backtest_lineage.get("contentHash") or ""),
+                "createdAt": str(backtest_lineage.get("createdAt") or ""),
+                "producer": str(backtest_lineage.get("producer") or ""),
+            },
+            "paper": {
+                "valid": paper_lineage_assessment.valid,
+                "legacy": paper_lineage_assessment.legacy,
+                "issues": list(paper_lineage_assessment.issues),
+                "contentHash": str(paper_lineage.get("contentHash") or ""),
+                "createdAt": str(paper_lineage.get("createdAt") or ""),
+                "producer": str(paper_lineage.get("producer") or ""),
+            },
+            "live": {
+                "valid": bool(
+                    permissions.get("liveEvidenceHash")
+                    or normalized_permissions.get("live_allowed")
+                ),
+                "contentHash": str(permissions.get("liveEvidenceHash") or ""),
+                "producer": "live_trader",
+            },
             "blockingIssues": lineage_issues,
         },
         "portfolio_candidate": {
@@ -981,6 +1348,8 @@ def sample_strategy_artifacts() -> list[dict[str, Any]]:
         {
             "strategy_id": "KR-MOM-LIVE-01",
             "name": "KR Momentum Approved",
+            "artifact_origin": UI_DEMO_ARTIFACT_ORIGIN,
+            "ui_demo_only": True,
             "symbol": "069500.KS",
             "asset": "kr-stock",
             "timeframe": "1d",
@@ -989,10 +1358,10 @@ def sample_strategy_artifacts() -> list[dict[str, Any]]:
             "score": 87,
             "permissions": {
                 "trader_export_allowed": True,
-                "live_small_eligible": True,
+                "live_small_eligible": False,
                 "live_eligible": False,
                 "live_allowed": False,
-                "fail_reasons": ["실계좌 API 키와 주문 어댑터 구현 전까지 doctor/runtime 게이트가 필요합니다."],
+                "fail_reasons": ["UI 데모 전략은 실주문 후보로 사용할 수 없습니다."],
             },
             "contract_version": TRADER_STRATEGY_CONTRACT_VERSION,
             "source_path": "sample",
@@ -1000,6 +1369,8 @@ def sample_strategy_artifacts() -> list[dict[str, Any]]:
         {
             "strategy_id": "BTC-BRK-SHADOW-04",
             "name": "BTC Breakout v4",
+            "artifact_origin": UI_DEMO_ARTIFACT_ORIGIN,
+            "ui_demo_only": True,
             "symbol": "BTCUSDT",
             "asset": "crypto",
             "timeframe": "5m",
@@ -1019,6 +1390,8 @@ def sample_strategy_artifacts() -> list[dict[str, Any]]:
         {
             "strategy_id": "US-ETF-ROT-02",
             "name": "US ETF Rotation",
+            "artifact_origin": UI_DEMO_ARTIFACT_ORIGIN,
+            "ui_demo_only": True,
             "symbol": "SPY",
             "asset": "us-stock",
             "timeframe": "1d",
