@@ -12,6 +12,8 @@ from .live_adapters import (
     build_binance_futures_account_request,
     build_binance_futures_account_config_request,
     build_binance_futures_cancel_order_request,
+    build_binance_futures_leverage_change_request,
+    build_binance_futures_margin_type_change_request,
     build_binance_futures_open_orders_request,
     build_binance_futures_order_status_request,
     build_binance_futures_order_request,
@@ -50,6 +52,15 @@ def send_binance_signed_request(
         refresh_binance_time_offset(futures=futures)
         response = send_prepared_request(builder())
     return response
+
+
+def send_binance_signed_mutation(
+    builder: Callable[[], Any],
+) -> dict[str, object]:
+    """Send one Futures account-setting mutation without an automatic retry."""
+
+    refresh_binance_time_offset(futures=True)
+    return send_prepared_request(builder())
 
 
 @dataclass(frozen=True)
@@ -1327,6 +1338,68 @@ class LiveBrokerRouter:
             ),
             "position_count": position_count,
             "open_order_count": len(open_orders),
+        }
+
+    def configure_binance_futures_symbol(
+        self,
+        symbol: str,
+        *,
+        margin_type: str,
+        leverage: int,
+        change_margin_type: bool,
+        change_leverage: bool,
+    ) -> dict[str, object]:
+        """Apply an explicitly authorized symbol policy.
+
+        The caller owns the fresh-position and one-time-confirmation gates.
+        Each mutation is sent at most once so an ambiguous timeout can never
+        cause a hidden retry.
+        """
+
+        normalized_symbol = (
+            str(symbol or "")
+            .strip()
+            .upper()
+            .removesuffix(".PERP")
+            .replace("-", "")
+        )
+        normalized_margin_type = str(margin_type or "").strip().upper()
+        normalized_leverage = int(leverage)
+        if not normalized_symbol:
+            raise BrokerNotReadyError("Binance Futures symbol이 필요합니다.")
+        if normalized_margin_type not in {"ISOLATED", "CROSSED"}:
+            raise BrokerNotReadyError("지원하지 않는 Binance Futures 마진 방식입니다.")
+        if normalized_leverage < 1 or normalized_leverage > 125:
+            raise BrokerNotReadyError("Binance Futures 레버리지는 1~125배여야 합니다.")
+
+        applied: list[str] = []
+        if change_margin_type:
+            ensure_response_ok(
+                "binance-futures",
+                send_binance_signed_mutation(
+                    lambda: build_binance_futures_margin_type_change_request(
+                        normalized_symbol,
+                        normalized_margin_type,
+                    )
+                ),
+            )
+            applied.append("margin_type")
+        if change_leverage:
+            ensure_response_ok(
+                "binance-futures",
+                send_binance_signed_mutation(
+                    lambda: build_binance_futures_leverage_change_request(
+                        normalized_symbol,
+                        normalized_leverage,
+                    )
+                ),
+            )
+            applied.append("leverage")
+        return {
+            "symbol": normalized_symbol,
+            "target_margin_type": normalized_margin_type,
+            "target_leverage": normalized_leverage,
+            "applied": applied,
         }
 
     def test_binance_futures_order(

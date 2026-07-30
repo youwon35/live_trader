@@ -146,6 +146,14 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path == "/api/binance-futures-settings/status":
+            self.send_json(
+                {
+                    "ok": True,
+                    "settings": state.binance_futures_settings_status(),
+                }
+            )
+            return
         if parsed.path == "/api/binance-futures-fill-soak/status":
             self.send_json(
                 {
@@ -314,6 +322,23 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/binance-futures-canary/test":
             self.send_json(
                 state.test_binance_futures_canary_order(
+                    payload.get("confirmation_token", ""),
+                    confirmed=payload.get("confirmed") is True,
+                )
+            )
+            return
+        if parsed.path == "/api/binance-futures-settings/preview":
+            self.send_json(
+                state.preview_binance_futures_settings(
+                    payload.get("symbol", "ETHUSDT"),
+                    payload.get("margin_type", "ISOLATED"),
+                    payload.get("leverage", 1),
+                )
+            )
+            return
+        if parsed.path == "/api/binance-futures-settings/apply":
+            self.send_json(
+                state.apply_binance_futures_settings(
                     payload.get("confirmation_token", ""),
                     confirmed=payload.get("confirmed") is True,
                 )

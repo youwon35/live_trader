@@ -24,6 +24,11 @@ from trading_runtime import DeploymentStore, build_paper_portfolio_evidence
 class OrderGateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.original_state = copy.deepcopy(state.STATE)
+        # Durable real-account snapshots must never make order-gate unit tests
+        # depend on the developer's current broker balance or daily PnL.
+        state.STATE["account_risk"] = {}
+        state.STATE["daily_loss_gate_tripped"] = False
+        state.STATE["daily_loss_entries_blocked"] = False
         self.original_recovery_journal = state.RECOVERY_JOURNAL
         self.original_decision_trace_store = state.DECISION_TRACE_STORE
         self.recovery_temp_dir = tempfile.TemporaryDirectory()

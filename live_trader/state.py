@@ -132,6 +132,7 @@ CheckStatus = Literal["pass", "warn", "fail"]
 RUNTIME_MODE_LOCK = threading.RLock()
 BINANCE_FUTURES_CANARY_LOCK = threading.RLock()
 BINANCE_FUTURES_FILL_SOAK_LOCK = threading.RLock()
+BINANCE_FUTURES_SETTINGS_LOCK = threading.RLock()
 # Serializes public runtime control operations without participating in a
 # closed-bar cycle.  Public calls acquire this lock before manager/controller
 # locks; they never hold RUNTIME_MODE_LOCK while entering the manager.
@@ -4202,6 +4203,7 @@ def snapshot() -> dict[str, Any]:
         "upbit_smoke_order": dict(STATE.get("upbit_smoke_order", {})),
         "binance_smoke_order": dict(STATE.get("binance_smoke_order", {})),
         "binance_futures_canary": binance_futures_canary_status(),
+        "binance_futures_settings": binance_futures_settings_status(),
         "binance_futures_fill_soak": binance_futures_fill_soak_status(),
         "execution_calibration": execution_calibration_snapshot(),
         "policy_replays": list(STATE.get("policy_replays", [])),
@@ -6858,9 +6860,29 @@ BINANCE_SMOKE_MIN_USDT = 5.0
 BINANCE_SMOKE_MAX_USDT = 10.0
 BINANCE_SMOKE_PREVIEW_TTL_SECONDS = 600
 BINANCE_FUTURES_CANARY_TEST_TTL_SECONDS = 300
+BINANCE_FUTURES_SETTINGS_TTL_SECONDS = 300
+BINANCE_FUTURES_SAFE_LEVERAGE_PRESETS = (1, 2, 3, 5)
 BINANCE_FUTURES_FILL_SOAK_TTL_SECONDS = 300
 BINANCE_FUTURES_FILL_SOAK_DURATION_SECONDS = 5 * 60 * 60
 BINANCE_FUTURES_FILL_SOAK_NOTIONAL_USDT = 5.0
+
+BINANCE_FUTURES_SETTINGS_ROUTER_FACTORY = LiveBrokerRouter
+BINANCE_FUTURES_SETTINGS_INTERNAL: dict[str, Any] = {
+    "status": "IDLE",
+    "symbol": "ETHUSDT",
+    "target_margin_type": "ISOLATED",
+    "target_leverage": 1,
+    "safe_leverage_presets": list(BINANCE_FUTURES_SAFE_LEVERAGE_PRESETS),
+    "confirmation_token_hash": "",
+    "confirmation_expires_epoch": 0.0,
+    "confirmation_used": False,
+    "preview": {},
+    "result": {},
+    "detail": (
+        "레버리지 배수와 거래 위험률은 별도입니다. "
+        "현재 계정 설정을 읽은 뒤 명시 확인으로만 변경합니다."
+    ),
+}
 
 BINANCE_FUTURES_FILL_SOAK_SESSION_FACTORY = BinanceFuturesFillSoakSession
 BINANCE_FUTURES_FILL_SOAK_SESSION: BinanceFuturesFillSoakSession | None = None
@@ -6888,6 +6910,346 @@ BINANCE_FUTURES_FILL_SOAK_INTERNAL: dict[str, Any] = {
         "3회 반복하고, 남은 시간은 평탄 상태로 감시합니다."
     ),
 }
+
+
+def _binance_futures_settings_summary(
+    observation: dict[str, object],
+) -> dict[str, object]:
+    account = (
+        observation.get("account")
+        if isinstance(observation.get("account"), dict)
+        else {}
+    )
+    symbol_config = (
+        observation.get("symbol_config")
+        if isinstance(observation.get("symbol_config"), dict)
+        else {}
+    )
+    return {
+        "can_trade": account.get("can_trade"),
+        "available_usdt": account.get("available_usdt"),
+        "symbol": str(symbol_config.get("symbol") or ""),
+        "margin_type": str(symbol_config.get("margin_type") or "").upper(),
+        "leverage": safe_float(symbol_config.get("leverage"), 0.0),
+        "position_count": int(
+            safe_float(observation.get("position_count"), 0.0)
+        ),
+        "open_order_count": int(
+            safe_float(observation.get("open_order_count"), 0.0)
+        ),
+    }
+
+
+def _binance_futures_settings_blockers(
+    observation: dict[str, object],
+) -> list[str]:
+    blockers: list[str] = []
+    if observation.get("can_trade") is not True:
+        blockers.append("account-cannot-trade")
+    if int(observation.get("position_count") or 0) > 0:
+        blockers.append("positions-present")
+    if int(observation.get("open_order_count") or 0) > 0:
+        blockers.append("open-orders-present")
+    if not str(observation.get("margin_type") or ""):
+        blockers.append("margin-type-unknown")
+    if safe_float(observation.get("leverage"), 0.0) <= 0:
+        blockers.append("leverage-unknown")
+    return blockers
+
+
+def binance_futures_settings_status() -> dict[str, Any]:
+    with BINANCE_FUTURES_SETTINGS_LOCK:
+        current = dict(BINANCE_FUTURES_SETTINGS_INTERNAL)
+    current.pop("confirmation_token_hash", None)
+    current.pop("confirmation_expires_epoch", None)
+    return redact_sensitive_payload(current)  # type: ignore[return-value]
+
+
+def preview_binance_futures_settings(
+    symbol: object = "ETHUSDT",
+    margin_type: object = "ISOLATED",
+    leverage: object = 1,
+) -> dict[str, Any]:
+    normalized_symbol = normalize_usdm_symbol(symbol)
+    normalized_margin_type = str(margin_type or "").strip().upper()
+    try:
+        normalized_leverage = int(str(leverage).strip())
+    except (TypeError, ValueError):
+        normalized_leverage = 0
+    validation_errors: list[str] = []
+    if not normalized_symbol:
+        validation_errors.append("symbol-invalid")
+    if normalized_margin_type != "ISOLATED":
+        validation_errors.append("only-isolated-supported")
+    if normalized_leverage not in BINANCE_FUTURES_SAFE_LEVERAGE_PRESETS:
+        validation_errors.append("leverage-outside-safe-presets")
+
+    with BINANCE_FUTURES_SETTINGS_LOCK:
+        BINANCE_FUTURES_SETTINGS_INTERNAL.update(
+            {
+                "status": "CHECKING",
+                "symbol": normalized_symbol or "ETHUSDT",
+                "target_margin_type": normalized_margin_type or "ISOLATED",
+                "target_leverage": normalized_leverage or 1,
+                "confirmation_token_hash": "",
+                "confirmation_expires_epoch": 0.0,
+                "confirmation_used": False,
+                "preview": {},
+                "result": {},
+                "detail": "현재 Binance Futures 종목 설정과 계정 상태를 조회 중입니다.",
+            }
+        )
+
+    if validation_errors:
+        observation: dict[str, object] = {}
+        blockers = validation_errors
+    else:
+        try:
+            observation = _binance_futures_settings_summary(
+                BINANCE_FUTURES_SETTINGS_ROUTER_FACTORY()
+                .get_binance_futures_canary_observation(normalized_symbol)
+            )
+            blockers = _binance_futures_settings_blockers(observation)
+        except (BrokerNotReadyError, RuntimeError, ValueError) as exc:
+            observation = {"error": str(exc)[:240]}
+            blockers = ["observation-failed"]
+
+    needs_change = (
+        not blockers
+        and (
+            observation.get("margin_type") != normalized_margin_type
+            or int(safe_float(observation.get("leverage"), 0.0))
+            != normalized_leverage
+        )
+    )
+    already_configured = not blockers and not needs_change
+    token = secrets.token_urlsafe(32) if needs_change else ""
+    token_hash = (
+        hashlib.sha256(token.encode("utf-8")).hexdigest()
+        if token
+        else ""
+    )
+    expires_epoch = (
+        time.time() + BINANCE_FUTURES_SETTINGS_TTL_SECONDS
+        if token
+        else 0.0
+    )
+    preview = {
+        **observation,
+        "target_margin_type": normalized_margin_type,
+        "target_leverage": normalized_leverage,
+        "blockers": blockers,
+        "needs_change": needs_change,
+        "already_configured": already_configured,
+    }
+    status = (
+        "READY"
+        if needs_change
+        else "CONFIGURED"
+        if already_configured
+        else "BLOCKED"
+    )
+    detail = (
+        "변경 직전 계정 상태를 다시 검사하는 1회 확인 토큰을 발급했습니다."
+        if needs_change
+        else "이미 목표 마진 방식과 레버리지로 설정되어 있습니다."
+        if already_configured
+        else "설정 변경 차단: " + ", ".join(blockers)
+    )
+    with BINANCE_FUTURES_SETTINGS_LOCK:
+        BINANCE_FUTURES_SETTINGS_INTERNAL.update(
+            {
+                "status": status,
+                "confirmation_token_hash": token_hash,
+                "confirmation_expires_epoch": expires_epoch,
+                "confirmation_used": False,
+                "preview": preview,
+                "detail": detail,
+            }
+        )
+    append_audit(
+        "info" if not blockers else "warn",
+        "Binance Futures 종목 설정 사전점검",
+        (
+            f"{normalized_symbol or '-'} · "
+            f"{normalized_margin_type or '-'} · {normalized_leverage}x · "
+            f"status {status} · 주문 전송 없음"
+        ),
+    )
+    return {
+        "ok": not blockers,
+        "reason": detail,
+        "settings": binance_futures_settings_status(),
+        "authorization": (
+            {
+                "confirmation_token": token,
+                "expires_at": datetime.fromtimestamp(
+                    expires_epoch,
+                    tz=timezone.utc,
+                ).isoformat().replace("+00:00", "Z"),
+            }
+            if token
+            else {}
+        ),
+    }
+
+
+def apply_binance_futures_settings(
+    confirmation_token: object,
+    *,
+    confirmed: bool,
+) -> dict[str, Any]:
+    token = str(confirmation_token or "")
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with BINANCE_FUTURES_SETTINGS_LOCK:
+        current = BINANCE_FUTURES_SETTINGS_INTERNAL
+        if (
+            confirmed is not True
+            or not token
+            or not current.get("confirmation_token_hash")
+            or not secrets.compare_digest(
+                token_hash,
+                str(current.get("confirmation_token_hash") or ""),
+            )
+        ):
+            return {
+                "ok": False,
+                "reason": "정확한 1회 확인 토큰과 명시 확인이 필요합니다.",
+                "settings": binance_futures_settings_status(),
+            }
+        if (
+            current.get("status") != "READY"
+            or current.get("confirmation_used") is True
+            or safe_float(current.get("confirmation_expires_epoch"), 0.0)
+            <= time.time()
+        ):
+            current.update(
+                {
+                    "status": "EXPIRED",
+                    "confirmation_token_hash": "",
+                    "confirmation_used": True,
+                    "detail": "사전점검이 만료되었거나 적용 가능한 상태가 아닙니다.",
+                }
+            )
+            return {
+                "ok": False,
+                "reason": current["detail"],
+                "settings": binance_futures_settings_status(),
+            }
+        symbol = str(current.get("symbol") or "")
+        target_margin_type = str(
+            current.get("target_margin_type") or ""
+        )
+        target_leverage = int(current.get("target_leverage") or 0)
+        current.update(
+            {
+                "status": "APPLYING",
+                "confirmation_token_hash": "",
+                "confirmation_used": True,
+                "detail": "적용 직전 포지션·미체결 주문·현재 설정을 다시 검사합니다.",
+            }
+        )
+
+    router = BINANCE_FUTURES_SETTINGS_ROUTER_FACTORY()
+    try:
+        before = _binance_futures_settings_summary(
+            router.get_binance_futures_canary_observation(symbol)
+        )
+        blockers = _binance_futures_settings_blockers(before)
+        if blockers:
+            raise BrokerNotReadyError(
+                "적용 직전 안전검사 차단: " + ", ".join(blockers)
+            )
+        change_margin_type = (
+            before.get("margin_type") != target_margin_type
+        )
+        change_leverage = (
+            int(safe_float(before.get("leverage"), 0.0))
+            != target_leverage
+        )
+        mutation = router.configure_binance_futures_symbol(
+            symbol,
+            margin_type=target_margin_type,
+            leverage=target_leverage,
+            change_margin_type=change_margin_type,
+            change_leverage=change_leverage,
+        )
+        after = _binance_futures_settings_summary(
+            router.get_binance_futures_canary_observation(symbol)
+        )
+        verified = (
+            after.get("margin_type") == target_margin_type
+            and int(safe_float(after.get("leverage"), 0.0))
+            == target_leverage
+            and int(after.get("position_count") or 0) == 0
+            and int(after.get("open_order_count") or 0) == 0
+        )
+        if not verified:
+            raise BrokerNotReadyError(
+                "변경 응답 후 재조회한 설정이 목표값과 일치하지 않습니다."
+            )
+        result = {
+            "before": before,
+            "after": after,
+            "applied": list(mutation.get("applied") or []),
+            "verified": True,
+        }
+        with BINANCE_FUTURES_SETTINGS_LOCK:
+            BINANCE_FUTURES_SETTINGS_INTERNAL.update(
+                {
+                    "status": "APPLIED",
+                    "preview": after,
+                    "result": result,
+                    "detail": (
+                        f"{symbol}을 {target_margin_type} · "
+                        f"{target_leverage}x로 적용하고 재검증했습니다."
+                    ),
+                }
+            )
+        append_audit(
+            "warn",
+            "Binance Futures 종목 설정 변경",
+            (
+                f"{symbol} · {before.get('margin_type')} "
+                f"{int(safe_float(before.get('leverage'), 0.0))}x → "
+                f"{target_margin_type} {target_leverage}x · "
+                f"변경 {','.join(result['applied']) or '없음'} · 재검증 완료"
+            ),
+        )
+        return {
+            "ok": True,
+            "reason": BINANCE_FUTURES_SETTINGS_INTERNAL["detail"],
+            "settings": binance_futures_settings_status(),
+        }
+    except (BrokerNotReadyError, RuntimeError, ValueError) as exc:
+        after: dict[str, object] = {}
+        try:
+            after = _binance_futures_settings_summary(
+                router.get_binance_futures_canary_observation(symbol)
+            )
+        except (BrokerNotReadyError, RuntimeError, ValueError):
+            pass
+        with BINANCE_FUTURES_SETTINGS_LOCK:
+            BINANCE_FUTURES_SETTINGS_INTERNAL.update(
+                {
+                    "status": "FAILED",
+                    "result": {"after": after, "verified": False},
+                    "detail": (
+                        str(exc)[:240]
+                        + " 자동 재시도하지 않았습니다. 현재값을 다시 점검하세요."
+                    ),
+                }
+            )
+        append_audit(
+            "danger",
+            "Binance Futures 종목 설정 변경 실패",
+            f"{symbol} · 자동 재시도 없음 · {str(exc)[:160]}",
+        )
+        return {
+            "ok": False,
+            "reason": BINANCE_FUTURES_SETTINGS_INTERNAL["detail"],
+            "settings": binance_futures_settings_status(),
+        }
 
 
 def _binance_futures_fill_soak_report_summary(

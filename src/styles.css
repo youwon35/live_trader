@@ -5765,6 +5765,61 @@ body {
   gap: 12px;
 }
 
+.futures-settings-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.futures-settings-controls {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(170px, 1fr) minmax(150px, 0.8fr);
+  gap: 10px;
+}
+
+.futures-settings-controls label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.futures-settings-controls input,
+.futures-settings-controls select {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  color: var(--ink);
+  padding: 0 11px;
+  font: inherit;
+}
+
+.futures-settings-controls select:disabled {
+  cursor: not-allowed;
+  opacity: 0.82;
+}
+
+.futures-settings-explainer {
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-muted, rgb(148 163 184 / 8%));
+}
+
+.futures-settings-explainer strong {
+  font-size: 13px;
+}
+
+.futures-settings-explainer span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .futures-fill-soak-observation {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -5817,6 +5872,10 @@ body {
 }
 
 @media (max-width: 1080px) {
+  .futures-settings-controls {
+    grid-template-columns: 1fr;
+  }
+
   .futures-fill-soak-observation {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

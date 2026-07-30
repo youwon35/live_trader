@@ -19,12 +19,16 @@ from live_trader.execution_streams import (
 )
 from live_trader.live_adapters import (
     BINANCE_FUTURES_ACCOUNT_CONFIG_ENDPOINT,
+    BINANCE_FUTURES_LEVERAGE_ENDPOINT,
+    BINANCE_FUTURES_MARGIN_TYPE_ENDPOINT,
     BINANCE_FUTURES_OPEN_ORDERS_ENDPOINT,
     BINANCE_FUTURES_ORDER_ENDPOINT,
     BINANCE_FUTURES_POSITION_MODE_ENDPOINT,
     BINANCE_FUTURES_SYMBOL_CONFIG_ENDPOINT,
     BINANCE_FUTURES_TEST_ORDER_ENDPOINT,
     build_binance_futures_account_config_request,
+    build_binance_futures_leverage_change_request,
+    build_binance_futures_margin_type_change_request,
     build_binance_futures_open_orders_request,
     build_binance_futures_order_request,
     build_binance_futures_order_status_request,
@@ -109,6 +113,40 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
         self.assertEqual([], request.blocked_reasons)
         self.assertIn("timestamp", request.query)
         self.assertIn("signature", request.query)
+
+    def test_symbol_risk_setting_requests_use_signed_post_endpoints(
+        self,
+    ) -> None:
+        leverage = build_binance_futures_leverage_change_request(
+            "eth-usdt.perp",
+            3,
+        )
+        margin = build_binance_futures_margin_type_change_request(
+            "eth-usdt.perp",
+            "isolated",
+        )
+
+        self.assertTrue(leverage.can_send)
+        self.assertEqual("POST", leverage.method)
+        self.assertEqual(BINANCE_FUTURES_LEVERAGE_ENDPOINT, leverage.endpoint)
+        self.assertEqual("ETHUSDT", leverage.query["symbol"])
+        self.assertEqual(3, leverage.query["leverage"])
+        self.assertTrue(margin.can_send)
+        self.assertEqual("POST", margin.method)
+        self.assertEqual(BINANCE_FUTURES_MARGIN_TYPE_ENDPOINT, margin.endpoint)
+        self.assertEqual("ISOLATED", margin.query["marginType"])
+        self.assertFalse(
+            build_binance_futures_leverage_change_request(
+                "ETHUSDT",
+                0,
+            ).can_send
+        )
+        self.assertFalse(
+            build_binance_futures_margin_type_change_request(
+                "ETHUSDT",
+                "portfolio",
+            ).can_send
+        )
 
     def test_hedge_mode_uses_short_position_side_without_reduce_only(
         self,

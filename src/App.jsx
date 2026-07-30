@@ -44,6 +44,8 @@ import {
   isApiConnectionFailure,
   loadArtifactMetadata,
   loadSharedSearchPresets,
+  applyBinanceFuturesSettings,
+  previewBinanceFuturesSettings,
   previewBinanceFuturesFillSoak,
   runFinalPreflight,
   runReconciliation,
@@ -2068,6 +2070,9 @@ function LivePreparationPanel({
           />
         </div>
         <div className="content-column">
+          <FuturesSettingsPanel
+            snapshot={snapshot.binance_futures_settings}
+          />
           <FuturesFillSoakPanel
             snapshot={snapshot.binance_futures_fill_soak}
           />
@@ -2094,6 +2099,179 @@ const FUTURES_FILL_SOAK_BLOCKER_LABELS = {
   "immutable-report-path-unavailable": "덮어쓰기 방지 리포트 경로를 준비할 수 없습니다.",
   "preview-observation-failed": "실계좌 읽기 전용 조회에 실패했습니다.",
 };
+
+const FUTURES_SETTINGS_BLOCKER_LABELS = {
+  "account-cannot-trade": "선물 계정 거래 권한을 확인할 수 없습니다.",
+  "positions-present": "열린 선물 포지션이 있어 계정 설정 변경을 차단했습니다.",
+  "open-orders-present": "미체결 선물 주문이 있어 계정 설정 변경을 차단했습니다.",
+  "margin-type-unknown": "현재 마진 방식을 확인할 수 없습니다.",
+  "leverage-unknown": "현재 레버리지를 확인할 수 없습니다.",
+  "symbol-invalid": "유효한 USD-M 선물 종목을 입력하세요.",
+  "only-isolated-supported": "안전 설정 화면에서는 격리(ISOLATED) 마진만 지원합니다.",
+  "leverage-outside-safe-presets": "초기 안전 프리셋 1x·2x·3x·5x 중 하나를 선택하세요.",
+  "observation-failed": "Binance 실계좌 설정 조회에 실패했습니다.",
+};
+
+function FuturesSettingsPanel({ snapshot = {} }) {
+  const [view, setView] = useState(snapshot || {});
+  const [symbol, setSymbol] = useState("ETHUSDT");
+  const [leverage, setLeverage] = useState(1);
+  const [authorizationToken, setAuthorizationToken] = useState("");
+  const [busy, setBusy] = useState("");
+  const [message, setMessage] = useState("");
+  const current = view?.status ? view : snapshot || {};
+  const preview = current.preview || {};
+  const blockers = Array.isArray(preview.blockers) ? preview.blockers : [];
+  const canApply = current.status === "READY" && Boolean(authorizationToken);
+
+  useEffect(() => {
+    if (!snapshot || typeof snapshot !== "object") return;
+    if (!view?.status || snapshot.status === "APPLIED" || snapshot.status === "FAILED") {
+      setView(snapshot);
+    }
+  }, [snapshot, view?.status]);
+
+  async function previewSettings() {
+    setBusy("preview");
+    setMessage("");
+    setAuthorizationToken("");
+    try {
+      const response = await previewBinanceFuturesSettings(
+        symbol,
+        "ISOLATED",
+        Number(leverage),
+      );
+      setView(response.settings || {});
+      setAuthorizationToken(response.authorization?.confirmation_token || "");
+      setMessage(response.reason || "");
+    } catch (error) {
+      setMessage(error?.message || "선물 설정 사전점검에 실패했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function applySettings() {
+    if (!authorizationToken) return;
+    const confirmed = window.confirm(
+      `${symbol}의 마진 방식을 ISOLATED, 레버리지를 ${leverage}x로 변경합니다.\n\n`
+      + "레버리지 배수는 손실 위험률(%)이 아닙니다. 이 작업은 주문을 만들지 않지만 "
+      + "향후 주문의 증거금·청산 위험을 바꿉니다.\n\n계속하시겠습니까?",
+    );
+    if (!confirmed) return;
+    setBusy("apply");
+    setMessage("");
+    try {
+      const response = await applyBinanceFuturesSettings(
+        authorizationToken,
+        true,
+      );
+      setAuthorizationToken("");
+      setView(response.settings || {});
+      setMessage(response.reason || "");
+    } catch (error) {
+      setAuthorizationToken("");
+      setMessage(error?.message || "선물 설정 적용에 실패했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  const statusTone = (
+    current.status === "APPLIED" || current.status === "CONFIGURED"
+      ? "success"
+      : current.status === "FAILED" || current.status === "BLOCKED"
+        ? "danger"
+        : current.status === "READY" || current.status === "APPLYING"
+          ? "warning"
+          : "info"
+  );
+
+  return (
+    <section className="panel futures-settings-panel">
+      <PanelHeader
+        title="Binance USD-M 종목별 증거금 설정"
+        subtitle="배율(x)과 위험률(%)을 분리하고, 포지션·미체결 주문이 없을 때만 명시 확인 후 적용합니다."
+        suffix={<StatusPill tone={statusTone}>{current.status || "IDLE"}</StatusPill>}
+      />
+      <div className="futures-settings-controls">
+        <label>
+          <span>종목</span>
+          <input
+            value={symbol}
+            onChange={(event) => {
+              setSymbol(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""));
+              setAuthorizationToken("");
+            }}
+            maxLength={20}
+          />
+        </label>
+        <label>
+          <span>마진 방식</span>
+          <select value="ISOLATED" disabled>
+            <option value="ISOLATED">ISOLATED · 격리</option>
+          </select>
+        </label>
+        <label>
+          <span>초기 레버리지</span>
+          <select
+            value={leverage}
+            onChange={(event) => {
+              setLeverage(Number(event.target.value));
+              setAuthorizationToken("");
+            }}
+          >
+            {[1, 2, 3, 5].map((value) => (
+              <option key={value} value={value}>{value}x</option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <div className="futures-settings-explainer">
+        <strong>레버리지 {leverage}x</strong>
+        <span>
+          10 USDT 증거금 기준 최대 명목 노출은 약 {10 * Number(leverage)} USDT입니다.
+          거래당 위험률은 손절 거리와 주문 크기로 별도 제한해야 합니다.
+        </span>
+      </div>
+      {preview.symbol && (
+        <div className="futures-fill-soak-observation">
+          <span>현재 <strong>{preview.margin_type || "-"} · {preview.leverage ?? "-"}x</strong></span>
+          <span>목표 <strong>{preview.target_margin_type || "ISOLATED"} · {preview.target_leverage ?? leverage}x</strong></span>
+          <span>가용 <strong>{preview.available_usdt ?? "-"} USDT</strong></span>
+          <span>포지션/미체결 <strong>{preview.position_count ?? 0}/{preview.open_order_count ?? 0}</strong></span>
+        </div>
+      )}
+      {blockers.length > 0 && (
+        <div className="futures-fill-soak-blockers" role="status">
+          {blockers.map((blocker) => (
+            <div {...semanticSurfaceProps("danger", "futures-fill-soak-blocker")} key={blocker}>
+              <ShieldAlert size={15} />
+              <span>{FUTURES_SETTINGS_BLOCKER_LABELS[blocker] || blocker}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="operator-actions">
+        <ActionButton
+          className="secondary-button"
+          disabled={Boolean(busy)}
+          label={busy === "preview" ? "점검 중" : "현재값·안전조건 점검"}
+          onClick={previewSettings}
+          status={busy === "preview" ? "pending" : undefined}
+        />
+        <ActionButton
+          className="danger-button"
+          disabled={!canApply || Boolean(busy)}
+          label={busy === "apply" ? "적용 중" : "확인 후 설정 적용"}
+          onClick={applySettings}
+          status={busy === "apply" ? "pending" : undefined}
+        />
+        {message && <span className="inline-state">{message}</span>}
+      </div>
+    </section>
+  );
+}
 
 function FuturesFillSoakPanel({ snapshot = {} }) {
   const [view, setView] = useState(snapshot || {});

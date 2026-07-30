@@ -45,6 +45,8 @@ BINANCE_FUTURES_ACCOUNT_CONFIG_ENDPOINT = "/fapi/v1/accountConfig"
 BINANCE_FUTURES_POSITION_ENDPOINT = "/fapi/v3/positionRisk"
 BINANCE_FUTURES_POSITION_MODE_ENDPOINT = "/fapi/v1/positionSide/dual"
 BINANCE_FUTURES_SYMBOL_CONFIG_ENDPOINT = "/fapi/v1/symbolConfig"
+BINANCE_FUTURES_LEVERAGE_ENDPOINT = "/fapi/v1/leverage"
+BINANCE_FUTURES_MARGIN_TYPE_ENDPOINT = "/fapi/v1/marginType"
 BINANCE_FUTURES_TIME_ENDPOINT = "/fapi/v1/time"
 BINANCE_FUTURES_EXCHANGE_INFO_ENDPOINT = "/fapi/v1/exchangeInfo"
 
@@ -796,6 +798,57 @@ def build_binance_futures_symbol_config_request(
         BINANCE_FUTURES_SYMBOL_CONFIG_ENDPOINT,
         {"symbol": normalized_symbol},
         blocked_reasons=[] if normalized_symbol else ["symbol"],
+    )
+
+
+def build_binance_futures_leverage_change_request(
+    symbol: str,
+    leverage: object,
+) -> PreparedRequest:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    try:
+        normalized_leverage = int(str(leverage).strip())
+    except (TypeError, ValueError):
+        normalized_leverage = 0
+    blocked: list[str] = []
+    if not normalized_symbol:
+        blocked.append("symbol")
+    if normalized_leverage < 1 or normalized_leverage > 125:
+        blocked.append("leverage")
+    return _build_binance_futures_signed_request(
+        "POST",
+        BINANCE_FUTURES_LEVERAGE_ENDPOINT,
+        {
+            "symbol": normalized_symbol,
+            "leverage": normalized_leverage,
+        },
+        blocked_reasons=blocked,
+    )
+
+
+def build_binance_futures_margin_type_change_request(
+    symbol: str,
+    margin_type: object,
+) -> PreparedRequest:
+    normalized_symbol = (
+        str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+    )
+    normalized_margin_type = str(margin_type or "").strip().upper()
+    blocked: list[str] = []
+    if not normalized_symbol:
+        blocked.append("symbol")
+    if normalized_margin_type not in {"ISOLATED", "CROSSED"}:
+        blocked.append("margin_type")
+    return _build_binance_futures_signed_request(
+        "POST",
+        BINANCE_FUTURES_MARGIN_TYPE_ENDPOINT,
+        {
+            "symbol": normalized_symbol,
+            "marginType": normalized_margin_type,
+        },
+        blocked_reasons=blocked,
     )
 
 

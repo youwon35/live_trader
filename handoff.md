@@ -1126,3 +1126,15 @@ API 없이 실제 실행한 기능:
 - 매 주문 뒤 브로커 주문 상태와 포지션을 순차 대조하고, 하나의 주문·포지션만 허용한다. 정지·오류 때는 세션이 만든 주문과 추적 수량만 취소·청산하며 다른 포지션을 건드리지 않는다. 최종 감사 JSON은 SHA-256으로 봉인하지만 전략 성과나 승급 근거로 사용하지 않는다.
 - 현재 실제 체결은 실행하지 않았다. USD-M Futures의 주문 가능 잔액과 `ISOLATED 1x` 전제조건이 충족되지 않아 Preview가 안전 차단 중이며, Spot 자산 이체나 margin/leverage 변경을 프로그램이 임의로 수행하지 않았다.
 - 관련 상태·Preview·Start·Stop·최신 Soak 보고 API와 실거래 준비 UI를 추가했다. 격리된 Live Python 회귀 275개, 공용 runtime 194개, 공용 design 테스트 9개와 Vite production build가 통과했다.
+
+## 2026-07-31 Binance 자금 이체·선물 종목 설정 안전 워크플로
+
+- 사용자 명시 요청으로 Binance Spot의 USDT 10을 USD-M Futures로 정확히 한 번 이체했다. 이체 전 Spot 23.8049427 USDT/Futures 0 USDT, 이체 후 Spot 13.8049427 USDT/Futures 10 USDT를 읽기 전용으로 재대조했다. 이체 뒤에도 선물 포지션과 미체결 주문은 각각 0건이다.
+- ETHUSDT의 실제 현재 설정은 `CROSSED · 20x`다. `CROSSED`는 여러 포지션이 선물 지갑 증거금을 공유하는 마진 방식이고 `20x`는 초기 레버리지 배수이므로 서로 다른 설정이다. 20x만 낮춰도 CROSSED가 ISOLATED로 바뀌지는 않는다.
+- 실거래 준비 화면에 종목별 Binance USD-M 증거금 설정 패널을 추가했다. 레버리지는 퍼센트가 아니라 1x·2x·3x·5x 안전 프리셋으로 표시하고, 손실 위험률은 주문 크기·손절 거리 정책과 별도임을 명시한다. 초기 버전은 `ISOLATED`만 적용할 수 있다.
+- 변경 Preview는 계정 거래 권한, 현재 마진/레버리지, 전체 포지션과 미체결 주문을 새로 조회한다. 포지션·주문이 0일 때만 5분짜리 1회 토큰을 발급하며, Apply 직전에 같은 조건을 다시 조회한다. 상태 변경 POST는 응답 timeout 때 자동 재전송하지 않고, 적용 뒤 목표값과 flat 상태를 다시 조회해 확인한다.
+- 화면을 열거나 Preview만 실행해서는 계정 설정을 바꾸지 않는다. 이번 작업에서도 ETHUSDT의 실제 `CROSSED · 20x`는 그대로 유지했다. 기존 실체결 Soak는 별도 안전 계약인 `HEDGE · ISOLATED · 1x`를 계속 강제한다.
+- 실계좌의 영속 계좌 위험값이 unittest의 가정값을 오염시키던 테스트 비결정성을 제거했다. 주문 게이트 테스트는 시작 시 실제 계좌 snapshot을 비우고 종료 시 원본을 복원한다.
+- 관련 안전 게이트·단일 전송·적용 후 재검증 테스트를 포함해 전체 Python unittest 283개가 통과했다. Vite production build와 100%·125%·150% 데스크톱 배율 계약, PyInstaller 패키징도 통과했다.
+- 최신 `release\LiveTrader.exe`는 19,717,111 bytes이며 SHA-256은 `03F01DD892BA9E13E502736E79186375557DD5C97D6BCF4CEE8BD9A313C75D50`다.
+- 이전 5시간 MONITOR Soak는 목표시간 18,000초를 채웠고 실주문·차단·heartbeat gap·손실 게이트 발생은 0이었다. 다만 KIS 읽기 연결이 약 34초간 1회 끊겼다가 자동 복구되어 엄격 정책상 최종 FAIL이다. 주문/포지션 모호성 사고는 아니며, 보고서는 `logs\reports\soak\20260730T043844Z-f078639b7e.json`과 같은 이름의 HTML이다.

@@ -124,6 +124,29 @@ export async function runFinalPreflight() {
   return request("/api/preflight", { method: "POST", body: {} });
 }
 
+export async function previewBinanceFuturesSettings(
+  symbol = "ETHUSDT",
+  marginType = "ISOLATED",
+  leverage = 1,
+) {
+  return request("/api/binance-futures-settings/preview", {
+    method: "POST",
+    body: { symbol, margin_type: marginType, leverage },
+    timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
+  });
+}
+
+export async function applyBinanceFuturesSettings(
+  confirmationToken,
+  confirmed = false,
+) {
+  return request("/api/binance-futures-settings/apply", {
+    method: "POST",
+    body: { confirmation_token: confirmationToken, confirmed },
+    timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
+  });
+}
+
 export async function previewBinanceFuturesFillSoak(symbol = "ETHUSDT") {
   return request("/api/binance-futures-fill-soak/preview", {
     method: "POST",
