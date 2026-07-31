@@ -6092,3 +6092,627 @@ body {
     grid-column: auto;
   }
 }
+
+/* --------------------------------------------------------------------------
+ * Compact workspace density
+ *
+ * Live Trader is an operations console, so locked mode should size surfaces
+ * from their content instead of inheriting the 150px edit-mode resize floor.
+ * The edit floor is intentionally left intact for draggable/resizable panels.
+ * -------------------------------------------------------------------------- */
+
+.app-shell {
+  --app-shell-columns-compact: 176px minmax(0, 1fr);
+}
+
+.sidebar {
+  gap: 10px;
+  padding: 12px 10px 10px;
+}
+
+.brand-block {
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: 9px;
+  min-height: 36px;
+  padding-bottom: 8px;
+}
+
+.brand-mark {
+  width: 36px;
+  height: 36px;
+}
+
+.brand-block strong {
+  font-size: 14px;
+}
+
+.nav-list {
+  gap: 5px;
+}
+
+.sidebar-footer {
+  padding: 8px 9px;
+}
+
+.topbar {
+  flex-basis: 46px;
+  min-height: 46px;
+  padding: 6px 10px;
+}
+
+.topbar-actions {
+  gap: 6px;
+}
+
+.page-view {
+  gap: 8px;
+  padding: 8px 10px 20px;
+}
+
+.page-view > .content-grid,
+.content-grid,
+.command-grid {
+  gap: 8px;
+  padding: 0;
+}
+
+.content-column,
+.live-prep-shell {
+  gap: 8px;
+}
+
+.workspace.layout-locked .panel {
+  min-height: 0;
+  padding: 8px;
+}
+
+.workspace.layout-locked .panel-header {
+  min-height: 38px;
+  margin: -8px -8px 7px;
+  padding: 4px 10px;
+}
+
+.workspace.layout-locked .panel-header h2 {
+  font-size: 12.5px;
+  line-height: 1.2;
+}
+
+.workspace.layout-locked .panel-header p {
+  margin-top: 1px;
+  font-size: 10.5px;
+  line-height: 1.25;
+}
+
+.workspace.layout-locked .panel-header .status-pill,
+.workspace.layout-locked .status-pill {
+  height: 22px;
+  min-height: 22px;
+  padding-inline: 7px;
+}
+
+.panel-action-line {
+  min-height: 30px;
+  margin-bottom: 7px;
+}
+
+.operator-actions {
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.internal-tabs {
+  margin-bottom: 7px;
+}
+
+.ts-nested-tabs.ts-nested-tabs--cards {
+  grid-template-columns: repeat(auto-fit, minmax(min(132px, 100%), 1fr));
+  gap: 6px;
+  padding: 0 0 7px;
+}
+
+.ts-nested-tabs.ts-nested-tabs--cards > .ts-nested-tabs__tab {
+  gap: 2px;
+  min-height: 44px;
+  padding: 5px 9px;
+  border-radius: 7px;
+}
+
+.ts-nested-tabs.ts-nested-tabs--cards .ts-nested-tabs__label {
+  font-size: 12px;
+}
+
+/* ui-patterns.css is intentionally imported after this app stylesheet.
+   Include the app-owned class so compact sizing still wins without changing
+   the shared package used by the other trading programs. */
+.page-view .internal-tabs.ts-nested-tabs.ts-nested-tabs--cards {
+  grid-template-columns: repeat(auto-fit, minmax(min(132px, 100%), 1fr));
+  gap: 6px;
+  padding: 0 0 7px;
+}
+
+.page-view .internal-tabs.ts-nested-tabs.ts-nested-tabs--cards > .ts-nested-tabs__tab {
+  gap: 2px;
+  min-height: 44px;
+  padding: 5px 9px;
+  border-radius: 7px;
+}
+
+.page-view .internal-tabs.ts-nested-tabs.ts-nested-tabs--cards .ts-nested-tabs__label {
+  font-size: 12px;
+}
+
+.summary-grid,
+.metric-grid,
+.queue-grid,
+.risk-grid {
+  gap: 7px;
+}
+
+.summary-grid div,
+.metric-card,
+.queue-card {
+  gap: 3px;
+  min-height: 50px;
+  padding: 7px 8px;
+}
+
+.summary-grid strong,
+.metric-card strong,
+.queue-card strong {
+  font-size: 14px;
+}
+
+.check-list,
+.broker-list,
+.position-list,
+.account-list,
+.audit-list,
+.checklist-list,
+.settings-list,
+.compact-list,
+.order-ledger-list,
+.promotion-readiness-list {
+  gap: 6px;
+}
+
+.status-row,
+.compact-row,
+.wizard-step,
+.checklist-row,
+.setting-row,
+.capability-item,
+.order-ledger-row {
+  min-height: 38px;
+  padding: 6px 8px;
+}
+
+.setting-row {
+  min-height: 46px;
+}
+
+.risk-rule {
+  min-height: 48px;
+  padding: 7px 8px;
+}
+
+.automation-panel,
+.automation-card,
+.automation-flow,
+.unattended-soak-card,
+.strategy-discovery-panel,
+.promotion-readiness-queue,
+.live-strategy-selector-panel,
+.portfolio-artifact-panel,
+.validation-monitor-card,
+.futures-fill-soak-panel,
+.futures-settings-panel,
+.futures-risk-panel,
+.capital-rollout-panel,
+.lineage-flow-panel {
+  gap: 8px;
+}
+
+.automation-card,
+.unattended-soak-card,
+.validation-monitor-card {
+  padding: 8px;
+}
+
+.automation-mode-grid,
+.automation-metrics,
+.unattended-soak-metrics {
+  gap: 6px;
+}
+
+.automation-metrics div,
+.adapter-preview,
+.automation-step,
+.unattended-soak-metrics > div {
+  gap: 3px;
+  padding: 7px 8px;
+}
+
+.provider-toggle {
+  gap: 6px;
+  padding-bottom: 7px;
+}
+
+.continuous-runtime-status,
+.closed-bar-countdown {
+  padding: 7px 9px;
+}
+
+.promotion-readiness-row {
+  gap: 8px;
+  align-items: start;
+  min-height: 62px;
+  padding: 8px;
+}
+
+.promotion-readiness-blockers strong,
+.promotion-readiness-action strong {
+  display: -webkit-box;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.strategy-discovery-primary {
+  gap: 7px;
+}
+
+.strategy-discovery-primary label {
+  gap: 3px;
+}
+
+.strategy-discovery-search svg {
+  bottom: 8px;
+}
+
+.strategy-discovery-saved {
+  gap: 6px;
+}
+
+.strategy-discovery-summary {
+  min-height: 34px;
+  padding: 5px 7px;
+}
+
+.live-strategy-selector-grid,
+.live-strategy-summary-grid,
+.portfolio-gate-metrics,
+.strategy-lifecycle-timeline,
+.promotion-checklist,
+.futures-risk-controls,
+.futures-risk-metrics,
+.capital-rollout-summary,
+.futures-settings-controls,
+.futures-fill-soak-observation {
+  gap: 6px;
+}
+
+.futures-settings-controls {
+  grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
+}
+
+.live-strategy-parameter-panel,
+.live-strategy-control-line,
+.portfolio-artifact-item,
+.promotion-checklist article,
+.capital-rollout-stage,
+.lineage-stage-card,
+.futures-settings-explainer,
+.futures-fill-soak-observation > span,
+.futures-fill-soak-blocker,
+.futures-fill-soak-final,
+.futures-risk-metrics > div,
+.capital-rollout-summary > div {
+  padding: 7px 8px;
+}
+
+.doctor-panel {
+  padding-bottom: 12px;
+}
+
+.doctor-hero {
+  gap: 10px;
+  padding: 9px 10px;
+}
+
+.doctor-hero strong {
+  margin-top: 2px;
+  font-size: 20px;
+}
+
+.doctor-hero p {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.doctor-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.doctor-card,
+.doctor-card.ts-status-card {
+  grid-template-columns: 26px minmax(0, 1fr);
+  gap: 7px;
+  min-height: 56px;
+  padding: 6px 8px;
+}
+
+.doctor-card .ts-status-card__trailing {
+  grid-column: 2;
+  justify-self: start;
+}
+
+.doctor-step {
+  width: 23px;
+  height: 23px;
+}
+
+.doctor-card strong {
+  font-size: 12.5px;
+}
+
+.doctor-card div span,
+.doctor-card .ts-status-card__detail {
+  margin-top: 1px;
+  font-size: 10.5px;
+  line-height: 1.25;
+}
+
+.doctor-detail-panel {
+  margin-top: 7px;
+  padding: 8px;
+}
+
+.doctor-detail-head {
+  padding-bottom: 7px;
+}
+
+.doctor-detail-list {
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.doctor-detail-row,
+.doctor-detail-row.ts-status-row {
+  width: 100%;
+  min-height: 36px;
+  padding: 5px 7px;
+}
+
+/* Settings: appearance and Telegram share a row; the credential assistant
+   keeps the full row because secret fields need label/input/status space. */
+.settings-content-grid > .content-column {
+  grid-template-areas:
+    "appearance telegram"
+    "assistant assistant";
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+}
+
+.settings-content-grid .appearance-panel {
+  grid-area: appearance;
+}
+
+.settings-content-grid .telegram-settings-panel {
+  grid-area: telegram;
+}
+
+.settings-content-grid .live-connection-assistant-panel {
+  grid-area: assistant;
+}
+
+.appearance-panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
+  gap: 7px;
+}
+
+.appearance-panel > .panel-header,
+.appearance-panel > .layout-settings-card {
+  grid-column: 1 / -1;
+}
+
+.settings-control-group {
+  gap: 6px;
+  margin: 0;
+  padding: 7px 8px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.layout-settings-card {
+  min-height: 46px;
+  padding: 7px 8px;
+}
+
+.telegram-settings-panel .telegram-connection-status {
+  margin: 0;
+}
+
+.live-assistant-tabs,
+.live-assistant-steps {
+  margin-bottom: 7px;
+}
+
+.live-assistant-summary {
+  min-height: 38px;
+  margin-bottom: 7px;
+  padding: 6px 8px;
+}
+
+.live-assistant-field-grid {
+  gap: 7px;
+}
+
+.live-assistant-field,
+.live-assistant-field.bool {
+  min-height: 52px;
+  padding: 7px 8px;
+}
+
+.live-assistant-field.bool {
+  padding-right: 76px;
+}
+
+.live-assistant-field.bool .ts-toggle-switch {
+  top: 7px;
+  right: 8px;
+}
+
+.live-assistant-save-row {
+  gap: 7px;
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+/* Account surfaces keep currency separation and all labels while using the
+   same dense card rhythm as the rest of the console. */
+.account-visual-overview {
+  gap: 8px;
+}
+
+.account-visual-summary {
+  gap: 6px;
+}
+
+.account-visual-summary > div {
+  padding: 6px 8px;
+}
+
+.account-visual-section {
+  gap: 6px;
+  padding-top: 7px;
+}
+
+.account-allocation-grid,
+.position-exposure-grid {
+  gap: 7px;
+}
+
+.account-allocation-card {
+  grid-template-columns: 100px minmax(0, 1fr);
+  gap: 8px;
+  padding: 8px;
+}
+
+.account-allocation-donut {
+  width: 100px;
+  height: 100px;
+}
+
+.account-allocation-donut__center {
+  inset: 18px;
+}
+
+.account-allocation-legend,
+.position-exposure-card {
+  gap: 5px;
+}
+
+.account-allocation-legend > div {
+  padding-bottom: 4px;
+}
+
+.account-allocation-legend__marker {
+  height: 22px;
+}
+
+.position-exposure-card {
+  padding: 8px;
+}
+
+.accounts-page-layout .live-unified-account-panel.ts-account-workspace {
+  gap: 8px;
+  padding: 9px;
+}
+
+.accounts-page-layout .live-unified-account-panel .ts-account-card-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 7px;
+}
+
+.accounts-page-layout .live-unified-account-panel .ts-account-card {
+  gap: 4px;
+  padding: 8px;
+}
+
+.accounts-page-layout .live-unified-account-panel .ts-account-card__balance {
+  font-size: 16px;
+}
+
+.accounts-page-layout .live-unified-account-panel .ts-account-position-table th,
+.accounts-page-layout .live-unified-account-panel .ts-account-position-table td {
+  padding: 6px 8px;
+}
+
+.account-baseline-toolbar {
+  padding: 8px 10px;
+}
+
+.audit-panel .logs-table,
+.logs-panel.logs-page-panel .logs-table {
+  min-height: clamp(300px, calc(100vh - 190px), 520px);
+}
+
+@media (min-width: 1200px) {
+  .workspace.layout-locked .page-view > .content-grid,
+  .workspace.layout-locked .content-grid {
+    grid-template-columns: minmax(0, 1.18fr) minmax(340px, 0.82fr);
+    overflow: visible;
+  }
+
+  .workspace.layout-locked .live-prep-shell > .content-grid {
+    grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.65fr);
+  }
+
+  .account-visual-overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .account-visual-overview > .panel-header,
+  .account-visual-overview > .account-visual-summary {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 1599px) {
+  .promotion-readiness-row {
+    grid-template-columns: minmax(180px, 0.8fr) minmax(120px, 0.55fr) minmax(220px, 1fr);
+  }
+
+  .promotion-readiness-action {
+    grid-column: 1 / 3;
+  }
+}
+
+@media (max-width: 1199px) {
+  .settings-content-grid > .content-column {
+    grid-template-areas:
+      "appearance"
+      "telegram"
+      "assistant";
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 720px) {
+  .appearance-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .appearance-panel > .panel-header,
+  .appearance-panel > .layout-settings-card {
+    grid-column: auto;
+  }
+}

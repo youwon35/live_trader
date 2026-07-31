@@ -3,8 +3,10 @@ import { chromium } from "playwright-core";
 const baseUrl = process.env.LIVE_TRADER_SMOKE_URL || "http://127.0.0.1:18795";
 const chromePath = process.env.CHROME_PATH || "";
 const viewports = [
-  { name: "right-monitor", width: 1707, height: 960 },
-  { name: "compact-desktop", width: 1280, height: 800 },
+  { name: "right-monitor-100", width: 1707, height: 960, desktopScale: 1 },
+  { name: "right-monitor-125", width: 1366, height: 768, desktopScale: 1.25 },
+  { name: "right-monitor-150", width: 1138, height: 640, desktopScale: 1.5 },
+  { name: "compact-desktop", width: 1280, height: 800, desktopScale: 1 },
 ];
 const tabs = ["사전점검", "계좌·포지션", "실거래 준비", "자동화", "로그", "설정"];
 const issues = [];
@@ -15,7 +17,7 @@ const browser = await chromium.launch(chromePath
 
 try {
   for (const viewport of viewports) {
-    const page = await browser.newPage({ viewport });
+    const page = await browser.newPage({ viewport: { width: viewport.width, height: viewport.height } });
     const consoleErrors = [];
     page.on("console", (message) => {
       if (message.type() === "error") consoleErrors.push(message.text());
@@ -107,7 +109,25 @@ try {
           issues.push(`${viewport.name}/${tab}: explicit program-ledger baseline action is missing`);
         }
       }
-      views.push({ viewport: viewport.name, tab, ...layout });
+      if (tab === "설정" && viewport.desktopScale <= 1.25) {
+        const compactSettings = await page.evaluate(() => {
+          const appearance = document.querySelector(".appearance-panel")?.getBoundingClientRect();
+          const telegram = document.querySelector(".telegram-settings-panel")?.getBoundingClientRect();
+          const controls = [...document.querySelectorAll(".appearance-panel > .settings-control-group")]
+            .map((element) => element.getBoundingClientRect());
+          return {
+            topPanelsShareRow: Boolean(appearance && telegram && Math.abs(appearance.top - telegram.top) <= 2),
+            appearanceControlsShareRow: controls.length >= 2 && Math.abs(controls[0].top - controls[1].top) <= 2,
+          };
+        });
+        if (!compactSettings.topPanelsShareRow) {
+          issues.push(`${viewport.name}/${tab}: appearance and Telegram panels do not share the compact row`);
+        }
+        if (!compactSettings.appearanceControlsShareRow) {
+          issues.push(`${viewport.name}/${tab}: mode and accent controls do not share the compact row`);
+        }
+      }
+      views.push({ viewport: viewport.name, desktopScale: viewport.desktopScale, tab, ...layout });
     }
 
     if (consoleErrors.length) issues.push(`${viewport.name}: console errors (${consoleErrors.join(" | ")})`);
