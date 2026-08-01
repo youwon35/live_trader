@@ -6207,13 +6207,15 @@ body {
 .ts-nested-tabs.ts-nested-tabs--cards {
   grid-template-columns: repeat(auto-fit, minmax(min(132px, 100%), 1fr));
   gap: 6px;
-  padding: 0 0 7px;
+  margin-bottom: 2px;
+  padding: 2px 0 12px;
+  border-bottom: 0;
 }
 
 .ts-nested-tabs.ts-nested-tabs--cards > .ts-nested-tabs__tab {
-  gap: 2px;
-  min-height: 44px;
-  padding: 5px 9px;
+  gap: 4px;
+  min-height: 50px;
+  padding: 8px 12px;
   border-radius: 7px;
 }
 
@@ -6227,13 +6229,15 @@ body {
 .page-view .internal-tabs.ts-nested-tabs.ts-nested-tabs--cards {
   grid-template-columns: repeat(auto-fit, minmax(min(132px, 100%), 1fr));
   gap: 6px;
-  padding: 0 0 7px;
+  margin-bottom: 2px;
+  padding: 2px 0 12px;
+  border-bottom: 0;
 }
 
 .page-view .internal-tabs.ts-nested-tabs.ts-nested-tabs--cards > .ts-nested-tabs__tab {
-  gap: 2px;
-  min-height: 44px;
-  padding: 5px 9px;
+  gap: 4px;
+  min-height: 50px;
+  padding: 8px 12px;
   border-radius: 7px;
 }
 
