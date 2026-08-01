@@ -38,6 +38,7 @@ class OrderDispatchSafetyTest(unittest.TestCase):
         state.STATE["persisted_idempotency_keys"] = []
         state.STATE["mode"] = "SMALL_LIVE"
         state.STATE["dry_run"] = False
+        state.STATE["operator_confirmed"] = True
         state.STATE["new_entries_blocked"] = False
 
     def tearDown(self) -> None:
@@ -77,9 +78,7 @@ class OrderDispatchSafetyTest(unittest.TestCase):
                 "strategy_instance_id": "dispatch-safety",
                 "instrument_id": "KRX:005930",
                 "target_revision": target_revision,
-                "confirmed_bar_end": (
-                    f"2026-07-31T00:00:{target_revision:02d}+00:00"
-                ),
+                "confirmed_bar_end": datetime.now(timezone.utc).isoformat(),
                 "order_type": "01",
             },
         )
@@ -105,6 +104,17 @@ class OrderDispatchSafetyTest(unittest.TestCase):
                 state,
                 "snapshot",
                 return_value={"summary": {}},
+            ),
+            patch.object(state, "real_orders_enabled", return_value=True),
+            patch.object(
+                state,
+                "durable_control_halt_active",
+                return_value=False,
+            ),
+            patch.object(
+                state,
+                "operational_runtime_dispatch_allowed",
+                return_value=(True, "operational-runtime-authorized", {}),
             ),
         ):
             return state.submit_order_intent(

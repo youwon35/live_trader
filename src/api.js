@@ -120,8 +120,12 @@ export async function syncExecutionEvents(brokerId = "all", options = {}) {
   });
 }
 
-export async function runFinalPreflight() {
-  return request("/api/preflight", { method: "POST", body: {} });
+export async function runFinalPreflight(deploymentId = "", strategyId = "") {
+  return request("/api/preflight", {
+    method: "POST",
+    body: { deployment_id: deploymentId, strategy_id: strategyId },
+    timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
+  });
 }
 
 export async function previewBinanceFuturesSettings(
@@ -235,8 +239,24 @@ export async function runStrategyCycle(profileId) {
   return request("/api/strategy-cycle", { method: "POST", body: { profile_id: profileId } });
 }
 
-export async function startContinuousRuntime(profileId, mode, portfolioId = "") {
-  return request("/api/runtime/start", { method: "POST", body: { profile_id: profileId, mode, portfolio_id: portfolioId }, timeoutMs: 30000 });
+export async function startContinuousRuntime(
+  profileId,
+  mode,
+  portfolioId = "",
+  deploymentId = "",
+  strategyId = "",
+) {
+  return request("/api/runtime/start", {
+    method: "POST",
+    body: {
+      profile_id: profileId,
+      mode,
+      portfolio_id: portfolioId,
+      deployment_id: deploymentId,
+      strategy_id: strategyId,
+    },
+    timeoutMs: 30000,
+  });
 }
 
 export async function stopContinuousRuntime(profileId = "") {
@@ -253,6 +273,13 @@ export async function setStrategyLifecycle(strategyId, action) {
 
 export async function runWatchdog() {
   return request("/api/watchdog", { method: "POST", body: {} });
+}
+
+export async function transitionIncident(incidentId, action, note = "") {
+  return request("/api/incidents/transition", {
+    method: "POST",
+    body: { incident_id: incidentId, action, note },
+  });
 }
 
 export async function request(path, options = {}) {

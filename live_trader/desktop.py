@@ -27,7 +27,7 @@ def main() -> None:
 
         window_state = _load_window_state()
         window = webview.create_window(
-            "Live Trader",
+            "[LIVE] Live Trader",
             url,
             width=window_state["width"],
             height=window_state["height"],

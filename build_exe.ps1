@@ -1,17 +1,29 @@
 $ErrorActionPreference = "Stop"
 
+function Assert-NativeCommandSucceeded([string]$Step) {
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Step failed with exit code $LASTEXITCODE"
+  }
+}
+
 if (-not (Test-Path ".venv")) {
   py -m venv .venv
 }
 
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
+Assert-NativeCommandSucceeded "pip upgrade"
 .\.venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
+Assert-NativeCommandSucceeded "desktop dependency install"
 
 npm install
+Assert-NativeCommandSucceeded "npm install"
 npm run build
+Assert-NativeCommandSucceeded "frontend build"
 node ..\scripts\desktop_scale_click_contract.mjs --app live_trader --app-root $PWD
+Assert-NativeCommandSucceeded "desktop scale/click contract"
 
 .\.venv\Scripts\python.exe tools\create_icon.py
+Assert-NativeCommandSucceeded "desktop icon generation"
 
 $liveTraderRunning = @(Get-Process -Name "LiveTrader" -ErrorAction SilentlyContinue).Count -gt 0
 $distPath = if ($liveTraderRunning) { "release_pending" } else { "release" }
@@ -55,5 +67,6 @@ if (-not (Test-Path -LiteralPath $sharedRuntime)) {
   --hidden-import Crypto.Util.Padding `
   --collect-submodules webview `
   live_trader\__main__.py
+Assert-NativeCommandSucceeded "PyInstaller package"
 
 Write-Host "Created LiveTrader executable: $(Join-Path $root "$distPath\LiveTrader.exe")"

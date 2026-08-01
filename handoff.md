@@ -1138,3 +1138,17 @@ API 없이 실제 실행한 기능:
 - 관련 안전 게이트·단일 전송·적용 후 재검증 테스트를 포함해 전체 Python unittest 283개가 통과했다. Vite production build와 100%·125%·150% 데스크톱 배율 계약, PyInstaller 패키징도 통과했다.
 - 최신 `release\LiveTrader.exe`는 19,717,111 bytes이며 SHA-256은 `03F01DD892BA9E13E502736E79186375557DD5C97D6BCF4CEE8BD9A313C75D50`다.
 - 이전 5시간 MONITOR Soak는 목표시간 18,000초를 채웠고 실주문·차단·heartbeat gap·손실 게이트 발생은 0이었다. 다만 KIS 읽기 연결이 약 34초간 1회 끊겼다가 자동 복구되어 엄격 정책상 최종 FAIL이다. 주문/포지션 모호성 사고는 아니며, 보고서는 `logs\reports\soak\20260730T043844Z-f078639b7e.json`과 같은 이름의 HTML이다.
+
+## 2026-08-01 Live 운영센터 전면 개편과 실거래 테스트 경로 완성
+
+- 화면을 `운영 현황`, `배포·승급`, `계좌·포지션`, `주문·체결`, `리스크·안전`, `실거래 운영`, `사고·감사`, `기술 로그`, `설정·진단`의 9개 운영 화면으로 재구성했다. 상단에는 주황색 LIVE 환경 바와 계정·Deployment·Session 컨텍스트를 고정하고, 과거 Artifact 차단은 중립 카드와 상태 배지로 낮춰 현재 사고가 더 잘 보이게 했다.
+- Live의 중심 단위를 개별 전략 체크가 아니라 `Deployment Manifest → 만료되는 Preflight Snapshot → Runtime Session → Order/Fill/Audit Event`로 고정했다. Manifest에는 Portfolio와 모든 Strategy member, 허용 심볼, 단일 Broker route, 정책·Artifact hash를 묶으며 실행 중 다른 Deployment나 심볼로 컨텍스트가 섞이면 최종 전송 단계에서도 차단한다.
+- 최종 Preflight는 선택한 Deployment와 계정만 대상으로 강제 REST Snapshot, 체결 Event poll, 로컬 Ledger를 3자 대조한다. 결과는 60초 안의 신선한 값만 인정하며 누락·오래됨·오류·불일치·활성 또는 결과 불확실 주문이 하나라도 있으면 위험 증가 주문을 차단한다. 다른 Broker의 오류는 현재 Deployment를 오염시키지 않고, 여러 Broker가 섞인 Portfolio는 다중 계정 Preflight가 생기기 전까지 차단한다.
+- `0`과 `조회 불가`를 분리하고 시장 데이터 신선도는 실제 Event/확정 봉 시각으로 판정한다. 현재 모드에서 쓰지 않는 경로는 녹색이 아니라 `해당 없음`으로 표시한다. Risk 화면은 현재 사용량과 Soft Warning/Hard Block을 함께 보여 주며 조회 요청과 주문 요청의 재시도 정책을 분리했다.
+- 주문은 생성·Risk 검증·전송 중·ACK·부분 체결·체결·취소 확인 중·취소 결과 불확실·거부 상태를 보존한다. 결정적 `client_order_id`와 `cancel_request_id`를 사용하고, 주문/취소 결과가 불확실하면 재전송하지 않고 Broker 조회와 대조를 먼저 수행한다. 취소와 체결이 경쟁하면 체결 사실을 최종 진실로 유지한다.
+- Reduce-only는 화면이나 전략이 보낸 주장만 믿지 않는다. 60초 이내의 성공한 해당 Broker·심볼 포지션 Snapshot과 방향·수량을 다시 검증해 포지션 절대값을 줄이면서 0을 넘지 않는 주문만 허용한다. Kill Switch는 신규 주문 차단, 알려진 미체결 취소 요청, Runtime 정지를 수행하되 포지션 강제 청산과 분리했다.
+- 감사·사고 저장소는 append-only SQLite로 구성하고 사고 확인·완화·해결 이력을 남긴다. 중앙 마스킹이 API Key, Bearer/JWT, Telegram Bot URL과 실제 환경 Secret을 메모리 로그·SQLite·Telegram 전송 전에 제거한다. Windows 보호 저장소를 계속 사용하며 화면에는 Secret 식별 상태와 마지막 검증만 표시한다.
+- 사용자의 허용에 따라 로컬 `.env`의 `LIVE_TRADER_ENABLE_REAL_ORDERS=true`를 유지했다. 실제 테스트는 정확한 Deployment 선택 → 운용자 확인 → Dry Run 해제 → 신규 진입 허용 → 새 Preflight PASS → Canary 전환 순서로 가능하다. 앱 시작만으로 주문이 나가지는 않으며 이번 작업의 자동 테스트에서는 Broker를 모의 처리해 실제 주문·취소·자금 이동을 한 건도 보내지 않았다.
+- Python 전체 회귀 387개, 계좌·시각화·polling·API 복원력·Futures Risk 프런트엔드 회귀, Workspace model 테스트와 production build가 통과했다. 9개 화면을 100%, 125%, 150%, compact desktop의 36개 조합으로 검사해 문서/작업영역 overflow, 화면 밖 조작 버튼, 콘솔 오류가 모두 0이었다.
+- 최신 `release\LiveTrader.exe`는 `--help` 안전 기동이 종료 코드 0으로 통과했다. 크기는 19,924,832 bytes이며 SHA-256은 `396895A11EE8954C3EE9CD760AAA0FCFB223C0B9BF7A3590DEB4009D04A1F110`이다.
+- 이번 단계에서 물리적으로 분리된 Windows Trading Engine/Risk Gateway/Watchdog 서비스, 원격 읽기 전용 Dashboard와 TOTP, 자동 자본 확대·Rollback, 실자금 장애 Drill, Broker 간 통화 정규화 성과 보고서는 만들지 않았다. 각각 별도 서비스 배포·외부 인증·실자금 승인·완전한 통합 원장 정책이 먼저 필요한 기능이며, 현재 데스크톱 앱에는 동일 목적의 논리적 Risk/Watchdog/감사 경계를 유지했다.

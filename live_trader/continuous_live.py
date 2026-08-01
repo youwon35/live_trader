@@ -32,12 +32,27 @@ class LiveContinuousController:
         self.profile_id = ""
         self.mode = "MONITOR"
         self.portfolio_path = ""
+        self.deployment_id = ""
+        self.portfolio_id = ""
+        self.requested_strategy_id = ""
+        self.strategy_ids: tuple[str, ...] = ()
+        self.allowed_symbols: tuple[str, ...] = ()
 
-    def start(self, profile_id: str, mode: str, portfolio_id: str = "") -> dict[str, Any]:
+    def start(
+        self,
+        profile_id: str,
+        mode: str,
+        portfolio_id: str = "",
+        strategy_id: str = "",
+        deployment_id: str = "",
+    ) -> dict[str, Any]:
         from . import state
 
         normalized_profile = "stock" if profile_id == "stock" else "crypto"
         normalized_mode = str(mode or "MONITOR").upper()
+        requested_portfolio = str(portfolio_id or "").strip()
+        requested_strategy = str(strategy_id or "").strip()
+        requested_deployment = str(deployment_id or "").strip()
         if normalized_mode not in {"MONITOR", "SMALL_LIVE", "FULL_LIVE"}:
             return {"ok": False, "reason": f"지원하지 않는 runtime mode입니다: {normalized_mode}", "snapshot": state.snapshot()}
         with self._lock:
@@ -63,7 +78,27 @@ class LiveContinuousController:
                         "runtime": self.snapshot(),
                         "snapshot": state.snapshot(),
                     }
+                context_blocker = self._running_context_blocker(
+                    portfolio_id=requested_portfolio,
+                    strategy_id=requested_strategy,
+                    deployment_id=requested_deployment,
+                )
+                if context_blocker:
+                    return {
+                        "ok": False,
+                        "reason": context_blocker,
+                        "runtime": self.snapshot(),
+                        "snapshot": state.snapshot(),
+                    }
                 specs = tuple(self.supervisor.engine.specs)
+                broker_context_blocker = self._single_broker_context_blocker(specs)
+                if broker_context_blocker:
+                    return {
+                        "ok": False,
+                        "reason": broker_context_blocker,
+                        "runtime": self.snapshot(),
+                        "snapshot": state.snapshot(),
+                    }
                 if normalized_mode != "MONITOR" and not all(
                     self._spec_mode_allowed(spec, normalized_mode) for spec in specs
                 ):
@@ -101,10 +136,14 @@ class LiveContinuousController:
                     f"{normalized_profile} runtime {previous_mode} → {normalized_mode} 무중단 전환",
                 )
                 return {"ok": True, "reason": "continuous runtime mode transitioned", "runtime": self.snapshot(), "snapshot": state.snapshot()}
-            portfolio = self._select_runtime_portfolio(
-                normalized_profile,
-                portfolio_id,
-                normalized_mode,
+            portfolio = (
+                self._select_runtime_portfolio(
+                    normalized_profile,
+                    requested_portfolio,
+                    normalized_mode,
+                )
+                if requested_portfolio or not requested_strategy
+                else None
             )
             loaded = None
             if portfolio is not None:
@@ -112,18 +151,53 @@ class LiveContinuousController:
                 if not source_path or not Path(source_path).exists():
                     return {"ok": False, "reason": "Portfolio Artifact 원본 경로가 없습니다.", "snapshot": state.snapshot()}
                 loaded = load_portfolio_runtime_path(source_path)
+                if requested_portfolio and loaded.portfolio_id != requested_portfolio:
+                    return {
+                        "ok": False,
+                        "reason": (
+                            "요청 Portfolio ID와 로드된 Artifact ID가 일치하지 않습니다: "
+                            f"{requested_portfolio} != {loaded.portfolio_id}"
+                        ),
+                        "snapshot": state.snapshot(),
+                    }
+                portfolio_broker_blocker = self._single_broker_context_blocker(
+                    tuple(loaded.specs)
+                )
+                if portfolio_broker_blocker:
+                    return {
+                        "ok": False,
+                        "reason": portfolio_broker_blocker,
+                        "snapshot": state.snapshot(),
+                    }
                 specs = tuple(spec for spec in loaded.specs if self._matches_profile(spec, normalized_profile))
+                loaded_strategy_ids = {
+                    str(spec.strategy_id or "").strip() for spec in specs
+                }
+                if requested_strategy and requested_strategy not in loaded_strategy_ids:
+                    return {
+                        "ok": False,
+                        "reason": (
+                            f"요청 Strategy({requested_strategy})가 선택 Portfolio "
+                            f"Artifact({loaded.portfolio_id}) 구성에 없습니다."
+                        ),
+                        "snapshot": state.snapshot(),
+                    }
                 runtime_id = loaded.portfolio_id
                 runtime_hash = loaded.portfolio_hash
                 runtime_permissions = loaded.payload.get("permissions") if isinstance(loaded.payload.get("permissions"), dict) else {}
             else:
-                if portfolio_id:
+                if requested_portfolio:
                     return {
                         "ok": False,
-                        "reason": f"요청한 Portfolio Artifact({portfolio_id})가 없거나 현재 구성 전략 상태로는 실행할 수 없습니다.",
+                        "reason": f"요청한 Portfolio Artifact({requested_portfolio})가 없거나 현재 구성 전략 상태로는 실행할 수 없습니다.",
                         "snapshot": state.snapshot(),
                     }
-                standalone = self._select_standalone_strategy(normalized_profile, normalized_mode)
+                standalone = self._select_standalone_strategy(
+                    normalized_profile,
+                    normalized_mode,
+                    requested_strategy,
+                    requested_deployment,
+                )
                 if standalone is None:
                     return {"ok": False, "reason": f"{normalized_profile}용 Portfolio/Strategy Artifact를 찾을 수 없습니다.", "snapshot": state.snapshot()}
                 source_path = str(standalone.get("source_path") or "")
@@ -133,6 +207,13 @@ class LiveContinuousController:
                 runtime_permissions = dict(standalone.get("permissions") or {})
             if not specs:
                 return {"ok": False, "reason": f"선택 Artifact에 {normalized_profile} Strategy Instance가 없습니다.", "snapshot": state.snapshot()}
+            broker_context_blocker = self._single_broker_context_blocker(specs)
+            if broker_context_blocker:
+                return {
+                    "ok": False,
+                    "reason": broker_context_blocker,
+                    "snapshot": state.snapshot(),
+                }
             if normalized_mode != "MONITOR":
                 allowed = runtime_permissions.get("live_eligible") is True or runtime_permissions.get("live_allowed") is True
                 if normalized_mode == "SMALL_LIVE":
@@ -181,6 +262,17 @@ class LiveContinuousController:
             self.profile_id = normalized_profile
             self.mode = normalized_mode
             self.portfolio_path = source_path
+            self.deployment_id = requested_deployment
+            self.portfolio_id = runtime_id if loaded is not None else ""
+            self.requested_strategy_id = requested_strategy or (
+                specs[0].strategy_id if len(specs) == 1 else ""
+            )
+            self.strategy_ids = tuple(
+                sorted({str(spec.strategy_id or "").strip() for spec in specs})
+            )
+            self.allowed_symbols = tuple(
+                sorted({str(spec.symbol or "").strip().upper() for spec in specs})
+            )
             feeds = feeds_for_specs(
                 specs,
                 prefer_kis=True,
@@ -265,7 +357,68 @@ class LiveContinuousController:
             "startedAt": "", "stoppedAt": "", "lastHeartbeat": "", "lastDataAt": "", "lastError": "",
             "reconnectCount": 0, "feedErrors": {}, "feeds": [], "engine": {},
         }
-        return {**base, "profileId": self.profile_id, "mode": self.mode, "portfolioPath": self.portfolio_path}
+        return {
+            **base,
+            "profileId": self.profile_id,
+            "mode": self.mode,
+            "portfolioPath": self.portfolio_path,
+            "deploymentId": self.deployment_id,
+            "portfolioId": self.portfolio_id,
+            "requestedStrategyId": self.requested_strategy_id,
+            "strategyIds": list(self.strategy_ids),
+            "allowedSymbols": list(self.allowed_symbols),
+        }
+
+    def _running_context_blocker(
+        self,
+        *,
+        portfolio_id: str,
+        strategy_id: str,
+        deployment_id: str,
+    ) -> str:
+        """Refuse a mode transition when it targets another deployment."""
+
+        explicit = bool(portfolio_id or strategy_id or deployment_id)
+        if not explicit:
+            return ""
+        mismatches: list[str] = []
+        if portfolio_id != self.portfolio_id:
+            mismatches.append(
+                f"portfolio={portfolio_id or 'standalone'} (running={self.portfolio_id or 'standalone'})"
+            )
+        if deployment_id and deployment_id != self.deployment_id:
+            mismatches.append(
+                f"deployment={deployment_id} (running={self.deployment_id or '-'})"
+            )
+        if strategy_id:
+            if self.requested_strategy_id:
+                if strategy_id != self.requested_strategy_id:
+                    mismatches.append(
+                        f"strategy={strategy_id} (running={self.requested_strategy_id})"
+                    )
+            elif strategy_id not in self.strategy_ids:
+                mismatches.append(
+                    f"strategy={strategy_id} (running={','.join(self.strategy_ids) or '-'})"
+                )
+        return (
+            "실행 중인 runtime과 요청한 Deployment 컨텍스트가 일치하지 않아 전환을 차단했습니다: "
+            + "; ".join(mismatches)
+            if mismatches
+            else ""
+        )
+
+    @staticmethod
+    def _single_broker_context_blocker(specs: tuple[Any, ...]) -> str:
+        broker_ids = {
+            str(spec.broker_id or "").strip().lower() for spec in specs
+        }
+        if "" in broker_ids or len(broker_ids) != 1:
+            routes = ", ".join(sorted(item or "unresolved" for item in broker_ids))
+            return (
+                "현재 Preflight는 단일 Broker 계좌만 봉인하므로 cross-broker "
+                f"Portfolio runtime을 차단했습니다: {routes or 'unresolved'}"
+            )
+        return ""
 
     def _select_portfolio(
         self,
@@ -381,10 +534,22 @@ class LiveContinuousController:
                 return False
         return True
 
-    def _select_standalone_strategy(self, profile_id: str, mode: str) -> dict[str, Any] | None:
+    def _select_standalone_strategy(
+        self,
+        profile_id: str,
+        mode: str,
+        strategy_id: str = "",
+        deployment_id: str = "",
+    ) -> dict[str, Any] | None:
         from . import state
 
+        requested_strategy = str(strategy_id or "").strip()
+        requested_deployment = str(deployment_id or "").strip()
         for strategy in state.strategy_rows():
+            if requested_strategy and str(strategy.get("strategy_id") or "") != requested_strategy:
+                continue
+            if requested_deployment and str(strategy.get("deployment_id") or "") != requested_deployment:
+                continue
             lifecycle = state.normalize_lifecycle_status(
                 strategy.get("lifecycle_status")
             )
@@ -555,7 +720,31 @@ class LiveContinuousController:
                 state.append_audit("info", "Continuous Runtime", f"{decision.strategy_id} {decision.signal}: {decision.reason}")
                 results.append({"strategyId": decision.strategy_id, "signal": decision.signal, "action": "MONITOR", "reason": decision.reason})
                 continue
-            spec = next(item for item in self.supervisor.engine.specs if item.strategy_instance_id == decision.strategy_instance_id)  # type: ignore[union-attr]
+            spec = next(
+                (
+                    item
+                    for item in self.supervisor.engine.specs  # type: ignore[union-attr]
+                    if item.strategy_instance_id == decision.strategy_instance_id
+                ),
+                None,
+            )
+            context_blocker = self._decision_context_blocker(decision, spec)
+            if context_blocker:
+                state.append_audit(
+                    "danger",
+                    "Continuous Runtime",
+                    context_blocker,
+                )
+                results.append(
+                    {
+                        "strategyId": str(decision.strategy_id or ""),
+                        "signal": decision.signal,
+                        "action": "BLOCKED",
+                        "reason": context_blocker,
+                        "ok": False,
+                    }
+                )
+                continue
             position_direction = self._position_direction(spec)
             current_position_quantity = state.broker_position_quantity(
                 spec.symbol,
@@ -597,6 +786,9 @@ class LiveContinuousController:
                     "broker_id": spec.broker_id,
                     "portfolio_id": "" if spec.artifact.get("standalone") else spec.portfolio_id,
                     "portfolio_hash": spec.portfolio_hash,
+                    "deployment_id": self.deployment_id,
+                    "runtime_strategy_ids": list(self.strategy_ids),
+                    "runtime_allowed_symbols": list(self.allowed_symbols),
                     "strategy_instance_id": spec.strategy_instance_id,
                     "instrument_id": spec.instrument_id,
                     "target_revision": max(1, int(datetime.fromisoformat(decision.bar.end_time.replace("Z", "+00:00")).timestamp())),
@@ -652,6 +844,35 @@ class LiveContinuousController:
             result = state.submit_order_intent(checks, intent, dry_run=bool(state.STATE["dry_run"]), audit_event="Continuous Runtime")
             results.append({"strategyId": decision.strategy_id, "signal": decision.signal, "action": result.get("reason"), "ok": result.get("ok")})
         return {"mode": self.mode, "profileId": self.profile_id, "results": results}
+
+    def _decision_context_blocker(self, decision: Any, spec: Any | None) -> str:
+        if spec is None:
+            return (
+                "평가 결과의 Strategy Instance가 현재 runtime 구성에 없어 주문 생성을 차단했습니다: "
+                f"{getattr(decision, 'strategy_instance_id', '') or '-'}"
+            )
+        decision_strategy = str(getattr(decision, "strategy_id", "") or "").strip()
+        spec_strategy = str(spec.strategy_id or "").strip()
+        if decision_strategy != spec_strategy:
+            return (
+                "평가 결과 Strategy와 runtime spec이 일치하지 않아 주문 생성을 차단했습니다: "
+                f"{decision_strategy or '-'} != {spec_strategy or '-'}"
+            )
+        symbol = str(spec.symbol or "").strip().upper()
+        if self.strategy_ids and spec_strategy not in self.strategy_ids:
+            return f"Strategy {spec_strategy}가 승인된 runtime 전략 목록에 없습니다."
+        if self.allowed_symbols and symbol not in self.allowed_symbols:
+            return f"Symbol {symbol}이 승인된 runtime 상품 목록에 없습니다."
+        if self.portfolio_id:
+            if spec.artifact.get("standalone") is True or str(spec.portfolio_id or "") != self.portfolio_id:
+                return (
+                    "평가 결과의 Portfolio가 승인된 runtime Portfolio와 일치하지 않아 주문 생성을 차단했습니다."
+                )
+        elif self.requested_strategy_id and spec_strategy != self.requested_strategy_id:
+            return (
+                f"Standalone runtime은 요청 Strategy {self.requested_strategy_id} 외 주문을 생성할 수 없습니다."
+            )
+        return ""
 
     @staticmethod
     def _custom_definition(spec: Any) -> dict[str, Any]:
@@ -808,13 +1029,22 @@ class LiveContinuousRuntimeManager:
             "crypto": LiveContinuousController(root),
         }
 
-    def start(self, profile_id: str, mode: str, portfolio_id: str = "") -> dict[str, Any]:
+    def start(
+        self,
+        profile_id: str,
+        mode: str,
+        portfolio_id: str = "",
+        strategy_id: str = "",
+        deployment_id: str = "",
+    ) -> dict[str, Any]:
         normalized = "stock" if profile_id == "stock" else "crypto"
         with self._lock:
             return self.controllers[normalized].start(
                 normalized,
                 mode,
                 portfolio_id,
+                strategy_id,
+                deployment_id,
             )
 
     def stop(self, profile_id: str = "") -> dict[str, Any]:

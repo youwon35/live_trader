@@ -47,11 +47,12 @@ class SQLiteAuditEventStore:
             self._ensure_schema(connection)
             connection.execute(
                 """
-                insert or replace into audit_events (
+                insert into audit_events (
                     event_id, occurred_at, app, category, scope, level, source, message,
                     strategy_id, dataset_id, symbol, order_id, risk_gate, decision, state,
                     reason, run_id, passport_id, trace_id, payload_json
                 ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(event_id) do nothing
                 """,
                 (
                     row["event_id"],

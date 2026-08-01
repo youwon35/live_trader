@@ -62,6 +62,7 @@ import {
   setStrategyLifecycle,
   setAutomationProfile,
   syncExecutionEvents,
+  transitionIncident,
   setRetryPolicy,
   setRiskSetting,
   saveUiSettings,
@@ -81,6 +82,13 @@ import {
   shouldHydrateRiskStrategy,
 } from "./futuresRiskSimulator";
 import { livePollingIntervals } from "./polling";
+import {
+  buildRetryMatrix,
+  projectAccountReconciliation,
+  projectExecutionQuality,
+  projectIncidents,
+  projectOrderTimeline,
+} from "./liveWorkspaceModel";
 import {
   ACCOUNT_REFRESH_INTERVAL_MS,
   createAccountRefreshCoordinator,
@@ -152,44 +160,62 @@ const SharedStatusRow = createStatusRow(React);
 const ToggleSwitch = createToggleSwitch(React);
 
 const navItems = [
-  { id: "overview", label: "사전점검", icon: LayoutDashboard },
+  { id: "overview", label: "운영 현황", icon: LayoutDashboard },
+  { id: "gate", label: "배포·승급", icon: ListChecks },
   { id: "accounts", label: "계좌·포지션", icon: WalletCards },
-  { id: "gate", label: "실거래 준비", icon: ListChecks },
-  { id: "automation", label: "자동화", icon: Power },
-  { id: "audit", label: "로그", icon: FileClock },
-  { id: "settings", label: "설정", icon: Settings },
+  { id: "orders", label: "주문·체결", icon: FileClock },
+  { id: "risk", label: "리스크·안전", icon: ShieldAlert },
+  { id: "automation", label: "실거래 운영", icon: Power },
+  { id: "incidents", label: "사고·감사", icon: Bell },
+  { id: "audit", label: "기술 로그", icon: TerminalSquare },
+  { id: "settings", label: "설정·진단", icon: Settings },
 ];
 
 const pageProfiles = {
   overview: {
-    title: "사전점검",
-    eyebrow: "Live Doctor",
-    summary: "실거래 전 API, 리스크, 체크리스트, 대조 상태를 한 번에 점검합니다.",
+    title: "운영 현황",
+    eyebrow: "LIVE CONTROL PLANE",
+    summary: "현재 Deployment, Session, Preflight, 위험·주문·사고 상태를 한눈에 확인합니다.",
+  },
+  gate: {
+    title: "배포·승급",
+    eyebrow: "DEPLOYMENT & PROMOTION",
+    summary: "검증된 Portfolio Artifact를 배포 단위로 고정하고 계보·Evidence·승급 조건을 확인합니다.",
   },
   accounts: {
     title: "계좌·포지션",
-    eyebrow: "브로커 자산 현황",
-    summary: "모든 브로커의 실제 계좌 잔고와 보유 포지션을 한눈에 확인합니다.",
+    eyebrow: "BROKER TRUTH",
+    summary: "Broker Snapshot, 실시간 체결 상태, 프로그램 원장을 구분해 계좌와 포지션을 대조합니다.",
   },
-  gate: {
-    title: "실거래 준비",
-    eyebrow: "자산군별 준비",
-    summary: "주식/ETF와 코인의 전략, 리스크 한도, 운영 차단 설정을 분리해서 준비합니다.",
+  orders: {
+    title: "주문·체결",
+    eyebrow: "ORDER & FILL LEDGER",
+    summary: "주문 의도부터 ACK·부분체결·완전체결·원장 대조까지 전체 상태와 실행 품질을 추적합니다.",
+  },
+  risk: {
+    title: "리스크·안전",
+    eyebrow: "RISK GATEWAY",
+    summary: "현재 사용량, Soft Warning·Hard Block, Reduce-only, 재시도·Kill 정책을 관리합니다.",
   },
   automation: {
-    title: "자동화",
-    eyebrow: "브로커별 실행",
-    summary: "주식/ETF는 한국투자증권, 코인은 Binance 또는 Upbit로 분리해 자동화를 시작합니다.",
+    title: "실거래 운영",
+    eyebrow: "RUNTIME SESSION",
+    summary: "Monitor → Canary → Limited Live → Full Live 순서와 구성 요소별 실행 상태를 관리합니다.",
+  },
+  incidents: {
+    title: "사고·감사",
+    eyebrow: "INCIDENT & AUDIT",
+    summary: "운영 사고의 영향·자동 조치·해결 상태와 변경 불가능한 감사 이벤트를 분리해 추적합니다.",
   },
   audit: {
-    title: "로그",
-    eyebrow: "운영 기록",
-    summary: "모드 전환, 주문 차단, 설정 변경 이력을 추적합니다.",
+    title: "기술 로그",
+    eyebrow: "ENGINEERING LOG",
+    summary: "Scope·Level·Source·Correlation ID로 개발 및 운영 로그를 검색하고 분석합니다.",
   },
   settings: {
-    title: "설정",
-    eyebrow: "화면/운영 환경",
-    summary: "테마, 강조 색상, 레이아웃 편집 같은 화면 환경만 관리합니다.",
+    title: "설정·진단",
+    eyebrow: "BROKER & RUNTIME",
+    summary: "보호 저장소, 브로커 capability, 알림, Runtime 자체 검사와 보기 설정을 관리합니다.",
   },
 };
 
@@ -208,7 +234,17 @@ const fallbackSnapshot = {
   risk_settings: [],
   checklist: [],
   retry_policy: [],
-  order_queue: { total: 0, blocked: 0, dry_run: 0, retryable: 0, canceled: 0 },
+  order_queue: { total: 0, active: 0, blocked: 0, dry_run: 0, retryable: 0, canceled: 0 },
+  retry_policy_matrix: [],
+  incidents: [],
+  live_governance: {
+    deploymentId: "",
+    manifest: null,
+    latestPreflight: null,
+    preflightValidity: { valid: false, reasons: ["api-disconnected"] },
+    activeSession: null,
+    incidents: [],
+  },
   watchdog: {
     last_run: "미실행",
     status: "unknown",
@@ -688,7 +724,7 @@ function buildSearchResults(snapshot, queryValue) {
       label: `${order.order_id} · ${order.symbol}`,
       detail: `${order.state} · ${order.reason}`,
       meta: [order.strategy_id, order.queue_state, order.side].join(" "),
-      targetNav: "gate",
+      targetNav: "orders",
       tone: statusTone(order.state),
     });
   });
@@ -775,6 +811,18 @@ function buildSearchResults(snapshot, queryValue) {
       meta: item.level,
       targetNav: "audit",
       tone: statusTone(item.level),
+    });
+  });
+
+  (snapshot.incidents ?? snapshot.live_governance?.incidents ?? []).slice(0, 10).forEach((incident, index) => {
+    addSearchResult(results, query, {
+      id: `incident-${incident.incident_id || incident.incidentId || index}`,
+      type: "사고",
+      label: incident.title || incident.code || "운영 사고",
+      detail: incident.detail || incident.impact || incident.status,
+      meta: [incident.severity, incident.status, incident.source || incident.scope].join(" "),
+      targetNav: "incidents",
+      tone: String(incident.severity || "").toUpperCase() === "CRITICAL" ? "danger" : "warning",
     });
   });
 
@@ -1329,7 +1377,41 @@ applyAppearance(readAppearance());
 applyLayoutMode(readLayoutMode());
 
 const LIVE_FLOW_STORAGE_KEY = "live_trader.guidedFlow.v1";
-const LIVE_FLOW_IDS = ["overview", "accounts", "gate", "automation", "audit"];
+const LIVE_FLOW_IDS = ["overview", "gate", "accounts", "orders", "risk", "automation", "incidents", "audit", "settings"];
+const DEPLOYMENT_CONTEXT_STORAGE_KEY = "live_trader.deploymentContext.v1";
+
+function strategyDeploymentIdentity(strategy = {}) {
+  return String(strategy.deployment_id || strategy.deploymentId || strategy.strategy_id || "").trim();
+}
+
+function strategyDeploymentContext(strategy = null) {
+  if (!strategy) {
+    return {
+      id: "",
+      strategyId: "",
+      name: "Deployment 미선택",
+      portfolioId: "",
+      portfolioName: "Portfolio 미확인",
+      brokerId: "-",
+      accountId: "미확인",
+      symbol: "-",
+      timeframe: "-",
+    };
+  }
+  const gate = strategy.portfolio_gate && typeof strategy.portfolio_gate === "object" ? strategy.portfolio_gate : {};
+  const brokerId = String(strategy.broker_id || strategy.provider || strategy.route || strategy.asset || "미확인");
+  return {
+    id: strategyDeploymentIdentity(strategy),
+    strategyId: String(strategy.strategy_id || ""),
+    name: String(strategy.name || strategy.strategy_id || "Deployment"),
+    portfolioId: String(gate.portfolioId || gate.portfolio_id || ""),
+    portfolioName: String(gate.portfolioName || gate.portfolio_name || gate.portfolioId || "Standalone (검토 필요)"),
+    brokerId,
+    accountId: String(strategy.account_id || strategy.accountId || "미확인"),
+    symbol: String(strategy.symbol || "-"),
+    timeframe: String(strategy.timeframe || "-"),
+  };
+}
 
 function App() {
   const [snapshot, setSnapshot] = useState(fallbackSnapshot);
@@ -1342,6 +1424,7 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [acknowledgedNotifications, setAcknowledgedNotifications] = useState(() => readStoredValue(NOTIFICATION_ACK_STORAGE_KEY, ""));
+  const [selectedDeploymentId, setSelectedDeploymentId] = useState(() => readStoredValue(DEPLOYMENT_CONTEXT_STORAGE_KEY, ""));
   const workspaceRef = useRef(null);
   const notificationRef = useRef(null);
   const snapshotRequestInFlightRef = useRef(false);
@@ -1432,6 +1515,25 @@ function App() {
   }, [layoutMode]);
 
   useEffect(() => {
+    document.title = "[LIVE] Live Trader";
+  }, []);
+
+  useEffect(() => {
+    const strategies = snapshot.strategies ?? [];
+    if (!strategies.length) return;
+    const stillExists = strategies.some((strategy) => strategyDeploymentIdentity(strategy) === selectedDeploymentId);
+    if (stillExists) return;
+    const preferred = strategies.find((strategy) => strategy.portfolio_gate?.active) || strategies.find((strategy) => strategy.live_allowed) || strategies[0];
+    const nextId = strategyDeploymentIdentity(preferred);
+    setSelectedDeploymentId(nextId);
+    try {
+      window.localStorage.setItem(DEPLOYMENT_CONTEXT_STORAGE_KEY, JSON.stringify(nextId));
+    } catch {
+      // Storage-restricted runtimes keep the context for this session only.
+    }
+  }, [selectedDeploymentId, snapshot.strategies]);
+
+  useEffect(() => {
     if (!notificationsOpen) return undefined;
     const closeOnKey = (event) => {
       if (event.key === "Escape") setNotificationsOpen(false);
@@ -1520,7 +1622,20 @@ function App() {
     return runAction(action);
   }
 
-  const title = navItems.find((item) => item.id === selectedNav)?.label ?? "사전점검";
+  function selectDeploymentContext(deploymentId) {
+    setSelectedDeploymentId(deploymentId);
+    try {
+      window.localStorage.setItem(DEPLOYMENT_CONTEXT_STORAGE_KEY, JSON.stringify(deploymentId));
+    } catch {
+      // Storage-restricted runtimes keep the context for this session only.
+    }
+  }
+
+  const title = navItems.find((item) => item.id === selectedNav)?.label ?? "운영 현황";
+  const selectedStrategy = (snapshot.strategies ?? []).find((strategy) => strategyDeploymentIdentity(strategy) === selectedDeploymentId)
+    || (snapshot.strategies ?? [])[0]
+    || null;
+  const deploymentContext = strategyDeploymentContext(selectedStrategy);
   const notifications = buildNotificationItems(snapshot, error);
   const notificationKey = notificationFingerprint(notifications);
   const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
@@ -1533,7 +1648,8 @@ function App() {
             <Radio size={19} />
           </div>
           <div>
-            <strong>실시간거래소</strong>
+            <strong>Live Trader</strong>
+            <span className="brand-environment">LIVE</span>
           </div>
         </div>
         <nav className="nav-list" aria-label="주요 메뉴">
@@ -1559,9 +1675,9 @@ function App() {
           ))}
         </nav>
         <div className="sidebar-footer">
-          <span>전체 차단</span>
+          <span>전역 Kill</span>
           <StatusPill tone={snapshot.api_connected ? (snapshot.kill_switch ? "danger" : "success") : "warning"}>
-            {snapshot.api_connected ? (snapshot.kill_switch ? "ON" : "OFF") : "확인 불가"}
+            {snapshot.api_connected ? (snapshot.kill_switch ? "KILLED" : "NORMAL") : "확인 불가"}
           </StatusPill>
         </div>
       </aside>
@@ -1579,22 +1695,21 @@ function App() {
             >
               <PanelLeft size={18} />
             </IconButton>
+            <div className="topbar-title-block">
+              <span>{pageProfiles[selectedNav]?.eyebrow || "LIVE"}</span>
+              <strong>{title}</strong>
+            </div>
           </div>
           <div className="topbar-actions">
-            <button
-              className={`layout-mode-button ${layoutMode === "edit" ? "active" : ""}`}
-              type="button"
-              aria-pressed={layoutMode === "edit"}
-              onClick={() => changeLayoutMode(layoutMode === "edit" ? "locked" : "edit")}
-              title={layoutMode === "edit" ? "레이아웃 편집 모드를 끄고 조작을 잠급니다." : "레이아웃 편집 모드를 켜서 패널 크기 조절을 활성화합니다."}
-            >
-              {layoutMode === "edit" ? <Unlock size={16} /> : <Lock size={16} />}
-              <span>{layoutMode === "edit" ? "레이아웃 편집" : "레이아웃 잠금"}</span>
-            </button>
-            <button className="layout-reset-button" type="button" onClick={resetWorkspaceLayout} title="패널 크기와 위치를 기본값으로 되돌립니다.">
-              <RotateCcw size={15} />
-              <span>레이아웃 초기화</span>
-            </button>
+            <StatusPill tone={snapshot.mode === "FULL_LIVE" ? "danger" : snapshot.mode === "SMALL_LIVE" ? "warning" : "info"}>
+              {snapshot.mode === "FULL_LIVE" ? "FULL LIVE" : snapshot.mode === "SMALL_LIVE" ? "LIMITED LIVE" : "MONITOR"}
+            </StatusPill>
+            <StatusPill tone={snapshot.new_entries_blocked ? "warning" : "success"}>
+              신규 진입 {snapshot.new_entries_blocked ? "차단" : "허용"}
+            </StatusPill>
+            <StatusPill tone={(snapshot.order_queue?.active || 0) ? "warning" : "neutral"}>
+              미결 주문 {snapshot.order_queue?.active || 0}
+            </StatusPill>
             <div className="notification-wrap" ref={notificationRef}>
               <IconButton
                 className="notification-button"
@@ -1618,14 +1733,21 @@ function App() {
               onClick={() =>
                 snapshot.kill_switch
                   ? confirmSafetyChange("긴급 차단을 해제하시겠습니까? 해제 후에도 다른 실거래 게이트는 유지됩니다.", () => setFlag("kill_switch", false, true))
-                  : runAction(() => setFlag("kill_switch", true))
+                  : confirmSafetyChange("전역 Kill Switch를 실행하시겠습니까? 신규 주문과 자동 운영을 차단하지만 포지션 청산 주문은 만들지 않습니다.", () => setFlag("kill_switch", true, true))
               }
             >
               <CircleStop size={17} />
-              {snapshot.kill_switch ? "긴급 차단 해제" : "긴급 차단"}
+              {snapshot.kill_switch ? "Kill 해제" : "전역 Kill"}
             </button>
           </div>
         </header>
+
+        <LiveEnvironmentBar
+          context={deploymentContext}
+          onSelect={selectDeploymentContext}
+          snapshot={snapshot}
+          strategies={snapshot.strategies ?? []}
+        />
 
         {error && snapshot.api_connected === false && (
           <section className="api-connection-banner" role="alert">
@@ -1645,6 +1767,9 @@ function App() {
           selectedNav={selectedNav}
           onNavigate={navigateWorkspace}
           snapshot={snapshot}
+          deploymentContext={deploymentContext}
+          selectedStrategy={selectedStrategy}
+          onDeploymentSelect={selectDeploymentContext}
           searchQuery={searchQuery}
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
           onDryRun={() =>
@@ -1660,18 +1785,30 @@ function App() {
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
           onStrategyCycle={(profileId) => runAction(() => runStrategyCycle(profileId))}
           onValidationEvaluate={(candidateId) => runAction(() => evaluateValidationSmallLive(candidateId))}
-          onRuntimeStart={(profileId, mode) => runAction(() => startContinuousRuntime(profileId, mode))}
+          onRuntimeStart={(profileId, mode) => runAction(() => startContinuousRuntime(
+            profileId,
+            mode,
+            deploymentContext.portfolioId,
+            deploymentContext.id,
+            deploymentContext.strategyId,
+          ))}
           onRuntimeStop={(profileId) => runAction(() => stopContinuousRuntime(profileId))}
           onPromoteLive={(strategyId) => runAction(() => promoteStrategyToLive(strategyId))}
           onStrategyLifecycle={(strategyId, action) => runAction(() => setStrategyLifecycle(strategyId, action))}
           onWatchdog={() => runAction(runWatchdog)}
+          onIncidentTransition={(incidentId, action) => {
+            const labels = { acknowledge: "확인", mitigate: "완화 시작", resolve: "해결" };
+            const note = window.prompt(`사고를 '${labels[action] || action}' 상태로 변경합니다. 운영자 메모를 입력하세요.`, "");
+            if (note === null) return Promise.resolve({ ok: false, cancelled: true });
+            return runAction(() => transitionIncident(incidentId, action, note));
+          }}
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
           onRetryPolicy={(name, value) => runAction(() => setRetryPolicy(name, value))}
           onRetryOrder={(orderId) => runAction(() => retryOrder(orderId))}
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
           onReconcile={() => runAction(runReconciliation)}
-          onPreflight={() => runAction(runFinalPreflight)}
+          onPreflight={() => runAction(() => runFinalPreflight(deploymentContext.id, deploymentContext.strategyId))}
           onAccountRefresh={() => runAction(() => accountRefreshCoordinatorRef.current.run())}
           onProgramLedgerBaseline={() =>
             confirmSafetyChange(
@@ -1688,6 +1825,75 @@ function App() {
         />
       </main>
     </div>
+  );
+}
+
+function LiveEnvironmentBar({ context, onSelect, snapshot, strategies }) {
+  const governedDeploymentId = snapshot.live_governance?.deploymentId
+    || snapshot.live_governance?.manifest?.deploymentId
+    || snapshot.live_governance?.latestPreflight?.deploymentId
+    || "";
+  const contextMatchesPreflight = Boolean(context.id)
+    && Boolean(governedDeploymentId)
+    && String(context.id) === String(governedDeploymentId);
+  const preflightValid = snapshot.live_governance?.preflightValidity?.valid === true;
+  const launchLocked = snapshot.launch_report?.real_order_lock !== "ready"
+    || !contextMatchesPreflight
+    || !preflightValid;
+  const armed = snapshot.api_connected === true
+    && !snapshot.kill_switch
+    && snapshot.operator_confirmed
+    && !launchLocked;
+  const orderRouteEnabled = armed
+    && !snapshot.dry_run
+    && ["SMALL_LIVE", "FULL_LIVE"].includes(String(snapshot.mode || "").toUpperCase());
+  const sessionId = snapshot.live_governance?.activeSession?.sessionId
+    || snapshot.runtime_session?.sessionId
+    || snapshot.continuous_runtime?.sessionId
+    || "세션 없음";
+  const safety = [
+    { label: "실거래 잠금", value: armed ? "ARMED" : "LOCKED", tone: armed ? "warning" : "neutral" },
+    { label: "신규 진입", value: snapshot.new_entries_blocked ? "BLOCKED" : "ALLOWED", tone: snapshot.new_entries_blocked ? "warning" : "success" },
+    { label: "위험 증가 주문", value: snapshot.new_entries_blocked ? "REDUCE-ONLY" : "ALLOWED", tone: snapshot.new_entries_blocked ? "warning" : "success" },
+    { label: "Broker 전송", value: orderRouteEnabled ? "ENABLED" : "DISABLED", tone: orderRouteEnabled ? "danger" : "neutral" },
+    { label: "전역 Kill", value: snapshot.kill_switch ? "KILLED" : "NORMAL", tone: snapshot.kill_switch ? "danger" : "success" },
+  ];
+
+  return (
+    <section className="live-environment-bar" aria-label="LIVE 환경 및 안전 상태">
+      <div className="live-environment-identity">
+        <span className="live-environment-badge">LIVE · 실계좌</span>
+        <label>
+          <span>현재 Deployment</span>
+          <select value={context.id} onChange={(event) => onSelect(event.target.value)}>
+            {(strategies || []).map((strategy) => {
+              const id = strategyDeploymentIdentity(strategy);
+              const gate = strategy.portfolio_gate || {};
+              return (
+                <option key={id} value={id}>
+                  {gate.portfolioName || gate.portfolioId || "Standalone"} · {strategy.symbol || "-"} · {strategy.name || strategy.strategy_id}
+                </option>
+              );
+            })}
+            {!strategies?.length && <option value="">Deployment 없음</option>}
+          </select>
+        </label>
+        <div className="live-context-meta">
+          <strong>{context.portfolioName}</strong>
+          <span>{context.brokerId} · 계정 {context.accountId} · {context.symbol} {context.timeframe}</span>
+          <span>Session · {sessionId}</span>
+          {(!contextMatchesPreflight || !preflightValid) && <span>선택 변경 또는 만료 · 이 Deployment의 Preflight를 다시 실행하세요.</span>}
+        </div>
+      </div>
+      <div className="live-safety-hierarchy">
+        {safety.map((item) => (
+          <div key={item.label}>
+            <span>{item.label}</span>
+            <StatusPill tone={item.tone}>{item.value}</StatusPill>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -1737,6 +1943,9 @@ function WorkspaceContent({
   selectedNav,
   onNavigate,
   snapshot,
+  deploymentContext,
+  selectedStrategy,
+  onDeploymentSelect,
   searchQuery,
   onConfirm,
   onDryRun,
@@ -1749,6 +1958,7 @@ function WorkspaceContent({
   onPromoteLive,
   onStrategyLifecycle,
   onWatchdog,
+  onIncidentTransition,
   onTestIntent,
   onRiskSetting,
   onRetryPolicy,
@@ -1775,6 +1985,7 @@ function WorkspaceContent({
     return renderPage(
       <section className="content-grid">
         <div className="content-column">
+          <DeploymentContextPanel context={deploymentContext} />
           <AutomationLauncherPanel
             profiles={snapshot.automation_profiles}
             strategies={snapshot.strategies}
@@ -1787,11 +1998,16 @@ function WorkspaceContent({
             runtime={snapshot.continuous_runtime}
             soakReport={snapshot.soakReport || snapshot.soak_report}
           />
+          <CapitalRolloutPanel
+            snapshot={snapshot.capital_rollout}
+            selectedStrategyId={selectedStrategy?.strategy_id}
+          />
         </div>
         <div className="content-column">
+          <RuntimeComponentStatusPanel snapshot={snapshot} />
           <WatchdogPanel watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
-          <OrderQueueSummaryPanel summary={snapshot.order_queue} />
-          <OrderPanel orders={snapshot.orders} onRetryOrder={onRetryOrder} onCancelOrder={onCancelOrder} />
+          <FuturesSettingsPanel snapshot={snapshot.binance_futures_settings} selectedSymbol={deploymentContext?.symbol} />
+          <FuturesFillSoakPanel snapshot={snapshot.binance_futures_fill_soak} selectedSymbol={deploymentContext?.symbol} />
         </div>
       </section>,
     );
@@ -1799,25 +2015,36 @@ function WorkspaceContent({
 
   if (selectedNav === "gate") {
     return renderPage(
-      <LivePreparationPanel
-        snapshot={snapshot}
-        onConfirm={onConfirm}
-        onDryRun={onDryRun}
-        onEntryBlock={onEntryBlock}
-        onTestIntent={onTestIntent}
-        onRiskSetting={onRiskSetting}
-        onRetryPolicy={onRetryPolicy}
-        onRetryOrder={onRetryOrder}
-        onCancelOrder={onCancelOrder}
-        onPromoteLive={onPromoteLive}
-        onStrategyLifecycle={onStrategyLifecycle}
-      />,
+      <section className="deployment-promotion-layout">
+        <DeploymentContextPanel context={deploymentContext} />
+        <DeploymentManifestPanel governance={snapshot.live_governance} />
+        <LivePreparationPanel
+          snapshot={snapshot}
+          deploymentOnly
+          selectedStrategyId={selectedStrategy?.strategy_id}
+          onSelectedStrategyIdChange={(strategyId) => {
+            const strategy = (snapshot.strategies ?? []).find((item) => item.strategy_id === strategyId);
+            if (strategy) onDeploymentSelect(strategyDeploymentIdentity(strategy));
+          }}
+          onConfirm={onConfirm}
+          onDryRun={onDryRun}
+          onEntryBlock={onEntryBlock}
+          onTestIntent={onTestIntent}
+          onRiskSetting={onRiskSetting}
+          onRetryPolicy={onRetryPolicy}
+          onRetryOrder={onRetryOrder}
+          onCancelOrder={onCancelOrder}
+          onPromoteLive={onPromoteLive}
+          onStrategyLifecycle={onStrategyLifecycle}
+        />
+      </section>,
     );
   }
 
   if (selectedNav === "accounts") {
     return renderPage(
       <section className="accounts-page-layout">
+        <ThreeWayReconciliationPanel snapshot={snapshot} />
         <UnifiedBrokerAccountPanel
           accounts={snapshot.accounts ?? []}
           executionEvents={snapshot.execution_events}
@@ -1831,10 +2058,56 @@ function WorkspaceContent({
     );
   }
 
+  if (selectedNav === "orders") {
+    return renderPage(
+      <OrderExecutionWorkspace
+        context={deploymentContext}
+        snapshot={snapshot}
+        onRetryOrder={onRetryOrder}
+        onCancelOrder={onCancelOrder}
+      />,
+    );
+  }
+
+  if (selectedNav === "risk") {
+    return renderPage(
+      <section className="content-grid">
+        <div className="content-column">
+          <DeploymentContextPanel context={deploymentContext} />
+          <RiskUsagePanel snapshot={snapshot} context={deploymentContext} />
+          <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
+          <FuturesRiskSimulatorPanel strategies={selectedStrategy ? [selectedStrategy] : []} />
+        </div>
+        <div className="content-column">
+          <OperationalSafeguardsPanel
+            apiConnected={snapshot.api_connected === true}
+            dryRun={snapshot.dry_run}
+            newEntriesBlocked={snapshot.new_entries_blocked}
+            killSwitch={snapshot.kill_switch}
+            operatorConfirmed={snapshot.operator_confirmed}
+            onConfirm={onConfirm}
+            onDryRun={onDryRun}
+            onEntryBlock={onEntryBlock}
+            onTestIntent={onTestIntent}
+          />
+          <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
+          <RetryDecisionMatrixPanel matrix={snapshot.retry_policy_matrix} />
+          <WatchdogPanel watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
+        </div>
+      </section>,
+    );
+  }
+
+  if (selectedNav === "incidents") {
+    return renderPage(
+      <IncidentAuditWorkspace snapshot={snapshot} onNavigate={onNavigate} onIncidentTransition={onIncidentTransition} />,
+    );
+  }
+
   if (selectedNav === "audit") {
     return renderPage(
       <section className="audit-page-layout">
-        <AuditPanel audit={snapshot.audit} />
+        <AuditPanel audit={snapshot.technical_logs || snapshot.audit} title="기술 로그" />
       </section>,
     );
   }
@@ -1853,25 +2126,462 @@ function WorkspaceContent({
           <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} onSave={onEnvSettings} />
           <TelegramConnectionPanel />
         </div>
+        <div className="content-column">
+          <CredentialProtectionPanel snapshot={snapshot} />
+          <BrokerCapabilityPanel diagnostics={snapshot.broker_diagnostics ?? []} />
+          <BrokerAdapterContractPanel contract={snapshot.broker_adapter_contract ?? []} />
+          <BrokerRequirementsPanel brokers={snapshot.brokers ?? []} />
+          <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
+        </div>
       </section>,
     );
   }
 
   return renderPage(
-    <section className="doctor-page-layout">
-      <PreTradeDoctorPanel
-        snapshot={snapshot}
-        onNavigate={onNavigate}
-        onReconcile={onReconcile}
-        onPreflight={onPreflight}
-        onWatchdog={onWatchdog}
+    <OperationsOverviewPage
+      context={deploymentContext}
+      snapshot={snapshot}
+      onNavigate={onNavigate}
+      onReconcile={onReconcile}
+      onPreflight={onPreflight}
+      onWatchdog={onWatchdog}
+    />,
+  );
+}
+
+function DeploymentContextPanel({ context = {} }) {
+  return (
+    <section className="panel deployment-context-panel">
+      <PanelHeader
+        title="현재 Deployment"
+        subtitle="이 화면의 설정·Preview·Runtime은 상단에서 선택한 동일한 배포 컨텍스트를 사용합니다."
+        suffix={<StatusPill tone={context.portfolioId ? "info" : "warning"}>{context.portfolioId ? "PORTFOLIO" : "STANDALONE"}</StatusPill>}
       />
-    </section>,
+      <div className="deployment-context-grid">
+        <div><span>Portfolio</span><strong>{context.portfolioName || "미확인"}</strong><small>{context.portfolioId || "검증된 Portfolio 연결 필요"}</small></div>
+        <div><span>Strategy</span><strong>{context.name || "미선택"}</strong><small>{context.strategyId || "-"}</small></div>
+        <div><span>Broker · 계정</span><strong>{context.brokerId || "미확인"}</strong><small>{context.accountId || "미확인"}</small></div>
+        <div><span>실행 대상</span><strong>{context.symbol || "-"}</strong><small>{context.timeframe || "-"}</small></div>
+      </div>
+    </section>
+  );
+}
+
+function compactHash(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return "미생성";
+  return text.length > 18 ? `${text.slice(0, 10)}…${text.slice(-6)}` : text;
+}
+
+function DeploymentManifestPanel({ governance = {} }) {
+  const manifest = governance?.manifest || null;
+  const preflight = governance?.latestPreflight || governance?.latest_preflight || null;
+  const session = governance?.activeSession || governance?.active_session || null;
+  const integrity = governance?.integrity || {};
+  const integrityOk = integrity.ok === true || integrity.valid === true;
+  return (
+    <section className="panel deployment-manifest-panel">
+      <PanelHeader
+        title="Deployment Manifest · Runtime 고정값"
+        subtitle="전략·Portfolio·계좌 fingerprint·Risk·Runtime 버전을 한 revision으로 봉인합니다. 변경 시 새 Manifest와 Preflight가 필요합니다."
+        suffix={<StatusPill tone={manifest ? (integrityOk ? "success" : "danger") : "neutral"}>{manifest ? (integrityOk ? "무결성 확인" : "무결성 점검") : "Preflight 전"}</StatusPill>}
+      />
+      {manifest ? (
+        <div className="deployment-manifest-grid">
+          <div><span>Manifest</span><strong>rev {manifest.revision} · {compactHash(manifest.manifestHash)}</strong><small>{manifest.deploymentId}</small></div>
+          <div><span>Artifact Hash</span><strong>{compactHash(manifest.portfolioArtifactHash || manifest.strategyArtifactHash)}</strong><small>Portfolio 우선 · Strategy 봉인</small></div>
+          <div><span>Broker · 계좌</span><strong>{manifest.brokerRoute || "미확인"}</strong><small>fingerprint {compactHash(manifest.accountFingerprint)}</small></div>
+          <div><span>Risk · Config</span><strong>R{manifest.riskPolicyRevision} · C{manifest.configRevision}</strong><small>{compactHash(manifest.riskPolicyHash)} · {compactHash(manifest.configHash)}</small></div>
+          <div><span>Preflight Snapshot</span><strong>{preflight?.status || "미생성"}</strong><small>{preflight?.snapshotId || "현재 Deployment 점검 필요"}</small></div>
+          <div><span>Runtime Session</span><strong>{session?.lifecycle || "중지"} · {session?.mode || "MONITOR"}</strong><small>{session?.sessionId || "세션 없음"}</small></div>
+        </div>
+      ) : <EmptyRow text="현재 Deployment의 Preflight를 실행하면 immutable Manifest가 생성됩니다." />}
+    </section>
+  );
+}
+
+function PreflightScopePanel({ snapshot = {}, onPreflight }) {
+  const checks = snapshot.final_preflight ?? [];
+  const deploymentLabels = new Set(["포지션·계좌 대조", "대조 증거 신선도", "전략 승인", "필수 운영 체크리스트", "운용자 확인", "신규 진입 차단"]);
+  const deploymentChecks = checks.filter((check) => deploymentLabels.has(check.label));
+  const globalChecks = checks.filter((check) => !deploymentLabels.has(check.label) && check.label !== "전략 승인");
+  const blockedInventory = (snapshot.strategies ?? []).filter((strategy) => strategy.live_allowed !== true).length;
+  const governance = snapshot.live_governance ?? {};
+  const latest = governance.latestPreflight || governance.latest_preflight || {};
+  const validity = governance.preflightValidity || governance.preflight_validity || {};
+  const expiresAt = latest.expiresAt || latest.expires_at || "";
+  const remainingSeconds = expiresAt ? Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000)) : null;
+  const snapshotValid = validity.valid === true
+    && String(latest.status || latest.result || "").toUpperCase() === "PASS"
+    && remainingSeconds > 0;
+  const snapshotTone = snapshotValid ? "success" : latest.snapshotId ? "warning" : "neutral";
+  return (
+    <section className="panel preflight-scope-panel">
+      <PanelHeader
+        title="Preflight 범위·유효성"
+        subtitle="전역 시스템, 현재 Deployment, 저장 Artifact 재고를 분리합니다. 재고 경고는 현재 배포의 Hard Stop으로 계산하지 않습니다."
+        suffix={<StatusPill tone={snapshotTone}>{latest.snapshotId ? (snapshotValid ? `${remainingSeconds}초 남음` : "무효·만료") : "스냅샷 없음"}</StatusPill>}
+      />
+      <div className="preflight-scope-grid">
+        <article>
+          <header><strong>전역 시스템 검사</strong><StatusPill tone={globalChecks.some((item) => item.status === "fail") ? "danger" : "success"}>{globalChecks.filter((item) => item.status === "fail").length} HARD</StatusPill></header>
+          {globalChecks.slice(0, 5).map((item) => <StatusRow key={item.label} label={item.label} status={item.status} detail={item.detail} />)}
+          {!globalChecks.length && <EmptyRow text="전역 검사 결과가 없습니다." />}
+        </article>
+        <article>
+          <header><strong>현재 Deployment 검사</strong><StatusPill tone={deploymentChecks.some((item) => item.status === "fail") ? "danger" : "success"}>{deploymentChecks.filter((item) => item.status === "fail").length} HARD</StatusPill></header>
+          {deploymentChecks.slice(0, 5).map((item) => <StatusRow key={item.label} label={item.label} status={item.status} detail={item.detail} />)}
+          {!deploymentChecks.length && <EmptyRow text="Deployment 검사 결과가 없습니다." />}
+        </article>
+        <article className="inventory-scope-card">
+          <header><strong>재고·관리 경고</strong><StatusPill tone={blockedInventory ? "warning" : "neutral"}>{blockedInventory}건</StatusPill></header>
+          <p>승급 불가 저장 Artifact {blockedInventory}개</p>
+          <span>현재 선택한 Deployment와 무관한 과거 Artifact는 관리 경고로만 표시합니다.</span>
+        </article>
+      </div>
+      <div className="panel-action-line">
+        <span>{latest.snapshotId ? `Snapshot ${latest.snapshotId}` : "실거래 테스트: 운용자 확인 → Dry Run 해제 → 신규 진입 허용 → 새 Preflight → Canary"}</span>
+        <button className="primary-button" type="button" onClick={onPreflight}><BadgeCheck size={15} />새 Preflight 실행</button>
+      </div>
+    </section>
+  );
+}
+
+function OperationsOverviewPage({ context, snapshot, onNavigate, onReconcile, onPreflight, onWatchdog }) {
+  return (
+    <section className="operations-overview-layout">
+      <DeploymentContextPanel context={context} />
+      <PreflightScopePanel snapshot={snapshot} onPreflight={onPreflight} />
+      <section className="content-grid operations-overview-grid">
+        <div className="content-column">
+          <PreTradeDoctorPanel
+            snapshot={snapshot}
+            onNavigate={onNavigate}
+            onReconcile={onReconcile}
+            onPreflight={onPreflight}
+            onWatchdog={onWatchdog}
+          />
+        </div>
+        <div className="content-column">
+          <LaunchReportPanel report={snapshot.launch_report ?? {}} />
+          {snapshot.operation_report?.sections && <OperationsReportPanel report={snapshot.operation_report} />}
+          <RuntimeComponentStatusPanel snapshot={snapshot} />
+          <OrderQueueSummaryPanel summary={snapshot.order_queue ?? {}} />
+        </div>
+      </section>
+    </section>
+  );
+}
+
+function RuntimeComponentStatusPanel({ snapshot = {} }) {
+  const runtime = snapshot.continuous_runtime ?? {};
+  const profiles = Object.values(runtime.profiles ?? {});
+  const runtimeRunning = profiles.some((profile) => profile?.running === true) || runtime.running === true;
+  const activeLive = ["SMALL_LIVE", "FULL_LIVE"].includes(String(snapshot.mode || "").toUpperCase());
+  const streams = snapshot.execution_streams?.brokers ?? {};
+  const streamRows = Object.values(streams);
+  const connectedStreams = streamRows.filter((item) => item?.running && item?.connected).length;
+  const orderRoute = activeLive && !snapshot.kill_switch && !snapshot.dry_run;
+  const rows = [
+    { label: "시장 데이터", status: runtimeRunning ? "pass" : activeLive ? "fail" : "na", value: runtimeRunning ? "RUNNING" : activeLive ? "STOPPED" : "해당 없음", detail: runtimeRunning ? "선택 배포의 feed heartbeat를 감시합니다." : "MONITOR 대기 중에는 활성 feed 경로가 없습니다." },
+    { label: "Bar Builder", status: runtimeRunning ? "pass" : activeLive ? "fail" : "na", value: runtimeRunning ? "RUNNING" : activeLive ? "STOPPED" : "해당 없음", detail: "완료 봉 경계와 중복 bar 처리를 런타임별로 추적합니다." },
+    { label: "전략 평가", status: runtimeRunning ? "pass" : "na", value: runtimeRunning ? "RUNNING" : "대기", detail: `마지막 평가 ${snapshot.strategy_runner?.last_run || "미실행"}` },
+    { label: "Portfolio Engine", status: runtimeRunning ? "pass" : "na", value: runtimeRunning ? "RUNNING" : "대기", detail: "전략 Sleeve를 계좌 Net Target으로 합산합니다." },
+    { label: "Risk Gateway", status: snapshot.api_connected ? "pass" : "fail", value: snapshot.api_connected ? "ENFORCING" : "확인 불가", detail: "주문 전 최종 위험 증가·Reduce-only 정책을 적용합니다." },
+    { label: "주문 전송", status: orderRoute ? "pass" : "na", value: orderRoute ? "ENABLED" : "BLOCKED", detail: orderRoute ? "LIVE route가 활성화되어 있습니다." : "전송 차단 상태에서도 시세·전략·대조는 독립적으로 동작할 수 있습니다." },
+    { label: "Broker Event", status: connectedStreams ? "pass" : activeLive ? "fail" : "na", value: connectedStreams ? `${connectedStreams} CONNECTED` : activeLive ? "DISCONNECTED" : "해당 없음", detail: "사설 주문·체결 이벤트와 REST Snapshot을 함께 대조합니다." },
+  ];
+  return (
+    <section className="panel runtime-component-panel">
+      <PanelHeader title="Runtime 구성 요소" subtitle="단일 STOPPED 대신 데이터·전략·리스크·주문·이벤트 상태를 각각 표시합니다." />
+      <div className="runtime-component-list">
+        {rows.map((row) => <StatusRow key={row.label} label={row.label} status={row.status} value={row.value} detail={row.detail} />)}
+      </div>
+    </section>
+  );
+}
+
+function ThreeWayReconciliationPanel({ snapshot = {} }) {
+  const summary = snapshot.reconciliation?.summary ?? {};
+  const execution = snapshot.execution_events ?? {};
+  const ledger = snapshot.program_ledger ?? {};
+  const streams = execution.streams?.brokers ?? snapshot.execution_streams?.brokers ?? {};
+  const streamConnected = Object.values(streams).some((item) => item?.connected === true);
+  const brokerKnown = Number(summary.api_required_count || 0) === 0 && Number(summary.error_count || 0) === 0;
+  const ledgerKnown = Number(ledger.cash_count || ledger.cashCount || (ledger.cash || []).length || 0) > 0
+    || Number(ledger.position_count || ledger.positionCount || (ledger.positions || []).length || 0) > 0;
+  const projected = projectAccountReconciliation(snapshot);
+  const rows = [
+    { label: "Broker REST Snapshot", status: brokerKnown ? "pass" : "warn", value: brokerKnown ? "조회됨" : "미확인", detail: `마지막 대조 ${summary.last_run || "미실행"}` },
+    { label: "실시간 주문·체결 Event", status: streamConnected ? "pass" : execution.last_poll ? "warn" : "na", value: streamConnected ? "연결" : execution.last_poll ? "폴링 보조" : "해당 없음", detail: `마지막 동기화 ${execution.last_poll || "미실행"}` },
+    { label: "Local Event Ledger", status: ledgerKnown ? "pass" : "warn", value: ledgerKnown ? "원장 있음" : "기준 없음", detail: `체결 이벤트 ${(ledger.execution_events || []).length}건 · 기준 ${ledger.state?.last_baseline || "미승인"}` },
+    { label: "3자 최종 대조", status: summary.status || "warn", value: summary.status_label || "미확인", detail: `불일치 ${summary.mismatch_count || 0} · API/원장 필요 ${summary.api_required_count || 0}` },
+  ];
+  return (
+    <section className="panel three-way-reconciliation-panel">
+      <PanelHeader title="계좌·포지션 3자 대조" subtitle={`조회 실패는 0으로 간주하지 않습니다. 확인된 계좌 ${projected.knownAccountCount}개 · 미확인 ${projected.unknownAccountCount}개`} />
+      <div className="three-way-flow">
+        {rows.map((row, index) => (
+          <React.Fragment key={row.label}>
+            <StatusCard title={row.label} value={row.value} detail={row.detail} tone={statusTone(row.status)} />
+            {index < rows.length - 1 && <span>→</span>}
+          </React.Fragment>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function orderStateLabel(value) {
+  const key = String(value || "").toUpperCase();
+  const labels = {
+    CREATED: "생성됨", RISK_CHECKING: "위험 점검", RISK_REJECTED: "위험 차단", SUBMITTING: "전송 중",
+    UNKNOWN: "접수 결과 불확실", UNKNOWN_SUBMIT_RESULT: "접수 결과 불확실", ACKNOWLEDGED: "접수됨",
+    PARTIALLY_FILLED: "부분 체결", FILLED: "완전 체결", CANCEL_PENDING: "취소 확인 중", CANCELED: "취소됨",
+    UNKNOWN_CANCEL_RESULT: "취소 결과 불확실",
+    REJECTED: "거부됨", EXPIRED: "만료", FAILED: "실패", RISK_BLOCKED: "위험 차단", DRY_RUN: "Dry Run", SENT: "전송됨",
+  };
+  return labels[key] || key || "미확인";
+}
+
+function orderStateTone(value) {
+  const key = String(value || "").toUpperCase();
+  if (["FILLED", "ACKNOWLEDGED", "SENT", "DRY_RUN"].includes(key)) return "success";
+  if (["UNKNOWN", "UNKNOWN_SUBMIT_RESULT", "UNKNOWN_CANCEL_RESULT", "PARTIALLY_FILLED", "SUBMITTING", "CANCEL_PENDING"].includes(key)) return "warning";
+  if (["RISK_BLOCKED", "RISK_REJECTED", "REJECTED", "FAILED"].includes(key)) return "danger";
+  return "neutral";
+}
+
+function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, onCancelOrder }) {
+  const orders = snapshot.orders ?? [];
+  const events = snapshot.execution_events?.recent ?? snapshot.program_ledger?.execution_events ?? [];
+  const [selectedOrderId, setSelectedOrderId] = useState("");
+  const selected = orders.find((order) => String(order.order_id) === selectedOrderId) || orders[0] || null;
+  const selectedEvents = events.filter((event) => !selected || String(event.order_id || event.broker_order_id || "") === String(selected.order_id || selected.broker_order_id || ""));
+  const calibration = snapshot.execution_calibration ?? {};
+  const timelineProjection = selected ? projectOrderTimeline(selected, events) : { timeline: [], directRetryAllowed: false };
+  const quality = projectExecutionQuality(orders, events, calibration);
+  return (
+    <section className="order-execution-layout">
+      <DeploymentContextPanel context={context} />
+      <OrderQueueSummaryPanel summary={snapshot.order_queue ?? {}} />
+      <section className="panel order-ledger-panel">
+        <PanelHeader title="주문 상태 원장" subtitle="불확실한 주문 결과는 실패와 분리하며, 같은 Client Order ID의 존재를 대조하기 전 재전송하지 않습니다." />
+        <div className="table-scroll order-ledger-table-wrap">
+          <table className="data-table order-ledger-table">
+            <thead><tr><th>시각</th><th>Broker</th><th>Order ID</th><th>Client Order ID</th><th>Deployment</th><th>심볼</th><th>방향</th><th>수량</th><th>체결</th><th>상태</th><th>Risk</th></tr></thead>
+            <tbody>
+              {orders.length ? orders.map((order) => (
+                <tr className={selected === order ? "is-selected" : ""} key={order.order_id} onClick={() => setSelectedOrderId(String(order.order_id || ""))}>
+                  <td>{formatAuditTime(order)}</td><td>{order.broker_id || "-"}</td><td>{order.order_id || "-"}</td>
+                  <td>{order.client_order_id || order.idempotency_key || "-"}</td><td>{order.deployment_id || context.id || "-"}</td>
+                  <td>{order.symbol || "-"}</td><td>{order.side || "-"}</td><td>{order.quantity ?? order.qty ?? "-"}</td>
+                  <td>{order.executed_quantity ?? order.executed_volume ?? "-"}</td>
+                  <td><StatusPill tone={orderStateTone(order.state)}>{orderStateLabel(order.state)}</StatusPill></td>
+                  <td>{order.risk_report?.can_submit === true ? "승인" : order.risk_report?.can_submit === false ? "차단" : "미확인"}</td>
+                </tr>
+              )) : <tr><td colSpan="11"><EmptyRow text="아직 주문 의도가 없습니다." /></td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section className="content-grid order-detail-grid">
+        <div className="content-column">
+          <section className="panel order-timeline-panel">
+            <PanelHeader title="주문 타임라인" subtitle={selected ? `${selected.order_id} · ${selected.symbol}` : "주문을 선택하세요."} />
+            {selected ? (
+              <div className="order-timeline">
+                {timelineProjection.timeline.map((event) => <div key={event.id}><span>{formatAuditTime({ timestamp: event.time })}</span><strong>{event.label}</strong><small>{event.detail || event.source || "상태 기록"}</small></div>)}
+                {!timelineProjection.timeline.length && <div><span>-</span><strong>Broker Event 대기</strong><small>체결 스트림 또는 REST 대조 결과가 아직 없습니다.</small></div>}
+              </div>
+            ) : <EmptyRow text="상세 타임라인을 볼 주문이 없습니다." />}
+            {selected && <div className="operator-actions"><button className="secondary-button" type="button" disabled={!timelineProjection.directRetryAllowed} onClick={() => onRetryOrder(selected.order_id)}>상태 대조 후 재시도</button><button className="secondary-button" type="button" disabled={Boolean(selected.cancel_request_id) || ["filled", "canceled"].includes(String(selected.state || "").toLowerCase())} onClick={() => onCancelOrder(selected.order_id)}>{selected.cancel_request_id ? "취소 대조 중" : "취소 요청"}</button></div>}
+          </section>
+        </div>
+        <div className="content-column">
+          <section className="panel fill-ledger-panel">
+            <PanelHeader title="체결 원장" subtitle="Fill ID·수량·가격·수수료·지연을 Broker Event 기준으로 표시합니다." />
+            <div className="compact-list">
+              {events.length ? events.slice(0, 30).map((event) => (
+                <div className="compact-row" key={event.event_id}>
+                  <strong>{event.symbol || "-"} · {event.side || "-"}</strong>
+                  <span>{event.quantity ?? "-"} @ {event.price ?? "-"} · {formatAuditTime({ timestamp: event.occurred_at })}</span>
+                  <StatusPill tone={orderStateTone(event.state)}>{orderStateLabel(event.state)}</StatusPill>
+                </div>
+              )) : <EmptyRow text="기록된 체결 Event가 없습니다." />}
+            </div>
+          </section>
+          <section className="panel execution-quality-panel">
+            <PanelHeader title="실행 품질" subtitle="측정 근거가 없는 지연과 Slippage는 0이 아니라 해당 없음으로 표시합니다." />
+            <MetricGrid columns={3}>
+              <MetricCard label="표본" value={`${quality.sampleCount}건`} detail={quality.submitted ? `Broker 제출 ${quality.submitted}건` : "Paper/Shadow/Live 표본 필요"} />
+              <MetricCard label="평균 Slippage" value={quality.averageSlippageBps == null ? "해당 없음" : `${quality.averageSlippageBps.toFixed(1)} bps`} detail="기대 가격 대비" />
+              <MetricCard label="평균 Broker 지연" value={quality.averageLatencyMs == null ? "해당 없음" : `${quality.averageLatencyMs.toFixed(0)} ms`} detail={`불확실 주문 ${quality.unknownSubmitResult}건`} />
+            </MetricGrid>
+          </section>
+        </div>
+      </section>
+    </section>
+  );
+}
+
+function RiskUsagePanel({ snapshot = {}, context = {} }) {
+  const settings = Object.fromEntries((snapshot.risk_settings ?? []).map((item) => [item.key || item.name, item]));
+  const openLimit = Number(settings.max_open_orders?.value ?? settings.max_open_orders?.current ?? 0);
+  const openOrders = Number(snapshot.order_queue?.active || 0);
+  const exposureLimit = Number(settings.max_symbol_exposure_pct?.value ?? settings.max_symbol_exposure_pct?.current ?? 0);
+  const symbolPosition = (snapshot.positions ?? []).find((item) => item.symbol === context.symbol && item.broker_value != null);
+  const account = (snapshot.accounts ?? []).find((item) => item.broker_id === symbolPosition?.broker_id && item.broker_equity_value != null);
+  const exposure = symbolPosition && account && Number(account.broker_equity_value) > 0
+    ? Math.abs(Number(symbolPosition.broker_value || 0)) / Number(account.broker_equity_value) * 100
+    : null;
+  const rows = [
+    { label: "일일 손실", current: snapshot.account_risk?.daily_loss_pct, warning: snapshot.account_risk?.warning_loss_pct, hard: settings.daily_loss_limit_pct?.value, unit: "%" },
+    { label: `${context.symbol || "선택 심볼"} 노출`, current: exposure, warning: exposureLimit ? exposureLimit * 0.8 : null, hard: exposureLimit || null, unit: "%" },
+    { label: "미체결·대기 주문", current: openOrders, warning: openLimit ? Math.max(1, Math.floor(openLimit * 0.8)) : null, hard: openLimit || null, unit: "건" },
+  ];
+  return (
+    <section className="panel risk-usage-panel">
+      <PanelHeader title="현재 리스크 사용량" subtitle="설정값만 보여주지 않고 현재·주의·Hard Block을 함께 표시합니다. 관측값이 없으면 0이 아닌 미확인입니다." />
+      <div className="risk-usage-list">
+        {rows.map((row) => {
+          const known = row.current !== null && row.current !== undefined && Number.isFinite(Number(row.current));
+          const hard = row.hard !== null && row.hard !== undefined ? Number(row.hard) : null;
+          const used = known && hard ? Math.min(100, Math.abs(Number(row.current) / hard) * 100) : 0;
+          return <article key={row.label}><header><strong>{row.label}</strong><span>{known ? `${Number(row.current).toFixed(2)}${row.unit}` : "미확인"} / {hard !== null ? `${hard}${row.unit}` : "정책 없음"}</span></header><div className="risk-usage-track"><span style={{ width: `${used}%` }} /></div><small>주의 {row.warning != null ? `${row.warning}${row.unit}` : "미설정"} · Hard Block {hard != null ? `${hard}${row.unit}` : "미설정"}</small></article>;
+        })}
+      </div>
+    </section>
+  );
+}
+
+function RetryDecisionMatrixPanel({ matrix }) {
+  const rows = Array.isArray(matrix) && matrix.length ? matrix : buildRetryMatrix();
+  const legacyRows = rows[0]?.request_kind
+    ? rows.map((row) => ({ request: row.request_kind === "read" ? "조회 API" : "주문 POST", result: row.outcome, action: row.next_action, automatic: row.automatic_retry === true }))
+    : rows[0]?.request || rows[0]?.request_type
+      ? rows
+      : rows.map((row) => ({ request: row.label, result: row.directRetryAllowed ? "접수 전 확정" : "접수 여부 불확실/거부", action: row.nextAction, automatic: row.autoRetry }));
+  /* Backend policy rows remain authoritative when provided; the shared model
+     is the safe fallback used while the API is disconnected. */
+  const displayRows = legacyRows.length ? legacyRows : [
+    { request: "시세·잔고·공개 메타데이터 조회", result: "일시 오류·429", action: "지연 후 자동 재조회", automatic: true },
+    { request: "주문 접수 전 로컬 검증", result: "명확한 로컬 실패", action: "원인 수정 후 새 Intent", automatic: false },
+    { request: "주문 제출", result: "접수 결과 불확실", action: "재전송 금지 · Client Order ID로 먼저 대조", automatic: false },
+    { request: "주문 취소", result: "취소 결과 불확실", action: "주문 상태 조회 후 결정", automatic: false },
+    { request: "Broker 주문", result: "명시적 거부", action: "원인 수정 전 재전송 금지", automatic: false },
+  ];
+  return (
+    <section className="panel retry-matrix-panel">
+      <PanelHeader title="요청별 재시도 원칙" subtitle="조회 재시도와 주문 POST 재전송을 분리합니다." />
+      <div className="table-scroll"><table className="data-table"><thead><tr><th>요청</th><th>결과</th><th>동작</th><th>자동</th></tr></thead><tbody>{displayRows.map((row, index) => <tr key={`${row.request || row.request_type}-${index}`}><td>{row.request || row.request_type}</td><td>{row.result || row.outcome}</td><td>{row.action || row.policy}</td><td><StatusPill tone={row.automatic ? "warning" : "neutral"}>{row.automatic ? "허용" : "금지"}</StatusPill></td></tr>)}</tbody></table></div>
+    </section>
+  );
+}
+
+function fallbackIncidents(snapshot = {}) {
+  const rows = [];
+  (snapshot.watchdog?.checks ?? []).filter((item) => item.status === "fail").forEach((item, index) => rows.push({ incidentId: `WATCHDOG-${index + 1}`, severity: "CRITICAL", title: item.label, detail: item.detail, status: "OPEN", occurredAt: snapshot.watchdog?.last_run, impact: "신규 진입 차단", source: "Watchdog" }));
+  const summary = snapshot.reconciliation?.summary ?? {};
+  if (Number(summary.mismatch_count || 0) > 0 || Number(summary.api_required_count || 0) > 0) rows.push({ incidentId: "RECONCILIATION-CURRENT", severity: Number(summary.mismatch_count || 0) ? "CRITICAL" : "WARNING", title: "포지션·계좌 대조 미완료", detail: `불일치 ${summary.mismatch_count || 0} · 미확인 ${summary.api_required_count || 0}`, status: "OPEN", occurredAt: summary.last_run, impact: "위험 증가 주문 차단", source: "Reconciliation" });
+  (snapshot.orders ?? []).filter((order) => ["unknown", "unknown_submit_result"].includes(String(order.state || "").toLowerCase())).forEach((order) => rows.push({ incidentId: `ORDER-${order.order_id}`, severity: "CRITICAL", title: "주문 접수 결과 불확실", detail: `${order.broker_id || "Broker"} · ${order.symbol || "-"} · ${order.order_id}`, status: "OPEN", occurredAt: order.updated_at || order.created_at, impact: "자동 재전송 금지", source: "Order Gateway" }));
+  return rows;
+}
+
+function IncidentAuditWorkspace({ snapshot = {}, onNavigate, onIncidentTransition }) {
+  const governance = snapshot.live_governance ?? {};
+  const storedIncidents = governance.incidents ?? snapshot.incidents ?? [];
+  const projectedIncidents = projectIncidents(snapshot).map((item) => ({
+    incidentId: item.id,
+    severity: item.severity?.raw || item.severity?.label,
+    title: item.title,
+    detail: item.detail,
+    status: item.state?.code?.toUpperCase(),
+    occurredAt: item.occurredAt,
+    impact: item.blocking ? "위험 증가 주문 차단" : "관찰",
+    source: item.source,
+    durable: false,
+  }));
+  const normalizedStored = storedIncidents.map((incident) => ({
+    ...incident,
+    incidentId: incident.incidentId || incident.incident_id,
+    status: incident.status || incident.state || "OPEN",
+    occurredAt: incident.occurredAt || incident.openedAt || incident.opened_at,
+    source: incident.source || incident.scopeType || incident.scope_type || "Runtime",
+    durable: true,
+  }));
+  const storedIds = new Set(normalizedStored.map((incident) => String(incident.incidentId || incident.code || "")));
+  const incidents = [
+    ...normalizedStored,
+    ...projectedIncidents.filter((incident) => !storedIds.has(String(incident.incidentId || ""))),
+  ];
+  const audit = snapshot.durable_audit ?? snapshot.audit_events ?? snapshot.audit ?? [];
+  return (
+    <section className="incident-audit-layout">
+      <section className="panel incident-panel">
+        <PanelHeader title="운영 사고" subtitle="현재 위험을 과거 Artifact 차단과 분리하고, 영향·자동 조치·해결 상태를 추적합니다." suffix={<StatusPill tone={incidents.some((item) => String(item.status).toUpperCase() === "OPEN") ? "danger" : "success"}>{incidents.filter((item) => String(item.status).toUpperCase() === "OPEN").length} OPEN</StatusPill>} />
+        <div className="incident-list">
+          {incidents.length ? incidents.map((incident) => (
+            <article className="incident-row" key={incident.incidentId || incident.incident_id}>
+              <div><StatusPill tone={String(incident.severity).toUpperCase() === "CRITICAL" ? "danger" : "warning"}>{incident.severity || "WARNING"}</StatusPill><strong>{incident.title || incident.code}</strong><span>{incident.detail || incident.evidence || "상세 증거 확인 필요"}</span></div>
+              <dl><div><dt>발생</dt><dd>{formatAuditTime({ timestamp: incident.occurredAt || incident.opened_at })}</dd></div><div><dt>영향</dt><dd>{incident.impact || "신규 진입 차단"}</dd></div><div><dt>상태</dt><dd>{incident.status || "OPEN"}</dd></div><div><dt>Source</dt><dd>{incident.source || incident.scope || "Runtime"}</dd></div></dl>
+              {incident.durable && String(incident.status || "OPEN").toUpperCase() !== "RESOLVED" ? (
+                <div className="incident-actions">
+                  {String(incident.status || "OPEN").toUpperCase() === "OPEN" && <button className="secondary-button" type="button" onClick={() => onIncidentTransition(incident.incidentId, "acknowledge")}>확인</button>}
+                  {["OPEN", "ACKNOWLEDGED"].includes(String(incident.status || "OPEN").toUpperCase()) && <button className="secondary-button" type="button" onClick={() => onIncidentTransition(incident.incidentId, "mitigate")}>완화 시작</button>}
+                  <button className="secondary-button" type="button" onClick={() => onIncidentTransition(incident.incidentId, "resolve")}>해결</button>
+                </div>
+              ) : !incident.durable ? <small className="incident-projection-note">현재 상태 투영 · Watchdog/대조 실행 시 감사 원장에 기록됩니다.</small> : null}
+            </article>
+          )) : <EmptyRow text="현재 열린 운영 사고가 없습니다." />}
+        </div>
+      </section>
+      <section className="panel immutable-audit-panel">
+        <PanelHeader title="감사 이벤트" subtitle="잠금·배포·Preflight·모드·Risk·주문·Kill·Secret 변경은 append-only 원장에 남깁니다." suffix={<StatusPill tone="info">{audit.length} EVENTS</StatusPill>} />
+        <div className="audit-event-grid">
+          {audit.slice(0, 100).map((item, index) => <article key={item.event_id || `${item.timestamp || item.time}-${index}`}><span>{formatAuditTime(item)}</span><strong>{item.source || item.event || item.category || "SYSTEM"}</strong><p>{item.message || item.detail || item.reason || "-"}</p><small>{item.trace_id ? `trace ${item.trace_id}` : item.decision || item.state || ""}</small></article>)}
+          {!audit.length && <EmptyRow text="표시할 감사 이벤트가 없습니다." />}
+        </div>
+        <div className="panel-action-line"><span>감사 이벤트는 화면 필터 초기화나 기술 로그 정리 대상이 아닙니다.</span><button className="secondary-button" type="button" onClick={() => onNavigate("audit")}>기술 로그 열기</button></div>
+      </section>
+    </section>
+  );
+}
+
+function CredentialProtectionPanel({ snapshot = {} }) {
+  const authenticated = (snapshot.brokers ?? []).filter((broker) => broker.status !== "missing_credentials");
+  return (
+    <section className="panel credential-protection-panel">
+      <PanelHeader title="Secret 보호 상태" subtitle="실전 Secret은 .env 평문 대신 Windows DPAPI 기반 앱 전용 보호 저장소에 보관하며 백업·로그·진단에서 제외합니다." suffix={<StatusPill tone="success">DPAPI 보호</StatusPill>} />
+      <div className="credential-status-grid">
+        <div><span>저장 방식</span><strong>Windows 보호 저장소</strong><small>파일에는 Secret 식별자와 비민감 설정만 유지</small></div>
+        <div><span>인증정보 설정</span><strong>{authenticated.length}/{(snapshot.brokers ?? []).length}</strong><small>설정됨과 인증 성공은 별도 capability에서 확인</small></div>
+        <div><span>마지막 정상 인증</span><strong>미확인</strong><small>Broker capability Probe 실행 필요</small></div>
+        <div><span>Key 교체 시각</span><strong>기록 없음</strong><small>다음 Secret 교체부터 감사 이벤트로 기록</small></div>
+      </div>
+    </section>
+  );
+}
+
+function DoctorHistoryPanel({ diagnostics = {}, onNavigate }) {
+  const latest = diagnostics?.latest ?? {};
+  const issues = latest.issues ?? [];
+  return (
+    <section className="panel doctor-history-panel">
+      <PanelHeader title="설정·Runtime 자체 검사" subtitle={`최근 진단 ${latest.generated_at || "미실행"}`} suffix={<StatusPill tone={latest.summary?.hard_stop_count ? "danger" : latest.summary?.warning_count ? "warning" : latest.run_id ? "success" : "neutral"}>{latest.summary?.status || "미실행"}</StatusPill>} />
+      <div className="compact-list">
+        {issues.slice(0, 12).map((issue) => <button className="compact-row doctor-history-row" type="button" key={issue.issue_code} onClick={() => onNavigate(issue.related_tab || "overview")}><strong>{issue.problem}</strong><span>{issue.remediation}</span><StatusPill tone={issue.severity === "hard_stop" ? "danger" : "warning"}>{issue.severity === "hard_stop" ? "차단" : "주의"}</StatusPill></button>)}
+        {!issues.length && <EmptyRow text="저장된 진단 이슈가 없습니다." />}
+      </div>
+    </section>
   );
 }
 
 function LivePreparationPanel({
   snapshot,
+  deploymentOnly = false,
+  selectedStrategyId: controlledSelectedStrategyId,
+  onSelectedStrategyIdChange,
   onConfirm,
   onDryRun,
   onEntryBlock,
@@ -1882,7 +2592,8 @@ function LivePreparationPanel({
   onStrategyLifecycle,
 }) {
   const [assetTab, setAssetTab] = useState("stock");
-  const [selectedStrategyId, setSelectedStrategyId] = useState("");
+  const [internalSelectedStrategyId, setInternalSelectedStrategyId] = useState("");
+  const selectedStrategyId = controlledSelectedStrategyId ?? internalSelectedStrategyId;
   const [discoveryFilters, setDiscoveryFilters] = useState(DEFAULT_STRATEGY_DISCOVERY_FILTERS);
   const [savedSearches, setSavedSearches] = useState(() => {
     const stored = readStoredValue(STRATEGY_SAVED_SEARCHES_KEY, []);
@@ -1932,11 +2643,24 @@ function LivePreparationPanel({
   ];
   const strategySearchPresets = savedSearches.filter((item) => item.entity === "strategy");
 
+  function selectStrategyId(strategyId) {
+    setInternalSelectedStrategyId(strategyId);
+    onSelectedStrategyIdChange?.(strategyId);
+  }
+
+  useEffect(() => {
+    if (!controlledSelectedStrategyId) return;
+    const selected = (snapshot.strategies ?? []).find((strategy) => strategy.strategy_id === controlledSelectedStrategyId);
+    if (!selected) return;
+    const expectedTab = isCryptoStrategy(selected) ? "crypto" : "stock";
+    if (assetTab !== expectedTab) setAssetTab(expectedTab);
+  }, [assetTab, controlledSelectedStrategyId, snapshot.strategies]);
+
   useEffect(() => {
     const firstId = filteredStrategies[0]?.strategy_id ?? "";
     const stillVisible = filteredStrategies.some((strategy) => strategy.strategy_id === selectedStrategyId);
     if (!stillVisible && selectedStrategyId !== firstId) {
-      setSelectedStrategyId(firstId);
+      selectStrategyId(firstId);
     }
   }, [filteredStrategies, selectedStrategyId]);
 
@@ -2078,7 +2802,7 @@ function LivePreparationPanel({
           />
           <LivePromotionReadinessQueue
             onSelect={(strategyId) => {
-              setSelectedStrategyId(strategyId);
+              selectStrategyId(strategyId);
               saveArtifactMetadata(strategyId, "strategy", { markUsed: true }).catch(() => undefined);
             }}
             operatorConfirmed={Boolean(snapshot.operator_confirmed)}
@@ -2096,7 +2820,7 @@ function LivePreparationPanel({
             strategies={filteredStrategies}
             selectedStrategy={selectedStrategy}
             onSelect={(strategyId) => {
-              setSelectedStrategyId(strategyId);
+              selectStrategyId(strategyId);
               saveArtifactMetadata(strategyId, "strategy", { markUsed: true }).catch(() => undefined);
             }}
             metadata={selectedStrategy ? artifactMetadata[artifactMetadataKey(selectedStrategy.strategy_id, "strategy")] : null}
@@ -2121,35 +2845,30 @@ function LivePreparationPanel({
               continuousRuntime={snapshot.continuous_runtime}
             />
           )}
-          <OperationalSafeguardsPanel
-            apiConnected={snapshot.api_connected === true}
-            dryRun={snapshot.dry_run}
-            newEntriesBlocked={snapshot.new_entries_blocked}
-            killSwitch={snapshot.kill_switch}
-            operatorConfirmed={snapshot.operator_confirmed}
-            onConfirm={onConfirm}
-            onDryRun={onDryRun}
-            onEntryBlock={onEntryBlock}
-            onTestIntent={onTestIntent}
-          />
+          {!deploymentOnly && (
+            <OperationalSafeguardsPanel
+              apiConnected={snapshot.api_connected === true}
+              dryRun={snapshot.dry_run}
+              newEntriesBlocked={snapshot.new_entries_blocked}
+              killSwitch={snapshot.kill_switch}
+              operatorConfirmed={snapshot.operator_confirmed}
+              onConfirm={onConfirm}
+              onDryRun={onDryRun}
+              onEntryBlock={onEntryBlock}
+              onTestIntent={onTestIntent}
+            />
+          )}
         </div>
-        <div className="content-column">
-          <FuturesSettingsPanel
-            snapshot={snapshot.binance_futures_settings}
-          />
-          <FuturesRiskSimulatorPanel
-            strategies={snapshot.strategies ?? []}
-          />
-          <CapitalRolloutPanel
-            snapshot={snapshot.capital_rollout}
-            selectedStrategyId={selectedStrategy?.strategy_id}
-          />
-          <FuturesFillSoakPanel
-            snapshot={snapshot.binance_futures_fill_soak}
-          />
-          <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
-          <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
-        </div>
+        {!deploymentOnly && (
+          <div className="content-column">
+            <FuturesSettingsPanel snapshot={snapshot.binance_futures_settings} selectedSymbol={selectedStrategy?.symbol} />
+            <FuturesRiskSimulatorPanel strategies={selectedStrategy ? [selectedStrategy] : []} />
+            <CapitalRolloutPanel snapshot={snapshot.capital_rollout} selectedStrategyId={selectedStrategy?.strategy_id} />
+            <FuturesFillSoakPanel snapshot={snapshot.binance_futures_fill_soak} selectedSymbol={selectedStrategy?.symbol} />
+            <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
+            <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
+          </div>
+        )}
       </section>
     </section>
   );
@@ -2467,9 +3186,14 @@ const FUTURES_SETTINGS_BLOCKER_LABELS = {
   "observation-failed": "Binance 실계좌 설정 조회에 실패했습니다.",
 };
 
-function FuturesSettingsPanel({ snapshot = {} }) {
+function futuresDeploymentSymbol(value) {
+  const normalized = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return /^[A-Z0-9]{3,18}USDT$/.test(normalized) ? normalized : "";
+}
+
+function FuturesSettingsPanel({ snapshot = {}, selectedSymbol = "" }) {
   const [view, setView] = useState(snapshot || {});
-  const [symbol, setSymbol] = useState("ETHUSDT");
+  const [symbol, setSymbol] = useState(() => futuresDeploymentSymbol(selectedSymbol) || "ETHUSDT");
   const [leverage, setLeverage] = useState(1);
   const [authorizationToken, setAuthorizationToken] = useState("");
   const [busy, setBusy] = useState("");
@@ -2485,6 +3209,13 @@ function FuturesSettingsPanel({ snapshot = {} }) {
       setView(snapshot);
     }
   }, [snapshot, view?.status]);
+
+  useEffect(() => {
+    const next = futuresDeploymentSymbol(selectedSymbol);
+    if (!next || next === symbol) return;
+    setSymbol(next);
+    setAuthorizationToken("");
+  }, [selectedSymbol, symbol]);
 
   async function previewSettings() {
     setBusy("preview");
@@ -2628,7 +3359,7 @@ function FuturesSettingsPanel({ snapshot = {} }) {
   );
 }
 
-function FuturesFillSoakPanel({ snapshot = {} }) {
+function FuturesFillSoakPanel({ snapshot = {}, selectedSymbol = "" }) {
   const [view, setView] = useState(snapshot || {});
   const [authorizationToken, setAuthorizationToken] = useState("");
   const [busy, setBusy] = useState("");
@@ -2639,6 +3370,7 @@ function FuturesFillSoakPanel({ snapshot = {} }) {
   const active = current.active === true;
   const ready = current.status === "READY" && Boolean(authorizationToken);
   const finalReport = current.final_report || current.latest_durable_report || {};
+  const soakSymbol = futuresDeploymentSymbol(selectedSymbol) || futuresDeploymentSymbol(current.symbol) || "ETHUSDT";
 
   useEffect(() => {
     if (!snapshot || typeof snapshot !== "object") return;
@@ -2657,7 +3389,7 @@ function FuturesFillSoakPanel({ snapshot = {} }) {
     setBusy("preview");
     setMessage("");
     try {
-      const response = await previewBinanceFuturesFillSoak("ETHUSDT");
+      const response = await previewBinanceFuturesFillSoak(soakSymbol);
       setView(response.fill_soak || {});
       setAuthorizationToken(response.authorization?.confirmation_token || "");
       setMessage(response.reason || "");
@@ -2672,7 +3404,7 @@ function FuturesFillSoakPanel({ snapshot = {} }) {
     if (!authorizationToken) return;
     const confirmed = window.confirm(
       "실제 Binance USD-M 주문을 시작합니다.\n\n"
-      + "ETHUSDT SHORT 진입·청산 3회(총 6체결), 주문당 5~10 USDT, "
+      + `${soakSymbol} SHORT 진입·청산 3회(총 6체결), 주문당 5~10 USDT, `
       + "초기 가용 USDT 100% 상한, 10% 손실 즉시 중단, 최종 평탄화 조건입니다.\n\n"
       + "계속하시겠습니까?",
     );
@@ -2728,7 +3460,7 @@ function FuturesFillSoakPanel({ snapshot = {} }) {
         suffix={<StatusPill tone={statusTone}>{current.status || "IDLE"}</StatusPill>}
       />
       <MetricGrid columns={4}>
-        <MetricCard label="검증 종목" value={current.symbol || "ETHUSDT"} detail="HEDGE · ISOLATED · 1x" />
+        <MetricCard label="검증 종목" value={current.symbol || soakSymbol} detail="HEDGE · ISOLATED · 1x" />
         <MetricCard label="실체결 목표" value="왕복 3회" detail="진입·청산 총 6 FILLED" />
         <MetricCard label="주문·자본 상한" value="5~10 USDT" detail="최초 가용 USDT 100% 이내" />
         <MetricCard label="손실·시간" value="10% · 5시간" detail="손실 즉시 중단 · 최종 flat" />
@@ -3218,7 +3950,7 @@ function buildDoctorItems(snapshot) {
       detail: riskFailures.length ? `리스크 차단 ${riskFailures.length}개가 있습니다.` : riskWarnings.length ? `warning ${riskWarnings.length}개를 검토하세요.` : "손실/노출/슬리피지 규칙이 정상입니다.",
       tone: riskFailures.length ? "danger" : riskWarnings.length ? "warning" : "success",
       status: riskFailures.length ? "차단" : riskWarnings.length ? "주의" : "통과",
-      targetNav: "gate",
+      targetNav: "risk",
       details: riskDetails.length ? riskDetails : [makeDetail("리스크 한도", "점검할 리스크 항목이 없습니다.", "pass")],
     },
     {
@@ -3342,7 +4074,7 @@ function verificationTone(status) {
   if (["pass", "passed", "ready", "valid", "ok"].includes(normalized)) return "success";
   if (["fail", "failed", "rejected", "blocked"].includes(normalized)) return "danger";
   if (["watch", "warn", "warning", "unknown"].includes(normalized)) return "warning";
-  if (["wait", "empty", "missing"].includes(normalized)) return "neutral";
+  if (["wait", "empty", "missing", "na", "n/a", "not_applicable"].includes(normalized)) return "neutral";
   return "info";
 }
 
@@ -3398,7 +4130,8 @@ const STRATEGY_LIFECYCLE_STEPS = [
 ];
 
 const navGroups = [
-  { id: "operate", label: "주 운영 흐름", itemIds: LIVE_FLOW_IDS },
+  { id: "operate", label: "주 운영 흐름", itemIds: ["overview", "gate", "accounts", "orders", "risk", "automation"] },
+  { id: "records", label: "기록·대응", itemIds: ["incidents", "audit"] },
   { id: "system", label: "시스템", itemIds: ["settings"] },
 ];
 
@@ -5554,25 +6287,30 @@ function PositionPanel({ positions }) {
   );
 }
 
-function AuditPanel({ audit }) {
+function AuditPanel({ audit = [], title = "기술 로그" }) {
   const [query, setQuery] = useState("");
   const [channel, setChannel] = useState("all");
   const [level, setLevel] = useState("all");
   const [sort, setSort] = useState("latest");
+  const [selectedLogId, setSelectedLogId] = useState("");
   const rows = audit.map((item, index) => {
     const logChannel = inferLogChannel(item);
-    const normalizedLevel = item.level === "danger" ? "ERROR" : item.level === "warn" ? "WARN" : "INFO";
+    const rawLevel = String(item.level || "INFO").toUpperCase();
+    const normalizedLevel = item.level === "danger" || ["ERROR", "CRITICAL", "FAIL", "FAILED"].includes(rawLevel) ? "ERROR" : item.level === "warn" || ["WARN", "WARNING"].includes(rawLevel) ? "WARN" : "INFO";
     const displayTime = formatAuditTime(item);
+    const source = item.source || item.event || item.category || "SYSTEM";
+    const message = item.message || item.detail || item.reason || "-";
     return {
-      id: `${item.timestamp || item.time}-${index}`,
+      id: item.event_id || `${item.timestamp || item.time}-${index}`,
       time: displayTime,
       level: normalizedLevel,
       channel: logChannel,
       scope: logChannel,
-      module: item.event,
-      source: item.event,
-      message: item.detail,
-      raw: `${displayTime} ${normalizedLevel} ${logChannel} ${item.event} ${item.detail}`.toLowerCase(),
+      module: source,
+      source,
+      message,
+      item,
+      raw: `${displayTime} ${normalizedLevel} ${logChannel} ${source} ${message} ${item.trace_id || ""}`.toLowerCase(),
     };
   });
   const visibleRows = rows
@@ -5581,6 +6319,7 @@ function AuditPanel({ audit }) {
     .filter((row) => !query.trim() || row.raw.includes(query.trim().toLowerCase()))
     .sort((a, b) => (sort === "latest" ? rows.indexOf(a) - rows.indexOf(b) : rows.indexOf(b) - rows.indexOf(a)));
   const channels = ["all", ...Array.from(new Set(rows.map((row) => row.channel)))];
+  const selectedLog = visibleRows.find((row) => row.id === selectedLogId) || visibleRows[0] || null;
   const handleExportLogs = () => {
     const exportRows = visibleRows.map((row) => ({
       time: row.time || "",
@@ -5594,6 +6333,7 @@ function AuditPanel({ audit }) {
 
   return (
     <section className="panel audit-panel">
+      <PanelHeader title={title} subtitle="사용자용 사고·감사 기록과 분리된 개발·운영 진단 로그입니다." />
       <div className="logs-toolbar">
         <label className="search-box logs-search">
           <input value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="메시지, scope, 작업명 검색" />
@@ -5622,37 +6362,58 @@ function AuditPanel({ audit }) {
         </button>
         <span>{visibleRows.length.toLocaleString()} / {rows.length.toLocaleString()}개</span>
       </div>
-      <div className="table-scroll compact-table logs-table">
-        <table>
-          <thead>
-            <tr>
-              <th>시간</th>
-              <th>Scope</th>
-              <th>Level</th>
-              <th>Source</th>
-              <th>메시지</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visibleRows.length ? (
-              visibleRows.map((row) => (
-                <tr key={row.id}>
-                  <td>{row.time}</td>
-                  <td><span className={`scope-pill scope-${logToken(row.scope)}`}>{row.scope}</span></td>
-                  <td><span className={`level-pill level-${logToken(row.level)}`}>{row.level}</span></td>
-                  <td>{row.source}</td>
-                  <td className="log-message-cell" title={row.message}>{row.message}</td>
-                </tr>
-              ))
-            ) : (
+      <div className="audit-log-workspace">
+        <div className="table-scroll compact-table logs-table">
+          <table>
+            <thead>
               <tr>
-                <td colSpan={5}>
-                  <EmptyRow text="검색 조건에 맞는 로그가 없습니다." />
-                </td>
+                <th>시간</th>
+                <th>Scope</th>
+                <th>Level</th>
+                <th>Source</th>
+                <th>메시지</th>
               </tr>
-            )}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {visibleRows.length ? (
+                visibleRows.map((row) => (
+                  <tr className={selectedLog?.id === row.id ? "is-selected" : ""} key={row.id} onClick={() => setSelectedLogId(row.id)}>
+                    <td>{row.time}</td>
+                    <td><span className={`scope-pill scope-${logToken(row.scope)}`}>{row.scope}</span></td>
+                    <td><span className={`level-pill level-${logToken(row.level)}`}>{row.level}</span></td>
+                    <td>{row.source}</td>
+                    <td className="log-message-cell" title={row.message}>{row.message}</td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={5}>
+                    <EmptyRow text="검색 조건에 맞는 로그가 없습니다." />
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <aside className="audit-log-detail" aria-label="선택한 기술 로그 상세">
+          <h3>로그 상세</h3>
+          {selectedLog ? (
+            <>
+              <p>{selectedLog.message}</p>
+              <dl>
+                <div><dt>시각</dt><dd>{selectedLog.time}</dd></div>
+                <div><dt>Scope · Level</dt><dd>{selectedLog.scope} · {selectedLog.level}</dd></div>
+                <div><dt>Source</dt><dd>{selectedLog.source}</dd></div>
+                <div><dt>Session</dt><dd>{selectedLog.item.session_id || selectedLog.item.sessionId || "-"}</dd></div>
+                <div><dt>Deployment</dt><dd>{selectedLog.item.deployment_id || selectedLog.item.deploymentId || "-"}</dd></div>
+                <div><dt>Strategy · Symbol</dt><dd>{selectedLog.item.strategy_id || "-"} · {selectedLog.item.symbol || "-"}</dd></div>
+                <div><dt>Order</dt><dd>{selectedLog.item.order_id || selectedLog.item.orderId || "-"}</dd></div>
+                <div><dt>Correlation</dt><dd>{selectedLog.item.correlation_id || selectedLog.item.trace_id || "-"}</dd></div>
+              </dl>
+              {(selectedLog.item.stack_trace || selectedLog.item.stackTrace) && <pre>{selectedLog.item.stack_trace || selectedLog.item.stackTrace}</pre>}
+            </>
+          ) : <EmptyRow text="상세를 볼 로그가 없습니다." />}
+        </aside>
       </div>
     </section>
   );
@@ -5663,7 +6424,7 @@ function logToken(value = "") {
 }
 
 function inferLogChannel(item) {
-  const text = `${item.event ?? ""} ${item.detail ?? ""}`.toLowerCase();
+  const text = `${item.source ?? item.event ?? ""} ${item.message ?? item.detail ?? ""} ${item.category ?? ""}`.toLowerCase();
   if (text.includes("주문") || text.includes("order")) return "ORDER";
   if (text.includes("api") || text.includes("broker") || text.includes("kis") || text.includes("binance")) return "API";
   if (text.includes("전략") || text.includes("contract") || text.includes("artifact")) return "STRATEGY";
@@ -5671,15 +6432,15 @@ function inferLogChannel(item) {
   return "SYSTEM";
 }
 
-function StatusRow({ label, status, detail }) {
+function StatusRow({ label, status, detail, value }) {
   const tone = statusTone(status);
-  const statusLabel = status === "pass" ? "통과" : status === "warn" ? "주의" : status === "fail" ? "조치" : status;
+  const statusLabel = status === "pass" ? "통과" : status === "warn" ? "주의" : status === "fail" ? "조치" : status === "na" ? "해당 없음" : status;
   return (
     <SharedStatusRow
       className={`status-row ${status}`}
       tone={tone}
       title={label}
-      detail={detail}
+      detail={value ? `${value} · ${detail}` : detail}
       badge={<span className="status-row-state">{statusLabel}</span>}
     />
   );

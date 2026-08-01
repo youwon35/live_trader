@@ -8,7 +8,18 @@ const viewports = [
   { name: "right-monitor-150", width: 1138, height: 640, desktopScale: 1.5 },
   { name: "compact-desktop", width: 1280, height: 800, desktopScale: 1 },
 ];
-const tabs = ["사전점검", "계좌·포지션", "실거래 준비", "자동화", "로그", "설정"];
+const tabs = [
+  { label: "운영 현황", requiredHeadings: ["현재 Deployment", "Preflight 범위·유효성"] },
+  { label: "배포·승급", requiredHeadings: ["승급 준비 큐", "데이터·전략 계보"] },
+  { label: "계좌·포지션", requiredHeadings: ["계좌·포지션 3자 대조", "내 계좌·보유 포지션"] },
+  { label: "주문·체결", requiredHeadings: ["주문 상태 원장", "주문 타임라인", "체결 원장", "실행 품질"] },
+  { label: "리스크·안전", requiredHeadings: ["현재 리스크 사용량", "요청별 재시도 원칙"] },
+  { label: "실거래 운영", requiredHeadings: ["Runtime 구성 요소", "Live Watchdog"] },
+  { label: "사고·감사", requiredHeadings: ["운영 사고", "감사 이벤트"] },
+  { label: "기술 로그", requiredHeadings: ["기술 로그"] },
+  { label: "설정·진단", requiredHeadings: ["Secret 보호 상태", "설정·Runtime 자체 검사"] },
+];
+const expectedNavigationLabels = tabs.map((tab) => tab.label);
 const issues = [];
 const views = [];
 const browser = await chromium.launch(chromePath
@@ -34,8 +45,25 @@ try {
       issues.push(`${viewport.name}: sidebar numeric badges are still visible`);
     }
 
+    const navigationLabels = await page.locator(".nav-item").allTextContents();
+    const normalizedNavigationLabels = navigationLabels.map((label) => label.trim());
+    if (JSON.stringify(normalizedNavigationLabels) !== JSON.stringify(expectedNavigationLabels)) {
+      issues.push(`${viewport.name}: navigation must contain exactly the 9 operational menus (${normalizedNavigationLabels.join(", ")})`);
+    }
+
+    const environmentBar = page.locator('[aria-label="LIVE 환경 및 안전 상태"]');
+    if (await environmentBar.count() !== 1 || !await environmentBar.isVisible()) {
+      issues.push(`${viewport.name}: persistent LIVE environment bar is missing`);
+    } else {
+      for (const requiredLabel of ["LIVE · 실계좌", "현재 Deployment", "실거래 잠금", "신규 진입", "위험 증가 주문", "Broker 전송", "전역 Kill"]) {
+        if (!await environmentBar.getByText(requiredLabel, { exact: true }).count()) {
+          issues.push(`${viewport.name}: LIVE environment bar is missing '${requiredLabel}'`);
+        }
+      }
+    }
+
     for (const tab of tabs) {
-      await page.getByRole("button", { name: new RegExp(`^${tab}\\d*$`) }).click();
+      await page.getByRole("button", { name: tab.label, exact: true }).first().click();
       await page.waitForTimeout(150);
       const layout = await page.evaluate(() => {
         const root = document.documentElement;
@@ -86,48 +114,47 @@ try {
           escapedControlBoxes,
         };
       });
-      if (layout.documentOverflow) issues.push(`${viewport.name}/${tab}: document horizontal overflow`);
-      if (layout.workspaceOverflow) issues.push(`${viewport.name}/${tab}: workspace horizontal overflow`);
-      if (!layout.pageTextLength) issues.push(`${viewport.name}/${tab}: empty page view`);
+      if (layout.documentOverflow) issues.push(`${viewport.name}/${tab.label}: document horizontal overflow`);
+      if (layout.workspaceOverflow) issues.push(`${viewport.name}/${tab.label}: workspace horizontal overflow`);
+      if (!layout.pageTextLength) issues.push(`${viewport.name}/${tab.label}: empty page view`);
       if (layout.escapedControls.length) {
-        issues.push(`${viewport.name}/${tab}: controls outside viewport (${layout.escapedControls.join(", ")})`);
+        issues.push(`${viewport.name}/${tab.label}: controls outside viewport (${layout.escapedControls.join(", ")})`);
       }
-      if (tab === "사전점검" && await page.getByText("포지션·계좌 대조 요약", { exact: true }).count()) {
-        issues.push(`${viewport.name}/${tab}: legacy reconciliation summary is still visible`);
+
+      const currentPageTitle = (await page.locator(".topbar-title-block strong").textContent())?.trim();
+      if (currentPageTitle !== tab.label) {
+        issues.push(`${viewport.name}/${tab.label}: topbar title is '${currentPageTitle || "missing"}'`);
       }
-      if (tab === "계좌·포지션") {
-        if (!await page.getByRole("heading", { name: "계좌 자본·포지션 노출", exact: true }).count()) {
-          issues.push(`${viewport.name}/${tab}: account allocation visualization is missing`);
+      for (const heading of tab.requiredHeadings) {
+        if (!await page.getByRole("heading", { name: heading, exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: required section '${heading}' is missing`);
         }
-        if (!await page.getByRole("heading", { name: "내 계좌·보유 포지션", exact: true }).count()) {
-          issues.push(`${viewport.name}/${tab}: account workspace is missing`);
+      }
+
+      if (tab.label === "운영 현황" && await page.getByText("포지션·계좌 대조 요약", { exact: true }).count()) {
+        issues.push(`${viewport.name}/${tab.label}: legacy reconciliation summary is still visible`);
+      }
+      if (tab.label === "계좌·포지션") {
+        if (!await page.getByRole("heading", { name: "계좌 자본·포지션 노출", exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: account allocation visualization is missing`);
         }
         if (!await page.getByText("10초 자동 갱신·대조", { exact: true }).count()) {
-          issues.push(`${viewport.name}/${tab}: automatic refresh/reconciliation label is missing`);
+          issues.push(`${viewport.name}/${tab.label}: automatic refresh/reconciliation label is missing`);
         }
         if (!await page.getByRole("button", { name: "현재 계좌를 기준 원장으로 승인", exact: true }).count()) {
-          issues.push(`${viewport.name}/${tab}: explicit program-ledger baseline action is missing`);
+          issues.push(`${viewport.name}/${tab.label}: explicit program-ledger baseline action is missing`);
         }
       }
-      if (tab === "설정" && viewport.desktopScale <= 1.25) {
-        const compactSettings = await page.evaluate(() => {
-          const appearance = document.querySelector(".appearance-panel")?.getBoundingClientRect();
-          const telegram = document.querySelector(".telegram-settings-panel")?.getBoundingClientRect();
-          const controls = [...document.querySelectorAll(".appearance-panel > .settings-control-group")]
-            .map((element) => element.getBoundingClientRect());
-          return {
-            topPanelsShareRow: Boolean(appearance && telegram && Math.abs(appearance.top - telegram.top) <= 2),
-            appearanceControlsShareRow: controls.length >= 2 && Math.abs(controls[0].top - controls[1].top) <= 2,
-          };
-        });
-        if (!compactSettings.topPanelsShareRow) {
-          issues.push(`${viewport.name}/${tab}: appearance and Telegram panels do not share the compact row`);
-        }
-        if (!compactSettings.appearanceControlsShareRow) {
-          issues.push(`${viewport.name}/${tab}: mode and accent controls do not share the compact row`);
-        }
+      if (tab.label === "주문·체결" && !await page.getByText("Client Order ID", { exact: true }).count()) {
+        issues.push(`${viewport.name}/${tab.label}: idempotent order identifier column is missing`);
       }
-      views.push({ viewport: viewport.name, desktopScale: viewport.desktopScale, tab, ...layout });
+      if (tab.label === "사고·감사" && !await page.getByText(/append-only 원장/).count()) {
+        issues.push(`${viewport.name}/${tab.label}: immutable audit guidance is missing`);
+      }
+      if (tab.label === "리스크·안전" && !await page.getByText(/주문 POST 재전송을 분리/).count()) {
+        issues.push(`${viewport.name}/${tab.label}: retry safety contract is missing`);
+      }
+      views.push({ viewport: viewport.name, desktopScale: viewport.desktopScale, tab: tab.label, ...layout });
     }
 
     if (consoleErrors.length) issues.push(`${viewport.name}: console errors (${consoleErrors.join(" | ")})`);

@@ -100,6 +100,47 @@ class LiveTelegramAuditAlertTests(unittest.TestCase):
 
         self.assertEqual("주문 취소 실패", state.STATE["audit"][-1]["event"])
 
+    def test_audit_and_telegram_mask_credentials_but_keep_order_ids(self) -> None:
+        secrets = {
+            "BINANCE_API_KEY": "binance-secret-value",
+            "KIS_ACCOUNT_NO": "12345678",
+            "TELEGRAM_BOT_TOKEN": "123456:telegram-secret",
+        }
+        detail = (
+            "api_secret=inline-secret Authorization: Bearer bearer-secret "
+            "KIS_ACCOUNT_NO=12345678 "
+            "https://api.telegram.org/bot123456:telegram-secret/sendMessage "
+            "order_id=ord-live-1 client_order_id=client-123"
+        )
+        with mock.patch.dict(os.environ, secrets, clear=False), mock.patch.object(
+            state,
+            "persist_audit_event",
+        ) as persist, mock.patch.object(
+            state.TELEGRAM_DISPATCHER,
+            "send_async",
+            return_value=True,
+        ) as send:
+            state.append_audit("error", "주문 취소 실패", detail)
+
+        rendered = "\n".join(
+            (
+                state.STATE["audit"][-1]["detail"],
+                persist.call_args.args[0].message,
+                send.call_args.args[0],
+                send.call_args.kwargs["dedupe_key"],
+            )
+        )
+        for secret in (
+            "inline-secret",
+            "bearer-secret",
+            "12345678",
+            "123456:telegram-secret",
+            "binance-secret-value",
+        ):
+            self.assertNotIn(secret, rendered)
+        self.assertIn("order_id=ord-live-1", rendered)
+        self.assertIn("client_order_id=client-123", rendered)
+
     def test_missing_checkpoint_fails_closed_and_queues_startup_warning_once(self) -> None:
         state.STATE.update({"mode": "FULL_LIVE", "dry_run": False, "new_entries_blocked": False})
         with tempfile.TemporaryDirectory() as temporary:

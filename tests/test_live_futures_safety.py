@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -167,72 +168,74 @@ class LiveFuturesSafetyTests(unittest.TestCase):
             (RiskCheck("base", "pass", "ok"),),
         )
         checks = {"strategies": [futures_strategy()], "watchdog": {}}
-        previous_positions = list(
-            state.STATE.get("broker_reconciliation", {}).get(
-                "positions",
-                [],
-            )
+        previous_reconciliation = copy.deepcopy(
+            state.STATE.get("broker_reconciliation", {})
         )
-        state.STATE.setdefault("broker_reconciliation", {})[
-            "positions"
-        ] = [
-            {
-                "broker_id": "binance-futures",
-                "symbol": "ETHUSDT",
-                "quantity": -0.2,
-                "position_side": "SHORT",
-            }
-        ]
-        with (
-            patch.object(
-                state.PreTradeRiskGate,
-                "evaluate",
-                return_value=passing,
-            ),
-            patch.object(state, "pre_trade_context", return_value=None),
-            patch.object(
-                state,
-                "portfolio_gate_for_intent",
-                return_value={"active": False},
-            ),
-            patch.object(
-                state,
-                "_binance_futures_live_order_risk",
-                return_value={
-                    "blockers": [
-                        "protective-stop-order-not-implemented"
-                    ],
-                    "warnings": [],
-                },
-            ) as guard,
-        ):
-            blocked = state.evaluate_order_gate_with_report(
-                checks,
-                "SELL",
-                False,
-                futures_intent(),
-            )
-            reducing = state.evaluate_order_gate_with_report(
-                checks,
-                "BUY",
-                False,
-                futures_intent(risk_reducing=True, side="BUY"),
-            )
-            forged_reducing = state.evaluate_order_gate_with_report(
-                checks,
-                "SELL",
-                False,
-                futures_intent(risk_reducing=True, side="SELL"),
-            )
+        state.STATE["broker_reconciliation"] = {
+            "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "accounts": [],
+            "positions": [
+                {
+                    "broker_id": "binance-futures",
+                    "symbol": "ETHUSDT",
+                    "quantity": -0.2,
+                    "position_side": "SHORT",
+                }
+            ],
+            "errors": [],
+            "successful_account_brokers": [],
+            "successful_position_brokers": ["binance-futures"],
+        }
+        try:
+            with (
+                patch.object(
+                    state.PreTradeRiskGate,
+                    "evaluate",
+                    return_value=passing,
+                ),
+                patch.object(state, "pre_trade_context", return_value=None),
+                patch.object(
+                    state,
+                    "portfolio_gate_for_intent",
+                    return_value={"active": False},
+                ),
+                patch.object(
+                    state,
+                    "_binance_futures_live_order_risk",
+                    return_value={
+                        "blockers": [
+                            "protective-stop-order-not-implemented"
+                        ],
+                        "warnings": [],
+                    },
+                ) as guard,
+            ):
+                blocked = state.evaluate_order_gate_with_report(
+                    checks,
+                    "SELL",
+                    False,
+                    futures_intent(),
+                )
+                reducing = state.evaluate_order_gate_with_report(
+                    checks,
+                    "BUY",
+                    False,
+                    futures_intent(risk_reducing=True, side="BUY"),
+                )
+                forged_reducing = state.evaluate_order_gate_with_report(
+                    checks,
+                    "SELL",
+                    False,
+                    futures_intent(risk_reducing=True, side="SELL"),
+                )
+        finally:
+            state.STATE["broker_reconciliation"] = previous_reconciliation
 
         self.assertFalse(blocked[0])
         self.assertEqual("risk_blocked", blocked[1])
         self.assertTrue(reducing[0])
         self.assertFalse(forged_reducing[0])
         self.assertEqual(2, guard.call_count)
-        state.STATE["broker_reconciliation"][
-            "positions"
-        ] = previous_positions
 
     def test_soak_acceptance_requires_scope_duration_and_freshness(self) -> None:
         scope = {

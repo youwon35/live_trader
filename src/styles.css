@@ -6716,3 +6716,1110 @@ body {
     grid-column: auto;
   }
 }
+
+/* --------------------------------------------------------------------------
+ * LIVE operations workspace
+ *
+ * The shared console stylesheet intentionally keeps every trading app very
+ * compact. Live Trader needs a little more legibility and a persistent,
+ * unmistakable production context without turning routine blockers into an
+ * all-red incident wall. These selectors are scoped to this app only.
+ * -------------------------------------------------------------------------- */
+
+:root[data-program="live-trader"] {
+  --live-environment: #f97316;
+  --live-environment-strong: #c2410c;
+  --live-environment-soft: color-mix(in srgb, var(--live-environment) 10%, var(--panel));
+  --live-environment-border: color-mix(in srgb, var(--live-environment) 58%, var(--border));
+  --ts-console-sidebar-width: 188px;
+  --ts-console-control-height: 34px;
+  --ts-console-body-size: 14px;
+  --ts-console-label-size: 12px;
+  --ts-console-caption-size: 11px;
+  --ts-console-panel-header-height: 44px;
+}
+
+:root[data-program="live-trader"] body {
+  min-width: 320px;
+  font-size: 14px;
+}
+
+:root[data-program="live-trader"] .app-shell {
+  grid-template-columns: var(--ts-console-sidebar-width) minmax(0, 1fr) !important;
+}
+
+:root[data-program="live-trader"] .workspace {
+  position: relative;
+  isolation: isolate;
+  align-content: start;
+  gap: 7px !important;
+  overflow: clip visible;
+}
+
+:root[data-program="live-trader"] .workspace::before {
+  position: fixed;
+  right: clamp(20px, 4vw, 72px);
+  bottom: clamp(16px, 4vh, 54px);
+  z-index: 0;
+  color: color-mix(in srgb, var(--live-environment) 4%, transparent);
+  font-family: var(--ts-console-font);
+  font-size: clamp(88px, 13vw, 230px);
+  font-weight: 900;
+  line-height: 0.8;
+  letter-spacing: -0.08em;
+  content: "LIVE";
+  pointer-events: none;
+  user-select: none;
+}
+
+:root[data-program="live-trader"] .workspace > :not(.topbar):not(.live-environment-bar) {
+  position: relative;
+  z-index: 1;
+}
+
+:root[data-program="live-trader"] .sidebar {
+  gap: 8px !important;
+  padding: 10px 8px !important;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+:root[data-program="live-trader"] .brand-block {
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 4px 7px;
+  border-bottom: 1px solid var(--border);
+}
+
+:root[data-program="live-trader"] .brand-block .brand-mark {
+  color: #fff;
+  background: var(--live-environment-strong) !important;
+  border-color: var(--live-environment-border) !important;
+}
+
+:root[data-program="live-trader"] .brand-block > div:last-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+:root[data-program="live-trader"] .brand-block strong {
+  overflow: hidden;
+  font-size: 13.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:root[data-program="live-trader"] .brand-block span.brand-environment {
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+  min-height: 17px;
+  margin: 0;
+  padding: 1px 6px;
+  color: #fff;
+  background: var(--live-environment-strong);
+  border: 1px solid var(--live-environment-border);
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 850;
+  line-height: 1;
+  letter-spacing: 0.08em;
+}
+
+:root[data-program="live-trader"] .nav-list {
+  gap: 2px !important;
+}
+
+:root[data-program="live-trader"] .nav-list .nav-group {
+  gap: 2px;
+  margin-top: 4px;
+}
+
+:root[data-program="live-trader"] .nav-group-label {
+  min-height: 17px;
+  padding-inline: 8px;
+  font-size: 10px;
+  line-height: 17px;
+}
+
+:root[data-program="live-trader"] .nav-item {
+  min-height: 36px !important;
+}
+
+:root[data-program="live-trader"] .nav-item span {
+  font-size: 13px !important;
+}
+
+:root[data-program="live-trader"] .sidebar-footer {
+  min-height: 38px;
+  padding: 6px 7px;
+  background: var(--panel) !important;
+}
+
+:root[data-program="live-trader"] .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 42;
+  min-height: 48px;
+  padding: 3px 2px;
+  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+:root[data-program="live-trader"] .topbar-title-block {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+:root[data-program="live-trader"] .topbar-title-block > span {
+  color: var(--live-environment);
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1.1;
+  letter-spacing: 0.08em;
+}
+
+:root[data-program="live-trader"] .topbar-title-block > strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 20px;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:root[data-program="live-trader"] .topbar-actions {
+  flex-wrap: wrap;
+}
+
+:root[data-program="live-trader"] .topbar-actions > .status-pill {
+  min-height: 23px;
+  font-size: 10px !important;
+}
+
+:root[data-program="live-trader"] .topbar-actions .emergency-stop-button {
+  min-height: 36px !important;
+}
+
+:root[data-program="live-trader"] .live-environment-bar {
+  position: sticky;
+  top: 54px;
+  z-index: 36;
+  display: grid;
+  grid-template-columns: minmax(500px, 1.15fr) minmax(520px, 0.85fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px;
+  background:
+    linear-gradient(100deg, color-mix(in srgb, var(--live-environment) 11%, var(--panel)) 0%, var(--panel) 46%, var(--panel) 100%);
+  border: 1px solid var(--live-environment-border);
+  border-left: 5px solid var(--live-environment);
+  border-radius: 8px;
+  box-shadow: 0 7px 18px color-mix(in srgb, #000 20%, transparent);
+}
+
+:root[data-program="live-trader"] .live-environment-identity {
+  display: grid;
+  grid-template-columns: auto minmax(230px, 1fr) minmax(210px, 0.8fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+:root[data-program="live-trader"] .live-environment-badge {
+  display: inline-flex;
+  align-items: center;
+  align-self: stretch;
+  justify-content: center;
+  min-width: 92px;
+  padding: 5px 9px;
+  color: #fff;
+  background: var(--live-environment-strong);
+  border: 1px solid color-mix(in srgb, #fff 22%, var(--live-environment-strong));
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.1;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+:root[data-program="live-trader"] .live-environment-identity label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+:root[data-program="live-trader"] .live-environment-identity label > span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+:root[data-program="live-trader"] .live-environment-identity select {
+  width: 100%;
+  min-width: 0;
+  min-height: 34px !important;
+  font-size: 13px !important;
+}
+
+:root[data-program="live-trader"] .live-context-meta {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  padding-left: 8px;
+  border-left: 1px solid var(--live-environment-border);
+}
+
+:root[data-program="live-trader"] .live-context-meta > :is(strong, span) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:root[data-program="live-trader"] .live-context-meta strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+:root[data-program="live-trader"] .live-context-meta span {
+  color: var(--text-muted);
+  font-family: var(--ts-console-mono);
+  font-size: 11px;
+}
+
+:root[data-program="live-trader"] .live-safety-hierarchy {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(86px, 1fr));
+  gap: 5px;
+  min-width: 0;
+}
+
+:root[data-program="live-trader"] .live-safety-hierarchy > div {
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 3px;
+  min-width: 0;
+  min-height: 42px;
+  padding: 5px 6px;
+  background: color-mix(in srgb, var(--panel-raised) 88%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+:root[data-program="live-trader"] .live-safety-hierarchy > div > span:first-child {
+  overflow: hidden;
+  width: 100%;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:root[data-program="live-trader"] .live-safety-hierarchy .status-pill {
+  max-width: 100%;
+  min-height: 20px;
+  font-size: 9.5px !important;
+}
+
+/* Minimum readable UI sizes. Dense means less unused space, not tiny text. */
+:root[data-program="live-trader"] main :is(.panel, .app-card) {
+  font-size: 13px;
+}
+
+:root[data-program="live-trader"] main .panel-header {
+  min-height: 44px;
+  padding: 6px 10px !important;
+}
+
+:root[data-program="live-trader"] main .panel-header h2 {
+  font-size: 13.5px !important;
+  line-height: 1.25;
+}
+
+:root[data-program="live-trader"] main .panel-header p {
+  display: block !important;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 12px !important;
+  line-height: 1.3;
+}
+
+:root[data-program="live-trader"] main :is(input, select, textarea) {
+  min-height: 34px;
+  font-size: 13px !important;
+}
+
+:root[data-program="live-trader"] main :is(
+  .ts-action-button[data-ts-action-component="true"],
+  .ts-ui-button,
+  .icon-button,
+  .primary-button,
+  .secondary-button,
+  .danger-button,
+  .ghost-button,
+  .mini-button,
+  .compact-button
+) {
+  min-height: 34px !important;
+  font-size: 12.5px !important;
+}
+
+:root[data-program="live-trader"] main .icon-button {
+  min-width: 34px;
+}
+
+:root[data-program="live-trader"] main th {
+  height: 34px;
+  padding: 6px 8px !important;
+  font-size: 12px !important;
+  letter-spacing: 0.02em;
+}
+
+:root[data-program="live-trader"] main td {
+  padding: 6px 8px !important;
+  font-size: 12.5px !important;
+  line-height: 1.35;
+}
+
+:root[data-program="live-trader"] main .status-pill {
+  min-height: 22px;
+  padding-inline: 7px;
+  font-size: 10px !important;
+}
+
+:root[data-program="live-trader"] main :is(.ts-status-card__title, .ts-status-row__title) {
+  font-size: 13px !important;
+}
+
+:root[data-program="live-trader"] main :is(.ts-status-card__detail, .ts-status-row__detail) {
+  font-size: 12px !important;
+  line-height: 1.35;
+}
+
+:root[data-program="live-trader"] .page-view,
+:root[data-program="live-trader"] :is(
+  .operations-overview-layout,
+  .accounts-page-layout,
+  .order-execution-layout,
+  .incident-audit-layout,
+  .audit-page-layout
+) {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  min-width: 0;
+}
+
+:root[data-program="live-trader"] .page-view {
+  padding: 0 0 18px;
+}
+
+:root[data-program="live-trader"] .content-column {
+  align-content: start;
+  min-width: 0;
+}
+
+:root[data-program="live-trader"] .workspace.layout-locked .panel {
+  min-height: 0;
+  padding: 9px !important;
+}
+
+:root[data-program="live-trader"] .workspace.layout-locked .panel-header {
+  margin: -9px -9px 8px;
+}
+
+.deployment-context-grid,
+.credential-status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.deployment-context-grid > div,
+.credential-status-grid > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 7px 8px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.deployment-context-grid :is(span, small),
+.credential-status-grid :is(span, small) {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+}
+
+.deployment-context-grid strong,
+.credential-status-grid strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13.5px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preflight-scope-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.preflight-scope-grid > article {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-width: 0;
+  padding: 7px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.preflight-scope-grid > article > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+}
+
+.preflight-scope-grid > article > header strong {
+  font-size: 13px;
+}
+
+.preflight-scope-grid .status-row,
+.runtime-component-list .status-row {
+  min-height: 42px;
+  padding: 6px 7px;
+}
+
+.inventory-scope-card p {
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.inventory-scope-card > span {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.runtime-component-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.three-way-flow {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto minmax(180px, 1fr) auto minmax(180px, 1fr) auto minmax(180px, 1fr);
+  align-items: stretch;
+  gap: 5px;
+  min-width: 0;
+}
+
+.three-way-flow > span {
+  display: grid;
+  place-items: center;
+  color: var(--live-environment);
+  font-size: 17px;
+  font-weight: 900;
+}
+
+.three-way-flow .ts-status-card {
+  align-content: center;
+  min-height: 76px;
+  padding: 8px !important;
+}
+
+.order-ledger-table-wrap {
+  max-height: min(420px, 50vh);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.order-ledger-table {
+  min-width: 1180px;
+}
+
+.order-ledger-table tbody tr {
+  cursor: pointer;
+}
+
+.order-ledger-table tbody tr:hover td {
+  background: color-mix(in srgb, var(--primary) 6%, var(--panel));
+}
+
+.order-ledger-table tbody tr.is-selected td {
+  background: color-mix(in srgb, var(--primary) 12%, var(--panel));
+  box-shadow: inset 0 1px color-mix(in srgb, var(--primary) 30%, transparent), inset 0 -1px color-mix(in srgb, var(--primary) 30%, transparent);
+}
+
+.order-detail-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) !important;
+}
+
+.order-timeline {
+  position: relative;
+  display: grid;
+  gap: 0;
+  min-width: 0;
+}
+
+.order-timeline > div {
+  position: relative;
+  display: grid;
+  grid-template-columns: 142px minmax(120px, 0.5fr) minmax(0, 1fr);
+  gap: 9px;
+  min-width: 0;
+  padding: 7px 7px 7px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.order-timeline > div::before {
+  position: absolute;
+  top: 12px;
+  left: 5px;
+  width: 7px;
+  height: 7px;
+  background: var(--primary);
+  border: 2px solid var(--panel);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px var(--primary-border);
+  content: "";
+}
+
+.order-timeline > div > span {
+  color: var(--text-muted);
+  font-family: var(--ts-console-mono);
+  font-size: 12px;
+}
+
+.order-timeline > div > strong {
+  font-size: 13px;
+}
+
+.order-timeline > div > small {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fill-ledger-panel .compact-list {
+  max-height: 300px;
+  overflow: auto;
+}
+
+.execution-quality-panel {
+  margin-top: 7px;
+}
+
+.risk-usage-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.risk-usage-list > article {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.risk-usage-list article > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+}
+
+.risk-usage-list article > header :is(strong, span) {
+  font-size: 13px;
+}
+
+.risk-usage-list article > header span,
+.risk-usage-list article > small {
+  color: var(--text-muted);
+}
+
+.risk-usage-track {
+  position: relative;
+  height: 7px;
+  overflow: hidden;
+  background: var(--panel-strong);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.risk-usage-track > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--success-base), var(--warning-base) 72%, var(--danger-base));
+  border-radius: inherit;
+}
+
+.retry-matrix-panel .table-scroll {
+  max-height: 340px;
+}
+
+.incident-list {
+  display: grid;
+  gap: 6px;
+}
+
+.incident-row {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.25fr) minmax(360px, 0.75fr);
+  gap: 12px;
+  min-width: 0;
+  padding: 9px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--danger-base);
+  border-radius: 6px;
+}
+
+.incident-row > div:first-child {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-content: start;
+  align-items: center;
+  gap: 4px 7px;
+  min-width: 0;
+}
+
+.incident-row > div:first-child > span:last-child {
+  grid-column: 2;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.incident-row dl {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px;
+  margin: 0;
+}
+
+.incident-row dl > div {
+  display: grid;
+  align-content: center;
+  gap: 2px;
+  min-width: 0;
+  padding: 5px 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.incident-row :is(dt, dd) {
+  overflow: hidden;
+  margin: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.incident-row dt {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.incident-row dd {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.audit-event-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+  max-height: min(520px, 58vh);
+  overflow: auto;
+}
+
+.audit-event-grid > article {
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  min-width: 0;
+  padding: 7px 8px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.audit-event-grid article > span,
+.audit-event-grid article > small {
+  color: var(--text-muted);
+  font-family: var(--ts-console-mono);
+  font-size: 11px;
+}
+
+.audit-event-grid article > strong {
+  font-size: 13px;
+}
+
+.audit-event-grid article > p {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 12px;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.doctor-history-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.8fr) minmax(0, 1.2fr) auto;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+}
+
+.doctor-history-row > span:not(.status-pill) {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* Routine readiness blockers remain neutral cards. Semantic colour is carried
+   by their badge/left rule; a full danger fill is reserved for active incidents. */
+:root[data-program="live-trader"] body .portfolio-artifact-item.ts-semantic-surface[data-tone],
+:root[data-program="live-trader"] body .promotion-readiness-row.ts-semantic-surface[data-tone] {
+  --status-surface-text: var(--text);
+  --status-surface-text-soft: var(--text-muted);
+  --status-surface-text-muted: var(--text-muted);
+  color: var(--text) !important;
+  background: var(--panel-raised) !important;
+  border-color: var(--border) !important;
+  border-left-width: 3px !important;
+}
+
+:root[data-program="live-trader"] body .portfolio-artifact-item.ts-semantic-surface[data-tone="danger"],
+:root[data-program="live-trader"] body .promotion-readiness-row.ts-semantic-surface[data-tone="danger"] {
+  border-left-color: var(--danger-base) !important;
+}
+
+:root[data-program="live-trader"] body .portfolio-artifact-item.ts-semantic-surface[data-tone="warning"],
+:root[data-program="live-trader"] body .promotion-readiness-row.ts-semantic-surface[data-tone="warning"] {
+  border-left-color: var(--warning-base) !important;
+}
+
+:root[data-program="live-trader"] body .portfolio-artifact-item.ts-semantic-surface[data-tone="success"],
+:root[data-program="live-trader"] body .promotion-readiness-row.ts-semantic-surface[data-tone="success"] {
+  border-left-color: var(--success-base) !important;
+}
+
+:root[data-program="live-trader"] :is(
+  .portfolio-artifact-item.ts-semantic-surface[data-tone],
+  .promotion-readiness-row.ts-semantic-surface[data-tone]
+) :is(strong, b) {
+  color: var(--text) !important;
+}
+
+:root[data-program="live-trader"] :is(
+  .portfolio-artifact-item.ts-semantic-surface[data-tone],
+  .promotion-readiness-row.ts-semantic-surface[data-tone]
+) :is(p, span:not(.status-pill):not(.status-pill-text), small, em) {
+  color: var(--text-muted) !important;
+}
+
+@media (max-width: 1599px) {
+  :root[data-program="live-trader"] .live-environment-bar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  :root[data-program="live-trader"] .live-safety-hierarchy {
+    grid-template-columns: repeat(5, minmax(110px, 1fr));
+  }
+
+  .three-way-flow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .three-way-flow > span {
+    display: none;
+  }
+
+  .incident-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 1279px) {
+  :root[data-program="live-trader"] {
+    --ts-console-sidebar-width: 176px;
+  }
+
+  :root[data-program="live-trader"] .live-environment-identity {
+    grid-template-columns: auto minmax(220px, 1fr);
+  }
+
+  :root[data-program="live-trader"] .live-context-meta {
+    grid-column: 1 / -1;
+    grid-template-columns: minmax(160px, auto) minmax(0, 1fr) minmax(170px, auto);
+    padding: 5px 0 0;
+    border-top: 1px solid var(--live-environment-border);
+    border-left: 0;
+  }
+
+  .deployment-context-grid,
+  .credential-status-grid,
+  .preflight-scope-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .preflight-scope-grid > article:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .runtime-component-list,
+  .risk-usage-list,
+  .audit-event-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .order-detail-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+}
+
+@media (max-width: 920px) {
+  :root[data-program="live-trader"] .topbar {
+    align-items: flex-start;
+  }
+
+  :root[data-program="live-trader"] .topbar-actions {
+    max-width: 62%;
+  }
+
+  :root[data-program="live-trader"] .live-safety-hierarchy {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .incident-row dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  :root[data-program="live-trader"] .app-shell {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  :root[data-program="live-trader"] .sidebar {
+    position: relative;
+    height: auto;
+    max-height: none;
+  }
+
+  :root[data-program="live-trader"] .topbar,
+  :root[data-program="live-trader"] .live-environment-bar {
+    position: relative;
+    top: auto;
+  }
+
+  :root[data-program="live-trader"] .topbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  :root[data-program="live-trader"] .topbar-actions {
+    justify-content: flex-start;
+    max-width: none;
+  }
+
+  :root[data-program="live-trader"] .live-environment-identity,
+  :root[data-program="live-trader"] .live-environment-identity label,
+  :root[data-program="live-trader"] .live-context-meta,
+  :root[data-program="live-trader"] .live-safety-hierarchy,
+  .deployment-context-grid,
+  .credential-status-grid,
+  .preflight-scope-grid,
+  .runtime-component-list,
+  .three-way-flow,
+  .risk-usage-list,
+  .audit-event-grid,
+  .incident-row dl,
+  .doctor-history-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .preflight-scope-grid > article:last-child,
+  :root[data-program="live-trader"] .live-context-meta {
+    grid-column: auto;
+  }
+
+  :root[data-program="live-trader"] .live-environment-badge {
+    min-height: 34px;
+  }
+
+  .order-timeline > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+    padding-left: 19px;
+  }
+
+  .incident-row > div:first-child > span:last-child {
+    grid-column: 1 / -1;
+  }
+}
+
+.audit-log-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(270px, 340px);
+  gap: 10px;
+  min-width: 0;
+}
+
+.deployment-promotion-layout {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.deployment-manifest-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 10px 12px 12px;
+}
+
+.deployment-manifest-grid > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--panel-raised);
+}
+
+.deployment-manifest-grid span,
+.deployment-manifest-grid small {
+  color: var(--text-muted);
+}
+
+.deployment-manifest-grid strong,
+.deployment-manifest-grid small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.incident-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.incident-projection-note {
+  display: block;
+  padding-top: 8px;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+}
+
+.audit-log-detail {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-raised);
+}
+
+.audit-log-detail h3,
+.audit-log-detail p {
+  margin: 0;
+}
+
+.audit-log-detail p {
+  margin-top: 8px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.audit-log-detail dl {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+}
+
+.audit-log-detail dl > div {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.audit-log-detail dt {
+  color: var(--text-muted);
+}
+
+.audit-log-detail dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.audit-log-detail pre {
+  max-height: 260px;
+  margin: 12px 0 0;
+  padding: 10px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--panel-strong);
+  white-space: pre-wrap;
+}
+
+.logs-table tbody tr {
+  cursor: pointer;
+}
+
+.logs-table tbody tr.is-selected td {
+  background: color-mix(in srgb, var(--primary) 9%, var(--panel));
+}
+
+@media (max-width: 1279px) {
+  .audit-log-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .deployment-manifest-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .deployment-manifest-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

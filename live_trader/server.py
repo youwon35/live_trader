@@ -279,7 +279,10 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             self.send_json(state.stop_execution_streams())
             return
         if parsed.path == "/api/preflight":
-            self.send_json(state.run_final_preflight())
+            self.send_json(state.run_final_preflight(
+                str(payload.get("deployment_id", "")),
+                str(payload.get("strategy_id", "")),
+            ))
             return
         if parsed.path == "/api/upbit-smoke-preview":
             self.send_json(
@@ -402,6 +405,8 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 str(payload.get("profile_id", "stock")),
                 str(payload.get("mode", "MONITOR")),
                 str(payload.get("portfolio_id", "")),
+                str(payload.get("deployment_id", "")),
+                str(payload.get("strategy_id", "")),
             ))
             return
         if parsed.path == "/api/runtime/stop":
@@ -415,6 +420,15 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/watchdog":
             self.send_json(state.run_watchdog())
+            return
+        if parsed.path == "/api/incidents/transition":
+            self.send_json(
+                state.transition_operational_incident(
+                    payload.get("incident_id", ""),
+                    payload.get("action", ""),
+                    payload.get("note", ""),
+                )
+            )
             return
         if parsed.path == "/api/ui-settings":
             self.send_json({"ok": True, "settings": write_ui_settings(payload)})
@@ -453,8 +467,13 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
-            settings = env_settings.save_env_settings(payload.get("values", {}) if isinstance(payload.get("values"), dict) else payload)
-            self.send_json({"ok": True, "settings": settings, "snapshot": state.snapshot()})
+            self.send_json(
+                state.save_environment_settings(
+                    payload.get("values", {})
+                    if isinstance(payload.get("values"), dict)
+                    else payload
+                )
+            )
             return
         self.send_error(404, "Unknown API endpoint")
 

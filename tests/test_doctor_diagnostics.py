@@ -269,8 +269,8 @@ class DoctorDiagnosticsTests(unittest.TestCase):
                 for item in state.risk_checks(reconciliation)
             }
 
-        self.assertEqual("pass", checks["데이터 지연"]["status"])
-        self.assertEqual("MONITOR", checks["데이터 지연"]["value"])
+        self.assertEqual("na", checks["데이터 지연"]["status"])
+        self.assertEqual("해당 없음", checks["데이터 지연"]["value"])
 
     def test_inactive_monitor_watchdog_has_no_periodic_readiness_warnings(self) -> None:
         brokers_snapshot = [
@@ -311,11 +311,35 @@ class DoctorDiagnosticsTests(unittest.TestCase):
             item["label"]: item
             for item in report["checks"]
         }
-        self.assertEqual("pass", checks["Watchdog heartbeat"]["status"])
-        self.assertEqual("pass", checks["시장 데이터 신선도"]["status"])
-        self.assertEqual("pass", checks["브로커/API 상태"]["status"])
+        for label in (
+            "Watchdog heartbeat",
+            "시장 데이터 신선도",
+            "브로커/API 상태",
+            "체결 이벤트 동기화",
+        ):
+            self.assertEqual("na", checks[label]["status"])
+            self.assertEqual("해당 없음", checks[label]["value"])
+        self.assertEqual("na", report["status"])
+        self.assertEqual("비활성", report["status_label"])
+        self.assertEqual(8, report["check_count"])
+        self.assertEqual(4, report["pass_count"])
+        self.assertEqual(4, report["not_applicable_count"])
         self.assertEqual(0, report["warning_count"])
         self.assertEqual(0, report["critical_count"])
+
+    def test_retry_policy_matrix_never_replays_ambiguous_order_submit(self) -> None:
+        with patch.dict(
+            state.STATE["retry_policy"],
+            {"retry_on_network_error": True, "retry_on_rate_limit": True},
+        ):
+            rows = {row["key"]: row for row in state.retry_policy_matrix()}
+
+        self.assertTrue(rows["read_network_or_server_error"]["automatic_retry"])
+        self.assertTrue(rows["read_rate_limited"]["automatic_retry"])
+        self.assertFalse(rows["order_outcome_unknown"]["automatic_retry"])
+        self.assertTrue(rows["order_outcome_unknown"]["requires_idempotency_lookup"])
+        self.assertIn("POST", rows["order_outcome_unknown"]["next_action"])
+        self.assertFalse(rows["order_explicit_reject"]["automatic_retry"])
 
     def test_diagnostics_endpoint_returns_persisted_document(self) -> None:
         handler = object.__new__(LiveTraderHandler)

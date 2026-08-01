@@ -270,7 +270,11 @@ class OrderGateTest(unittest.TestCase):
         state.STATE["orders"] = [order]
 
         class FakeRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
             def cancel_order(self, broker_id, broker_order_id, **context):
+                self.calls += 1
                 self.called = (broker_id, broker_order_id, context)
                 return {"ok": True, "json": {"status": "CANCELED"}}
 
@@ -281,8 +285,103 @@ class OrderGateTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(("binance", "778899"), fake_router.called[:2])
         self.assertEqual("BTCUSDT", fake_router.called[2]["symbol"])
-        self.assertEqual("canceled", order["state"])
+        self.assertEqual("cancel_pending", order["state"])
+        self.assertEqual("reconcile_required", order["queue_state"])
+        self.assertTrue(result["reconciliation_required"])
+        self.assertTrue(order["cancel_request_id"].startswith("cancel-"))
         self.assertIn("broker_cancel_response", order)
+
+        duplicate = state.cancel_order("ord-live-1")
+        self.assertTrue(duplicate["ok"])
+        self.assertEqual(result["cancel_request_id"], duplicate["cancel_request_id"])
+        self.assertEqual(1, fake_router.calls)
+
+    def test_ambiguous_cancel_result_requires_reconciliation_without_resubmit(self) -> None:
+        order = {
+            "order_id": "ord-live-timeout",
+            "state": "acknowledged",
+            "queue_state": "submitted",
+            "dry_run": False,
+            "broker_id": "binance",
+            "broker_order_id": "778900",
+            "symbol": "BTCUSDT",
+            "asset": "crypto",
+            "qty": "0.01",
+            "broker_request": {"broker_id": "binance", "symbol": "BTCUSDT"},
+        }
+        state.STATE["orders"] = [order]
+
+        class TimeoutRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def cancel_order(self, *_args, **_kwargs):
+                self.calls += 1
+                raise TimeoutError("response lost")
+
+        router = TimeoutRouter()
+        with patch("live_trader.state.LiveBrokerRouter", return_value=router):
+            first = state.cancel_order("ord-live-timeout")
+            second = state.cancel_order("ord-live-timeout")
+
+        self.assertFalse(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertEqual(1, router.calls)
+        self.assertEqual("unknown_cancel_result", order["state"])
+        self.assertEqual("reconcile_required", order["queue_state"])
+        self.assertTrue(second["reconciliation_required"])
+
+    def test_fill_truth_wins_late_cancel_event(self) -> None:
+        order = {
+            "order_id": "ord-live-race",
+            "state": "cancel_pending",
+            "queue_state": "reconcile_required",
+            "cancel_request_id": "cancel-race",
+            "broker_id": "binance",
+            "broker_order_id": "778901",
+            "symbol": "BTCUSDT",
+            "asset": "crypto",
+            "qty": "0.01",
+            "filled_quantity": 0.0,
+            "average_fill_price": 0.0,
+            "fee": 0.0,
+        }
+        state.STATE["orders"] = [order]
+
+        filled = state.apply_execution_events_to_local_orders(
+            [
+                {
+                    "event_id": "fill-race-1",
+                    "broker_id": "binance",
+                    "broker_order_id": "778901",
+                    "state": "filled",
+                    "quantity": 0.01,
+                    "price": 65_000.0,
+                    "fee": 0.1,
+                    "raw": {},
+                }
+            ]
+        )
+        canceled = state.apply_execution_events_to_local_orders(
+            [
+                {
+                    "event_id": "cancel-race-2",
+                    "broker_id": "binance",
+                    "broker_order_id": "778901",
+                    "state": "canceled",
+                    "quantity": 0.0,
+                    "price": 0.0,
+                    "fee": 0.0,
+                    "raw": {},
+                }
+            ]
+        )
+
+        self.assertEqual(1, filled)
+        self.assertEqual(1, canceled)
+        self.assertEqual("filled", order["state"])
+        self.assertEqual("completed", order["queue_state"])
+        self.assertEqual("filled-truth-prevailed", order["cancel_reconciliation"])
 
     def test_strategy_market_data_uses_shared_canonical_event(self) -> None:
         strategy = {
@@ -1873,6 +1972,16 @@ class OrderGateTest(unittest.TestCase):
                     "running": True,
                     "phase": "RUNNING",
                     "lastHeartbeat": now.isoformat(),
+                    "lastDataAt": now.isoformat(),
+                    "engine": {
+                        "latestBars": {
+                            "strategy-1": {
+                                "endTime": now.isoformat(),
+                                "receivedTime": now.isoformat(),
+                                "timeframe": "1h",
+                            }
+                        }
+                    },
                 }
             }
         }

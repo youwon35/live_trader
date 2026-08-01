@@ -6,6 +6,7 @@ import html
 import hashlib
 import json
 import math
+import re
 import secrets
 import sqlite3
 import threading
@@ -90,12 +91,13 @@ from .contracts import (
     strategy_revalidation_status,
 )
 from .audit_store import SQLiteAuditEventStore
+from .operational_governance import OperationalGovernanceStore, stable_sha256 as governance_sha256
 from .account_risk import (
     broker_account_risk,
     load_account_risk_budget,
     update_account_risk_budget,
 )
-from .env_loader import default_runtime_data_root
+from .env_loader import LIVE_TRADER_SECRET_KEYS, default_runtime_data_root
 from .execution_streams import ExecutionStreamManager
 from .live_adapters import (
     BINANCE_BASE_URL,
@@ -135,7 +137,7 @@ from trading_runtime.telegram_notifications import (
 
 
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
-CheckStatus = Literal["pass", "warn", "fail"]
+CheckStatus = Literal["pass", "warn", "fail", "na"]
 LIVE_BROKER_DISPATCH_MODES = frozenset({"SMALL_LIVE", "FULL_LIVE"})
 RUNTIME_MODE_LOCK = threading.RLock()
 BINANCE_FUTURES_CANARY_LOCK = threading.RLock()
@@ -392,6 +394,7 @@ DOCTOR_DIAGNOSTIC_HISTORY_LIMIT = 50
 BROKER_SNAPSHOT_ACTIVE_INTERVAL_SECONDS = 30.0
 BROKER_SNAPSHOT_IDLE_INTERVAL_SECONDS = 300.0
 BROKER_SNAPSHOT_MAX_BACKOFF_SECONDS = 1800.0
+REDUCE_ONLY_POSITION_MAX_AGE_SECONDS = 60.0
 EXECUTION_SUMMARY_AUDIT_INTERVAL_SECONDS = 900.0
 APP_DATA_ROOT = default_runtime_data_root()
 DOCTOR_DIAGNOSTICS_PATH = Path(
@@ -416,6 +419,11 @@ PROGRAM_LEDGER_PATH = Path(
     os.environ.get("LIVE_TRADER_PROGRAM_LEDGER_DB") or APP_DATA_ROOT / "logs" / "live_trader_program_ledger.sqlite3"
 )
 PROGRAM_LEDGER = ProgramLedger(PROGRAM_LEDGER_PATH)
+OPERATIONAL_GOVERNANCE_PATH = Path(
+    os.environ.get("LIVE_TRADER_OPERATIONAL_GOVERNANCE_DB")
+    or APP_DATA_ROOT / "logs" / "live_trader_operational_governance.sqlite3"
+)
+OPERATIONAL_GOVERNANCE = OperationalGovernanceStore(OPERATIONAL_GOVERNANCE_PATH)
 DECISION_TRACE_STORE = DecisionTraceStore(APP_DATA_ROOT / "logs" / "decision_trace.jsonl")
 LIVE_OMS = OrderManagementSystem()
 DEFAULT_WATCHDOG_SETTINGS: dict[str, float] = {
@@ -516,6 +524,7 @@ STATE: dict[str, Any] = {
     "mode": "MONITOR",
     "dry_run": True,
     "kill_switch": False,
+    "kill_switch_rearm_required": False,
     "new_entries_blocked": True,
     "broker_truth_blocked": True,
     "daily_loss_gate_tripped": False,
@@ -532,6 +541,10 @@ STATE: dict[str, Any] = {
     },
     "strategy_runner": {
         "last_run": "미실행",
+        "last_market_event_at": "",
+        "last_market_received_at": "",
+        "last_market_timeframe": "",
+        "last_market_verified": False,
         "last_profile": "-",
         "last_strategy": "-",
         "last_signal": "-",
@@ -555,6 +568,7 @@ STATE: dict[str, Any] = {
         "errors": [],
         "successful_account_brokers": [],
         "successful_position_brokers": [],
+        "position_observations": {},
     },
     "program_ledger": {
         "last_baseline": None,
@@ -580,6 +594,12 @@ STATE: dict[str, Any] = {
     },
     "reconciliation_last_run": None,
     "preflight_last_run": None,
+    "selected_deployment_id": "",
+    "selected_strategy_id": "",
+    "latest_preflight_snapshot_id": "",
+    "active_runtime_session_ids": {},
+    "risk_policy_revision": 1,
+    "config_revision": 1,
     "orders": [],
     "order_trace_index": {},
     "persisted_idempotency_keys": [],
@@ -665,6 +685,7 @@ SENSITIVE_SNAPSHOT_KEYS = {
     "accountno",
     "accountnumber",
     "accountid",
+    "chatid",
     "htsid",
     "jwt",
 }
@@ -701,6 +722,65 @@ def redact_url_query(value: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 
+SENSITIVE_DETAIL_ASSIGNMENT = re.compile(
+    r"(?i)(?P<prefix>[\"']?(?:x[-_]?mbx[-_]?apikey|api[-_ ]*(?:key|secret)|"
+    r"app[-_ ]*(?:key|secret)|access[-_ ]*(?:key|token)|refresh[-_ ]*token|"
+    r"secret[-_ ]*key|bot[-_ ]*token|confirmation[-_ ]*token|signature|"
+    r"query[-_ ]*hash|jwt|account[-_ ]*(?:no|number|id)|cano|hts[-_ ]*id|"
+    r"chat[-_ ]*id|계좌번호)[\"']?\s*(?:=|:)\s*)"
+    r"(?P<quote>[\"']?)(?P<value>[^\"'\s,;}\]]+)(?P=quote)"
+)
+AUTHORIZATION_BEARER = re.compile(
+    r"(?i)(?P<prefix>\bauthorization\s*(?:=|:)\s*(?:bearer\s+)?)"
+    r"(?P<value>[^\s,;}\]]+)"
+)
+STANDALONE_BEARER = re.compile(
+    r"(?i)(?P<prefix>\bbearer\s+)(?P<value>[^\s,;}\]]+)"
+)
+TELEGRAM_BOT_URL = re.compile(
+    r"(?i)(?P<prefix>api\.telegram\.org/bot)(?P<value>[^/\s?]+)"
+)
+JWT_VALUE = re.compile(
+    r"(?P<value>eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})"
+)
+
+
+def mask_secrets(value: object) -> str:
+    """Mask credentials in free-form audit text without hiding order IDs."""
+
+    text = str(value or "")
+    for key, raw_value in os.environ.items():
+        normalized_key = normalized_sensitive_key(key)
+        is_sensitive = (
+            key in LIVE_TRADER_SECRET_KEYS
+            or normalized_key in SENSITIVE_SNAPSHOT_KEYS
+            or normalized_key.endswith(("apikey", "apisecret", "bottoken", "accesstoken", "refreshtoken", "accountno"))
+        )
+        secret_value = str(raw_value or "").strip()
+        if is_sensitive and len(secret_value) >= 4:
+            text = text.replace(secret_value, "***")
+    text = AUTHORIZATION_BEARER.sub(
+        lambda match: f"{match.group('prefix')}***",
+        text,
+    )
+    text = STANDALONE_BEARER.sub(
+        lambda match: f"{match.group('prefix')}***",
+        text,
+    )
+    text = TELEGRAM_BOT_URL.sub(
+        lambda match: f"{match.group('prefix')}***",
+        text,
+    )
+    text = JWT_VALUE.sub("***", text)
+    text = SENSITIVE_DETAIL_ASSIGNMENT.sub(
+        lambda match: f"{match.group('prefix')}{match.group('quote')}***{match.group('quote')}",
+        text,
+    )
+    # URL query redaction runs last so the replacement is encoded exactly as
+    # the original snapshot contract expects (``%2A%2A%2A``).
+    return redact_url_query(text)
+
+
 def redact_sensitive_payload(value: object, *, key_hint: str = "") -> object:
     normalized_key = normalized_sensitive_key(key_hint)
     if normalized_key in SENSITIVE_SNAPSHOT_KEYS:
@@ -717,7 +797,7 @@ def redact_sensitive_payload(value: object, *, key_hint: str = "") -> object:
     if isinstance(value, tuple):
         return [redact_sensitive_payload(item) for item in value]
     if isinstance(value, str):
-        return redact_url_query(value)
+        return mask_secrets(value)
     return value
 
 
@@ -793,6 +873,7 @@ def strategy_rows(portfolios: list[dict[str, Any]] | None = None) -> list[dict[s
         rows.append(
             {
                 **artifact,
+                "deployment_id": _live_deployment_id(artifact),
                 "live_allowed": live_allowed,
                 "live_small_eligible": live_small_eligible,
                 "live_eligible": live_eligible,
@@ -2063,7 +2144,6 @@ def risk_checks(reconciliation_summary: dict[str, Any] | None = None) -> list[di
     reconcile_status = str(reconciliation_summary["status"])
     reconcile_risk_status = "pass" if reconcile_status == "pass" else "fail" if reconcile_status == "fail" else "warn"
     active_live = live_exposure_active()
-    market_data_age = seconds_since(STATE["strategy_runner"].get("last_run"))
     stale_limit = int(
         float(
             STATE["watchdog"].get("settings", DEFAULT_WATCHDOG_SETTINGS).get(
@@ -2073,21 +2153,26 @@ def risk_checks(reconciliation_summary: dict[str, Any] | None = None) -> list[di
         )
     )
     if not active_live:
-        data_delay_status: CheckStatus = "pass"
-        data_delay_value = "MONITOR"
+        data_delay_status: CheckStatus = "na"
+        data_delay_value = "해당 없음"
         data_delay_detail = "실거래 자동화가 비활성이라 데이터 신선도 경고를 적용하지 않습니다."
-    elif market_data_age is None:
-        data_delay_status = "warn"
-        data_delay_value = "미실행"
-        data_delay_detail = "활성 자동화의 최근 완료 봉 처리 이력이 없습니다."
-    elif market_data_age > stale_limit:
-        data_delay_status = "fail"
-        data_delay_value = f"{market_data_age}초"
-        data_delay_detail = f"시장 데이터가 허용 지연 {stale_limit}초를 넘었습니다."
     else:
-        data_delay_status = "pass"
-        data_delay_value = f"{market_data_age}초"
-        data_delay_detail = f"시장 데이터가 허용 지연 {stale_limit}초 안에 있습니다."
+        market_freshness = market_data_freshness_snapshot(stale_limit=stale_limit)
+        market_data_age = market_freshness.get("age_seconds")
+        if market_freshness.get("fresh") is True:
+            data_delay_status = "pass"
+            data_delay_value = f"{market_data_age}초"
+            data_delay_detail = "실제 시장 이벤트/확정 봉 시각이 허용 범위 안에 있습니다."
+        elif market_freshness.get("available") is not True:
+            data_delay_status = "fail"
+            data_delay_value = "미확인"
+            data_delay_detail = "활성 자동화의 실제 시장 이벤트/확정 봉 시각이 없습니다."
+        else:
+            data_delay_status = "fail"
+            data_delay_value = f"{market_data_age}초"
+            data_delay_detail = (
+                f"시장 데이터가 허용 지연 {market_freshness.get('allowed_age_seconds', stale_limit)}초를 넘었습니다."
+            )
     return [
         {
             "label": "일일 손실 한도",
@@ -3519,6 +3604,82 @@ def retry_policy_rows() -> list[dict[str, object]]:
     return rows
 
 
+def retry_policy_matrix() -> list[dict[str, object]]:
+    """Describe which request outcomes may be retried automatically.
+
+    Read requests are safe to retry within the configured bounds.  Stored
+    order submissions are deliberately stricter: a POST is never replayed
+    automatically, and an ambiguous outcome must first be reconciled through
+    the deterministic client/idempotency identifier.
+    """
+
+    max_attempts = int(float(STATE["retry_policy"]["max_attempts"]))
+    backoff_sec = float(STATE["retry_policy"]["backoff_sec"])
+    return [
+        {
+            "key": "read_success",
+            "request_kind": "read",
+            "outcome": "success",
+            "automatic_retry": False,
+            "next_action": "응답을 사용하고 요청을 종료합니다.",
+        },
+        {
+            "key": "read_network_or_server_error",
+            "request_kind": "read",
+            "outcome": "network_timeout_or_5xx",
+            "automatic_retry": bool(STATE["retry_policy"]["retry_on_network_error"]),
+            "max_attempts": max_attempts,
+            "backoff_sec": backoff_sec,
+            "next_action": "멱등 조회만 설정된 횟수와 backoff 안에서 재시도합니다.",
+        },
+        {
+            "key": "read_rate_limited",
+            "request_kind": "read",
+            "outcome": "rate_limited",
+            "automatic_retry": bool(STATE["retry_policy"]["retry_on_rate_limit"]),
+            "max_attempts": max_attempts,
+            "backoff_sec": backoff_sec,
+            "next_action": "Retry-After를 우선 적용하고 설정된 한도 안에서 조회를 재시도합니다.",
+        },
+        {
+            "key": "read_explicit_client_error",
+            "request_kind": "read",
+            "outcome": "auth_validation_or_not_found",
+            "automatic_retry": False,
+            "next_action": "인증·입력·대상 상태를 수정한 뒤 새 조회를 시작합니다.",
+        },
+        {
+            "key": "order_confirmed_not_sent",
+            "request_kind": "order_submit",
+            "outcome": "confirmed_not_transmitted",
+            "automatic_retry": False,
+            "next_action": "저장된 주문을 재사용하지 않고 새 의도와 새 사전 점검을 생성합니다.",
+        },
+        {
+            "key": "order_outcome_unknown",
+            "request_kind": "order_submit",
+            "outcome": "timeout_disconnect_or_ambiguous_response",
+            "automatic_retry": False,
+            "requires_idempotency_lookup": True,
+            "next_action": "POST를 재전송하지 말고 client_order_id/idempotency key로 브로커 상태를 조회·대조합니다.",
+        },
+        {
+            "key": "order_explicit_reject",
+            "request_kind": "order_submit",
+            "outcome": "explicit_reject",
+            "automatic_retry": False,
+            "next_action": "거절 원인을 기록하고 다음 전략 결정에서 새 주문 의도를 생성합니다.",
+        },
+        {
+            "key": "order_accepted",
+            "request_kind": "order_submit",
+            "outcome": "accepted_or_filled",
+            "automatic_retry": False,
+            "next_action": "주문 상태를 추적하며 동일 주문 POST를 다시 전송하지 않습니다.",
+        },
+    ]
+
+
 def can_retry_order(_order: dict[str, Any]) -> bool:
     """Existing orders are never resubmitted from stale stored inputs.
 
@@ -3549,6 +3710,7 @@ def order_queue_summary() -> dict[str, int]:
     rows = order_rows()
     return {
         "total": len(rows),
+        "active": sum(1 for order in rows if _restore_order_is_pending_or_unknown(order)),
         "blocked": sum(1 for order in rows if order["state"] == "risk_blocked"),
         "dry_run": sum(1 for order in rows if order.get("dry_run") is True),
         "retryable": sum(1 for order in rows if order["retryable"]),
@@ -3591,6 +3753,162 @@ def watchdog_check(label: str, status: CheckStatus, detail: str, value: object =
     return {"label": label, "status": status, "detail": detail, "value": str(value)}
 
 
+def market_timeframe_seconds(value: object) -> int:
+    """Return the declared bar duration used to distinguish silence from stale data."""
+
+    text = str(value or "").strip().lower()
+    if not text:
+        return 0
+    digits = "".join(character for character in text if character.isdigit())
+    unit = "".join(character for character in text if character.isalpha())
+    if not digits:
+        return 0
+    amount = max(1, int(digits))
+    multiplier = {
+        "s": 1,
+        "sec": 1,
+        "m": 60,
+        "min": 60,
+        "h": 60 * 60,
+        "d": 24 * 60 * 60,
+        "w": 7 * 24 * 60 * 60,
+    }.get(unit, 0)
+    return amount * multiplier
+
+
+def market_data_freshness_snapshot(
+    continuous: dict[str, Any] | None = None,
+    *,
+    now: datetime | None = None,
+    stale_limit: int | None = None,
+) -> dict[str, Any]:
+    """Measure freshness from market evidence, never from a worker heartbeat.
+
+    A closed-bar strategy can legitimately be silent until the next boundary,
+    therefore its allowed age is one declared timeframe plus the feed grace
+    period.  If the runtime does not yet expose a closed bar, ``lastDataAt`` is
+    accepted as a receipt-time fallback.  A heartbeat alone is never market
+    data evidence.
+    """
+
+    current = now or datetime.now()
+    settings = STATE["watchdog"].get("settings", DEFAULT_WATCHDOG_SETTINGS)
+    limit = max(
+        1,
+        int(
+            stale_limit
+            if stale_limit is not None
+            else float(
+                settings.get(
+                    "market_data_stale_sec",
+                    DEFAULT_WATCHDOG_SETTINGS["market_data_stale_sec"],
+                )
+            )
+        ),
+    )
+    runtime = continuous if isinstance(continuous, dict) else LIVE_CONTINUOUS_CONTROLLER.snapshot()
+    profiles = runtime.get("profiles") if isinstance(runtime.get("profiles"), dict) else {}
+    live_profiles = [
+        (str(profile_id), profile)
+        for profile_id, profile in profiles.items()
+        if isinstance(profile, dict)
+        and profile.get("running") is True
+        and str(profile.get("phase") or "").upper() in {"RUNNING", "DEGRADED"}
+    ]
+    observations: list[dict[str, Any]] = []
+    missing_profiles: list[str] = []
+    for profile_id, profile in live_profiles:
+        engine = profile.get("engine") if isinstance(profile.get("engine"), dict) else {}
+        latest_bars = engine.get("latestBars") if isinstance(engine.get("latestBars"), dict) else {}
+        valid_bar_count = 0
+        for instance_id, raw_bar in latest_bars.items():
+            if not isinstance(raw_bar, dict):
+                continue
+            event_time = str(raw_bar.get("endTime") or raw_bar.get("eventTime") or "")
+            age = seconds_since(event_time, current)
+            if age is None:
+                continue
+            timeframe = str(raw_bar.get("timeframe") or "")
+            allowed_age = limit + market_timeframe_seconds(timeframe)
+            observations.append(
+                {
+                    "profile": profile_id,
+                    "instanceId": str(instance_id),
+                    "source": "closed-bar-end-time",
+                    "eventTime": event_time,
+                    "receivedTime": str(raw_bar.get("receivedTime") or ""),
+                    "timeframe": timeframe,
+                    "ageSeconds": age,
+                    "allowedAgeSeconds": allowed_age,
+                    "fresh": age <= allowed_age,
+                }
+            )
+            valid_bar_count += 1
+        if valid_bar_count:
+            continue
+        received_at = str(profile.get("lastDataAt") or "")
+        received_age = seconds_since(received_at, current)
+        if received_age is None:
+            missing_profiles.append(profile_id)
+            continue
+        observations.append(
+            {
+                "profile": profile_id,
+                "instanceId": "",
+                "source": "feed-received-time",
+                "eventTime": received_at,
+                "receivedTime": received_at,
+                "timeframe": "",
+                "ageSeconds": received_age,
+                "allowedAgeSeconds": limit,
+                "fresh": received_age <= limit,
+            }
+        )
+
+    if not live_profiles:
+        runner = STATE.get("strategy_runner") if isinstance(STATE.get("strategy_runner"), dict) else {}
+        event_time = str(runner.get("last_market_event_at") or "")
+        age = seconds_since(event_time, current)
+        if age is not None and runner.get("last_market_verified") is True:
+            timeframe = str(runner.get("last_market_timeframe") or "")
+            allowed_age = limit + market_timeframe_seconds(timeframe)
+            observations.append(
+                {
+                    "profile": str(runner.get("last_profile") or "manual"),
+                    "instanceId": str(runner.get("last_strategy") or ""),
+                    "source": "strategy-market-event-time",
+                    "eventTime": event_time,
+                    "receivedTime": str(runner.get("last_market_received_at") or ""),
+                    "timeframe": timeframe,
+                    "ageSeconds": age,
+                    "allowedAgeSeconds": allowed_age,
+                    "fresh": age <= allowed_age,
+                }
+            )
+
+    stale = [item for item in observations if item.get("fresh") is not True]
+    available = bool(observations) and not missing_profiles
+    fresh = available and not stale
+    worst = max(
+        observations,
+        key=lambda item: (
+            safe_float(item.get("ageSeconds"), 0.0)
+            / max(1.0, safe_float(item.get("allowedAgeSeconds"), 1.0))
+        ),
+        default={},
+    )
+    return {
+        "available": available,
+        "fresh": fresh,
+        "age_seconds": int(safe_float(worst.get("ageSeconds"), 0.0)) if worst else None,
+        "allowed_age_seconds": int(safe_float(worst.get("allowedAgeSeconds"), limit)) if worst else limit,
+        "source": str(worst.get("source") or ""),
+        "event_time": str(worst.get("eventTime") or ""),
+        "missing_profiles": missing_profiles,
+        "observations": observations,
+    }
+
+
 def watchdog_snapshot(
     brokers: list[dict[str, object]] | None = None,
     reconciliation_summary: dict[str, Any] | None = None,
@@ -3608,21 +3926,19 @@ def watchdog_snapshot(
     checks: list[dict[str, str]] = []
     heartbeat_timeout = int(float(settings.get("heartbeat_timeout_sec", DEFAULT_WATCHDOG_SETTINGS["heartbeat_timeout_sec"])))
     heartbeat_age = seconds_since(STATE["watchdog"].get("last_run"), current)
-    if heartbeat_age is None:
-        heartbeat_status: CheckStatus = "fail" if active_live else "pass"
+    if not active_live:
+        heartbeat_status: CheckStatus = "na"
+        heartbeat_detail = "MONITOR 비활성 상태에서는 Watchdog heartbeat 점검이 적용되지 않습니다."
+        heartbeat_value = "해당 없음"
+    elif heartbeat_age is None:
+        heartbeat_status = "fail"
         heartbeat_detail = (
             "Watchdog 점검 이력이 없습니다. 활성 자동화는 시작할 수 없습니다."
-            if active_live
-            else "MONITOR 상태에서는 Watchdog heartbeat 미실행을 경고로 계산하지 않습니다."
         )
         heartbeat_value = "미실행"
     elif heartbeat_age > heartbeat_timeout:
-        heartbeat_status = "fail" if active_live else "pass"
-        heartbeat_detail = (
-            f"마지막 Watchdog 점검이 {heartbeat_age}초 전이며 활성 운용 한도 {heartbeat_timeout}초를 넘었습니다."
-            if active_live
-            else f"MONITOR 상태이므로 {heartbeat_age}초 전 heartbeat를 운용 경고로 계산하지 않습니다."
-        )
+        heartbeat_status = "fail"
+        heartbeat_detail = f"마지막 Watchdog 점검이 {heartbeat_age}초 전이며 활성 운용 한도 {heartbeat_timeout}초를 넘었습니다."
         heartbeat_value = f"{heartbeat_age}초"
     else:
         heartbeat_status = "pass"
@@ -3631,42 +3947,35 @@ def watchdog_snapshot(
     checks.append(watchdog_check("Watchdog heartbeat", heartbeat_status, heartbeat_detail, heartbeat_value))
 
     stale_limit = int(float(settings.get("market_data_stale_sec", DEFAULT_WATCHDOG_SETTINGS["market_data_stale_sec"])))
-    runner_age = seconds_since(STATE["strategy_runner"].get("last_run"), current)
     continuous = LIVE_CONTINUOUS_CONTROLLER.snapshot()
-    continuous_profiles = continuous.get("profiles") if isinstance(continuous.get("profiles"), dict) else {}
-    live_continuous_profiles = [
-        profile
-        for profile in continuous_profiles.values()
-        if isinstance(profile, dict)
-        and profile.get("running") is True
-        and str(profile.get("phase") or "").upper() == "RUNNING"
-    ]
-    continuous_heartbeat_ages = [
-        age
-        for age in (seconds_since(profile.get("lastHeartbeat"), current) for profile in live_continuous_profiles)
-        if age is not None
-    ]
-    continuous_fresh = bool(continuous_heartbeat_ages) and min(continuous_heartbeat_ages) <= heartbeat_timeout
-    if active_live and continuous_fresh:
+    market_freshness = market_data_freshness_snapshot(
+        continuous,
+        now=current,
+        stale_limit=stale_limit,
+    )
+    if not active_live:
+        data_status: CheckStatus = "na"
+        data_detail = "MONITOR 비활성 상태에서는 시장 데이터 신선도 점검이 적용되지 않습니다."
+        data_value = "해당 없음"
+    elif market_freshness["fresh"] is True:
         data_status = "pass"
-        data_detail = "연속 실행기가 완료 봉을 감시 중이며 feed heartbeat가 정상입니다."
-        data_value = f"{min(continuous_heartbeat_ages)}초"
-    elif active_live and runner_age is None:
-        data_status: CheckStatus = "fail"
-        data_detail = "자동화가 활성화됐지만 최근 전략/시장 데이터 점검 시간이 없습니다."
-        data_value = "미실행"
-    elif active_live and runner_age is not None and runner_age > stale_limit:
+        data_detail = (
+            "실제 시장 이벤트/확정 봉 시각이 허용 범위 안에 있습니다. "
+            f"근거: {market_freshness['source']}"
+        )
+        data_value = f"{market_freshness['age_seconds']}초"
+    elif market_freshness["available"] is not True:
         data_status = "fail"
-        data_detail = f"최근 전략/시장 데이터가 {runner_age}초 전입니다. 허용 {stale_limit}초를 넘었습니다."
-        data_value = f"{runner_age}초"
-    elif runner_age is None:
-        data_status = "pass"
-        data_detail = "MONITOR 상태에서는 전략 사이클 미실행을 시장 데이터 경고로 계산하지 않습니다."
-        data_value = "미실행"
+        missing = ", ".join(market_freshness["missing_profiles"]) or "활성 프로필"
+        data_detail = f"{missing}의 실제 시장 이벤트/봉 시각을 확인할 수 없습니다. heartbeat만으로 정상 처리하지 않습니다."
+        data_value = "미확인"
     else:
-        data_status = "pass"
-        data_detail = "최근 전략/시장 데이터 점검 시간이 허용 범위 안에 있습니다."
-        data_value = f"{runner_age}초"
+        data_status = "fail"
+        data_detail = (
+            f"실제 시장 이벤트/봉이 {market_freshness['age_seconds']}초 전이며 "
+            f"허용 {market_freshness['allowed_age_seconds']}초를 넘었습니다."
+        )
+        data_value = f"{market_freshness['age_seconds']}초"
     checks.append(watchdog_check("시장 데이터 신선도", data_status, data_detail, data_value))
 
     broker_map = {str(broker.get("broker_id")): broker for broker in brokers}
@@ -3681,14 +3990,9 @@ def watchdog_snapshot(
         )
         broker_value = f"{len(blocked) - len(unavailable)}/{len(blocked)}"
     else:
-        unavailable = [broker for broker in brokers if not broker.get("order_ready")]
-        broker_status = "pass"
-        broker_detail = (
-            "활성 자동화 라우트가 없어 브로커 주문 준비 상태를 운용 경고로 계산하지 않습니다."
-            if unavailable
-            else "비활성 상태이며 브로커 준비 경고가 없습니다."
-        )
-        broker_value = "비활성"
+        broker_status = "na"
+        broker_detail = "MONITOR 비활성 상태에서는 브로커 주문 준비 점검이 적용되지 않습니다."
+        broker_value = "해당 없음"
     checks.append(watchdog_check("브로커/API 상태", broker_status, broker_detail, broker_value))
 
     recent_limit = int(float(settings.get("max_recent_orders_per_min", DEFAULT_WATCHDOG_SETTINGS["max_recent_orders_per_min"])))
@@ -3748,15 +4052,19 @@ def watchdog_snapshot(
         and stream_brokers[broker_id].get("connected") is True
         for broker_id in active_brokers
     )
-    if active_live and active_streams_ready:
+    if not active_live:
+        event_status: CheckStatus = "na"
+        event_detail = "MONITOR 비활성 상태에서는 체결 이벤트 동기화 점검이 적용되지 않습니다."
+        event_value = "해당 없음"
+    elif active_streams_ready:
         event_status = "pass"
         event_detail = "활성 브로커의 사설 체결 스트림이 연결되어 있습니다."
         event_value = f"{len(active_brokers)}/{len(active_brokers)}"
-    elif active_live and event_age is None:
-        event_status: CheckStatus = "fail"
+    elif event_age is None:
+        event_status = "fail"
         event_detail = "자동화가 활성화됐지만 체결/계좌 이벤트 동기화 이력이 없습니다."
         event_value = "미실행"
-    elif active_live and event_age is not None and event_age > heartbeat_timeout:
+    elif event_age > heartbeat_timeout:
         event_status = "fail"
         event_detail = f"마지막 체결 이벤트 동기화가 {event_age}초 전입니다. 허용 {heartbeat_timeout}초를 넘었습니다."
         event_value = f"{event_age}초"
@@ -3772,9 +4080,31 @@ def watchdog_snapshot(
 
     critical = [check for check in checks if check["status"] == "fail"]
     warnings = [check for check in checks if check["status"] == "warn"]
-    status: CheckStatus = "fail" if critical else "warn" if warnings else "pass"
-    status_label = "차단" if status == "fail" else "주의" if status == "warn" else "정상"
-    next_actions = [check["label"] for check in critical[:5]] or [check["label"] for check in warnings[:5]] or ["Watchdog 정상"]
+    passed = [check for check in checks if check["status"] == "pass"]
+    not_applicable = [check for check in checks if check["status"] == "na"]
+    status: CheckStatus = (
+        "fail"
+        if critical
+        else "warn"
+        if warnings
+        else "na"
+        if not active_live and not_applicable
+        else "pass"
+    )
+    status_label = (
+        "차단"
+        if status == "fail"
+        else "주의"
+        if status == "warn"
+        else "비활성"
+        if status == "na"
+        else "정상"
+    )
+    next_actions = (
+        [check["label"] for check in critical[:5]]
+        or [check["label"] for check in warnings[:5]]
+        or (["활성 자동화 없음"] if status == "na" else ["Watchdog 정상"])
+    )
     return {
         "last_run": STATE["watchdog"].get("last_run", "미실행"),
         "status": status,
@@ -3784,8 +4114,11 @@ def watchdog_snapshot(
         "trip_count": int(STATE["watchdog"].get("trip_count", 0)),
         "active_brokers": sorted(active_brokers),
         "active_live": active_live,
+        "check_count": len(checks),
+        "pass_count": len(passed),
         "critical_count": len(critical),
         "warning_count": len(warnings),
+        "not_applicable_count": len(not_applicable),
         "checks": checks,
         "next_actions": next_actions,
     }
@@ -3840,9 +4173,25 @@ def run_watchdog(include_snapshot: bool = True) -> dict[str, Any]:
     STATE["watchdog"]["last_action"] = (
         f"critical {report['critical_count']} / warning {report['warning_count']}"
         if report["critical_count"] or report["warning_count"]
-        else "정상"
+        else report["status_label"]
     )
     changed = apply_watchdog_fail_closed(report)
+    sync_operational_incident(
+        code="WATCHDOG_CRITICAL",
+        active=int(report["critical_count"]) > 0,
+        severity="CRITICAL",
+        title="Live Watchdog Critical",
+        detail=(
+            ", ".join(str(item) for item in report["next_actions"][:5])
+            if int(report["critical_count"]) > 0
+            else "Watchdog critical 항목이 모두 복구되었습니다."
+        ),
+        impact=(
+            "신규 위험 주문 차단 및 MONITOR 전환"
+            if int(report["critical_count"]) > 0
+            else "자동 차단 원인 해소"
+        ),
+    )
     if previous_status != report["status"] and not changed:
         level = "danger" if report["status"] == "fail" else "warn" if report["status"] == "warn" else "info"
         append_audit(level, "Watchdog", f"{report['status_label']}: {STATE['watchdog']['last_action']}")
@@ -3904,15 +4253,29 @@ def final_preflight_checks(
     strategies: list[dict[str, Any]],
     brokers: list[dict[str, object]],
     reconciliation: dict[str, Any],
+    current_strategy: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     reconcile_summary = reconciliation["summary"]
     checklist = checklist_rows(reconcile_summary)
     checklist_missing = [item for item in checklist if item["required"] and not item["checked"]]
-    live_ready_count = sum(1 for strategy in strategies if strategy.get("live_allowed") is True)
-    full_live_ready_count = sum(1 for strategy in strategies if strategy.get("live_eligible") is True)
-    adapter_blocked = [broker for broker in brokers if broker["live_order_adapter_ready"] is not True]
-    missing_brokers = [broker for broker in brokers if broker["status"] == "missing_credentials"]
+    scoped_strategies = [current_strategy] if current_strategy is not None else strategies
+    live_ready_count = sum(1 for strategy in scoped_strategies if strategy.get("live_allowed") is True)
+    full_live_ready_count = sum(1 for strategy in scoped_strategies if strategy.get("live_eligible") is True)
+    current_broker_id = strategy_broker_id(current_strategy) if current_strategy is not None else ""
+    scoped_brokers = [
+        broker
+        for broker in brokers
+        if not current_broker_id or str(broker.get("broker_id") or "") == current_broker_id
+    ]
+    adapter_blocked = [broker for broker in scoped_brokers if broker["live_order_adapter_ready"] is not True]
+    missing_brokers = [broker for broker in scoped_brokers if broker["status"] == "missing_credentials"]
     queue = order_queue_summary()
+    reconciliation_fresh = reconcile_summary.get("fresh") is True
+    three_way_verified = reconcile_summary.get("three_way_verified") is True
+    freshness_detail = str(
+        reconcile_summary.get("freshness_detail")
+        or "Fresh Broker REST Snapshot·Execution Event·Local Ledger 증거가 없습니다."
+    )
     return [
         {
             "label": "실거래 환경 변수",
@@ -3935,9 +4298,19 @@ def final_preflight_checks(
             "detail": f"{reconcile_summary['status_label']} 상태입니다. 마지막 대조: {reconcile_summary['last_run']}",
         },
         {
+            "label": "대조 증거 신선도",
+            "status": "pass" if reconciliation_fresh and three_way_verified else "fail",
+            "detail": freshness_detail,
+        },
+        {
             "label": "전략 승인",
             "status": "pass" if live_ready_count else "fail",
-            "detail": f"Live-Small 이상 {live_ready_count}개 · Full Live {full_live_ready_count}개",
+            "detail": (
+                f"현재 Deployment 전략 {str(current_strategy.get('strategy_id') or '')}: "
+                f"Live-Small {live_ready_count} · Full Live {full_live_ready_count}"
+                if current_strategy is not None
+                else f"Live-Small 이상 {live_ready_count}개 · Full Live {full_live_ready_count}개"
+            ),
         },
         {
             "label": "필수 운영 체크리스트",
@@ -3956,13 +4329,28 @@ def final_preflight_checks(
         },
         {
             "label": "Dry Run 보호",
-            "status": "pass" if STATE["dry_run"] else "warn",
-            "detail": "Dry Run이 꺼진 상태에서는 실제 전송 차단 조건을 더 엄격히 확인해야 합니다.",
+            "status": "warn" if STATE["dry_run"] else "pass",
+            "detail": (
+                "Dry Run이 켜져 있어 이 Snapshot으로 실주문 Runtime을 승인할 수 없습니다."
+                if STATE["dry_run"]
+                else "실주문 전송 의도를 확인했습니다. 운용자 확인·Fresh 대조·Runtime·주문 위험 게이트는 계속 적용됩니다."
+            ),
+        },
+        {
+            "label": "신규 진입 차단",
+            "status": "warn" if STATE["new_entries_blocked"] else "pass",
+            "detail": (
+                "신규 진입 차단이 켜져 있어 Reduce-only 외 주문을 승인할 수 없습니다."
+                if STATE["new_entries_blocked"]
+                else "현재 Deployment의 신규 진입 의도를 확인했습니다."
+            ),
         },
         {
             "label": "주문 큐 잔여",
-            "status": "warn" if queue["retryable"] else "pass",
-            "detail": f"재시도 가능 주문 {queue['retryable']}건",
+            "status": "fail" if queue.get("active", 0) else "pass",
+            "detail": (
+                f"미확인·진행 중 주문 {queue.get('active', 0)}건, 재시도 가능 주문 {queue['retryable']}건"
+            ),
         },
     ]
 
@@ -4439,6 +4827,523 @@ def lineage_flow_snapshot(
     }
 
 
+def _operational_strategy(
+    strategies: list[dict[str, Any]],
+    *,
+    deployment_id: str = "",
+    strategy_id: str = "",
+    portfolio_id: str = "",
+) -> dict[str, Any] | None:
+    normalized_deployment = str(deployment_id or "").strip()
+    normalized_strategy = str(strategy_id or "").strip()
+    normalized_portfolio = str(portfolio_id or "").strip()
+    if normalized_deployment:
+        matched = next(
+            (
+                item
+                for item in strategies
+                if str(item.get("deployment_id") or "") == normalized_deployment
+            ),
+            None,
+        )
+        if matched is not None:
+            return matched
+    if normalized_strategy:
+        matched = next(
+            (
+                item
+                for item in strategies
+                if str(item.get("strategy_id") or "") == normalized_strategy
+            ),
+            None,
+        )
+        if matched is not None:
+            return matched
+    if normalized_portfolio:
+        matched = next(
+            (
+                item
+                for item in strategies
+                if str(
+                    (item.get("portfolio_gate") or {}).get("portfolioId")
+                    if isinstance(item.get("portfolio_gate"), dict)
+                    else ""
+                )
+                == normalized_portfolio
+            ),
+            None,
+        )
+        if matched is not None:
+            return matched
+    selected_id = str(STATE.get("selected_deployment_id") or "")
+    if selected_id:
+        matched = next(
+            (
+                item
+                for item in strategies
+                if str(item.get("deployment_id") or "") == selected_id
+            ),
+            None,
+        )
+        if matched is not None:
+            return matched
+    return (
+        next(
+            (
+                item
+                for item in strategies
+                if isinstance(item.get("portfolio_gate"), dict)
+                and item["portfolio_gate"].get("active") is True
+                and item.get("live_allowed") is True
+            ),
+            None,
+        )
+        or next((item for item in strategies if item.get("live_allowed") is True), None)
+        or (strategies[0] if strategies else None)
+    )
+
+
+def _operational_artifact_hash(strategy: dict[str, Any]) -> str:
+    reference = (
+        strategy.get("artifact_reference")
+        if isinstance(strategy.get("artifact_reference"), dict)
+        else {}
+    )
+    return governance_sha256(
+        {
+            "strategyId": str(strategy.get("strategy_id") or ""),
+            "artifactId": str(reference.get("artifactId") or strategy.get("id") or ""),
+            "artifactHash": str(reference.get("artifactHash") or strategy.get("artifact_hash") or ""),
+            "contentHash": str(reference.get("contentHash") or strategy.get("content_hash") or ""),
+            "lifecycle": str(
+                (strategy.get("lifecycle") or {}).get("status")
+                if isinstance(strategy.get("lifecycle"), dict)
+                else strategy.get("lifecycle_status") or ""
+            ),
+        }
+    )
+
+
+def _operational_portfolio_members(
+    strategy: dict[str, Any],
+) -> tuple[str, list[dict[str, str]]]:
+    """Resolve the immutable strategy/symbol routes owned by a deployment."""
+
+    gate = (
+        strategy.get("portfolio_gate")
+        if isinstance(strategy.get("portfolio_gate"), dict)
+        else {}
+    )
+    portfolio_id = str(gate.get("portfolioId") or "").strip()
+    if not portfolio_id or gate.get("active") is not True:
+        return "", [
+            {
+                "strategyId": str(strategy.get("strategy_id") or "").strip(),
+                "symbol": str(strategy.get("symbol") or "").strip().upper(),
+                "brokerId": strategy_broker_id(strategy) or "unresolved-route",
+                "artifactHash": _operational_artifact_hash(strategy),
+            }
+        ]
+
+    portfolio = next(
+        (
+            item
+            for item in portfolio_rows()
+            if str(
+                item.get("id")
+                or item.get("portfolio_id")
+                or item.get("portfolioId")
+                or ""
+            ).strip()
+            == portfolio_id
+        ),
+        None,
+    )
+    if not isinstance(portfolio, dict):
+        raise ValueError(
+            f"선택 Portfolio Artifact({portfolio_id})를 찾을 수 없습니다."
+        )
+    instances = (
+        portfolio.get("strategy_instances")
+        if isinstance(portfolio.get("strategy_instances"), list)
+        else portfolio.get("strategies")
+        if isinstance(portfolio.get("strategies"), list)
+        else []
+    )
+    artifacts = load_strategy_artifacts()
+    members: list[dict[str, str]] = []
+    for instance in instances:
+        if not isinstance(instance, dict):
+            continue
+        strategy_id = str(
+            instance.get("sourceStrategyId")
+            or instance.get("strategyId")
+            or instance.get("strategy_id")
+            or ""
+        ).strip()
+        symbol = str(
+            instance.get("symbol")
+            or instance.get("qualifiedSymbol")
+            or ""
+        ).strip().upper()
+        if not strategy_id or not symbol:
+            continue
+        artifact = next(
+            (
+                item
+                for item in artifacts
+                if str(item.get("strategy_id") or item.get("strategyId") or item.get("id") or "").strip()
+                == strategy_id
+                and (
+                    not str(item.get("symbol") or "").strip()
+                    or str(item.get("symbol") or "").strip().upper() == symbol
+                )
+            ),
+            None,
+        )
+        source_hash = str(instance.get("sourceArtifactHash") or "").strip()
+        artifact_hash = (
+            _operational_artifact_hash(artifact)
+            if isinstance(artifact, dict)
+            else governance_sha256(
+                {
+                    "strategyId": strategy_id,
+                    "symbol": symbol,
+                    "sourceArtifactHash": source_hash,
+                }
+            )
+        )
+        route_source = artifact if isinstance(artifact, dict) else {
+            "symbol": symbol,
+            "broker_id": instance.get("brokerId") or instance.get("broker_id"),
+            "market_type": instance.get("marketType") or instance.get("market_type"),
+        }
+        members.append(
+            {
+                "strategyId": strategy_id,
+                "symbol": symbol,
+                "brokerId": strategy_broker_id(route_source) or "unresolved-route",
+                "artifactHash": artifact_hash,
+            }
+        )
+    unique_members = {
+        (item["strategyId"], item["symbol"]): item for item in members
+    }
+    normalized = sorted(
+        unique_members.values(),
+        key=lambda item: (item["strategyId"], item["symbol"]),
+    )
+    if not normalized:
+        raise ValueError(
+            f"선택 Portfolio Artifact({portfolio_id})에 실행 가능한 Strategy 구성이 없습니다."
+        )
+    selected_pair = (
+        str(strategy.get("strategy_id") or "").strip(),
+        str(strategy.get("symbol") or "").strip().upper(),
+    )
+    if selected_pair not in unique_members:
+        raise ValueError(
+            "선택 Deployment Strategy가 Portfolio Artifact 구성에 없습니다."
+        )
+    return portfolio_id, normalized
+
+
+def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
+    route = strategy_broker_id(strategy) or "unresolved-route"
+    gate = (
+        strategy.get("portfolio_gate")
+        if isinstance(strategy.get("portfolio_gate"), dict)
+        else {}
+    )
+    risk_policy_hash = governance_sha256(
+        {
+            "settings": STATE.get("risk_settings", {}),
+            "policyRevision": max(
+                1,
+                int(STATE.get("risk_policy_revision") or 1),
+            ),
+        }
+    )
+    portfolio_id, strategy_members = _operational_portfolio_members(strategy)
+    strategy_ids = sorted({item["strategyId"] for item in strategy_members})
+    allowed_symbols = sorted({item["symbol"] for item in strategy_members})
+    broker_routes = sorted({item["brokerId"] for item in strategy_members})
+    if len(broker_routes) != 1 or broker_routes[0] != route:
+        raise ValueError(
+            "현재 Deployment Preflight는 단일 Broker 계좌만 봉인합니다. "
+            "cross-broker Portfolio는 계좌별 Preflight가 구현되기 전까지 실행할 수 없습니다: "
+            + ", ".join(broker_routes or ["unresolved-route"])
+        )
+    member_artifact_hash = governance_sha256(
+        {
+            "portfolioId": portfolio_id,
+            "members": strategy_members,
+        }
+    )
+    config_hash = governance_sha256(
+        {
+            "route": route,
+            "brokerRoutes": broker_routes,
+            "symbol": str(strategy.get("symbol") or ""),
+            "timeframe": str(strategy.get("timeframe") or ""),
+            "strategyMembers": strategy_members,
+            "riskPolicyHash": risk_policy_hash,
+            "retryPolicy": STATE.get("retry_policy", {}),
+            "realOrdersEnabled": real_orders_enabled(),
+            "checklist": STATE.get("checklist", {}),
+        }
+    )
+    build_hash = governance_sha256(
+        {
+            "runtime": "live-trader-runtime-v2",
+            "adapterContract": broker_adapter_contract(),
+        }
+    )
+    portfolio_hash = (
+        governance_sha256(
+            {
+                "portfolioId": portfolio_id,
+                "policyHash": str(gate.get("portfolioPolicyHash") or ""),
+                "operationsHash": str(gate.get("advancedOperationsHash") or ""),
+                "readinessHash": str(gate.get("operationalReadinessHash") or ""),
+                "strategyMembers": strategy_members,
+            }
+        )
+        if portfolio_id
+        else ""
+    )
+    return {
+        "deployment_id": str(strategy.get("deployment_id") or _live_deployment_id(strategy)),
+        "strategy_artifact_hash": (
+            member_artifact_hash
+            if portfolio_id
+            else strategy_members[0]["artifactHash"]
+        ),
+        "portfolio_artifact_hash": portfolio_hash,
+        "account_fingerprint": governance_sha256({"scope": _restore_account_scope(route)}),
+        "broker_route": route,
+        "runtime_version": "live-trader-runtime-v2",
+        "build_hash": build_hash,
+        "execution_adapter": f"{route}-signed-adapter",
+        "execution_adapter_version": "v2",
+        "risk_policy_revision": max(1, int(STATE.get("risk_policy_revision") or 1)),
+        "risk_policy_hash": risk_policy_hash,
+        "config_revision": max(1, int(STATE.get("config_revision") or 1)),
+        "config_hash": config_hash,
+        "preflight_ttl_seconds": 300,
+        "metadata": {
+            "strategyId": str(strategy.get("strategy_id") or ""),
+            "strategyIds": strategy_ids,
+            "allowedSymbols": allowed_symbols,
+            "brokerRoutes": broker_routes,
+            "strategyMembers": strategy_members,
+            "portfolioId": portfolio_id,
+            "symbol": str(strategy.get("symbol") or ""),
+            "timeframe": str(strategy.get("timeframe") or ""),
+            "brokerId": route,
+        },
+    }
+
+
+def ensure_operational_deployment_manifest(strategy: dict[str, Any]):
+    values = _operational_manifest_inputs(strategy)
+    current = OPERATIONAL_GOVERNANCE.get_deployment_manifest(values["deployment_id"])
+    if current is not None:
+        current_payload = current.to_dict()
+        comparisons = {
+            "strategyArtifactHash": values["strategy_artifact_hash"],
+            "portfolioArtifactHash": values["portfolio_artifact_hash"],
+            "accountFingerprint": values["account_fingerprint"],
+            "brokerRoute": values["broker_route"],
+            "runtimeVersion": values["runtime_version"],
+            "buildHash": values["build_hash"],
+            "executionAdapter": values["execution_adapter"],
+            "executionAdapterVersion": values["execution_adapter_version"],
+            "riskPolicyRevision": values["risk_policy_revision"],
+            "riskPolicyHash": values["risk_policy_hash"],
+            "configRevision": values["config_revision"],
+            "configHash": values["config_hash"],
+            "preflightTtlSeconds": values["preflight_ttl_seconds"],
+            "metadata": values["metadata"],
+        }
+        if all(current_payload.get(key) == value for key, value in comparisons.items()):
+            return current
+    return OPERATIONAL_GOVERNANCE.create_deployment_manifest(**values)
+
+
+def operational_governance_snapshot(
+    strategies: list[dict[str, Any]],
+) -> dict[str, Any]:
+    strategy = _operational_strategy(strategies)
+    deployment_id = str(strategy.get("deployment_id") or "") if strategy else ""
+    try:
+        workspace = OPERATIONAL_GOVERNANCE.workspace_snapshot(deployment_id)
+        for incident in workspace.get("incidents", []):
+            events = OPERATIONAL_GOVERNANCE.incident_events(str(incident.get("incidentId") or ""))
+            latest = events[-1].to_dict() if events else {}
+            incident["latestEvent"] = latest
+            payload = latest.get("payload") if isinstance(latest.get("payload"), dict) else {}
+            incident["title"] = str(payload.get("title") or incident.get("code") or "운영 사고")
+            incident["detail"] = str(payload.get("detail") or payload.get("impact") or "상세 증거 확인 필요")
+            incident["impact"] = str(payload.get("impact") or "신규 위험 주문 차단")
+        return workspace
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return {
+            "schemaVersion": "live-operational-governance-workspace-v1",
+            "deploymentId": deployment_id,
+            "manifest": None,
+            "latestPreflight": None,
+            "preflightValidity": {"valid": False, "reasons": ["governance-store-unavailable"]},
+            "activeSession": None,
+            "incidents": [],
+            "integrity": {"valid": False, "issues": [f"{type(exc).__name__}: {str(exc)[:240]}"]},
+        }
+
+
+def durable_audit_rows(limit: int = 200) -> list[dict[str, Any]]:
+    try:
+        return AUDIT_STORE.list_events(limit=limit, newest_first=True)
+    except (OSError, sqlite3.Error, ValueError):
+        return []
+
+
+def sync_operational_incident(
+    *,
+    code: str,
+    active: bool,
+    severity: str,
+    title: str,
+    detail: str,
+    impact: str,
+    scope_type: str = "GLOBAL",
+    scope_id: str = "global",
+) -> None:
+    """Dual-write operational failures without letting incident I/O stop trading."""
+
+    try:
+        existing = next(
+            (
+                item
+                for item in OPERATIONAL_GOVERNANCE.list_incidents(
+                    limit=200,
+                    active_only=True,
+                )
+                if item.code == code.upper()
+                and item.scope_type == scope_type.upper()
+                and item.scope_id == scope_id
+            ),
+            None,
+        )
+        payload = {"title": title, "detail": detail, "impact": impact}
+        if active:
+            if existing is not None:
+                OPERATIONAL_GOVERNANCE.append_incident_event(
+                    existing.incident_id,
+                    event_type="INCIDENT_OBSERVED",
+                    actor="live_trader.runtime",
+                    severity=severity,
+                    evidence_hash=governance_sha256(payload),
+                    payload=payload,
+                )
+            else:
+                OPERATIONAL_GOVERNANCE.open_incident(
+                    code=code,
+                    scope_type=scope_type,
+                    scope_id=scope_id,
+                    severity=severity,
+                    actor="live_trader.runtime",
+                    deployment_id=str(STATE.get("selected_deployment_id") or ""),
+                    session_id=str(
+                        next(
+                            iter((STATE.get("active_runtime_session_ids") or {}).values()),
+                            "",
+                        )
+                    ),
+                    evidence_hash=governance_sha256(payload),
+                    payload=payload,
+                )
+        elif existing is not None:
+            OPERATIONAL_GOVERNANCE.resolve_incident(
+                existing.incident_id,
+                actor="live_trader.runtime",
+                evidence_hash=governance_sha256(payload),
+                payload=payload,
+            )
+    except (OSError, sqlite3.Error, ValueError):
+        return
+
+
+def _sanitized_incident_note(value: object, limit: int = 1000) -> str:
+    """Bound operator text and remove common credential assignments/values."""
+
+    import re
+
+    note = str(value or "").strip()[: max(1, limit)]
+    note = re.sub(
+        r"(?i)\b(api[_ -]?key|api[_ -]?secret|secret|token|authorization|account[_ -]?(?:no|number|id)|hts[_ -]?id)\b\s*[:=]\s*[^\s,;]+",
+        lambda match: f"{match.group(1)}=***",
+        note,
+    )
+    for key in (
+        "KIS_APP_KEY",
+        "KIS_APP_SECRET",
+        "KIS_ACCOUNT_NO",
+        "KIS_HTS_ID",
+        "BINANCE_API_KEY",
+        "BINANCE_API_SECRET",
+        "UPBIT_ACCESS_KEY",
+        "UPBIT_SECRET_KEY",
+    ):
+        secret_value = str(os.environ.get(key) or "")
+        if len(secret_value) >= 4:
+            note = note.replace(secret_value, "***")
+    return redact_url_query(note)
+
+
+def transition_operational_incident(
+    incident_id: object,
+    action: object,
+    note: object = "",
+) -> dict[str, Any]:
+    """Expose only the operator-safe Incident lifecycle transitions."""
+
+    normalized_action = str(action or "").strip().lower()
+    target = {
+        "acknowledge": "ACKNOWLEDGED",
+        "ack": "ACKNOWLEDGED",
+        "mitigate": "MITIGATING",
+        "resolve": "RESOLVED",
+    }.get(normalized_action, "")
+    normalized_id = str(incident_id or "").strip()
+    if not normalized_id or not target:
+        return {
+            "ok": False,
+            "reason": "incident id와 acknowledge/mitigate/resolve action이 필요합니다.",
+            "snapshot": snapshot(),
+        }
+    safe_note = _sanitized_incident_note(note)
+    try:
+        incident = OPERATIONAL_GOVERNANCE.transition_incident(
+            normalized_id,
+            target,
+            actor="live_trader.operator",
+            event_type=f"INCIDENT_{target}",
+            evidence_hash=governance_sha256({"incidentId": normalized_id, "state": target, "note": safe_note}),
+            payload={"note": safe_note},
+        )
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        reason = f"사고 상태 변경 실패: {str(exc)[:240]}"
+        append_audit("warn", "사고 상태 변경", f"{normalized_id} · {target} · 실패")
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+    append_audit("info", "사고 상태 변경", f"{normalized_id} · {target}")
+    return {
+        "ok": True,
+        "reason": "incident transitioned",
+        "incident": incident.to_dict(),
+        "snapshot": snapshot(),
+    }
+
+
 def snapshot() -> dict[str, Any]:
     brokers = [broker.to_dict() for broker in broker_readiness()]
     portfolios = portfolio_rows()
@@ -4448,7 +5353,21 @@ def snapshot() -> dict[str, Any]:
     queue = order_queue_summary()
     watchdog = watchdog_snapshot(brokers, reconciliation["summary"], queue)
     checks = readiness_checks(strategies, brokers, reconciliation["summary"])
-    preflight = final_preflight_checks(strategies, brokers, reconciliation)
+    selected_preflight_strategy = (
+        _operational_strategy(
+            strategies,
+            deployment_id=str(STATE.get("selected_deployment_id") or ""),
+            strategy_id=str(STATE.get("selected_strategy_id") or ""),
+        )
+        if STATE.get("selected_deployment_id") or STATE.get("selected_strategy_id")
+        else None
+    )
+    preflight = final_preflight_checks(
+        strategies,
+        brokers,
+        reconciliation,
+        current_strategy=selected_preflight_strategy,
+    )
     report = operation_report(reconciliation, checks, preflight, watchdog)
     launch = launch_report(preflight)
     blockers = [check for check in checks if check.status == "fail"]
@@ -4459,11 +5378,14 @@ def snapshot() -> dict[str, Any]:
     continuous_runtime = LIVE_CONTINUOUS_CONTROLLER.snapshot()
     broker_truth = broker_position_truth_snapshot(reconciliation)
     restart_recovery = restart_recovery_plan_snapshot(reconciliation, continuous_runtime, broker_truth)
+    governance = operational_governance_snapshot(strategies)
+    durable_audit = durable_audit_rows()
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode": STATE["mode"],
         "dry_run": STATE["dry_run"],
         "kill_switch": STATE["kill_switch"],
+        "kill_switch_rearm_required": bool(STATE.get("kill_switch_rearm_required")),
         "new_entries_blocked": STATE["new_entries_blocked"],
         "operator_confirmed": STATE["operator_confirmed"],
         "central_control": durable_control_snapshot(),
@@ -4485,6 +5407,7 @@ def snapshot() -> dict[str, Any]:
         ),
         "checklist": checklist_rows(reconciliation["summary"]),
         "retry_policy": retry_policy_rows(),
+        "retry_policy_matrix": retry_policy_matrix(),
         "order_queue": queue,
         "brokers": brokers,
         "broker_diagnostics": broker_diagnostics(),
@@ -4537,6 +5460,10 @@ def snapshot() -> dict[str, Any]:
         "operation_report": report,
         "final_preflight": preflight,
         "launch_report": launch,
+        "live_governance": governance,
+        "incidents": governance.get("incidents", []),
+        "durable_audit": durable_audit,
+        "technical_logs": list(reversed(STATE["audit"][-200:])),
         "doctor_diagnostics": doctor_diagnostics_document(include_history=False),
         "audit": list(reversed(STATE["audit"][-30:])),
     }
@@ -4596,28 +5523,36 @@ def persist_audit_event(record: AuditEvent) -> None:
 
 def append_audit(level: str, event: str, detail: str, *, audit_record: AuditEvent | None = None) -> None:
     now = datetime.now()
+    safe_detail = mask_secrets(detail)
     STATE["audit"].append({
         "time": now.strftime("%H:%M:%S"),
         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
         "level": level,
         "event": event,
-        "detail": detail,
+        "detail": safe_detail,
     })
     if len(STATE["audit"]) > AUDIT_LOG_LIMIT:
         del STATE["audit"][: len(STATE["audit"]) - AUDIT_LOG_LIMIT]
-    persist_audit_event(
-        audit_record
-        or build_audit_event(
+    safe_audit_record = (
+        replace(
+            audit_record,
+            message=mask_secrets(audit_record.message),
+            reason=mask_secrets(audit_record.reason),
+            payload=redact_sensitive_payload(audit_record.payload),
+        )
+        if audit_record is not None
+        else build_audit_event(
             app="live_trader",
             category=audit_category_for_event(event),  # type: ignore[arg-type]
             level=audit_level_for_common_event(level),  # type: ignore[arg-type]
             source=event,
-            message=detail,
+            message=safe_detail,
             occurred_at=now,
             scope=current_mode(),
         )
     )
-    queue_live_audit_telegram(level, event, detail)
+    persist_audit_event(safe_audit_record)
+    queue_live_audit_telegram(level, event, safe_detail)
 
 
 def queue_live_audit_telegram(level: str, event: str, detail: str) -> bool:
@@ -4812,6 +5747,162 @@ def _set_mode_serialized(mode: str) -> dict[str, Any]:
     }
 
 
+def cancel_working_orders_for_kill_switch() -> dict[str, Any]:
+    """Request cancellation of known working orders without creating exits.
+
+    Orders with an ambiguous submit outcome are deliberately left in
+    reconciliation-required state: without a confirmed broker order id, a
+    local "canceled" label would be unsafe and misleading.
+    """
+
+    candidates = [
+        order
+        for order in list(STATE.get("orders", []))
+        if isinstance(order, dict) and _restore_order_is_pending_or_unknown(order)
+    ]
+    results: list[dict[str, Any]] = []
+    for order in candidates:
+        order_id = str(order.get("order_id") or order.get("oms_order_id") or "")
+        broker_order_id = str(order.get("broker_order_id") or "").strip()
+        queue_state = str(order.get("queue_state") or "").strip().lower()
+        locally_safe = bool(order.get("dry_run"))
+        broker_cancelable = bool(broker_order_id and queue_state in {"submitted", "sent", "partially_filled"})
+        if not order_id or (not locally_safe and not broker_cancelable):
+            results.append(
+                {
+                    "order_id": order_id,
+                    "ok": False,
+                    "status": "reconciliation_required",
+                    "reason": "브로커 접수 여부/주문 ID가 불확실하여 취소 완료로 표시하지 않습니다.",
+                }
+            )
+            continue
+        try:
+            outcome = cancel_order(order_id)
+        except Exception as exc:  # cancellation is best-effort; Kill remains latched
+            outcome = {"ok": False, "reason": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        results.append(
+            {
+                "order_id": order_id,
+                "ok": outcome.get("ok") is True,
+                "status": "cancel_requested" if outcome.get("ok") is True else "cancel_failed",
+                "reason": str(outcome.get("reason") or ""),
+            }
+        )
+    canceled_count = sum(1 for item in results if item["ok"])
+    unresolved_count = sum(1 for item in results if item["status"] == "reconciliation_required")
+    failed_count = sum(1 for item in results if item["status"] == "cancel_failed")
+    summary = {
+        "working_count": len(candidates),
+        "cancel_requested_count": canceled_count,
+        "failed_count": failed_count,
+        "unresolved_count": unresolved_count,
+        "flatten_requested": False,
+        "results": results,
+    }
+    append_audit(
+        "danger" if failed_count or unresolved_count else "warn",
+        "Kill Switch 미체결 취소",
+        (
+            f"working {len(candidates)}건 · 취소 요청 성공 {canceled_count}건 · "
+            f"실패 {failed_count}건 · 대조 필요 {unresolved_count}건 · 포지션 청산 요청 없음"
+        ),
+    )
+    sync_operational_incident(
+        code="KILL_CANCEL_INCOMPLETE",
+        active=bool(failed_count or unresolved_count),
+        severity="CRITICAL",
+        title="Kill Switch 미체결 취소 미완료",
+        detail=f"취소 실패 {failed_count}건 · 대조 필요 {unresolved_count}건",
+        impact=(
+            "Kill은 유지되지만 일부 Working Order가 Broker에 남아 있을 수 있습니다."
+            if failed_count or unresolved_count
+            else "Working Order 취소 요청이 완료되었습니다."
+        ),
+    )
+    return summary
+
+
+def stop_operational_runtime_sessions_for_kill(
+    *,
+    runtime_transition: dict[str, Any],
+    cancellation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Close live governance sessions after the engine is forced to MONITOR."""
+
+    outcomes: list[dict[str, Any]] = []
+    active_sessions = dict(STATE.get("active_runtime_session_ids") or {})
+    for profile_id, raw_session_id in active_sessions.items():
+        session_id = str(raw_session_id or "")
+        if not session_id:
+            continue
+        try:
+            session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+            if session is None:
+                raise ValueError("runtime session not found")
+            payload = {
+                "profile": profile_id,
+                "runtimeTransitionOk": runtime_transition.get("ok") is True,
+                "workingOrderCount": int(cancellation.get("working_count") or 0),
+                "cancelFailureCount": int(cancellation.get("failed_count") or 0),
+                "cancelUnresolvedCount": int(cancellation.get("unresolved_count") or 0),
+                "flattenRequested": False,
+            }
+            if session.lifecycle in {"RUNNING", "DEGRADED"}:
+                session = OPERATIONAL_GOVERNANCE.transition_runtime_session(
+                    session_id,
+                    "DRAINING",
+                    actor="live_trader.kill_switch",
+                    event_type="KILL_SWITCH_DRAIN_REQUESTED",
+                    payload=payload,
+                )
+            if session.lifecycle in {"STARTING", "DRAINING"}:
+                session = OPERATIONAL_GOVERNANCE.transition_runtime_session(
+                    session_id,
+                    "STOPPING",
+                    actor="live_trader.kill_switch",
+                    event_type="KILL_SWITCH_RUNTIME_STOP_REQUESTED",
+                    payload=payload,
+                )
+            if session.lifecycle == "PREFLIGHT":
+                session = OPERATIONAL_GOVERNANCE.transition_runtime_session(
+                    session_id,
+                    "FAILED",
+                    actor="live_trader.kill_switch",
+                    event_type="KILL_SWITCH_PREFLIGHT_ABORTED",
+                    payload=payload,
+                )
+            elif session.lifecycle == "STOPPING":
+                session = OPERATIONAL_GOVERNANCE.transition_runtime_session(
+                    session_id,
+                    "STOPPED" if runtime_transition.get("ok") is True else "FAILED",
+                    actor="live_trader.kill_switch",
+                    event_type=(
+                        "KILL_SWITCH_RUNTIME_STOPPED"
+                        if runtime_transition.get("ok") is True
+                        else "KILL_SWITCH_RUNTIME_STOP_FAILED"
+                    ),
+                    payload=payload,
+                )
+            terminal = session.lifecycle in {"STOPPED", "FAILED"}
+            if terminal:
+                STATE.setdefault("active_runtime_session_ids", {}).pop(profile_id, None)
+            outcomes.append(
+                {"profile_id": profile_id, "session_id": session_id, "lifecycle": session.lifecycle, "ok": terminal}
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            outcomes.append(
+                {
+                    "profile_id": profile_id,
+                    "session_id": session_id,
+                    "lifecycle": "UNKNOWN",
+                    "ok": False,
+                    "reason": f"{type(exc).__name__}: {str(exc)[:200]}",
+                }
+            )
+    return outcomes
+
+
 def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, Any]:
     if name not in {"kill_switch", "new_entries_blocked", "operator_confirmed", "dry_run"}:
         return {"ok": False, "reason": "unknown flag", "snapshot": snapshot()}
@@ -4829,7 +5920,20 @@ def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, An
         reason = f"{label}는 명시 확인이 필요합니다."
         append_audit("warn", f"{label} 거부", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
+    changed = bool(STATE.get(name)) != bool(value)
+    opens_live_risk = risky_release or (
+        name == "operator_confirmed"
+        and STATE.get(name) is not True
+        and bool(value)
+    )
     STATE[name] = bool(value)
+    # Only a risk-opening transition supersedes a sealed live configuration.
+    # Tightening a transient control remains immediately effective without
+    # invalidating the active immutable Session (notably Reduce-only under an
+    # entry block). Kill still closes the Runtime explicitly below.
+    if changed and opens_live_risk:
+        STATE["config_revision"] = int(STATE.get("config_revision") or 1) + 1
+        STATE["latest_preflight_snapshot_id"] = ""
     if name == "new_entries_blocked":
         STATE["manual_new_entries_blocked"] = bool(value)
     label = {
@@ -4840,9 +5944,11 @@ def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, An
     }[name]
     level = "info" if name == "dry_run" and value else ("warn" if value else "info")
     append_audit(level, label, f"{label} 값이 {value}(으)로 변경되었습니다.")
+    kill_action: dict[str, Any] | None = None
     if name == "kill_switch" and value:
         with RUNTIME_CONTROL_LOCK:
-            LIVE_CONTINUOUS_CONTROLLER.transition_running("MONITOR")
+            STATE["kill_switch_rearm_required"] = True
+            runtime_transition = LIVE_CONTINUOUS_CONTROLLER.transition_running("MONITOR")
             with RUNTIME_MODE_LOCK:
                 STATE["new_entries_blocked"] = True
                 for profile_id in ("stock", "crypto"):
@@ -4851,7 +5957,84 @@ def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, An
                         "MONITOR",
                         action="Kill Switch fail-closed MONITOR 전환",
                     )
-    return {"ok": True, "reason": "flag changed", "snapshot": snapshot()}
+            cancellation = cancel_working_orders_for_kill_switch()
+            governance_sessions = stop_operational_runtime_sessions_for_kill(
+                runtime_transition=runtime_transition,
+                cancellation=cancellation,
+            )
+            kill_action = {
+                "runtime": runtime_transition,
+                "cancellation": cancellation,
+                "governance_sessions": governance_sessions,
+                "flatten_requested": False,
+            }
+            append_audit(
+                "danger",
+                "Kill Switch",
+                (
+                    "신규/위험 증가 주문 차단, 런타임 MONITOR 전환, 미체결 취소 요청 완료. "
+                    "포지션 전량 청산은 요청하지 않았습니다."
+                ),
+            )
+    return {
+        "ok": True,
+        "reason": "flag changed",
+        **({"kill_switch_action": kill_action} if kill_action is not None else {}),
+        "snapshot": snapshot(),
+    }
+
+
+def save_environment_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
+    """Persist broker settings and invalidate every stale live authorization."""
+
+    from . import env_settings
+
+    submitted = raw_values if isinstance(raw_values, dict) else {}
+    fields = {field.key: field for field in env_settings.ENV_SETTING_FIELDS}
+    before = {
+        str(item.get("key") or ""): item
+        for item in env_settings.env_settings_snapshot().get("fields", [])
+        if isinstance(item, dict)
+    }
+    settings = env_settings.save_env_settings(submitted)
+    after = {
+        str(item.get("key") or ""): item
+        for item in settings.get("fields", [])
+        if isinstance(item, dict)
+    }
+    changed_keys: list[str] = []
+    for raw_key, raw_value in submitted.items():
+        key = str(raw_key)
+        field = fields.get(key)
+        if field is None:
+            continue
+        if field.kind == "secret":
+            if str(raw_value or "").strip():
+                changed_keys.append(key)
+            continue
+        if str(before.get(key, {}).get("value") or "") != str(after.get(key, {}).get("value") or ""):
+            changed_keys.append(key)
+    changed_keys = list(dict.fromkeys(changed_keys))
+    if changed_keys:
+        STATE["config_revision"] = int(STATE.get("config_revision") or 1) + 1
+        STATE["latest_preflight_snapshot_id"] = ""
+        if live_exposure_active():
+            STATE["new_entries_blocked"] = True
+        append_audit(
+            "warn" if live_exposure_active() else "info",
+            "실거래 환경 설정 변경",
+            (
+                f"보호 설정 {len(changed_keys)}개가 변경되어 Preflight를 무효화했습니다. "
+                f"변경 키: {', '.join(changed_keys)} · 값은 감사 로그에 기록하지 않았습니다."
+            ),
+        )
+    return {
+        "ok": True,
+        "reason": "environment settings saved",
+        "settings": settings,
+        "changed_keys": changed_keys,
+        "snapshot": snapshot(),
+    }
 
 
 def raw_portfolio_payload(strategy_dir: Path, portfolio_id: str) -> dict[str, Any] | None:
@@ -5664,6 +6847,9 @@ def set_risk_setting(name: str, value: object) -> dict[str, Any]:
             "reason": f"리스크 한도 저장에 실패했습니다: {exc}",
             "snapshot": snapshot(),
         }
+    STATE["risk_policy_revision"] = int(STATE.get("risk_policy_revision") or 1) + 1
+    STATE["config_revision"] = int(STATE.get("config_revision") or 1) + 1
+    STATE["latest_preflight_snapshot_id"] = ""
     append_audit("warn", "리스크 한도 변경", f"{meta['label']} 값이 {numeric:g}{meta['unit']}(으)로 변경되었습니다.")
     return {"ok": True, "reason": "risk setting changed", "snapshot": snapshot()}
 
@@ -5684,6 +6870,8 @@ def set_checklist_item(name: str, value: bool) -> dict[str, Any]:
             "reason": f"체크리스트 저장에 실패했습니다: {exc}",
             "snapshot": snapshot(),
         }
+    STATE["config_revision"] = int(STATE.get("config_revision") or 1) + 1
+    STATE["latest_preflight_snapshot_id"] = ""
     append_audit("info" if value else "warn", "운영 체크리스트", f"{item['label']} 확인 값이 {bool(value)}(으)로 변경되었습니다.")
     return {"ok": True, "reason": "checklist changed", "snapshot": snapshot()}
 
@@ -5694,6 +6882,8 @@ def set_retry_policy(name: str, value: object) -> dict[str, Any]:
         return {"ok": False, "reason": "unknown retry policy", "snapshot": snapshot()}
     if meta["type"] == "boolean":
         STATE["retry_policy"][name] = bool(value)
+        STATE["config_revision"] = int(STATE.get("config_revision") or 1) + 1
+        STATE["latest_preflight_snapshot_id"] = ""
         append_audit("info", "재시도 정책 변경", f"{meta['label']} 값이 {bool(value)}(으)로 변경되었습니다.")
         return {"ok": True, "reason": "retry policy changed", "snapshot": snapshot()}
     try:
@@ -5705,6 +6895,8 @@ def set_retry_policy(name: str, value: object) -> dict[str, Any]:
     if numeric < minimum or numeric > maximum:
         return {"ok": False, "reason": f"{meta['label']} 값은 {minimum:g}~{maximum:g} 범위여야 합니다.", "snapshot": snapshot()}
     STATE["retry_policy"][name] = float(int(numeric))
+    STATE["config_revision"] = int(STATE.get("config_revision") or 1) + 1
+    STATE["latest_preflight_snapshot_id"] = ""
     append_audit("info", "재시도 정책 변경", f"{meta['label']} 값이 {int(numeric)}{meta['unit']}(으)로 변경되었습니다.")
     return {"ok": True, "reason": "retry policy changed", "snapshot": snapshot()}
 
@@ -5773,6 +6965,7 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
         "errors": [],
         "successful_account_brokers": [],
         "successful_position_brokers": [],
+        "position_observations": {},
     }
     for broker_id, result in fetch_broker_snapshots(router, broker_ids).items():
         if isinstance(result, Exception):
@@ -5787,6 +6980,9 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
         if isinstance(positions_snapshot, list):
             data["positions"].extend(item for item in positions_snapshot if isinstance(item, dict))
             data["successful_position_brokers"].append(broker_id)
+            data["position_observations"][broker_id] = {
+                "observedAt": data["fetched_at"],
+            }
     STATE["broker_reconciliation"] = data
     refresh_account_risk_budget(data["accounts"])
     return data
@@ -6292,7 +7488,12 @@ def apply_execution_events_to_local_orders(
                 else "broker-partially-filled"
             )
         elif state_name in {"accepted", "acknowledged", "new", "open"}:
-            if managed is not None and not managed.terminal:
+            cancel_reconciliation_pending = (
+                str(order.get("state") or "").lower()
+                in {"cancel_pending", "unknown_cancel_result"}
+                or bool(order.get("cancel_request_id"))
+            )
+            if managed is not None and not managed.terminal and not cancel_reconciliation_pending:
                 try:
                     if managed.status == "SUBMITTING":
                         managed = LIVE_OMS.acknowledge(
@@ -6309,10 +7510,34 @@ def apply_execution_events_to_local_orders(
                         )
                 except ValueError as exc:
                     order["reconciliation_warning"] = str(exc)
-            order["state"] = "acknowledged"
-            order["queue_state"] = "submitted"
-            order["reason"] = "broker-acknowledged"
+            if cancel_reconciliation_pending:
+                # An active/open snapshot after a cancel ACK is not proof that
+                # cancel failed, and must never trigger another cancel submit.
+                order["queue_state"] = "reconcile_required"
+                order["reason"] = "broker-active-after-cancel-request"
+                order["cancel_reconciliation"] = "broker-still-active"
+            else:
+                order["state"] = "acknowledged"
+                order["queue_state"] = "submitted"
+                order["reason"] = "broker-acknowledged"
         elif state_name in {"rejected", "expired", "failed", "canceled"}:
+            filled_truth = (
+                str(order.get("state") or "").lower() == "filled"
+                or (managed is not None and managed.status == "FILLED")
+            )
+            if state_name == "canceled" and filled_truth:
+                # A late cancel event can race with the final fill.  Broker fill
+                # truth is irreversible and therefore wins the reconciliation.
+                order["state"] = "filled"
+                order["queue_state"] = "completed"
+                order["reason"] = "broker-filled-cancel-race"
+                order["cancel_reconciliation"] = "filled-truth-prevailed"
+                order["updated_at"] = now_text()
+                order["last_execution_event_id"] = event_id
+                if managed is not None:
+                    order["oms_status"] = managed.status
+                updated += 1
+                continue
             target = {
                 "rejected": "REJECTED",
                 "failed": "REJECTED",
@@ -6869,7 +8094,18 @@ def merge_broker_reconciliation_cache(
     ) | set(successful_brokers)
     cache["successful_account_brokers"] = sorted(account_success)
     cache["successful_position_brokers"] = sorted(position_success)
-    cache["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    observed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    observations = (
+        dict(cache.get("position_observations"))
+        if isinstance(cache.get("position_observations"), dict)
+        else {}
+    )
+    for broker_id in successful_brokers:
+        observations[str(broker_id).strip().lower()] = {
+            "observedAt": observed_at,
+        }
+    cache["position_observations"] = observations
+    cache["fetched_at"] = observed_at
     if accounts:
         refresh_account_risk_budget(
             [
@@ -8927,6 +10163,8 @@ def submit_binance_smoke_order(confirmation_token: object, *, confirmed: bool) -
             "target_revision": int(datetime.now(timezone.utc).timestamp()),
             "order_purpose": "BROKER_SMOKE",
             "order_type": "MARKET",
+            "market_event_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "market_data_verified": True,
         },
     )
     result = submit_order_intent(snapshot(), intent, dry_run=False, audit_event="Binance Broker Smoke")
@@ -9146,6 +10384,21 @@ def submit_upbit_smoke_order(confirmation_token: object, *, confirmed: bool) -> 
         "notional": amount,
         "identifier": str(preview.get("identifier") or ""),
     }
+    if (
+        STATE.get("kill_switch")
+        or STATE.get("new_entries_blocked")
+        or STATE.get("dry_run")
+        or current_mode() != "SMALL_LIVE"
+        or not real_orders_enabled()
+    ):
+        reason = "전송 직전 실거래 안전 상태가 변경되어 Upbit 주문을 차단했습니다. 새 미리보기가 필요합니다."
+        _upbit_smoke_order_view(
+            status="blocked",
+            status_label="전송 직전 차단",
+            detail=reason,
+        )
+        append_audit("danger", "Upbit 실제 소액 주문", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
     response = router.place_order(intent)
     payload = response.get("json") if isinstance(response.get("json"), dict) else {}
     if not bool(response.get("ok")):
@@ -9242,7 +10495,12 @@ def run_reconciliation(
     STATE["broker_truth_blocked"] = bool(broker_truth.get("newEntriesBlocked"))
     if STATE["broker_truth_blocked"]:
         STATE["new_entries_blocked"] = True
-    elif was_broker_blocked and not STATE.get("kill_switch") and not STATE.get("manual_new_entries_blocked"):
+    elif (
+        was_broker_blocked
+        and not STATE.get("kill_switch")
+        and not STATE.get("kill_switch_rearm_required")
+        and not STATE.get("manual_new_entries_blocked")
+    ):
         STATE["new_entries_blocked"] = False
     append_audit(
         "danger" if int(summary["mismatch_count"]) or broker_data["errors"] else "warn" if int(summary["api_required_count"]) or int(summary.get("capability_gap_count") or 0) else "info",
@@ -9251,6 +10509,36 @@ def run_reconciliation(
             f"{summary['status_label']}: API/원장 필요 {summary['api_required_count']}개, "
             f"미지원 capability {summary.get('capability_gap_count', 0)}개, "
             f"불일치 {summary['mismatch_count']}개, 조회 오류 {len(broker_data['errors'])}개"
+        ),
+    )
+    reconciliation_blocked = bool(
+        broker_truth.get("newEntriesBlocked")
+        or int(summary.get("mismatch_count") or 0)
+        or int(summary.get("api_required_count") or 0)
+        or int(summary.get("capability_gap_count") or 0)
+        or broker_data.get("errors")
+    )
+    sync_operational_incident(
+        code="RECONCILIATION_BLOCKED",
+        active=reconciliation_blocked,
+        severity=(
+            "CRITICAL"
+            if int(summary.get("mismatch_count") or 0) or broker_data.get("errors")
+            else "ERROR"
+        ),
+        title="포지션·계좌 3자 대조 차단",
+        detail=(
+            f"API/원장 필요 {summary.get('api_required_count', 0)}개 · "
+            f"capability gap {summary.get('capability_gap_count', 0)}개 · "
+            f"불일치 {summary.get('mismatch_count', 0)}개 · "
+            f"조회 오류 {len(broker_data.get('errors') or [])}개"
+            if reconciliation_blocked
+            else "Broker Snapshot·실시간 Event·내부 Ledger 대조가 복구되었습니다."
+        ),
+        impact=(
+            "신규 위험 주문 차단"
+            if reconciliation_blocked
+            else "대조 기반 차단 원인 해소"
         ),
     )
     automatic_results = automatic_live_promotion_sweep()
@@ -9264,20 +10552,353 @@ def run_reconciliation(
     }
 
 
-def run_final_preflight() -> dict[str, Any]:
+PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS = 60
+
+
+def refresh_preflight_reconciliation(
+    strategy: dict[str, Any],
+    *,
+    maximum_age_seconds: int = PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS,
+) -> dict[str, Any]:
+    """Build broker-scoped, fresh REST/Event/Ledger evidence for Preflight.
+
+    The broker poll only reads broker state. It drains private execution events
+    into the local event ledger and forces a new REST account/position snapshot
+    for the selected Deployment route. A previous cached PASS is never enough.
+    """
+
+    broker_id = strategy_broker_id(strategy)
+    maximum_age = max(1, int(maximum_age_seconds))
+    try:
+        poll_result = poll_execution_events(
+            broker_id,
+            force_snapshot=True,
+            include_snapshot=False,
+        )
+    except Exception as exc:  # Broker read boundary must become evidence, not a crash.
+        poll_result = {
+            "ok": False,
+            "errors": [
+                {
+                    "broker_id": broker_id,
+                    "detail": f"{type(exc).__name__}: {str(exc)[:240]}",
+                }
+            ],
+        }
+
+    poll_errors = (
+        poll_result.get("errors", [])
+        if isinstance(poll_result, dict)
+        and isinstance(poll_result.get("errors"), list)
+        else []
+    )
+    poll_ok = bool(
+        isinstance(poll_result, dict)
+        and poll_result.get("ok") is True
+        and poll_result.get("coalesced") is not True
+        and not poll_errors
+    )
+    if poll_ok:
+        STATE["reconciliation_last_run"] = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    reconciliation = reconciliation_snapshot()
+    scoped_summary = _reconciliation_summary_for_broker_snapshot(
+        reconciliation,
+        broker_id,
+    )
+    positions_data = [
+        item
+        for item in reconciliation.get("positions", [])
+        if isinstance(item, dict)
+        and str(item.get("broker_id") or "").strip().lower() == broker_id
+    ]
+    accounts_data = [
+        item
+        for item in reconciliation.get("accounts", [])
+        if isinstance(item, dict)
+        and str(item.get("broker_id") or "").strip().lower() == broker_id
+    ]
+    scoped_errors = [
+        item
+        for item in reconciliation.get("errors", [])
+        if isinstance(item, dict)
+        and str(item.get("broker_id") or "").strip().lower() == broker_id
+    ]
+
+    broker_cache = (
+        STATE.get("broker_reconciliation")
+        if isinstance(STATE.get("broker_reconciliation"), dict)
+        else {}
+    )
+    execution_state = (
+        STATE.get("execution_events")
+        if isinstance(STATE.get("execution_events"), dict)
+        else {}
+    )
+    program_state = (
+        STATE.get("program_ledger")
+        if isinstance(STATE.get("program_ledger"), dict)
+        else {}
+    )
+    position_observations = (
+        broker_cache.get("position_observations")
+        if isinstance(broker_cache.get("position_observations"), dict)
+        else {}
+    )
+    broker_observation = (
+        position_observations.get(broker_id)
+        if isinstance(position_observations.get(broker_id), dict)
+        else {}
+    )
+    evidence_times = {
+        "broker_snapshot": broker_observation.get("observedAt")
+        or broker_observation.get("observed_at"),
+        "execution_event": execution_state.get("last_poll"),
+        "local_ledger": program_state.get("last_event_sync"),
+    }
+    evidence_ages = {
+        label: seconds_since(value)
+        for label, value in evidence_times.items()
+    }
+    successful_accounts = {
+        str(item).strip().lower()
+        for item in broker_cache.get("successful_account_brokers", [])
+    }
+    successful_positions = {
+        str(item).strip().lower()
+        for item in broker_cache.get("successful_position_brokers", [])
+    }
+    execution_errors = [
+        item
+        for item in execution_state.get("errors", [])
+        if isinstance(item, dict)
+        and str(item.get("broker_id") or "").strip().lower() == broker_id
+    ]
+    evidence_issues: list[str] = []
+    if not broker_id:
+        evidence_issues.append("deployment-broker-route-missing")
+    if not poll_ok:
+        evidence_issues.append(
+            "broker-poll-coalesced"
+            if isinstance(poll_result, dict)
+            and poll_result.get("coalesced") is True
+            else "broker-poll-failed"
+        )
+    if broker_id not in successful_accounts:
+        evidence_issues.append("broker-account-snapshot-unverified")
+    if broker_id not in successful_positions:
+        evidence_issues.append("broker-position-snapshot-unverified")
+    if scoped_errors or execution_errors:
+        evidence_issues.append("broker-or-execution-poll-error")
+    for label, age in evidence_ages.items():
+        if age is None:
+            evidence_issues.append(f"{label}-timestamp-missing")
+        elif age > maximum_age:
+            evidence_issues.append(f"{label}-stale:{age}s")
+
+    fresh = not evidence_issues
+    three_way_verified = bool(
+        fresh
+        and scoped_summary.get("status") == "pass"
+        and int(scoped_summary.get("row_count") or 0) > 0
+    )
+    if not three_way_verified and scoped_summary.get("status") != "pass":
+        evidence_issues.append("broker-event-ledger-mismatch-or-unverified")
+    if not three_way_verified and int(scoped_summary.get("row_count") or 0) == 0:
+        evidence_issues.append("broker-scoped-reconciliation-rows-missing")
+    evidence_issues = list(dict.fromkeys(evidence_issues))
+    freshness_detail = (
+        "Fresh Broker REST Snapshot·Execution Event·Local Ledger 3자 대조를 "
+        f"{max(evidence_ages.values() or [0])}초 이내 증거로 확인했습니다."
+        if fresh and three_way_verified
+        else "Fresh 3자 대조 차단: " + ", ".join(evidence_issues)
+    )
+    scoped_summary.update(
+        {
+            "last_run": STATE.get("reconciliation_last_run") or "미실행",
+            "fresh": fresh,
+            "three_way_verified": three_way_verified,
+            "freshness_detail": freshness_detail,
+            "freshness_max_age_seconds": maximum_age,
+            "evidence_ages_seconds": evidence_ages,
+            "error_count": len(scoped_errors) + len(execution_errors),
+        }
+    )
+    if not three_way_verified:
+        STATE["broker_truth_blocked"] = True
+        STATE["new_entries_blocked"] = True
+    return {
+        "summary": scoped_summary,
+        "positions": positions_data,
+        "accounts": accounts_data,
+        "errors": scoped_errors,
+        "poll": {
+            "ok": poll_ok,
+            "coalesced": bool(
+                isinstance(poll_result, dict)
+                and poll_result.get("coalesced") is True
+            ),
+            "error_count": len(poll_errors),
+        },
+    }
+
+
+def run_final_preflight(
+    deployment_id: str = "",
+    strategy_id: str = "",
+) -> dict[str, Any]:
     STATE["preflight_last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     data = snapshot()
-    hard_stop_count = int(data["launch_report"]["hard_stop_count"])
-    warning_count = int(data["launch_report"]["warning_count"])
-    doctor_diagnostics = persist_doctor_diagnostic_snapshot(data)
+    strategies = data.get("strategies") if isinstance(data.get("strategies"), list) else []
+    selected = _operational_strategy(
+        strategies,
+        deployment_id=deployment_id,
+        strategy_id=strategy_id,
+    )
+    requested_deployment = str(deployment_id or "").strip()
+    requested_strategy = str(strategy_id or "").strip()
+    explicit_context = bool(requested_deployment or requested_strategy)
+    if selected is not None and (
+        (requested_deployment and str(selected.get("deployment_id") or "") != requested_deployment)
+        or (requested_strategy and str(selected.get("strategy_id") or "") != requested_strategy)
+    ):
+        selected = None
+    if explicit_context and selected is None:
+        scoped_checks = [
+            {
+                "label": "Deployment 실행 컨텍스트",
+                "status": "fail",
+                "detail": "요청한 deployment_id/strategy_id와 정확히 일치하는 Artifact를 찾지 못했습니다.",
+            }
+        ]
+        scoped_launch = launch_report(scoped_checks)
+        doctor_data = {
+            **data,
+            "final_preflight": scoped_checks,
+            "launch_report": scoped_launch,
+        }
+        doctor_diagnostics = persist_doctor_diagnostic_snapshot(doctor_data)
+        append_audit(
+            "danger",
+            "최종 Preflight",
+            "명시한 Deployment 실행 컨텍스트가 없어 fail-closed로 차단했습니다.",
+        )
+        return {
+            "ok": False,
+            "reason": "요청한 Deployment 실행 컨텍스트를 찾지 못했습니다.",
+            "preflight_snapshot": {
+                "status": "BLOCKED",
+                "error": "deployment-context-not-found",
+            },
+            "doctor_diagnostics": doctor_diagnostics,
+            "snapshot": snapshot(),
+        }
+    if selected is not None:
+        data = {
+            **data,
+            "reconciliation": refresh_preflight_reconciliation(selected),
+        }
+    scoped_checks = (
+        final_preflight_checks(
+            [selected],
+            data.get("brokers") if isinstance(data.get("brokers"), list) else [],
+            data.get("reconciliation") if isinstance(data.get("reconciliation"), dict) else reconciliation_snapshot(),
+            current_strategy=selected,
+        )
+        if selected is not None
+        else data.get("final_preflight", [])
+    )
+    scoped_launch = launch_report(scoped_checks)
+    hard_stop_count = int(scoped_launch["hard_stop_count"])
+    warning_count = int(scoped_launch["warning_count"])
+    governance_preflight: dict[str, Any] | None = None
+    if selected is not None:
+        try:
+            manifest = ensure_operational_deployment_manifest(selected)
+            reconciliation = data.get("reconciliation") if isinstance(data.get("reconciliation"), dict) else {}
+            checks = [
+                {
+                    "checkId": f"preflight-{governance_sha256(str(check.get('label') or index))[:16]}",
+                    "status": str(check.get("status") or "fail").upper(),
+                    "detail": str(check.get("detail") or ""),
+                    "evidenceHash": governance_sha256(
+                        {
+                            "label": str(check.get("label") or ""),
+                            "status": str(check.get("status") or ""),
+                            "detail": str(check.get("detail") or ""),
+                        }
+                    ),
+                }
+                for index, check in enumerate(scoped_checks)
+                if isinstance(check, dict)
+            ]
+            preflight_snapshot = OPERATIONAL_GOVERNANCE.create_preflight_snapshot(
+                deployment_id=manifest.deployment_id,
+                deployment_manifest_hash=manifest.manifest_hash,
+                checks=checks,
+                reconciliation_hash=governance_sha256(
+                    {
+                        "summary": reconciliation.get("summary", {}),
+                        "positions": reconciliation.get("positions", []),
+                        "accounts": reconciliation.get("accounts", []),
+                    }
+                ),
+                broker_snapshot_hash=governance_sha256(
+                    {
+                        "brokers": data.get("brokers", []),
+                        "executionStreams": data.get("execution_streams", {}),
+                        "generatedAt": data.get("generated_at", ""),
+                    }
+                ),
+                metadata={
+                    "mode": str(data.get("mode") or "MONITOR"),
+                    "strategyId": str(selected.get("strategy_id") or ""),
+                    "portfolioId": str((selected.get("portfolio_gate") or {}).get("portfolioId") or ""),
+                },
+            )
+            STATE["selected_deployment_id"] = manifest.deployment_id
+            STATE["selected_strategy_id"] = str(selected.get("strategy_id") or "")
+            STATE["latest_preflight_snapshot_id"] = preflight_snapshot.snapshot_id
+            governance_preflight = preflight_snapshot.to_dict()
+            if hard_stop_count == 0 and warning_count == 0:
+                STATE["kill_switch_rearm_required"] = False
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            scoped_checks = [
+                *scoped_checks,
+                {
+                    "label": "운영 거버넌스 저장소",
+                    "status": "fail",
+                    "detail": f"Preflight Snapshot 저장 실패: {type(exc).__name__}",
+                },
+            ]
+            scoped_launch = launch_report(scoped_checks)
+            hard_stop_count = int(scoped_launch["hard_stop_count"])
+            warning_count = int(scoped_launch["warning_count"])
+            governance_preflight = {
+                "status": "BLOCKED",
+                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            }
+    doctor_data = {
+        **data,
+        "final_preflight": scoped_checks,
+        "launch_report": scoped_launch,
+    }
+    doctor_diagnostics = persist_doctor_diagnostic_snapshot(doctor_data)
     append_audit(
         "danger" if hard_stop_count else "warn" if warning_count else "info",
         "최종 Preflight",
-        f"hard stop {hard_stop_count}개, warning {warning_count}개. {data['launch_report']['lock_reason']}",
+        (
+            f"hard stop {hard_stop_count}개, warning {warning_count}개. "
+            f"{scoped_launch['lock_reason']} · snapshot "
+            f"{(governance_preflight or {}).get('snapshotId', '저장 실패/미적용')}"
+        ),
     )
     return {
         "ok": True,
         "reason": f"최종 점검 완료: hard stop {hard_stop_count}개, warning {warning_count}개",
+        "preflight_snapshot": governance_preflight,
         "doctor_diagnostics": doctor_diagnostics,
         "snapshot": snapshot(),
     }
@@ -9351,6 +10972,18 @@ def futures_risk_reducing_verified(
     checks: dict[str, Any],
     intent: OrderIntent,
 ) -> bool:
+    """Verify a reduce-only claim against fresh broker position truth.
+
+    ``risk_reducing`` is an untrusted intent claim.  A missing position row is
+    deliberately different from a confirmed flat position: neither can prove
+    that a new order reduces risk.  The check therefore requires a recent,
+    successful snapshot for the exact broker and instrument and rejects orders
+    that cross through zero.
+
+    The historical function name is kept because futures rollout code imports
+    it, but the invariant applies to every live broker.
+    """
+
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     if metadata.get("risk_reducing") is not True:
         return False
@@ -9358,36 +10991,146 @@ def futures_risk_reducing_verified(
         metadata.get("broker_id")
         or broker_id_from_symbol(intent.symbol, intent.asset)
     ).strip().lower()
-    if broker_id != "binance-futures":
-        return True
-    strategy = strategy_for_order_intent(checks, intent)
-    if not strategy or strategy_broker_id(strategy) != "binance-futures":
+    if broker_id not in {"kis", "binance", "binance-futures", "upbit"}:
         return False
-    direction = str(
-        strategy.get("position_direction") or ""
-    ).strip().lower()
-    if direction not in {"long", "short"}:
+
+    reconciliation = (
+        STATE.get("broker_reconciliation")
+        if isinstance(STATE.get("broker_reconciliation"), dict)
+        else {}
+    )
+    successful = {
+        str(item).strip().lower()
+        for item in reconciliation.get("successful_position_brokers", [])
+        if str(item).strip()
+    }
+    if broker_id not in successful:
         return False
-    try:
-        position_quantity = broker_position_quantity(
-            intent.symbol,
-            "binance-futures",
-            "SHORT" if direction == "short" else "LONG",
+    failed = {
+        str(item.get("broker_id") or "").strip().lower()
+        for item in reconciliation.get("errors", [])
+        if isinstance(item, dict)
+    }
+    if broker_id in failed:
+        return False
+    fetched_age = seconds_since(reconciliation.get("fetched_at"))
+    if (
+        fetched_age is None
+        or fetched_age > REDUCE_ONLY_POSITION_MAX_AGE_SECONDS
+    ):
+        return False
+
+    # A merged multi-broker cache may receive a new global fetched_at when a
+    # different broker is refreshed.  If broker-scoped observation evidence is
+    # available, it must independently be fresh as well.
+    observations = reconciliation.get("position_observations")
+    broker_observation = (
+        observations.get(broker_id)
+        if isinstance(observations, dict)
+        and isinstance(observations.get(broker_id), dict)
+        else {}
+    )
+    if broker_observation:
+        observed_age = seconds_since(
+            broker_observation.get("observedAt")
+            or broker_observation.get("observed_at")
         )
-    except RuntimeError:
+        if (
+            observed_age is None
+            or observed_age > REDUCE_ONLY_POSITION_MAX_AGE_SECONDS
+        ):
+            return False
+    canonical_symbol = _canonical_restore_instrument(
+        broker_id,
+        str(intent.symbol or "").upper().removesuffix(".PERP"),
+    )
+    matching_positions = [
+        item
+        for item in reconciliation.get("positions", [])
+        if isinstance(item, dict)
+        and str(item.get("broker_id") or "").strip().lower() == broker_id
+        and _canonical_restore_instrument(
+            broker_id,
+            str(item.get("symbol") or "").upper().removesuffix(".PERP"),
+        )
+        == canonical_symbol
+    ]
+    if not matching_positions:
+        return False
+
+    if broker_id == "binance-futures":
+        strategy = strategy_for_order_intent(checks, intent)
+        if not strategy:
+            try:
+                strategy = next(
+                    (
+                        item
+                        for item in strategy_rows(portfolio_rows())
+                        if str(item.get("strategy_id") or "")
+                        == intent.strategy_id
+                    ),
+                    {},
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return False
+        if not strategy or strategy_broker_id(strategy) != "binance-futures":
+            return False
+        direction = str(
+            strategy.get("position_direction") or ""
+        ).strip().lower()
+        if direction not in {"long", "short"}:
+            return False
+        requested_side = "SHORT" if direction == "short" else "LONG"
+        exact_positions = [
+            item
+            for item in matching_positions
+            if normalized_reconciliation_position_side(
+                item,
+                source="broker",
+            )
+            == requested_side
+        ]
+        one_way_positions = [
+            item
+            for item in matching_positions
+            if normalized_reconciliation_position_side(
+                item,
+                source="broker",
+            )
+            == "BOTH"
+        ]
+        matching_positions = exact_positions or one_way_positions
+        if not matching_positions:
+            return False
+
+    try:
+        order_quantity = float(intent.quantity)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    position_quantity = sum(
+        _restore_quantity(item)
+        for item in matching_positions
+    )
+    if (
+        not math.isfinite(order_quantity)
+        or order_quantity <= 0
+        or not math.isfinite(position_quantity)
+    ):
         return False
     tolerance = max(1e-12, abs(position_quantity) * 1e-9)
-    if direction == "short":
+    if position_quantity < -tolerance:
         return (
-            position_quantity < 0
-            and intent.side == "BUY"
-            and intent.quantity
-            <= abs(position_quantity) + tolerance
+            intent.side == "BUY"
+            and order_quantity <= abs(position_quantity) + tolerance
+            and abs(position_quantity + order_quantity)
+            < abs(position_quantity)
         )
     return (
-        position_quantity > 0
+        position_quantity > tolerance
         and intent.side == "SELL"
-        and intent.quantity <= position_quantity + tolerance
+        and order_quantity <= position_quantity + tolerance
+        and abs(position_quantity - order_quantity)
+        < abs(position_quantity)
     )
 
 
@@ -10057,6 +11800,7 @@ def strategy_executions_for_profile(checks: dict[str, Any], profile_id: str) -> 
     executions: list[tuple[dict[str, Any], StrategyExecutionResult]] = []
     for strategy in strategies:
         broker_id = strategy_broker_id(strategy)
+        market_data = strategy_market_data(strategy)
         futures_policy = (
             strategy.get("futures_execution_policy")
             if isinstance(strategy.get("futures_execution_policy"), dict)
@@ -10066,6 +11810,12 @@ def strategy_executions_for_profile(checks: dict[str, Any], profile_id: str) -> 
             "broker_id": broker_id,
             "profile_id": normalized_profile,
             "runner": "StrategyExecutionRunner",
+            "market_event_time": market_data.occurred_at,
+            "market_received_time": market_data.received_at,
+            "market_data_latency_seconds": market_data.latency_seconds,
+            "market_data_verified": bool(
+                strategy.get("price_time") or strategy.get("occurred_at")
+            ),
             "market_type": str(
                 strategy.get("market_type") or "spot"
             ).lower(),
@@ -10113,7 +11863,7 @@ def strategy_executions_for_profile(checks: dict[str, Any], profile_id: str) -> 
                 strategy,
                 runner.run(
                     artifact=strategy,
-                    market_data=strategy_market_data(strategy),
+                    market_data=market_data,
                     mode=current_mode(),
                     stream_id=(
                         f"live:{normalized_profile}:"
@@ -10668,6 +12418,37 @@ def broker_symbol_exposure(intent: OrderIntent) -> float:
     return total
 
 
+def intent_market_data_age_seconds(
+    metadata: dict[str, Any],
+    *,
+    required: bool,
+    maximum_age_seconds: int = 120,
+) -> int:
+    """Resolve live-order data age from a confirmed event, fail closed if absent."""
+
+    event_time = str(
+        metadata.get("confirmed_bar_end")
+        or metadata.get("market_event_time")
+        or metadata.get("price_time")
+        or ""
+    )
+    verified = bool(
+        metadata.get("confirmed_bar_end")
+        or metadata.get("market_data_verified") is True
+        or metadata.get("fresh_quote_verified") is True
+    )
+    age = seconds_since(event_time)
+    if not required:
+        return max(0, int(age or 0))
+    if not verified or age is None:
+        return maximum_age_seconds + 1
+    declared_latency = max(
+        0,
+        int(safe_float(metadata.get("market_data_latency_seconds"), 0.0)),
+    )
+    return max(age, declared_latency)
+
+
 def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool) -> PreTradeContext:
     settings = STATE["risk_settings"]
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
@@ -10684,6 +12465,7 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
         not dry_run
         and intent.mode in {"SMALL_LIVE", "FULL_LIVE"}
     )
+    maximum_market_data_age = 120
     account_known = account_risk.get("known") is True
     account_fresh = account_risk.get("fresh") is True
     available_cash = (
@@ -10772,12 +12554,12 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
             if live_account_required
             else True
         ),
-        data_latency_seconds=int(
-            safe_float(account_risk.get("age_seconds"), 0.0)
-            if account_known
-            else 0.0
+        data_latency_seconds=intent_market_data_age_seconds(
+            metadata,
+            required=live_account_required,
+            maximum_age_seconds=maximum_market_data_age,
         ),
-        max_data_latency_seconds=120,
+        max_data_latency_seconds=maximum_market_data_age,
         max_slippage_bps=float(settings["max_slippage_bps"]),
         max_open_orders=int(float(settings["max_open_orders"])),
         open_order_count=effective_open_order_count,
@@ -10980,11 +12762,38 @@ def live_broker_dispatch_allowed(
 ) -> tuple[bool, str]:
     if dry_run:
         return False, "dry-run-broker-dispatch-forbidden"
+    if STATE.get("dry_run"):
+        return False, "dry-run-control-active"
     normalized_mode = str(intent.mode or "").strip().upper()
     if normalized_mode not in LIVE_BROKER_DISPATCH_MODES:
         return False, "non-live-intent-broker-dispatch-forbidden"
     if current_mode() not in LIVE_BROKER_DISPATCH_MODES:
         return False, "non-live-runtime-broker-dispatch-forbidden"
+    if not real_orders_enabled():
+        return False, "real-order-route-disabled"
+    if not STATE.get("operator_confirmed"):
+        return False, "operator-confirmation-required"
+    if STATE.get("kill_switch") or durable_control_halt_active(intent):
+        return False, "kill-switch-broker-dispatch-forbidden"
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    if intent_market_data_age_seconds(metadata, required=True) > 120:
+        return False, "market-data-event-stale-or-unverified"
+    verified_risk_reducing = False
+    if metadata.get("risk_reducing") is True or STATE.get(
+        "new_entries_blocked"
+    ):
+        verified_risk_reducing = futures_risk_reducing_verified({}, intent)
+    if STATE.get("new_entries_blocked"):
+        # Recompute from current broker truth at the final side-effect edge.
+        # The metadata flag may originate in strategy code and is never enough
+        # on its own to bypass a new-entry block.
+        if not verified_risk_reducing:
+            return False, "risk-increasing-order-blocked"
+    elif (
+        metadata.get("risk_reducing") is True
+        and not verified_risk_reducing
+    ):
+        return False, "reduce-only-position-verification-failed"
     return True, ""
 
 
@@ -11084,6 +12893,128 @@ def live_broker_payload(
     }
 
 
+def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str, dict[str, Any]]:
+    """Revalidate immutable live session identity at the final side-effect edge."""
+
+    if intent.mode not in {"SMALL_LIVE", "FULL_LIVE"}:
+        return False, "operational-session-live-mode-required", {}
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    profile_id = "stock" if broker_id == "kis" else "crypto"
+    session_id = str(
+        (STATE.get("active_runtime_session_ids") or {}).get(profile_id) or ""
+    )
+    if not session_id:
+        return False, "operational-runtime-session-missing", {}
+    try:
+        authorization = OPERATIONAL_GOVERNANCE.runtime_authorization(
+            session_id,
+            require_fresh_preflight=False,
+        )
+        if authorization.get("allowed") is not True:
+            return (
+                False,
+                "operational-runtime-authorization-blocked:"
+                + ",".join(str(item) for item in authorization.get("reasons", [])),
+                authorization,
+            )
+        session = authorization.get("session") if isinstance(authorization.get("session"), dict) else {}
+        manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(
+            str(session.get("deploymentManifestHash") or "")
+        )
+        if manifest is None:
+            return False, "operational-deployment-manifest-missing", authorization
+        manifest_metadata = dict(manifest.metadata)
+        manifest_broker_routes = sorted(
+            {
+                str(item).strip().lower()
+                for item in manifest_metadata.get("brokerRoutes", [])
+                if str(item).strip()
+            }
+        )
+        if not manifest_broker_routes:
+            manifest_broker_routes = [str(manifest.broker_route or "").lower()]
+        if (
+            len(manifest_broker_routes) != 1
+            or manifest_broker_routes[0] != str(manifest.broker_route or "").lower()
+        ):
+            return False, "operational-cross-broker-portfolio-blocked", authorization
+        members = [
+            dict(item)
+            for item in manifest_metadata.get("strategyMembers", [])
+            if isinstance(item, dict)
+        ]
+        if not members:
+            members = [
+                {
+                    "strategyId": str(manifest_metadata.get("strategyId") or ""),
+                    "symbol": str(manifest_metadata.get("symbol") or "").upper(),
+                    "brokerId": str(manifest_metadata.get("brokerId") or "").lower(),
+                    "artifactHash": manifest.strategy_artifact_hash,
+                }
+            ]
+        member = next(
+            (
+                item
+                for item in members
+                if str(item.get("strategyId") or "") == str(intent.strategy_id)
+                and str(item.get("symbol") or "").upper()
+                == str(intent.symbol).upper()
+            ),
+            None,
+        )
+        if member is None:
+            return False, "operational-strategy-context-mismatch", authorization
+        if str(member.get("brokerId") or "").lower() != broker_id:
+            return False, "operational-broker-context-mismatch", authorization
+        requested_portfolio = str(
+            metadata.get("portfolio_id") or metadata.get("portfolioId") or ""
+        )
+        manifest_portfolio = str(manifest_metadata.get("portfolioId") or "")
+        if manifest.portfolio_artifact_hash and requested_portfolio != manifest_portfolio:
+            return False, "operational-portfolio-context-mismatch", authorization
+        strategies = strategy_rows(portfolio_rows())
+        strategy = next(
+            (
+                item
+                for item in strategies
+                if str(item.get("strategy_id") or "") == str(intent.strategy_id)
+                and (
+                    not manifest_portfolio
+                    or str(
+                        (item.get("portfolio_gate") or {}).get("portfolioId")
+                        if isinstance(item.get("portfolio_gate"), dict)
+                        else ""
+                    )
+                    == manifest_portfolio
+                )
+            ),
+            None,
+        )
+        if strategy is None:
+            return False, "operational-current-strategy-missing", authorization
+        current_member_hash = _operational_artifact_hash(strategy)
+        if str(member.get("artifactHash") or "") != current_member_hash:
+            return False, "operational-strategy-hash-changed", authorization
+        current_inputs = _operational_manifest_inputs(strategy)
+        if current_inputs["strategy_artifact_hash"] != manifest.strategy_artifact_hash:
+            return False, "operational-strategy-hash-changed", authorization
+        if current_inputs["portfolio_artifact_hash"] != manifest.portfolio_artifact_hash:
+            return False, "operational-portfolio-hash-changed", authorization
+        if current_inputs["risk_policy_hash"] != manifest.risk_policy_hash:
+            return False, "operational-risk-policy-changed", authorization
+        if current_inputs["config_revision"] != manifest.config_revision:
+            return False, "operational-config-revision-changed", authorization
+        if current_inputs["config_hash"] != manifest.config_hash:
+            return False, "operational-config-changed", authorization
+        return True, "operational-runtime-authorized", authorization
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return False, f"operational-runtime-authorization-error:{type(exc).__name__}", {}
+
+
 def dispatch_live_order_with_checkpoint(
     order: dict[str, Any],
     intent: OrderIntent,
@@ -11113,6 +13044,26 @@ def dispatch_live_order_with_checkpoint(
             }
         )
         return False, invariant_reason
+    governance_allowed, governance_reason, governance_authorization = (
+        operational_runtime_dispatch_allowed(intent)
+    )
+    order["runtime_authorization"] = governance_authorization
+    if not governance_allowed:
+        LIVE_OMS.transition(
+            managed_order.order_id,
+            "REJECTED",
+            governance_reason,
+        )
+        order.update(
+            {
+                "state": "risk_blocked",
+                "queue_state": "blocked",
+                "reason": governance_reason,
+                "next_retry_at": "-",
+                "updated_at": now_text(),
+            }
+        )
+        return False, governance_reason
 
     broker_payload = live_broker_payload(
         intent,
@@ -11226,6 +13177,23 @@ def dispatch_live_order_with_checkpoint(
                 }
             )
             return False, invariant_reason
+        governance_allowed, governance_reason, governance_authorization = (
+            operational_runtime_dispatch_allowed(intent)
+        )
+        order["runtime_authorization"] = governance_authorization
+        if not governance_allowed:
+            LIVE_OMS.mark_unknown(
+                managed_order.order_id,
+                governance_reason,
+            )
+            order.update(
+                {
+                    "state": "unknown",
+                    "queue_state": "reconcile_required",
+                    "reason": governance_reason,
+                }
+            )
+            return False, governance_reason
 
         LIVE_OMS.transition(
             managed_order.order_id,
@@ -11437,16 +13405,17 @@ def submit_order_intent(
         metadata.get("broker_id")
         or broker_id_from_symbol(intent.symbol, intent.asset)
     ).strip().lower()
-    if broker_id == "binance-futures":
-        claimed_risk_reducing = metadata.get("risk_reducing") is True
-        candidate_intent = replace(intent, metadata=dict(metadata))
-        verified_risk_reducing = futures_risk_reducing_verified(
-            checks,
-            candidate_intent,
-        )
-        metadata["risk_reducing"] = verified_risk_reducing
-        if claimed_risk_reducing and not verified_risk_reducing:
-            metadata["risk_reducing_claim_rejected"] = True
+    claimed_risk_reducing = metadata.get("risk_reducing") is True
+    candidate_intent = replace(intent, metadata=dict(metadata))
+    verified_risk_reducing = futures_risk_reducing_verified(
+        checks,
+        candidate_intent,
+    )
+    metadata["risk_reducing"] = verified_risk_reducing
+    if claimed_risk_reducing and not verified_risk_reducing:
+        metadata["risk_reducing_claim_rejected"] = True
+    else:
+        metadata.pop("risk_reducing_claim_rejected", None)
     intent = replace(intent, metadata=metadata)
     canary_scope = (
         current_live_canary_scope(
@@ -11720,15 +13689,208 @@ def submit_order_intent(
     return {"ok": ok, "reason": reason, "order": order, "snapshot": snapshot()}
 
 
-def start_continuous_runtime(profile_id: str, mode: str, portfolio_id: str = "") -> dict[str, Any]:
+def _prepare_operational_runtime_session(
+    profile_id: str,
+    mode: Mode,
+    portfolio_id: str,
+    deployment_id: str = "",
+    strategy_id: str = "",
+) -> tuple[object | None, str]:
+    requested_deployment = str(deployment_id or "").strip()
+    requested_strategy = str(strategy_id or "").strip()
+    requested_portfolio = str(portfolio_id or "").strip()
+    explicit_context = bool(requested_deployment or requested_strategy)
+    if mode == "MONITOR" and not explicit_context and not requested_portfolio:
+        return None, "명시 Deployment가 없는 안전 관찰 MONITOR 세션입니다."
+    strategies = strategy_rows(portfolio_rows())
+    strategy = (
+        _operational_strategy(
+            strategies,
+            deployment_id=requested_deployment,
+            strategy_id=requested_strategy,
+            portfolio_id=requested_portfolio,
+        )
+        if explicit_context
+        else _operational_strategy(
+            strategies,
+            deployment_id=str(STATE.get("selected_deployment_id") or ""),
+            strategy_id=str(STATE.get("selected_strategy_id") or ""),
+            portfolio_id=requested_portfolio,
+        )
+    )
+    if strategy is None:
+        if mode == "MONITOR" and not explicit_context:
+            return None, "MONITOR 세션은 선택 가능한 Deployment 없이 관찰 모드로 시작합니다."
+        raise ValueError(
+            "요청한 Live Deployment를 선택할 수 없습니다."
+            if explicit_context
+            else "현재 Live Deployment를 선택할 수 없습니다."
+        )
+    actual_deployment = str(strategy.get("deployment_id") or "")
+    actual_strategy = str(strategy.get("strategy_id") or "")
+    actual_portfolio = str(
+        (strategy.get("portfolio_gate") or {}).get("portfolioId")
+        if isinstance(strategy.get("portfolio_gate"), dict)
+        else ""
+    )
+    context_mismatches = [
+        label
+        for label, requested, actual in (
+            ("deployment", requested_deployment, actual_deployment),
+            ("strategy", requested_strategy, actual_strategy),
+            ("portfolio", requested_portfolio, actual_portfolio),
+        )
+        if requested and requested != actual
+    ]
+    if context_mismatches:
+        raise ValueError(
+            "요청한 Live 실행 컨텍스트가 Artifact와 일치하지 않습니다: "
+            + ", ".join(context_mismatches)
+        )
+    expected_profile = "stock" if strategy_broker_id(strategy) == "kis" else "crypto"
+    if profile_id != expected_profile:
+        raise ValueError(
+            f"요청 profile {profile_id}이 Deployment broker profile {expected_profile}과 일치하지 않습니다."
+        )
+    manifest = ensure_operational_deployment_manifest(strategy)
+    latest_preflight = OPERATIONAL_GOVERNANCE.latest_preflight_for_deployment(
+        manifest.deployment_id
+    )
+    preflight_id = latest_preflight.snapshot_id if latest_preflight is not None else ""
+    if mode in {"SMALL_LIVE", "FULL_LIVE"}:
+        if not real_orders_enabled():
+            raise ValueError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 필요합니다.")
+        if not preflight_id:
+            raise ValueError("현재 Deployment의 Preflight Snapshot을 먼저 실행하세요.")
+        validity = OPERATIONAL_GOVERNANCE.preflight_validity(preflight_id)
+        if validity.get("valid") is not True:
+            raise ValueError(
+                "Preflight Snapshot이 유효하지 않습니다: "
+                + ", ".join(str(item) for item in validity.get("reasons", []))
+            )
+    session = OPERATIONAL_GOVERNANCE.create_runtime_session(
+        deployment_id=manifest.deployment_id,
+        deployment_manifest_hash=manifest.manifest_hash,
+        profile=profile_id,
+        mode=mode,
+        runtime_instance_id=f"desktop-{os.getpid()}-{secrets.token_hex(8)}",
+        preflight_snapshot_id=preflight_id if mode in {"SMALL_LIVE", "FULL_LIVE"} else "",
+        metadata={
+            "portfolioId": str((strategy.get("portfolio_gate") or {}).get("portfolioId") or ""),
+            "strategyId": str(strategy.get("strategy_id") or ""),
+            "brokerId": strategy_broker_id(strategy),
+            "symbol": str(strategy.get("symbol") or ""),
+        },
+    )
+    session = OPERATIONAL_GOVERNANCE.transition_runtime_session(
+        session.session_id,
+        "STARTING",
+        actor="live_trader.desktop",
+        event_type="RUNTIME_START_REQUESTED",
+        payload={"profile": profile_id, "mode": mode},
+    )
+    STATE["selected_deployment_id"] = manifest.deployment_id
+    STATE["selected_strategy_id"] = str(strategy.get("strategy_id") or "")
+    STATE.setdefault("active_runtime_session_ids", {})[profile_id] = session.session_id
+    return session, "운영 거버넌스 Session을 생성했습니다."
+
+
+def _finish_operational_runtime_start(session: object | None, ok: bool, reason: str) -> None:
+    session_id = str(getattr(session, "session_id", "") or "")
+    if not session_id:
+        return
+    try:
+        OPERATIONAL_GOVERNANCE.transition_runtime_session(
+            session_id,
+            "RUNNING" if ok else "FAILED",
+            actor="live_trader.desktop",
+            event_type="RUNTIME_STARTED" if ok else "RUNTIME_START_FAILED",
+            payload={"detail": str(reason or "")[:500]},
+        )
+    except (OSError, sqlite3.Error, ValueError):
+        STATE["new_entries_blocked"] = True
+
+
+def _restore_previous_runtime_session_binding(
+    profile_id: str,
+    failed_session: object | None,
+    previous_session_id: str,
+) -> None:
+    failed_session_id = str(getattr(failed_session, "session_id", "") or "")
+    active = STATE.setdefault("active_runtime_session_ids", {})
+    if not isinstance(active, dict) or not failed_session_id:
+        return
+    if str(active.get(profile_id) or "") != failed_session_id:
+        return
+    if previous_session_id:
+        active[profile_id] = previous_session_id
+    else:
+        active.pop(profile_id, None)
+
+
+def start_continuous_runtime(
+    profile_id: str,
+    mode: str,
+    portfolio_id: str = "",
+    deployment_id: str = "",
+    strategy_id: str = "",
+) -> dict[str, Any]:
     normalized_profile = "stock" if profile_id == "stock" else "crypto"
     normalized_mode = normalize_runtime_mode(mode)
-    with RUNTIME_CONTROL_LOCK:
-        result = LIVE_CONTINUOUS_CONTROLLER.start(
+    governance_session: object | None = None
+    previous_session_id = str(
+        (STATE.get("active_runtime_session_ids") or {}).get(normalized_profile)
+        or ""
+    )
+    try:
+        governance_session, _governance_reason = _prepare_operational_runtime_session(
             normalized_profile,
             normalized_mode,
             portfolio_id,
+            deployment_id,
+            strategy_id,
         )
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        STATE["new_entries_blocked"] = True
+        append_audit(
+            "danger",
+            "Runtime Session",
+            f"{normalized_mode} 시작 차단: {str(exc)[:300]}",
+        )
+        return {"ok": False, "reason": str(exc), "snapshot": snapshot()}
+    session_metadata = (
+        dict(getattr(governance_session, "metadata", {}) or {})
+        if governance_session is not None
+        else {}
+    )
+    bound_portfolio_id = str(
+        session_metadata.get("portfolioId") or portfolio_id or ""
+    ).strip()
+    bound_strategy_id = str(
+        session_metadata.get("strategyId") or strategy_id or ""
+    ).strip()
+    bound_deployment_id = str(
+        getattr(governance_session, "deployment_id", "")
+        or deployment_id
+        or ""
+    ).strip()
+    with RUNTIME_CONTROL_LOCK:
+        try:
+            result = LIVE_CONTINUOUS_CONTROLLER.start(
+                normalized_profile,
+                normalized_mode,
+                bound_portfolio_id,
+                bound_strategy_id,
+                bound_deployment_id,
+            )
+        except Exception as exc:
+            _finish_operational_runtime_start(governance_session, False, str(exc))
+            _restore_previous_runtime_session_binding(
+                normalized_profile,
+                governance_session,
+                previous_session_id,
+            )
+            raise
         if result.get("ok"):
             with RUNTIME_MODE_LOCK:
                 sync_runtime_profile_mode(
@@ -11737,8 +13899,24 @@ def start_continuous_runtime(profile_id: str, mode: str, portfolio_id: str = "")
                     action=f"Continuous runtime {normalized_mode} 동기화",
                 )
                 result["snapshot"] = snapshot()
-    if portfolio_id and result.get("ok"):
-        ArtifactMetadataStore().update(portfolio_id, "portfolio", mark_used=True)
+        _finish_operational_runtime_start(
+            governance_session,
+            bool(result.get("ok")),
+            str(result.get("reason") or ""),
+        )
+        if not result.get("ok"):
+            _restore_previous_runtime_session_binding(
+                normalized_profile,
+                governance_session,
+                previous_session_id,
+            )
+        if governance_session is not None:
+            result["runtime_session_id"] = str(
+                getattr(governance_session, "session_id", "")
+            )
+        result["snapshot"] = snapshot()
+    if bound_portfolio_id and result.get("ok"):
+        ArtifactMetadataStore().update(bound_portfolio_id, "portfolio", mark_used=True)
     return result
 
 
@@ -11808,6 +13986,39 @@ def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
     normalized_profile = (
         profile_id if profile_id in {"stock", "crypto"} else ""
     )
+    target_profiles = (
+        (normalized_profile,)
+        if normalized_profile
+        else ("stock", "crypto")
+    )
+    governance_sessions: list[tuple[str, str]] = []
+    for target in target_profiles:
+        session_id = str(
+            (STATE.get("active_runtime_session_ids") or {}).get(target) or ""
+        )
+        if not session_id:
+            continue
+        try:
+            session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+            if session is not None and session.lifecycle in {"RUNNING", "DEGRADED"}:
+                session = OPERATIONAL_GOVERNANCE.transition_runtime_session(
+                    session_id,
+                    "DRAINING",
+                    actor="live_trader.desktop",
+                    event_type="RUNTIME_DRAIN_REQUESTED",
+                    payload={"profile": target},
+                )
+            if session is not None and session.lifecycle in {"STARTING", "RUNNING", "DEGRADED", "DRAINING"}:
+                OPERATIONAL_GOVERNANCE.transition_runtime_session(
+                    session_id,
+                    "STOPPING",
+                    actor="live_trader.desktop",
+                    event_type="RUNTIME_STOP_REQUESTED",
+                    payload={"profile": target},
+                )
+            governance_sessions.append((target, session_id))
+        except (OSError, sqlite3.Error, ValueError):
+            STATE["new_entries_blocked"] = True
     # Controller.stop() first transitions the engine to MONITOR under
     # RUNTIME_MODE_LOCK, then releases that lock before joining the worker.
     # Holding it here across stop() would deadlock a worker that is flushing a
@@ -11815,12 +14026,7 @@ def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
     with RUNTIME_CONTROL_LOCK:
         result = LIVE_CONTINUOUS_CONTROLLER.stop(normalized_profile)
         with RUNTIME_MODE_LOCK:
-            targets = (
-                (normalized_profile,)
-                if normalized_profile
-                else ("stock", "crypto")
-            )
-            for target in targets:
+            for target in target_profiles:
                 sync_runtime_profile_mode(
                     target,
                     "MONITOR",
@@ -11830,7 +14036,22 @@ def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
                         else "Continuous runtime 정지 실패 fail-closed MONITOR"
                     ),
                 )
-            result["snapshot"] = snapshot()
+        for target, session_id in governance_sessions:
+            try:
+                session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+                if session is not None and session.lifecycle == "STOPPING":
+                    OPERATIONAL_GOVERNANCE.transition_runtime_session(
+                        session_id,
+                        "STOPPED" if result.get("ok") else "FAILED",
+                        actor="live_trader.desktop",
+                        event_type="RUNTIME_STOPPED" if result.get("ok") else "RUNTIME_STOP_FAILED",
+                        payload={"profile": target, "detail": str(result.get("reason") or "")[:500]},
+                    )
+                if result.get("ok"):
+                    STATE.setdefault("active_runtime_session_ids", {}).pop(target, None)
+            except (OSError, sqlite3.Error, ValueError):
+                STATE["new_entries_blocked"] = True
+        result["snapshot"] = snapshot()
     return result
 
 
@@ -12084,6 +14305,7 @@ def run_strategy_cycle(profile_id: str) -> dict[str, Any]:
         reason = f"{normalized_profile} 프로필에 live_small_eligible/live_eligible 전략이 없습니다."
         STATE["strategy_runner"].update({
             "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "last_market_verified": False,
             "last_profile": normalized_profile,
             "last_strategy": "-",
             "last_signal": "-",
@@ -12099,6 +14321,10 @@ def run_strategy_cycle(profile_id: str) -> dict[str, Any]:
 
     STATE["strategy_runner"].update({
         "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_market_event_at": execution.market_data.occurred_at,
+        "last_market_received_at": execution.market_data.received_at,
+        "last_market_timeframe": str(strategy_executions[0][0].get("timeframe") or ""),
+        "last_market_verified": execution.metadata.get("market_data_verified") is True,
         "last_profile": normalized_profile,
         "last_strategy": execution.artifact_id,
         "last_signal": execution.signal or "-",
@@ -12265,6 +14491,25 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
             STATE.setdefault("strategy_sleeves", {}).update(plan.sleeve_targets)
     STATE["strategy_runner"].update({
         "last_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "last_profile": profile_id,
+        "last_market_event_at": max(
+            (
+                str(execution.market_data.occurred_at or "")
+                for _, execution in strategy_executions
+            ),
+            default="",
+        ),
+        "last_market_received_at": max(
+            (
+                str(execution.market_data.received_at or "")
+                for _, execution in strategy_executions
+            ),
+            default="",
+        ),
+        "last_market_timeframe": str(strategy_executions[0][0].get("timeframe") or ""),
+        "last_market_verified": all(
+            execution.metadata.get("market_data_verified") is True
+            for _, execution in strategy_executions
+        ),
         "last_strategy": f"{len(strategy_executions)} sleeves", "last_signal": "NET",
         "last_action": f"{len(plans)} instrument targets · {len(order_results)} net orders",
     })
@@ -12402,6 +14647,21 @@ def cancel_order(order_id: str) -> dict[str, Any]:
         return {"ok": False, "reason": "order not found", "snapshot": snapshot()}
     if order.get("state") == "canceled":
         return {"ok": True, "reason": "order already canceled", "snapshot": snapshot()}
+    if str(order.get("state") or "").lower() == "filled":
+        return {"ok": False, "reason": "filled order cannot be canceled", "snapshot": snapshot()}
+    if order.get("cancel_request_id"):
+        pending = str(order.get("state") or "").lower() == "cancel_pending"
+        return {
+            "ok": pending,
+            "reason": (
+                "cancel request already submitted; broker reconciliation pending"
+                if pending
+                else "cancel result remains unknown; broker reconciliation required"
+            ),
+            "cancel_request_id": str(order.get("cancel_request_id")),
+            "reconciliation_required": True,
+            "snapshot": snapshot(),
+        }
     broker_order_id = str(order.get("broker_order_id") or "").strip()
     submitted_to_broker = (
         not bool(order.get("dry_run"))
@@ -12414,6 +14674,59 @@ def cancel_order(order_id: str) -> dict[str, Any]:
         response_payload = broker_response.get("json") if isinstance(broker_response.get("json"), dict) else {}
         output = response_payload.get("output") if isinstance(response_payload.get("output"), dict) else {}
         broker_id = str(order.get("broker_id") or broker_request.get("broker_id") or broker_id_from_symbol(str(order.get("symbol") or ""), str(order.get("asset") or ""))).lower()
+        cancel_request_id = "cancel-" + hashlib.sha256(
+            "|".join(
+                (
+                    order_id,
+                    str(order.get("idempotency_key") or ""),
+                    broker_id,
+                    broker_order_id,
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        order.update(
+            {
+                "cancel_request_id": cancel_request_id,
+                "cancel_requested_at": datetime.now(timezone.utc).isoformat(),
+                "state": "cancel_pending",
+                "queue_state": "reconcile_required",
+                "reason": "broker-cancel-request-prepared",
+                "next_retry_at": "-",
+                "updated_at": now_text(),
+            }
+        )
+        oms_order_id = str(order.get("oms_order_id") or "")
+        managed = LIVE_OMS.orders.get(oms_order_id)
+        if managed is not None:
+            if managed.status == "FILLED":
+                order.update({"state": "filled", "queue_state": "completed", "reason": "broker-filled"})
+                return {"ok": False, "reason": "filled order cannot be canceled", "snapshot": snapshot()}
+            if managed.status in {"ACKNOWLEDGED", "PARTIALLY_FILLED"}:
+                try:
+                    managed = LIVE_OMS.transition(
+                        oms_order_id,
+                        "CANCEL_PENDING",
+                        "broker cancel request prepared",
+                        {"cancelRequestId": cancel_request_id},
+                    )
+                except ValueError as exc:
+                    order["reconciliation_warning"] = str(exc)
+            order["oms_status"] = managed.status
+        if order.get("idempotency_key"):
+            try:
+                cancel_checkpoint_saved = PROGRAM_LEDGER.update_order_dispatch(order)
+            except (OSError, sqlite3.Error, ValueError):
+                cancel_checkpoint_saved = False
+            if not cancel_checkpoint_saved:
+                order.update(
+                    {
+                        "state": "unknown_cancel_result",
+                        "reason": "cancel-request-checkpoint-failed",
+                    }
+                )
+                STATE["new_entries_blocked"] = True
+                append_audit("error", "주문 취소 실패", f"{order_id} · 취소 요청 checkpoint 저장 실패")
+                return {"ok": False, "reason": "cancel-request-checkpoint-failed", "snapshot": snapshot()}
         try:
             cancel_response = LiveBrokerRouter().cancel_order(
                 broker_id,
@@ -12424,15 +14737,86 @@ def cancel_order(order_id: str) -> dict[str, Any]:
                 exchange=str(broker_request.get("exchange") or ""),
                 organization_no=str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("KRX_FWDG_ORD_ORG_NO") or ""),
             )
-        except (BrokerNotReadyError, RuntimeError) as exc:
-            reason = f"브로커 주문 취소 실패: {exc}"
+        except Exception as exc:
+            reason = f"브로커 주문 취소 결과 불명: {type(exc).__name__}: {exc}"
+            order.update(
+                {
+                    "state": "unknown_cancel_result",
+                    "queue_state": "reconcile_required",
+                    "reason": "broker-cancel-outcome-unknown",
+                    "cancel_error_type": type(exc).__name__,
+                    "updated_at": now_text(),
+                }
+            )
+            if managed is not None and managed.status == "CANCEL_PENDING":
+                try:
+                    managed = LIVE_OMS.mark_unknown(oms_order_id, "broker cancel outcome unknown")
+                    order["oms_status"] = managed.status
+                except ValueError as transition_error:
+                    order["reconciliation_warning"] = str(transition_error)
+            if order.get("idempotency_key"):
+                try:
+                    PROGRAM_LEDGER.update_order_dispatch(order)
+                except (OSError, sqlite3.Error, ValueError):
+                    pass
             append_audit("error", "주문 취소 실패", f"{order_id} · {reason}")
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
         if cancel_response.get("ok") is not True:
             reason = str(cancel_response.get("text") or cancel_response.get("status") or "broker cancel rejected")
+            order.update(
+                {
+                    "state": "unknown_cancel_result",
+                    "queue_state": "reconcile_required",
+                    "reason": "broker-cancel-not-confirmed",
+                    "broker_cancel_response": redact_sensitive_payload(cancel_response),
+                    "updated_at": now_text(),
+                }
+            )
+            if managed is not None and managed.status == "CANCEL_PENDING":
+                try:
+                    managed = LIVE_OMS.mark_unknown(oms_order_id, "broker cancel not confirmed")
+                    order["oms_status"] = managed.status
+                except ValueError as transition_error:
+                    order["reconciliation_warning"] = str(transition_error)
+            if order.get("idempotency_key"):
+                try:
+                    PROGRAM_LEDGER.update_order_dispatch(order)
+                except (OSError, sqlite3.Error, ValueError):
+                    pass
             append_audit("error", "주문 취소 실패", f"{order_id} · {reason}")
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
-        order["broker_cancel_response"] = cancel_response
+        order.update(
+            {
+                "broker_cancel_response": redact_sensitive_payload(cancel_response),
+                "cancel_acknowledged_at": datetime.now(timezone.utc).isoformat(),
+                "state": "cancel_pending",
+                "queue_state": "reconcile_required",
+                "reason": "broker-cancel-request-acknowledged",
+                "updated_at": now_text(),
+            }
+        )
+        if order.get("idempotency_key"):
+            try:
+                PROGRAM_LEDGER.update_order_dispatch(order)
+            except (OSError, sqlite3.Error, ValueError):
+                order["state"] = "unknown_cancel_result"
+                order["reason"] = "cancel-ack-checkpoint-failed"
+                STATE["new_entries_blocked"] = True
+                return {"ok": False, "reason": "cancel-ack-checkpoint-failed", "snapshot": snapshot()}
+        append_audit("warn", "주문 취소", f"{order_id} 브로커 취소 요청 접수 · 상태/체결 대조 대기")
+        queue_live_order_lifecycle_notification(
+            order,
+            status="cancel_pending",
+            reason=str(order["reason"]),
+            message_final=False,
+        )
+        return {
+            "ok": True,
+            "reason": "cancel request acknowledged; reconciliation pending",
+            "cancel_request_id": cancel_request_id,
+            "reconciliation_required": True,
+            "snapshot": snapshot(),
+        }
     order["state"] = "canceled"
     order["queue_state"] = "canceled"
     order["updated_at"] = now_text()

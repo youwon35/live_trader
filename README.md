@@ -8,7 +8,19 @@ Real-money trading console for the `trading-system` workspace.
 - `backtester`: strategy research, optimization, and artifact export
 - `paper_trader`: shadow/paper validation, approval workflow, and operational safety checks
 
-This app intentionally blocks live orders until broker API credentials, live strategy permissions, risk checks, and broker order adapters are ready.
+This app intentionally blocks live orders until an immutable Deployment, a fresh Preflight Snapshot, broker/account reconciliation, live strategy permissions, risk checks, and broker order adapters are ready. Enabling the real-order environment flag never submits an order by itself.
+
+The desktop workspace is organized around nine operational views:
+
+- 운영 현황
+- 배포·승급
+- 계좌·포지션
+- 주문·체결
+- 리스크·안전
+- 실거래 운영
+- 사고·감사
+- 기술 로그
+- 설정·진단
 
 ## Run The Desktop App
 
@@ -36,9 +48,9 @@ release\LiveTrader.exe
 
 ## Required Broker/API Settings
 
-Create `.env` next to this README. Do not commit real secrets.
+Create `.env` next to this README for non-secret runtime flags. Do not commit real credentials.
 The desktop app loads this file automatically on startup, without overriding OS-level environment variables.
-Use the in-app settings for UI/risk controls only; broker secrets such as `KIS_APP_SECRET` should stay in `.env` or a safer OS secret store.
+Broker keys entered through the settings screen are stored in the app's protected secret store. On Windows this uses user-scoped DPAPI encryption; legacy plaintext secret values are migrated out of `.env` and the UI never returns them after saving.
 
 ```text
 LIVE_TRADER_ENABLE_REAL_ORDERS=false
@@ -52,6 +64,18 @@ BINANCE_API_SECRET=
 ```
 
 Current implementation includes signed KIS/Binance/Upbit order adapters and private KIS/Upbit execution streams. Real orders still require an eligible immutable portfolio, Paper evidence, account reconciliation, risk checks, explicit mode/route enablement, and a natural confirmed-bar signal.
+
+For an intentional live test, set `LIVE_TRADER_ENABLE_REAL_ORDERS=true`, select exactly one Deployment, confirm the operator, turn Dry Run off, and release new-entry protection with explicit confirmation. Then run a new Preflight for that exact Deployment and start with Canary/Limited Live only after it passes. A Deployment, risk policy, account route, or risk-opening control change invalidates the Preflight and requires it to be run again. Tightening a safety control takes effect immediately; enabling new-entry protection still permits only independently verified position-reducing orders. The global Kill Switch blocks orders and requests cancellation of working orders; it never creates a position-flattening order.
+
+Operational identity and recovery evidence are persisted as append-only records:
+
+- immutable Deployment Manifest revisions and hashes
+- expiring Preflight Snapshots
+- Runtime Sessions and lifecycle events
+- order/fill/audit events
+- Incident state transitions
+
+The selected Deployment broker's REST snapshot, private execution event state, and local event ledger must be freshly reconciled within 60 seconds before Preflight can pass. Cross-broker portfolios remain blocked until account-scoped Preflight supports every route. An unknown submit result is reconciled by Client Order ID and is never blindly retransmitted. A broker cancel acknowledgement remains `cancel_pending` until a later status/event reconciliation proves cancellation; a fill always takes precedence over a pending cancel.
 
 ## Binance Futures safety contract
 

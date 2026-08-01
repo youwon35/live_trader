@@ -16,6 +16,93 @@ from live_trader.server import (
 
 
 class ServerSafetyTests(unittest.TestCase):
+    def test_preflight_route_forwards_deployment_and_strategy_scope(self) -> None:
+        handler = object.__new__(LiveTraderHandler)
+        handler.path = "/api/preflight"
+        handler.read_json = Mock(
+            return_value={
+                "deployment_id": "DEPLOY-20260801-01",
+                "strategy_id": "STRATEGY-BTC-1H",
+            }
+        )
+        handler.send_json = Mock()
+        expected = {
+            "ok": True,
+            "preflight_snapshot": {
+                "deployment_id": "DEPLOY-20260801-01",
+                "strategy_id": "STRATEGY-BTC-1H",
+            },
+        }
+
+        with patch(
+            "live_trader.server.state.run_final_preflight",
+            return_value=expected,
+        ) as run_final_preflight:
+            handler.do_POST()
+
+        run_final_preflight.assert_called_once_with(
+            "DEPLOY-20260801-01",
+            "STRATEGY-BTC-1H",
+        )
+        handler.send_json.assert_called_once_with(expected)
+
+    def test_runtime_start_route_forwards_exact_deployment_context(self) -> None:
+        handler = object.__new__(LiveTraderHandler)
+        handler.path = "/api/runtime/start"
+        handler.read_json = Mock(
+            return_value={
+                "profile_id": "crypto",
+                "mode": "SMALL_LIVE",
+                "portfolio_id": "PORTFOLIO-01",
+                "deployment_id": "DEPLOYMENT-01",
+                "strategy_id": "STRATEGY-01",
+            }
+        )
+        handler.send_json = Mock()
+        expected = {"ok": True, "runtime_session_id": "SESSION-01"}
+
+        with patch(
+            "live_trader.server.state.start_continuous_runtime",
+            return_value=expected,
+        ) as start_runtime:
+            handler.do_POST()
+
+        start_runtime.assert_called_once_with(
+            "crypto",
+            "SMALL_LIVE",
+            "PORTFOLIO-01",
+            "DEPLOYMENT-01",
+            "STRATEGY-01",
+        )
+        handler.send_json.assert_called_once_with(expected)
+
+    def test_incident_transition_route_forwards_only_operator_contract(self) -> None:
+        handler = object.__new__(LiveTraderHandler)
+        handler.path = "/api/incidents/transition"
+        handler.read_json = Mock(
+            return_value={
+                "incident_id": "incident-01",
+                "action": "acknowledge",
+                "note": "원인 확인 중",
+                "state": "CLIENT-MUST-NOT-CONTROL",
+            }
+        )
+        handler.send_json = Mock()
+        expected = {"ok": True, "incident": {"state": "ACKNOWLEDGED"}}
+
+        with patch(
+            "live_trader.server.state.transition_operational_incident",
+            return_value=expected,
+        ) as transition_incident:
+            handler.do_POST()
+
+        transition_incident.assert_called_once_with(
+            "incident-01",
+            "acknowledge",
+            "원인 확인 중",
+        )
+        handler.send_json.assert_called_once_with(expected)
+
     def test_futures_test_route_accepts_only_confirmation_contract(
         self,
     ) -> None:

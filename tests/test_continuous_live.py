@@ -816,6 +816,11 @@ class LiveContinuousControllerTest(unittest.TestCase):
                     "start",
                     return_value={"ok": False, "reason": "restore-blocked"},
                 ),
+                patch.object(
+                    state,
+                    "_prepare_operational_runtime_session",
+                    return_value=(None, "unit"),
+                ),
                 patch.object(state, "snapshot", return_value={}),
             ):
                 blocked = state.start_continuous_runtime(
@@ -834,6 +839,11 @@ class LiveContinuousControllerTest(unittest.TestCase):
                     state.LIVE_CONTINUOUS_CONTROLLER,
                     "start",
                     return_value={"ok": True, "reason": "started"},
+                ),
+                patch.object(
+                    state,
+                    "_prepare_operational_runtime_session",
+                    return_value=(None, "unit"),
                 ),
                 patch.object(state, "snapshot", return_value={}),
             ):
