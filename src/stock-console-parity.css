@@ -1,0 +1,221 @@
+/*
+ * Visual parity with Stock Data Scraper. Live safety state and command
+ * behavior stay unchanged; only app-specific presentation is normalized.
+ */
+
+:root[data-program="live-trader"] {
+  --live-environment: var(--primary);
+  --live-environment-strong: var(--primary);
+  --live-environment-soft: color-mix(in srgb, var(--primary) 8%, var(--panel));
+  --live-environment-border: color-mix(in srgb, var(--primary) 34%, var(--border));
+  --ts-console-sidebar-width: 174px;
+  --ts-console-control-height: 32px;
+  --ts-console-body-size: 13px;
+  --ts-console-label-size: 11px;
+  --ts-console-caption-size: 9px;
+  --ts-console-panel-header-height: 39px;
+}
+
+:root[data-program="live-trader"] body {
+  font-size: var(--ts-console-body-size);
+}
+
+:root[data-program="live-trader"] .workspace {
+  gap: 6px !important;
+}
+
+:root[data-program="live-trader"] .workspace::before {
+  display: none;
+}
+
+:root[data-program="live-trader"] .sidebar {
+  gap: 12px !important;
+}
+
+:root[data-program="live-trader"] .brand-block {
+  min-height: 36px;
+  padding: 0 4px;
+  border-bottom: 0;
+}
+
+:root[data-program="live-trader"] .brand-block .brand-mark {
+  color: var(--icon-blue);
+  background: var(--button) !important;
+  border-color: var(--border) !important;
+}
+
+:root[data-program="live-trader"] .brand-block span.brand-environment {
+  display: none !important;
+}
+
+:root[data-program="live-trader"] .nav-list {
+  gap: 3px !important;
+}
+
+:root[data-program="live-trader"] .nav-list .nav-group {
+  gap: 3px;
+  margin-top: 0;
+}
+
+:root[data-program="live-trader"] .nav-item {
+  min-height: 34px !important;
+}
+
+:root[data-program="live-trader"] .nav-item span {
+  font-size: 12px !important;
+}
+
+:root[data-program="live-trader"] .topbar {
+  min-height: 52px;
+  padding: 7px 2px;
+  background: var(--window-bar, var(--bg));
+  border-bottom-color: var(--border);
+  backdrop-filter: none;
+}
+
+:root[data-program="live-trader"] .topbar-title-block > span {
+  color: var(--primary);
+  font-size: 9px;
+  letter-spacing: 0;
+}
+
+:root[data-program="live-trader"] .topbar-title-block > strong {
+  font-size: 16px;
+}
+
+:root[data-program="live-trader"] .topbar-actions > .status-pill {
+  min-height: 22px;
+}
+
+:root[data-program="live-trader"] .live-environment-bar {
+  top: 58px;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  border-radius: var(--ts-console-panel-radius, 7px);
+  box-shadow: none;
+}
+
+:root[data-program="live-trader"] .live-environment-identity {
+  grid-template-columns: auto minmax(210px, 1fr) minmax(190px, 0.8fr);
+  gap: 6px;
+}
+
+:root[data-program="live-trader"] .live-environment-badge {
+  align-self: center;
+  min-width: 80px;
+  min-height: 32px;
+  padding: 4px 8px;
+  color: var(--accent-contrast-text, #fff);
+  background: var(--primary);
+  border-color: var(--primary-border);
+  border-radius: var(--ts-console-control-radius, 6px);
+  font-size: 11px;
+}
+
+:root[data-program="live-trader"] .live-environment-identity label > span {
+  font-size: 11px;
+}
+
+:root[data-program="live-trader"] .live-environment-identity select {
+  min-height: 32px !important;
+  font-size: 12px !important;
+}
+
+:root[data-program="live-trader"] .live-context-meta {
+  border-left-color: var(--border);
+}
+
+:root[data-program="live-trader"] .live-context-meta strong {
+  font-size: 12px;
+}
+
+:root[data-program="live-trader"] .live-context-meta span {
+  font-size: 10px;
+}
+
+:root[data-program="live-trader"] .live-safety-hierarchy > div {
+  min-width: 0;
+  min-height: 38px;
+  padding: 4px;
+  background: var(--panel-raised);
+  border-color: var(--border);
+}
+
+:root[data-program="live-trader"] .live-safety-hierarchy {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+:root[data-program="live-trader"] .live-safety-hierarchy .status-pill {
+  padding-inline: 4px;
+  font-size: 9px !important;
+}
+
+:root[data-program="live-trader"] .live-safety-hierarchy > div > span:first-child {
+  font-size: 10px;
+}
+
+:root[data-program="live-trader"] main :is(.panel, .app-card) {
+  font-size: 12px;
+}
+
+:root[data-program="live-trader"] main .panel-header {
+  min-height: var(--ts-console-panel-header-height, 39px);
+  padding: 5px 9px !important;
+}
+
+:root[data-program="live-trader"] main .panel-header h2 {
+  font-size: 12px !important;
+}
+
+:root[data-program="live-trader"] main .panel-header p {
+  font-size: 11px !important;
+}
+
+:root[data-program="live-trader"] main :is(input, select, textarea) {
+  min-height: var(--ts-console-control-height, 32px);
+  font-size: 12px !important;
+}
+
+:root[data-program="live-trader"] main :is(
+  .ts-action-button[data-ts-action-component="true"],
+  .ts-ui-button,
+  .icon-button,
+  .primary-button,
+  .secondary-button,
+  .danger-button,
+  .ghost-button,
+  .mini-button,
+  .compact-button
+) {
+  min-height: var(--ts-console-control-height, 32px) !important;
+  font-size: 12px !important;
+}
+
+:root[data-program="live-trader"] main th {
+  height: 32px;
+  font-size: 11px !important;
+}
+
+:root[data-program="live-trader"] main td {
+  font-size: 12px !important;
+}
+
+:root[data-program="live-trader"] .workspace.layout-locked .panel {
+  padding: var(--ts-console-panel-padding, 9px) !important;
+}
+
+@media (max-width: 1180px) {
+  :root[data-program="live-trader"] .live-environment-bar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  :root[data-program="live-trader"] .live-environment-bar {
+    top: auto;
+  }
+}
