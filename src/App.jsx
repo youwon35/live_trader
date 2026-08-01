@@ -107,7 +107,9 @@ import { readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/desig
 import {
   LAYOUT_RESIZE_DIRECTIONS,
   applyLayoutTransformOffset,
+  captureLayoutPeerDimensions,
   clearLayoutTransformOffset,
+  freezeLayoutPeerDimensions,
   layoutAlignedOffset,
   layoutDropTarget,
   layoutElementOverlapsPeers,
@@ -326,12 +328,13 @@ const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
 const STRATEGY_SAVED_SEARCHES_KEY = "live-trader.strategySavedSearches.v1";
 const LAYOUT_RESET_EVENT = "live-trader-layout-reset";
 const LAYOUT_RESTORE_EVENT = "live-trader-layout-restore";
+const LAYOUT_BASELINE_EVENT = "live-trader-layout-baseline";
 const LAYOUT_SNAP_SIZE = 8;
 const LAYOUT_COLLISION_GAP = 8;
 const LAYOUT_MAX_DIMENSION = 100000;
 const LAYOUT_MAX_OFFSET = 100000;
-const MIN_PANEL_WIDTH = 260;
-const MIN_PANEL_HEIGHT = 150;
+const MIN_PANEL_WIDTH = 180;
+const MIN_PANEL_HEIGHT = 80;
 const DEFAULT_STRATEGY_DISCOVERY_FILTERS = {
   query: "",
   stage: "all",
@@ -1124,12 +1127,34 @@ function useEditablePanels(rootRef) {
   useEffect(() => {
     const root = rootRef.current;
     if (!root) return undefined;
+    let captureNewBaselines = false;
 
     const enhancePanels = () => {
-      root.querySelectorAll(".panel").forEach((panel) => ensurePanelHandles(panel));
+      const storedSizes = readStoredMap(PANEL_SIZE_STORAGE_KEY);
+      let capturedBaseline = false;
+      root.querySelectorAll(".panel").forEach((panel) => {
+        ensurePanelHandles(panel);
+        if (!captureNewBaselines || document.documentElement.dataset.layoutMode !== "edit") return;
+        const key = panelLayoutKey(panel);
+        if (storedSizes[key]) return;
+        const rect = panel.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        storedSizes[key] = {
+          width: snapStoredSlotDimension(rect.width, "width"),
+          height: snapStoredSlotDimension(rect.height, "height"),
+        };
+        capturedBaseline = true;
+      });
+      if (capturedBaseline) writeStoredMap(PANEL_SIZE_STORAGE_KEY, storedSizes);
+    };
+
+    const capturePanelBaselines = () => {
+      captureNewBaselines = true;
+      enhancePanels();
     };
 
     const resetLayout = () => {
+      captureNewBaselines = false;
       root.querySelectorAll(".panel").forEach((panel) => {
         panel.style.width = "";
         panel.style.height = "";
@@ -1149,6 +1174,14 @@ function useEditablePanels(rootRef) {
       const key = panelLayoutKey(panel);
       const startX = event.clientX;
       const startY = event.clientY;
+      const frozenPeerSlots = freezeLayoutPeerDimensions(
+        captureLayoutPeerDimensions(panel, ".panel", {
+          max: LAYOUT_MAX_DIMENSION,
+          minHeight: MIN_PANEL_HEIGHT,
+          minWidth: MIN_PANEL_WIDTH,
+          snap: LAYOUT_SNAP_SIZE,
+        }),
+      );
       const bounds = panel.getBoundingClientRect();
       const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
       const startOffset = currentPanelOffset(panel, positions[key]);
@@ -1200,9 +1233,12 @@ function useEditablePanels(rootRef) {
       const onUp = () => {
         const stored = readStoredMap(PANEL_SIZE_STORAGE_KEY);
         stored[key] = {
-          width: Math.round(panel.getBoundingClientRect().width),
-          height: Math.round(panel.getBoundingClientRect().height),
+          width: Math.round(panel.getBoundingClientRect().width * 100) / 100,
+          height: Math.round(panel.getBoundingClientRect().height * 100) / 100,
         };
+        frozenPeerSlots.forEach((slot) => {
+          stored[panelLayoutKey(slot.element)] = { width: slot.width, height: slot.height };
+        });
         writeStoredMap(PANEL_SIZE_STORAGE_KEY, stored);
         const nextOffset = currentPanelOffset(panel, positions[key]);
         const positionStore = readStoredMap(PANEL_POSITION_STORAGE_KEY);
@@ -1363,12 +1399,14 @@ function useEditablePanels(rootRef) {
     root.addEventListener("pointerdown", onPointerDown);
     window.addEventListener(LAYOUT_RESET_EVENT, resetLayout);
     window.addEventListener(LAYOUT_RESTORE_EVENT, enhancePanels);
+    window.addEventListener(LAYOUT_BASELINE_EVENT, capturePanelBaselines);
 
     return () => {
       observer.disconnect();
       root.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener(LAYOUT_RESET_EVENT, resetLayout);
       window.removeEventListener(LAYOUT_RESTORE_EVENT, enhancePanels);
+      window.removeEventListener(LAYOUT_BASELINE_EVENT, capturePanelBaselines);
     };
   }, [rootRef]);
 }
@@ -1578,6 +1616,7 @@ function App() {
     const next = applyLayoutMode(mode);
     setLayoutMode(next);
     persistUiSettings({ layoutMode: next });
+    if (next === "edit") window.dispatchEvent(new Event(LAYOUT_BASELINE_EVENT));
   }
 
   function toggleSidebarCollapsed() {

@@ -3883,9 +3883,9 @@ body {
 }
 
 .resizable-panel {
-  min-width: 260px;
+  min-width: 180px;
   max-width: 100%;
-  min-height: 150px;
+  min-height: 80px;
   resize: none;
 }
 
@@ -3903,6 +3903,8 @@ body {
 }
 
 .workspace.layout-edit .resizable-panel {
+  min-width: 180px;
+  min-height: 80px;
   max-width: none;
   outline: 1px solid rgba(97, 165, 255, 0.18);
   outline-offset: -1px;
@@ -6494,12 +6496,32 @@ body {
 
 /* Settings: appearance and Telegram share a row; the credential assistant
    keeps the full row because secret fields need label/input/status space. */
-.settings-content-grid > .content-column {
+.settings-content-grid > .content-column:first-child {
   grid-template-areas:
     "appearance telegram"
     "assistant assistant";
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
+}
+
+.settings-content-grid > .content-column:last-child {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+}
+
+.settings-content-grid :is(.credential-protection-panel, .doctor-history-panel) {
+  grid-column: 1 / -1;
+}
+
+.settings-content-grid .credential-status-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.settings-content-grid .credential-status-grid :is(span, strong, small) {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
 }
 
 .settings-content-grid .appearance-panel {
@@ -6701,11 +6723,15 @@ body {
 }
 
 @media (max-width: 1199px) {
-  .settings-content-grid > .content-column {
+  .settings-content-grid > .content-column:first-child {
     grid-template-areas:
       "appearance"
       "telegram"
       "assistant";
+  }
+
+  .settings-content-grid > .content-column:first-child,
+  .settings-content-grid > .content-column:last-child {
     grid-template-columns: minmax(0, 1fr);
   }
 }
