@@ -2463,74 +2463,222 @@ function orderStateTone(value) {
   return "neutral";
 }
 
+function ExecutionQualitySummary({ quality }) {
+  return (
+    <MetricGrid columns={3}>
+      <MetricCard label="표본" value={String(quality.sampleCount) + "건"} detail={quality.submitted ? "Broker 제출 " + quality.submitted + "건" : "Paper/Shadow/Live 표본 필요"} />
+      <MetricCard label="평균 Slippage" value={quality.averageSlippageBps == null ? "해당 없음" : quality.averageSlippageBps.toFixed(1) + " bps"} detail="기대 가격 대비" />
+      <MetricCard label="평균 Broker 지연" value={quality.averageLatencyMs == null ? "해당 없음" : quality.averageLatencyMs.toFixed(0) + " ms"} detail={"불확실 주문 " + quality.unknownSubmitResult + "건"} />
+    </MetricGrid>
+  );
+}
+
 function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, onCancelOrder }) {
   const orders = snapshot.orders ?? [];
   const events = snapshot.execution_events?.recent ?? snapshot.program_ledger?.execution_events ?? [];
-  const [selectedOrderId, setSelectedOrderId] = useState("");
-  const selected = orders.find((order) => String(order.order_id) === selectedOrderId) || orders[0] || null;
-  const selectedEvents = events.filter((event) => !selected || String(event.order_id || event.broker_order_id || "") === String(selected.order_id || selected.broker_order_id || ""));
+  const [query, setQuery] = useState("");
+  const [stateFilter, setStateFilter] = useState("all");
+  const [brokerFilter, setBrokerFilter] = useState("all");
+  const [selectedOrderKey, setSelectedOrderKey] = useState("");
   const calibration = snapshot.execution_calibration ?? {};
-  const timelineProjection = selected ? projectOrderTimeline(selected, events) : { timeline: [], directRetryAllowed: false };
   const quality = projectExecutionQuality(orders, events, calibration);
+  const orderRows = useMemo(
+    () => orders.map((order, index) => ({
+      key: String(
+        order.order_id
+        || order.client_order_id
+        || order.idempotency_key
+        || order.broker_order_id
+        || "order-" + index,
+      ),
+      order,
+    })),
+    [orders],
+  );
+  const stateOptions = useMemo(
+    () => [...new Set(orders.map((order) => String(order.state || "").toUpperCase()).filter(Boolean))].sort(),
+    [orders],
+  );
+  const brokerOptions = useMemo(
+    () => [...new Set(orders.map((order) => String(order.broker_id || "")).filter(Boolean))].sort(),
+    [orders],
+  );
+  const visibleOrderRows = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase();
+    return orderRows.filter(({ order }) => {
+      const state = String(order.state || "").toUpperCase();
+      const broker = String(order.broker_id || "");
+      if (stateFilter !== "all" && state !== stateFilter) return false;
+      if (brokerFilter !== "all" && broker !== brokerFilter) return false;
+      if (!needle) return true;
+      return [
+        order.order_id,
+        order.client_order_id,
+        order.idempotency_key,
+        order.broker_order_id,
+        order.deployment_id || context.id,
+        order.symbol,
+        order.state,
+        orderStateLabel(order.state),
+      ].some((value) => String(value || "").toLocaleLowerCase().includes(needle));
+    });
+  }, [brokerFilter, context.id, orderRows, query, stateFilter]);
+  const selectedRow = visibleOrderRows.find((row) => row.key === selectedOrderKey) || visibleOrderRows[0] || null;
+  const selected = selectedRow?.order || null;
+  const selectedEvents = useMemo(() => {
+    if (!selected) return [];
+    const selectedIds = new Set(
+      [selected.order_id, selected.broker_order_id, selected.client_order_id]
+        .map((value) => String(value || ""))
+        .filter(Boolean),
+    );
+    return events.filter((event) => (
+      [event.order_id, event.broker_order_id, event.client_order_id]
+        .map((value) => String(value || ""))
+        .some((value) => value && selectedIds.has(value))
+    ));
+  }, [events, selected]);
   return (
     <section className="order-execution-layout">
       <DeploymentContextPanel context={context} />
       <OrderQueueSummaryPanel summary={snapshot.order_queue ?? {}} />
       <section className="panel order-ledger-panel">
         <PanelHeader title="주문 상태 원장" subtitle="불확실한 주문 결과는 실패와 분리하며, 같은 Client Order ID의 존재를 대조하기 전 재전송하지 않습니다." />
-        <div className="table-scroll order-ledger-table-wrap">
-          <table className="data-table order-ledger-table">
-            <thead><tr><th>시각</th><th>Broker</th><th>Order ID</th><th>Client Order ID</th><th>Deployment</th><th>심볼</th><th>방향</th><th>수량</th><th>체결</th><th>상태</th><th>Risk</th></tr></thead>
-            <tbody>
-              {orders.length ? orders.map((order) => (
-                <tr className={selected === order ? "is-selected" : ""} key={order.order_id} onClick={() => setSelectedOrderId(String(order.order_id || ""))}>
-                  <td>{formatAuditTime(order)}</td><td>{order.broker_id || "-"}</td><td>{order.order_id || "-"}</td>
-                  <td>{order.client_order_id || order.idempotency_key || "-"}</td><td>{order.deployment_id || context.id || "-"}</td>
-                  <td>{order.symbol || "-"}</td><td>{order.side || "-"}</td><td>{order.quantity ?? order.qty ?? "-"}</td>
-                  <td>{order.executed_quantity ?? order.executed_volume ?? "-"}</td>
-                  <td><StatusPill tone={orderStateTone(order.state)}>{orderStateLabel(order.state)}</StatusPill></td>
-                  <td>{order.risk_report?.can_submit === true ? "승인" : order.risk_report?.can_submit === false ? "차단" : "미확인"}</td>
-                </tr>
-              )) : <tr><td colSpan="11"><EmptyRow text="아직 주문 의도가 없습니다." /></td></tr>}
-            </tbody>
-          </table>
-        </div>
-      </section>
-      <section className="content-grid order-detail-grid">
-        <div className="content-column">
-          <section className="panel order-timeline-panel">
-            <PanelHeader title="주문 타임라인" subtitle={selected ? `${selected.order_id} · ${selected.symbol}` : "주문을 선택하세요."} />
-            {selected ? (
-              <div className="order-timeline">
-                {timelineProjection.timeline.map((event) => <div key={event.id}><span>{formatAuditTime({ timestamp: event.time })}</span><strong>{event.label}</strong><small>{event.detail || event.source || "상태 기록"}</small></div>)}
-                {!timelineProjection.timeline.length && <div><span>-</span><strong>Broker Event 대기</strong><small>체결 스트림 또는 REST 대조 결과가 아직 없습니다.</small></div>}
-              </div>
-            ) : <EmptyRow text="상세 타임라인을 볼 주문이 없습니다." />}
-            {selected && <div className="operator-actions"><button className="secondary-button" type="button" disabled={!timelineProjection.directRetryAllowed} onClick={() => onRetryOrder(selected.order_id)}>상태 대조 후 재시도</button><button className="secondary-button" type="button" disabled={Boolean(selected.cancel_request_id) || ["filled", "canceled"].includes(String(selected.state || "").toLowerCase())} onClick={() => onCancelOrder(selected.order_id)}>{selected.cancel_request_id ? "취소 대조 중" : "취소 요청"}</button></div>}
-          </section>
-        </div>
-        <div className="content-column">
-          <section className="panel fill-ledger-panel">
-            <PanelHeader title="체결 원장" subtitle="Fill ID·수량·가격·수수료·지연을 Broker Event 기준으로 표시합니다." />
-            <div className="compact-list">
-              {events.length ? events.slice(0, 30).map((event) => (
-                <div className="compact-row" key={event.event_id}>
-                  <strong>{event.symbol || "-"} · {event.side || "-"}</strong>
-                  <span>{event.quantity ?? "-"} @ {event.price ?? "-"} · {formatAuditTime({ timestamp: event.occurred_at })}</span>
-                  <StatusPill tone={orderStateTone(event.state)}>{orderStateLabel(event.state)}</StatusPill>
+        <MasterDetailLog
+          className="order-ledger-workspace"
+          classes={{
+            detail: "order-workspace-detail",
+            detailPane: "order-ledger-detail-pane",
+            list: "table-scroll order-ledger-table-wrap",
+          }}
+          detailAriaLabel="선택한 주문 상세"
+          detailHeader={selected ? (
+            <span>{selected.order_id || selected.client_order_id || "주문"} · {selected.symbol || "-"}</span>
+          ) : "주문 상세"}
+          emptyDetail={(
+            <div className="order-empty-detail">
+              <section className="order-detail-section order-timeline-section">
+                <header><h4>주문 타임라인</h4><span>0건</span></header>
+                <EmptyRow text="상세 타임라인을 볼 주문이 없습니다." />
+              </section>
+              <section className="order-detail-section fill-ledger-panel">
+                <header><h4>체결 원장</h4><span>{events.length}건</span></header>
+                <div className="compact-list">
+                  {events.length ? events.slice(0, 30).map((event, index) => (
+                    <div className="compact-row" key={event.event_id || "unmatched-event-" + index}>
+                      <strong>{event.symbol || "-"} · {event.side || "-"}</strong>
+                      <span>{event.quantity ?? "-"} @ {event.price ?? "-"} · {formatAuditTime({ timestamp: event.occurred_at })}</span>
+                      <StatusPill tone={orderStateTone(event.state)}>{orderStateLabel(event.state)}</StatusPill>
+                    </div>
+                  )) : <EmptyRow text="기록된 체결 Event가 없습니다." />}
                 </div>
-              )) : <EmptyRow text="기록된 체결 Event가 없습니다." />}
+              </section>
+              <section className="order-detail-section execution-quality-panel">
+                <header><h4>실행 품질</h4><span>전체 주문 기준</span></header>
+                <ExecutionQualitySummary quality={quality} />
+              </section>
             </div>
-          </section>
-          <section className="panel execution-quality-panel">
-            <PanelHeader title="실행 품질" subtitle="측정 근거가 없는 지연과 Slippage는 0이 아니라 해당 없음으로 표시합니다." />
-            <MetricGrid columns={3}>
-              <MetricCard label="표본" value={`${quality.sampleCount}건`} detail={quality.submitted ? `Broker 제출 ${quality.submitted}건` : "Paper/Shadow/Live 표본 필요"} />
-              <MetricCard label="평균 Slippage" value={quality.averageSlippageBps == null ? "해당 없음" : `${quality.averageSlippageBps.toFixed(1)} bps`} detail="기대 가격 대비" />
-              <MetricCard label="평균 Broker 지연" value={quality.averageLatencyMs == null ? "해당 없음" : `${quality.averageLatencyMs.toFixed(0)} ms`} detail={`불확실 주문 ${quality.unknownSubmitResult}건`} />
-            </MetricGrid>
-          </section>
-        </div>
+          )}
+          emptyList={(
+            <table aria-label="주문 상태 원장 목록" className="data-table order-ledger-table" role="grid">
+              <thead><tr><th>시각</th><th>Broker</th><th>주문 / <span>Client Order ID</span></th><th>Deployment</th><th>심볼</th><th>상태</th></tr></thead>
+              <tbody><tr><td colSpan="6"><EmptyRow text="검색 조건에 맞는 주문이 없습니다." /></td></tr></tbody>
+            </table>
+          )}
+          getItemKey={(row) => row.key}
+          itemRole="row"
+          items={visibleOrderRows}
+          listAriaLabel="주문 상태 원장 목록"
+          onSelectedKeyChange={(key) => setSelectedOrderKey(String(key))}
+          renderDetail={({ order }) => {
+            const timelineProjection = projectOrderTimeline(order, events);
+            const orderEvents = selectedEvents;
+            return (
+              <>
+                <section className="order-detail-summary" aria-label="주문 식별 정보">
+                  <dl>
+                    <div><dt>Broker</dt><dd>{order.broker_id || "-"}</dd></div>
+                    <div><dt>Order ID</dt><dd>{order.order_id || "-"}</dd></div>
+                    <div><dt>Client Order ID</dt><dd>{order.client_order_id || order.idempotency_key || "-"}</dd></div>
+                    <div><dt>Deployment</dt><dd>{order.deployment_id || context.id || "-"}</dd></div>
+                    <div><dt>주문</dt><dd>{order.symbol || "-"} · {order.side || "-"} · {order.quantity ?? order.qty ?? "-"}</dd></div>
+                    <div><dt>체결</dt><dd>{order.executed_quantity ?? order.executed_volume ?? "-"}</dd></div>
+                    <div><dt>상태</dt><dd><StatusPill tone={orderStateTone(order.state)}>{orderStateLabel(order.state)}</StatusPill></dd></div>
+                    <div><dt>Risk</dt><dd>{order.risk_report?.can_submit === true ? "승인" : order.risk_report?.can_submit === false ? "차단" : "미확인"}</dd></div>
+                  </dl>
+                </section>
+                <section className="order-detail-section order-timeline-section">
+                  <header><h4>주문 타임라인</h4><span>{timelineProjection.timeline.length}건</span></header>
+                  <div className="order-timeline">
+                    {timelineProjection.timeline.map((event) => <div key={event.id}><span>{formatAuditTime({ timestamp: event.time })}</span><strong>{event.label}</strong><small>{event.detail || event.source || "상태 기록"}</small></div>)}
+                    {!timelineProjection.timeline.length && <div><span>-</span><strong>Broker Event 대기</strong><small>체결 스트림 또는 REST 대조 결과가 아직 없습니다.</small></div>}
+                  </div>
+                  <div className="operator-actions">
+                    <button className="secondary-button" type="button" disabled={!order.order_id || !timelineProjection.directRetryAllowed} onClick={() => onRetryOrder(order.order_id)}>상태 대조 후 재시도</button>
+                    <button className="secondary-button" type="button" disabled={!order.order_id || Boolean(order.cancel_request_id) || ["filled", "canceled"].includes(String(order.state || "").toLowerCase())} onClick={() => onCancelOrder(order.order_id)}>{order.cancel_request_id ? "취소 대조 중" : "취소 요청"}</button>
+                  </div>
+                </section>
+                <section className="order-detail-section fill-ledger-panel">
+                  <header><h4>체결 원장</h4><span>{orderEvents.length}건</span></header>
+                  <div className="compact-list">
+                    {orderEvents.length ? orderEvents.slice(0, 30).map((event, index) => (
+                      <div className="compact-row" key={event.event_id || "event-" + index}>
+                        <strong>{event.symbol || "-"} · {event.side || "-"}</strong>
+                        <span>{event.quantity ?? "-"} @ {event.price ?? "-"} · {formatAuditTime({ timestamp: event.occurred_at })}</span>
+                        <StatusPill tone={orderStateTone(event.state)}>{orderStateLabel(event.state)}</StatusPill>
+                      </div>
+                    )) : <EmptyRow text="선택 주문에 연결된 체결 Event가 없습니다." />}
+                  </div>
+                </section>
+                <section className="order-detail-section execution-quality-panel">
+                  <header><h4>실행 품질</h4><span>전체 주문 기준</span></header>
+                  <ExecutionQualitySummary quality={quality} />
+                </section>
+              </>
+            );
+          }}
+          renderList={({ items, selectedKey, getItemProps }) => (
+            <table aria-label="주문 상태 원장 목록" className="data-table order-ledger-table" role="grid">
+              <thead><tr><th>시각</th><th>Broker</th><th>주문 / <span>Client Order ID</span></th><th>Deployment</th><th>심볼</th><th>상태</th></tr></thead>
+              <tbody>
+                {items.map((row, index) => (
+                  <tr {...getItemProps(row, index, { className: selectedKey === row.key ? "is-selected" : "" })} key={row.key}>
+                    <td>{formatAuditTime(row.order)}</td>
+                    <td>{row.order.broker_id || "-"}</td>
+                    <td><strong>{row.order.order_id || "-"}</strong><small>{row.order.client_order_id || row.order.idempotency_key || "-"}</small></td>
+                    <td>{row.order.deployment_id || context.id || "-"}</td>
+                    <td>{row.order.symbol || "-"}</td>
+                    <td><StatusPill tone={orderStateTone(row.order.state)}>{orderStateLabel(row.order.state)}</StatusPill></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          selectedKey={selectedOrderKey}
+          toolbar={(
+            <div className="order-ledger-toolbar">
+              <label className="search-box order-ledger-search">
+                <input
+                  aria-label="주문 검색"
+                  value={query}
+                  onChange={(event) => setQuery(event.currentTarget.value)}
+                  placeholder="주문/Client Order ID, deployment, 심볼, 상태 검색"
+                />
+                <Search size={18} />
+              </label>
+              <select aria-label="주문 상태 필터" value={stateFilter} onChange={(event) => setStateFilter(event.currentTarget.value)}>
+                <option value="all">전체 상태</option>
+                {stateOptions.map((state) => <option value={state} key={state}>{orderStateLabel(state)}</option>)}
+              </select>
+              <select aria-label="브로커 필터" value={brokerFilter} onChange={(event) => setBrokerFilter(event.currentTarget.value)}>
+                <option value="all">전체 브로커</option>
+                {brokerOptions.map((broker) => <option value={broker} key={broker}>{broker}</option>)}
+              </select>
+              <span>{visibleOrderRows.length.toLocaleString()} / {orders.length.toLocaleString()}건</span>
+            </div>
+          )}
+          toolbarAriaLabel="주문 검색 및 필터"
+        />
       </section>
     </section>
   );
@@ -6281,34 +6429,6 @@ function AuditPanel({
   return (
     <section className="panel audit-panel">
       <PanelHeader title={title} subtitle={subtitle} />
-      <div className="logs-toolbar">
-        <label className="search-box logs-search">
-          <input value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="메시지, scope, 작업명 검색" />
-          <Search size={18} />
-        </label>
-        <select value={channel} onChange={(event) => setChannel(event.currentTarget.value)}>
-          {channels.map((item) => (
-            <option value={item} key={item}>
-              {item === "all" ? "전체" : item}
-            </option>
-          ))}
-        </select>
-        <select value={level} onChange={(event) => setLevel(event.currentTarget.value)}>
-          <option value="all">전체</option>
-          <option value="INFO">INFO</option>
-          <option value="WARN">WARN</option>
-          <option value="ERROR">ERROR</option>
-        </select>
-        <select value={sort} onChange={(event) => setSort(event.currentTarget.value)}>
-          <option value="latest">최신순</option>
-          <option value="oldest">오래된순</option>
-        </select>
-        <button className="logs-export-button" type="button" onClick={handleExportLogs} disabled={!visibleRows.length}>
-          <Download size={16} />
-          CSV
-        </button>
-        <span>{visibleRows.length.toLocaleString()} / {rows.length.toLocaleString()}개</span>
-      </div>
       <MasterDetailLog
         className="logs-workbench audit-log-workspace"
         classes={{
@@ -6319,7 +6439,7 @@ function AuditPanel({
         detailHeader={<h3>{detailLabel}</h3>}
         emptyDetail={<EmptyRow text="상세를 볼 로그가 없습니다." />}
         emptyList={(
-          <table>
+          <table aria-label={`${title} 목록`} role="grid">
             <thead>
               <tr>
                 <th>시간</th>
@@ -6339,6 +6459,7 @@ function AuditPanel({
           </table>
         )}
         getItemKey={(row) => row.id}
+        itemRole="row"
         items={visibleRows}
         listAriaLabel={`${title} 목록`}
         onSelectedKeyChange={(key) => setSelectedLogId(key)}
@@ -6365,7 +6486,7 @@ function AuditPanel({
           );
         }}
         renderList={({ items, selectedKey, getItemProps }) => (
-          <table>
+          <table aria-label={`${title} 목록`} role="grid">
             <thead>
               <tr>
                 <th>시간</th>
@@ -6392,6 +6513,36 @@ function AuditPanel({
           </table>
         )}
         selectedKey={selectedLog?.id || ""}
+        toolbar={(
+          <div className="logs-toolbar">
+            <label className="search-box logs-search">
+              <input aria-label={`${title} 검색`} value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="메시지, scope, 작업명 검색" />
+              <Search size={18} />
+            </label>
+            <select aria-label={`${title} 채널 필터`} value={channel} onChange={(event) => setChannel(event.currentTarget.value)}>
+              {channels.map((item) => (
+                <option value={item} key={item}>
+                  {item === "all" ? "전체" : item}
+                </option>
+              ))}
+            </select>
+            <select aria-label={`${title} 레벨 필터`} value={level} onChange={(event) => setLevel(event.currentTarget.value)}>
+              <option value="all">전체</option>
+              <option value="INFO">INFO</option>
+              <option value="WARN">WARN</option>
+              <option value="ERROR">ERROR</option>
+            </select>
+            <select aria-label={`${title} 정렬`} value={sort} onChange={(event) => setSort(event.currentTarget.value)}>
+              <option value="latest">최신순</option>
+              <option value="oldest">오래된순</option>
+            </select>
+            <button className="logs-export-button" type="button" onClick={handleExportLogs} disabled={!visibleRows.length}>
+              <Download size={16} />
+              CSV
+            </button>
+            <span>{visibleRows.length.toLocaleString()} / {rows.length.toLocaleString()}개</span>
+          </div>
+        )}
       />
     </section>
   );
