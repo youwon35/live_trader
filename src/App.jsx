@@ -174,7 +174,7 @@ const navItems = [
   { id: "orders", label: "주문·체결", icon: FileClock },
   { id: "risk", label: "리스크·안전", icon: ShieldAlert },
   { id: "automation", label: "실거래 운영", icon: Power },
-  { id: "incidents", label: "사고·감사", icon: Bell },
+  { id: "incidents", label: "감사 기록", icon: Bell },
   { id: "audit", label: "기술 로그", icon: TerminalSquare },
   { id: "settings", label: "설정·진단", icon: Settings },
 ];
@@ -211,8 +211,8 @@ const pageProfiles = {
     summary: "Monitor → Canary → Limited Live → Full Live 순서와 구성 요소별 실행 상태를 관리합니다.",
   },
   incidents: {
-    title: "사고·감사",
-    eyebrow: "INCIDENT & AUDIT",
+    title: "감사 기록",
+    eyebrow: "AUDIT RECORDS",
     summary: "잠금·배포·Preflight·모드·Risk·주문·Kill·Secret 변경을 append-only 감사 이벤트로 추적합니다.",
   },
   audit: {
@@ -6232,7 +6232,7 @@ function AuditPanel({
   audit = [],
   detailLabel = "기술 로그 상세",
   emptyText = "검색 조건에 맞는 로그가 없습니다.",
-  subtitle = "사용자용 사고·감사 기록과 분리된 개발·운영 진단 로그입니다.",
+  subtitle = "사용자용 감사 기록과 분리된 개발·운영 진단 로그입니다.",
   title = "기술 로그",
 }) {
   const [query, setQuery] = useState("");

@@ -15,7 +15,7 @@ const tabs = [
   { label: "주문·체결", requiredHeadings: ["주문 상태 원장", "주문 타임라인", "체결 원장", "실행 품질"] },
   { label: "리스크·안전", requiredHeadings: ["현재 리스크 사용량", "요청별 재시도 원칙"] },
   { label: "실거래 운영", requiredHeadings: ["Runtime 구성 요소", "Live Watchdog"] },
-  { label: "사고·감사", requiredHeadings: ["감사 이벤트"], forbiddenHeadings: ["운영 사고"] },
+  { label: "감사 기록", requiredHeadings: ["감사 이벤트"], forbiddenHeadings: ["운영 사고"] },
   { label: "기술 로그", requiredHeadings: ["기술 로그"] },
   {
     label: "설정·진단",
@@ -187,7 +187,7 @@ try {
       if (tab.label === "주문·체결" && !await page.getByText("Client Order ID", { exact: true }).count()) {
         issues.push(`${viewport.name}/${tab.label}: idempotent order identifier column is missing`);
       }
-      if (tab.label === "사고·감사" && !await page.getByText(/append-only 원장/).count()) {
+      if (tab.label === "감사 기록" && !await page.getByText(/append-only 원장/).count()) {
         issues.push(`${viewport.name}/${tab.label}: immutable audit guidance is missing`);
       }
       if (tab.label === "리스크·안전" && !await page.getByText(/주문 POST 재전송을 분리/).count()) {

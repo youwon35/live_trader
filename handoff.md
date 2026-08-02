@@ -1141,7 +1141,7 @@ API 없이 실제 실행한 기능:
 
 ## 2026-08-01 Live 운영센터 전면 개편과 실거래 테스트 경로 완성
 
-- 화면을 `운영 현황`, `배포·승급`, `계좌·포지션`, `주문·체결`, `리스크·안전`, `실거래 운영`, `사고·감사`, `기술 로그`, `설정·진단`의 9개 운영 화면으로 재구성했다. 상단에는 주황색 LIVE 환경 바와 계정·Deployment·Session 컨텍스트를 고정하고, 과거 Artifact 차단은 중립 카드와 상태 배지로 낮춰 현재 사고가 더 잘 보이게 했다.
+- 화면은 `운영 현황`, `배포·승급`, `계좌·포지션`, `주문·체결`, `리스크·안전`, `실거래 운영`, `감사 기록`, `기술 로그`, `설정·진단`의 9개 운영 화면으로 구성한다. 상단에는 LIVE 환경 바와 계정·Deployment·Session 컨텍스트를 고정한다.
 - Live의 중심 단위를 개별 전략 체크가 아니라 `Deployment Manifest → 만료되는 Preflight Snapshot → Runtime Session → Order/Fill/Audit Event`로 고정했다. Manifest에는 Portfolio와 모든 Strategy member, 허용 심볼, 단일 Broker route, 정책·Artifact hash를 묶으며 실행 중 다른 Deployment나 심볼로 컨텍스트가 섞이면 최종 전송 단계에서도 차단한다.
 - 최종 Preflight는 선택한 Deployment와 계정만 대상으로 강제 REST Snapshot, 체결 Event poll, 로컬 Ledger를 3자 대조한다. 결과는 60초 안의 신선한 값만 인정하며 누락·오래됨·오류·불일치·활성 또는 결과 불확실 주문이 하나라도 있으면 위험 증가 주문을 차단한다. 다른 Broker의 오류는 현재 Deployment를 오염시키지 않고, 여러 Broker가 섞인 Portfolio는 다중 계정 Preflight가 생기기 전까지 차단한다.
 - `0`과 `조회 불가`를 분리하고 시장 데이터 신선도는 실제 Event/확정 봉 시각으로 판정한다. 현재 모드에서 쓰지 않는 경로는 녹색이 아니라 `해당 없음`으로 표시한다. Risk 화면은 현재 사용량과 Soft Warning/Hard Block을 함께 보여 주며 조회 요청과 주문 요청의 재시도 정책을 분리했다.

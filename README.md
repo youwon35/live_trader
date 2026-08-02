@@ -18,7 +18,7 @@ The desktop workspace is organized around nine operational views:
 - 주문·체결
 - 리스크·안전
 - 실거래 운영
-- 사고·감사
+- 감사 기록
 - 기술 로그
 - 설정·진단
 
