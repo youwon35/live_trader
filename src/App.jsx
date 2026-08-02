@@ -101,6 +101,7 @@ import {
 } from "./accountVisualization";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
+import { createAppearanceSettingsPanel } from "../../../packages/design/appearance-settings-panel.js";
 import {
   formatBarCountdown,
   nextClosedBarSummary,
@@ -122,6 +123,7 @@ import {
   readLayoutTransformOffset,
 } from "../../../packages/design/layout-editing.js";
 import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
+import { createMasterDetailLog } from "../../../packages/design/master-detail-log.js";
 import {
   buildPromotionReadinessQueue,
   normalizePromotionLifecycle,
@@ -150,7 +152,9 @@ import {
 } from "../../../packages/trading-contracts/src/index.js";
 
 const ActionButton = createActionButton(React);
+const AppearanceSettingsPanel = createAppearanceSettingsPanel(React);
 const BrokerAccountWorkspace = createBrokerAccountWorkspace(React);
+const MasterDetailLog = createMasterDetailLog(React);
 const StatusPill = createStatusPill(React);
 const TelegramConnectionStatus = createTelegramConnectionStatus(React);
 const EmptyState = createEmptyState(React);
@@ -4415,79 +4419,29 @@ function statusTone(status) {
 
 function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, changeLayoutMode, resetWorkspaceLayout }) {
   const isLayoutEditing = layoutMode === "edit";
-  const handleCustomAccentChange = (event) => {
-    updateAppearance({ accent: "custom", customAccent: event.target.value });
-  };
 
   return (
-    <section className="panel appearance-panel">
-      <PanelHeader title="화면 테마" subtitle="테마, 강조 색상, 패널 레이아웃" suffix={<Palette size={17} />} />
-      <div className="appearance-inline-grid">
-        <div className="settings-control-group">
-          <div>
-            <strong>모드</strong>
-            <span>앱 전체의 밝기와 대비</span>
-          </div>
-          <SegmentedControl
-            activeClassName="selected"
-            buttonClassName="theme-mode-button"
-            className="theme-mode-row"
-            onChange={(theme) => updateAppearance({ theme })}
-            options={appearanceThemeOptions.map((option) => ({
-              icon: option.icon,
-              label: option.label,
-              value: option.id,
-            }))}
-            value={appearance.theme}
-          />
-        </div>
-        <div className="settings-control-group">
-          <div>
-            <strong>강조 색상</strong>
-            <span>실행·선택·진행 상태의 기준 색</span>
-          </div>
-          <div className="custom-accent-row">
-            <label
-              className={`custom-accent-picker ${appearance.accent === "custom" ? "selected" : ""}`}
-              style={{ "--custom-accent": appearance.customAccent }}
-              onClick={() => updateAppearance({ accent: "custom" })}
-            >
-              <span className="custom-accent-wheel" aria-hidden="true"><i /></span>
-              <span className="custom-accent-label"><strong>사용자 색상</strong><em>{appearance.customAccent}</em></span>
-              <input
-                aria-label="사용자 강조 색상"
-                onChange={handleCustomAccentChange}
-                onInput={handleCustomAccentChange}
-                type="color"
-                value={appearance.customAccent}
-              />
-            </label>
-          </div>
-        </div>
-        <div className="settings-control-group layout-settings-card">
-          <div>
-            <strong>레이아웃 편집</strong>
-            <span>패널 위치와 크기를 조절합니다.</span>
-          </div>
-          <div className="layout-settings-actions">
-            <button
-              aria-pressed={isLayoutEditing}
-              className={isLayoutEditing ? "layout-mode-button active" : "layout-mode-button"}
-              data-layout-control="editor"
-              onClick={() => changeLayoutMode(isLayoutEditing ? "locked" : "edit")}
-              type="button"
-            >
-              {isLayoutEditing ? <Lock size={16} /> : <Unlock size={16} />}
-              {isLayoutEditing ? "편집 종료" : "레이아웃 편집"}
-            </button>
-            <button className="layout-reset-button" onClick={resetWorkspaceLayout} type="button">
-              <RefreshCw size={16} />
-              초기화
-            </button>
-          </div>
-        </div>
-      </div>
-    </section>
+    <AppearanceSettingsPanel
+      accent={appearance.accent}
+      className="appearance-panel"
+      customAccent={appearance.customAccent}
+      headerIcon={Palette}
+      layoutEditIcon={Unlock}
+      layoutEditing={isLayoutEditing}
+      layoutEditingIcon={Lock}
+      mode={appearance.theme}
+      modeOptions={appearanceThemeOptions.map((option) => ({
+        icon: option.icon,
+        label: option.label,
+        value: option.id,
+      }))}
+      onAccentChange={(accent) => updateAppearance({ accent })}
+      onCustomAccentChange={(customAccent) => updateAppearance({ accent: "custom", customAccent })}
+      onLayoutEditingChange={(editing) => changeLayoutMode(editing ? "edit" : "locked")}
+      onModeChange={(theme) => updateAppearance({ theme })}
+      onResetLayout={resetWorkspaceLayout}
+      resetIcon={RefreshCw}
+    />
   );
 }
 
@@ -6416,8 +6370,6 @@ function AuditPanel({
     .sort((a, b) => (sort === "latest" ? rows.indexOf(a) - rows.indexOf(b) : rows.indexOf(b) - rows.indexOf(a)));
   const channels = ["all", ...Array.from(new Set(rows.map((row) => row.channel)))];
   const selectedLog = visibleRows.find((row) => row.id === selectedLogId) || visibleRows[0] || null;
-  const selectedAuditFields = selectedLog ? auditDetailFields(selectedLog.item) : [];
-  const selectedPayload = selectedLog ? formatAuditPayload(selectedLog.item) : "";
   const handleExportLogs = () => {
     const exportRows = visibleRows.map((row) => ({
       time: row.time || "",
@@ -6460,8 +6412,16 @@ function AuditPanel({
         </button>
         <span>{visibleRows.length.toLocaleString()} / {rows.length.toLocaleString()}개</span>
       </div>
-      <div className="logs-workbench audit-log-workspace">
-        <div className="table-scroll compact-table logs-table">
+      <MasterDetailLog
+        className="logs-workbench audit-log-workspace"
+        classes={{
+          detailPane: "log-detail-panel audit-log-detail",
+          list: "table-scroll compact-table logs-table",
+        }}
+        detailAriaLabel={`선택한 ${detailLabel}`}
+        detailHeader={<h3>{detailLabel}</h3>}
+        emptyDetail={<EmptyRow text="상세를 볼 로그가 없습니다." />}
+        emptyList={(
           <table>
             <thead>
               <tr>
@@ -6473,19 +6433,56 @@ function AuditPanel({
               </tr>
             </thead>
             <tbody>
-              {visibleRows.length ? (
-                visibleRows.map((row) => (
+              <tr>
+                <td colSpan={5}>
+                  <EmptyRow text={emptyText} />
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        )}
+        getItemKey={(row) => row.id}
+        items={visibleRows}
+        listAriaLabel={`${title} 목록`}
+        onSelectedKeyChange={(key) => setSelectedLogId(key)}
+        renderDetail={(row) => {
+          const detailFields = auditDetailFields(row.item);
+          const payload = formatAuditPayload(row.item);
+          return (
+            <>
+              <p>{row.message}</p>
+              <dl>
+                <div><dt>시각</dt><dd>{row.time}</dd></div>
+                <div><dt>Scope · Level</dt><dd>{row.scope} · {row.level}</dd></div>
+                <div><dt>Source</dt><dd>{row.source}</dd></div>
+                <div><dt>Session</dt><dd>{row.item.session_id || row.item.sessionId || "-"}</dd></div>
+                <div><dt>Deployment</dt><dd>{row.item.deployment_id || row.item.deploymentId || "-"}</dd></div>
+                <div><dt>Strategy · Symbol</dt><dd>{row.item.strategy_id || "-"} · {row.item.symbol || "-"}</dd></div>
+                <div><dt>Order</dt><dd>{row.item.order_id || row.item.orderId || "-"}</dd></div>
+                <div><dt>Correlation</dt><dd>{row.item.correlation_id || row.item.trace_id || "-"}</dd></div>
+                {detailFields.map((field) => <div key={field.label}><dt>{field.label}</dt><dd>{field.value}</dd></div>)}
+              </dl>
+              {(row.item.stack_trace || row.item.stackTrace) && <pre>{row.item.stack_trace || row.item.stackTrace}</pre>}
+              {payload ? <><h4>Payload</h4><pre>{payload}</pre></> : null}
+            </>
+          );
+        }}
+        renderList={({ items, selectedKey, getItemProps }) => (
+          <table>
+            <thead>
+              <tr>
+                <th>시간</th>
+                <th>Scope</th>
+                <th>Level</th>
+                <th>Source</th>
+                <th>메시지</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((row, index) => (
                   <tr
-                    aria-selected={selectedLog?.id === row.id}
-                    className={selectedLog?.id === row.id ? "is-selected" : ""}
+                    {...getItemProps(row, index, { className: selectedKey === row.id ? "is-selected" : "" })}
                     key={row.id}
-                    onClick={() => setSelectedLogId(row.id)}
-                    onKeyDown={(event) => {
-                      if (event.key !== "Enter" && event.key !== " ") return;
-                      event.preventDefault();
-                      setSelectedLogId(row.id);
-                    }}
-                    tabIndex={0}
                   >
                     <td>{row.time}</td>
                     <td><span className={`scope-pill scope-${logToken(row.scope)}`}>{row.scope}</span></td>
@@ -6493,39 +6490,12 @@ function AuditPanel({
                     <td>{row.source}</td>
                     <td className="log-message-cell" title={row.message}>{row.message}</td>
                   </tr>
-                ))
-              ) : (
-                <tr>
-                  <td colSpan={5}>
-                    <EmptyRow text={emptyText} />
-                  </td>
-                </tr>
-              )}
+              ))}
             </tbody>
           </table>
-        </div>
-        <aside className="log-detail-panel audit-log-detail" aria-label={`선택한 ${detailLabel}`}>
-          <h3>{detailLabel}</h3>
-          {selectedLog ? (
-            <>
-              <p>{selectedLog.message}</p>
-              <dl>
-                <div><dt>시각</dt><dd>{selectedLog.time}</dd></div>
-                <div><dt>Scope · Level</dt><dd>{selectedLog.scope} · {selectedLog.level}</dd></div>
-                <div><dt>Source</dt><dd>{selectedLog.source}</dd></div>
-                <div><dt>Session</dt><dd>{selectedLog.item.session_id || selectedLog.item.sessionId || "-"}</dd></div>
-                <div><dt>Deployment</dt><dd>{selectedLog.item.deployment_id || selectedLog.item.deploymentId || "-"}</dd></div>
-                <div><dt>Strategy · Symbol</dt><dd>{selectedLog.item.strategy_id || "-"} · {selectedLog.item.symbol || "-"}</dd></div>
-                <div><dt>Order</dt><dd>{selectedLog.item.order_id || selectedLog.item.orderId || "-"}</dd></div>
-                <div><dt>Correlation</dt><dd>{selectedLog.item.correlation_id || selectedLog.item.trace_id || "-"}</dd></div>
-                {selectedAuditFields.map((field) => <div key={field.label}><dt>{field.label}</dt><dd>{field.value}</dd></div>)}
-              </dl>
-              {(selectedLog.item.stack_trace || selectedLog.item.stackTrace) && <pre>{selectedLog.item.stack_trace || selectedLog.item.stackTrace}</pre>}
-              {selectedPayload ? <><h4>Payload</h4><pre>{selectedPayload}</pre></> : null}
-            </>
-          ) : <EmptyRow text="상세를 볼 로그가 없습니다." />}
-        </aside>
-      </div>
+        )}
+        selectedKey={selectedLog?.id || ""}
+      />
     </section>
   );
 }

@@ -6537,56 +6537,6 @@ body {
   grid-area: assistant;
 }
 
-.appearance-panel {
-  display: grid;
-  align-content: start;
-  gap: 8px;
-}
-
-.appearance-inline-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.appearance-inline-grid .settings-control-group {
-  align-content: start;
-  gap: 8px;
-  min-width: 0;
-  margin: 0;
-  padding: 10px;
-  background: var(--panel-raised);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-}
-
-.appearance-inline-grid .settings-control-group > div:first-child {
-  display: grid;
-  gap: 3px;
-}
-
-.appearance-inline-grid .settings-control-group strong {
-  font-size: 13px;
-}
-
-.appearance-inline-grid .settings-control-group span {
-  font-size: 11.5px;
-  line-height: 1.35;
-}
-
-.appearance-inline-grid .layout-settings-card {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  align-content: start;
-  min-height: 0;
-}
-
-.appearance-inline-grid .layout-settings-actions {
-  flex-wrap: wrap;
-  justify-content: flex-start;
-  gap: 7px;
-}
-
 .telegram-settings-panel .telegram-connection-status {
   margin: 0;
 }
@@ -6757,12 +6707,6 @@ body {
 
   .settings-content-grid > .content-column:first-child,
   .settings-content-grid > .content-column:last-child {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
-@media (max-width: 720px) {
-  .appearance-inline-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }
@@ -7742,13 +7686,6 @@ body {
   }
 }
 
-.audit-log-workspace {
-  display: grid;
-  grid-template-columns: minmax(520px, 1.35fr) minmax(300px, 0.65fr);
-  gap: 9px;
-  min-width: 0;
-}
-
 .deployment-promotion-layout {
   display: grid;
   gap: 10px;
@@ -7800,14 +7737,7 @@ body {
 }
 
 .audit-log-detail {
-  display: grid;
-  align-content: start;
-  gap: 10px;
   min-width: 0;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--panel-raised);
 }
 
 .audit-log-detail h3,
@@ -7873,10 +7803,6 @@ body {
 }
 
 @media (max-width: 1279px) {
-  .audit-log-workspace {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
   .deployment-manifest-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
