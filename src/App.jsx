@@ -113,6 +113,8 @@ import {
   layoutAlignedOffset,
   layoutDropTarget,
   layoutElementOverlapsPeers,
+  LAYOUT_EDIT_EXIT_EVENT,
+  repairLayoutPanelOverlaps,
   layoutSwapDimensions,
   layoutSwapOffsets,
   readLayoutTransformOffset,
@@ -1013,6 +1015,24 @@ function currentPanelOffset(panel, storedPosition = {}) {
   });
 }
 
+function repairLivePanelOverlaps(root) {
+  if (!(root instanceof Element)) return [];
+  const repairs = repairLayoutPanelOverlaps(".panel", { root, gap: LAYOUT_COLLISION_GAP });
+  if (!repairs.length) return repairs;
+
+  const sizeStore = readStoredMap(PANEL_SIZE_STORAGE_KEY);
+  const positionStore = readStoredMap(PANEL_POSITION_STORAGE_KEY);
+  repairs.forEach(({ element, offsetReset, sizeReset }) => {
+    const key = panelLayoutKey(element);
+    if (offsetReset) delete positionStore[key];
+    if (sizeReset) delete sizeStore[key];
+  });
+  writeStoredMap(PANEL_SIZE_STORAGE_KEY, sizeStore);
+  writeStoredMap(PANEL_POSITION_STORAGE_KEY, positionStore);
+  window.dispatchEvent(new Event(LAYOUT_RESTORE_EVENT));
+  return repairs;
+}
+
 function resolvePanelCollision(panel) {
   const workspace = panel.closest(".page-view") ?? panel.parentElement;
   if (!workspace) return null;
@@ -1529,6 +1549,23 @@ function App() {
   useEffect(() => {
     applyAppearance(appearance);
   }, [appearance]);
+
+  useEffect(() => {
+    const exitLayoutEditing = (event) => {
+      if (layoutMode !== "edit") return;
+      if (event.detail) event.detail.handled = true;
+      repairLivePanelOverlaps(workspaceRef.current);
+      changeLayoutMode("locked");
+    };
+    window.addEventListener(LAYOUT_EDIT_EXIT_EVENT, exitLayoutEditing);
+    return () => window.removeEventListener(LAYOUT_EDIT_EXIT_EVENT, exitLayoutEditing);
+  }, [layoutMode]);
+
+  useEffect(() => {
+    if (layoutMode === "edit") return undefined;
+    const frame = window.requestAnimationFrame(() => repairLivePanelOverlaps(workspaceRef.current));
+    return () => window.cancelAnimationFrame(frame);
+  }, [layoutMode, selectedNav]);
 
   useEffect(() => {
     let cancelled = false;
