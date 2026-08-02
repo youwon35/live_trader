@@ -13,11 +13,13 @@ import {
   LockKeyhole,
   Moon,
   Network,
+  Palette,
   PanelLeft,
   Pause,
   Play,
   Power,
   Radio,
+  RefreshCw,
   RefreshCcw,
   RotateCcw,
   Save,
@@ -639,7 +641,9 @@ function applyCustomAccent(root, appearance) {
 }
 
 function applyAccentContrast(root, appearance) {
-  root.style.setProperty("--accent-contrast-text", accentContrastText(accentColorForContrast(appearance.accent, appearance.customAccent)));
+  const contrast = accentContrastText(accentColorForContrast(appearance.accent, appearance.customAccent));
+  root.style.setProperty("--accent-contrast-text", contrast);
+  root.style.setProperty("--command-button-primary-text", contrast);
 }
 
 function readAppearance() {
@@ -1978,7 +1982,7 @@ function dateStamp(date = new Date()) {
 }
 
 function formatAuditTime(item = {}) {
-  const value = item.timestamp || item.datetime || item.createdAt || item.time || "";
+  const value = item.timestamp || item.datetime || item.occurred_at || item.occurredAt || item.created_at || item.createdAt || item.time || "";
   const text = String(value || "").trim();
   const fullMatch = text.match(/(\d{4})[-.](\d{2})[-.](\d{2})[T\s]+(\d{2}:\d{2}:\d{2})/);
   if (fullMatch) return `${fullMatch[1]}-${fullMatch[2]}-${fullMatch[3]} ${fullMatch[4]}`;
@@ -2176,7 +2180,7 @@ function WorkspaceContent({
 
   if (selectedNav === "incidents") {
     return renderPage(
-      <IncidentAuditWorkspace snapshot={snapshot} onNavigate={onNavigate} onIncidentTransition={onIncidentTransition} />,
+      <IncidentAuditWorkspace snapshot={snapshot} onIncidentTransition={onIncidentTransition} />,
     );
   }
 
@@ -2564,7 +2568,7 @@ function fallbackIncidents(snapshot = {}) {
   return rows;
 }
 
-function IncidentAuditWorkspace({ snapshot = {}, onNavigate, onIncidentTransition }) {
+function IncidentAuditWorkspace({ snapshot = {}, onIncidentTransition }) {
   const governance = snapshot.live_governance ?? {};
   const storedIncidents = governance.incidents ?? snapshot.incidents ?? [];
   const projectedIncidents = projectIncidents(snapshot).map((item) => ({
@@ -2612,14 +2616,13 @@ function IncidentAuditWorkspace({ snapshot = {}, onNavigate, onIncidentTransitio
           )) : <EmptyRow text="현재 열린 운영 사고가 없습니다." />}
         </div>
       </section>
-      <section className="panel immutable-audit-panel">
-        <PanelHeader title="감사 이벤트" subtitle="잠금·배포·Preflight·모드·Risk·주문·Kill·Secret 변경은 append-only 원장에 남깁니다." suffix={<StatusPill tone="info">{audit.length} EVENTS</StatusPill>} />
-        <div className="audit-event-grid">
-          {audit.slice(0, 100).map((item, index) => <article key={item.event_id || `${item.timestamp || item.time}-${index}`}><span>{formatAuditTime(item)}</span><strong>{item.source || item.event || item.category || "SYSTEM"}</strong><p>{item.message || item.detail || item.reason || "-"}</p><small>{item.trace_id ? `trace ${item.trace_id}` : item.decision || item.state || ""}</small></article>)}
-          {!audit.length && <EmptyRow text="표시할 감사 이벤트가 없습니다." />}
-        </div>
-        <div className="panel-action-line"><span>감사 이벤트는 화면 필터 초기화나 기술 로그 정리 대상이 아닙니다.</span><button className="secondary-button" type="button" onClick={() => onNavigate("audit")}>기술 로그 열기</button></div>
-      </section>
+      <AuditPanel
+        audit={audit}
+        detailLabel="감사 기록 상세"
+        emptyText="표시할 감사 이벤트가 없습니다."
+        subtitle="잠금·배포·Preflight·모드·Risk·주문·Kill·Secret 변경을 append-only 원장에서 검색합니다."
+        title="감사 이벤트"
+      />
     </section>
   );
 }
@@ -2712,7 +2715,16 @@ function LivePreparationPanel({
     ),
     [artifactMetadata, assetStrategies, discoveryFilters, snapshot.continuous_runtime],
   );
-  const selectedStrategy = filteredStrategies.find((strategy) => strategy.strategy_id === selectedStrategyId) ?? filteredStrategies[0] ?? null;
+  const controlledSelectedStrategy = controlledSelectedStrategyId
+    ? (snapshot.strategies ?? []).find((strategy) => strategy.strategy_id === controlledSelectedStrategyId) ?? null
+    : null;
+  const controlledAssetTab = controlledSelectedStrategy
+    ? (isCryptoStrategy(controlledSelectedStrategy) ? "crypto" : "stock")
+    : "";
+  const selectedStrategy = controlledSelectedStrategy
+    ?? filteredStrategies.find((strategy) => strategy.strategy_id === selectedStrategyId)
+    ?? filteredStrategies[0]
+    ?? null;
   const tabItems = [
     { id: "stock", label: "주식/ETF", detail: "한국투자증권 KIS", count: (snapshot.strategies ?? []).filter((strategy) => !isCryptoStrategy(strategy)).length },
     { id: "crypto", label: "코인", detail: "Binance / Upbit", count: (snapshot.strategies ?? []).filter(isCryptoStrategy).length },
@@ -2725,20 +2737,21 @@ function LivePreparationPanel({
   }
 
   useEffect(() => {
-    if (!controlledSelectedStrategyId) return;
-    const selected = (snapshot.strategies ?? []).find((strategy) => strategy.strategy_id === controlledSelectedStrategyId);
-    if (!selected) return;
-    const expectedTab = isCryptoStrategy(selected) ? "crypto" : "stock";
-    if (assetTab !== expectedTab) setAssetTab(expectedTab);
-  }, [assetTab, controlledSelectedStrategyId, snapshot.strategies]);
+    if (controlledAssetTab) setAssetTab(controlledAssetTab);
+  }, [controlledAssetTab, controlledSelectedStrategyId]);
 
   useEffect(() => {
+    // A controlled Deployment is the source of truth. Asset tabs and discovery
+    // filters may temporarily hide it, but must never replace it implicitly.
+    // The operator can still change Deployment explicitly from the selector or
+    // by choosing a strategy row.
+    if (controlledSelectedStrategyId) return;
     const firstId = filteredStrategies[0]?.strategy_id ?? "";
     const stillVisible = filteredStrategies.some((strategy) => strategy.strategy_id === selectedStrategyId);
     if (!stillVisible && selectedStrategyId !== firstId) {
       selectStrategyId(firstId);
     }
-  }, [filteredStrategies, selectedStrategyId]);
+  }, [controlledSelectedStrategyId, filteredStrategies, selectedStrategyId]);
 
   useEffect(() => {
     let active = true;
@@ -4408,69 +4421,70 @@ function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, chan
 
   return (
     <section className="panel appearance-panel">
-      <PanelHeader title="화면 / 레이아웃" subtitle="백테스터와 같은 UI 토큰, 강조 색상, 패널 편집 모드를 사용합니다." />
-      <div className="settings-control-group">
-        <div>
-          <strong>모드</strong>
-          <span>실거래 콘솔의 밝기와 텍스트 대비를 바꿉니다.</span>
+      <PanelHeader title="화면 테마" subtitle="테마, 강조 색상, 패널 레이아웃" suffix={<Palette size={17} />} />
+      <div className="appearance-inline-grid">
+        <div className="settings-control-group">
+          <div>
+            <strong>모드</strong>
+            <span>앱 전체의 밝기와 대비</span>
+          </div>
+          <SegmentedControl
+            activeClassName="selected"
+            buttonClassName="theme-mode-button"
+            className="theme-mode-row"
+            onChange={(theme) => updateAppearance({ theme })}
+            options={appearanceThemeOptions.map((option) => ({
+              icon: option.icon,
+              label: option.label,
+              value: option.id,
+            }))}
+            value={appearance.theme}
+          />
         </div>
-        <SegmentedControl
-          activeClassName="selected"
-          buttonClassName="theme-mode-button"
-          className="theme-mode-row"
-          onChange={(theme) => updateAppearance({ theme })}
-          options={appearanceThemeOptions.map((option) => ({
-            icon: option.icon,
-            label: option.label,
-            value: option.id,
-          }))}
-          value={appearance.theme}
-        />
-      </div>
-
-      <div className="settings-control-group">
-        <div>
-          <strong>강조 색상</strong>
-          <span>선택된 메뉴, 주요 버튼, 진행 상태의 기준 색을 정합니다.</span>
+        <div className="settings-control-group">
+          <div>
+            <strong>강조 색상</strong>
+            <span>실행·선택·진행 상태의 기준 색</span>
+          </div>
+          <div className="custom-accent-row">
+            <label
+              className={`custom-accent-picker ${appearance.accent === "custom" ? "selected" : ""}`}
+              style={{ "--custom-accent": appearance.customAccent }}
+              onClick={() => updateAppearance({ accent: "custom" })}
+            >
+              <span className="custom-accent-wheel" aria-hidden="true"><i /></span>
+              <span className="custom-accent-label"><strong>사용자 색상</strong><em>{appearance.customAccent}</em></span>
+              <input
+                aria-label="사용자 강조 색상"
+                onChange={handleCustomAccentChange}
+                onInput={handleCustomAccentChange}
+                type="color"
+                value={appearance.customAccent}
+              />
+            </label>
+          </div>
         </div>
-        <div className="custom-accent-row">
-          <label
-            className={`custom-accent-picker ${appearance.accent === "custom" ? "selected" : ""}`}
-            style={{ "--custom-accent": appearance.customAccent }}
-            onClick={() => updateAppearance({ accent: "custom" })}
-          >
-            <span className="custom-accent-wheel" aria-hidden="true">
-              <i />
-            </span>
-            <span className="custom-accent-label">
-              <strong>사용자 색상</strong>
-              <em>{appearance.customAccent}</em>
-            </span>
-            <input
-              type="color"
-              value={appearance.customAccent}
-              aria-label="사용자 강조 색상"
-              onInput={handleCustomAccentChange}
-              onChange={handleCustomAccentChange}
-            />
-          </label>
-        </div>
-      </div>
-
-      <div className="layout-settings-card">
-        <div>
-          <strong>{isLayoutEditing ? "레이아웃 편집 중" : "레이아웃 잠금 중"}</strong>
-          <span>{isLayoutEditing ? "패널 헤더를 끌고 오른쪽 아래 핸들로 크기를 조절할 수 있습니다." : "패널 위치와 크기가 고정되어 실수로 바뀌지 않습니다."}</span>
-        </div>
-        <div className="layout-settings-actions">
-          <button className={`ghost-button ${isLayoutEditing ? "active" : ""}`} type="button" onClick={() => changeLayoutMode(isLayoutEditing ? "locked" : "edit")}>
-            {isLayoutEditing ? <Unlock size={16} /> : <Lock size={16} />}
-            {isLayoutEditing ? "편집 종료" : "편집 모드"}
-          </button>
-          <button className="ghost-button" type="button" onClick={resetWorkspaceLayout}>
-            <PanelLeft size={16} />
-            초기화
-          </button>
+        <div className="settings-control-group layout-settings-card">
+          <div>
+            <strong>레이아웃 편집</strong>
+            <span>패널 위치와 크기를 조절합니다.</span>
+          </div>
+          <div className="layout-settings-actions">
+            <button
+              aria-pressed={isLayoutEditing}
+              className={isLayoutEditing ? "layout-mode-button active" : "layout-mode-button"}
+              data-layout-control="editor"
+              onClick={() => changeLayoutMode(isLayoutEditing ? "locked" : "edit")}
+              type="button"
+            >
+              {isLayoutEditing ? <Lock size={16} /> : <Unlock size={16} />}
+              {isLayoutEditing ? "편집 종료" : "레이아웃 편집"}
+            </button>
+            <button className="layout-reset-button" onClick={resetWorkspaceLayout} type="button">
+              <RefreshCw size={16} />
+              초기화
+            </button>
+          </div>
         </div>
       </div>
     </section>
@@ -6363,7 +6377,13 @@ function PositionPanel({ positions }) {
   );
 }
 
-function AuditPanel({ audit = [], title = "기술 로그" }) {
+function AuditPanel({
+  audit = [],
+  detailLabel = "기술 로그 상세",
+  emptyText = "검색 조건에 맞는 로그가 없습니다.",
+  subtitle = "사용자용 사고·감사 기록과 분리된 개발·운영 진단 로그입니다.",
+  title = "기술 로그",
+}) {
   const [query, setQuery] = useState("");
   const [channel, setChannel] = useState("all");
   const [level, setLevel] = useState("all");
@@ -6377,7 +6397,7 @@ function AuditPanel({ audit = [], title = "기술 로그" }) {
     const source = item.source || item.event || item.category || "SYSTEM";
     const message = item.message || item.detail || item.reason || "-";
     return {
-      id: item.event_id || `${item.timestamp || item.time}-${index}`,
+      id: item.event_id || `${item.timestamp || item.occurred_at || item.occurredAt || item.created_at || item.createdAt || item.time}-${index}`,
       time: displayTime,
       level: normalizedLevel,
       channel: logChannel,
@@ -6396,6 +6416,8 @@ function AuditPanel({ audit = [], title = "기술 로그" }) {
     .sort((a, b) => (sort === "latest" ? rows.indexOf(a) - rows.indexOf(b) : rows.indexOf(b) - rows.indexOf(a)));
   const channels = ["all", ...Array.from(new Set(rows.map((row) => row.channel)))];
   const selectedLog = visibleRows.find((row) => row.id === selectedLogId) || visibleRows[0] || null;
+  const selectedAuditFields = selectedLog ? auditDetailFields(selectedLog.item) : [];
+  const selectedPayload = selectedLog ? formatAuditPayload(selectedLog.item) : "";
   const handleExportLogs = () => {
     const exportRows = visibleRows.map((row) => ({
       time: row.time || "",
@@ -6409,7 +6431,7 @@ function AuditPanel({ audit = [], title = "기술 로그" }) {
 
   return (
     <section className="panel audit-panel">
-      <PanelHeader title={title} subtitle="사용자용 사고·감사 기록과 분리된 개발·운영 진단 로그입니다." />
+      <PanelHeader title={title} subtitle={subtitle} />
       <div className="logs-toolbar">
         <label className="search-box logs-search">
           <input value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="메시지, scope, 작업명 검색" />
@@ -6438,7 +6460,7 @@ function AuditPanel({ audit = [], title = "기술 로그" }) {
         </button>
         <span>{visibleRows.length.toLocaleString()} / {rows.length.toLocaleString()}개</span>
       </div>
-      <div className="audit-log-workspace">
+      <div className="logs-workbench audit-log-workspace">
         <div className="table-scroll compact-table logs-table">
           <table>
             <thead>
@@ -6453,7 +6475,18 @@ function AuditPanel({ audit = [], title = "기술 로그" }) {
             <tbody>
               {visibleRows.length ? (
                 visibleRows.map((row) => (
-                  <tr className={selectedLog?.id === row.id ? "is-selected" : ""} key={row.id} onClick={() => setSelectedLogId(row.id)}>
+                  <tr
+                    aria-selected={selectedLog?.id === row.id}
+                    className={selectedLog?.id === row.id ? "is-selected" : ""}
+                    key={row.id}
+                    onClick={() => setSelectedLogId(row.id)}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      setSelectedLogId(row.id);
+                    }}
+                    tabIndex={0}
+                  >
                     <td>{row.time}</td>
                     <td><span className={`scope-pill scope-${logToken(row.scope)}`}>{row.scope}</span></td>
                     <td><span className={`level-pill level-${logToken(row.level)}`}>{row.level}</span></td>
@@ -6464,15 +6497,15 @@ function AuditPanel({ audit = [], title = "기술 로그" }) {
               ) : (
                 <tr>
                   <td colSpan={5}>
-                    <EmptyRow text="검색 조건에 맞는 로그가 없습니다." />
+                    <EmptyRow text={emptyText} />
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
-        <aside className="audit-log-detail" aria-label="선택한 기술 로그 상세">
-          <h3>로그 상세</h3>
+        <aside className="log-detail-panel audit-log-detail" aria-label={`선택한 ${detailLabel}`}>
+          <h3>{detailLabel}</h3>
           {selectedLog ? (
             <>
               <p>{selectedLog.message}</p>
@@ -6485,14 +6518,70 @@ function AuditPanel({ audit = [], title = "기술 로그" }) {
                 <div><dt>Strategy · Symbol</dt><dd>{selectedLog.item.strategy_id || "-"} · {selectedLog.item.symbol || "-"}</dd></div>
                 <div><dt>Order</dt><dd>{selectedLog.item.order_id || selectedLog.item.orderId || "-"}</dd></div>
                 <div><dt>Correlation</dt><dd>{selectedLog.item.correlation_id || selectedLog.item.trace_id || "-"}</dd></div>
+                {selectedAuditFields.map((field) => <div key={field.label}><dt>{field.label}</dt><dd>{field.value}</dd></div>)}
               </dl>
               {(selectedLog.item.stack_trace || selectedLog.item.stackTrace) && <pre>{selectedLog.item.stack_trace || selectedLog.item.stackTrace}</pre>}
+              {selectedPayload ? <><h4>Payload</h4><pre>{selectedPayload}</pre></> : null}
             </>
           ) : <EmptyRow text="상세를 볼 로그가 없습니다." />}
         </aside>
       </div>
     </section>
   );
+}
+
+const AUDIT_PAYLOAD_SECRET_KEY = /(authorization|api[-_]?key|secret|password|passwd|token|credential|private[-_]?key|chat[-_]?id)/i;
+
+function firstAuditValue(item, ...keys) {
+  for (const key of keys) {
+    const value = item?.[key];
+    if (value !== undefined && value !== null && String(value).trim() !== "") return String(value);
+  }
+  return "";
+}
+
+function auditDetailFields(item = {}) {
+  return [
+    { label: "Decision", value: firstAuditValue(item, "decision") },
+    { label: "State", value: firstAuditValue(item, "state") },
+    { label: "Reason", value: firstAuditValue(item, "reason") },
+    { label: "Risk gate", value: firstAuditValue(item, "risk_gate", "riskGate") },
+    { label: "Run ID", value: firstAuditValue(item, "run_id", "runId") },
+    { label: "Passport ID", value: firstAuditValue(item, "passport_id", "passportId") },
+  ].filter((field) => field.value);
+}
+
+function sanitizeAuditPayload(value, depth = 0) {
+  if (depth >= 5) return "[depth limited]";
+  if (Array.isArray(value)) return value.slice(0, 30).map((item) => sanitizeAuditPayload(item, depth + 1));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).slice(0, 60).map(([key, item]) => [
+        key,
+        AUDIT_PAYLOAD_SECRET_KEY.test(key) ? "[redacted]" : sanitizeAuditPayload(item, depth + 1),
+      ]),
+    );
+  }
+  if (typeof value === "string") return value.length > 600 ? `${value.slice(0, 600)}…` : value;
+  return value;
+}
+
+function formatAuditPayload(item = {}) {
+  let payload = item.payload ?? item.payload_json ?? item.payloadJson;
+  if (payload === undefined || payload === null || payload === "") return "";
+  if (typeof payload === "string") {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+      payload = payload.length > 2000 ? `${payload.slice(0, 2000)}…` : payload;
+    }
+  }
+  try {
+    const text = JSON.stringify(sanitizeAuditPayload(payload), null, 2);
+    return text.length > 5000 ? `${text.slice(0, 5000)}\n…` : text;
+  } catch {
+    return "[payload를 표시할 수 없습니다.]";
+  }
 }
 
 function logToken(value = "") {

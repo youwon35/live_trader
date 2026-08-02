@@ -6498,7 +6498,8 @@ body {
    keeps the full row because secret fields need label/input/status space. */
 .settings-content-grid > .content-column:first-child {
   grid-template-areas:
-    "appearance telegram"
+    "appearance appearance"
+    "telegram telegram"
     "assistant assistant";
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
@@ -6538,28 +6539,52 @@ body {
 
 .appearance-panel {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
   align-content: start;
-  gap: 7px;
+  gap: 8px;
 }
 
-.appearance-panel > .panel-header,
-.appearance-panel > .layout-settings-card {
-  grid-column: 1 / -1;
+.appearance-inline-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
 }
 
-.settings-control-group {
-  gap: 6px;
+.appearance-inline-grid .settings-control-group {
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
   margin: 0;
-  padding: 7px 8px;
+  padding: 10px;
   background: var(--panel-raised);
   border: 1px solid var(--border);
   border-radius: 7px;
 }
 
-.layout-settings-card {
-  min-height: 46px;
-  padding: 7px 8px;
+.appearance-inline-grid .settings-control-group > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.appearance-inline-grid .settings-control-group strong {
+  font-size: 13px;
+}
+
+.appearance-inline-grid .settings-control-group span {
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.appearance-inline-grid .layout-settings-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  min-height: 0;
+}
+
+.appearance-inline-grid .layout-settings-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 7px;
 }
 
 .telegram-settings-panel .telegram-connection-status {
@@ -6737,13 +6762,8 @@ body {
 }
 
 @media (max-width: 720px) {
-  .appearance-panel {
+  .appearance-inline-grid {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .appearance-panel > .panel-header,
-  .appearance-panel > .layout-settings-card {
-    grid-column: auto;
   }
 }
 
@@ -7724,8 +7744,8 @@ body {
 
 .audit-log-workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(270px, 340px);
-  gap: 10px;
+  grid-template-columns: minmax(520px, 1.35fr) minmax(300px, 0.65fr);
+  gap: 9px;
   min-width: 0;
 }
 
@@ -7780,16 +7800,25 @@ body {
 }
 
 .audit-log-detail {
+  display: grid;
+  align-content: start;
+  gap: 10px;
   min-width: 0;
   padding: 12px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 9px;
   background: var(--panel-raised);
 }
 
 .audit-log-detail h3,
+.audit-log-detail h4,
 .audit-log-detail p {
   margin: 0;
+}
+
+.audit-log-detail h4 {
+  margin-top: 2px;
+  font-size: 12px;
 }
 
 .audit-log-detail p {
@@ -7838,6 +7867,11 @@ body {
   background: color-mix(in srgb, var(--primary) 9%, var(--panel));
 }
 
+.logs-table tbody tr:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
 @media (max-width: 1279px) {
   .audit-log-workspace {
     grid-template-columns: minmax(0, 1fr);
@@ -7846,6 +7880,32 @@ body {
   .deployment-manifest-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+
+/* Runtime accent contrast must outrank the shared console's static primary
+   text token when users choose very bright colours such as white or yellow. */
+:root[data-program="live-trader"] #root :is(
+  .primary-button,
+  .primary-action,
+  .run-button,
+  .doctor-run-button,
+  .ts-ui-button--primary,
+  .ts-action-button--primary,
+  [data-ts-action-component="true"][data-ts-variant="primary"]
+) {
+  color: var(--accent-contrast-text, #ffffff) !important;
+}
+
+:root[data-program="live-trader"] #root :is(
+  .primary-button,
+  .primary-action,
+  .run-button,
+  .doctor-run-button,
+  .ts-ui-button--primary,
+  .ts-action-button--primary,
+  [data-ts-action-component="true"][data-ts-variant="primary"]
+) * {
+  color: inherit !important;
 }
 
 @media (max-width: 760px) {
