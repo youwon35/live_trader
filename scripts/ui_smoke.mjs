@@ -15,9 +15,13 @@ const tabs = [
   { label: "주문·체결", requiredHeadings: ["주문 상태 원장", "주문 타임라인", "체결 원장", "실행 품질"] },
   { label: "리스크·안전", requiredHeadings: ["현재 리스크 사용량", "요청별 재시도 원칙"] },
   { label: "실거래 운영", requiredHeadings: ["Runtime 구성 요소", "Live Watchdog"] },
-  { label: "사고·감사", requiredHeadings: ["운영 사고", "감사 이벤트"] },
+  { label: "사고·감사", requiredHeadings: ["감사 이벤트"], forbiddenHeadings: ["운영 사고"] },
   { label: "기술 로그", requiredHeadings: ["기술 로그"] },
-  { label: "설정·진단", requiredHeadings: ["Secret 보호 상태", "설정·Runtime 자체 검사"] },
+  {
+    label: "설정·진단",
+    requiredHeadings: ["설정·Runtime 자체 검사"],
+    forbiddenHeadings: ["Secret 보호 상태", "브로커 Capability", "어댑터 인터페이스 계약", "브로커 준비 항목"],
+  },
 ];
 const expectedNavigationLabels = tabs.map((tab) => tab.label);
 const issues = [];
@@ -142,6 +146,11 @@ try {
           issues.push(`${viewport.name}/${tab.label}: required section '${heading}' is missing`);
         }
       }
+      for (const heading of tab.forbiddenHeadings ?? []) {
+        if (await page.getByRole("heading", { name: heading, exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: removed section '${heading}' is visible`);
+        }
+      }
 
       if (tab.label === "배포·승급") {
         const deploymentSelect = environmentBar.locator("select");
@@ -158,13 +167,6 @@ try {
         ));
         if (borderMismatches.length) {
           issues.push(`${viewport.name}/${tab.label}: status cards still use a colored side border (${JSON.stringify(borderMismatches.slice(0, 3))})`);
-        }
-      }
-
-      if (tab.label === "사고·감사") {
-        const borderMismatches = await nonUniformCardBorders(page.locator(".incident-row"));
-        if (borderMismatches.length) {
-          issues.push(`${viewport.name}/${tab.label}: incident cards still use a colored side border (${JSON.stringify(borderMismatches.slice(0, 3))})`);
         }
       }
 

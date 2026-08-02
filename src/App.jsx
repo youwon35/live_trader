@@ -64,7 +64,6 @@ import {
   setStrategyLifecycle,
   setAutomationProfile,
   syncExecutionEvents,
-  transitionIncident,
   setRetryPolicy,
   setRiskSetting,
   saveUiSettings,
@@ -88,7 +87,6 @@ import {
   buildRetryMatrix,
   projectAccountReconciliation,
   projectExecutionQuality,
-  projectIncidents,
   projectOrderTimeline,
 } from "./liveWorkspaceModel";
 import {
@@ -215,7 +213,7 @@ const pageProfiles = {
   incidents: {
     title: "사고·감사",
     eyebrow: "INCIDENT & AUDIT",
-    summary: "운영 사고의 영향·자동 조치·해결 상태와 변경 불가능한 감사 이벤트를 분리해 추적합니다.",
+    summary: "잠금·배포·Preflight·모드·Risk·주문·Kill·Secret 변경을 append-only 감사 이벤트로 추적합니다.",
   },
   audit: {
     title: "기술 로그",
@@ -225,7 +223,7 @@ const pageProfiles = {
   settings: {
     title: "설정·진단",
     eyebrow: "BROKER & RUNTIME",
-    summary: "보호 저장소, 브로커 capability, 알림, Runtime 자체 검사와 보기 설정을 관리합니다.",
+    summary: "화면·레이아웃, 브로커 연결, Telegram 알림과 Runtime 자체 검사를 관리합니다.",
   },
 };
 
@@ -1920,12 +1918,6 @@ function App() {
           onPromoteLive={(strategyId) => runAction(() => promoteStrategyToLive(strategyId))}
           onStrategyLifecycle={(strategyId, action) => runAction(() => setStrategyLifecycle(strategyId, action))}
           onWatchdog={() => runAction(runWatchdog)}
-          onIncidentTransition={(incidentId, action) => {
-            const labels = { acknowledge: "확인", mitigate: "완화 시작", resolve: "해결" };
-            const note = window.prompt(`사고를 '${labels[action] || action}' 상태로 변경합니다. 운영자 메모를 입력하세요.`, "");
-            if (note === null) return Promise.resolve({ ok: false, cancelled: true });
-            return runAction(() => transitionIncident(incidentId, action, note));
-          }}
           onTestIntent={() => runAction(submitTestIntent)}
           onRiskSetting={(name, value) => runAction(() => setRiskSetting(name, value))}
           onRetryPolicy={(name, value) => runAction(() => setRetryPolicy(name, value))}
@@ -2082,7 +2074,6 @@ function WorkspaceContent({
   onPromoteLive,
   onStrategyLifecycle,
   onWatchdog,
-  onIncidentTransition,
   onTestIntent,
   onRiskSetting,
   onRetryPolicy,
@@ -2224,7 +2215,7 @@ function WorkspaceContent({
 
   if (selectedNav === "incidents") {
     return renderPage(
-      <IncidentAuditWorkspace snapshot={snapshot} onIncidentTransition={onIncidentTransition} />,
+      <IncidentAuditWorkspace snapshot={snapshot} />,
     );
   }
 
@@ -2251,10 +2242,6 @@ function WorkspaceContent({
           <TelegramConnectionPanel />
         </div>
         <div className="content-column">
-          <CredentialProtectionPanel snapshot={snapshot} />
-          <BrokerCapabilityPanel diagnostics={snapshot.broker_diagnostics ?? []} />
-          <BrokerAdapterContractPanel contract={snapshot.broker_adapter_contract ?? []} />
-          <BrokerRequirementsPanel brokers={snapshot.brokers ?? []} />
           <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
         </div>
       </section>,
@@ -2603,63 +2590,10 @@ function RetryDecisionMatrixPanel({ matrix }) {
   );
 }
 
-function fallbackIncidents(snapshot = {}) {
-  const rows = [];
-  (snapshot.watchdog?.checks ?? []).filter((item) => item.status === "fail").forEach((item, index) => rows.push({ incidentId: `WATCHDOG-${index + 1}`, severity: "CRITICAL", title: item.label, detail: item.detail, status: "OPEN", occurredAt: snapshot.watchdog?.last_run, impact: "신규 진입 차단", source: "Watchdog" }));
-  const summary = snapshot.reconciliation?.summary ?? {};
-  if (Number(summary.mismatch_count || 0) > 0 || Number(summary.api_required_count || 0) > 0) rows.push({ incidentId: "RECONCILIATION-CURRENT", severity: Number(summary.mismatch_count || 0) ? "CRITICAL" : "WARNING", title: "포지션·계좌 대조 미완료", detail: `불일치 ${summary.mismatch_count || 0} · 미확인 ${summary.api_required_count || 0}`, status: "OPEN", occurredAt: summary.last_run, impact: "위험 증가 주문 차단", source: "Reconciliation" });
-  (snapshot.orders ?? []).filter((order) => ["unknown", "unknown_submit_result"].includes(String(order.state || "").toLowerCase())).forEach((order) => rows.push({ incidentId: `ORDER-${order.order_id}`, severity: "CRITICAL", title: "주문 접수 결과 불확실", detail: `${order.broker_id || "Broker"} · ${order.symbol || "-"} · ${order.order_id}`, status: "OPEN", occurredAt: order.updated_at || order.created_at, impact: "자동 재전송 금지", source: "Order Gateway" }));
-  return rows;
-}
-
-function IncidentAuditWorkspace({ snapshot = {}, onIncidentTransition }) {
-  const governance = snapshot.live_governance ?? {};
-  const storedIncidents = governance.incidents ?? snapshot.incidents ?? [];
-  const projectedIncidents = projectIncidents(snapshot).map((item) => ({
-    incidentId: item.id,
-    severity: item.severity?.raw || item.severity?.label,
-    title: item.title,
-    detail: item.detail,
-    status: item.state?.code?.toUpperCase(),
-    occurredAt: item.occurredAt,
-    impact: item.blocking ? "위험 증가 주문 차단" : "관찰",
-    source: item.source,
-    durable: false,
-  }));
-  const normalizedStored = storedIncidents.map((incident) => ({
-    ...incident,
-    incidentId: incident.incidentId || incident.incident_id,
-    status: incident.status || incident.state || "OPEN",
-    occurredAt: incident.occurredAt || incident.openedAt || incident.opened_at,
-    source: incident.source || incident.scopeType || incident.scope_type || "Runtime",
-    durable: true,
-  }));
-  const storedIds = new Set(normalizedStored.map((incident) => String(incident.incidentId || incident.code || "")));
-  const incidents = [
-    ...normalizedStored,
-    ...projectedIncidents.filter((incident) => !storedIds.has(String(incident.incidentId || ""))),
-  ];
+function IncidentAuditWorkspace({ snapshot = {} }) {
   const audit = snapshot.durable_audit ?? snapshot.audit_events ?? snapshot.audit ?? [];
   return (
     <section className="incident-audit-layout">
-      <section className="panel incident-panel">
-        <PanelHeader title="운영 사고" subtitle="현재 위험을 과거 Artifact 차단과 분리하고, 영향·자동 조치·해결 상태를 추적합니다." suffix={<StatusPill tone={incidents.some((item) => String(item.status).toUpperCase() === "OPEN") ? "danger" : "success"}>{incidents.filter((item) => String(item.status).toUpperCase() === "OPEN").length} OPEN</StatusPill>} />
-        <div className="incident-list">
-          {incidents.length ? incidents.map((incident) => (
-            <article className="incident-row" key={incident.incidentId || incident.incident_id}>
-              <div><StatusPill tone={String(incident.severity).toUpperCase() === "CRITICAL" ? "danger" : "warning"}>{incident.severity || "WARNING"}</StatusPill><strong>{incident.title || incident.code}</strong><span>{incident.detail || incident.evidence || "상세 증거 확인 필요"}</span></div>
-              <dl><div><dt>발생</dt><dd>{formatAuditTime({ timestamp: incident.occurredAt || incident.opened_at })}</dd></div><div><dt>영향</dt><dd>{incident.impact || "신규 진입 차단"}</dd></div><div><dt>상태</dt><dd>{incident.status || "OPEN"}</dd></div><div><dt>Source</dt><dd>{incident.source || incident.scope || "Runtime"}</dd></div></dl>
-              {incident.durable && String(incident.status || "OPEN").toUpperCase() !== "RESOLVED" ? (
-                <div className="incident-actions">
-                  {String(incident.status || "OPEN").toUpperCase() === "OPEN" && <button className="secondary-button" type="button" onClick={() => onIncidentTransition(incident.incidentId, "acknowledge")}>확인</button>}
-                  {["OPEN", "ACKNOWLEDGED"].includes(String(incident.status || "OPEN").toUpperCase()) && <button className="secondary-button" type="button" onClick={() => onIncidentTransition(incident.incidentId, "mitigate")}>완화 시작</button>}
-                  <button className="secondary-button" type="button" onClick={() => onIncidentTransition(incident.incidentId, "resolve")}>해결</button>
-                </div>
-              ) : !incident.durable ? <small className="incident-projection-note">현재 상태 투영 · Watchdog/대조 실행 시 감사 원장에 기록됩니다.</small> : null}
-            </article>
-          )) : <EmptyRow text="현재 열린 운영 사고가 없습니다." />}
-        </div>
-      </section>
       <AuditPanel
         audit={audit}
         detailLabel="감사 기록 상세"
@@ -2667,21 +2601,6 @@ function IncidentAuditWorkspace({ snapshot = {}, onIncidentTransition }) {
         subtitle="잠금·배포·Preflight·모드·Risk·주문·Kill·Secret 변경을 append-only 원장에서 검색합니다."
         title="감사 이벤트"
       />
-    </section>
-  );
-}
-
-function CredentialProtectionPanel({ snapshot = {} }) {
-  const authenticated = (snapshot.brokers ?? []).filter((broker) => broker.status !== "missing_credentials");
-  return (
-    <section className="panel credential-protection-panel">
-      <PanelHeader title="Secret 보호 상태" subtitle="실전 Secret은 .env 평문 대신 Windows DPAPI 기반 앱 전용 보호 저장소에 보관하며 백업·로그·진단에서 제외합니다." suffix={<StatusPill tone="success">DPAPI 보호</StatusPill>} />
-      <div className="credential-status-grid">
-        <div><span>저장 방식</span><strong>Windows 보호 저장소</strong><small>파일에는 Secret 식별자와 비민감 설정만 유지</small></div>
-        <div><span>인증정보 설정</span><strong>{authenticated.length}/{(snapshot.brokers ?? []).length}</strong><small>설정됨과 인증 성공은 별도 capability에서 확인</small></div>
-        <div><span>마지막 정상 인증</span><strong>미확인</strong><small>Broker capability Probe 실행 필요</small></div>
-        <div><span>Key 교체 시각</span><strong>기록 없음</strong><small>다음 Secret 교체부터 감사 이벤트로 기록</small></div>
-      </div>
     </section>
   );
 }
@@ -5127,48 +5046,6 @@ function isCryptoStrategy(strategy) {
   return ["crypto", "coin", "btc", "eth", "usdt", "코인"].some((token) => text.includes(token));
 }
 
-function BrokerCapabilityPanel({ diagnostics }) {
-  return (
-    <section className="panel broker-capability-panel">
-      <PanelHeader title="브로커 Capability" subtitle="실계좌 연결에 필요한 기능별 구현/차단 상태입니다." />
-      <div className="capability-list">
-        {diagnostics.map((broker) => (
-          <div className="capability-broker" key={broker.broker_id}>
-            <div className="capability-broker-title">
-              <Network size={16} />
-              <strong>{broker.name}</strong>
-            </div>
-            <div className="capability-grid">
-              {broker.capabilities.map((capability) => (
-                <div className={`capability-item ${capability.status}`} data-ts-contrast="light" key={capability.key}>
-                  <strong>{capability.label}</strong>
-                  <span>{capability.detail}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function BrokerAdapterContractPanel({ contract }) {
-  return (
-    <section className="panel broker-contract-panel">
-      <PanelHeader title="어댑터 인터페이스 계약" subtitle="KIS/Binance 어댑터가 공통으로 구현해야 할 메서드입니다." />
-      <div className="compact-list">
-        {contract.map((item) => (
-          <div {...semanticSurfaceProps(statusTone(item.status), "compact-row")} key={item.method}>
-            <strong>{item.method}</strong>
-            <span>{item.purpose}</span>
-            <StatusPill tone={statusTone(item.status)}>{item.status}</StatusPill>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
 
 function RiskPanel({ checks }) {
   return (
@@ -5386,26 +5263,6 @@ function RetryPolicyPanel({ policy, onRetryPolicy }) {
                 <span>{setting.unit}</span>
               </label>
             )}
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function BrokerRequirementsPanel({ brokers }) {
-  return (
-    <section className="panel">
-      <PanelHeader title="브로커 준비 항목" subtitle="실제 주문 연결 전에 비어 있는 환경 값을 확인합니다." />
-      <div className="compact-list">
-        {brokers.map((broker) => (
-          <div
-            {...semanticSurfaceProps(broker.order_ready ? "success" : "danger", "compact-row")}
-            key={broker.broker_id}
-          >
-            <strong>{broker.name}</strong>
-            <span>{broker.missing_env.length ? `${broker.missing_env.length}개 값 필요` : "환경 값 입력됨"}</span>
-            <StatusPill tone={broker.order_ready ? "success" : "danger"}>{broker.order_ready ? "ready" : "blocked"}</StatusPill>
           </div>
         ))}
       </div>
