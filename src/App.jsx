@@ -21,7 +21,6 @@ import {
   Radio,
   RefreshCw,
   RefreshCcw,
-  RotateCcw,
   Save,
   Search,
   Settings,
@@ -131,12 +130,10 @@ import { createStatusPill } from "../../../packages/design/status-pill.js";
 import { createTelegramConnectionStatus } from "../../../packages/design/telegram-connection-status.js";
 import {
   createEmptyState,
-  createFormField,
   createIconButton,
   createMetricCard,
   createMetricGrid,
   createPanelHeader,
-  createSegmentedControl,
   createStatusCard,
   createStatusRow,
   createToggleSwitch,
@@ -156,13 +153,11 @@ const MasterDetailLog = createMasterDetailLog(React);
 const StatusPill = createStatusPill(React);
 const TelegramConnectionStatus = createTelegramConnectionStatus(React);
 const EmptyState = createEmptyState(React);
-const FormField = createFormField(React);
 const IconButton = createIconButton(React);
 const MetricCard = createMetricCard(React);
 const MetricGrid = createMetricGrid(React);
 const NestedTabs = createNestedTabs(React);
 const PanelHeader = createPanelHeader(React);
-const SegmentedControl = createSegmentedControl(React);
 const StatusCard = createStatusCard(React);
 const SharedStatusRow = createStatusRow(React);
 const ToggleSwitch = createToggleSwitch(React);
@@ -2098,39 +2093,37 @@ function WorkspaceContent({
 
   if (selectedNav === "automation") {
     return renderPage(
-      <section className="content-grid">
-        <div className="content-column">
-          <DeploymentContextPanel context={deploymentContext} />
-          <AutomationLauncherPanel
-            profiles={snapshot.automation_profiles}
-            strategies={snapshot.strategies}
-            runnerState={snapshot.strategy_runner}
-            onAutomation={onAutomation}
-            onStrategyCycle={onStrategyCycle}
-            onValidationEvaluate={onValidationEvaluate}
-            onRuntimeStart={onRuntimeStart}
-            onRuntimeStop={onRuntimeStop}
-            runtime={snapshot.continuous_runtime}
-            soakReport={snapshot.soakReport || snapshot.soak_report}
-          />
-          <CapitalRolloutPanel
-            snapshot={snapshot.capital_rollout}
-            selectedStrategyId={selectedStrategy?.strategy_id}
-          />
-        </div>
-        <div className="content-column">
-          <RuntimeComponentStatusPanel snapshot={snapshot} />
-          <WatchdogPanel watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
-          <FuturesSettingsPanel snapshot={snapshot.binance_futures_settings} selectedSymbol={deploymentContext?.symbol} />
-          <FuturesFillSoakPanel snapshot={snapshot.binance_futures_fill_soak} selectedSymbol={deploymentContext?.symbol} />
-        </div>
+      <section className="ts-panel-grid ts-panel-grid--two automation-page-layout">
+        <DeploymentContextPanel className="live-grid-full" context={deploymentContext} />
+        <AutomationLauncherPanel
+          className="live-grid-full"
+          profiles={snapshot.automation_profiles}
+          strategies={snapshot.strategies}
+          runnerState={snapshot.strategy_runner}
+          onAutomation={onAutomation}
+          onStrategyCycle={onStrategyCycle}
+          onValidationEvaluate={onValidationEvaluate}
+          onRuntimeStart={onRuntimeStart}
+          onRuntimeStop={onRuntimeStop}
+          runtime={snapshot.continuous_runtime}
+          soakReport={snapshot.soakReport || snapshot.soak_report}
+        />
+        <RuntimeComponentStatusPanel snapshot={snapshot} />
+        <WatchdogPanel watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
+        <FuturesSettingsPanel snapshot={snapshot.binance_futures_settings} selectedSymbol={deploymentContext?.symbol} />
+        <FuturesFillSoakPanel snapshot={snapshot.binance_futures_fill_soak} selectedSymbol={deploymentContext?.symbol} />
+        <CapitalRolloutPanel
+          className="live-grid-full"
+          snapshot={snapshot.capital_rollout}
+          selectedStrategyId={selectedStrategy?.strategy_id}
+        />
       </section>,
     );
   }
 
   if (selectedNav === "gate") {
     return renderPage(
-      <section className="deployment-promotion-layout">
+      <section className="deployment-promotion-layout ts-layout-stack">
         <DeploymentContextPanel context={deploymentContext} />
         <DeploymentManifestPanel governance={snapshot.live_governance} />
         <LivePreparationPanel
@@ -2158,7 +2151,7 @@ function WorkspaceContent({
 
   if (selectedNav === "accounts") {
     return renderPage(
-      <section className="accounts-page-layout">
+      <section className="accounts-page-layout ts-layout-stack">
         <ThreeWayReconciliationPanel snapshot={snapshot} />
         <UnifiedBrokerAccountPanel
           accounts={snapshot.accounts ?? []}
@@ -2186,29 +2179,25 @@ function WorkspaceContent({
 
   if (selectedNav === "risk") {
     return renderPage(
-      <section className="content-grid">
-        <div className="content-column">
-          <DeploymentContextPanel context={deploymentContext} />
-          <RiskUsagePanel snapshot={snapshot} context={deploymentContext} />
-          <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
-          <FuturesRiskSimulatorPanel strategies={selectedStrategy ? [selectedStrategy] : []} />
-        </div>
-        <div className="content-column">
-          <OperationalSafeguardsPanel
-            apiConnected={snapshot.api_connected === true}
-            dryRun={snapshot.dry_run}
-            newEntriesBlocked={snapshot.new_entries_blocked}
-            killSwitch={snapshot.kill_switch}
-            operatorConfirmed={snapshot.operator_confirmed}
-            onConfirm={onConfirm}
-            onDryRun={onDryRun}
-            onEntryBlock={onEntryBlock}
-            onTestIntent={onTestIntent}
-          />
-          <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
-          <RetryDecisionMatrixPanel matrix={snapshot.retry_policy_matrix} />
-          <WatchdogPanel watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
-        </div>
+      <section className="ts-panel-grid ts-panel-grid--two risk-page-layout">
+        <DeploymentContextPanel className="live-grid-full" context={deploymentContext} />
+        <RiskUsagePanel snapshot={snapshot} context={deploymentContext} />
+        <OperationalSafeguardsPanel
+          apiConnected={snapshot.api_connected === true}
+          dryRun={snapshot.dry_run}
+          newEntriesBlocked={snapshot.new_entries_blocked}
+          killSwitch={snapshot.kill_switch}
+          operatorConfirmed={snapshot.operator_confirmed}
+          onConfirm={onConfirm}
+          onDryRun={onDryRun}
+          onEntryBlock={onEntryBlock}
+          onTestIntent={onTestIntent}
+        />
+        <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
+        <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
+        <FuturesRiskSimulatorPanel strategies={selectedStrategy ? [selectedStrategy] : []} />
+        <RetryDecisionMatrixPanel matrix={snapshot.retry_policy_matrix} />
+        <WatchdogPanel className="live-grid-full" watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
       </section>,
     );
   }
@@ -2221,7 +2210,7 @@ function WorkspaceContent({
 
   if (selectedNav === "audit") {
     return renderPage(
-      <section className="audit-page-layout">
+      <section className="audit-page-layout ts-layout-stack">
         <AuditPanel audit={snapshot.technical_logs || snapshot.audit} title="기술 로그" />
       </section>,
     );
@@ -2229,8 +2218,8 @@ function WorkspaceContent({
 
   if (selectedNav === "settings") {
     return renderPage(
-      <section className="content-grid settings-content-grid">
-        <div className="content-column">
+      <section className="settings-page-layout ts-layout-stack">
+        <div className="settings-summary-grid ts-panel-grid ts-panel-grid--two">
           <AppearanceControlPanel
             appearance={appearance}
             updateAppearance={updateAppearance}
@@ -2238,12 +2227,10 @@ function WorkspaceContent({
             changeLayoutMode={changeLayoutMode}
             resetWorkspaceLayout={resetWorkspaceLayout}
           />
-          <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} onSave={onEnvSettings} />
           <TelegramConnectionPanel />
         </div>
-        <div className="content-column">
-          <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
-        </div>
+        <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} onSave={onEnvSettings} />
+        <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
       </section>,
     );
   }
@@ -2260,9 +2247,9 @@ function WorkspaceContent({
   );
 }
 
-function DeploymentContextPanel({ context = {} }) {
+function DeploymentContextPanel({ context = {}, className = "" }) {
   return (
-    <section className="panel deployment-context-panel">
+    <section className={`panel deployment-context-panel ${className}`.trim()}>
       <PanelHeader
         title="현재 Deployment"
         subtitle="이 화면의 설정·Preview·Runtime은 상단에서 선택한 동일한 배포 컨텍스트를 사용합니다."
@@ -2360,11 +2347,11 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
 
 function OperationsOverviewPage({ context, snapshot, onNavigate, onReconcile, onPreflight, onWatchdog }) {
   return (
-    <section className="operations-overview-layout">
+    <section className="operations-overview-layout ts-layout-stack">
       <DeploymentContextPanel context={context} />
       <PreflightScopePanel snapshot={snapshot} onPreflight={onPreflight} />
-      <section className="content-grid operations-overview-grid">
-        <div className="content-column">
+      <section className="content-grid operations-overview-grid ts-panel-grid ts-panel-grid--two">
+        <div className="content-column ts-scroll-panel">
           <PreTradeDoctorPanel
             snapshot={snapshot}
             onNavigate={onNavigate}
@@ -2373,7 +2360,7 @@ function OperationsOverviewPage({ context, snapshot, onNavigate, onReconcile, on
             onWatchdog={onWatchdog}
           />
         </div>
-        <div className="content-column">
+        <div className="content-column ts-scroll-panel">
           <LaunchReportPanel report={snapshot.launch_report ?? {}} />
           {snapshot.operation_report?.sections && <OperationsReportPanel report={snapshot.operation_report} />}
           <RuntimeComponentStatusPanel snapshot={snapshot} />
@@ -2539,7 +2526,7 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
     ));
   }, [events, selected]);
   return (
-    <section className="order-execution-layout">
+    <section className="order-execution-layout ts-layout-stack">
       <DeploymentContextPanel context={context} />
       <OrderQueueSummaryPanel summary={snapshot.order_queue ?? {}} />
       <section className="panel order-ledger-panel">
@@ -2733,7 +2720,7 @@ function RetryDecisionMatrixPanel({ matrix }) {
   return (
     <section className="panel retry-matrix-panel">
       <PanelHeader title="요청별 재시도 원칙" subtitle="조회 재시도와 주문 POST 재전송을 분리합니다." />
-      <div className="table-scroll"><table className="data-table"><thead><tr><th>요청</th><th>결과</th><th>동작</th><th>자동</th></tr></thead><tbody>{displayRows.map((row, index) => <tr key={`${row.request || row.request_type}-${index}`}><td>{row.request || row.request_type}</td><td>{row.result || row.outcome}</td><td>{row.action || row.policy}</td><td><StatusPill tone={row.automatic ? "warning" : "neutral"}>{row.automatic ? "허용" : "금지"}</StatusPill></td></tr>)}</tbody></table></div>
+      <div className="table-scroll ts-scroll-panel"><table className="data-table"><thead><tr><th>요청</th><th>결과</th><th>동작</th><th>자동</th></tr></thead><tbody>{displayRows.map((row, index) => <tr key={`${row.request || row.request_type}-${index}`}><td>{row.request || row.request_type}</td><td>{row.result || row.outcome}</td><td>{row.action || row.policy}</td><td><StatusPill tone={row.automatic ? "warning" : "neutral"}>{row.automatic ? "허용" : "금지"}</StatusPill></td></tr>)}</tbody></table></div>
     </section>
   );
 }
@@ -2741,7 +2728,7 @@ function RetryDecisionMatrixPanel({ matrix }) {
 function IncidentAuditWorkspace({ snapshot = {} }) {
   const audit = snapshot.durable_audit ?? snapshot.audit_events ?? snapshot.audit ?? [];
   return (
-    <section className="incident-audit-layout">
+    <section className="incident-audit-layout ts-layout-stack">
       <AuditPanel
         audit={audit}
         detailLabel="감사 기록 상세"
@@ -2977,7 +2964,7 @@ function LivePreparationPanel({
         variant="cards"
         value={assetTab}
       />
-      <section className="content-grid">
+      <section className="content-grid ts-scroll-panel">
         <div className="content-column">
           <StrategyDiscoveryToolbar
             filters={discoveryFilters}
@@ -3195,11 +3182,11 @@ function LineageFlowPanel({ snapshot = {}, selectedStrategyId = "" }) {
   );
 }
 
-function CapitalRolloutPanel({ snapshot = {}, selectedStrategyId = "" }) {
+function CapitalRolloutPanel({ snapshot = {}, selectedStrategyId = "", className = "" }) {
   const rows = Array.isArray(snapshot?.strategies) ? snapshot.strategies : [];
   const rollout = rows.find((item) => item.strategyId === selectedStrategyId) || rows[0];
   return (
-    <section className="panel capital-rollout-panel">
+    <section className={`panel capital-rollout-panel ${className}`.trim()}>
       <PanelHeader
         title="단계별 자본 확대"
         subtitle="최소 Canary → Small Live → Full Live 순서로만 상한이 커집니다. 실제 주문 게이트에도 같은 한도를 적용합니다."
@@ -4269,15 +4256,6 @@ function NotificationPanel({ items, onNavigate }) {
   );
 }
 
-function verificationTone(status) {
-  const normalized = String(status || "").toLowerCase();
-  if (["pass", "passed", "ready", "valid", "ok"].includes(normalized)) return "success";
-  if (["fail", "failed", "rejected", "blocked"].includes(normalized)) return "danger";
-  if (["watch", "warn", "warning", "unknown"].includes(normalized)) return "warning";
-  if (["wait", "empty", "missing", "na", "n/a", "not_applicable"].includes(normalized)) return "neutral";
-  return "info";
-}
-
 function normalizePromotionStage(stage = "") {
   const normalized = String(stage || "").toLowerCase().replaceAll("_", "-");
   const aliases = {
@@ -4475,16 +4453,6 @@ function formatPercentValue(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return "0.00";
   return (numeric * 100).toFixed(2);
-}
-
-function portfolioEvidenceLabel(gate = {}) {
-  if (!gate.required) return "LEGACY";
-  return gate.ready ? "PASS" : "BLOCK";
-}
-
-function portfolioEvidenceTone(gate = {}) {
-  if (!gate.required) return "info";
-  return gate.ready ? "success" : "danger";
 }
 
 function statusTone(status) {
@@ -4835,6 +4803,7 @@ function UnattendedSoakReportCard({ report }) {
 }
 
 function AutomationLauncherPanel({
+  className = "",
   profiles,
   strategies,
   runnerState,
@@ -4919,7 +4888,7 @@ function AutomationLauncherPanel({
 
   if (!activeProfile) {
     return (
-      <section className="panel automation-panel">
+      <section className={`panel automation-panel ${className}`.trim()}>
         <PanelHeader title="브로커별 자동화" subtitle="실거래 자동화는 자산군과 브로커별로 분리해서 시작합니다." />
         <EmptyRow text="사용 가능한 자동화 프로필이 없습니다." />
       </section>
@@ -4939,7 +4908,7 @@ function AutomationLauncherPanel({
     : profileRuntime?.phase === "FAILED" ? "danger" : "neutral";
 
   return (
-    <section className="panel automation-panel">
+    <section className={`panel automation-panel ${className}`.trim()}>
       <PanelHeader title="브로커별 자동화" subtitle="실거래 자동화는 자산군과 브로커별로 분리해서 시작합니다." />
       <NestedTabs
         ariaLabel="자동화 자산군"
@@ -5195,26 +5164,6 @@ function isCryptoStrategy(strategy) {
 }
 
 
-function RiskPanel({ checks }) {
-  return (
-    <section className="panel risk-panel">
-      <PanelHeader title="Pre-Trade Risk Gate" subtitle="주문 전 차단 규칙은 항상 브로커 전송보다 먼저 실행됩니다." />
-      <div className="risk-grid">
-        {checks.map((check) => (
-          <SharedStatusRow
-            className={`risk-rule ${check.status}`}
-            tone={statusTone(check.status)}
-            key={check.label}
-            title={check.label}
-            detail={check.detail}
-            value={check.value}
-          />
-        ))}
-      </div>
-    </section>
-  );
-}
-
 function RiskSettingsPanel({ settings, onRiskSetting }) {
   function commitChange(event, setting) {
     const nextValue = event.currentTarget.value;
@@ -5256,41 +5205,7 @@ function RiskSettingsPanel({ settings, onRiskSetting }) {
   );
 }
 
-function OrderCommandPanel({ newEntriesBlocked, dryRun, killSwitch, onDryRun, onEntryBlock, onTestIntent }) {
-  return (
-    <section className="panel">
-      <PanelHeader title="주문 제어" subtitle="실주문 전송 전 차단 상태와 테스트 게이트를 관리합니다." />
-      <div className="operator-actions">
-        <ActionButton
-          className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`}
-          icon={<ShieldCheck size={16} />}
-          label="Dry Run"
-          onClick={onDryRun}
-          status={dryRun ? "success" : "error"}
-        />
-        <ActionButton
-          active={newEntriesBlocked}
-          className="secondary-button"
-          icon={<ShieldCheck size={16} />}
-          label="신규 진입 차단"
-          onClick={onEntryBlock}
-          status={newEntriesBlocked ? "success" : undefined}
-        />
-        <ActionButton
-          className="primary-button"
-          icon={<TerminalSquare size={16} />}
-          label="테스트 주문 게이트"
-          onClick={onTestIntent}
-          pendingLabel="확인 중"
-          variant="primary"
-        />
-        <span className={`inline-state ${killSwitch ? "danger" : "success"}`}>{killSwitch ? "긴급 차단 켜짐" : "긴급 차단 꺼짐"}</span>
-      </div>
-    </section>
-  );
-}
-
-function WatchdogPanel({ watchdog, onWatchdog }) {
+function WatchdogPanel({ watchdog, onWatchdog, className = "" }) {
   const data = watchdog ?? fallbackSnapshot.watchdog;
   const tone = statusTone(data.status);
   const statusText = data.status_label ?? data.status ?? "대기";
@@ -5303,7 +5218,7 @@ function WatchdogPanel({ watchdog, onWatchdog }) {
   ];
 
   return (
-    <section className="panel watchdog-panel">
+    <section className={`panel watchdog-panel ${className}`.trim()}>
       <PanelHeader title="Live Watchdog" subtitle={`마지막 점검 ${data.last_run ?? "미실행"}`} />
       <div className="panel-action-line">
         <div>
@@ -5662,29 +5577,6 @@ function OperationsReportPanel({ report }) {
             <span>{section.value} · {section.detail}</span>
             <StatusPill tone={statusTone(section.status)}>{section.status}</StatusPill>
           </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function FinalPreflightPanel({ checks, onPreflight, compact = false }) {
-  const visibleChecks = compact ? checks.slice(0, 6) : checks;
-  return (
-    <section className="panel final-preflight-panel">
-      <PanelHeader title="최종 점검" subtitle="실브로커 어댑터 연결 직전의 hard stop과 warning을 점검합니다." />
-      <div className="panel-action-line">
-        <StatusPill tone={checks.some((check) => check.status === "fail") ? "danger" : checks.some((check) => check.status === "warn") ? "warning" : "success"}>
-          {checks.filter((check) => check.status === "fail").length} hard stop
-        </StatusPill>
-        <button className="mini-button" type="button" onClick={onPreflight}>
-          <BadgeCheck size={14} />
-          최종 점검
-        </button>
-      </div>
-      <div className="check-list">
-        {visibleChecks.map((check) => (
-          <StatusRow key={check.label} label={check.label} status={check.status} detail={check.detail} />
         ))}
       </div>
     </section>
@@ -6239,141 +6131,6 @@ function sortLiveStrategies(strategies, sort) {
     const rightDate = right.updated_at || right.updatedAt || right.release?.created_at || "";
     return String(rightDate).localeCompare(String(leftDate)) || leftName.localeCompare(rightName, "ko");
   });
-}
-
-function StrategyPanel({ strategies, selectedStrategyId, onSelect }) {
-  return (
-    <section className="panel strategy-panel">
-      <PanelHeader title="전략 Artifact" subtitle="Backtester/Paper 승인 결과와 lifecycle/evidence 계약을 확인합니다." />
-      <div className="data-table strategy-table">
-        <div className="table-head">
-          <span>전략</span>
-          <span>심볼</span>
-          <span>상태</span>
-          <span>Score</span>
-          <span>검증</span>
-          <span>권한</span>
-          <span>Evidence</span>
-          <span>차단 사유</span>
-        </div>
-        {strategies.map((strategy) => {
-          const backtester = strategy.verification?.backtester || {
-            label: strategy.backtester_label || "Backtester 정보 없음",
-            status: strategy.backtester_verified ? "pass" : "unknown",
-          };
-          const paper = strategy.verification?.paper_trader || {
-            label: strategy.paper_trader_label || "Paper 미검증",
-            status: strategy.paper_trader_verified ? "pass" : "wait",
-          };
-          return (
-            <div
-              className={`table-row ${strategy.strategy_id === selectedStrategyId ? "selected" : ""}`}
-              key={strategy.strategy_id}
-              onClick={() => onSelect(strategy.strategy_id)}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  onSelect(strategy.strategy_id);
-                }
-              }}
-            >
-              <strong>{strategy.name}</strong>
-              <span>{strategy.symbol}</span>
-              <span>{strategy.lifecycle_status}</span>
-              <span>{strategy.score}</span>
-              <span className="strategy-verification-pills">
-                <StatusPill tone={verificationTone(backtester.status)}>{backtester.label}</StatusPill>
-                <StatusPill tone={verificationTone(paper.status)}>{paper.label}</StatusPill>
-              </span>
-              <StatusPill tone={strategy.live_allowed ? "success" : "danger"}>{strategy.permission_label}</StatusPill>
-              <StatusPill tone={portfolioEvidenceTone(strategy.paper_portfolio_evidence_gate)}>
-                {portfolioEvidenceLabel(strategy.paper_portfolio_evidence_gate)}
-              </StatusPill>
-              <em>{strategy.block_reason}</em>
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function OrderPanel({ orders, onRetryOrder, onCancelOrder }) {
-  return (
-    <section className="panel order-panel">
-      <PanelHeader title="주문 기록" subtitle="차단, Dry Run, 재시도, 취소 이벤트를 감사 추적합니다." />
-      <div className="order-ledger-list">
-        {orders.length === 0 ? (
-          <EmptyRow text="아직 주문 이벤트가 없습니다. 테스트 주문 게이트를 누르면 차단 이벤트가 생성됩니다." />
-        ) : (
-          orders.map((order) => (
-            <div {...semanticSurfaceProps(statusTone(order.state), "order-ledger-row")} key={order.order_id}>
-              <div className="order-ledger-head">
-                <div>
-                  <strong>{order.order_id}</strong>
-                  <span>{order.time} · {order.strategy_id}</span>
-                </div>
-                <StatusPill tone={statusTone(order.state)}>{order.state}</StatusPill>
-              </div>
-              <div className="order-ledger-meta" data-ts-semantic-preserve="true">
-                <span>{order.symbol}</span>
-                <span className="side-buy">{order.side}</span>
-                <span>큐 {order.queue_state}</span>
-                <span>시도 {order.attempts}/{order.max_attempts}</span>
-                <span>다음 {order.next_retry_at}</span>
-              </div>
-              <div className="order-ledger-foot">
-                <em>{order.reason}</em>
-                <div className="order-actions">
-                  <IconButton
-                    className="mini-icon-button"
-                    title="재시도"
-                    aria-label={`${order.order_id} 재시도`}
-                    disabled={!order.retryable}
-                    onClick={() => onRetryOrder(order.order_id)}
-                  >
-                    <RotateCcw size={13} />
-                  </IconButton>
-                  <IconButton
-                    className="mini-icon-button"
-                    title="취소"
-                    aria-label={`${order.order_id} 취소`}
-                    disabled={order.state === "canceled"}
-                    onClick={() => onCancelOrder(order.order_id)}
-                  >
-                    <CircleStop size={13} />
-                  </IconButton>
-                </div>
-              </div>
-            </div>
-          ))
-        )}
-      </div>
-    </section>
-  );
-}
-
-function PositionPanel({ positions }) {
-  return (
-    <section className="panel position-panel">
-      <PanelHeader title="포지션 대조" subtitle="프로그램 포지션과 브로커 계좌 포지션 비교가 필요합니다." />
-      <div className="position-list">
-        {positions.map((position) => (
-          <div {...semanticSurfaceProps(statusTone(position.status), "position-row")} key={position.symbol}>
-            <WalletCards size={16} />
-            <div>
-              <strong>{position.symbol}</strong>
-              <span>{position.asset} · {position.broker_name}</span>
-            </div>
-            <em>{position.program_qty} / {position.broker_qty} · Δ {position.delta_qty}</em>
-            <StatusPill tone={statusTone(position.status)}>{position.status_label}</StatusPill>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
 }
 
 function AuditPanel({

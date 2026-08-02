@@ -791,8 +791,6 @@ button {
 
 .check-list,
 .broker-list,
-.position-list,
-.account-list,
 .audit-list,
 .checklist-list,
 .settings-list {
@@ -1013,10 +1011,6 @@ button {
 
 .live-prep-shell > .content-grid {
   overflow: visible;
-}
-
-.live-prep-shell .strategy-panel {
-  overflow: hidden;
 }
 
 .internal-tabs {
@@ -1559,19 +1553,6 @@ button {
   gap: 6px;
   overflow-x: auto;
   padding-bottom: 1px;
-}
-
-.table-head,
-.table-row {
-  display: grid;
-  align-items: center;
-  gap: 8px;
-  min-width: 840px;
-}
-
-.strategy-table .table-head,
-.strategy-table .table-row {
-  grid-template-columns: minmax(190px, 1.25fr) 110px 92px 62px minmax(200px, 1fr) 112px 92px minmax(240px, 1.3fr);
 }
 
 .automation-actions {
@@ -2345,147 +2326,6 @@ button {
   border-color: var(--border);
 }
 
-.order-table .table-head,
-.order-table .table-row {
-  grid-template-columns: 66px 132px minmax(160px, 1fr) 96px 56px 112px 76px 58px 64px minmax(280px, 1.3fr) 74px;
-  min-width: 1240px;
-}
-
-.table-head {
-  padding: 0 10px 4px;
-  color: var(--text-muted);
-  font-size: var(--font-size-caption);
-  font-weight: var(--font-weight-strong);
-}
-
-.table-row {
-  min-height: 48px;
-  padding: 0 10px;
-  background: var(--panel-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  font-size: var(--font-size-small);
-}
-
-.strategy-table .table-row {
-  cursor: pointer;
-}
-
-.strategy-table .table-row:hover,
-.strategy-table .table-row.selected {
-  border-color: color-mix(in srgb, var(--primary) 58%, var(--border));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 18%, transparent);
-}
-
-.strategy-table .table-row:focus-visible {
-  outline: 3px solid color-mix(in srgb, var(--primary) 28%, transparent);
-  outline-offset: 2px;
-}
-
-.table-row strong,
-.table-row span,
-.table-row em {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.table-row strong {
-  color: var(--text);
-  font-weight: var(--font-weight-bold);
-}
-
-.table-row span {
-  color: var(--text-soft);
-}
-
-.table-row em {
-  color: var(--text-muted);
-  font-style: normal;
-}
-
-.side-buy {
-  color: var(--success-text) !important;
-  font-weight: var(--font-weight-strong);
-}
-
-.order-ledger-list {
-  display: grid;
-  gap: 8px;
-}
-
-.order-ledger-row {
-  display: grid;
-  gap: 8px;
-  min-width: 0;
-  padding: 10px;
-  background: var(--panel-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-}
-
-.order-ledger-head,
-.order-ledger-foot {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-}
-
-.order-ledger-head strong,
-.order-ledger-head span {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.order-ledger-head strong {
-  color: var(--text);
-  font-size: 13px;
-  font-weight: var(--font-weight-bold);
-}
-
-.order-ledger-head span {
-  margin-top: 2px;
-  color: var(--text-muted);
-  font-size: var(--font-size-small);
-}
-
-.order-ledger-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.order-ledger-meta span {
-  display: inline-grid;
-  place-items: center;
-  min-height: 24px;
-  padding: 0 8px;
-  color: var(--text-soft);
-  background: var(--panel-strong);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-pill);
-  font-size: var(--font-size-caption);
-  font-weight: var(--font-weight-bold);
-}
-
-.order-ledger-foot em {
-  overflow: hidden;
-  color: var(--text-muted);
-  font-size: var(--font-size-small);
-  font-style: normal;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.order-actions {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-
 .empty-row {
   display: flex;
   align-items: center;
@@ -2497,53 +2337,6 @@ button {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   font-size: var(--font-size-small);
-}
-
-.position-row,
-.account-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 9px;
-  min-height: 48px;
-  padding: 8px 10px;
-  background: var(--panel-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-}
-
-.position-row svg,
-.account-row svg {
-  color: var(--icon-blue);
-}
-
-.position-row strong,
-.position-row span,
-.account-row strong,
-.account-row span {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.position-row strong,
-.account-row strong {
-  font-size: 13px;
-}
-
-.position-row span,
-.position-row em,
-.account-row span,
-.account-row em {
-  color: var(--text-muted);
-  font-size: var(--font-size-small);
-}
-
-.position-row em,
-.account-row em {
-  font-style: normal;
-  font-weight: var(--font-weight-bold);
 }
 
 .launch-lock {
@@ -3856,9 +3649,6 @@ body {
 .wizard-card,
 .capability-item,
 .workflow-step,
-.account-row,
-.position-row,
-.order-ledger-row,
 .env-check {
   border-radius: 7px;
 }
@@ -4437,7 +4227,6 @@ body {
 :root[data-ui-theme='light'] .panel strong,
 :root[data-ui-theme='light'] .compact-row strong,
 :root[data-ui-theme='light'] .status-row strong,
-:root[data-ui-theme='light'] .table-row strong,
 :root[data-ui-theme='light'] .summary-grid strong,
 :root[data-ui-theme='light'] .metric-card strong,
 :root[data-ui-theme='light'] .queue-card strong {
@@ -4448,7 +4237,6 @@ body {
 :root[data-ui-theme='light'] .panel span,
 :root[data-ui-theme='light'] .compact-row span,
 :root[data-ui-theme='light'] .status-row span,
-:root[data-ui-theme='light'] .table-row span,
 :root[data-ui-theme='light'] .metric-card span,
 :root[data-ui-theme='light'] .queue-card span {
   color: #26364f;
@@ -4838,18 +4626,6 @@ body {
   .env-check-grid,
   .capability-grid {
     grid-template-columns: 1fr;
-  }
-
-  .position-row,
-  .account-row {
-    grid-template-columns: auto minmax(0, 1fr);
-  }
-
-  .position-row em,
-  .account-row em,
-  .position-row .status-pill,
-  .account-row .status-pill {
-    grid-column: 2;
   }
 
   .operations-trace-list article {
@@ -6271,13 +6047,10 @@ body {
 
 .check-list,
 .broker-list,
-.position-list,
-.account-list,
 .audit-list,
 .checklist-list,
 .settings-list,
 .compact-list,
-.order-ledger-list,
 .promotion-readiness-list {
   gap: 6px;
 }
@@ -6287,8 +6060,7 @@ body {
 .wizard-step,
 .checklist-row,
 .setting-row,
-.capability-item,
-.order-ledger-row {
+.capability-item {
   min-height: 38px;
   padding: 6px 8px;
 }
@@ -6495,49 +6267,6 @@ body {
   padding: 5px 7px;
 }
 
-/* Settings: appearance and Telegram share a row; the credential assistant
-   keeps the full row because secret fields need label/input/status space. */
-.settings-content-grid > .content-column:first-child {
-  grid-template-areas:
-    "appearance appearance"
-    "telegram telegram"
-    "assistant assistant";
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: start;
-}
-
-.settings-content-grid > .content-column:last-child {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: start;
-}
-
-.settings-content-grid :is(.credential-protection-panel, .doctor-history-panel) {
-  grid-column: 1 / -1;
-}
-
-.settings-content-grid .credential-status-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.settings-content-grid .credential-status-grid :is(span, strong, small) {
-  overflow: visible;
-  overflow-wrap: anywhere;
-  text-overflow: clip;
-  white-space: normal;
-}
-
-.settings-content-grid .appearance-panel {
-  grid-area: appearance;
-}
-
-.settings-content-grid .telegram-settings-panel {
-  grid-area: telegram;
-}
-
-.settings-content-grid .live-connection-assistant-panel {
-  grid-area: assistant;
-}
-
 .telegram-settings-panel .telegram-connection-status {
   margin: 0;
 }
@@ -6695,20 +6424,6 @@ body {
 
   .promotion-readiness-action {
     grid-column: 1 / 3;
-  }
-}
-
-@media (max-width: 1199px) {
-  .settings-content-grid > .content-column:first-child {
-    grid-template-areas:
-      "appearance"
-      "telegram"
-      "assistant";
-  }
-
-  .settings-content-grid > .content-column:first-child,
-  .settings-content-grid > .content-column:last-child {
-    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -8015,5 +7730,110 @@ body {
 @media (max-width: 760px) {
   .deployment-manifest-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Major-page alignment ----------------------------------------------------
+ * The shared layout primitives establish one spacing rhythm across the
+ * desktop apps. Live-owned rules only describe which operational panels span
+ * both columns and how long tabular surfaces scroll inside their card. */
+:root[data-program="live-trader"] {
+  --ts-layout-gap: 8px;
+  --ts-panel-grid-gap: 8px;
+}
+
+.automation-page-layout,
+.risk-page-layout,
+.settings-page-layout,
+.settings-summary-grid {
+  min-width: 0;
+  align-content: start;
+}
+
+.automation-page-layout > .panel,
+.risk-page-layout > .panel,
+.settings-summary-grid > .panel {
+  height: 100%;
+}
+
+.live-grid-full {
+  grid-column: 1 / -1;
+}
+
+.page-view .table-scroll {
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.retry-matrix-panel .ts-scroll-panel {
+  --ts-scroll-panel-height: min(44vh, 420px);
+}
+
+/* Single-screen operating surfaces ---------------------------------------
+ * Keep the deployment identity and safety scope visible while long status
+ * collections scroll inside their own region. This avoids a second page-level
+ * scrollbar without removing any operator control or diagnostic detail. */
+.overview-view,
+.gate-view {
+  grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.operations-overview-layout {
+  grid-template-rows: auto auto minmax(0, 1fr);
+  height: 100%;
+  overflow: hidden;
+}
+
+.operations-overview-grid {
+  --ts-scroll-panel-height: none;
+  align-items: stretch;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.operations-overview-grid > .ts-scroll-panel {
+  max-height: none;
+  padding-right: 3px;
+}
+
+.deployment-promotion-layout {
+  grid-template-rows: auto auto minmax(0, 1fr);
+  height: 100%;
+  overflow: hidden;
+}
+
+.deployment-promotion-layout > .live-prep-shell {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.deployment-promotion-layout > .live-prep-shell > .ts-scroll-panel {
+  --ts-scroll-panel-height: none;
+  max-height: none;
+  padding-right: 3px;
+}
+
+@media (max-width: 760px) {
+  .live-grid-full {
+    grid-column: auto;
+  }
+
+  .overview-view,
+  .gate-view,
+  .operations-overview-layout,
+  .deployment-promotion-layout,
+  .deployment-promotion-layout > .live-prep-shell {
+    height: auto;
+    overflow: visible;
+  }
+
+  .operations-overview-grid,
+  .operations-overview-grid > .ts-scroll-panel,
+  .deployment-promotion-layout > .live-prep-shell > .ts-scroll-panel {
+    max-height: none;
+    overflow: visible;
   }
 }
