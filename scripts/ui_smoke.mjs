@@ -22,6 +22,18 @@ const tabs = [
 const expectedNavigationLabels = tabs.map((tab) => tab.label);
 const issues = [];
 const views = [];
+
+async function nonUniformCardBorders(locator) {
+  return locator.evaluateAll((nodes) => nodes.flatMap((node) => {
+    const style = window.getComputedStyle(node);
+    const widths = [style.borderTopWidth, style.borderRightWidth, style.borderBottomWidth, style.borderLeftWidth];
+    const colors = [style.borderTopColor, style.borderRightColor, style.borderBottomColor, style.borderLeftColor];
+    return new Set(widths).size === 1 && new Set(colors).size === 1
+      ? []
+      : [{ className: node.className, widths, colors }];
+  }));
+}
+
 const browser = await chromium.launch(chromePath
   ? { headless: true, executablePath: chromePath }
   : { channel: "msedge", headless: true });
@@ -128,6 +140,31 @@ try {
       for (const heading of tab.requiredHeadings) {
         if (!await page.getByRole("heading", { name: heading, exact: true }).count()) {
           issues.push(`${viewport.name}/${tab.label}: required section '${heading}' is missing`);
+        }
+      }
+
+      if (tab.label === "배포·승급") {
+        const deploymentSelect = environmentBar.locator("select");
+        const observedDeployments = [];
+        for (let index = 0; index < 6; index += 1) {
+          observedDeployments.push(await deploymentSelect.inputValue());
+          await page.waitForTimeout(80);
+        }
+        if (new Set(observedDeployments).size > 1) {
+          issues.push(`${viewport.name}/${tab.label}: current Deployment changed without operator input (${observedDeployments.join(" -> ")})`);
+        }
+        const borderMismatches = await nonUniformCardBorders(page.locator(
+          ".portfolio-artifact-item[data-tone], .promotion-readiness-row[data-tone]",
+        ));
+        if (borderMismatches.length) {
+          issues.push(`${viewport.name}/${tab.label}: status cards still use a colored side border (${JSON.stringify(borderMismatches.slice(0, 3))})`);
+        }
+      }
+
+      if (tab.label === "사고·감사") {
+        const borderMismatches = await nonUniformCardBorders(page.locator(".incident-row"));
+        if (borderMismatches.length) {
+          issues.push(`${viewport.name}/${tab.label}: incident cards still use a colored side border (${JSON.stringify(borderMismatches.slice(0, 3))})`);
         }
       }
 

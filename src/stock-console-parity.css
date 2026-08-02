@@ -219,3 +219,15 @@
     top: auto;
   }
 }
+
+/* Stock/Backtester parity: operational meaning belongs to the badge/content,
+ * while repeated cards use the same quiet, four-sided border. */
+:root[data-program="live-trader"] body :is(
+  .incident-row,
+  .portfolio-artifact-item.ts-semantic-surface[data-tone],
+  .promotion-readiness-row.ts-semantic-surface[data-tone]
+) {
+  background: var(--panel-raised) !important;
+  border: 1px solid var(--border) !important;
+  box-shadow: none;
+}

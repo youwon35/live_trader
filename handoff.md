@@ -1152,3 +1152,13 @@ API 없이 실제 실행한 기능:
 - Python 전체 회귀 387개, 계좌·시각화·polling·API 복원력·Futures Risk 프런트엔드 회귀, Workspace model 테스트와 production build가 통과했다. 9개 화면을 100%, 125%, 150%, compact desktop의 36개 조합으로 검사해 문서/작업영역 overflow, 화면 밖 조작 버튼, 콘솔 오류가 모두 0이었다.
 - 최신 `release\LiveTrader.exe`는 `--help` 안전 기동이 종료 코드 0으로 통과했다. 크기는 19,924,832 bytes이며 SHA-256은 `396895A11EE8954C3EE9CD760AAA0FCFB223C0B9BF7A3590DEB4009D04A1F110`이다.
 - 이번 단계에서 물리적으로 분리된 Windows Trading Engine/Risk Gateway/Watchdog 서비스, 원격 읽기 전용 Dashboard와 TOTP, 자동 자본 확대·Rollback, 실자금 장애 Drill, Broker 간 통화 정규화 성과 보고서는 만들지 않았다. 각각 별도 서비스 배포·외부 인증·실자금 승인·완전한 통합 원장 정책이 먼저 필요한 기능이며, 현재 데스크톱 앱에는 동일 목적의 논리적 Risk/Watchdog/감사 경계를 유지했다.
+
+## 2026-08-03 상태 카드 외곽선 통일과 Deployment 선택 안정화
+
+- 사고·감사 화면의 사고 카드와 배포·승급 화면의 Portfolio Artifact·승급 준비 카드는 색상 왼쪽 띠를 제거했다. Stock Data Scraper와 Backtester의 일반 카드처럼 회색 1px 사방 외곽선과 중립 배경을 사용하고, 위험 의미는 카드 안의 상태 배지와 문구가 담당한다.
+- 배포·승급 화면에서 현재 Deployment가 Portfolio와 단일 Strategy 사이를 계속 왕복한 원인은 전역 `selectedStrategyId`와 패널 내부 `assetTab`을 동기화하는 두 effect가 서로 상대 선택을 덮어쓰던 순환이었다.
+- 현재 Deployment를 controlled source of truth로 고정했다. 자산 탭은 목록 탐색만 바꾸며, 운용자가 Deployment select나 전략 행을 명시적으로 고를 때만 실제 Deployment가 바뀐다. controlled 선택을 찾을 수 없을 때 임의의 첫 전략으로 되돌리는 동작도 차단했다.
+- `scripts/ui_smoke.mjs`에 운용자 입력 없는 Deployment 6회 연속 표본의 불변성 검사와 사고·Artifact·승급 카드의 계산된 사방 테두리 일치 검사를 추가했다. 레이아웃 스모크는 현재 버튼명인 `레이아웃 편집`을 사용하도록 갱신했다.
+- Vite production build, workspace model·polling·계좌·계좌 시각화·API 복원력·Futures Risk·레이아웃 회귀와 4개 화면 크기 × 9개 탭 UI smoke 36/36을 통과했다. 실제 브라우저에서도 Deployment 12회 표본이 한 값으로 유지되고 대상 카드의 네 변이 모두 동일한 회색 1px임을 확인했다.
+- PyInstaller로 `release\LiveTrader.exe`를 재생성했다. 파일 크기는 19,929,242 bytes, SHA-256은 `2CD7FBDC889C844E4978962DEADC30C1636D13EDEB659A7A737CDDCD415F971E`이다.
+- 새 unsigned one-file의 최초 기동이 `_MEI` 추출 전 한 차례 지연됐지만 이후 `--help`는 약 2.6초에 exit 0으로 종료했다. 격리된 APPDATA에서 실주문·Telegram을 끄고 최신 EXE를 실행해 18795 API와 `/api/snapshot`의 `MONITOR`, `real-orders=false`, `Telegram=false`를 확인했으며, 이 실제 패키지를 대상으로 한 UI smoke도 36/36을 통과했다. 별도 새 one-file의 최초 기동은 5.06초에 정상 종료해 재현 가능한 소스·패키징 결함은 확인되지 않았고, 최초 지연은 Windows의 새 unsigned 파일 검사 가능성이 높은 환경성 현상으로 기록했다.

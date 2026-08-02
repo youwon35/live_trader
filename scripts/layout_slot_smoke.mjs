@@ -24,7 +24,7 @@ try {
   });
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: /^설정·진단/ }).click();
-  await page.getByRole("button", { name: "편집 모드", exact: true }).click();
+  await page.getByRole("button", { name: "레이아웃 편집", exact: true }).click();
   await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "edit");
   await page.getByRole("button", { name: /^리스크·안전/ }).click();
   await page.locator(".operational-safeguards-panel").waitFor({ state: "visible" });
