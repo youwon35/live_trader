@@ -331,6 +331,7 @@ const PANEL_POSITION_STORAGE_KEY = "live-trader.panelPositions.v1";
 const LAYOUT_MODE_STORAGE_KEY = "live-trader.layoutMode.v1";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "live-trader.sidebarCollapsed.v1";
 const APPEARANCE_STORAGE_KEY = "live-trader.appearance.v1";
+const STOCK_ACCENT_BASELINE_STORAGE_KEY = "live-trader.stockAccentBaseline.v1";
 const NOTIFICATION_ACK_STORAGE_KEY = "live-trader.notifications.ack.v1";
 const LEGACY_THEME_STORAGE_KEY = "live-trader.ui-theme.v1";
 const STRATEGY_SAVED_SEARCHES_KEY = "live-trader.strategySavedSearches.v1";
@@ -353,6 +354,7 @@ const DEFAULT_STRATEGY_DISCOVERY_FILTERS = {
   sort: "updated-desc",
 };
 const MIN_LIVE_CANARY_FILLS = 3;
+const EMPTY_FUTURES_PANEL_SNAPSHOT = Object.freeze({});
 
 function liveStrategyBarSchedule(strategy, fallbackProvider = "") {
   if (!strategy) return null;
@@ -463,7 +465,7 @@ function collectUiSettings() {
 
 function persistUiSettings(partial = {}) {
   const payload = { ...collectUiSettings(), ...partial };
-  saveUiSettings(payload).catch(() => {});
+  return saveUiSettings(payload).catch(() => null);
 }
 
 const accentPalettes = Object.fromEntries(
@@ -477,6 +479,7 @@ const accentPalettes = Object.fromEntries(
 );
 const fallbackAccentId = designTokens.accent?.default ?? "blue";
 const fallbackAccentSwatch = accentPalettes[fallbackAccentId]?.swatch ?? "#2f80ed";
+const STOCK_CURRENT_ACCENT = "#8fa7c1";
 
 function normalizeHexColor(value, fallback = fallbackAccentSwatch) {
   const text = String(value || "").trim();
@@ -547,9 +550,25 @@ const appearanceThemeOptions = [
 
 const defaultAppearance = {
   theme: "dark",
-  accent: fallbackAccentId,
-  customAccent: fallbackAccentSwatch,
+  accent: "custom",
+  customAccent: STOCK_CURRENT_ACCENT,
 };
+
+function stockAccentBaselinePending() {
+  try {
+    return window.localStorage.getItem(STOCK_ACCENT_BASELINE_STORAGE_KEY) !== "applied";
+  } catch {
+    return true;
+  }
+}
+
+function markStockAccentBaselineApplied() {
+  try {
+    window.localStorage.setItem(STOCK_ACCENT_BASELINE_STORAGE_KEY, "applied");
+  } catch {
+    // Storage-restricted runtimes still receive the baseline for this session.
+  }
+}
 
 function readStoredMap(key) {
   try {
@@ -653,8 +672,17 @@ function applyAccentContrast(root, appearance) {
 function readAppearance() {
   try {
     const raw = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
-    if (raw) return normalizeAppearance(JSON.parse(raw));
-    return normalizeAppearance({ theme: window.localStorage.getItem(LEGACY_THEME_STORAGE_KEY) });
+    const storedAppearance = raw
+      ? JSON.parse(raw)
+      : { theme: window.localStorage.getItem(LEGACY_THEME_STORAGE_KEY) };
+    if (stockAccentBaselinePending()) {
+      return normalizeAppearance({
+        ...storedAppearance,
+        accent: "custom",
+        customAccent: STOCK_CURRENT_ACCENT,
+      });
+    }
+    return normalizeAppearance(storedAppearance);
   } catch {
     return defaultAppearance;
   }
@@ -1580,8 +1608,19 @@ function App() {
     getUiSettings()
       .then((result) => {
         if (cancelled || !result?.settings) return;
+        const applyStockAccentBaseline = stockAccentBaselinePending();
         restoreUiSettings(result.settings);
-        const restoredAppearance = result.settings.appearance ? applyAppearance(result.settings.appearance) : readAppearance();
+        const savedAppearance = result.settings.appearance ?? readAppearance();
+        const restoredAppearance = applyAppearance(
+          applyStockAccentBaseline
+            ? { ...savedAppearance, accent: "custom", customAccent: STOCK_CURRENT_ACCENT }
+            : savedAppearance,
+        );
+        if (applyStockAccentBaseline) {
+          persistUiSettings({ appearance: restoredAppearance }).then((saved) => {
+            if (saved) markStockAccentBaselineApplied();
+          });
+        }
         setAppearance(restoredAppearance);
         setLayoutMode(readLayoutMode());
         setSidebarCollapsed(readSidebarCollapsed());
@@ -1652,6 +1691,7 @@ function App() {
   function updateAppearance(partial) {
     setAppearance((current) => {
       const next = applyAppearance({ ...current, ...partial });
+      markStockAccentBaselineApplied();
       persistUiSettings({ appearance: next });
       return next;
     });
@@ -3284,7 +3324,7 @@ function futuresDeploymentSymbol(value) {
   return /^[A-Z0-9]{3,18}USDT$/.test(normalized) ? normalized : "";
 }
 
-function FuturesSettingsPanel({ snapshot = {}, selectedSymbol = "" }) {
+function FuturesSettingsPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selectedSymbol = "" }) {
   const [view, setView] = useState(snapshot || {});
   const [symbol, setSymbol] = useState(() => futuresDeploymentSymbol(selectedSymbol) || "ETHUSDT");
   const [leverage, setLeverage] = useState(1);
@@ -3452,7 +3492,7 @@ function FuturesSettingsPanel({ snapshot = {}, selectedSymbol = "" }) {
   );
 }
 
-function FuturesFillSoakPanel({ snapshot = {}, selectedSymbol = "" }) {
+function FuturesFillSoakPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selectedSymbol = "" }) {
   const [view, setView] = useState(snapshot || {});
   const [authorizationToken, setAuthorizationToken] = useState("");
   const [busy, setBusy] = useState("");
@@ -6570,13 +6610,14 @@ function inferLogChannel(item) {
 function StatusRow({ label, status, detail, value }) {
   const tone = statusTone(status);
   const statusLabel = status === "pass" ? "통과" : status === "warn" ? "주의" : status === "fail" ? "조치" : status === "na" ? "해당 없음" : status;
+  const pillLabel = status === "pass" ? "pass" : status === "warn" ? "warn" : status === "fail" ? "fail" : status === "na" ? "wait" : status;
   return (
     <SharedStatusRow
       className={`status-row ${status}`}
       tone={tone}
       title={label}
       detail={value ? `${value} · ${detail}` : detail}
-      badge={<span className="status-row-state">{statusLabel}</span>}
+      badge={<StatusPill aria-label={`상태: ${statusLabel}`} tone={tone}>{pillLabel}</StatusPill>}
     />
   );
 }

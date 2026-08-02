@@ -16,6 +16,21 @@
   --ts-console-panel-header-height: 39px;
 }
 
+/* Stock Data Scraper keeps the application shell softly tinted and the
+ * readable content surfaces white. Semantic color belongs to pills. */
+:root[data-ui-theme="light"][data-program="live-trader"] {
+  --status-card-success-background: var(--panel-raised);
+  --status-card-warning-background: var(--panel-raised);
+  --status-card-danger-background: var(--panel-raised);
+  --status-card-info-background: var(--panel-raised);
+  --status-card-neutral-background: var(--panel-raised);
+  --status-card-success-border: var(--border);
+  --status-card-warning-border: var(--border);
+  --status-card-danger-border: var(--border);
+  --status-card-info-border: var(--border);
+  --status-card-neutral-border: var(--border);
+}
+
 :root[data-program="live-trader"] body {
   font-size: var(--ts-console-body-size);
 }
@@ -230,4 +245,49 @@
   background: var(--panel-raised) !important;
   border: 1px solid var(--border) !important;
   box-shadow: none;
+}
+
+/* A few legacy rows predate the shared semantic-surface contract. Keep
+ * their parent card quiet while retaining the colored status pill inside. */
+:root[data-ui-theme="light"][data-program="live-trader"] body :is(
+  .capability-item.pass,
+  .capability-item.warn,
+  .capability-item.warning,
+  .capability-item.fail,
+  .env-check.present,
+  .env-check.missing,
+  .checklist-row.checked,
+  .strategy-lifecycle-timeline article.done,
+  .strategy-lifecycle-timeline article.retired,
+  .promotion-checklist article.success,
+  .promotion-checklist article.warning,
+  .promotion-checklist article.info,
+  .promotion-checklist article.danger,
+  .account-visual-summary > div.is-warning,
+  .telegram-connection-status.status-connected,
+  .telegram-connection-status.status-error,
+  .telegram-connection-status.status-not_configured
+) {
+  color: var(--text) !important;
+  background: var(--panel-raised) !important;
+  border-color: var(--border) !important;
+  box-shadow: none;
+}
+
+:root[data-ui-theme="light"][data-program="live-trader"] body :is(
+  .capability-item.pass,
+  .capability-item.warn,
+  .capability-item.warning,
+  .capability-item.fail
+) strong {
+  color: var(--text) !important;
+}
+
+:root[data-ui-theme="light"][data-program="live-trader"] body :is(
+  .capability-item.pass,
+  .capability-item.warn,
+  .capability-item.warning,
+  .capability-item.fail
+) span {
+  color: var(--text-muted) !important;
 }
