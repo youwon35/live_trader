@@ -6119,6 +6119,7 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
 
 
 RESUME_PAPER_MINIMUM_OBSERVATION_DAYS = 30
+RESUME_PAPER_MINIMUM_OBSERVATION_SECONDS = 30 * 24 * 60 * 60
 RESUME_PAPER_MINIMUM_REGIME_COUNT = 2
 RESUME_PAPER_MINIMUM_ORDER_COUNT = 5
 RESUME_REPROMOTION_REASON = "resume-current-paper-live-forward-repromotion-required"
@@ -6274,6 +6275,9 @@ def paper_live_forward_resume_assessment(
         blockers.append("paper-live-forward-source-missing")
 
     observed_days = _resume_evidence_number(metrics.get("forwardObservedDays"))
+    observed_seconds = _resume_evidence_number(
+        metrics.get("forwardElapsedSeconds")
+    )
     regime_count = _resume_evidence_number(metrics.get("forwardRegimeCount"))
     order_count = _resume_evidence_number(
         metrics.get("paperOrderCount"),
@@ -6283,6 +6287,11 @@ def paper_live_forward_resume_assessment(
         blockers.append(
             f"paper-observation-days:{max(0, observed_days)}/"
             f"{RESUME_PAPER_MINIMUM_OBSERVATION_DAYS}"
+        )
+    if observed_seconds < RESUME_PAPER_MINIMUM_OBSERVATION_SECONDS:
+        blockers.append(
+            f"paper-observation-seconds:{max(0, observed_seconds)}/"
+            f"{RESUME_PAPER_MINIMUM_OBSERVATION_SECONDS}"
         )
     if regime_count < RESUME_PAPER_MINIMUM_REGIME_COUNT:
         blockers.append(
@@ -6409,6 +6418,7 @@ def paper_live_forward_resume_assessment(
         "portfolioId": current_portfolio_id,
         "portfolioHash": current_portfolio_hash,
         "observedDays": max(0, observed_days),
+        "observedSeconds": max(0, observed_seconds),
         "regimeCount": max(0, regime_count),
         "orderCount": max(0, order_count),
     }

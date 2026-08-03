@@ -110,6 +110,7 @@ class OrderGateTest(unittest.TestCase):
         *,
         evidence_id: str = "paper-resume-current",
         observed_days: int = 30,
+        observed_seconds: int = 30 * 24 * 60 * 60,
         regime_count: int = 2,
         recovery_verified: bool = True,
         reconciliation_mismatches: int = 0,
@@ -130,6 +131,7 @@ class OrderGateTest(unittest.TestCase):
             metrics={
                 "paperOrderCount": 5,
                 "forwardObservedDays": observed_days,
+                "forwardElapsedSeconds": observed_seconds,
                 "forwardRegimeCount": regime_count,
                 "recoveryVerified": recovery_verified,
                 "reconciliationMismatches": reconciliation_mismatches,
@@ -1343,6 +1345,26 @@ class OrderGateTest(unittest.TestCase):
         self.assertFalse(deployment["permissions"]["live_small_eligible"])
         self.assertIn(
             "paper-evidence-artifact-hash-mismatch",
+            deployment["permissions"]["resumeEvidence"]["blockers"],
+        )
+
+    def test_before_live_small_resume_requires_thirty_full_elapsed_days(self) -> None:
+        artifact = self.resume_artifact("RESUME-SHORT-DURATION")
+
+        _pause, resume, deployment = self.run_resume_scenario(
+            artifact,
+            evidence_artifact=artifact,
+            evidence_options={
+                "observed_days": 30,
+                "observed_seconds": 29 * 24 * 60 * 60,
+            },
+        )
+
+        self.assertTrue(resume["ok"], resume["reason"])
+        self.assertEqual("papered", deployment["lifecycle"])
+        self.assertFalse(deployment["permissions"]["live_small_eligible"])
+        self.assertIn(
+            "paper-observation-seconds:2505600/2592000",
             deployment["permissions"]["resumeEvidence"]["blockers"],
         )
 
