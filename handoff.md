@@ -1162,3 +1162,10 @@ API 없이 실제 실행한 기능:
 - Vite production build, workspace model·polling·계좌·계좌 시각화·API 복원력·Futures Risk·레이아웃 회귀와 4개 화면 크기 × 9개 탭 UI smoke 36/36을 통과했다. 실제 브라우저에서도 Deployment 12회 표본이 한 값으로 유지되고 대상 카드의 네 변이 모두 동일한 회색 1px임을 확인했다.
 - PyInstaller로 `release\LiveTrader.exe`를 재생성했다. 파일 크기는 19,929,242 bytes, SHA-256은 `2CD7FBDC889C844E4978962DEADC30C1636D13EDEB659A7A737CDDCD415F971E`이다.
 - 새 unsigned one-file의 최초 기동이 `_MEI` 추출 전 한 차례 지연됐지만 이후 `--help`는 약 2.6초에 exit 0으로 종료했다. 격리된 APPDATA에서 실주문·Telegram을 끄고 최신 EXE를 실행해 18795 API와 `/api/snapshot`의 `MONITOR`, `real-orders=false`, `Telegram=false`를 확인했으며, 이 실제 패키지를 대상으로 한 UI smoke도 36/36을 통과했다. 별도 새 one-file의 최초 기동은 5.06초에 정상 종료해 재현 가능한 소스·패키징 결함은 확인되지 않았고, 최초 지연은 Windows의 새 unsigned 파일 검사 가능성이 높은 환경성 현상으로 기록했다.
+
+## 2026-08-04 Live 승급의 수동 승인 경계 강화
+
+- canary 체결 수가 자동 승급 기준을 만족해도 `automatic_live_promotion_sweep()`은 더 이상 `before-live-small → live` lifecycle을 변경하지 않는다. 판정과 봉인된 evidence는 남기되 `operator-confirmed-manual-promotion-required`로 정지하며, 자동 `PAUSE` 안전 동작은 유지한다.
+- 장시간 살아 있는 Runtime Session도 실제 브로커 side effect 직전에 preflight TTL을 다시 검사한다. 시작 당시 승인만으로 만료 뒤 주문을 허용하지 않는다.
+- Live 재개가 인정하는 Paper 확정봉 evidence policy를 v2로 올렸고 legacy v1은 `paper-live-forward-source-missing`으로 fail-closed한다.
+- 집중 회귀 11개와 Live Trader 전체 Python unittest 398개가 모두 통과했다. SMALL/FULL 전환, dry-run 해제, 운용자 승인, 실제 주문·취소는 호출하지 않았다.

@@ -345,7 +345,7 @@ class RuntimeContextBindingTest(unittest.TestCase):
                         "reasons": [],
                         "session": {"deploymentManifestHash": "manifest-1"},
                     },
-                ),
+                ) as authorize,
                 patch.object(
                     state.OPERATIONAL_GOVERNANCE,
                     "get_deployment_manifest_by_hash",
@@ -397,6 +397,13 @@ class RuntimeContextBindingTest(unittest.TestCase):
         self.assertEqual(
             "operational-cross-broker-portfolio-blocked",
             mixed_route[1],
+        )
+        self.assertEqual(3, authorize.call_count)
+        self.assertTrue(
+            all(
+                call.kwargs.get("require_fresh_preflight") is True
+                for call in authorize.call_args_list
+            )
         )
 
 

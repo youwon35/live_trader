@@ -6270,7 +6270,7 @@ def paper_live_forward_resume_assessment(
     )
     if (
         str(evidence_policy.get("promotionSource") or "")
-        != "continuous-live-forward-closed-bar-v1"
+        != "continuous-live-forward-closed-bar-v2"
     ):
         blockers.append("paper-live-forward-source-missing")
 
@@ -7540,10 +7540,13 @@ def automatic_live_promotion_sweep(*, fresh_broker_ids: set[str] | None = None) 
             "freshBrokerTruth": strategy_broker_id(strategy) in fresh_brokers,
         }
         may_mutate = bool(item["freshBrokerTruth"])
-        if decision.action == "PROMOTE" and may_mutate:
-            promotion = promote_strategy_to_live(strategy_id)
-            item["promoted"] = bool(promotion.get("ok"))
-            item["reason"] = str(promotion.get("reason") or "")
+        if decision.action == "PROMOTE":
+            # Automatic evaluation may prove that a canary has enough evidence,
+            # but it must never mutate a strategy into FULL LIVE.  Promotion is
+            # an exposure-increasing operator decision and therefore remains on
+            # the explicit, freshly preflighted manual path.
+            item["promoted"] = False
+            item["reason"] = "operator-confirmed-manual-promotion-required"
         elif decision.action == "PAUSE" and may_mutate:
             pause = set_strategy_lifecycle_status(strategy_id, "pause")
             item["paused"] = bool(pause.get("ok"))
@@ -12818,7 +12821,10 @@ def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str
     try:
         authorization = OPERATIONAL_GOVERNANCE.runtime_authorization(
             session_id,
-            require_fresh_preflight=False,
+            # A runtime may stay alive longer than its launch preflight TTL.
+            # Revalidate freshness again at every broker side-effect edge so
+            # an expired launch approval cannot authorize a later order.
+            require_fresh_preflight=True,
         )
         if authorization.get("allowed") is not True:
             return (

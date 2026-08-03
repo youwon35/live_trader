@@ -115,6 +115,7 @@ class OrderGateTest(unittest.TestCase):
         recovery_verified: bool = True,
         reconciliation_mismatches: int = 0,
         ended_at: str = "2026-07-25T00:00:00+00:00",
+        promotion_source: str = "continuous-live-forward-closed-bar-v2",
     ) -> None:
         evidence = build_paper_portfolio_evidence(
             evidence_id=evidence_id,
@@ -138,7 +139,7 @@ class OrderGateTest(unittest.TestCase):
             },
             details={
                 "evidencePolicy": {
-                    "promotionSource": "continuous-live-forward-closed-bar-v1",
+                    "promotionSource": promotion_source,
                 },
                 "lifecyclePolicy": {
                     "action": "PROMOTE",
@@ -1383,6 +1384,82 @@ class OrderGateTest(unittest.TestCase):
         self.assertTrue(deployment["permissions"]["live_small_eligible"])
         self.assertFalse(deployment["permissions"]["live_eligible"])
         self.assertFalse(deployment["permissions"]["live_allowed"])
+
+    def test_before_live_small_resume_rejects_legacy_v1_forward_policy(self) -> None:
+        artifact = self.resume_artifact("RESUME-LEGACY-POLICY")
+
+        _pause, resume, deployment = self.run_resume_scenario(
+            artifact,
+            evidence_artifact=artifact,
+            evidence_options={
+                "promotion_source": "continuous-live-forward-closed-bar-v1",
+            },
+        )
+
+        self.assertTrue(resume["ok"], resume["reason"])
+        self.assertEqual("papered", deployment["lifecycle"])
+        self.assertFalse(deployment["permissions"]["live_small_eligible"])
+        self.assertIn(
+            "paper-live-forward-source-missing",
+            deployment["permissions"]["resumeEvidence"]["blockers"],
+        )
+
+    def test_automatic_sweep_never_promotes_full_live_without_operator(self) -> None:
+        decision = state.AutomaticPromotionDecision(
+            action="PROMOTE",
+            current_stage="before-live-small",
+            target_stage="live",
+            passed=True,
+            blockers=(),
+            checks=(),
+            evidence={"contentHash": "promotion-evidence-hash"},
+        )
+        strategy = {
+            "strategy_id": "AUTO-PROMOTE-BLOCKED",
+            "lifecycle_status": "before-live-small",
+            "broker_id": "binance",
+            "asset": "CRYPTO",
+            "symbol": "BTCUSDT",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            state,
+            "APP_DATA_ROOT",
+            Path(temp_dir),
+        ), patch.object(
+            state,
+            "strategy_rows",
+            return_value=[strategy],
+        ), patch.object(
+            state,
+            "reconciliation_snapshot",
+            return_value={},
+        ), patch.object(
+            state,
+            "broker_position_truth_snapshot",
+            return_value={"mismatchCount": 0},
+        ), patch.object(
+            state,
+            "live_small_execution_summary",
+            return_value={"successful": 3, "blocked": 0, "fills": 3},
+        ), patch.object(
+            state,
+            "evaluate_automatic_promotion",
+            return_value=decision,
+        ), patch.object(
+            state,
+            "promote_strategy_to_live",
+        ) as promote:
+            results = state.automatic_live_promotion_sweep(
+                fresh_broker_ids={"binance"},
+            )
+
+        promote.assert_not_called()
+        self.assertEqual(1, len(results))
+        self.assertFalse(results[0]["promoted"])
+        self.assertEqual(
+            "operator-confirmed-manual-promotion-required",
+            results[0]["reason"],
+        )
 
     def test_live_resume_never_restores_full_live_permission_directly(self) -> None:
         artifact = self.resume_artifact("RESUME-LIVE", lifecycle="live")
