@@ -96,6 +96,14 @@ import {
   buildAccountVisualization,
   formatAllocationValue,
 } from "./accountVisualization";
+import {
+  buildCurrentDeploymentOptions,
+  deploymentContextMatchesPreflight,
+  deploymentRuntimeProfile,
+  governedDeploymentIdentity,
+  strategyDeploymentIdentity,
+} from "./deploymentSelection";
+import { buildOrderCsvRows, ORDER_CSV_COLUMNS } from "./orderCsv";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
 import { createAppearanceSettingsPanel } from "../../../packages/design/appearance-settings-panel.js";
@@ -161,6 +169,7 @@ const PanelHeader = createPanelHeader(React);
 const StatusCard = createStatusCard(React);
 const SharedStatusRow = createStatusRow(React);
 const ToggleSwitch = createToggleSwitch(React);
+const ProgramJourney = React.lazy(() => import("../../../packages/design/program-journey.js").then((module) => ({ default: module.createProgramJourney(React) })));
 
 const navItems = [
   { id: "overview", label: "운영 현황", icon: LayoutDashboard },
@@ -1466,10 +1475,7 @@ applyLayoutMode(readLayoutMode());
 const LIVE_FLOW_STORAGE_KEY = "live_trader.guidedFlow.v1";
 const LIVE_FLOW_IDS = ["overview", "gate", "accounts", "orders", "risk", "automation", "incidents", "audit", "settings"];
 const DEPLOYMENT_CONTEXT_STORAGE_KEY = "live_trader.deploymentContext.v1";
-
-function strategyDeploymentIdentity(strategy = {}) {
-  return String(strategy.deployment_id || strategy.deploymentId || strategy.strategy_id || "").trim();
-}
+const LIVE_PROGRAM_JOURNEY_STORAGE_KEY = "live_trader.programJourney.v1";
 
 function strategyDeploymentContext(strategy = null) {
   if (!strategy) {
@@ -1633,20 +1639,31 @@ function App() {
     document.title = "[LIVE] Live Trader";
   }, []);
 
+  const runningDeploymentId = snapshot.live_governance?.activeSession?.deploymentId
+    || (snapshot.continuous_runtime?.running ? snapshot.continuous_runtime?.deploymentId : "")
+    || "";
+  const deploymentOptions = useMemo(
+    () => buildCurrentDeploymentOptions(snapshot.strategies ?? [], {
+      pinnedDeploymentIds: [runningDeploymentId],
+    }),
+    [runningDeploymentId, snapshot.strategies],
+  );
+
   useEffect(() => {
-    const strategies = snapshot.strategies ?? [];
-    if (!strategies.length) return;
-    const stillExists = strategies.some((strategy) => strategyDeploymentIdentity(strategy) === selectedDeploymentId);
+    if (!deploymentOptions.length) {
+      if (selectedDeploymentId) setSelectedDeploymentId("");
+      return;
+    }
+    const stillExists = deploymentOptions.some((option) => option.id === selectedDeploymentId);
     if (stillExists) return;
-    const preferred = strategies.find((strategy) => strategy.portfolio_gate?.active) || strategies.find((strategy) => strategy.live_allowed) || strategies[0];
-    const nextId = strategyDeploymentIdentity(preferred);
+    const nextId = deploymentOptions[0].id;
     setSelectedDeploymentId(nextId);
     try {
       window.localStorage.setItem(DEPLOYMENT_CONTEXT_STORAGE_KEY, JSON.stringify(nextId));
     } catch {
       // Storage-restricted runtimes keep the context for this session only.
     }
-  }, [selectedDeploymentId, snapshot.strategies]);
+  }, [deploymentOptions, selectedDeploymentId]);
 
   useEffect(() => {
     if (!notificationsOpen) return undefined;
@@ -1749,10 +1766,45 @@ function App() {
   }
 
   const title = navItems.find((item) => item.id === selectedNav)?.label ?? "운영 현황";
-  const selectedStrategy = (snapshot.strategies ?? []).find((strategy) => strategyDeploymentIdentity(strategy) === selectedDeploymentId)
-    || (snapshot.strategies ?? [])[0]
+  const selectedStrategy = deploymentOptions.find((option) => option.id === selectedDeploymentId)?.strategy
+    || deploymentOptions[0]?.strategy
     || null;
   const deploymentContext = strategyDeploymentContext(selectedStrategy);
+  const journeyGovernance = snapshot.live_governance ?? {};
+  const journeyGovernedDeploymentId = governedDeploymentIdentity(journeyGovernance);
+  const journeyContextMatchesPreflight = deploymentContextMatchesPreflight(
+    deploymentContext.id,
+    journeyGovernance,
+  );
+  const journeyPreflight = journeyGovernance.preflightValidity ?? journeyGovernance.preflight_validity ?? {};
+  const journeyPreflightReasonValue = journeyPreflight.reasons ?? journeyPreflight.reasonCodes;
+  const journeyPreflightReasons = Array.isArray(journeyPreflightReasonValue) ? journeyPreflightReasonValue : [];
+  const journeyArtifact = selectedStrategy
+    ? `Paper Trader 전달 후보 ${deploymentContext.id || deploymentContext.strategyId} · ${deploymentContext.portfolioName} · ${deploymentContext.symbol} ${deploymentContext.timeframe}`
+    : "Paper Trader에서 SHADOW·PAPER Evidence를 통과한 Deployment가 아직 없습니다.";
+  const journeyBlocker = snapshot.api_connected !== true
+    ? "API 연결이 끊겨 LIVE 안전 상태를 확인할 수 없습니다."
+    : !selectedStrategy
+      ? "LIVE 승급을 검토할 Deployment가 없습니다."
+      : selectedStrategy.live_allowed !== true
+        ? selectedStrategy.block_reason || "선택한 Deployment가 LIVE 승급 조건을 충족하지 못했습니다."
+        : snapshot.kill_switch
+          ? "전역 Kill Switch가 활성화되어 있습니다."
+          : !journeyContextMatchesPreflight
+            ? `선택 Deployment(${deploymentContext.id || "미선택"})와 Preflight Deployment(${journeyGovernedDeploymentId || "미확인"})가 일치하지 않습니다.`
+            : journeyPreflight.valid !== true
+            ? `유효한 Preflight가 없습니다${journeyPreflightReasons.length ? ` · ${journeyPreflightReasons.slice(0, 2).join(", ")}` : ""}.`
+            : snapshot.new_entries_blocked
+              ? "신규 진입 차단 상태입니다."
+              : snapshot.dry_run
+                ? "Dry Run 보호가 활성화되어 Broker 주문 전송이 차단됩니다."
+                : "없음 · 선택 Deployment의 LIVE 안전 게이트가 준비되었습니다.";
+  const journeyBlockerTone = snapshot.api_connected !== true || snapshot.kill_switch
+    ? "danger"
+    : selectedStrategy?.live_allowed === true && journeyContextMatchesPreflight && journeyPreflight.valid === true && !snapshot.new_entries_blocked && !snapshot.dry_run
+      ? "success"
+      : "warning";
+  const journeyNextAction = "Preflight → MONITOR 장기 감시 → LIMITED LIVE → FULL LIVE 순서를 지키고 감사 Evidence를 계속 보존합니다.";
   const notifications = buildNotificationItems(snapshot, error);
   const notificationKey = notificationFingerprint(notifications);
   const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
@@ -1861,10 +1913,21 @@ function App() {
 
         <LiveEnvironmentBar
           context={deploymentContext}
+          deploymentOptions={deploymentOptions}
           onSelect={selectDeploymentContext}
           snapshot={snapshot}
-          strategies={snapshot.strategies ?? []}
         />
+
+        <React.Suspense fallback={null}>
+          <ProgramJourney
+            activeStepId="live"
+            artifact={journeyArtifact}
+            blocker={journeyBlocker}
+            blockerTone={journeyBlockerTone}
+            nextAction={journeyNextAction}
+            storageKey={LIVE_PROGRAM_JOURNEY_STORAGE_KEY}
+          />
+        </React.Suspense>
 
         {error && snapshot.api_connected === false && (
           <section className="api-connection-banner" role="alert">
@@ -1939,14 +2002,12 @@ function App() {
   );
 }
 
-function LiveEnvironmentBar({ context, onSelect, snapshot, strategies }) {
-  const governedDeploymentId = snapshot.live_governance?.deploymentId
-    || snapshot.live_governance?.manifest?.deploymentId
-    || snapshot.live_governance?.latestPreflight?.deploymentId
-    || "";
-  const contextMatchesPreflight = Boolean(context.id)
-    && Boolean(governedDeploymentId)
-    && String(context.id) === String(governedDeploymentId);
+function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) {
+  const governedDeploymentId = governedDeploymentIdentity(snapshot.live_governance);
+  const contextMatchesPreflight = deploymentContextMatchesPreflight(
+    context.id,
+    snapshot.live_governance,
+  );
   const preflightValid = snapshot.live_governance?.preflightValidity?.valid === true;
   const launchLocked = snapshot.launch_report?.real_order_lock !== "ready"
     || !contextMatchesPreflight
@@ -1977,16 +2038,10 @@ function LiveEnvironmentBar({ context, onSelect, snapshot, strategies }) {
         <label>
           <span>현재 Deployment</span>
           <select value={context.id} onChange={(event) => onSelect(event.target.value)}>
-            {(strategies || []).map((strategy) => {
-              const id = strategyDeploymentIdentity(strategy);
-              const gate = strategy.portfolio_gate || {};
-              return (
-                <option key={id} value={id}>
-                  {gate.portfolioName || gate.portfolioId || "Standalone"} · {strategy.symbol || "-"} · {strategy.name || strategy.strategy_id}
-                </option>
-              );
-            })}
-            {!strategies?.length && <option value="">Deployment 없음</option>}
+            {(deploymentOptions || []).map((option) => (
+              <option key={option.id} value={option.id}>{option.label}</option>
+            ))}
+            {!deploymentOptions?.length && <option value="">실행 가능한 Deployment 없음</option>}
           </select>
         </label>
         <div className="live-context-meta">
@@ -2033,7 +2088,9 @@ function formatAuditTime(item = {}) {
 
 function csvCell(value) {
   if (value === null || value === undefined) return "";
-  const text = String(value).replaceAll('"', '""');
+  const raw = String(value);
+  const formulaSafe = typeof value === "string" && /^[=+\-@]/.test(raw) ? `'${raw}` : raw;
+  const text = formulaSafe.replaceAll('"', '""');
   return /[",\n]/.test(text) ? `"${text}"` : text;
 }
 
@@ -2097,6 +2154,7 @@ function WorkspaceContent({
         <DeploymentContextPanel className="live-grid-full" context={deploymentContext} />
         <AutomationLauncherPanel
           className="live-grid-full"
+          deploymentContext={deploymentContext}
           profiles={snapshot.automation_profiles}
           strategies={snapshot.strategies}
           runnerState={snapshot.strategy_runner}
@@ -2525,6 +2583,10 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
         .some((value) => value && selectedIds.has(value))
     ));
   }, [events, selected]);
+  const handleExportOrders = () => {
+    const exportRows = buildOrderCsvRows(visibleOrderRows, context.id, formatAuditTime);
+    downloadCsv(ORDER_CSV_COLUMNS, exportRows, `live-trader-orders-${dateStamp()}.csv`);
+  };
   return (
     <section className="order-execution-layout ts-layout-stack">
       <DeploymentContextPanel context={context} />
@@ -2661,6 +2723,10 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
                 <option value="all">전체 브로커</option>
                 {brokerOptions.map((broker) => <option value={broker} key={broker}>{broker}</option>)}
               </select>
+              <button className="logs-export-button" type="button" onClick={handleExportOrders} disabled={!visibleOrderRows.length}>
+                <Download size={16} />
+                CSV
+              </button>
               <span>{visibleOrderRows.length.toLocaleString()} / {orders.length.toLocaleString()}건</span>
             </div>
           )}
@@ -4804,6 +4870,7 @@ function UnattendedSoakReportCard({ report }) {
 
 function AutomationLauncherPanel({
   className = "",
+  deploymentContext,
   profiles,
   strategies,
   runnerState,
@@ -4821,6 +4888,10 @@ function AutomationLauncherPanel({
   const [validationLoading, setValidationLoading] = useState(false);
   const [selectedValidationId, setSelectedValidationId] = useState("");
   const [lastValidationResult, setLastValidationResult] = useState(null);
+  const [requestedModes, setRequestedModes] = useState({
+    stock: "MONITOR",
+    crypto: "MONITOR",
+  });
   const activeProfile = rows.find((profile) => profile.id === assetTab) ?? rows[0];
   const modes = [
     { id: "MONITOR", label: "MONITOR", icon: Power },
@@ -4906,6 +4977,20 @@ function AutomationLauncherPanel({
   const runtimeTone = runtimeRunning
     ? profileRuntime.phase === "DEGRADED" ? "warning" : "success"
     : profileRuntime?.phase === "FAILED" ? "danger" : "neutral";
+  const requestedMode = runtimeRunning
+    ? String(profileRuntime.mode || "MONITOR").toUpperCase()
+    : requestedModes[activeProfile.id] || "MONITOR";
+  const expectedRuntimeProfile = deploymentRuntimeProfile(deploymentContext);
+  const runtimeBindingBlocked = !deploymentContext?.id
+    || !expectedRuntimeProfile
+    || expectedRuntimeProfile !== activeProfile.id;
+  const runtimeBindingDetail = !deploymentContext?.id
+    ? "상단에서 실행할 Deployment를 먼저 선택하세요."
+    : !expectedRuntimeProfile
+      ? `선택한 Deployment의 broker(${deploymentContext.brokerId || "미확인"})를 runtime profile에 매핑할 수 없습니다.`
+      : expectedRuntimeProfile !== activeProfile.id
+        ? `선택한 Deployment는 ${expectedRuntimeProfile === "stock" ? "주식/ETF" : "코인"} profile입니다. 같은 자산군 탭에서만 Run할 수 있습니다.`
+        : `${deploymentContext.name} · ${deploymentContext.symbol} · ${deploymentContext.id}`;
 
   return (
     <section className={`panel automation-panel ${className}`.trim()}>
@@ -4920,8 +5005,8 @@ function AutomationLauncherPanel({
       />
       <div
         {...semanticSurfaceProps(
-          activeProfile.enabled ? "success" : activeProfile.ready ? "info" : "danger",
-          `automation-card ${activeProfile.enabled ? "running" : ""}`,
+          runtimeRunning ? "success" : activeProfile.ready ? "info" : "danger",
+          `automation-card ${runtimeRunning ? "running" : ""}`,
         )}
       >
         <div className="automation-card-head">
@@ -4929,8 +5014,8 @@ function AutomationLauncherPanel({
             <strong>{activeProfile.title}</strong>
             <span>{activeProfile.provider_label}</span>
           </div>
-          <StatusPill tone={activeProfile.enabled ? "success" : activeProfile.ready ? "info" : "danger"}>
-            {activeProfile.enabled ? "실행 중" : activeProfile.ready ? "대기" : "차단"}
+          <StatusPill tone={runtimeRunning ? "success" : activeProfile.ready ? "info" : "danger"}>
+            {runtimeRunning ? "실행 중" : activeProfile.ready ? "대기" : "차단"}
           </StatusPill>
         </div>
         <p>{activeProfile.detail}</p>
@@ -4956,15 +5041,19 @@ function AutomationLauncherPanel({
         <div className="automation-mode-grid">
           {modes.map((mode) => {
             const Icon = mode.icon;
-            const active = activeProfile.mode === mode.id;
+            const active = requestedMode === mode.id;
             return (
               <button
                 className={`mode-button ts-action-button ${active ? "active" : ""}`}
                 data-action-status={active ? "success" : undefined}
                 aria-pressed={active}
+                disabled={runtimeRunning}
                 type="button"
                 key={mode.id}
-                onClick={() => onAutomation(activeProfile.id, mode.id !== "MONITOR", activeProfile.provider, mode.id)}
+                onClick={() => setRequestedModes((current) => ({
+                  ...current,
+                  [activeProfile.id]: mode.id,
+                }))}
               >
                 <Icon size={16} />
                 <span>{mode.label}</span>
@@ -4972,6 +5061,13 @@ function AutomationLauncherPanel({
               </button>
             );
           })}
+        </div>
+        <div {...semanticSurfaceProps(runtimeBindingBlocked ? "danger" : "info", "runtime-deployment-binding")}>
+          <StatusPill tone={runtimeBindingBlocked ? "danger" : "info"}>
+            {runtimeBindingBlocked ? "RUN BLOCK" : "DEPLOYMENT BOUND"}
+          </StatusPill>
+          <span>{runtimeBindingDetail}</span>
+          <small>모드 버튼은 화면의 실행 요청만 선택하며, Run을 누르기 전에는 runtime 설정을 변경하지 않습니다.</small>
         </div>
         <div className="automation-metrics">
           <div>
@@ -5003,11 +5099,11 @@ function AutomationLauncherPanel({
           <button
             className="ts-action-button"
             type="button"
-            disabled={profileRuntime?.running}
-            onClick={() => onRuntimeStart(activeProfile.id, activeProfile.mode)}
+            disabled={profileRuntime?.running || runtimeBindingBlocked}
+            onClick={() => onRuntimeStart(activeProfile.id, requestedMode)}
           >
             <Play size={16} />
-            <span>Run 지속 감시</span>
+            <span>{requestedMode} Run</span>
           </button>
           <button
             className="ts-action-button"
@@ -5040,7 +5136,7 @@ function AutomationLauncherPanel({
       <section className="validation-monitor-card">
         <PanelHeader
           title="검증 전용 MONITOR"
-          subtitle="Backtest·Portfolio 후보를 표준 lifecycle 승급 없이 실제 지표 코드로 1회 평가합니다. 이 경로에는 OrderIntent 생성과 브로커 주문 전송이 없습니다."
+          subtitle="Backtest 후보를 Portfolio 또는 명시적 standalone Strategy로 정확히 바인딩해, lifecycle 승급 없이 실제 지표 코드로 1회 평가합니다. 이 경로에는 OrderIntent 생성과 브로커 주문 전송이 없습니다."
           suffix={(
             <button className="mini-button" type="button" disabled={validationLoading} onClick={refreshValidationPlan}>
               <RefreshCcw size={14} />
@@ -5049,7 +5145,7 @@ function AutomationLauncherPanel({
           )}
         />
         <div className="validation-monitor-metrics">
-          <MetricCard label="일반 통합 Smoke" value={`${validation?.generalSmokeCandidateCount ?? 0}개`} tone="info" />
+          <MetricCard label="일반·Standalone Smoke" value={`${validation?.generalSmokeCandidateCount ?? 0}개`} tone="info" />
           <MetricCard label="Futures SHORT 정식 후보" value={`${validation?.futuresShortCandidateCount ?? 0}개`} tone={(validation?.futuresShortCandidateCount ?? 0) > 0 ? "success" : "warning"} />
           <MetricCard label="승급 차단 SHORT" value={`${validation?.blockedFuturesShortCount ?? 0}개`} tone={(validation?.blockedFuturesShortCount ?? 0) > 0 ? "warning" : "success"} />
           <MetricCard label="실제 평가 가능" value={`${validation?.runtimeEvaluationReadyCount ?? 0}개`} tone="success" />
@@ -5093,7 +5189,11 @@ function AutomationLauncherPanel({
               <strong>{selectedValidation.strategyName || selectedValidation.strategyId}</strong>
               <span>
                 {selectedValidation.brokerHint} · {selectedValidation.marketType} · {selectedValidation.plugin}
+                {selectedValidation.standaloneStrategy ? " · Standalone Strategy" : ` · ${selectedValidation.portfolioName || selectedValidation.portfolioId}`}
               </span>
+              <small>
+                {selectedValidation.strategyId} · artifact {selectedValidation.strategyArtifactHash?.slice(0, 12) || "N/A"} · file {selectedValidation.strategyFileSha256?.slice(0, 12) || "N/A"}
+              </small>
             </div>
             <StatusPill tone={selectedValidation.runtimeEvaluationReady ? "success" : "warning"}>
               {selectedValidation.runtimeEvaluationReady ? "CANONICAL · MONITOR ONLY" : "LEGACY · 목록 전용"}
@@ -5123,7 +5223,7 @@ function AutomationLauncherPanel({
           <div {...semanticSurfaceProps("danger", "validation-evaluation-error")}>{lastValidationResult.reason}</div>
         )}
         <p className="validation-monitor-note">
-          지속 감시는 현재 표준 Portfolio runner와 별도 연결하지 않았습니다. 후보 plan을 우회해 장시간 runtime을 시작하지 않으며, 표준 SMALL/FULL LIVE 권한도 변경하지 않습니다.
+          이 검증 plan은 지속 감시 runner와 연결하지 않습니다. 후보 plan을 우회해 장시간 runtime을 시작하지 않으며, Portfolio를 합성하지 않고 표준 SMALL/FULL LIVE 권한도 변경하지 않습니다.
         </p>
         {researchShort && (
           <div

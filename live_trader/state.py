@@ -310,45 +310,6 @@ DEFAULT_RETRY_POLICY: dict[str, float | bool] = {
     "retry_on_rate_limit": True,
 }
 
-POSITION_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
-    {
-        "symbol": "069500.KS",
-        "asset": "한국주식",
-        "broker_id": "kis",
-        "broker_name": "한국투자증권",
-        "program_qty": 0.0,
-        "broker_qty": None,
-        "program_value": 0.0,
-        "broker_value": None,
-        "currency": "KRW",
-        "tolerance_qty": 0.0,
-    },
-    {
-        "symbol": "BTCUSDT",
-        "asset": "코인",
-        "broker_id": "binance",
-        "broker_name": "Binance",
-        "program_qty": 0.0,
-        "broker_qty": None,
-        "program_value": 0.0,
-        "broker_value": None,
-        "currency": "USDT",
-        "tolerance_qty": 0.000001,
-    },
-    {
-        "symbol": "SPY",
-        "asset": "미국 ETF",
-        "broker_id": "kis",
-        "broker_name": "한국투자증권",
-        "program_qty": 0.0,
-        "broker_qty": None,
-        "program_value": 0.0,
-        "broker_value": None,
-        "currency": "USD",
-        "tolerance_qty": 0.0,
-    },
-)
-
 ACCOUNT_RECONCILIATION_BOOK: tuple[dict[str, object], ...] = (
     {
         "broker_id": "kis",
@@ -3125,71 +3086,6 @@ def positions() -> list[dict[str, str]]:
     ledger_rows = program_position_rows()
     errors = broker_reconciliation_errors()
     successful_brokers = successful_position_brokers()
-    for item in POSITION_RECONCILIATION_BOOK:
-        key = (str(item["broker_id"]), str(item["symbol"]), "")
-        broker_row = broker_rows.pop(key, None)
-        ledger_row = ledger_rows.pop(key, None)
-        broker_qty = broker_row.get("broker_qty") if broker_row else item["broker_qty"]
-        broker_id = str(item["broker_id"])
-        has_complete_zero_snapshot = broker_id in successful_brokers
-        if broker_qty is None and has_complete_zero_snapshot:
-            broker_qty = 0.0
-        program_qty = float(ledger_row["quantity"] if ledger_row else item["program_qty"])
-        tolerance_qty = float(item["tolerance_qty"])
-        capability_unavailable = bool(item.get("capability")) and broker_qty is None and abs(program_qty) <= tolerance_qty
-        if capability_unavailable:
-            status = "capability_unavailable"
-            status_label = "미지원"
-            delta_qty = "-"
-            detail = "KIS 해외주식 잔고 대조 capability가 아직 구현되지 않았습니다. 실제 해외 포지션 원장이 생기면 fail-closed로 차단합니다."
-        elif broker_qty is None:
-            status = "api_required"
-            status_label = "API 필요"
-            delta_qty = "-"
-            detail = errors.get(broker_id, "브로커 포지션 조회 결과가 아직 없습니다.")
-        else:
-            numeric_broker_qty = float(broker_qty)
-            delta = program_qty - numeric_broker_qty
-            delta_qty = format_quantity(delta)
-            if abs(delta) <= tolerance_qty:
-                status = "pass"
-                status_label = "일치"
-                detail = "프로그램 포지션과 브로커 포지션이 허용 오차 안에 있습니다."
-            else:
-                status = "mismatch"
-                status_label = "불일치"
-                detail = "프로그램 포지션과 브로커 포지션 수량이 다릅니다."
-        rows.append(
-            {
-                "symbol": str(item["symbol"]),
-                "asset": str(item["asset"]),
-                "broker_id": str(item["broker_id"]),
-                "broker_name": str(item["broker_name"]),
-                "currency": str(item["currency"]),
-                "position_side": normalized_reconciliation_position_side(
-                    broker_row or ledger_row or item,
-                    source="broker" if broker_row else "program",
-                ),
-                "program_qty": format_quantity(program_qty),
-                "broker_qty": format_quantity(float(broker_qty)) if broker_qty is not None else "미지원" if capability_unavailable else "API 필요",
-                "program_qty_value": program_qty,
-                "broker_qty_value": float(broker_qty) if broker_qty is not None else None,
-                "broker_value": safe_float(broker_row.get("broker_value"), 0.0) if broker_row else None,
-                "average_price": safe_float(broker_row.get("average_price"), 0.0) if broker_row else None,
-                "current_price": safe_float(broker_row.get("current_price"), 0.0) if broker_row else None,
-                "unrealized_profit": safe_float(broker_row.get("unrealized_profit"), 0.0) if broker_row else None,
-                "leverage": safe_float(broker_row.get("leverage"), 0.0) if broker_row else None,
-                "valuation_basis": str(broker_row.get("valuation_basis") or "unavailable") if broker_row else "unavailable",
-                "broker_value_display": format_money(broker_row.get("broker_value"), str(item["currency"])) if broker_row and safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
-                "average_price_display": format_money(broker_row.get("average_price"), str(item["currency"])) if broker_row and safe_float(broker_row.get("average_price"), 0.0) > 0 else "-",
-                "current_price_display": format_money(broker_row.get("current_price"), str(item["currency"])) if broker_row and safe_float(broker_row.get("current_price"), 0.0) > 0 else "-",
-                "delta_qty": delta_qty,
-                "status": status,
-                "status_label": status_label,
-                "program_source": str(ledger_row.get("source") if ledger_row else "sample"),
-                "detail": detail,
-            }
-        )
     for key, ledger_row in sorted(ledger_rows.items()):
         broker_row = broker_rows.pop(key, None)
         broker_qty = broker_row.get("broker_qty") if broker_row else None

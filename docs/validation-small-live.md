@@ -22,24 +22,63 @@ Backtest와 Portfolio만 통과한 후보를 바로 표준 `before-live-small`�
 
 ## 생성 및 재검증
 
-```powershell
-.\.venv\Scripts\python.exe scripts\prepare_validation_small_live.py
-.\.venv\Scripts\python.exe scripts\prepare_validation_small_live.py --verify
-```
-
-기본 결과는 `%LOCALAPPDATA%\live_trader\logs\validation-small-live-plan.json`에 저장된다. 파일을 쓰지 않고 후보만 확인하려면 `--preview`를 사용한다.
-
-```powershell
-.\.venv\Scripts\python.exe scripts\prepare_validation_small_live.py --preview
-```
-
-종목이나 봉을 제한할 수도 있다.
+검증 plan은 무조건 exact binding으로 생성한다. Portfolio 경로는 Strategy
+ID·canonical hash와 Portfolio ID·canonical hash의 네 값을 모두 입력해야
+한다. 일부만 입력하거나 아무 값도 입력하지 않으면 plan을 만들지 않고
+`exact-artifact-binding-invalid`로 종료한다. 따라서 같은 ID의 다른
+revision을 정렬 순서로 임의 선택하지 않는다.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\prepare_validation_small_live.py `
+  --artifact-root <BACKTESTER_ARTIFACT_ROOT> `
+  --strategy-id <STRATEGY_ID> `
+  --strategy-artifact-hash <64_HEX_STRATEGY_HASH> `
+  --portfolio-id <PORTFOLIO_ID> `
+  --portfolio-artifact-hash <64_HEX_PORTFOLIO_HASH> `
+  --output <ISOLATED_PLAN_PATH> `
+  --preview
+```
+
+기본 결과는 `%LOCALAPPDATA%\live_trader\logs\validation-small-live-plan.json`에
+저장된다. 파일을 쓰지 않고 후보만 확인하려면 위처럼 `--preview`를 쓰며,
+저장한 plan은 다음처럼 원본 file SHA-256까지 다시 검사한다.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\prepare_validation_small_live.py `
+  --output <ISOLATED_PLAN_PATH> `
+  --verify
+```
+
+종목이나 봉 제한은 완전한 exact binding 인자에 추가한다.
+
+```powershell
   --symbols BTCUSDT,BNBUSDT `
   --timeframes 1h,1d
 ```
+
+명령 출력의 `artifactBinding`, `candidates`와 plan의 원본 파일 SHA-256이
+모두 일치해야 한다. canonical lock 내용이 변조됐거나 Portfolio가 다른
+Strategy hash를 가리키면 후보 생성 또는 1회 평가 단계에서 fail-closed한다.
+
+Backtester가 Portfolio 없이 standalone Strategy만 발행한 경우에는 임의
+Portfolio를 만들거나 다른 Portfolio와 섞지 않는다. ID·hash를 고정하고
+`--strategy-only`를 명시하면 동일한 canonical Strategy를 주문 경로 없는
+1회 MONITOR 평가기로만 읽는다.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\prepare_validation_small_live.py `
+  --artifact-root <BACKTESTER_ARTIFACT_ROOT> `
+  --strategy-id <STRATEGY_ID> `
+  --strategy-artifact-hash <64_HEX_STRATEGY_HASH> `
+  --strategy-only `
+  --output <ISOLATED_PLAN_PATH>
+```
+
+이 경로의 `portfolioId`와 `portfolioArtifactHash`는 비어 있으며,
+`standaloneStrategy=true`로 기록된다. 이는 validation grouping일 뿐
+Portfolio Artifact나 Portfolio 승급 근거를 합성하지 않는다.
+`--strategy-only`에서도 Strategy ID 또는 hash 중 하나만 넣을 수 없고,
+Portfolio ID/hash를 함께 넣으면 즉시 차단된다.
 
 ## Live Trader에서 보이는 분류
 

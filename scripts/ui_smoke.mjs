@@ -76,6 +76,22 @@ try {
           issues.push(`${viewport.name}: LIVE environment bar is missing '${requiredLabel}'`);
         }
       }
+      const deploymentOptions = await environmentBar.locator("select option").evaluateAll((options) => options.map((option) => ({
+        label: option.textContent?.trim() || "",
+        value: option.value,
+      })));
+      const deploymentValues = deploymentOptions.map((option) => option.value).filter(Boolean);
+      const deploymentLabels = deploymentOptions.map((option) => option.label).filter(Boolean);
+      if (new Set(deploymentValues).size !== deploymentValues.length || new Set(deploymentLabels).size !== deploymentLabels.length) {
+        issues.push(`${viewport.name}: current Deployment selector contains duplicate values or labels`);
+      }
+      const hiddenTerminalVisible = deploymentOptions.some((option) => (
+        !option.label.startsWith("[현재 세션]")
+        && / · (retired|paused|archived) · #/i.test(option.label)
+      ));
+      if (hiddenTerminalVisible) {
+        issues.push(`${viewport.name}: retired/paused/archived Deployment is visible in the default selector`);
+      }
     }
 
     for (const tab of tabs) {
@@ -184,8 +200,25 @@ try {
           issues.push(`${viewport.name}/${tab.label}: explicit program-ledger baseline action is missing`);
         }
       }
-      if (tab.label === "주문·체결" && !await page.getByText("Client Order ID", { exact: true }).count()) {
-        issues.push(`${viewport.name}/${tab.label}: idempotent order identifier column is missing`);
+      if (tab.label === "주문·체결") {
+        if (!await page.getByText("Client Order ID", { exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: idempotent order identifier column is missing`);
+        }
+        if (!await page.getByRole("button", { name: "CSV", exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: filtered order CSV export is missing`);
+        }
+      }
+      if (tab.label === "실거래 운영") {
+        await page.getByRole("tab", { name: "주식/ETF", exact: true }).waitFor({ state: "visible", timeout: 5000 });
+        if (!await page.locator(".runtime-deployment-binding").count()) {
+          issues.push(`${viewport.name}/${tab.label}: Deployment/runtime binding status is missing`);
+        }
+        if (!await page.getByText(/Run을 누르기 전에는 runtime 설정을 변경하지 않습니다/).count()) {
+          issues.push(`${viewport.name}/${tab.label}: mode selection safety guidance is missing`);
+        }
+        if (!await page.getByRole("button", { name: /MONITOR Run/, exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: Deployment-bound MONITOR Run action is missing`);
+        }
       }
       if (tab.label === "감사 기록" && !await page.getByText(/append-only 원장/).count()) {
         issues.push(`${viewport.name}/${tab.label}: immutable audit guidance is missing`);

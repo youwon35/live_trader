@@ -38,8 +38,10 @@ def _csv(value: str) -> tuple[str, ...]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Backtest/Portfolio PASS 후보를 실제 주문 권한 없이 "
-            "MONITOR/Dry-run 검증 plan으로 고정합니다."
+            "Backtest PASS 후보를 exact ID/hash 완전쌍으로 바인딩해 "
+            "실제 주문 권한 없는 MONITOR/Dry-run 검증 plan으로 고정합니다. "
+            "Portfolio 경로는 Strategy+Portfolio 두 완전쌍이 필요하고, "
+            "--strategy-only는 Strategy 완전쌍만 허용합니다."
         )
     )
     parser.add_argument(
@@ -67,6 +69,34 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="broker/symbol/timeframe별 최대 후보 수",
+    )
+    parser.add_argument(
+        "--strategy-id",
+        default="",
+        help="정확히 바인딩할 Strategy Artifact ID",
+    )
+    parser.add_argument(
+        "--strategy-artifact-hash",
+        default="",
+        help="정확히 바인딩할 Strategy canonical artifact hash",
+    )
+    parser.add_argument(
+        "--portfolio-id",
+        default="",
+        help="정확히 바인딩할 Portfolio Artifact ID",
+    )
+    parser.add_argument(
+        "--portfolio-artifact-hash",
+        default="",
+        help="정확히 바인딩할 Portfolio canonical artifact hash",
+    )
+    parser.add_argument(
+        "--strategy-only",
+        action="store_true",
+        help=(
+            "Portfolio를 합성하거나 대체하지 않고 canonical Strategy "
+            "Artifact만 MONITOR 후보로 고정합니다."
+        ),
     )
     parser.add_argument(
         "--preview",
@@ -98,6 +128,29 @@ def _summary(
         "candidateCount": plan.get("candidateCount"),
         "blockedCount": plan.get("blockedCount"),
         "coverage": plan.get("coverage"),
+        "strategyOnly": bool(
+            (plan.get("selectionPolicy") or {}).get("strategyOnly")
+        ),
+        "artifactBinding": plan.get("artifactBinding") or {},
+        "candidates": [
+            {
+                "validationStrategyInstanceId": item.get(
+                    "validationStrategyInstanceId"
+                ),
+                "strategyId": item.get("strategyId"),
+                "strategyArtifactHash": item.get(
+                    "strategyArtifactHash"
+                ),
+                "portfolioId": item.get("portfolioId"),
+                "portfolioArtifactHash": item.get(
+                    "portfolioArtifactHash"
+                ),
+                "symbol": item.get("symbol"),
+                "timeframe": item.get("timeframe"),
+            }
+            for item in plan.get("candidates") or []
+            if isinstance(item, dict)
+        ],
         "output": str(output),
         "written": written,
         "verificationIssues": verification.get("issues") or [],
@@ -123,13 +176,37 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0 if result["verification"]["ok"] else 3
 
-    plan = build_validation_plan(
-        args.artifact_root,
-        symbols=_csv(args.symbols),
-        timeframes=_csv(args.timeframes),
-        max_per_bucket=args.max_per_bucket,
-        research_short_bundle=research_short_bundle_snapshot(),
-    )
+    try:
+        plan = build_validation_plan(
+            args.artifact_root,
+            symbols=_csv(args.symbols),
+            timeframes=_csv(args.timeframes),
+            max_per_bucket=args.max_per_bucket,
+            strategy_id=args.strategy_id,
+            strategy_artifact_hash=args.strategy_artifact_hash,
+            portfolio_id=args.portfolio_id,
+            portfolio_artifact_hash=args.portfolio_artifact_hash,
+            strategy_only=args.strategy_only,
+            research_short_bundle=research_short_bundle_snapshot(),
+        )
+    except ValueError as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "mode": "MONITOR",
+                    "dryRunRequired": True,
+                    "brokerSubmitAllowed": False,
+                    "productionLifecycleMutation": False,
+                    "reason": str(exc),
+                    "written": False,
+                    "output": str(output),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 3
     verification = validate_monitor_only_plan(
         plan,
         verify_files=True,

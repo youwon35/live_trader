@@ -1035,6 +1035,35 @@ button {
   gap: 8px;
 }
 
+.runtime-deployment-binding {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 5px 9px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+}
+
+.runtime-deployment-binding span,
+.runtime-deployment-binding small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.runtime-deployment-binding span {
+  color: var(--text);
+  font-size: var(--font-size-small);
+  font-weight: var(--font-weight-semibold);
+}
+
+.runtime-deployment-binding small {
+  grid-column: 2;
+  color: var(--text-muted);
+  font-size: var(--font-size-caption);
+}
+
 .automation-card-head strong,
 .automation-card-head span {
   display: block;

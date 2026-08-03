@@ -858,7 +858,7 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual("warn", kis["status"])
         self.assertGreater(kis["api_required_count"], 0)
 
-    def test_successful_kis_snapshot_attests_zero_overseas_position(self) -> None:
+    def test_empty_durable_ledger_and_broker_snapshot_do_not_create_phantom_positions(self) -> None:
         with patch("live_trader.state.live_position_rows", return_value={}), patch(
             "live_trader.state.program_position_rows",
             return_value={},
@@ -871,16 +871,11 @@ class OrderGateTest(unittest.TestCase):
         ):
             rows = state.positions()
 
-        spy = next(row for row in rows if row["broker_id"] == "kis" and row["symbol"] == "SPY")
-        self.assertEqual("pass", spy["status"])
-        self.assertEqual("일치", spy["status_label"])
-        self.assertEqual("0", spy["broker_qty"])
+        self.assertEqual([], rows)
+        self.assertFalse(any(row.get("program_source") == "sample" for row in rows))
 
         scoped = {
-            "positions": [
-                {"broker_id": "kis", "status": "pass"},
-                {"broker_id": "kis", "status": "pass"},
-            ],
+            "positions": [],
             "accounts": [{"broker_id": "kis", "status": "pass"}],
         }
         with patch("live_trader.state.reconciliation_snapshot", return_value=scoped), patch(

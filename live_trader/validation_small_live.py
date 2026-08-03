@@ -14,8 +14,11 @@ from trading_runtime import (
     PortfolioRuntimeEngine,
     RuntimeStrategySpec,
     feeds_for_specs,
+    infer_market_route,
     load_portfolio_runtime_path,
     required_warmup_bars,
+    verify_portfolio_artifact,
+    verify_strategy_artifact,
 )
 
 
@@ -308,6 +311,22 @@ def _integrity_class(payload: dict[str, Any], artifact_kind: str) -> dict[str, A
         else "portfolio-artifact-lock-v2"
     )
     if schema == expected_schema and _HASH_RE.fullmatch(declared_hash):
+        verification = (
+            verify_strategy_artifact(payload)
+            if artifact_kind == "strategy"
+            else verify_portfolio_artifact(payload)
+        )
+        if not verification.valid:
+            return {
+                "class": "canonical-invalid",
+                "productionIntegrityReady": False,
+                "schemaVersion": schema,
+                "artifactHash": declared_hash,
+                "issues": [
+                    f"canonical-lock:{issue}"
+                    for issue in verification.issues
+                ],
+            }
         return {
             "class": "canonical-current",
             "productionIntegrityReady": True,
@@ -368,7 +387,7 @@ def _strategy_precheck(payload: dict[str, Any]) -> list[str]:
     elif fail_reasons not in (None, ""):
         issues.append(f"strategy-fail-reason:{fail_reasons}")
     integrity = _integrity_class(payload, "strategy")
-    if integrity["class"] == "unsealed":
+    if integrity["class"] in {"unsealed", "canonical-invalid"}:
         issues.extend(integrity["issues"])
     return list(dict.fromkeys(issues))
 
@@ -393,7 +412,7 @@ def _portfolio_precheck(payload: dict[str, Any]) -> list[str]:
     ]
     issues.extend(f"portfolio-risk-check:{item}" for item in failed_risk_checks)
     integrity = _integrity_class(payload, "portfolio")
-    if integrity["class"] == "unsealed":
+    if integrity["class"] in {"unsealed", "canonical-invalid"}:
         issues.extend(integrity["issues"])
     return list(dict.fromkeys(issues))
 
@@ -522,12 +541,209 @@ def _scan_payloads(
     return output
 
 
+def _standalone_validation_candidate(
+    strategy_path: Path,
+    strategy: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    strategy_id = _artifact_id(strategy)
+    symbol = _strategy_symbol(strategy)
+    timeframe = _strategy_timeframe(strategy)
+    integrity = _integrity_class(strategy, "strategy")
+    market_type = _market_type(strategy, {})
+    position_direction = _position_direction(strategy)
+    allow_short = _allow_short(strategy, position_direction)
+    dataset = _mapping(strategy.get("dataset"))
+    data_artifact = _mapping(
+        strategy.get("dataArtifact") or strategy.get("data_artifact")
+    )
+    trader_contract = _mapping(
+        strategy.get("traderContract") or strategy.get("trader_contract")
+    )
+    trader_scope = _mapping(trader_contract.get("scope"))
+    declared_broker = str(
+        strategy.get("brokerId")
+        or strategy.get("broker_id")
+        or trader_scope.get("brokerId")
+        or ""
+    ).strip().lower()
+    broker_hint = _broker_hint(
+        {"brokerId": declared_broker},
+        symbol,
+        market_type=market_type,
+        position_direction=position_direction,
+        allow_short=allow_short,
+    )
+    route_issues: list[str] = []
+    if position_direction == "short":
+        if market_type not in _FUTURES_MARKET_TYPES:
+            route_issues.append(
+                f"short-market-must-be-futures:{market_type}"
+            )
+        if declared_broker != "binance-futures":
+            route_issues.append(
+                "short-broker-must-be-binance-futures:"
+                + (declared_broker or "missing")
+            )
+    if (
+        market_type in _FUTURES_MARKET_TYPES
+        and symbol.upper().endswith(("USDT", "USDC"))
+        and declared_broker != "binance-futures"
+    ):
+        route_issues.append(
+            "futures-broker-must-be-binance-futures:"
+            + (declared_broker or "missing")
+        )
+    if route_issues:
+        return None, list(dict.fromkeys(route_issues))
+    futures_short_candidate = bool(
+        market_type in _FUTURES_MARKET_TYPES
+        and position_direction == "short"
+        and allow_short
+        and broker_hint == "binance-futures"
+    )
+    parameters = _mapping(strategy.get("parameters"))
+    try:
+        target_weight = max(
+            0.0,
+            float(parameters.get("positionSize", 100.0)),
+        ) / 100.0
+    except (TypeError, ValueError):
+        target_weight = 1.0
+    return {
+        "validationStage": (
+            VALIDATION_STAGE
+            if futures_short_candidate
+            else "integration-monitor-smoke"
+        ),
+        "candidateClass": (
+            "futures-short-monitor-smoke"
+            if futures_short_candidate
+            else "general-integration-smoke"
+        ),
+        "standaloneStrategy": True,
+        "validationEligible": True,
+        "runtimeMode": "MONITOR",
+        "dryRunRequired": True,
+        "brokerSubmitAllowed": False,
+        "productionPermissionGranted": False,
+        "strategyId": strategy_id,
+        "strategyName": str(
+            strategy.get("name")
+            or strategy.get("strategyName")
+            or strategy_id
+        ),
+        "strategyPath": str(strategy_path),
+        "strategyFileSha256": _file_hash(strategy_path),
+        "strategyArtifactHash": str(integrity["artifactHash"]),
+        "strategyIntegrity": integrity,
+        "productionLifecycle": _lifecycle(strategy),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "plugin": _strategy_plugin(strategy),
+        "brokerHint": broker_hint,
+        "marketType": market_type,
+        "positionDirection": position_direction,
+        "allowShort": allow_short,
+        "futuresShortCandidate": futures_short_candidate,
+        "marketDataProvider": str(
+            strategy.get("marketDataProvider")
+            or data_artifact.get("marketDataProvider")
+            or data_artifact.get("provider")
+            or dataset.get("provider")
+            or broker_hint
+        ).strip().lower(),
+        "portfolioId": "",
+        "portfolioName": "Standalone Strategy",
+        "portfolioPath": "",
+        "portfolioFileSha256": "",
+        "portfolioArtifactHash": "",
+        "portfolioIntegrity": {
+            "class": "not-applicable-standalone",
+            "productionIntegrityReady": True,
+            "schemaVersion": "",
+            "artifactHash": "",
+            "issues": [],
+        },
+        "runtimeEvaluationReady": bool(
+            integrity["productionIntegrityReady"]
+        ),
+        "strategyInstanceId": f"standalone:{strategy_id}",
+        "targetWeight": target_weight,
+        "targetStatus": "standalone-monitor-only",
+        "productionGatesPending": [
+            "shadow-evidence",
+            "paper-order-evidence",
+            "paper-observation-window",
+            "recovery-drill",
+            "broker-reconciliation",
+            "operator-confirmation",
+            "small-live-canary-fills",
+        ],
+    }, []
+
+
+def _validation_strategy_instance_id(candidate: dict[str, Any]) -> str:
+    return "vsi:" + _stable_hash(
+        {
+            "strategyId": candidate.get("strategyId"),
+            "strategyFileSha256": candidate.get("strategyFileSha256"),
+            "portfolioId": candidate.get("portfolioId"),
+            "strategyInstanceId": candidate.get("strategyInstanceId"),
+        }
+    )[:24]
+
+
+def _validation_portfolio_instance_id(candidate: dict[str, Any]) -> str:
+    return "vpi:" + _stable_hash(
+        {
+            "portfolioId": candidate.get("portfolioId"),
+            "portfolioFileSha256": candidate.get("portfolioFileSha256"),
+        }
+    )[:24]
+
+
+def _exact_binding_issues(
+    binding: dict[str, Any],
+    *,
+    strategy_only: bool,
+) -> list[str]:
+    strategy_id = str(binding.get("strategyId") or "").strip()
+    strategy_hash = str(
+        binding.get("strategyArtifactHash") or ""
+    ).strip().lower()
+    portfolio_id = str(binding.get("portfolioId") or "").strip()
+    portfolio_hash = str(
+        binding.get("portfolioArtifactHash") or ""
+    ).strip().lower()
+    issues: list[str] = []
+
+    if not strategy_id or not strategy_hash:
+        issues.append("strategy-binding-complete-pair-required")
+    if strategy_hash and not _HASH_RE.fullmatch(strategy_hash):
+        issues.append("strategy-artifact-hash-invalid")
+
+    if strategy_only:
+        if portfolio_id or portfolio_hash:
+            issues.append("portfolio-binding-forbidden-for-strategy-only")
+    else:
+        if not portfolio_id or not portfolio_hash:
+            issues.append("portfolio-binding-complete-pair-required")
+        if portfolio_hash and not _HASH_RE.fullmatch(portfolio_hash):
+            issues.append("portfolio-artifact-hash-invalid")
+    return list(dict.fromkeys(issues))
+
+
 def build_validation_plan(
     artifact_root: Path | str,
     *,
     symbols: Iterable[str] = (),
     timeframes: Iterable[str] = (),
     max_per_bucket: int = 1,
+    strategy_id: str = "",
+    strategy_artifact_hash: str = "",
+    portfolio_id: str = "",
+    portfolio_artifact_hash: str = "",
+    strategy_only: bool = False,
     research_short_bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = Path(artifact_root).expanduser().resolve(strict=False)
@@ -537,13 +753,37 @@ def build_validation_plan(
     timeframe_filter = {
         str(item).strip().lower() for item in timeframes if str(item).strip()
     }
+    exact_binding = {
+        "strategyId": str(strategy_id or "").strip(),
+        "strategyArtifactHash": str(
+            strategy_artifact_hash or ""
+        ).strip().lower(),
+        "portfolioId": str(portfolio_id or "").strip(),
+        "portfolioArtifactHash": str(
+            portfolio_artifact_hash or ""
+        ).strip().lower(),
+    }
+    binding_issues = _exact_binding_issues(
+        exact_binding,
+        strategy_only=bool(strategy_only),
+    )
+    if binding_issues:
+        raise ValueError(
+            "exact-artifact-binding-invalid: "
+            + ", ".join(binding_issues)
+        )
+    exact_binding_requested = True
     strategy_files = _scan_payloads(
         root,
         ignored=_IGNORED_STRATEGY_FILES,
     )
-    portfolio_files = _scan_payloads(
-        root / "portfolios",
-        ignored=_IGNORED_PORTFOLIO_FILES,
+    portfolio_files = (
+        []
+        if strategy_only
+        else _scan_payloads(
+            root / "portfolios",
+            ignored=_IGNORED_PORTFOLIO_FILES,
+        )
     )
     strategy_index: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
     blocked: list[dict[str, Any]] = []
@@ -570,6 +810,32 @@ def build_validation_plan(
         strategy_index.setdefault(strategy_id, []).append((path, payload))
 
     candidates: list[dict[str, Any]] = []
+    if strategy_only:
+        for eligible_strategy_id, matches in strategy_index.items():
+            for strategy_path, strategy in matches:
+                symbol = _strategy_symbol(strategy)
+                timeframe = _strategy_timeframe(strategy)
+                if symbol_filter and symbol.upper() not in symbol_filter:
+                    continue
+                if timeframe_filter and timeframe.lower() not in timeframe_filter:
+                    continue
+                candidate, route_issues = _standalone_validation_candidate(
+                    strategy_path,
+                    strategy,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+                    continue
+                blocked.append(
+                    {
+                        "kind": "standalone-strategy",
+                        "id": eligible_strategy_id,
+                        "path": str(strategy_path),
+                        "issues": route_issues,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                    }
+                )
     for portfolio_path, portfolio in portfolio_files:
         portfolio_id = _artifact_id(portfolio)
         portfolio_issues = _portfolio_precheck(portfolio)
@@ -837,10 +1103,39 @@ def build_validation_plan(
                     }
                 )
 
+    if exact_binding_requested:
+        matching_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            mismatch = False
+            for field, expected in exact_binding.items():
+                if not expected:
+                    continue
+                actual = str(candidate.get(field) or "").strip()
+                if field.endswith("Hash"):
+                    mismatch = actual.lower() != expected.lower()
+                else:
+                    mismatch = actual != expected
+                if mismatch:
+                    break
+            if not mismatch:
+                matching_candidates.append(candidate)
+        candidates = matching_candidates
+        if not candidates:
+            blocked.append(
+                {
+                    "kind": "exact-artifact-binding",
+                    "id": exact_binding["strategyId"] or "requested",
+                    "path": str(root),
+                    "issues": ["exact-artifact-binding-not-eligible"],
+                    "requested": dict(exact_binding),
+                }
+            )
+
     integrity_order = {
         "canonical-current": 0,
         "legacy-lock-validation-only": 1,
-        "unsealed": 2,
+        "canonical-invalid": 2,
+        "unsealed": 3,
     }
     candidates.sort(
         key=lambda item: (
@@ -872,30 +1167,10 @@ def build_validation_plan(
             continue
         bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
         candidate["validationStrategyInstanceId"] = (
-            "vsi:"
-            + _stable_hash(
-                {
-                    "strategyId": candidate["strategyId"],
-                    "strategyFileSha256": candidate[
-                        "strategyFileSha256"
-                    ],
-                    "portfolioId": candidate["portfolioId"],
-                    "strategyInstanceId": candidate[
-                        "strategyInstanceId"
-                    ],
-                }
-            )[:24]
+            _validation_strategy_instance_id(candidate)
         )
         candidate["validationPortfolioInstanceId"] = (
-            "vpi:"
-            + _stable_hash(
-                {
-                    "portfolioId": candidate["portfolioId"],
-                    "portfolioFileSha256": candidate[
-                        "portfolioFileSha256"
-                    ],
-                }
-            )[:24]
+            _validation_portfolio_instance_id(candidate)
         )
         selected.append(candidate)
 
@@ -914,6 +1189,11 @@ def build_validation_plan(
         1
         for item in selected
         if item.get("candidateClass") == "general-integration-smoke"
+    )
+    standalone_strategy_candidate_count = sum(
+        1
+        for item in selected
+        if item.get("standaloneStrategy") is True
     )
     blocked_futures_short_count = sum(
         1
@@ -937,8 +1217,9 @@ def build_validation_plan(
         "createdAt": _utc_now(),
         "artifactRoot": str(root),
         "purpose": (
-            "Backtest와 Portfolio를 통과한 후보를 실제 주문 권한 없이 "
-            "Live Trader의 MONITOR/Dry-run 통합 검증 대상으로 고정합니다."
+            "Backtest를 통과한 Portfolio 또는 명시적 standalone Strategy "
+            "후보를 실제 주문 권한 없이 Live Trader의 MONITOR/Dry-run "
+            "통합 검증 대상으로 고정합니다."
         ),
         "guardrails": {
             "runtimeMode": "MONITOR",
@@ -960,6 +1241,12 @@ def build_validation_plan(
                 "positive target weight + sealed artifact"
             ),
             "maxPerBrokerSymbolTimeframe": limit,
+            "strategyOnly": bool(strategy_only),
+        },
+        "artifactBinding": {
+            "requested": exact_binding_requested,
+            **exact_binding,
+            "matchedCandidateCount": len(selected),
         },
         "coverage": [
             {
@@ -971,6 +1258,9 @@ def build_validation_plan(
         ],
         "candidateCount": len(selected),
         "generalSmokeCandidateCount": general_smoke_candidate_count,
+        "standaloneStrategyCandidateCount": (
+            standalone_strategy_candidate_count
+        ),
         "futuresShortCandidateCount": futures_short_candidate_count,
         "blockedFuturesShortCount": blocked_futures_short_count,
         "validationStrategyInstanceCount": len(selected),
@@ -1027,6 +1317,44 @@ def validate_monitor_only_plan(
 
     root = Path(str(plan.get("artifactRoot") or "")).resolve(strict=False)
     candidates = _items(plan.get("candidates"))
+    selection_policy = _mapping(plan.get("selectionPolicy"))
+    strategy_only = selection_policy.get("strategyOnly") is True
+    artifact_binding = _mapping(plan.get("artifactBinding"))
+    if artifact_binding.get("requested") is not True:
+        issues.append("artifact-binding-request-required")
+    binding_issues = _exact_binding_issues(
+        artifact_binding,
+        strategy_only=strategy_only,
+    )
+    issues.extend(
+        f"artifact-binding:{item}"
+        for item in binding_issues
+    )
+    if artifact_binding.get("requested") is True and not binding_issues:
+        for field in (
+            "strategyId",
+            "strategyArtifactHash",
+            "portfolioId",
+            "portfolioArtifactHash",
+        ):
+            expected = str(artifact_binding.get(field) or "").strip()
+            if not expected:
+                continue
+            for index, candidate in enumerate(candidates):
+                actual = str(candidate.get(field) or "").strip()
+                matches = (
+                    actual.lower() == expected.lower()
+                    if field.endswith("Hash")
+                    else actual == expected
+                )
+                if not matches:
+                    issues.append(
+                        f"candidate-{index}:{field}-binding-mismatch"
+                    )
+    if int(artifact_binding.get("matchedCandidateCount") or 0) != len(
+        candidates
+    ):
+        issues.append("artifact-binding-match-count-mismatch")
     if int(plan.get("candidateCount") or 0) != len(candidates):
         issues.append("candidate-count-mismatch")
     strategy_instance_ids = {
@@ -1069,8 +1397,33 @@ def validate_monitor_only_plan(
         general_smoke_count
     ):
         issues.append("general-smoke-candidate-count-mismatch")
+    standalone_count = sum(
+        1
+        for item in candidates
+        if item.get("standaloneStrategy") is True
+    )
+    if int(plan.get("standaloneStrategyCandidateCount") or 0) != (
+        standalone_count
+    ):
+        issues.append("standalone-strategy-candidate-count-mismatch")
     for index, candidate in enumerate(candidates):
         prefix = f"candidate-{index}"
+        if str(candidate.get("validationStrategyInstanceId") or "") != (
+            _validation_strategy_instance_id(candidate)
+        ):
+            issues.append(f"{prefix}:strategy-instance-identity-mismatch")
+        if str(candidate.get("validationPortfolioInstanceId") or "") != (
+            _validation_portfolio_instance_id(candidate)
+        ):
+            issues.append(f"{prefix}:portfolio-instance-identity-mismatch")
+        if strategy_only and candidate.get("standaloneStrategy") is not True:
+            issues.append(f"{prefix}:strategy-only-selection-mismatch")
+        if (
+            candidate.get("standaloneStrategy") is True
+            and str(candidate.get("strategyInstanceId") or "")
+            != f"standalone:{candidate.get('strategyId')}"
+        ):
+            issues.append(f"{prefix}:standalone-runtime-identity-mismatch")
         if candidate.get("validationEligible") is not True:
             issues.append(f"{prefix}:validation-eligibility-missing")
         if candidate.get("runtimeMode") != "MONITOR":
@@ -1090,7 +1443,12 @@ def validate_monitor_only_plan(
                 issues.append(f"{prefix}:short-permission-not-declared")
         if not verify_files:
             continue
-        for kind in ("strategy", "portfolio"):
+        artifact_kinds = (
+            ("strategy",)
+            if candidate.get("standaloneStrategy") is True
+            else ("strategy", "portfolio")
+        )
+        for kind in artifact_kinds:
             path = Path(str(candidate.get(f"{kind}Path") or "")).resolve(
                 strict=False
             )
@@ -1427,9 +1785,11 @@ def validation_plan_snapshot(
             },
             "candidateCount": 0,
             "generalSmokeCandidateCount": 0,
+            "standaloneStrategyCandidateCount": 0,
             "futuresShortCandidateCount": 0,
             "runtimeEvaluationReadyCount": 0,
             "candidates": [],
+            "artifactBinding": {},
             "researchShortBundle": research,
         }
     try:
@@ -1443,9 +1803,11 @@ def validation_plan_snapshot(
             "verification": {"ok": False, "issues": [str(exc)]},
             "candidateCount": 0,
             "generalSmokeCandidateCount": 0,
+            "standaloneStrategyCandidateCount": 0,
             "futuresShortCandidateCount": 0,
             "runtimeEvaluationReadyCount": 0,
             "candidates": [],
+            "artifactBinding": {},
             "researchShortBundle": research,
         }
     plan = loaded["plan"]
@@ -1472,12 +1834,18 @@ def validation_plan_snapshot(
             portfolio_counts.get(portfolio_key, 0) + 1
         )
     for item in _items(plan.get("candidates")):
-        integrity_ready = bool(
+        strategy_integrity_ready = bool(
             _mapping(item.get("strategyIntegrity")).get(
                 "productionIntegrityReady"
             )
-            and _mapping(item.get("portfolioIntegrity")).get(
-                "productionIntegrityReady"
+        )
+        integrity_ready = bool(
+            strategy_integrity_ready
+            and (
+                item.get("standaloneStrategy") is True
+                or _mapping(item.get("portfolioIntegrity")).get(
+                    "productionIntegrityReady"
+                )
             )
         )
         candidates.append(
@@ -1489,8 +1857,20 @@ def validation_plan_snapshot(
                     item.get("validationPortfolioInstanceId") or ""
                 ),
                 "strategyId": str(item.get("strategyId") or ""),
+                "strategyArtifactHash": str(
+                    item.get("strategyArtifactHash") or ""
+                ),
+                "strategyFileSha256": str(
+                    item.get("strategyFileSha256") or ""
+                ),
                 "strategyName": str(item.get("strategyName") or ""),
                 "portfolioId": str(item.get("portfolioId") or ""),
+                "portfolioArtifactHash": str(
+                    item.get("portfolioArtifactHash") or ""
+                ),
+                "portfolioFileSha256": str(
+                    item.get("portfolioFileSha256") or ""
+                ),
                 "portfolioName": str(item.get("portfolioName") or ""),
                 "symbol": str(item.get("symbol") or ""),
                 "timeframe": str(item.get("timeframe") or ""),
@@ -1507,6 +1887,9 @@ def validation_plan_snapshot(
                 "candidateClass": str(
                     item.get("candidateClass")
                     or "general-integration-smoke"
+                ),
+                "standaloneStrategy": (
+                    item.get("standaloneStrategy") is True
                 ),
                 "productionLifecycle": str(
                     item.get("productionLifecycle") or ""
@@ -1542,6 +1925,11 @@ def validation_plan_snapshot(
             for item in candidates
             if item["candidateClass"] == "general-integration-smoke"
         ),
+        "standaloneStrategyCandidateCount": sum(
+            1
+            for item in candidates
+            if item["standaloneStrategy"]
+        ),
         "futuresShortCandidateCount": sum(
             1
             for item in candidates
@@ -1554,6 +1942,7 @@ def validation_plan_snapshot(
             1 for item in candidates if item["runtimeEvaluationReady"]
         ),
         "guardrails": _mapping(plan.get("guardrails")),
+        "artifactBinding": _mapping(plan.get("artifactBinding")),
         "candidates": candidates,
         "researchShortBundle": research,
     }
@@ -1589,8 +1978,11 @@ def resolve_runtime_candidate(
         _mapping(candidate.get("strategyIntegrity")).get(
             "productionIntegrityReady"
         )
-        and _mapping(candidate.get("portfolioIntegrity")).get(
-            "productionIntegrityReady"
+        and (
+            candidate.get("standaloneStrategy") is True
+            or _mapping(candidate.get("portfolioIntegrity")).get(
+                "productionIntegrityReady"
+            )
         )
     )
     if not runtime_ready:
@@ -1627,6 +2019,92 @@ def validation_candidate_profile(candidate: dict[str, Any]) -> str:
 def _candidate_runtime_spec(
     candidate: dict[str, Any],
 ) -> RuntimeStrategySpec:
+    if candidate.get("standaloneStrategy") is True:
+        strategy_path = Path(
+            str(candidate.get("strategyPath") or "")
+        ).expanduser().resolve(strict=False)
+        expected_file_sha = str(
+            candidate.get("strategyFileSha256") or ""
+        ).strip().lower()
+        if (
+            not _HASH_RE.fullmatch(expected_file_sha)
+            or _file_hash(strategy_path) != expected_file_sha
+        ):
+            raise ValueError(
+                "검증 plan의 standalone Strategy file SHA-256이 "
+                "원본 파일과 일치하지 않습니다."
+            )
+        strategy = _read_json(strategy_path)
+        verification = verify_strategy_artifact(strategy)
+        expected_hash = str(
+            candidate.get("strategyArtifactHash") or ""
+        ).strip().lower()
+        if (
+            not verification.valid
+            or verification.declared_hash != expected_hash
+        ):
+            raise ValueError(
+                "검증 plan의 standalone Strategy canonical hash가 "
+                "원본 Artifact와 일치하지 않습니다."
+            )
+        strategy_id = _artifact_id(strategy)
+        expected_runtime_instance_id = f"standalone:{strategy_id}"
+        symbol = _strategy_symbol(strategy).upper()
+        timeframe = _strategy_timeframe(strategy).lower()
+        plugin = _strategy_plugin(strategy)
+        if (
+            strategy_id != str(candidate.get("strategyId") or "")
+            or symbol != str(candidate.get("symbol") or "").upper()
+            or timeframe
+            != str(candidate.get("timeframe") or "").lower()
+            or plugin != str(candidate.get("plugin") or "")
+            or str(candidate.get("strategyInstanceId") or "")
+            != expected_runtime_instance_id
+        ):
+            raise ValueError(
+                "검증 plan과 standalone Strategy 실행 계약이 정확히 "
+                "일치하지 않습니다."
+            )
+        market_type = str(
+            candidate.get("marketType") or ""
+        ).strip().lower()
+        inferred_provider, inferred_broker, instrument_id = (
+            infer_market_route(symbol, market_type)
+        )
+        provider = str(
+            candidate.get("marketDataProvider") or inferred_provider
+        ).strip().lower()
+        broker_id = str(
+            candidate.get("brokerHint") or inferred_broker
+        ).strip().lower()
+        data_artifact = _mapping(
+            strategy.get("dataArtifact")
+            or strategy.get("data_artifact")
+        )
+        instrument_id = str(
+            data_artifact.get("instrumentId")
+            or strategy.get("instrumentId")
+            or instrument_id
+        ).strip()
+        return RuntimeStrategySpec(
+            portfolio_id=f"standalone:{strategy_id}",
+            portfolio_hash=expected_hash,
+            strategy_instance_id=expected_runtime_instance_id,
+            strategy_id=strategy_id,
+            artifact_hash=expected_hash,
+            plugin_id=plugin,
+            instrument_id=instrument_id,
+            symbol=(instrument_id if provider == "yahoo" else symbol),
+            timeframe=timeframe,
+            provider=provider,
+            broker_id=broker_id,
+            target_weight=max(
+                0.0,
+                float(candidate.get("targetWeight") or 0.0),
+            ),
+            parameters=_mapping(strategy.get("parameters")),
+            artifact={**strategy, "standalone": True},
+        )
     loaded = load_portfolio_runtime_path(
         str(candidate.get("portfolioPath") or "")
     )
@@ -1639,13 +2117,22 @@ def _candidate_runtime_spec(
         for spec in loaded.specs
         if spec.strategy_instance_id == instance_id
         and spec.strategy_id == strategy_id
+        and spec.artifact_hash
+        == str(candidate.get("strategyArtifactHash") or "")
         and spec.symbol == symbol
         and spec.timeframe.lower() == timeframe
     ]
+    if loaded.portfolio_hash != str(
+        candidate.get("portfolioArtifactHash") or ""
+    ):
+        raise ValueError(
+            "검증 plan의 Portfolio artifact hash와 canonical runtime "
+            "artifact hash가 일치하지 않습니다."
+        )
     if len(matches) != 1:
         raise ValueError(
-            "검증 plan과 canonical Portfolio runtime spec이 정확히 "
-            "일치하지 않습니다."
+            "검증 plan의 Strategy ID·artifact hash와 canonical "
+            "Portfolio runtime spec이 정확히 일치하지 않습니다."
         )
     return matches[0]
 

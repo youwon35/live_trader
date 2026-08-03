@@ -36,6 +36,32 @@ def _strategy(
 
 
 class RuntimeContextBindingTest(unittest.TestCase):
+    def test_runtime_start_rejects_missing_selected_deployment_without_fallback(self) -> None:
+        available = _strategy("available", deployment_id="dep-available")
+        original_state = copy.deepcopy(state.STATE)
+        try:
+            with (
+                patch.object(state, "portfolio_rows", return_value=[]),
+                patch.object(state, "strategy_rows", return_value=[available]),
+                patch.object(state, "snapshot", return_value={}),
+                patch.object(state, "append_audit"),
+                patch.object(state.LIVE_CONTINUOUS_CONTROLLER, "start") as start,
+            ):
+                result = state.start_continuous_runtime(
+                    "crypto",
+                    "MONITOR",
+                    "",
+                    "dep-missing",
+                    "missing",
+                )
+        finally:
+            state.STATE.clear()
+            state.STATE.update(original_state)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("일치하지 않습니다", result["reason"])
+        start.assert_not_called()
+
     def test_explicit_standalone_selector_never_falls_back_to_first_eligible(self) -> None:
         controller = LiveContinuousController(Path("."))
         first = _strategy("first", deployment_id="dep-first")
