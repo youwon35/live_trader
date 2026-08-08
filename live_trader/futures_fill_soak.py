@@ -244,6 +244,7 @@ class FillSoakConfig:
     poll_interval_seconds: float = 1.0
     monitor_interval_seconds: float = 10.0
     strategy_id: str = "binance-futures-fill-soak"
+    canary_scope: dict[str, object] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         normalized_session_id = _safe_id(self.session_id, maximum=64)
@@ -276,6 +277,7 @@ class FillSoakConfig:
         object.__setattr__(self, "symbol", normalized_symbol)
         object.__setattr__(self, "target_notional_usdt", target)
         object.__setattr__(self, "daily_drawdown_limit_pct", drawdown)
+        object.__setattr__(self, "canary_scope", dict(self.canary_scope))
 
     def to_dict(self) -> dict[str, object]:
         result = asdict(self)
@@ -446,6 +448,10 @@ class BinanceFuturesFillSoakSession:
         rules_provider: Callable[[str], dict[str, object]] | None = None,
         live_orders_enabled: Callable[[], bool] | None = None,
         report_writer: ReportWriter | None = None,
+        dispatch_authorizer: (
+            Callable[[dict[str, object]], tuple[bool, str, dict[str, object]]]
+            | None
+        ) = None,
     ) -> None:
         self.config = config
         self.router: Router = router or LiveBrokerRouter()
@@ -456,6 +462,9 @@ class BinanceFuturesFillSoakSession:
             live_orders_enabled or real_orders_enabled
         )
         self.report_writer = report_writer or ImmutableJsonReportWriter()
+        # There is deliberately no permissive default. Production injects the
+        # operational runtime gate and tests must explicitly provide a stub.
+        self.dispatch_authorizer = dispatch_authorizer
         self._stop_requested = threading.Event()
         self._run_lock = threading.Lock()
         self._status_lock = threading.Lock()
@@ -486,6 +495,24 @@ class BinanceFuturesFillSoakSession:
         self._attempted_entry_quantity = Decimal("0")
         self._final_report: dict[str, object] | None = None
         self._report_path = ""
+
+    def _authorize_place_order(self, intent: dict[str, object]) -> None:
+        if self.dispatch_authorizer is None:
+            raise FillSoakHalt("operational-dispatch-authorizer-missing")
+        try:
+            allowed, reason, _snapshot = self.dispatch_authorizer(dict(intent))
+        except FillSoakHalt:
+            raise
+        except Exception as exc:
+            raise FillSoakHalt(
+                "operational-dispatch-authorization-error",
+                type(exc).__name__,
+            ) from exc
+        if allowed is not True:
+            raise FillSoakHalt(
+                "operational-dispatch-authorization-blocked",
+                str(reason or "operational runtime authorization denied"),
+            )
 
     def request_stop(self) -> None:
         self._stop_requested.set()
@@ -1324,6 +1351,8 @@ class BinanceFuturesFillSoakSession:
             "required_margin_type": "ISOLATED",
             "risk_reducing": leg == "cover",
             "reduce_only": leg == "cover",
+            "soak_leg": leg,
+            "canary_scope": dict(self.config.canary_scope),
             "identifier": client_order_id,
         }
         record: dict[str, object] = {
@@ -1338,7 +1367,11 @@ class BinanceFuturesFillSoakSession:
         }
         self._orders.append(record)
         try:
+            self._authorize_place_order(intent)
             response = self.router.place_order(intent)
+        except FillSoakHalt:
+            record["status"] = "BLOCKED"
+            raise
         except Exception as exc:
             resolved = self._resolve_ambiguous_submission(
                 client_order_id,
@@ -1693,6 +1726,8 @@ class BinanceFuturesFillSoakSession:
             "required_margin_type": "ISOLATED",
             "risk_reducing": True,
             "reduce_only": True,
+            "soak_leg": "recovery-cover",
+            "canary_scope": dict(self.config.canary_scope),
             "identifier": client_order_id,
         }
         record: dict[str, object] = {
@@ -1704,7 +1739,16 @@ class BinanceFuturesFillSoakSession:
         }
         self._orders.append(record)
         try:
+            self._authorize_place_order(intent)
             response = self.router.place_order(intent)
+        except FillSoakHalt as exc:
+            record["status"] = "BLOCKED"
+            return {
+                "ok": False,
+                "reason_id": exc.reason_id,
+                "detail": exc.detail,
+                "client_order_id": client_order_id,
+            }
         except Exception as exc:
             status = self._resolve_ambiguous_submission(
                 client_order_id,

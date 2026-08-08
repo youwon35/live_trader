@@ -7,6 +7,7 @@ import {
   Clock3,
   Download,
   FileClock,
+  FlaskConical,
   LayoutDashboard,
   ListChecks,
   Lock,
@@ -105,6 +106,7 @@ import {
 } from "./deploymentSelection";
 import { buildOrderCsvRows, ORDER_CSV_COLUMNS } from "./orderCsv";
 import { createActionButton } from "../../../packages/design/action-button.js";
+import FunctionalTestWorkspace from "./FunctionalTestWorkspace";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
 import { createAppearanceSettingsPanel } from "../../../packages/design/appearance-settings-panel.js";
 import {
@@ -174,6 +176,7 @@ const ProgramJourney = React.lazy(() => import("../../../packages/design/program
 const navItems = [
   { id: "overview", label: "운영 현황", icon: LayoutDashboard },
   { id: "gate", label: "배포·승급", icon: ListChecks },
+  { id: "functional-test", label: "기능시험", icon: FlaskConical },
   { id: "accounts", label: "계좌·포지션", icon: WalletCards },
   { id: "orders", label: "주문·체결", icon: FileClock },
   { id: "risk", label: "리스크·안전", icon: ShieldAlert },
@@ -193,6 +196,11 @@ const pageProfiles = {
     title: "배포·승급",
     eyebrow: "DEPLOYMENT & PROMOTION",
     summary: "검증된 Portfolio Artifact를 배포 단위로 고정하고 계보·Evidence·승급 조건을 확인합니다.",
+  },
+  "functional-test": {
+    title: "기능시험",
+    eyebrow: "KIS LIVE FUNCTIONAL TEST",
+    summary: "승급 Evidence와 분리된 기간형 KIS 실전 기능시험 허가와 당일 활성화를 준비합니다.",
   },
   accounts: {
     title: "계좌·포지션",
@@ -1473,7 +1481,7 @@ applyAppearance(readAppearance());
 applyLayoutMode(readLayoutMode());
 
 const LIVE_FLOW_STORAGE_KEY = "live_trader.guidedFlow.v1";
-const LIVE_FLOW_IDS = ["overview", "gate", "accounts", "orders", "risk", "automation", "incidents", "audit", "settings"];
+const LIVE_FLOW_IDS = ["overview", "gate", "functional-test", "accounts", "orders", "risk", "automation", "incidents", "audit", "settings"];
 const DEPLOYMENT_CONTEXT_STORAGE_KEY = "live_trader.deploymentContext.v1";
 const LIVE_PROGRAM_JOURNEY_STORAGE_KEY = "live_trader.programJourney.v1";
 
@@ -1911,23 +1919,27 @@ function App() {
           </div>
         </header>
 
-        <LiveEnvironmentBar
-          context={deploymentContext}
-          deploymentOptions={deploymentOptions}
-          onSelect={selectDeploymentContext}
-          snapshot={snapshot}
-        />
-
-        <React.Suspense fallback={null}>
-          <ProgramJourney
-            activeStepId="live"
-            artifact={journeyArtifact}
-            blocker={journeyBlocker}
-            blockerTone={journeyBlockerTone}
-            nextAction={journeyNextAction}
-            storageKey={LIVE_PROGRAM_JOURNEY_STORAGE_KEY}
+        {selectedNav === "functional-test" ? null : (
+          <LiveEnvironmentBar
+            context={deploymentContext}
+            deploymentOptions={deploymentOptions}
+            onSelect={selectDeploymentContext}
+            snapshot={snapshot}
           />
-        </React.Suspense>
+        )}
+
+        {selectedNav === "functional-test" ? null : (
+          <React.Suspense fallback={null}>
+            <ProgramJourney
+              activeStepId="live"
+              artifact={journeyArtifact}
+              blocker={journeyBlocker}
+              blockerTone={journeyBlockerTone}
+              nextAction={journeyNextAction}
+              storageKey={LIVE_PROGRAM_JOURNEY_STORAGE_KEY}
+            />
+          </React.Suspense>
+        )}
 
         {error && snapshot.api_connected === false && (
           <section className="api-connection-banner" role="alert">
@@ -2177,6 +2189,10 @@ function WorkspaceContent({
         />
       </section>,
     );
+  }
+
+  if (selectedNav === "functional-test") {
+    return renderPage(<FunctionalTestWorkspace />);
   }
 
   if (selectedNav === "gate") {
@@ -4374,7 +4390,7 @@ const STRATEGY_LIFECYCLE_STEPS = [
 ];
 
 const navGroups = [
-  { id: "operate", label: "주 운영 흐름", itemIds: ["overview", "gate", "accounts", "orders", "risk", "automation"] },
+  { id: "operate", label: "주 운영 흐름", itemIds: ["overview", "gate", "functional-test", "accounts", "orders", "risk", "automation"] },
   { id: "records", label: "기록·대응", itemIds: ["incidents", "audit"] },
   { id: "system", label: "시스템", itemIds: ["settings"] },
 ];

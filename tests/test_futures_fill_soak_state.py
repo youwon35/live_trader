@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import threading
 import unittest
+from unittest.mock import patch
 
 from live_trader import state
 
@@ -178,6 +179,175 @@ class FuturesFillSoakStateTest(unittest.TestCase):
             "BLOCKED",
             response["fill_soak"]["status"],
         )
+
+    @staticmethod
+    def _production_strategy() -> dict[str, object]:
+        return {
+            "strategy_id": "binance-futures-qualified",
+            "symbol": "BTCUSDT",
+            "broker_id": "binance-futures",
+            "strategy_instance_id": "bf-instance-1",
+            "portfolio_gate": {},
+        }
+
+    @staticmethod
+    def _entry_payload() -> dict[str, object]:
+        return {
+            "strategy_id": "binance-futures-qualified",
+            "symbol": "BTCUSDT",
+            "side": "SELL",
+            "quantity": "0.001",
+            "price": "6000",
+            "order_type": "MARKET",
+            "position_direction": "short",
+            "risk_reducing": False,
+            "reduce_only": False,
+            "soak_leg": "entry",
+            "canary_scope": {"eligible": True, "scopeId": "a" * 64},
+        }
+
+    def test_every_fill_soak_entry_revalidates_common_gate_scope_and_runtime(
+        self,
+    ) -> None:
+        original_mode = state.STATE.get("mode")
+        state.STATE["mode"] = "SMALL_LIVE"
+        try:
+            with patch.object(
+                state,
+                "strategy_rows",
+                return_value=[self._production_strategy()],
+            ), patch.object(
+                state,
+                "live_broker_dispatch_allowed",
+                return_value=(True, ""),
+            ) as broker_gate, patch.object(
+                state,
+                "exact_live_canary_scope_dispatch_allowed",
+                return_value=(True, "", {"eligible": True, "scopeId": "a" * 64}),
+            ) as scope_gate, patch.object(
+                state,
+                "operational_runtime_dispatch_allowed",
+                return_value=(True, "operational-runtime-authorized", {}),
+            ) as runtime_gate:
+                result = state._authorize_binance_futures_fill_soak_dispatch(
+                    self._entry_payload()
+                )
+        finally:
+            state.STATE["mode"] = original_mode
+
+        self.assertTrue(result[0])
+        self.assertEqual("new-entry", result[2]["dispatchPath"])
+        broker_gate.assert_called_once()
+        self.assertFalse(broker_gate.call_args.kwargs["dry_run"])
+        scope_gate.assert_called_once()
+        runtime_gate.assert_called_once()
+
+    def test_fill_soak_entry_propagates_each_mutable_safety_block(self) -> None:
+        original_mode = state.STATE.get("mode")
+        state.STATE["mode"] = "SMALL_LIVE"
+        try:
+            for reason in (
+                "dry-run-broker-dispatch-forbidden",
+                "risk-increasing-order-blocked",
+                "operator-confirmation-required",
+                "live-runtime-intent-mode-mismatch",
+            ):
+                with self.subTest(reason=reason), patch.object(
+                    state,
+                    "strategy_rows",
+                    return_value=[self._production_strategy()],
+                ), patch.object(
+                    state,
+                    "live_broker_dispatch_allowed",
+                    return_value=(False, reason),
+                ), patch.object(
+                    state,
+                    "exact_live_canary_scope_dispatch_allowed",
+                ) as scope_gate, patch.object(
+                    state,
+                    "operational_runtime_dispatch_allowed",
+                ) as runtime_gate:
+                    result = state._authorize_binance_futures_fill_soak_dispatch(
+                        self._entry_payload()
+                    )
+                self.assertFalse(result[0])
+                self.assertEqual(reason, result[1])
+                scope_gate.assert_not_called()
+                runtime_gate.assert_not_called()
+        finally:
+            state.STATE["mode"] = original_mode
+
+    def test_fill_soak_entry_blocks_changed_exact_canary_scope(self) -> None:
+        original_mode = state.STATE.get("mode")
+        state.STATE["mode"] = "SMALL_LIVE"
+        try:
+            with patch.object(
+                state,
+                "strategy_rows",
+                return_value=[self._production_strategy()],
+            ), patch.object(
+                state,
+                "live_broker_dispatch_allowed",
+                return_value=(True, ""),
+            ), patch.object(
+                state,
+                "exact_live_canary_scope_dispatch_allowed",
+                return_value=(
+                    False,
+                    "live-canary-order-scope-changed:currentDeploymentRevision",
+                    {"eligible": True, "scopeId": "b" * 64},
+                ),
+            ), patch.object(
+                state,
+                "operational_runtime_dispatch_allowed",
+            ) as runtime_gate:
+                result = state._authorize_binance_futures_fill_soak_dispatch(
+                    self._entry_payload()
+                )
+        finally:
+            state.STATE["mode"] = original_mode
+
+        self.assertFalse(result[0])
+        self.assertIn("scope-changed", result[1])
+        runtime_gate.assert_not_called()
+
+    def test_fill_soak_recovery_cover_uses_explicit_reduce_only_path(self) -> None:
+        payload = {
+            **self._entry_payload(),
+            "side": "BUY",
+            "risk_reducing": True,
+            "reduce_only": True,
+            "soak_leg": "recovery-cover",
+        }
+        with patch.object(
+            state,
+            "strategy_rows",
+            return_value=[self._production_strategy()],
+        ), patch.object(
+            state,
+            "futures_risk_reducing_verified",
+            return_value=True,
+        ) as reducing, patch.object(
+            state,
+            "live_broker_dispatch_allowed",
+        ) as broker_gate, patch.object(
+            state,
+            "exact_live_canary_scope_dispatch_allowed",
+        ) as scope_gate, patch.object(
+            state,
+            "operational_runtime_dispatch_allowed",
+            return_value=(True, "operational-runtime-authorized", {}),
+        ) as runtime_gate:
+            result = state._authorize_binance_futures_fill_soak_dispatch(
+                payload
+            )
+
+        self.assertTrue(result[0])
+        self.assertTrue(result[2]["recoveryReduceOnly"])
+        reducing.assert_called_once()
+        broker_gate.assert_not_called()
+        scope_gate.assert_not_called()
+        runtime_gate.assert_called_once()
 
 
 if __name__ == "__main__":

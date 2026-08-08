@@ -29,6 +29,10 @@ from trading_runtime.artifact_governance import (  # noqa: E402
     verify_portfolio_artifact,
     verify_strategy_artifact,
 )
+from trading_runtime.paper_live_contract import (  # noqa: E402
+    PAPER_LIVE_QUALIFICATION_SCHEMA_VERSION,
+    validate_paper_live_evidence,
+)
 from trading_runtime.lifecycle import (  # noqa: E402
     ACTIVE_REVALIDATION_STAGES,
     LIFECYCLE_LABELS,
@@ -836,8 +840,36 @@ def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         or artifact.get("promotionStage")
         or "draft"
     )
+    artifact_id = str(
+        artifact.get("id")
+        or artifact.get("portfolio_id")
+        or artifact.get("_source_path")
+        or "portfolio"
+    )
+    reference_payload = {
+        key: value
+        for key, value in artifact.items()
+        if key not in {"_artifact_integrity", "_source_path"}
+    }
+    try:
+        canonical_reference = artifact_reference(reference_payload)
+    except ValueError:
+        canonical_reference = {}
+    artifact_reference_value = {
+        "artifactId": str(
+            canonical_reference.get("artifactId") or artifact_id
+        ).strip(),
+        "artifactHash": str(
+            canonical_reference.get("artifactHash")
+            or integrity.get("declaredHash")
+            or ""
+        ).strip().lower(),
+        "contentHash": str(
+            canonical_reference.get("contentHash") or ""
+        ).strip().lower(),
+    }
     return {
-        "id": str(artifact.get("id") or artifact.get("portfolio_id") or artifact.get("_source_path") or "portfolio"),
+        "id": artifact_id,
         "name": str(artifact.get("name") or artifact.get("portfolioName") or artifact.get("id") or "Portfolio Artifact"),
         "schema_version": str(artifact.get("schemaVersion") or "portfolio-artifact-v1"),
         "artifact_type": str(artifact.get("artifactType") or "portfolio"),
@@ -865,6 +897,10 @@ def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "operational_readiness_bundle": operational_bundle,
         "operational_readiness_hash": str(operational_bundle.get("contentHash") or ""),
         "artifact_integrity": integrity,
+        # Keep the canonical reference alongside the normalized portfolio.
+        # Live must select the exact deployment-pinned artifact, never merely
+        # the newest file that happens to reuse the same Portfolio ID.
+        "artifact_reference": artifact_reference_value,
         "live_usable": integrity_valid,
         "source_path": str(artifact.get("_source_path") or ""),
     }
@@ -891,23 +927,218 @@ def enrich_strategy_artifact_runtime(folder: Path, path: Path, artifact: dict[st
         for item in DeploymentStore(folder).list()
         if _dict_value(item.get("strategyArtifact")).get("artifactId") == reference.get("artifactId")
         and _dict_value(item.get("strategyArtifact")).get("artifactHash") == reference.get("artifactHash")
+        and str(item.get("environment") or "").strip().upper()
+        in {"LIVE", "SMALL_LIVE", "FULL_LIVE"}
     ]
     deployment = deployments[0] if deployments else {}
     if deployment:
         payload["_deployment"] = deployment
     portfolio_ref = _dict_value(deployment.get("portfolioArtifact"))
-    evidence_record = EvidenceStore(folder).latest_for_strategy(
-        str(reference.get("artifactId") or ""),
-        strategy_artifact_hash=str(reference.get("artifactHash") or ""),
-        portfolio_artifact_id=str(portfolio_ref.get("artifactId") or ""),
-        portfolio_artifact_hash=str(portfolio_ref.get("artifactHash") or ""),
+    qualification = load_pinned_paper_live_qualification(
+        folder,
+        payload,
+        deployment,
+        strategy_reference=reference,
+        portfolio_reference=portfolio_ref,
     )
-    if evidence_record is not None:
-        payload["_external_paper_evidence"] = evidence_record.payload
-        payload["_external_paper_evidence_valid"] = evidence_record.valid
-        payload["_external_paper_evidence_issues"] = list(evidence_record.issues)
+    payload["_paper_live_qualification_required"] = True
+    payload["_paper_live_qualification"] = qualification
+    evidence_payload = qualification.get("evidencePayload")
+    if isinstance(evidence_payload, dict):
+        payload["_external_paper_evidence"] = evidence_payload
+        payload["_external_paper_evidence_valid"] = qualification.get("ready") is True
+        payload["_external_paper_evidence_issues"] = list(
+            qualification.get("issues") or []
+        )
     payload["_source_path"] = str(path)
     return payload
+
+
+def load_pinned_paper_live_qualification(
+    folder: Path,
+    artifact: dict[str, Any],
+    deployment: dict[str, Any],
+    *,
+    permissions: dict[str, Any] | None = None,
+    strategy_reference: dict[str, Any] | None = None,
+    portfolio_reference: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load only the exact Paper evidence pinned by Live deployment policy.
+
+    An evidence file being newer, having the same Strategy ID, or merely
+    passing the legacy evidence envelope is never enough.  The deployment
+    must name the outer evidence-envelope hash, the inner EvidenceBundle hash,
+    and the final binding hash.  Artifact permissions are never authority.
+    """
+
+    live_deployment_id = str(deployment.get("deploymentId") or "").strip()
+    live_environment = str(deployment.get("environment") or "").strip().upper()
+    deployment_permissions = deployment.get("permissions")
+    if (
+        not live_deployment_id
+        or live_environment not in {"LIVE", "SMALL_LIVE", "FULL_LIVE"}
+    ):
+        return {
+            "ready": False,
+            "required": True,
+            "schemaVersion": PAPER_LIVE_QUALIFICATION_SCHEMA_VERSION,
+            "evidenceId": "",
+            "evidenceHash": "",
+            "evidenceBundleHash": "",
+            "bindingHash": "",
+            "issues": ["paper-live-live-environment-deployment-required"],
+        }
+    if not isinstance(deployment_permissions, dict):
+        return {
+            "ready": False,
+            "required": True,
+            "schemaVersion": PAPER_LIVE_QUALIFICATION_SCHEMA_VERSION,
+            "evidenceId": "",
+            "evidenceHash": "",
+            "evidenceBundleHash": "",
+            "bindingHash": "",
+            "issues": ["paper-live-deployment-permissions-required"],
+        }
+    # The optional argument is retained for call compatibility, but it cannot
+    # override authority. Even resume must use pins present on the persisted
+    # Live Deployment itself; caller- or Artifact-supplied permissions are not
+    # trusted.
+    _ = permissions
+    permission_source = deployment_permissions
+    evidence_id = str(permission_source.get("paperEvidenceId") or "").strip()
+    evidence_hash = str(permission_source.get("paperEvidenceHash") or "").strip().lower()
+    evidence_bundle_hash = str(
+        permission_source.get("paperEvidenceBundleHash") or ""
+    ).strip().lower()
+    binding_hash = str(
+        permission_source.get("paperFinalBindingHash") or ""
+    ).strip().lower()
+    paper_governance_deployment_id = str(
+        permission_source.get("paperGovernanceDeploymentId") or ""
+    ).strip()
+    strategy_instance_id = str(
+        permission_source.get("paperStrategyInstanceId") or ""
+    ).strip()
+    deployment_strategy_ref = _dict_value(deployment.get("strategyArtifact"))
+    portfolio_ref = _dict_value(deployment.get("portfolioArtifact"))
+    portfolio_id = str(portfolio_ref.get("artifactId") or "").strip()
+    portfolio_hash = str(portfolio_ref.get("artifactHash") or "").strip().lower()
+    portfolio_required = bool(portfolio_id or portfolio_hash)
+    portfolio_instance_id = str(
+        permission_source.get("paperPortfolioInstanceId") or ""
+    ).strip()
+    missing = [
+        key
+        for key, value in (
+            ("paperEvidenceId", evidence_id),
+            ("paperEvidenceHash", evidence_hash),
+            ("paperEvidenceBundleHash", evidence_bundle_hash),
+            ("paperFinalBindingHash", binding_hash),
+            ("paperGovernanceDeploymentId", paper_governance_deployment_id),
+            ("paperStrategyInstanceId", strategy_instance_id),
+            (
+                "paperPortfolioInstanceId",
+                portfolio_instance_id if portfolio_required else True,
+            ),
+        )
+        if not value
+    ]
+    base = {
+        "ready": False,
+        "required": True,
+        "schemaVersion": PAPER_LIVE_QUALIFICATION_SCHEMA_VERSION,
+        "evidenceId": evidence_id,
+        "evidenceHash": evidence_hash,
+        "evidenceBundleHash": evidence_bundle_hash,
+        "bindingHash": binding_hash,
+        "issues": [],
+    }
+    if (
+        not str(deployment_strategy_ref.get("artifactId") or "").strip()
+        or not str(deployment_strategy_ref.get("artifactHash") or "").strip()
+    ):
+        base["issues"] = ["paper-live-deployment-strategy-reference-incomplete"]
+        return base
+    if missing:
+        base["issues"] = [
+            "paper-live-deployment-pin-missing:" + ",".join(missing)
+        ]
+        return base
+    if portfolio_required and (not portfolio_id or not portfolio_hash):
+        base["issues"] = ["paper-live-portfolio-artifact-reference-incomplete"]
+        return base
+    if not portfolio_required and portfolio_instance_id:
+        base["issues"] = ["paper-live-standalone-portfolio-pin-not-empty"]
+        return base
+    if paper_governance_deployment_id == live_deployment_id:
+        base["issues"] = ["paper-live-governance-deployment-not-distinct"]
+        return base
+
+    record = EvidenceStore(folder).get_paper(evidence_id)
+    if record is None:
+        base["issues"] = ["paper-live-pinned-evidence-not-found"]
+        return base
+    if not record.valid:
+        base["issues"] = [
+            f"paper-live-artifact-evidence-invalid:{issue}"
+            for issue in (record.issues or ("integrity",))
+        ]
+        base["evidencePayload"] = record.payload
+        return base
+
+    current_strategy_ref = strategy_reference
+    if not isinstance(current_strategy_ref, dict):
+        try:
+            current_strategy_ref = artifact_reference(artifact)
+        except ValueError:
+            current_strategy_ref = {}
+    for key in ("artifactId", "artifactHash"):
+        if str(current_strategy_ref.get(key) or "") != str(
+            deployment_strategy_ref.get(key) or ""
+        ):
+            base["issues"] = [
+                f"paper-live-current-deployment-strategy-{key}-mismatch"
+            ]
+            return base
+    if isinstance(portfolio_reference, dict):
+        for key in ("artifactId", "artifactHash"):
+            if str(portfolio_reference.get(key) or "") != str(
+                portfolio_ref.get(key) or ""
+            ):
+                base["issues"] = [
+                    f"paper-live-current-deployment-portfolio-{key}-mismatch"
+                ]
+                return base
+    validation = validate_paper_live_evidence(
+        record.payload,
+        expected_evidence_id=evidence_id,
+        expected_evidence_hash=evidence_hash,
+        expected_evidence_bundle_hash=evidence_bundle_hash,
+        expected_binding_hash=binding_hash,
+        expected_paper_governance_deployment_id=(
+            paper_governance_deployment_id
+        ),
+        expected_strategy_artifact_id=str(
+            deployment_strategy_ref.get("artifactId") or ""
+        ),
+        expected_strategy_artifact_hash=str(
+            deployment_strategy_ref.get("artifactHash") or ""
+        ),
+        expected_strategy_instance_id=strategy_instance_id,
+        expected_portfolio_artifact_id=portfolio_id,
+        expected_portfolio_artifact_hash=portfolio_hash,
+        expected_portfolio_instance_id=portfolio_instance_id,
+        expected_portfolio_required=portfolio_required,
+    )
+    snapshot = validation.snapshot()
+    snapshot.update(
+        {
+            "required": True,
+            "evidencePayload": record.payload,
+            "evidencePath": str(record.path),
+        }
+    )
+    return snapshot
 
 
 def load_strategy_artifacts(limit: int | None = None) -> list[dict[str, Any]]:
@@ -1005,6 +1236,23 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "live_eligible": permissions.get("live_eligible") is True,
         "live_allowed": permissions.get("live_allowed") is True,
         "paper_trader_verified": permissions.get("paper_trader_verified") is True,
+        "paperEvidenceId": str(permissions.get("paperEvidenceId") or ""),
+        "paperEvidenceHash": str(permissions.get("paperEvidenceHash") or ""),
+        "paperEvidenceBundleHash": str(
+            permissions.get("paperEvidenceBundleHash") or ""
+        ),
+        "paperFinalBindingHash": str(
+            permissions.get("paperFinalBindingHash") or ""
+        ),
+        "paperGovernanceDeploymentId": str(
+            permissions.get("paperGovernanceDeploymentId") or ""
+        ),
+        "paperStrategyInstanceId": str(
+            permissions.get("paperStrategyInstanceId") or ""
+        ),
+        "paperPortfolioInstanceId": str(
+            permissions.get("paperPortfolioInstanceId") or ""
+        ),
         "fail_reasons": _reason_list(permissions.get("fail_reasons") or artifact.get("fail_reasons")),
     }
     artifact_integrity = (
@@ -1188,6 +1436,56 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         capabilities["canSubmitOrder"] = False
         capabilities["blockingFailReasons"] = list(dict.fromkeys([*capabilities.get("blockingFailReasons", []), *provider_reasons]))
         capabilities["failReasons"] = list(dict.fromkeys([*capabilities.get("failReasons", []), *provider_reasons]))
+    paper_live_qualification = (
+        dict(artifact.get("_paper_live_qualification"))
+        if isinstance(artifact.get("_paper_live_qualification"), dict)
+        else {
+            "required": bool(artifact.get("_paper_live_qualification_required")),
+            "ready": not bool(artifact.get("_paper_live_qualification_required")),
+            "issues": [],
+        }
+    )
+    if (
+        paper_live_qualification.get("required") is True
+        and paper_live_qualification.get("ready") is not True
+    ):
+        qualification_reasons = [
+            f"paper-live-qualification:{issue}"
+            for issue in (
+                paper_live_qualification.get("issues")
+                or ["exact-pinned-evidence-required"]
+            )
+        ]
+        normalized_permissions["live_small_eligible"] = False
+        normalized_permissions["live_eligible"] = False
+        normalized_permissions["live_allowed"] = False
+        normalized_permissions["fail_reasons"] = list(
+            dict.fromkeys(
+                [
+                    *normalized_permissions["fail_reasons"],
+                    *qualification_reasons,
+                ]
+            )
+        )
+        capabilities["liveSmallEligible"] = False
+        capabilities["liveEligible"] = False
+        capabilities["canSubmitOrder"] = False
+        capabilities["blockingFailReasons"] = list(
+            dict.fromkeys(
+                [
+                    *capabilities.get("blockingFailReasons", []),
+                    *qualification_reasons,
+                ]
+            )
+        )
+        capabilities["failReasons"] = list(
+            dict.fromkeys(
+                [
+                    *capabilities.get("failReasons", []),
+                    *qualification_reasons,
+                ]
+            )
+        )
     verification = {
         "backtester": _backtester_verification_badge(normalized_permissions, final_test_status),
         "paper_trader": _paper_verification_badge(artifact, normalized_permissions, lifecycle_status),
@@ -1224,6 +1522,23 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "deployment_environment": str(deployment.get("environment") or ""),
         "deployment_mode": str(deployment.get("mode") or ""),
         "deployment_source": "deployment-registry" if deployment else "legacy-artifact",
+        "deployment_strategy_reference": dict(
+            deployment.get("strategyArtifact")
+            if isinstance(deployment.get("strategyArtifact"), dict)
+            else {}
+        ),
+        "deployment_portfolio_reference": dict(
+            deployment.get("portfolioArtifact")
+            if isinstance(deployment.get("portfolioArtifact"), dict)
+            else {}
+        ),
+        "strategy_instance_id": str(
+            paper_live_qualification.get("strategyInstanceId")
+            or permissions.get("paperStrategyInstanceId")
+            or artifact.get("strategyInstanceId")
+            or artifact.get("instanceId")
+            or ""
+        ),
         "name": str(artifact.get("name") or artifact.get("strategyName") or strategy_id),
         "symbol": str(artifact.get("symbol") or dataset.get("symbol") or data_artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN"),
         "asset": str(artifact.get("asset") or dataset.get("assetClass") or data_artifact.get("assetClass") or artifact.get("assetClass") or "unknown"),
@@ -1291,6 +1606,7 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "live_eligible": capabilities["liveEligible"],
         "verification": verification,
         "paper_portfolio_evidence": paper_portfolio_evidence,
+        "paper_live_qualification": paper_live_qualification,
         "lineage": {
             "dataset": dataset_lineage,
             "backtest": {

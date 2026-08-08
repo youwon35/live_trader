@@ -654,6 +654,11 @@ class LiveContinuousControllerTest(unittest.TestCase):
                 "_restore_context_assessment",
                 return_value={"fresh": False, "reason": "unit"},
             ),
+            patch.object(
+                controller,
+                "_paper_final_binding_blocker",
+                return_value="",
+            ),
         ):
             result = controller.start("crypto", "SMALL_LIVE")
 
@@ -952,6 +957,71 @@ class LiveContinuousControllerTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("FAILED", result["reason"])
         supervisor.engine.transition_mode.assert_not_called()
+
+    def test_functional_test_reuses_running_supervisor_without_new_feed(self) -> None:
+        controller = LiveContinuousController(Path("."))
+        controller.profile_id = "stock"
+        controller.mode = "SMALL_LIVE"
+        controller.portfolio_id = "portfolio-one"
+        controller.requested_strategy_id = "lead-strategy"
+        controller.deployment_id = "functional-deployment"
+        controller.execution_purpose = state.FUNCTIONAL_TEST_EXECUTION_PURPOSE
+        controller.functional_test_context = {
+            "functional_test_session_id": "session-one"
+        }
+
+        spec = SimpleNamespace(
+            broker_id="kis",
+            symbol="005930",
+            strategy_id="lead-strategy",
+            strategy_instance_id="sleeve-one",
+            portfolio_id="portfolio-one",
+            artifact={"permissions": {"live_small_eligible": True}},
+        )
+        supervisor = MagicMock()
+        supervisor.running = True
+        supervisor.snapshot.return_value = {"phase": "RUNNING", "running": True}
+        supervisor.engine.specs = (spec,)
+        supervisor.engine.transition_mode.return_value = None
+        controller.supervisor = supervisor
+
+        with (
+            patch.object(
+                state,
+                "functional_test_runtime_start_allowed",
+                return_value=(True, "allowed", {"scope": {}}),
+            ),
+            patch.object(
+                controller,
+                "_paper_final_binding_blocker",
+                return_value="",
+            ),
+            patch.object(
+                controller,
+                "_restore_context_assessment",
+                return_value={"reconciled": True},
+            ),
+            patch("live_trader.continuous_live.feeds_for_specs") as feeds,
+            patch.object(state, "snapshot", return_value={}),
+            patch.object(state, "append_audit"),
+        ):
+            result = controller.start(
+                "stock",
+                "SMALL_LIVE",
+                "portfolio-one",
+                "lead-strategy",
+                "functional-deployment",
+                state.FUNCTIONAL_TEST_EXECUTION_PURPOSE,
+                {"functional_test_session_id": "session-two"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIs(supervisor, controller.supervisor)
+        feeds.assert_not_called()
+        supervisor.engine.transition_mode.assert_called_once_with(
+            "SMALL_LIVE",
+            restore_context={"reconciled": True},
+        )
 
     def test_state_stop_does_not_hold_runtime_lock_across_controller_join(self) -> None:
         due_bar_acquired = threading.Event()

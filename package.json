@@ -15,6 +15,7 @@
     "test:api-resilience": "node scripts/api_resilience.test.mjs",
     "test:futures-risk-ui": "node scripts/futures_risk_simulator.test.mjs",
     "test:deployment-selection": "node --test scripts/deployment_selection.test.mjs",
+    "test:functional-test-ui": "node scripts/functional_test_model.test.mjs",
     "ui:smoke": "node scripts/ui_smoke.mjs"
   },
   "dependencies": {

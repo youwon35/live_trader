@@ -12,6 +12,7 @@ from live_trader.live_adapters import (
     KIS_DOMESTIC_ORDER_ENDPOINT,
     KIS_OVERSEAS_BALANCE_ENDPOINT,
     KIS_OVERSEAS_ORDER_ENDPOINT,
+    KisRestRateLimitError,
     UPBIT_ACCOUNTS_ENDPOINT,
     UPBIT_ORDER_ENDPOINT,
     UPBIT_ORDER_DETAIL_ENDPOINT,
@@ -369,7 +370,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         )
         response = {"json": {"access_token": "token-123", "expires_in": 3600}}
 
-        with patch("live_trader.live_adapters.http_json", return_value=response) as request, patch(
+        with patch("live_trader.live_adapters._acquire_shared_kis_rest_slot", return_value=0.0), patch("live_trader.live_adapters.http_json", return_value=response) as request, patch(
             "live_trader.live_adapters.time.monotonic",
             side_effect=[100.0, 100.0, 100.0, 101.0],
         ):
@@ -395,7 +396,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         )
         response = {"ok": True, "json": {"rt_cd": "0"}}
 
-        with patch(
+        with patch("live_trader.live_adapters._acquire_shared_kis_rest_slot", return_value=0.0), patch(
             "live_trader.live_adapters.http_json",
             return_value=response,
         ) as request, patch(
@@ -410,6 +411,103 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertEqual(2, request.call_count)
         sleep.assert_called_once()
         self.assertAlmostEqual(1.9, sleep.call_args.args[0], places=9)
+
+    def test_kis_shared_slot_is_reserved_immediately_before_network(self) -> None:
+        os.environ.update(
+            {
+                "KIS_APP_KEY": "kis-app-key",
+                "KIS_APP_SECRET": "kis-app-secret",
+                "KIS_ACCOUNT_NO": "12345678-01",
+                "KIS_ACCOUNT_PRODUCT_CODE": "01",
+            }
+        )
+        prepared = build_kis_domestic_balance_request(access_token="token-123")
+        events = []
+        with patch(
+            "live_trader.live_adapters.GLOBAL_KIS_REST_LIMITERS.get"
+        ) as get_limiter, patch(
+            "live_trader.live_adapters.http_json",
+            side_effect=lambda *args, **kwargs: (
+                events.append("network")
+                or {"ok": True, "json": {"rt_cd": "0"}}
+            ),
+        ) as request:
+            get_limiter.return_value.acquire.side_effect = lambda: (
+                events.append("limit") or 0.0
+            )
+            result = send_prepared_request(prepared)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(["limit", "network"], events)
+        account_id, app_key_id, mode = get_limiter.call_args.args
+        self.assertTrue(account_id.startswith("sha256:"))
+        self.assertTrue(app_key_id.startswith("sha256:"))
+        self.assertEqual("PROD", mode)
+        request.assert_called_once()
+
+        with patch(
+            "live_trader.live_adapters.GLOBAL_KIS_REST_LIMITERS.get"
+        ) as blocked_limiter, patch(
+            "live_trader.live_adapters.http_json"
+        ) as blocked_request:
+            blocked_limiter.return_value.acquire.side_effect = (
+                KisRestRateLimitError("limiter unavailable")
+            )
+            with self.assertRaises(KisRestRateLimitError):
+                send_prepared_request(prepared)
+        blocked_request.assert_not_called()
+
+    def test_kis_token_uses_separate_app_key_scoped_one_second_limiter(self) -> None:
+        os.environ.update(
+            {
+                "KIS_APP_KEY": "kis-app-key",
+                "KIS_APP_SECRET": "kis-app-secret",
+                "KIS_BASE_URL": "https://kis.example.test",
+            }
+        )
+        events = []
+        response = {"json": {"access_token": "token-123", "expires_in": 3600}}
+
+        with (
+            patch(
+                "live_trader.live_adapters.GLOBAL_KIS_REST_LIMITERS.get_token"
+            ) as get_token_limiter,
+            patch(
+                "live_trader.live_adapters.GLOBAL_KIS_REST_LIMITERS.get"
+            ) as get_rest_limiter,
+            patch(
+                "live_trader.live_adapters.http_json",
+                side_effect=lambda *args, **kwargs: (
+                    events.append("network") or response
+                ),
+            ) as request,
+        ):
+            get_token_limiter.return_value.acquire.side_effect = lambda: (
+                events.append("token-limit") or 0.0
+            )
+            token = issue_kis_access_token()
+
+        self.assertEqual("token-123", token)
+        self.assertEqual(["token-limit", "network"], events)
+        (app_key_id,) = get_token_limiter.call_args.args
+        self.assertTrue(app_key_id.startswith("sha256:"))
+        self.assertNotIn("kis-app-key", app_key_id)
+        get_rest_limiter.assert_not_called()
+        request.assert_called_once()
+
+        _clear_kis_access_token_cache()
+        with (
+            patch(
+                "live_trader.live_adapters.GLOBAL_KIS_REST_LIMITERS.get_token"
+            ) as blocked_limiter,
+            patch("live_trader.live_adapters.http_json") as blocked_request,
+        ):
+            blocked_limiter.return_value.acquire.side_effect = (
+                KisRestRateLimitError("token limiter unavailable")
+            )
+            with self.assertRaises(KisRestRateLimitError):
+                issue_kis_access_token()
+        blocked_request.assert_not_called()
 
     def test_kis_read_rate_limit_is_retried_but_post_is_not(self) -> None:
         os.environ.update(
@@ -435,7 +533,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         }
         recovered = {"ok": True, "json": {"rt_cd": "0"}}
 
-        with patch(
+        with patch("live_trader.live_adapters._acquire_shared_kis_rest_slot", return_value=0.0), patch(
             "live_trader.live_adapters.http_json",
             side_effect=[rate_limited, recovered],
         ) as request, patch(
@@ -458,7 +556,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
             access_token="token-123",
         )
         _reset_kis_request_pacer()
-        with patch(
+        with patch("live_trader.live_adapters._acquire_shared_kis_rest_slot", return_value=0.0), patch(
             "live_trader.live_adapters.http_json",
             return_value=rate_limited,
         ) as request, patch(

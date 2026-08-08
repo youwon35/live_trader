@@ -1169,3 +1169,50 @@ API 없이 실제 실행한 기능:
 - 장시간 살아 있는 Runtime Session도 실제 브로커 side effect 직전에 preflight TTL을 다시 검사한다. 시작 당시 승인만으로 만료 뒤 주문을 허용하지 않는다.
 - Live 재개가 인정하는 Paper 확정봉 evidence policy를 v2로 올렸고 legacy v1은 `paper-live-forward-source-missing`으로 fail-closed한다.
 - 집중 회귀 11개와 Live Trader 전체 Python unittest 398개가 모두 통과했다. SMALL/FULL 전환, dry-run 해제, 운용자 승인, 실제 주문·취소는 호출하지 않았다.
+
+## 2026-08-04 Paper→Live 최종 근거의 정확한 고정
+
+- 공용 runtime에 `paper-live-qualification-v1` 검증 계약을 추가했다. Live가 인정하는 Paper 근거는 EvidenceBundle 전체, `paper-live-candidate-publication-v2`, `paper-final-position-reconciliation-v2`, `paper-forward-scope-v1`, 그리고 이 모두를 묶은 `paper-live-final-binding-v1` 해시를 포함해야 한다.
+- Live Deployment 권한은 `paperEvidenceId`, outer-envelope `paperEvidenceHash`, inner-bundle `paperEvidenceBundleHash`, `paperFinalBindingHash`를 명시적으로 고정한다. EvidenceStore는 해당 ID만 조회하며 같은 전략의 더 새 근거, 최신 파일, 유사한 전략 ID를 자동 채택하지 않는다. 고정된 ID·두 content hash·binding hash 중 하나라도 없거나 다르면 fail-closed한다.
+- 최종 Paper 봉인은 runtime 정지, 열린 봉 경계 0, 미처리 intent 0, working order 0, 내부·브로커 포지션 모두 flat, ledger 대조 일치와 source selection 고정을 함께 증명한다. 전략/Portfolio artifact hash, Strategy/Portfolio Instance, Paper governance deployment, session, manifest, ledger generation/hash도 전 구간에서 정확히 같아야 한다.
+- 단일 전략과 Portfolio를 별도로 검증한다. Portfolio는 멤버별 Strategy Instance가 각자의 정확한 Paper 근거를 가져야 하며 하나라도 누락되면 SMALL/FULL 진입과 MONITOR→live 전환을 차단한다. MONITOR 자체는 주문 권한 없이 계속 사용할 수 있다.
+- 검증된 Paper final binding 목록과 목록 hash를 Live 운영 manifest/config에 동결한다. 세션 준비, MONITOR→live 전환, 재개, 브로커 side-effect 직전마다 현재 고정 근거를 다시 검증해 중간 교체·변조·누락을 차단한다.
+- Paper producer가 위 v2/v1 구조와 `PENDING_INTENT_V3`, 명시적 flat position 필드를 발행하기 전에는 기존 v1 근거를 Live가 승인하지 않는다. 이는 호환 fallback이 아니라 의도한 안전 차단이다.
+- 공용 runtime 전체 unittest 239개와 Live Trader 전체 unittest 404개가 통과했다. 새 정확 고정 회귀는 정상 단일/Portfolio, 미고정 신규 근거 비채택, pin 누락, 최종 봉인 변조, 정확 재개를 포함한다. 실제 주문·취소·모드 승급은 실행하지 않았다.
+
+### 독립 P1 리뷰 보완
+
+- Live Deployment의 `paperEvidenceHash`는 이제 전체 `trading-evidence-v1` envelope의 `integrity.contentHash`를 뜻한다. 내부 EvidenceBundle의 `contentHash`는 별도 `paperEvidenceBundleHash`로 함께 고정한다. 따라서 metrics나 qualification 밖 details를 변경하고 outer envelope를 다시 봉인해도 기존 Deployment pin으로는 통과할 수 없다.
+- 권한 출처는 `SMALL_LIVE`·`FULL_LIVE`·명시적 LIVE 환경 Deployment의 permissions뿐이다. PAPER 환경 Deployment는 선택하지 않으며 Strategy Artifact permissions fallback도 제거했다. Live Deployment ID와 Paper governance deployment ID는 서로 달라야 한다.
+- 단일 전략은 `portfolioRequired=false`와 비어 있는 Portfolio identity를 강제한다. Portfolio는 artifact ID/hash/instance가 모두 정확히 같아야 하고, 모든 형태에서 Paper governance deployment와 Strategy Instance pin이 필수다.
+- 30일 관찰 기준은 metrics 선언값만 읽지 않는다. timezone이 있는 `startedAt`·`endedAt`의 실제 UTC 차이를 직접 계산해 최소 30일인지 확인하고, `forwardElapsedSeconds` 및 일 단위 내림값 `forwardObservedDays`와 정확히 일치해야 한다. 미래 종료, 역순 시간, 선언값 불일치는 모두 차단한다.
+- 일반 주문 외에 Upbit smoke와 Binance Futures fill-soak의 진입·커버도 모든 `place_order` 직전에 `operational_runtime_dispatch_allowed()`를 호출한다. 이 단계에서 정확한 active Deployment/manifest, fresh preflight, outer+bundle+final binding, 현재 Strategy/Portfolio 구성을 다시 검증하며 authorizer 누락·stale binding이면 브로커 함수 호출 전에 중단한다.
+- 최종 dispatch는 세션 manifest의 Live Deployment ID와 현재 선택된 Deployment ID, 그리고 intent의 Strategy Instance와 manifest member의 Strategy Instance를 정확히 비교한다. standalone intent에 Portfolio ID가 섞여도 차단한다. pause/resume 및 full-live 승급은 빈 Deployment 권한을 Artifact 권한으로 대체하지 않으며, full-live 승급 직전에도 pinned Paper qualification 전체를 다시 검증한다.
+- 음성 회귀에는 outer 재봉인 후 기존 pin 재사용, bundle pin 누락·불일치, PAPER Deployment/Artifact permission fallback과 pause→resume pin 세탁, governance·Strategy/Portfolio Instance 누락·혼용, Live Deployment 교체, standalone Portfolio 혼입, 30일 미달·시간 역순·미래·duration 불일치, Upbit/Futures 최종 binding 차단을 포함했다.
+- Canary scope를 `live-canary-scope-v2`로 올려 현재 Live Deployment revision, outer/bundle/final Paper hash, Paper governance Deployment, 정확한 Strategy/Portfolio Instance를 함께 묶었다. exact pin이나 Deployment revision이 바뀌면 이전 체결은 승급 표본으로 재사용되지 않는다. 이 scope는 Binance Futures뿐 아니라 KIS·Binance spot·Upbit를 포함한 모든 non-dry `SMALL_LIVE` 전략 주문에 붙으며, 지원되지 않는 broker route는 기존 dispatch 계약에서 명시적으로 주문 차단된다.
+- non-dry `SMALL_LIVE` 주문은 현재 canary scope를 주문당 한 번만 읽는다. scope가 없거나 `eligible=false`이거나 읽기 자체가 실패하면 `Live Canary Scope` RiskCheck를 추가하고 `live-canary-scope-missing` 또는 `live-canary-scope-invalid:*` 사유로 `risk_blocked/blocked` 처리한다. 실패 scope와 사유를 주문·append-only audit에 함께 남기며 broker side-effect 함수는 호출하지 않는다. KIS·Binance spot·Upbit·Binance Futures의 missing/invalid 두 경우를 모두 음성 회귀로 고정했다.
+- 일반 단일 Strategy Runner, Portfolio Runner, Multi-Strategy 순주문, manual/default intent가 정확한 `strategy_instance_id`와 standalone/portfolio 문맥을 주문까지 전달한다. Multi-Strategy는 manifest에 봉인된 sleeve Instance 집합과 lead Instance를 대조한다. Binance spot smoke는 Preview에 고정된 Instance/Portfolio를 제출 직전에 다시 읽고 달라졌으면 네트워크 전에 차단한다.
+- 최종 회귀는 주문 게이트 94개, dispatch safety 7개, Live Trader 전체 unittest 421개, 공용 runtime 전체 unittest 244개가 통과했다. 실제 주문·취소·Live 상태 변경은 실행하지 않았다.
+
+## 2026-08-05 별도 KIS 실전 기능시험 경로
+
+- `FUNCTIONAL_TEST`를 일반 SMALL/FULL LIVE 승급과 분리했다. Backtester·Paper 검증이 고정된 정확한 Strategy/Portfolio Artifact만 선택하고, 사용자가 시간 또는 일 단위로 최대 90일까지 허가 기간을 정할 수 있다. 허가 시계는 문서 생성 즉시 시작하며, 실제 실행은 별도의 확인 체크와 `기능시험 시작` 버튼을 눌러야 한다.
+- 실전 활성화는 XKRX 거래일에만 매일 다시 발급한다. 휴장일과 달력 범위 밖 날짜는 fail-closed하며, 활성화 만료는 최대 6시간과 해당 거래일의 공식 장 마감 중 이른 시각이다.
+- 기능시험은 KIS 국내주식·ETF, 지정가, SMALL_LIVE, 고정 소액·주문 수·포지션·손실 한도만 허용한다. permit·당일 activation·계정·심볼·Strategy sleeve/Portfolio 구성·Artifact hash·Risk/config/build hash·fresh reconciliation을 별도 immutable manifest/preflight/runtime session에 봉인하고, 모든 broker dispatch 직전에 다시 읽어 하나라도 달라지면 차단한다.
+- 기능시험 주문은 append-only 예약 원장으로 원자적으로 수량을 선점한다. 중복·거부·취소·결과 불명도 한도를 소비하며, 기능시험의 주문·체결·성과는 `FUNCTIONAL_TEST_NON_PROMOTION`으로 기록되어 Live 승급 evidence나 Canary 표본으로 사용할 수 없다.
+- KIS REST 제한은 모든 로컬 프로세스가 공유하는 SQLite 제한기로 통합했다. 일반 Live REST는 계좌+앱 키 단위 18회/초, `/oauth2/tokenP`는 별도 앱 키 단위 1회/초 버킷을 네트워크 호출 직전에 예약하고, 제한기 자체가 실패하면 요청을 보내지 않는다.
+- Live의 stock controller는 하나의 supervisor와 동일한 KIS feed 객체를 warm-up 뒤 연속 실행에도 재사용한다. 기능시험 시작 시 기존 stock runtime이 STARTING/RUNNING/DEGRADED/STOPPING이거나 worker가 살아 있으면 먼저 완전히 정지하도록 fail-closed한다. 현재 OS WebSocket owner registry는 Paper Trader 내부에만 있어 같은 app-key를 Paper와 Live 프로세스가 동시에 쓰는 교차 앱 소유권까지 공용으로 봉인하지는 않는다. 일반적으로 Demo와 Live 키를 분리하고, 같은 키를 재사용한다면 두 앱을 동시에 실행하지 않아야 한다. 공용 registry 승격은 후속 범위다.
+- 이번 검증은 모두 mock/local로 수행했고 실제 KIS 네트워크·주문·취소는 호출하지 않았다. 기능시험/연속 runtime 40개, API·달력·비승급·기존 안전 경로 57개, Live adapter 16개가 통과했으며 Python 구문 검사, 기능시험 프런트 모델 테스트, Vite production build도 통과했다.
+
+## 2026-08-08 KIS 기능시험 최종 봉인과 다일 재개 계약
+
+- 이 절은 위 2026-08-05 절의 미완료·후속 범위를 대체한다. Live Trader의 별도 `기능시험` 탭, 시간/달력일 permit, 당일 activation, `오늘 실행 정지`, `계획 완전 종료`가 모두 연결되었다. 기간은 허가서 발급 시각부터 흐르며 `DAYS`는 거래일이 아닌 24시간 달력일이라 주말·휴일도 소비한다.
+- 당일 activation은 XKRX 공식 정규장 안에서만 발급되고 최대 6시간 또는 장 마감 중 이른 시각에 끝난다. activation 만료 즉시 PRETRADE, DISPATCH, 최종 KIS POST가 모두 fail-closed한다. 다일 시험은 매일 `오늘 실행 정지`로 activation 삭제 → runtime drain → KIS 강제 poll/3자 대조 → `PAUSED`를 만든 뒤, 다음 거래일에 새 token으로 다시 활성화한다. 1일봉의 15:30 확정봉까지 관찰하려면 6시간 상한 때문에 당일 활성화를 09:30 KST 이후에 시작해야 한다.
+- permit·activation 작성/삭제와 시작·정지 lifecycle은 하나의 lifecycle lock으로 직렬화하고 activation 포인터 교체는 최종 dispatch lock과 함께 처리한다. KIS POST 직전에는 intent/session에 봉인된 permit ID/hash, activation token ID/hash, account fingerprint를 현재 권한과 다시 비교한다. 같은 permit에서 token A가 token B로 바뀌는 TOCTOU도 broker 호출 전에 차단한다.
+- 만료·손상된 current pointer나 immutable authority 참조가 남아 있으면 새 permit으로 덮어쓸 수 없다. 화면의 대상·기간·단위·허가서 버튼도 `authorityReferencePresent`가 사라질 때까지 잠긴다. 최종 종료는 runtime이나 working order가 없어도 permit 실행 이력이 있으면 fresh KIS poll/대조를 마친 뒤에만 권한 포인터를 제거한다.
+- 비정상 종료 뒤 append-only governance DB에 RUNNING 계열 세션이 남았는데 현재 controller/runtime binding이 없으면 새 세션을 곧바로 만들지 않는다. 신규 진입을 잠그고 non-coalesced KIS 강제 poll, fresh execution poll, 계좌·포지션·주문 3자 대조, 미해결 기능시험 주문 0건을 확인한 뒤에만 이전 세션을 `FUNCTIONAL_TEST_CRASH_RECOVERY_FAILED_CLOSED` 이벤트와 `FAILED` lifecycle로 종결한다. 어느 확인이든 실패하면 entry block과 이전 세션을 유지한다.
+- Strategy sleeve별 신호와 목표 수량, 동일 종목 내부 상계, 한 broker 주문의 sleeve별 부분 체결·수수료 귀속, Portfolio/각 sleeve 이중 원장, 재시작 후 KIS 대조를 구현했다. KIS 시세 확정봉과 개인 체결은 같은 market/private WebSocket mux를 사용하고 별도 private thread를 먼저 중지한다. 공용 runtime의 계좌+앱키 단일 owner registry와 SQLite REST limiter를 사용하므로 2026-08-05 절의 “교차 앱 owner registry 미구현” 문장은 더 이상 현재 상태가 아니다.
+- 기능시험 주문·체결·손익은 `FUNCTIONAL_TEST_NON_PROMOTION`, `promotionEligible=false`로 계속 격리된다. 이 경로는 긴 승급 조건을 우회해 실제 배선과 장시간 동작을 보는 기능시험이지 SMALL/FULL LIVE 승급 근거가 아니다.
+- 최종 검증은 격리 APPDATA와 `LIVE_TRADER_ENABLE_REAL_ORDERS=false`, Telegram/실인증정보 제거 환경에서 수행했다. Live Python 45개 파일·540개 테스트, 프런트 회귀 7종, Vite production build, Edge 4개 viewport × 10개 탭 40개 UI smoke가 모두 통과했고 overflow·화면 밖 조작부·필수 섹션 누락·콘솔 오류는 0건이었다. 기능시험 확대 캡처에서도 승급 제외 안내, 기간/단위, 당일 담당자, 5개 lifecycle 버튼과 exact binding이 정상 표시됐다.
+- 실제 KIS REST/WebSocket·주문·취소·계좌 변경은 실행하지 않았다. 현재 저장 Artifact 중 기능시험 exact-integrity gate를 통과하지 못한 대상은 UI에서 `사용 불가`로 정직하게 표시되며, 실제 실전 기능시험은 사용자의 별도 명시 승인과 유효한 KIS 설정이 있을 때만 시작해야 한다.
+- 다음 개선 권고는 달력 기간 외에 `최소 확인 거래일 또는 최소 확정봉 수`를 함께 요구하는 이중 완료 조건이다. 특히 일봉 전략은 휴장일이 기간을 소비하므로 `N일 경과`만으로 장시간 작동 검증을 완료했다고 판단하면 안 된다.

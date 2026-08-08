@@ -73,6 +73,8 @@ class ServerSafetyTests(unittest.TestCase):
             "PORTFOLIO-01",
             "DEPLOYMENT-01",
             "STRATEGY-01",
+            "",
+            None,
         )
         handler.send_json.assert_called_once_with(expected)
 

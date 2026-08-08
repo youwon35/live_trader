@@ -6,14 +6,169 @@ import hmac
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from live_trader import state
+from live_trader import execution_streams as execution_stream_module
 from live_trader.execution_streams import ExecutionStreamManager, binance_stream_subscription_params, parse_binance_execution_report, parse_kis_domestic_execution, parse_kis_overseas_execution, parse_upbit_my_order, upbit_websocket_token
+from trading_runtime import realtime_feeds
+from trading_runtime.realtime_feeds import FeedSubscription, KisWebSocketClosedBarFeed
 
 
 class ExecutionStreamTest(unittest.TestCase):
+    def test_private_and_market_kis_approval_calls_share_one_limiter(self) -> None:
+        self.assertIs(
+            execution_stream_module.GLOBAL_KIS_REST_LIMITERS,
+            realtime_feeds.GLOBAL_KIS_REST_LIMITERS,
+        )
+
+    def test_private_execution_stream_limits_before_approval_http(self) -> None:
+        order: list[str] = []
+        registry = Mock()
+        registry.get_approval.return_value.acquire.side_effect = (
+            lambda: order.append("acquire")
+        )
+        response = Mock()
+        response.read.return_value = b'{"approval_key":"approval"}'
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        socket = Mock()
+        stop = threading.Event()
+        stop.set()
+
+        def open_approval(*_args, **_kwargs):
+            order.append("http")
+            return response
+
+        with (
+            patch.object(
+                execution_stream_module,
+                "GLOBAL_KIS_REST_LIMITERS",
+                registry,
+            ),
+            patch.dict(
+                execution_stream_module.os.environ,
+                {
+                    "KIS_APP_KEY": "shared-app-key",
+                    "KIS_APP_SECRET": "secret",
+                    "KIS_HTS_ID": "user-id",
+                },
+                clear=False,
+            ),
+            patch(
+                "live_trader.execution_streams.urllib.request.urlopen",
+                side_effect=open_approval,
+            ),
+            patch("websocket.create_connection", return_value=socket),
+        ):
+            manager = ExecutionStreamManager(Path("."))
+            manager._status["kis"] = {
+                "running": True,
+                "connected": False,
+                "lastEventAt": "",
+                "lastError": "",
+                "reconnectCount": 0,
+            }
+            manager._run_kis(stop)
+
+        self.assertEqual(["acquire", "http"], order)
+        registry.get_approval.assert_called_once_with("shared-app-key")
+        socket.close.assert_called_once()
+
+    def test_market_feed_limits_before_approval_fetch(self) -> None:
+        order: list[str] = []
+        registry = Mock()
+        registry.get_approval.return_value.acquire.side_effect = (
+            lambda: order.append("acquire")
+        )
+        socket = Mock()
+
+        def approval_fetcher(_url, _payload):
+            order.append("http")
+            return {"approval_key": "approval"}
+
+        feed = KisWebSocketClosedBarFeed(
+            (
+                FeedSubscription(
+                    "KRX:005930",
+                    "005930.KS",
+                    "1m",
+                ),
+            ),
+            app_key="shared-app-key",
+            app_secret="secret",
+            approval_fetcher=approval_fetcher,
+        )
+        with (
+            patch.object(
+                realtime_feeds,
+                "GLOBAL_KIS_REST_LIMITERS",
+                registry,
+            ),
+            patch("websocket.create_connection", return_value=socket),
+        ):
+            feed.connect()
+            feed.disconnect()
+
+        self.assertEqual(["acquire", "http"], order)
+        registry.get_approval.assert_called_once_with("shared-app-key")
+
+    def test_owned_kis_stream_stops_without_stopping_shared_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = ExecutionStreamManager(Path(temporary))
+            started = {
+                "kis": threading.Event(),
+                "upbit": threading.Event(),
+            }
+
+            def fake_run(broker_id, stop_event):
+                started[broker_id].set()
+                stop_event.wait(2.0)
+
+            with patch.object(manager, "_run", side_effect=fake_run):
+                manager.start(("kis", "upbit"))
+                self.assertTrue(started["kis"].wait(1.0))
+                self.assertTrue(started["upbit"].wait(1.0))
+                snapshot = manager.stop_brokers(("kis",), timeout=1.0)
+
+                self.assertFalse(snapshot["brokers"]["kis"]["running"])
+                self.assertTrue(snapshot["brokers"]["upbit"]["running"])
+                manager.stop(timeout=1.0)
+
+    def test_mux_sink_records_domestic_notice_and_rejects_malformed_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = ExecutionStreamManager(Path(temporary))
+            fields = [""] * 14
+            fields[2] = "12345"
+            fields[4] = "02"
+            fields[8] = "005930"
+            fields[9] = "1"
+            fields[10] = "70000"
+            fields[11] = "090001"
+            fields[12] = "N"
+            fields[13] = "1"
+
+            event = manager.ingest_kis_domestic_fields(
+                "H0STCNI0",
+                tuple(fields),
+            )
+
+            self.assertEqual("kis", event["broker_id"])
+            self.assertEqual("005930.KS", event["symbol"])
+            self.assertEqual([event], manager.drain("kis"))
+            with self.assertRaisesRegex(ValueError, "malformed"):
+                manager.ingest_kis_domestic_fields(
+                    "H0STCNI0",
+                    ("too", "short"),
+                )
+            with self.assertRaisesRegex(ValueError, "unsupported"):
+                manager.ingest_kis_domestic_fields(
+                    "H0GSCNI0",
+                    tuple(fields),
+                )
+
     def test_binance_subscription_uses_server_adjusted_timestamp(self) -> None:
         with patch("live_trader.execution_streams.refresh_binance_time_offset") as refresh, patch(
             "live_trader.execution_streams.binance_timestamp_ms",

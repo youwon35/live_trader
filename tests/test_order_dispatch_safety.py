@@ -83,6 +83,35 @@ class OrderDispatchSafetyTest(unittest.TestCase):
             },
         )
 
+    @staticmethod
+    def eligible_canary_scope(intent: OrderIntent) -> dict:
+        return {
+            "schemaVersion": state.CANARY_SCOPE_SCHEMA_VERSION,
+            "strategyId": intent.strategy_id,
+            "strategyArtifactId": "dispatch-safety-artifact",
+            "strategyArtifactHash": "a" * 64,
+            "strategyContentHash": "b" * 64,
+            "deploymentId": "dispatch-safety-live-deployment",
+            "deploymentRevision": 2,
+            "currentDeploymentRevision": 2,
+            "beforeLiveSmallAt": "2026-08-01T00:00:00+00:00",
+            "paperEvidenceId": "dispatch-safety-paper-evidence",
+            "paperEvidenceHash": "c" * 64,
+            "paperEvidenceBundleHash": "d" * 64,
+            "paperFinalBindingHash": "e" * 64,
+            "paperGovernanceDeploymentId": (
+                "dispatch-safety-paper-deployment"
+            ),
+            "paperStrategyInstanceId": "dispatch-safety",
+            "paperPortfolioRequired": True,
+            "paperPortfolioArtifactId": "dispatch-safety-portfolio",
+            "paperPortfolioArtifactHash": "f" * 64,
+            "paperPortfolioInstanceId": "dispatch-safety",
+            "eligible": True,
+            "issues": [],
+            "scopeId": "1" * 64,
+        }
+
     def submit_with_passing_gate(
         self,
         intent: OrderIntent,
@@ -115,6 +144,11 @@ class OrderDispatchSafetyTest(unittest.TestCase):
                 state,
                 "operational_runtime_dispatch_allowed",
                 return_value=(True, "operational-runtime-authorized", {}),
+            ),
+            patch.object(
+                state,
+                "current_live_canary_scope",
+                return_value=self.eligible_canary_scope(intent),
             ),
         ):
             return state.submit_order_intent(
@@ -195,6 +229,73 @@ class OrderDispatchSafetyTest(unittest.TestCase):
         self.assertEqual(
             result["order"]["idempotency_key"],
             durable["broker_request"]["identifier"],
+        )
+
+    def test_scope_revision_change_after_checkpoint_never_reaches_broker(
+        self,
+    ) -> None:
+        intent = self.intent(target_revision=211)
+        stored_scope = self.eligible_canary_scope(intent)
+        changed_scope = {
+            **stored_scope,
+            "currentDeploymentRevision": 3,
+            "scopeId": "2" * 64,
+        }
+        passing = self.passing_report()
+        router = Mock()
+        with (
+            patch.object(
+                state,
+                "evaluate_order_gate_with_report",
+                return_value=(
+                    True,
+                    "approved",
+                    "ready",
+                    "passed",
+                    passing,
+                ),
+            ),
+            patch.object(state, "snapshot", return_value={"summary": {}}),
+            patch.object(state, "real_orders_enabled", return_value=True),
+            patch.object(
+                state,
+                "durable_control_halt_active",
+                return_value=False,
+            ),
+            patch.object(
+                state,
+                "operational_runtime_dispatch_allowed",
+                return_value=(True, "operational-runtime-authorized", {}),
+            ),
+            patch.object(
+                state,
+                "current_live_canary_scope",
+                side_effect=[stored_scope, stored_scope, changed_scope],
+            ),
+            patch.object(state, "LiveBrokerRouter", return_value=router),
+        ):
+            result = state.submit_order_intent(
+                {"summary": {}},
+                intent,
+                dry_run=False,
+                audit_event="dispatch safety",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("scope-changed", result["reason"])
+        self.assertEqual("risk_blocked", result["order"]["state"])
+        self.assertEqual(
+            "blocked",
+            result["order"]["queue_state"],
+        )
+        router.place_order.assert_not_called()
+        durable = self.ledger.order_dispatch_for_idempotency_key(
+            result["order"]["idempotency_key"]
+        )
+        self.assertEqual("risk_blocked", durable["state"])
+        self.assertEqual(
+            "blocked",
+            durable["queue_state"],
         )
 
     def test_dispatch_exception_stays_unknown_and_restart_blocks_duplicate(

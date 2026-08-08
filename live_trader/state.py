@@ -65,6 +65,7 @@ from trading_runtime import (
     PositionTruth,
     PromotionMetrics,
     PromotionPolicy,
+    PAPER_FORWARD_EXECUTION_POLICY,
     build_restart_recovery_plan,
     build_trace_id,
     evaluate_automatic_promotion,
@@ -73,6 +74,15 @@ from trading_runtime import (
     reconcile_broker_truth,
     record_flight_event,
 )
+from trading_runtime.functional_test import (
+    FunctionalTestContractError,
+    assert_functional_test_permit_active,
+    default_functional_test_root,
+    parse_functional_test_permit,
+    parse_live_activation_token,
+    read_functional_test_document,
+)
+from trading_runtime.operations import ENVIRONMENT_PROFILES
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
 from .program_ledger import ProgramLedger
 from .contracts import (
@@ -81,6 +91,7 @@ from .contracts import (
     can_live_use_artifact,
     enrich_strategy_artifact_runtime,
     lifecycle_rank,
+    load_pinned_paper_live_qualification,
     load_portfolio_artifacts,
     load_strategy_artifacts,
     normalize_lifecycle_status,
@@ -110,6 +121,7 @@ from .live_adapters import (
     build_upbit_order_request,
     env_value,
     http_json,
+    split_kis_account,
 )
 from .futures_canary import (
     build_futures_canary_test_intents,
@@ -125,6 +137,16 @@ from .futures_fill_soak import (
 )
 from .capital_rollout import build_capital_rollout, capital_cap_for_mode
 from .futures_risk import simulate_futures_order_risk
+from .functional_test import (
+    FunctionalTestRiskSnapshot,
+    FunctionalTestSafetyReport,
+    evaluate_functional_test_order,
+)
+from .functional_test_workspace import (
+    LIVE_FUNCTIONAL_TEST_CAPS,
+    canonical_kis_domestic_symbol,
+    kis_account_binding_id,
+)
 from .order_management import OrderIntent, OrderSide
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
@@ -139,6 +161,19 @@ from trading_runtime.telegram_notifications import (
 Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
 CheckStatus = Literal["pass", "warn", "fail", "na"]
 LIVE_BROKER_DISPATCH_MODES = frozenset({"SMALL_LIVE", "FULL_LIVE"})
+FUNCTIONAL_TEST_EXECUTION_PURPOSE = "FUNCTIONAL_TEST"
+FUNCTIONAL_TEST_ENVIRONMENT = "KIS_LIVE"
+FUNCTIONAL_TEST_DOCUMENT_ROOT = default_functional_test_root()
+FUNCTIONAL_TEST_CURRENT_PERMIT_DOCUMENT = (
+    FUNCTIONAL_TEST_DOCUMENT_ROOT / "live" / "current-permit.json"
+)
+FUNCTIONAL_TEST_CURRENT_ACTIVATION_DOCUMENT = (
+    FUNCTIONAL_TEST_DOCUMENT_ROOT / "live" / "current-activation.json"
+)
+FUNCTIONAL_TEST_RISK_MAX_AGE_SECONDS = 60.0
+FUNCTIONAL_TEST_PREFLIGHT_REFRESH_MARGIN_SECONDS = 45.0
+FUNCTIONAL_TEST_EXECUTION_OBSERVATION_MAX_AGE_SECONDS = 45.0
+FUNCTIONAL_TEST_RUNTIME_GUARD_INTERVAL_SECONDS = 20.0
 RUNTIME_MODE_LOCK = threading.RLock()
 BINANCE_FUTURES_CANARY_LOCK = threading.RLock()
 BINANCE_FUTURES_FILL_SOAK_LOCK = threading.RLock()
@@ -148,6 +183,16 @@ BINANCE_FUTURES_SETTINGS_LOCK = threading.RLock()
 # locks; they never hold RUNTIME_MODE_LOCK while entering the manager.
 RUNTIME_CONTROL_LOCK = threading.RLock()
 BROKER_POLL_LOCK = threading.Lock()
+FUNCTIONAL_TEST_PREFLIGHT_LOCK = threading.RLock()
+# Serializes permit/activation/start/pause/final-end lifecycle mutations in
+# the threaded HTTP server.  Pointer writes additionally take the dispatch
+# lock below so a token replacement/revocation cannot cross the final POST
+# edge.
+FUNCTIONAL_TEST_LIFECYCLE_LOCK = threading.RLock()
+# Serializes the irreversible KIS POST boundary against permit authority
+# closure.  If a stop wins this lock, no later order can POST; if an already
+# authorized POST wins, stop waits for its broker outcome before closing.
+FUNCTIONAL_TEST_AUTHORITY_DISPATCH_LOCK = threading.RLock()
 RUNTIME_MODE_RANK = {"MONITOR": 0, "SMALL_LIVE": 1, "FULL_LIVE": 2}
 PROFESSIONAL_PROMOTION_POLICY = PromotionPolicy()
 
@@ -620,6 +665,20 @@ from .continuous_live import LiveContinuousRuntimeManager  # noqa: E402
 
 LIVE_CONTINUOUS_CONTROLLER = LiveContinuousRuntimeManager(APP_DATA_ROOT)
 LIVE_EXECUTION_STREAMS = ExecutionStreamManager(APP_DATA_ROOT)
+FUNCTIONAL_TEST_RUNTIME_GUARD_LOCK = threading.RLock()
+FUNCTIONAL_TEST_RUNTIME_GUARD_STOP = threading.Event()
+FUNCTIONAL_TEST_RUNTIME_GUARD_THREAD: threading.Thread | None = None
+FUNCTIONAL_TEST_RUNTIME_GUARD_SESSION_ID = ""
+FUNCTIONAL_TEST_RUNTIME_GUARD_STREAM_OWNED = False
+FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS: dict[str, Any] = {
+    "running": False,
+    "sessionId": "",
+    "lastCheckAt": "",
+    "lastSuccessAt": "",
+    "lastReason": "not-started",
+    "failureCount": 0,
+    "kisExecutionStreamOwned": False,
+}
 
 
 def now_text() -> str:
@@ -814,11 +873,18 @@ def strategy_rows(portfolios: list[dict[str, Any]] | None = None) -> list[dict[s
         live_allowed = live_eligible or live_small_eligible
         portfolio_gate = portfolio_gate_for_strategy(artifact, portfolio_artifacts, mode=current_mode())
         paper_portfolio_evidence_gate = paper_portfolio_evidence_gate_for_strategy(artifact, portfolio_gate)
+        paper_live_qualification_gate = paper_live_qualification_gate_for_strategy(
+            artifact
+        )
         if portfolio_gate.get("active") and portfolio_gate.get("allowed") is not True:
             live_allowed = False
             live_small_eligible = False
             live_eligible = False
         if paper_portfolio_evidence_gate.get("required") and paper_portfolio_evidence_gate.get("ready") is not True:
+            live_allowed = False
+            live_small_eligible = False
+            live_eligible = False
+        if paper_live_qualification_gate.get("required") and paper_live_qualification_gate.get("ready") is not True:
             live_allowed = False
             live_small_eligible = False
             live_eligible = False
@@ -828,6 +894,8 @@ def strategy_rows(portfolios: list[dict[str, Any]] | None = None) -> list[dict[s
             block_reasons.append(str(portfolio_gate.get("detail") or "Portfolio artifact gate blocked strategy."))
         if paper_portfolio_evidence_gate.get("required") and paper_portfolio_evidence_gate.get("ready") is not True:
             block_reasons.append(str(paper_portfolio_evidence_gate.get("detail") or "Portfolio paper evidence gate blocked strategy."))
+        if paper_live_qualification_gate.get("required") and paper_live_qualification_gate.get("ready") is not True:
+            block_reasons.append(str(paper_live_qualification_gate.get("detail") or "Exact Paper→Live qualification gate blocked strategy."))
         verification = artifact.get("verification") if isinstance(artifact.get("verification"), dict) else {}
         backtester_verification = verification.get("backtester") if isinstance(verification.get("backtester"), dict) else {}
         paper_verification = verification.get("paper_trader") if isinstance(verification.get("paper_trader"), dict) else {}
@@ -846,9 +914,40 @@ def strategy_rows(portfolios: list[dict[str, Any]] | None = None) -> list[dict[s
                 "paper_trader_label": str(paper_verification.get("label", "Paper 미검증")),
                 "portfolio_gate": portfolio_gate,
                 "paper_portfolio_evidence_gate": paper_portfolio_evidence_gate,
+                "paper_live_qualification_gate": paper_live_qualification_gate,
             }
         )
     return rows
+
+
+def paper_live_qualification_gate_for_strategy(
+    strategy: dict[str, Any],
+) -> dict[str, Any]:
+    qualification = (
+        strategy.get("paper_live_qualification")
+        if isinstance(strategy.get("paper_live_qualification"), dict)
+        else {}
+    )
+    required = qualification.get("required") is True
+    if not required:
+        return {
+            "required": False,
+            "ready": True,
+            "detail": "Artifact discovery 외부의 legacy/unit context",
+        }
+    ready = qualification.get("ready") is True
+    issues = [str(item) for item in qualification.get("issues") or [] if str(item)]
+    return {
+        **qualification,
+        "required": True,
+        "ready": ready,
+        "detail": (
+            "Deployment에 고정된 exact Paper Evidence/Final seal 검증 통과"
+            if ready
+            else "Exact Paper→Live qualification 차단: "
+            + ", ".join(issues[:5] or ["pinned evidence unavailable"])
+        ),
+    }
 
 
 def paper_portfolio_evidence_gate_for_strategy(strategy: dict[str, Any], portfolio_gate: dict[str, Any]) -> dict[str, Any]:
@@ -957,6 +1056,96 @@ def portfolio_fx_freshness(portfolio: dict[str, Any], symbol: str) -> dict[str, 
     return {"currency": currency, "baseCurrency": base_currency, "rate": 0.0, "asOf": "", "ageDays": 999999, "fresh": False, "limitDays": 7, "source": "missing-fx"}
 
 
+def verified_portfolio_artifact_reference(
+    portfolio: dict[str, Any],
+) -> dict[str, str]:
+    """Return an exact canonical Portfolio reference or an empty mapping.
+
+    A reusable Portfolio ID is not an immutable execution identity.  Only a
+    canonically verified artifact whose declared and computed hashes agree can
+    be bound to a Live Deployment.
+    """
+
+    integrity = (
+        portfolio.get("artifact_integrity")
+        if isinstance(portfolio.get("artifact_integrity"), dict)
+        else {}
+    )
+    reference = (
+        portfolio.get("artifact_reference")
+        if isinstance(portfolio.get("artifact_reference"), dict)
+        else {}
+    )
+    artifact_id = str(
+        reference.get("artifactId")
+        or portfolio.get("id")
+        or portfolio.get("portfolio_id")
+        or ""
+    ).strip()
+    artifact_hash = str(
+        reference.get("artifactHash")
+        or integrity.get("declaredHash")
+        or ""
+    ).strip().lower()
+    content_hash = str(reference.get("contentHash") or "").strip().lower()
+    declared_hash = str(integrity.get("declaredHash") or "").strip().lower()
+    computed_hash = str(integrity.get("computedHash") or "").strip().lower()
+    if (
+        integrity.get("valid") is not True
+        or not artifact_id
+        or len(artifact_hash) != 64
+        or len(content_hash) != 64
+        or len(declared_hash) != 64
+        or len(computed_hash) != 64
+        or not secrets.compare_digest(declared_hash, computed_hash)
+        or not secrets.compare_digest(artifact_hash, declared_hash)
+    ):
+        return {}
+    return {
+        "artifactId": artifact_id,
+        "artifactHash": artifact_hash,
+        "contentHash": content_hash,
+    }
+
+
+def verified_strategy_artifact_reference(
+    strategy: dict[str, Any],
+) -> dict[str, str]:
+    """Return the verified canonical identity of one normalized Strategy."""
+
+    integrity = (
+        strategy.get("artifact_integrity")
+        if isinstance(strategy.get("artifact_integrity"), dict)
+        else {}
+    )
+    reference = (
+        strategy.get("artifact_reference")
+        if isinstance(strategy.get("artifact_reference"), dict)
+        else {}
+    )
+    artifact_id = str(reference.get("artifactId") or "").strip()
+    artifact_hash = str(reference.get("artifactHash") or "").strip().lower()
+    content_hash = str(reference.get("contentHash") or "").strip().lower()
+    declared_hash = str(integrity.get("declaredHash") or "").strip().lower()
+    computed_hash = str(integrity.get("computedHash") or "").strip().lower()
+    if (
+        integrity.get("valid") is not True
+        or not artifact_id
+        or len(artifact_hash) != 64
+        or len(content_hash) != 64
+        or len(declared_hash) != 64
+        or len(computed_hash) != 64
+        or not secrets.compare_digest(declared_hash, computed_hash)
+        or not secrets.compare_digest(artifact_hash, declared_hash)
+    ):
+        return {}
+    return {
+        "artifactId": artifact_id,
+        "artifactHash": artifact_hash,
+        "contentHash": content_hash,
+    }
+
+
 def portfolio_gate_for_strategy(
     strategy: dict[str, Any],
     portfolios: list[dict[str, Any]] | None = None,
@@ -964,8 +1153,80 @@ def portfolio_gate_for_strategy(
     mode: Mode | None = None,
 ) -> dict[str, Any]:
     portfolio_artifacts = portfolios if portfolios is not None else portfolio_rows()
+    deployment_reference = (
+        strategy.get("deployment_portfolio_reference")
+        if isinstance(strategy.get("deployment_portfolio_reference"), dict)
+        else {}
+    )
+    expected_portfolio_id = str(
+        deployment_reference.get("artifactId") or ""
+    ).strip()
+    expected_portfolio_hash = str(
+        deployment_reference.get("artifactHash") or ""
+    ).strip().lower()
     if not portfolio_artifacts:
-        return {"active": False, "allowed": True, "detail": "Portfolio artifact 저장소가 없어 단일 전략 기준으로 평가합니다."}
+        if expected_portfolio_id or expected_portfolio_hash:
+            return {
+                "active": True,
+                "allowed": False,
+                "detail": (
+                    "Live Deployment가 고정한 exact Portfolio Artifact "
+                    "저장소가 비어 있습니다."
+                ),
+                "portfolioId": expected_portfolio_id,
+                "portfolioArtifactHash": expected_portfolio_hash,
+            }
+        return {
+            "active": False,
+            "allowed": True,
+            "detail": "Portfolio artifact 저장소가 없어 단일 전략 기준으로 평가합니다.",
+        }
+    if (
+        strategy.get("deployment_source") == "deployment-registry"
+        and not expected_portfolio_id
+        and not expected_portfolio_hash
+    ):
+        return {
+            "active": False,
+            "allowed": True,
+            "detail": (
+                "현재 Live Deployment는 Portfolio Artifact를 고정하지 않은 "
+                "standalone Deployment입니다."
+            ),
+        }
+    if expected_portfolio_id or expected_portfolio_hash:
+        if not expected_portfolio_id or not expected_portfolio_hash:
+            return {
+                "active": True,
+                "allowed": False,
+                "detail": "Live Deployment Portfolio reference가 불완전합니다.",
+                "portfolioId": expected_portfolio_id,
+                "portfolioArtifactHash": expected_portfolio_hash,
+            }
+        exact_portfolios = [
+            portfolio
+            for portfolio in portfolio_artifacts
+            if (
+                (reference := verified_portfolio_artifact_reference(portfolio))
+                and reference["artifactId"] == expected_portfolio_id
+                and secrets.compare_digest(
+                    reference["artifactHash"],
+                    expected_portfolio_hash,
+                )
+            )
+        ]
+        if not exact_portfolios:
+            return {
+                "active": True,
+                "allowed": False,
+                "detail": (
+                    "Live Deployment가 고정한 exact Portfolio Artifact를 "
+                    "찾거나 검증할 수 없습니다."
+                ),
+                "portfolioId": expected_portfolio_id,
+                "portfolioArtifactHash": expected_portfolio_hash,
+            }
+        portfolio_artifacts = exact_portfolios
 
     strategy_id = str(strategy.get("strategy_id") or "")
     symbol = str(strategy.get("symbol") or "")
@@ -973,6 +1234,17 @@ def portfolio_gate_for_strategy(
         match = portfolio_match_for_strategy(portfolio, strategy_id, symbol, mode=mode or current_mode())
         if match is not None:
             return match
+    if expected_portfolio_id or expected_portfolio_hash:
+        return {
+            "active": True,
+            "allowed": False,
+            "detail": (
+                "Live Deployment가 고정한 exact Portfolio Artifact에 "
+                f"{strategy_id}/{symbol} Strategy Instance가 없습니다."
+            ),
+            "portfolioId": expected_portfolio_id,
+            "portfolioArtifactHash": expected_portfolio_hash,
+        }
     return {
         "active": False,
         "allowed": True,
@@ -1100,12 +1372,22 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
         if level != "order" and total > maximum + 1e-12:
             policy_limit_blockers.append(f"{level}:{key}:exposure-limit")
     blockers.extend(policy_limit_blockers)
+    portfolio_reference = verified_portfolio_artifact_reference(portfolio)
+    if "artifact_integrity" in portfolio and not portfolio_reference:
+        blockers.append("portfolio-artifact-integrity-unverified")
 
     return {
         "active": True,
         "allowed": not blockers,
         "detail": "Portfolio hard gate 통과" if not blockers else "Portfolio hard gate 차단: " + "; ".join(blockers),
         "portfolioId": str(portfolio.get("id") or ""),
+        "portfolioArtifactHash": str(
+            portfolio_reference.get("artifactHash") or ""
+        ),
+        "portfolioContentHash": str(
+            portfolio_reference.get("contentHash") or ""
+        ),
+        "portfolioArtifactReference": dict(portfolio_reference),
         "portfolioName": str(portfolio.get("name") or ""),
         "portfolioPath": str(portfolio.get("source_path") or ""),
         "lifecycleStatus": lifecycle_status,
@@ -1408,7 +1690,7 @@ def append_strategy_promotion_log(strategy_dir: Path, payload: dict[str, Any], a
     ArtifactMetadataStore().update(event["artifactId"], "strategy", mark_promoted=True)
 
 
-CANARY_SCOPE_SCHEMA_VERSION = "live-canary-scope-v1"
+CANARY_SCOPE_SCHEMA_VERSION = "live-canary-scope-v2"
 CANARY_SCOPE_FIELDS = (
     "strategyId",
     "strategyArtifactId",
@@ -1416,7 +1698,18 @@ CANARY_SCOPE_FIELDS = (
     "strategyContentHash",
     "deploymentId",
     "deploymentRevision",
+    "currentDeploymentRevision",
     "beforeLiveSmallAt",
+    "paperEvidenceId",
+    "paperEvidenceHash",
+    "paperEvidenceBundleHash",
+    "paperFinalBindingHash",
+    "paperGovernanceDeploymentId",
+    "paperStrategyInstanceId",
+    "paperPortfolioRequired",
+    "paperPortfolioArtifactId",
+    "paperPortfolioArtifactHash",
+    "paperPortfolioInstanceId",
 )
 
 
@@ -1585,6 +1878,11 @@ def current_live_canary_scope(
         if isinstance(current_deployment.get("strategyArtifact"), dict)
         else {}
     )
+    deployed_portfolio_reference = (
+        current_deployment.get("portfolioArtifact")
+        if isinstance(current_deployment.get("portfolioArtifact"), dict)
+        else {}
+    )
     revision, entered_at = _before_live_small_entry(
         current_deployment,
         strategy_dir=strategy_dir,
@@ -1606,6 +1904,19 @@ def current_live_canary_scope(
             != str(current_reference.get(key) or "")
         ):
             issues.append(f"current-strategy-{key}-mismatch")
+    paper_qualification = load_pinned_paper_live_qualification(
+        strategy_dir,
+        payload if isinstance(payload, dict) else {},
+        current_deployment,
+        strategy_reference=current_reference,
+        portfolio_reference=deployed_portfolio_reference,
+    )
+    if paper_qualification.get("ready") is not True:
+        issues.extend(
+            f"paper-live-qualification:{item}"
+            for item in paper_qualification.get("issues")
+            or ["exact-pinned-evidence-required"]
+        )
 
     scope = {
         "schemaVersion": CANARY_SCOPE_SCHEMA_VERSION,
@@ -1615,7 +1926,41 @@ def current_live_canary_scope(
         "strategyContentHash": str(current_reference.get("contentHash") or ""),
         "deploymentId": str(current_deployment.get("deploymentId") or ""),
         "deploymentRevision": revision,
+        "currentDeploymentRevision": max(
+            0,
+            int(safe_float(current_deployment.get("revision"), 0.0)),
+        ),
         "beforeLiveSmallAt": entered_at,
+        "paperEvidenceId": str(
+            paper_qualification.get("evidenceId") or ""
+        ),
+        "paperEvidenceHash": str(
+            paper_qualification.get("evidenceHash") or ""
+        ),
+        "paperEvidenceBundleHash": str(
+            paper_qualification.get("evidenceBundleHash") or ""
+        ),
+        "paperFinalBindingHash": str(
+            paper_qualification.get("bindingHash") or ""
+        ),
+        "paperGovernanceDeploymentId": str(
+            paper_qualification.get("paperGovernanceDeploymentId") or ""
+        ),
+        "paperStrategyInstanceId": str(
+            paper_qualification.get("strategyInstanceId") or ""
+        ),
+        "paperPortfolioRequired": (
+            paper_qualification.get("portfolioRequired") is True
+        ),
+        "paperPortfolioArtifactId": str(
+            paper_qualification.get("portfolioArtifactId") or ""
+        ),
+        "paperPortfolioArtifactHash": str(
+            paper_qualification.get("portfolioArtifactHash") or ""
+        ),
+        "paperPortfolioInstanceId": str(
+            paper_qualification.get("portfolioInstanceId") or ""
+        ),
         "eligible": not issues,
         "issues": issues,
     }
@@ -1643,6 +1988,33 @@ def _canary_scope_matches(
         str(order_scope.get(key) or "")
         == str(current_scope.get(key) or "")
         for key in CANARY_SCOPE_FIELDS
+    )
+
+
+def _promotion_evidence_order_allowed(value: object) -> bool:
+    """Exclude functional/explicitly non-promotional records fail-closed."""
+
+    if not isinstance(value, dict):
+        return False
+    purpose = str(
+        value.get("execution_purpose")
+        or value.get("executionPurpose")
+        or ""
+    ).strip().upper()
+    if purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE:
+        return False
+    if (
+        value.get("promotion_eligible") is False
+        or value.get("promotionEligible") is False
+    ):
+        return False
+    functional_report = (
+        value.get("functional_test")
+        if isinstance(value.get("functional_test"), dict)
+        else {}
+    )
+    return str(functional_report.get("evidenceClass") or "").strip().upper() != (
+        "FUNCTIONAL_TEST_NON_PROMOTION"
     )
 
 
@@ -1690,6 +2062,7 @@ def live_small_execution_summary(
             str(order.get("strategy_id") or "") != str(strategy_id)
             or bool(order.get("dry_run"))
             or str(order.get("mode") or "").upper() != "SMALL_LIVE"
+            or not _promotion_evidence_order_allowed(order)
             or not _canary_scope_matches(order.get("canary_scope"), scope)
         ):
             continue
@@ -1714,6 +2087,9 @@ def live_small_execution_summary(
     for event in durable_gate_events:
         if (
             str(event.get("strategy_id") or "") != str(strategy_id)
+            or bool(event.get("dry_run"))
+            or str(event.get("mode") or "").upper() != "SMALL_LIVE"
+            or not _promotion_evidence_order_allowed(event)
             or not _canary_scope_matches(event.get("canary_scope"), scope)
         ):
             continue
@@ -4799,6 +5175,150 @@ def _operational_strategy(
     )
 
 
+def _normalized_execution_permission_digest(
+    permissions: dict[str, Any],
+) -> str:
+    """Hash the persisted Deployment permission document canonically."""
+
+    normalized = json.loads(
+        json.dumps(
+            permissions,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    )
+    return governance_sha256(normalized)
+
+
+def _current_live_deployment_binding(
+    strategy: dict[str, Any],
+    *,
+    require_store: bool = False,
+) -> dict[str, Any]:
+    """Read the exact current Deployment revision used for a Live decision.
+
+    Production artifacts are enriched from DeploymentStore.  The small
+    normalized fallback exists only for isolated unit/legacy diagnostics and
+    is rejected by every Live session/order boundary via ``source``.
+    """
+
+    deployment_id = str(strategy.get("deployment_id") or "").strip()
+    source_path_text = str(strategy.get("artifact_source_path") or "").strip()
+    deployment: dict[str, Any] | None = None
+    if (
+        deployment_id
+        and source_path_text
+        and strategy.get("deployment_source") == "deployment-registry"
+    ):
+        source_path = Path(source_path_text)
+        try:
+            deployment = DeploymentStore(source_path.parent).get(deployment_id)
+        except (OSError, ValueError, TypeError):
+            deployment = None
+    if deployment is None and require_store:
+        raise ValueError("current-live-deployment-store-entry-missing")
+
+    persisted = deployment if isinstance(deployment, dict) else {}
+    permissions = (
+        persisted.get("permissions")
+        if isinstance(persisted.get("permissions"), dict)
+        else strategy.get("permissions")
+        if isinstance(strategy.get("permissions"), dict)
+        else {}
+    )
+    strategy_reference = (
+        persisted.get("strategyArtifact")
+        if isinstance(persisted.get("strategyArtifact"), dict)
+        else strategy.get("deployment_strategy_reference")
+        if isinstance(strategy.get("deployment_strategy_reference"), dict)
+        else strategy.get("artifact_reference")
+        if isinstance(strategy.get("artifact_reference"), dict)
+        else {}
+    )
+    portfolio_reference = (
+        persisted.get("portfolioArtifact")
+        if isinstance(persisted.get("portfolioArtifact"), dict)
+        else strategy.get("deployment_portfolio_reference")
+        if isinstance(strategy.get("deployment_portfolio_reference"), dict)
+        else {}
+    )
+    revision = max(
+        0,
+        int(
+            safe_float(
+                persisted.get("revision", strategy.get("deployment_revision")),
+                0.0,
+            )
+        ),
+    )
+    lifecycle = normalize_lifecycle_status(
+        persisted.get("lifecycle")
+        or strategy.get("lifecycle_status")
+        or "draft"
+    )
+    environment = str(
+        persisted.get("environment")
+        or strategy.get("deployment_environment")
+        or ""
+    ).strip().upper()
+    mode = str(
+        persisted.get("mode") or strategy.get("deployment_mode") or ""
+    ).strip().upper()
+    source = "deployment-store" if deployment is not None else "normalized-context"
+    binding = {
+        "source": source,
+        "deploymentId": str(
+            persisted.get("deploymentId") or deployment_id
+        ).strip(),
+        "revision": revision,
+        "lifecycle": lifecycle,
+        "environment": environment,
+        "mode": mode,
+        "executionPermissionDigest": _normalized_execution_permission_digest(
+            dict(permissions)
+        ),
+        "strategyArtifact": {
+            key: str(strategy_reference.get(key) or "").strip().lower()
+            if key != "artifactId"
+            else str(strategy_reference.get(key) or "").strip()
+            for key in ("artifactId", "artifactHash", "contentHash")
+        },
+        "portfolioArtifact": {
+            key: str(portfolio_reference.get(key) or "").strip().lower()
+            if key != "artifactId"
+            else str(portfolio_reference.get(key) or "").strip()
+            for key in ("artifactId", "artifactHash", "contentHash")
+        },
+    }
+    binding["bindingHash"] = governance_sha256(binding)
+    return binding
+
+
+def _live_deployment_binding_is_executable(
+    binding: dict[str, Any],
+    *,
+    mode: str,
+) -> bool:
+    normalized_mode = str(mode or "").strip().upper()
+    lifecycle = normalize_lifecycle_status(binding.get("lifecycle"))
+    return bool(
+        binding.get("source") == "deployment-store"
+        and str(binding.get("deploymentId") or "").strip()
+        and int(safe_float(binding.get("revision"), 0.0)) > 0
+        and str(binding.get("environment") or "").upper()
+        in {"LIVE", "SMALL_LIVE", "FULL_LIVE"}
+        and lifecycle in {"before-live-small", "live"}
+        and (
+            normalized_mode != "FULL_LIVE"
+            or lifecycle == "live"
+        )
+        and len(str(binding.get("executionPermissionDigest") or "")) == 64
+        and len(str(binding.get("bindingHash") or "")) == 64
+    )
+
+
 def _operational_artifact_hash(strategy: dict[str, Any]) -> str:
     reference = (
         strategy.get("artifact_reference")
@@ -4822,7 +5342,7 @@ def _operational_artifact_hash(strategy: dict[str, Any]) -> str:
 
 def _operational_portfolio_members(
     strategy: dict[str, Any],
-) -> tuple[str, list[dict[str, str]]]:
+) -> tuple[str, dict[str, str], list[dict[str, Any]]]:
     """Resolve the immutable strategy/symbol routes owned by a deployment."""
 
     gate = (
@@ -4830,35 +5350,187 @@ def _operational_portfolio_members(
         if isinstance(strategy.get("portfolio_gate"), dict)
         else {}
     )
-    portfolio_id = str(gate.get("portfolioId") or "").strip()
-    if not portfolio_id or gate.get("active") is not True:
-        return "", [
+    deployment_binding = _current_live_deployment_binding(strategy)
+    deployed_portfolio_reference = (
+        deployment_binding.get("portfolioArtifact")
+        if isinstance(deployment_binding.get("portfolioArtifact"), dict)
+        else {}
+    )
+    portfolio_id = str(
+        deployed_portfolio_reference.get("artifactId")
+        or gate.get("portfolioId")
+        or ""
+    ).strip()
+    expected_portfolio_hash = str(
+        deployed_portfolio_reference.get("artifactHash")
+        or gate.get("portfolioArtifactHash")
+        or ""
+    ).strip().lower()
+    has_deployed_portfolio_reference = any(
+        str(deployed_portfolio_reference.get(key) or "").strip()
+        for key in ("artifactId", "artifactHash", "contentHash")
+    )
+    if (
+        deployment_binding.get("source") == "deployment-store"
+        and gate.get("active") is True
+        and not has_deployed_portfolio_reference
+    ):
+        raise ValueError(
+            "deployment-store-portfolio-reference-missing"
+        )
+    if has_deployed_portfolio_reference and (
+        gate.get("active") is not True
+        or str(gate.get("portfolioId") or "").strip() != portfolio_id
+        or str(gate.get("portfolioArtifactHash") or "").strip().lower()
+        != expected_portfolio_hash
+    ):
+        raise ValueError(
+            "현재 Portfolio gate가 Live Deployment exact Portfolio reference와 "
+            "일치하지 않습니다."
+        )
+    if not portfolio_id:
+        qualification = paper_live_qualification_gate_for_strategy(strategy)
+        strategy_instance_id = str(
+            strategy.get("strategy_instance_id") or ""
+        ).strip()
+        current_strategy_reference = (
+            strategy.get("artifact_reference")
+            if isinstance(strategy.get("artifact_reference"), dict)
+            else {}
+        )
+        strict_deployment_scope = (
+            deployment_binding.get("source") == "deployment-store"
+        )
+        exact_strategy_scope_matches = bool(
+            not strict_deployment_scope
+            or (
+                str(qualification.get("strategyArtifactId") or "")
+                == str(current_strategy_reference.get("artifactId") or "")
+                == str(
+                    (
+                        deployment_binding.get("strategyArtifact")
+                        if isinstance(
+                            deployment_binding.get("strategyArtifact"), dict
+                        )
+                        else {}
+                    ).get("artifactId")
+                    or ""
+                )
+                and secrets.compare_digest(
+                    str(
+                        qualification.get("strategyArtifactHash") or ""
+                    ).lower(),
+                    str(
+                        current_strategy_reference.get("artifactHash") or ""
+                    ).lower(),
+                )
+                and secrets.compare_digest(
+                    str(
+                        current_strategy_reference.get("artifactHash") or ""
+                    ).lower(),
+                    str(
+                        (
+                            deployment_binding.get("strategyArtifact")
+                            if isinstance(
+                                deployment_binding.get("strategyArtifact"),
+                                dict,
+                            )
+                            else {}
+                        ).get("artifactHash")
+                        or ""
+                    ).lower(),
+                )
+            )
+        )
+        qualification_scope_matches = bool(
+            qualification.get("ready") is True
+            and qualification.get("portfolioRequired") is False
+            and strategy_instance_id
+            and str(qualification.get("strategyInstanceId") or "")
+            == strategy_instance_id
+            and not str(qualification.get("portfolioArtifactId") or "")
+            and not str(qualification.get("portfolioArtifactHash") or "")
+            and not str(qualification.get("portfolioInstanceId") or "")
+            and str(qualification.get("paperGovernanceDeploymentId") or "")
+            and exact_strategy_scope_matches
+        )
+        return "", {}, [
             {
                 "strategyId": str(strategy.get("strategy_id") or "").strip(),
+                "strategyInstanceId": strategy_instance_id,
                 "symbol": str(strategy.get("symbol") or "").strip().upper(),
                 "brokerId": strategy_broker_id(strategy) or "unresolved-route",
                 "artifactHash": _operational_artifact_hash(strategy),
+                "strategyArtifactReference": {
+                    key: str(current_strategy_reference.get(key) or "")
+                    for key in ("artifactId", "artifactHash", "contentHash")
+                },
+                "paperEvidenceId": str(qualification.get("evidenceId") or ""),
+                "paperEvidenceHash": str(qualification.get("evidenceHash") or ""),
+                "paperEvidenceBundleHash": str(
+                    qualification.get("evidenceBundleHash") or ""
+                ),
+                "paperFinalBindingHash": str(
+                    qualification.get("bindingHash") or ""
+                ),
+                "paperGovernanceDeploymentId": str(
+                    qualification.get("paperGovernanceDeploymentId") or ""
+                ),
+                "paperPortfolioArtifactId": "",
+                "paperPortfolioArtifactHash": "",
+                "paperPortfolioInstanceId": "",
+                "paperQualificationReady": qualification_scope_matches,
             }
         ]
 
-    portfolio = next(
-        (
-            item
-            for item in portfolio_rows()
-            if str(
-                item.get("id")
-                or item.get("portfolio_id")
-                or item.get("portfolioId")
-                or ""
-            ).strip()
-            == portfolio_id
-        ),
-        None,
-    )
+    if deployment_binding.get("source") == "deployment-store" and not expected_portfolio_hash:
+        raise ValueError("Live Deployment exact Portfolio Artifact hash가 없습니다.")
+    portfolio: dict[str, Any] | None = None
+    portfolio_reference: dict[str, str] = {}
+    for candidate in portfolio_rows():
+        candidate_id = str(
+            candidate.get("id")
+            or candidate.get("portfolio_id")
+            or candidate.get("portfolioId")
+            or ""
+        ).strip()
+        if candidate_id != portfolio_id:
+            continue
+        candidate_reference = verified_portfolio_artifact_reference(candidate)
+        if expected_portfolio_hash:
+            if (
+                not candidate_reference
+                or not secrets.compare_digest(
+                    candidate_reference["artifactHash"],
+                    expected_portfolio_hash,
+                )
+            ):
+                continue
+        elif deployment_binding.get("source") == "deployment-store":
+            continue
+        portfolio = candidate
+        portfolio_reference = candidate_reference
+        break
     if not isinstance(portfolio, dict):
         raise ValueError(
-            f"선택 Portfolio Artifact({portfolio_id})를 찾을 수 없습니다."
+            "Live Deployment가 고정한 exact Portfolio Artifact를 찾을 수 "
+            f"없습니다: {portfolio_id}/{expected_portfolio_hash or 'hash-missing'}"
         )
+    if not portfolio_reference:
+        # Isolated legacy/unit contexts may not carry a canonical lock.  Live
+        # startup rejects their normalized-context Deployment binding.
+        synthetic_hash = governance_sha256(
+            {
+                key: value
+                for key, value in portfolio.items()
+                if key not in {"source_path", "artifact_integrity"}
+            }
+        )
+        portfolio_reference = {
+            "artifactId": portfolio_id,
+            "artifactHash": synthetic_hash,
+            "contentHash": synthetic_hash,
+        }
     instances = (
         portfolio.get("strategy_instances")
         if isinstance(portfolio.get("strategy_instances"), list)
@@ -4867,7 +5539,10 @@ def _operational_portfolio_members(
         else []
     )
     artifacts = load_strategy_artifacts()
-    members: list[dict[str, str]] = []
+    members: list[dict[str, Any]] = []
+    strict_deployment_scope = (
+        deployment_binding.get("source") == "deployment-store"
+    )
     for instance in instances:
         if not isinstance(instance, dict):
             continue
@@ -4898,6 +5573,62 @@ def _operational_portfolio_members(
             None,
         )
         source_hash = str(instance.get("sourceArtifactHash") or "").strip()
+        if strict_deployment_scope:
+            if len(source_hash) != 64:
+                raise ValueError(
+                    "Portfolio Strategy Instance sourceArtifactHash가 "
+                    f"불완전합니다: {strategy_id}/{symbol}"
+                )
+            artifact = next(
+                (
+                    item
+                    for item in artifacts
+                    if str(
+                        item.get("strategy_id")
+                        or item.get("strategyId")
+                        or item.get("id")
+                        or ""
+                    ).strip()
+                    == strategy_id
+                    and (
+                        not str(item.get("symbol") or "").strip()
+                        or str(item.get("symbol") or "").strip().upper()
+                        == symbol
+                    )
+                    and (
+                        candidate_reference := (
+                            verified_strategy_artifact_reference(item)
+                        )
+                    )
+                    and secrets.compare_digest(
+                        candidate_reference["artifactHash"],
+                        source_hash.lower(),
+                    )
+                ),
+                None,
+            )
+            if not isinstance(artifact, dict):
+                raise ValueError(
+                    "Portfolio가 고정한 exact Strategy Artifact를 찾을 수 "
+                    f"없습니다: {strategy_id}/{symbol}/{source_hash}"
+                )
+        strategy_artifact_reference = (
+            verified_strategy_artifact_reference(artifact)
+            if isinstance(artifact, dict)
+            else {}
+        )
+        if not strategy_artifact_reference and isinstance(artifact, dict):
+            strategy_artifact_reference = {
+                key: str(
+                    (
+                        artifact.get("artifact_reference")
+                        if isinstance(artifact.get("artifact_reference"), dict)
+                        else {}
+                    ).get(key)
+                    or ""
+                )
+                for key in ("artifactId", "artifactHash", "contentHash")
+            }
         artifact_hash = (
             _operational_artifact_hash(artifact)
             if isinstance(artifact, dict)
@@ -4914,20 +5645,93 @@ def _operational_portfolio_members(
             "broker_id": instance.get("brokerId") or instance.get("broker_id"),
             "market_type": instance.get("marketType") or instance.get("market_type"),
         }
+        strategy_instance_id = str(
+            instance.get("instanceId")
+            or instance.get("strategyInstanceId")
+            or ""
+        ).strip()
+        qualification = (
+            paper_live_qualification_gate_for_strategy(artifact)
+            if isinstance(artifact, dict)
+            else {
+                "required": True,
+                "ready": False,
+                "issues": ["portfolio-member-artifact-missing"],
+            }
+        )
+        qualification_scope_matches = bool(
+            qualification.get("ready") is True
+            and qualification.get("portfolioRequired") is True
+            and str(qualification.get("portfolioArtifactId") or "")
+            == portfolio_id
+            and secrets.compare_digest(
+                str(qualification.get("portfolioArtifactHash") or "").lower(),
+                str(portfolio_reference.get("artifactHash") or "").lower(),
+            )
+            and str(qualification.get("portfolioInstanceId") or "")
+            and strategy_instance_id
+            and str(qualification.get("strategyInstanceId") or "")
+            == strategy_instance_id
+            and str(qualification.get("paperGovernanceDeploymentId") or "")
+            and (
+                not strict_deployment_scope
+                or (
+                    str(qualification.get("strategyArtifactId") or "")
+                    == str(strategy_artifact_reference.get("artifactId") or "")
+                    and secrets.compare_digest(
+                        str(
+                            qualification.get("strategyArtifactHash") or ""
+                        ).lower(),
+                        str(
+                            strategy_artifact_reference.get("artifactHash")
+                            or ""
+                        ).lower(),
+                    )
+                )
+            )
+        )
         members.append(
             {
                 "strategyId": strategy_id,
+                "strategyInstanceId": strategy_instance_id,
                 "symbol": symbol,
                 "brokerId": strategy_broker_id(route_source) or "unresolved-route",
                 "artifactHash": artifact_hash,
+                "strategyArtifactReference": strategy_artifact_reference,
+                "paperEvidenceId": str(qualification.get("evidenceId") or ""),
+                "paperEvidenceHash": str(qualification.get("evidenceHash") or ""),
+                "paperEvidenceBundleHash": str(
+                    qualification.get("evidenceBundleHash") or ""
+                ),
+                "paperFinalBindingHash": str(
+                    qualification.get("bindingHash") or ""
+                ),
+                "paperGovernanceDeploymentId": str(
+                    qualification.get("paperGovernanceDeploymentId") or ""
+                ),
+                "paperPortfolioArtifactId": str(
+                    qualification.get("portfolioArtifactId") or ""
+                ),
+                "paperPortfolioArtifactHash": str(
+                    qualification.get("portfolioArtifactHash") or ""
+                ),
+                "paperPortfolioInstanceId": str(
+                    qualification.get("portfolioInstanceId") or ""
+                ),
+                "paperQualificationReady": qualification_scope_matches,
             }
         )
     unique_members = {
-        (item["strategyId"], item["symbol"]): item for item in members
+        (item["strategyId"], item["strategyInstanceId"], item["symbol"]): item
+        for item in members
     }
     normalized = sorted(
         unique_members.values(),
-        key=lambda item: (item["strategyId"], item["symbol"]),
+        key=lambda item: (
+            item["strategyId"],
+            item["strategyInstanceId"],
+            item["symbol"],
+        ),
     )
     if not normalized:
         raise ValueError(
@@ -4937,15 +5741,20 @@ def _operational_portfolio_members(
         str(strategy.get("strategy_id") or "").strip(),
         str(strategy.get("symbol") or "").strip().upper(),
     )
-    if selected_pair not in unique_members:
+    if not any(
+        item["strategyId"] == selected_pair[0]
+        and item["symbol"] == selected_pair[1]
+        for item in normalized
+    ):
         raise ValueError(
             "선택 Deployment Strategy가 Portfolio Artifact 구성에 없습니다."
         )
-    return portfolio_id, normalized
+    return portfolio_id, portfolio_reference, normalized
 
 
 def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
     route = strategy_broker_id(strategy) or "unresolved-route"
+    deployment_binding = _current_live_deployment_binding(strategy)
     gate = (
         strategy.get("portfolio_gate")
         if isinstance(strategy.get("portfolio_gate"), dict)
@@ -4960,10 +5769,72 @@ def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     )
-    portfolio_id, strategy_members = _operational_portfolio_members(strategy)
+    (
+        portfolio_id,
+        portfolio_reference,
+        strategy_members,
+    ) = _operational_portfolio_members(strategy)
+    current_strategy_reference = (
+        strategy.get("artifact_reference")
+        if isinstance(strategy.get("artifact_reference"), dict)
+        else {}
+    )
+    deployed_strategy_reference = (
+        deployment_binding.get("strategyArtifact")
+        if isinstance(deployment_binding.get("strategyArtifact"), dict)
+        else {}
+    )
+    deployed_portfolio_reference = (
+        deployment_binding.get("portfolioArtifact")
+        if isinstance(deployment_binding.get("portfolioArtifact"), dict)
+        else {}
+    )
+    if deployment_binding.get("source") == "deployment-store":
+        for key in ("artifactId", "artifactHash", "contentHash"):
+            if str(current_strategy_reference.get(key) or "").lower() != str(
+                deployed_strategy_reference.get(key) or ""
+            ).lower():
+                raise ValueError(
+                    f"current-live-deployment-strategy-{key}-mismatch"
+                )
+        for key in ("artifactId", "artifactHash", "contentHash"):
+            if str(portfolio_reference.get(key) or "").lower() != str(
+                deployed_portfolio_reference.get(key) or ""
+            ).lower():
+                raise ValueError(
+                    f"current-live-deployment-portfolio-{key}-mismatch"
+                )
     strategy_ids = sorted({item["strategyId"] for item in strategy_members})
     allowed_symbols = sorted({item["symbol"] for item in strategy_members})
     broker_routes = sorted({item["brokerId"] for item in strategy_members})
+    paper_final_bindings = [
+        {
+            "strategyId": str(item.get("strategyId") or ""),
+            "strategyInstanceId": str(item.get("strategyInstanceId") or ""),
+            "paperEvidenceId": str(item.get("paperEvidenceId") or ""),
+            "paperEvidenceHash": str(item.get("paperEvidenceHash") or ""),
+            "paperEvidenceBundleHash": str(
+                item.get("paperEvidenceBundleHash") or ""
+            ),
+            "paperFinalBindingHash": str(
+                item.get("paperFinalBindingHash") or ""
+            ),
+            "paperGovernanceDeploymentId": str(
+                item.get("paperGovernanceDeploymentId") or ""
+            ),
+            "paperPortfolioArtifactId": str(
+                item.get("paperPortfolioArtifactId") or ""
+            ),
+            "paperPortfolioArtifactHash": str(
+                item.get("paperPortfolioArtifactHash") or ""
+            ),
+            "paperPortfolioInstanceId": str(
+                item.get("paperPortfolioInstanceId") or ""
+            ),
+            "ready": item.get("paperQualificationReady") is True,
+        }
+        for item in strategy_members
+    ]
     if len(broker_routes) != 1 or broker_routes[0] != route:
         raise ValueError(
             "현재 Deployment Preflight는 단일 Broker 계좌만 봉인합니다. "
@@ -4983,6 +5854,9 @@ def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
             "symbol": str(strategy.get("symbol") or ""),
             "timeframe": str(strategy.get("timeframe") or ""),
             "strategyMembers": strategy_members,
+            "paperFinalBindings": paper_final_bindings,
+            "deploymentBinding": deployment_binding,
+            "portfolioArtifact": portfolio_reference,
             "riskPolicyHash": risk_policy_hash,
             "retryPolicy": STATE.get("retry_policy", {}),
             "realOrdersEnabled": real_orders_enabled(),
@@ -4995,21 +5869,13 @@ def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
             "adapterContract": broker_adapter_contract(),
         }
     )
-    portfolio_hash = (
-        governance_sha256(
-            {
-                "portfolioId": portfolio_id,
-                "policyHash": str(gate.get("portfolioPolicyHash") or ""),
-                "operationsHash": str(gate.get("advancedOperationsHash") or ""),
-                "readinessHash": str(gate.get("operationalReadinessHash") or ""),
-                "strategyMembers": strategy_members,
-            }
-        )
-        if portfolio_id
-        else ""
-    )
+    portfolio_hash = str(portfolio_reference.get("artifactHash") or "")
     return {
-        "deployment_id": str(strategy.get("deployment_id") or _live_deployment_id(strategy)),
+        "deployment_id": str(
+            deployment_binding.get("deploymentId")
+            or strategy.get("deployment_id")
+            or _live_deployment_id(strategy)
+        ),
         "strategy_artifact_hash": (
             member_artifact_hash
             if portfolio_id
@@ -5033,6 +5899,13 @@ def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
             "allowedSymbols": allowed_symbols,
             "brokerRoutes": broker_routes,
             "strategyMembers": strategy_members,
+            "paperFinalBindings": paper_final_bindings,
+            "paperFinalBindingsHash": governance_sha256(paper_final_bindings),
+            "deploymentBinding": deployment_binding,
+            "deploymentBindingHash": str(
+                deployment_binding.get("bindingHash") or ""
+            ),
+            "portfolioArtifact": portfolio_reference,
             "portfolioId": portfolio_id,
             "symbol": str(strategy.get("symbol") or ""),
             "timeframe": str(strategy.get("timeframe") or ""),
@@ -5041,29 +5914,45 @@ def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _operational_manifest_matches_inputs(
+    manifest: object,
+    values: dict[str, Any],
+) -> bool:
+    to_dict = getattr(manifest, "to_dict", None)
+    if not callable(to_dict):
+        return False
+    current_payload = to_dict()
+    comparisons = {
+        "deploymentId": values["deployment_id"],
+        "strategyArtifactHash": values["strategy_artifact_hash"],
+        "portfolioArtifactHash": values["portfolio_artifact_hash"],
+        "accountFingerprint": values["account_fingerprint"],
+        "brokerRoute": values["broker_route"],
+        "runtimeVersion": values["runtime_version"],
+        "buildHash": values["build_hash"],
+        "executionAdapter": values["execution_adapter"],
+        "executionAdapterVersion": values["execution_adapter_version"],
+        "riskPolicyRevision": values["risk_policy_revision"],
+        "riskPolicyHash": values["risk_policy_hash"],
+        "configRevision": values["config_revision"],
+        "configHash": values["config_hash"],
+        "preflightTtlSeconds": values["preflight_ttl_seconds"],
+        "metadata": values["metadata"],
+    }
+    return all(
+        current_payload.get(key) == value
+        for key, value in comparisons.items()
+    )
+
+
 def ensure_operational_deployment_manifest(strategy: dict[str, Any]):
     values = _operational_manifest_inputs(strategy)
     current = OPERATIONAL_GOVERNANCE.get_deployment_manifest(values["deployment_id"])
-    if current is not None:
-        current_payload = current.to_dict()
-        comparisons = {
-            "strategyArtifactHash": values["strategy_artifact_hash"],
-            "portfolioArtifactHash": values["portfolio_artifact_hash"],
-            "accountFingerprint": values["account_fingerprint"],
-            "brokerRoute": values["broker_route"],
-            "runtimeVersion": values["runtime_version"],
-            "buildHash": values["build_hash"],
-            "executionAdapter": values["execution_adapter"],
-            "executionAdapterVersion": values["execution_adapter_version"],
-            "riskPolicyRevision": values["risk_policy_revision"],
-            "riskPolicyHash": values["risk_policy_hash"],
-            "configRevision": values["config_revision"],
-            "configHash": values["config_hash"],
-            "preflightTtlSeconds": values["preflight_ttl_seconds"],
-            "metadata": values["metadata"],
-        }
-        if all(current_payload.get(key) == value for key, value in comparisons.items()):
-            return current
+    if current is not None and _operational_manifest_matches_inputs(
+        current,
+        values,
+    ):
+        return current
     return OPERATIONAL_GOVERNANCE.create_deployment_manifest(**values)
 
 
@@ -5311,6 +6200,9 @@ def snapshot() -> dict[str, Any]:
         "automation_profiles": automations,
         "continuous_runtime": continuous_runtime,
         "execution_streams": LIVE_EXECUTION_STREAMS.snapshot(),
+        "functional_test_runtime_guard": (
+            functional_test_runtime_guard_snapshot()
+        ),
         "strategy_runner": dict(STATE["strategy_runner"]),
         "strategy_sleeves": dict(STATE.get("strategy_sleeves", {})),
         "multi_strategy": {
@@ -5976,11 +6868,46 @@ def ensure_live_deployment(
     )
     lifecycle = normalize_lifecycle_status(normalized.get("lifecycle_status") or "draft")
     if lifecycle != "draft":
+        seed_permissions = dict(normalized.get("permissions") or {})
+        # Legacy Strategy Artifact permissions are descriptive input, never
+        # Live authority. A newly created Live Deployment must receive exact
+        # Paper pins through an explicit Deployment transition.
+        for key in (
+            "paperEvidenceId",
+            "paperEvidenceHash",
+            "paperEvidenceBundleHash",
+            "paperFinalBindingHash",
+            "paperGovernanceDeploymentId",
+            "paperStrategyInstanceId",
+            "paperPortfolioInstanceId",
+        ):
+            seed_permissions.pop(key, None)
+        seed_permissions.update(
+            {
+                "paper_trader_verified": False,
+                "live_small_eligible": False,
+                "live_eligible": False,
+                "live_allowed": False,
+                "fail_reasons": list(
+                    dict.fromkeys(
+                        [
+                            *[
+                                str(item)
+                                for item in seed_permissions.get(
+                                    "fail_reasons", []
+                                )
+                            ],
+                            "live-deployment-exact-paper-pins-required",
+                        ]
+                    )
+                ),
+            }
+        )
         current = store.transition(
             definition["deploymentId"],
             lifecycle=lifecycle,
             mode="MONITOR",
-            permissions=dict(normalized.get("permissions") or {}),
+            permissions=seed_permissions,
             actor="live_trader-migration",
             reason="legacy strategy lifecycle seeded into live deployment",
         )
@@ -6015,7 +6942,34 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
         append_audit("danger", "Live 승급 차단", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
     deployment_permissions = dict(deployment.get("permissions") or {})
-    if deployment_permissions.get("live_small_eligible") is not True and normalized.get("live_small_eligible") is not True:
+    try:
+        current_strategy_reference = artifact_reference(payload)
+    except ValueError:
+        current_strategy_reference = {}
+    deployment_portfolio_reference = (
+        dict(deployment.get("portfolioArtifact"))
+        if isinstance(deployment.get("portfolioArtifact"), dict)
+        else {}
+    )
+    paper_qualification = load_pinned_paper_live_qualification(
+        strategy_dir,
+        payload,
+        deployment,
+        strategy_reference=current_strategy_reference,
+        portfolio_reference=deployment_portfolio_reference,
+    )
+    if paper_qualification.get("ready") is not True:
+        reason = (
+            "Live Deployment의 정확한 Paper final binding 재검증에 실패했습니다: "
+            + ", ".join(
+                str(item)
+                for item in paper_qualification.get("issues")
+                or ["exact-pinned-evidence-required"]
+            )
+        )
+        append_audit("danger", "Live 승급 차단", reason)
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
+    if deployment_permissions.get("live_small_eligible") is not True:
         reason = "live_small_eligible=true 전략만 소액 실거래 후 live로 승급할 수 있습니다."
         append_audit("danger", "Live 승급 차단", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
@@ -6051,10 +7005,10 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
         return {"ok": False, "reason": reason, "snapshot": data}
     fail_reasons = [
         reason
-        for reason in (deployment.get("permissions") or normalized.get("permissions") or {}).get("fail_reasons", []) or []
+        for reason in deployment_permissions.get("fail_reasons", []) or []
         if str(reason) not in {"live-activation-required", "before-live-small 승급 후 소액 실거래 확인이 필요합니다."}
     ]
-    permissions = dict(deployment.get("permissions") or normalized.get("permissions") or {})
+    permissions = dict(deployment_permissions)
     permissions.update({
         "paper_trader_verified": True,
         "live_small_eligible": True,
@@ -6064,7 +7018,6 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
     })
     now = datetime.now().astimezone().replace(microsecond=0).isoformat()
     evidence_id = f"live-{strategy_id}-{datetime.now().strftime('%Y%m%dT%H%M%S%f')}"
-    paper_evidence = normalized.get("paper_portfolio_evidence") if isinstance(normalized.get("paper_portfolio_evidence"), dict) else {}
     live_evidence = build_live_execution_evidence(
         evidence_id=evidence_id,
         strategy_artifact=payload,
@@ -6086,7 +7039,12 @@ def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
                 created_at=now,
                 inputs={
                     "strategyArtifactHash": artifact_content_hash(payload),
-                    "paperEvidenceHash": str(paper_evidence.get("evidenceHash") or normalized.get("permissions", {}).get("paperEvidenceHash") or "legacy-paper-evidence"),
+                    "paperEvidenceHash": str(
+                        paper_qualification.get("evidenceHash") or ""
+                    ),
+                    "paperEvidenceBundleHash": str(
+                        paper_qualification.get("evidenceBundleHash") or ""
+                    ),
                     "runtimeVersion": "live-trader-v1",
                     "brokerRoute": strategy_broker_id(normalized),
                 },
@@ -6152,6 +7110,7 @@ def paper_live_forward_resume_assessment(
     payload: dict[str, Any],
     normalized: dict[str, Any],
     deployment: dict[str, Any],
+    permissions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Re-evaluate immutable Paper evidence before restoring Live-Small permission."""
 
@@ -6176,75 +7135,41 @@ def paper_live_forward_resume_assessment(
     current_portfolio_id = str(portfolio_reference.get("artifactId") or "")
     current_portfolio_hash = str(portfolio_reference.get("artifactHash") or "")
 
-    records = EvidenceStore(strategy_dir).list_paper()
-    matching_id = [
-        record
-        for record in records
-        if str((record.payload.get("strategyArtifact") or {}).get("artifactId") or "")
-        == current_artifact_id
-    ]
-    if not matching_id:
-        blockers.append("paper-live-forward-evidence-missing")
-        return {
-            "ready": False,
-            "blockers": blockers,
-            "evidenceId": "",
-            "artifactHash": current_artifact_hash,
-        }
-
-    matching_hash = [
-        record
-        for record in matching_id
-        if str((record.payload.get("strategyArtifact") or {}).get("artifactHash") or "")
-        == current_artifact_hash
-    ]
-    if not matching_hash:
-        blockers.append("paper-evidence-artifact-hash-mismatch")
-        return {
-            "ready": False,
-            "blockers": blockers,
-            "evidenceId": "",
-            "artifactHash": current_artifact_hash,
-        }
-
-    matching_portfolio = []
-    for record in matching_hash:
-        evidence_portfolio = (
-            record.payload.get("portfolioArtifact")
-            if isinstance(record.payload.get("portfolioArtifact"), dict)
-            else {}
-        )
-        evidence_portfolio_id = str(evidence_portfolio.get("artifactId") or "")
-        evidence_portfolio_hash = str(evidence_portfolio.get("artifactHash") or "")
-        if evidence_portfolio_id != current_portfolio_id:
-            continue
-        if current_portfolio_hash and evidence_portfolio_hash != current_portfolio_hash:
-            continue
-        matching_portfolio.append(record)
-    if not matching_portfolio:
-        blockers.append("paper-evidence-portfolio-hash-mismatch")
-        return {
-            "ready": False,
-            "blockers": blockers,
-            "evidenceId": "",
-            "artifactHash": current_artifact_hash,
-        }
-
-    evidence_record = max(
-        matching_portfolio,
-        key=lambda item: str(
-            item.payload.get("endedAt")
-            or item.payload.get("createdAt")
-            or item.path.name
-        ),
+    qualification = load_pinned_paper_live_qualification(
+        strategy_dir,
+        payload,
+        deployment,
+        permissions=permissions,
+        strategy_reference=current_reference,
+        portfolio_reference=portfolio_reference,
     )
-    evidence = evidence_record.payload
-    evidence_id = str(evidence.get("evidenceId") or "")
-    if not evidence_record.valid:
+    if qualification.get("ready") is not True:
         blockers.extend(
-            f"paper-evidence-invalid:{issue}"
-            for issue in (evidence_record.issues or ("integrity",))
+            str(issue)
+            for issue in (
+                qualification.get("issues")
+                or ["paper-live-exact-qualification-missing"]
+            )
         )
+        return {
+            "ready": False,
+            "blockers": list(dict.fromkeys(blockers)),
+            "evidenceId": str(qualification.get("evidenceId") or ""),
+            "evidenceHash": str(qualification.get("evidenceHash") or ""),
+            "evidenceBundleHash": str(
+                qualification.get("evidenceBundleHash") or ""
+            ),
+            "bindingHash": str(qualification.get("bindingHash") or ""),
+            "artifactHash": current_artifact_hash,
+            "portfolioId": current_portfolio_id,
+            "portfolioHash": current_portfolio_hash,
+        }
+    evidence = (
+        qualification.get("evidencePayload")
+        if isinstance(qualification.get("evidencePayload"), dict)
+        else {}
+    )
+    evidence_id = str(qualification.get("evidenceId") or "")
     if str(evidence.get("evidenceType") or "") != "paper-portfolio":
         blockers.append("paper-evidence-type-invalid")
     if str(evidence.get("result") or "").upper() != "PASS":
@@ -6270,7 +7195,7 @@ def paper_live_forward_resume_assessment(
     )
     if (
         str(evidence_policy.get("promotionSource") or "")
-        != "continuous-live-forward-closed-bar-v2"
+        != PAPER_FORWARD_EXECUTION_POLICY
     ):
         blockers.append("paper-live-forward-source-missing")
 
@@ -6413,7 +7338,20 @@ def paper_live_forward_resume_assessment(
         "ready": not blockers,
         "blockers": list(dict.fromkeys(blockers)),
         "evidenceId": evidence_id,
-        "evidenceHash": str((evidence.get("integrity") or {}).get("contentHash") or ""),
+        "evidenceHash": str(qualification.get("evidenceHash") or ""),
+        "evidenceBundleHash": str(
+            qualification.get("evidenceBundleHash") or ""
+        ),
+        "bindingHash": str(qualification.get("bindingHash") or ""),
+        "paperGovernanceDeploymentId": str(
+            qualification.get("paperGovernanceDeploymentId") or ""
+        ),
+        "strategyInstanceId": str(
+            qualification.get("strategyInstanceId") or ""
+        ),
+        "portfolioInstanceId": str(
+            qualification.get("portfolioInstanceId") or ""
+        ),
         "artifactHash": current_artifact_hash,
         "portfolioId": current_portfolio_id,
         "portfolioHash": current_portfolio_hash,
@@ -6440,7 +7378,7 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
 
     deployment_store, deployment, _portfolio_payload = ensure_live_deployment(strategy_dir, payload, normalized)
     current_status = normalize_lifecycle_status(deployment.get("lifecycle") or normalized.get("lifecycle_status"))
-    permissions = dict(deployment.get("permissions") or normalized.get("permissions") or {})
+    permissions = dict(deployment.get("permissions") or {})
 
     if action == "resume":
         if current_status != "paused":
@@ -6472,6 +7410,7 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
                 payload,
                 normalized,
                 deployment,
+                permissions=permissions,
             )
             permissions["resumeEvidence"] = resume_evidence
             if resume_evidence.get("ready") is True:
@@ -6485,6 +7424,19 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
                         "live_allowed": False,
                         "paperEvidenceId": resume_evidence.get("evidenceId"),
                         "paperEvidenceHash": resume_evidence.get("evidenceHash"),
+                        "paperEvidenceBundleHash": resume_evidence.get(
+                            "evidenceBundleHash"
+                        ),
+                        "paperFinalBindingHash": resume_evidence.get("bindingHash"),
+                        "paperGovernanceDeploymentId": resume_evidence.get(
+                            "paperGovernanceDeploymentId"
+                        ),
+                        "paperStrategyInstanceId": resume_evidence.get(
+                            "strategyInstanceId"
+                        ),
+                        "paperPortfolioInstanceId": resume_evidence.get(
+                            "portfolioInstanceId"
+                        ),
                     }
                 )
                 permissions.pop("liveEvidenceId", None)
@@ -6526,6 +7478,11 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
                 for evidence_key in (
                     "paperEvidenceId",
                     "paperEvidenceHash",
+                    "paperEvidenceBundleHash",
+                    "paperFinalBindingHash",
+                    "paperGovernanceDeploymentId",
+                    "paperStrategyInstanceId",
+                    "paperPortfolioInstanceId",
                     "liveEvidenceId",
                     "liveEvidenceHash",
                 ):
@@ -6558,7 +7515,7 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
         if action == "pause":
             permissions["pausedFrom"] = current_status
             permissions["pausedPermissions"] = dict(permissions)
-        fail_reasons = list(permissions.get("fail_reasons", payload.get("fail_reasons", [])) or [])
+        fail_reasons = list(permissions.get("fail_reasons", []) or [])
         fail_reasons.append(f"lifecycle-{target_status}")
         fail_reasons = list(dict.fromkeys(str(reason) for reason in fail_reasons))
         permissions.update({
@@ -9002,12 +9959,153 @@ def binance_futures_fill_soak_status() -> dict[str, Any]:
     return redact_sensitive_payload(current)  # type: ignore[return-value]
 
 
+def _authorize_binance_futures_fill_soak_dispatch(
+    payload: dict[str, object],
+) -> tuple[bool, str, dict[str, object]]:
+    """Authorize fill-soak entries and reduce-only exits on separate paths."""
+
+    strategy_id = str(payload.get("strategy_id") or "").strip()
+    symbol = normalize_usdm_symbol(payload.get("symbol"))
+    strategy = next(
+        (
+            item
+            for item in strategy_rows()
+            if str(item.get("strategy_id") or "") == strategy_id
+            and normalize_usdm_symbol(item.get("symbol")) == symbol
+            and strategy_broker_id(item) == "binance-futures"
+        ),
+        None,
+    )
+    portfolio_gate = (
+        strategy.get("portfolio_gate")
+        if isinstance(strategy, dict)
+        and isinstance(strategy.get("portfolio_gate"), dict)
+        else {}
+    )
+    now = datetime.now(timezone.utc)
+    soak_leg = str(payload.get("soak_leg") or "").strip().lower()
+    risk_reducing = payload.get("risk_reducing") is True
+    reduce_only = payload.get("reduce_only") is True
+    intent = OrderIntent(
+        strategy_id=strategy_id,
+        asset="CRYPTO",
+        symbol=symbol,
+        side=str(payload.get("side") or "BUY").upper(),
+        quantity=max(0.0, safe_float(payload.get("quantity"), 0.0)),
+        reference_price=max(0.0, safe_float(payload.get("price"), 0.0)),
+        mode=current_mode(),
+        reason="Binance Futures fill-soak operational dispatch revalidation",
+        metadata={
+            "broker_id": "binance-futures",
+            "profile_id": "crypto",
+            "strategy_instance_id": str(
+                strategy.get("strategy_instance_id")
+                if isinstance(strategy, dict)
+                else ""
+            ),
+            "portfolio_id": str(portfolio_gate.get("portfolioId") or ""),
+            "order_purpose": "FUTURES_FILL_SOAK",
+            "order_type": str(payload.get("order_type") or "MARKET"),
+            "market_type": "futures",
+            "position_direction": str(
+                payload.get("position_direction") or "short"
+            ),
+            "risk_reducing": payload.get("risk_reducing") is True,
+            "reduce_only": reduce_only,
+            "soak_leg": soak_leg,
+            "market_event_time": now.isoformat().replace("+00:00", "Z"),
+            "market_data_verified": True,
+        },
+    )
+    if strategy is None:
+        return False, "fill-soak-current-strategy-missing", {}
+
+    # Every risk-increasing entry gets all mutable safety controls and its
+    # preview-bound canary scope re-read immediately before broker dispatch.
+    if soak_leg == "entry" and not risk_reducing and not reduce_only:
+        if intent.mode != "SMALL_LIVE":
+            return False, "fill-soak-entry-small-live-required", {}
+        invariant_allowed, invariant_reason = live_broker_dispatch_allowed(
+            intent,
+            dry_run=False,
+        )
+        if not invariant_allowed:
+            return False, invariant_reason, {}
+        scope_allowed, scope_reason, current_scope = (
+            exact_live_canary_scope_dispatch_allowed(
+                intent,
+                payload.get("canary_scope")
+                if isinstance(payload.get("canary_scope"), dict)
+                else {},
+            )
+        )
+        if not scope_allowed:
+            return False, scope_reason, {"canaryScope": current_scope}
+        allowed, reason, authorization = operational_runtime_dispatch_allowed(
+            intent
+        )
+        result = dict(authorization)
+        result.update(
+            {
+                "dispatchPath": "new-entry",
+                "brokerInvariantRevalidated": True,
+                "canaryScope": current_scope,
+            }
+        )
+        return allowed, reason, result
+
+    # A cover is never allowed to masquerade as a new entry.  It has a
+    # deliberately separate recovery path so a safety stop can flatten an
+    # already-open short, but current broker truth must prove it is reducing.
+    if (
+        soak_leg in {"cover", "recovery-cover"}
+        and risk_reducing
+        and reduce_only
+    ):
+        if not futures_risk_reducing_verified({}, intent):
+            return False, "fill-soak-reduce-only-position-unverified", {}
+        allowed, reason, authorization = operational_runtime_dispatch_allowed(
+            intent
+        )
+        result = dict(authorization)
+        result.update(
+            {
+                "dispatchPath": "recovery-reduce-only",
+                "recoveryReduceOnly": True,
+            }
+        )
+        return allowed, reason, result
+
+    return False, "fill-soak-dispatch-shape-invalid", {}
+
+
 def preview_binance_futures_fill_soak(
     symbol: object = "ETHUSDT",
 ) -> dict[str, Any]:
     global BINANCE_FUTURES_FILL_SOAK_SESSION
 
     normalized_symbol = normalize_usdm_symbol(symbol or "ETHUSDT")
+    selected_strategy_id = str(STATE.get("selected_strategy_id") or "").strip()
+    selected_deployment_id = str(
+        STATE.get("selected_deployment_id") or ""
+    ).strip()
+    selected_strategy = next(
+        (
+            item
+            for item in strategy_rows()
+            if (
+                (selected_strategy_id and str(item.get("strategy_id") or "") == selected_strategy_id)
+                or (
+                    selected_deployment_id
+                    and str(item.get("deployment_id") or "")
+                    == selected_deployment_id
+                )
+            )
+            and normalize_usdm_symbol(item.get("symbol")) == normalized_symbol
+            and strategy_broker_id(item) == "binance-futures"
+        ),
+        None,
+    )
     session_id = (
         "bfsoak-"
         + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
@@ -9040,6 +10138,14 @@ def preview_binance_futures_fill_soak(
         )
 
     try:
+        selected_canary_scope = (
+            current_live_canary_scope(
+                str(selected_strategy.get("strategy_id") or ""),
+                materialize=True,
+            )
+            if isinstance(selected_strategy, dict)
+            else {}
+        )
         config = FillSoakConfig(
             session_id=session_id,
             symbol=normalized_symbol,
@@ -9047,8 +10153,17 @@ def preview_binance_futures_fill_soak(
             target_round_trips=3,
             target_notional_usdt=BINANCE_FUTURES_FILL_SOAK_NOTIONAL_USDT,
             daily_drawdown_limit_pct=10,
+            strategy_id=str(
+                selected_strategy.get("strategy_id")
+                if isinstance(selected_strategy, dict)
+                else "binance-futures-fill-soak-unbound"
+            ),
+            canary_scope=selected_canary_scope,
         )
         session = BINANCE_FUTURES_FILL_SOAK_SESSION_FACTORY(config)
+        session.dispatch_authorizer = (
+            _authorize_binance_futures_fill_soak_dispatch
+        )
         preview = session.preview()
     except (BrokerNotReadyError, RuntimeError, ValueError) as exc:
         preview = {
@@ -9921,18 +11036,27 @@ def _binance_ticker_price() -> float:
     return price
 
 
-def preview_binance_smoke_order(strategy_id: str) -> dict[str, Any]:
-    strategy = next(
+def approved_binance_smoke_strategy(strategy_id: object) -> dict[str, Any] | None:
+    selected_id = str(strategy_id or "").strip()
+    if not selected_id:
+        return None
+    return next(
         (
             item
             for item in strategy_rows()
-            if str(item.get("strategy_id") or "") == str(strategy_id or "")
+            if str(item.get("strategy_id") or "") == selected_id
             and item.get("live_small_eligible") is True
             and strategy_broker_id(item) == "binance"
-            and str(item.get("symbol") or "").upper() == BINANCE_SMOKE_SYMBOL
+            and str(item.get("symbol") or "").upper()
+            == BINANCE_SMOKE_SYMBOL
+            and str(item.get("strategy_instance_id") or "").strip()
         ),
         None,
     )
+
+
+def preview_binance_smoke_order(strategy_id: str) -> dict[str, Any]:
+    strategy = approved_binance_smoke_strategy(strategy_id)
     if strategy is None:
         reason = "선택한 Binance Strategy Instance가 before-live-small 및 검증 evidence를 통과하지 못했습니다."
         _binance_smoke_order_view(status="blocked", status_label="차단", detail=reason, confirmation_token="")
@@ -9992,6 +11116,12 @@ def preview_binance_smoke_order(strategy_id: str) -> dict[str, Any]:
         status="ready" if ready else "blocked",
         status_label="확인 대기" if ready else "차단",
         strategy_id=str(strategy.get("strategy_id") or ""),
+        strategy_instance_id=str(strategy.get("strategy_instance_id") or ""),
+        portfolio_id=str(
+            (strategy.get("portfolio_gate") or {}).get("portfolioId")
+            if isinstance(strategy.get("portfolio_gate"), dict)
+            else ""
+        ),
         symbol=BINANCE_SMOKE_SYMBOL,
         side="BUY",
         order_type="MARKET",
@@ -10022,6 +11152,31 @@ def submit_binance_smoke_order(confirmation_token: object, *, confirmed: bool) -
     if safe_float(preview.get("expires_epoch"), 0.0) <= datetime.now(timezone.utc).timestamp():
         _binance_smoke_order_view(status="expired", status_label="만료", confirmation_token="", detail="미리보기가 만료되었습니다.")
         return {"ok": False, "reason": "미리보기가 만료되었습니다. 다시 조회하세요.", "snapshot": snapshot()}
+    strategy = approved_binance_smoke_strategy(preview.get("strategy_id"))
+    current_portfolio_id = str(
+        (strategy.get("portfolio_gate") or {}).get("portfolioId")
+        if isinstance(strategy, dict)
+        and isinstance(strategy.get("portfolio_gate"), dict)
+        else ""
+    )
+    if (
+        strategy is None
+        or str(preview.get("strategy_instance_id") or "").strip()
+        != str(strategy.get("strategy_instance_id") or "").strip()
+        or str(preview.get("portfolio_id") or "").strip()
+        != current_portfolio_id
+    ):
+        reason = (
+            "미리보기의 Binance Strategy/Portfolio Instance가 현재 Live "
+            "Deployment와 달라졌습니다. 다시 조회하세요."
+        )
+        _binance_smoke_order_view(
+            status="blocked",
+            status_label="전송 직전 차단",
+            detail=reason,
+            confirmation_token="",
+        )
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
     if STATE.get("kill_switch") or STATE.get("new_entries_blocked"):
         return {"ok": False, "reason": "긴급/신규 진입 차단이 켜져 있어 실제 주문을 전송할 수 없습니다.", "snapshot": snapshot()}
     if STATE.get("dry_run") or current_mode() != "SMALL_LIVE":
@@ -10054,7 +11209,7 @@ def submit_binance_smoke_order(confirmation_token: object, *, confirmed: bool) -
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
 
     _binance_smoke_order_view(status="submitting", status_label="전송 중", used=True, confirmation_token="")
-    strategy_id = str(preview.get("strategy_id") or "")
+    strategy_id = str(strategy.get("strategy_id") or "")
     intent = OrderIntent(
         strategy_id=strategy_id,
         asset="CRYPTO",
@@ -10067,7 +11222,10 @@ def submit_binance_smoke_order(confirmation_token: object, *, confirmed: bool) -
         metadata={
             "broker_id": "binance",
             "profile_id": "crypto",
-            "strategy_instance_id": strategy_id,
+            "strategy_instance_id": str(
+                strategy.get("strategy_instance_id") or ""
+            ),
+            "portfolio_id": current_portfolio_id,
             "instrument_id": BINANCE_SMOKE_SYMBOL,
             "target_revision": int(datetime.now(timezone.utc).timestamp()),
             "order_purpose": "BROKER_SMOKE",
@@ -10210,6 +11368,12 @@ def preview_upbit_smoke_order(
         status="ready" if ready else "blocked",
         status_label="확인 대기" if ready else "차단",
         strategy_id=str(strategy.get("strategy_id") or ""),
+        strategy_instance_id=str(strategy.get("strategy_instance_id") or ""),
+        portfolio_id=str(
+            (strategy.get("portfolio_gate") or {}).get("portfolioId")
+            if isinstance(strategy.get("portfolio_gate"), dict)
+            else ""
+        ),
         market=UPBIT_SMOKE_MARKET,
         side="BUY",
         order_type="시장가 매수",
@@ -10255,12 +11419,40 @@ def submit_upbit_smoke_order(confirmation_token: object, *, confirmed: bool) -> 
             "reason": "미리보기 전략의 Upbit before-live-small/live_small_eligible 승인이 더 이상 유효하지 않습니다.",
             "snapshot": snapshot(),
         }
+    current_portfolio_id = str(
+        (strategy.get("portfolio_gate") or {}).get("portfolioId")
+        if isinstance(strategy.get("portfolio_gate"), dict)
+        else ""
+    )
+    if (
+        str(preview.get("strategy_instance_id") or "").strip()
+        != str(strategy.get("strategy_instance_id") or "").strip()
+        or str(preview.get("portfolio_id") or "").strip()
+        != current_portfolio_id
+    ):
+        reason = (
+            "미리보기의 Upbit Strategy/Portfolio Instance가 현재 Live "
+            "Deployment와 달라졌습니다. 다시 조회하세요."
+        )
+        _upbit_smoke_order_view(
+            status="blocked",
+            status_label="전송 직전 차단",
+            detail=reason,
+            confirmation_token="",
+        )
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
     if STATE.get("kill_switch") or STATE.get("new_entries_blocked"):
         return {"ok": False, "reason": "긴급/신규 진입 차단이 켜져 있어 실제 주문을 전송할 수 없습니다.", "snapshot": snapshot()}
     if STATE.get("dry_run") or current_mode() != "SMALL_LIVE":
         return {"ok": False, "reason": "Dry Run을 해제하고 SMALL_LIVE에서만 점검 주문을 보낼 수 있습니다.", "snapshot": snapshot()}
     if not real_orders_enabled():
         return {"ok": False, "reason": "LIVE_TRADER_ENABLE_REAL_ORDERS=true가 필요합니다.", "snapshot": snapshot()}
+    if STATE.get("operator_confirmed") is not True:
+        return {
+            "ok": False,
+            "reason": "실제 주문 전 운용자 수동 확인이 필요합니다.",
+            "snapshot": snapshot(),
+        }
 
     amount = int(safe_float(preview.get("notional_krw"), 0.0))
     if amount < UPBIT_SMOKE_MIN_KRW or amount > UPBIT_SMOKE_MAX_KRW:
@@ -10283,40 +11475,94 @@ def submit_upbit_smoke_order(confirmation_token: object, *, confirmed: bool) -> 
 
     # 네트워크 결과가 불명확해도 같은 identifier로 재전송하지 않도록 전송 직전에 소진 처리합니다.
     _upbit_smoke_order_view(status="submitting", status_label="전송 중", used=True, confirmation_token="")
-    intent = {
-        "broker_id": "upbit",
-        "strategy_id": str(strategy.get("strategy_id") or ""),
-        "market": str(preview.get("market") or UPBIT_SMOKE_MARKET),
-        "symbol": str(preview.get("market") or UPBIT_SMOKE_MARKET),
-        "side": "BUY",
-        "order_type": "price",
-        "notional": amount,
-        "identifier": str(preview.get("identifier") or ""),
-    }
-    if (
-        STATE.get("kill_switch")
-        or STATE.get("new_entries_blocked")
-        or STATE.get("dry_run")
-        or current_mode() != "SMALL_LIVE"
-        or not real_orders_enabled()
-    ):
-        reason = "전송 직전 실거래 안전 상태가 변경되어 Upbit 주문을 차단했습니다. 새 미리보기가 필요합니다."
-        _upbit_smoke_order_view(
-            status="blocked",
-            status_label="전송 직전 차단",
-            detail=reason,
+    now = datetime.now(timezone.utc)
+    dispatch_intent = OrderIntent(
+        strategy_id=str(strategy.get("strategy_id") or ""),
+        asset="CRYPTO",
+        symbol=str(preview.get("market") or UPBIT_SMOKE_MARKET),
+        side="BUY",
+        quantity=1.0,
+        reference_price=float(amount),
+        mode="SMALL_LIVE",
+        reason="Upbit broker smoke operational dispatch revalidation",
+        metadata={
+            "broker_id": "upbit",
+            "profile_id": "crypto",
+            "strategy_instance_id": str(
+                strategy.get("strategy_instance_id") or ""
+            ),
+            "portfolio_id": current_portfolio_id,
+            "instrument_id": str(
+                preview.get("market") or UPBIT_SMOKE_MARKET
+            ),
+            "target_revision": int(now.timestamp()),
+            "order_purpose": "BROKER_SMOKE",
+            "order_type": "price",
+            "market_event_time": now.isoformat().replace("+00:00", "Z"),
+            "market_data_verified": True,
+        },
+    )
+    result = submit_order_intent(
+        snapshot(),
+        dispatch_intent,
+        dry_run=False,
+        audit_event="Upbit Broker Smoke",
+    )
+    dispatch_order = (
+        dict(result.get("order"))
+        if isinstance(result.get("order"), dict)
+        else {}
+    )
+    if result.get("ok") is not True:
+        reason = str(result.get("reason") or "Upbit 주문 경로가 차단되었습니다.")
+        dispatch_state = str(dispatch_order.get("state") or "").strip().lower()
+        smoke_status = (
+            "unknown"
+            if dispatch_state == "unknown"
+            else "blocked"
+            if dispatch_state == "risk_blocked"
+            else "rejected"
         )
-        append_audit("danger", "Upbit 실제 소액 주문", reason)
-        return {"ok": False, "reason": reason, "snapshot": snapshot()}
-    response = router.place_order(intent)
-    payload = response.get("json") if isinstance(response.get("json"), dict) else {}
-    if not bool(response.get("ok")):
-        safe_error = str(payload.get("error") or response.get("text") or "Upbit 주문 요청 실패")[:500]
-        _upbit_smoke_order_view(status="rejected", status_label="거절", detail=safe_error, broker_response=payload)
-        append_audit("danger", "Upbit 실제 소액 주문", f"거래소 거절 · {safe_error}")
-        return {"ok": False, "reason": safe_error, "response": payload, "snapshot": snapshot()}
+        smoke_label = (
+            "결과 불명·조정 필요"
+            if smoke_status == "unknown"
+            else "전송 직전 차단"
+            if smoke_status == "blocked"
+            else "거절"
+        )
+        _upbit_smoke_order_view(
+            status=smoke_status,
+            status_label=smoke_label,
+            detail=reason,
+            order_id=str(dispatch_order.get("order_id") or ""),
+            order_state=str(dispatch_order.get("state") or ""),
+            runtime_authorization=(
+                dispatch_order.get("runtime_authorization")
+                if isinstance(
+                    dispatch_order.get("runtime_authorization"), dict
+                )
+                else {}
+            ),
+        )
+        return {
+            **result,
+            "dispatch_order": dispatch_order,
+            "order": dict(STATE["upbit_smoke_order"]),
+        }
 
-    order_uuid = str(payload.get("uuid") or "").strip()
+    broker_response = (
+        dispatch_order.get("broker_response")
+        if isinstance(dispatch_order.get("broker_response"), dict)
+        else {}
+    )
+    payload = (
+        broker_response.get("json")
+        if isinstance(broker_response.get("json"), dict)
+        else {}
+    )
+    order_uuid = str(
+        dispatch_order.get("broker_order_id") or payload.get("uuid") or ""
+    ).strip()
     broker_state = str(payload.get("state") or "wait").strip().lower()
     order_detail = payload
     if order_uuid:
@@ -10345,11 +11591,24 @@ def submit_upbit_smoke_order(confirmation_token: object, *, confirmed: bool) -> 
         paid_fee=paid_fee,
         detail=detail,
         broker_response=order_detail,
+        order_id=str(dispatch_order.get("order_id") or ""),
+        order_state=str(dispatch_order.get("state") or ""),
+        runtime_authorization=(
+            dispatch_order.get("runtime_authorization")
+            if isinstance(dispatch_order.get("runtime_authorization"), dict)
+            else {}
+        ),
     )
     append_audit("info", "Upbit 실제 소액 주문", detail)
     poll_execution_events("upbit")
     run_reconciliation()
-    return {"ok": True, "reason": detail, "order": dict(STATE["upbit_smoke_order"]), "snapshot": snapshot()}
+    return {
+        "ok": True,
+        "reason": detail,
+        "order": dict(STATE["upbit_smoke_order"]),
+        "dispatch_order": dispatch_order,
+        "snapshot": snapshot(),
+    }
 
 
 def refresh_upbit_smoke_order() -> dict[str, Any]:
@@ -11340,6 +12599,7 @@ def evaluate_order_gate_with_report(
     intent: OrderIntent | None = None,
 ) -> tuple[bool, str, str, str, PreTradeRiskReport]:
     intent = intent or default_order_intent(checks, side)
+    functional_execution = functional_test_execution_requested(intent)
     portfolio_gate = portfolio_gate_for_intent(checks, intent)
     context = apply_portfolio_gate_to_context(pre_trade_context(checks, intent, dry_run), portfolio_gate, intent)
     report = PreTradeRiskGate().evaluate(intent, context)
@@ -11354,7 +12614,7 @@ def evaluate_order_gate_with_report(
         )
     strategy = strategy_for_order_intent(checks, intent)
     paper_portfolio_evidence_gate = strategy.get("paper_portfolio_evidence_gate") if isinstance(strategy.get("paper_portfolio_evidence_gate"), dict) else {}
-    if paper_portfolio_evidence_gate.get("required"):
+    if not functional_execution and paper_portfolio_evidence_gate.get("required"):
         evidence_status: CheckStatus = "pass" if paper_portfolio_evidence_gate.get("ready") is True else "fail"
         report = PreTradeRiskReport(
             report.checked_at,
@@ -11363,8 +12623,34 @@ def evaluate_order_gate_with_report(
                 *report.checks,
             ),
         )
+    paper_live_qualification_gate = (
+        strategy.get("paper_live_qualification_gate")
+        if isinstance(strategy.get("paper_live_qualification_gate"), dict)
+        else {}
+    )
+    if not functional_execution and paper_live_qualification_gate.get("required"):
+        qualification_status: CheckStatus = (
+            "pass"
+            if paper_live_qualification_gate.get("ready") is True
+            else "fail"
+        )
+        report = PreTradeRiskReport(
+            report.checked_at,
+            (
+                RiskCheck(
+                    "Exact Paper Final Binding",
+                    qualification_status,
+                    str(paper_live_qualification_gate.get("detail") or ""),
+                ),
+                *report.checks,
+            ),
+        )
     revalidation = strategy_revalidation_status(strategy, lifecycle_status=strategy.get("lifecycle_status")) if strategy else {}
-    if intent.side == "BUY" and revalidation.get("expired") is True:
+    if (
+        not functional_execution
+        and intent.side == "BUY"
+        and revalidation.get("expired") is True
+    ):
         report = PreTradeRiskReport(
             report.checked_at,
             (*report.checks, RiskCheck("전략 재검증", "fail", str(revalidation.get("detail")))),
@@ -11700,6 +12986,33 @@ def strategy_execution_for_profile(checks: dict[str, Any], profile_id: str) -> S
     return executions[0][1] if executions else None
 
 
+def _strategy_runtime_instance_context(
+    strategy: dict[str, Any],
+) -> tuple[str, str]:
+    gate = (
+        strategy.get("portfolio_gate")
+        if isinstance(strategy.get("portfolio_gate"), dict)
+        else {}
+    )
+    instance = (
+        gate.get("instance")
+        if isinstance(gate.get("instance"), dict)
+        else {}
+    )
+    strategy_instance_id = str(
+        strategy.get("strategy_instance_id")
+        or instance.get("instanceId")
+        or instance.get("strategyInstanceId")
+        or ""
+    ).strip()
+    portfolio_id = (
+        str(gate.get("portfolioId") or "").strip()
+        if gate.get("active") is True
+        else ""
+    )
+    return strategy_instance_id, portfolio_id
+
+
 def strategy_executions_for_profile(checks: dict[str, Any], profile_id: str) -> list[tuple[dict[str, Any], StrategyExecutionResult]]:
     strategies = select_strategies_for_profile(checks, profile_id)
     if not strategies:
@@ -11710,6 +13023,9 @@ def strategy_executions_for_profile(checks: dict[str, Any], profile_id: str) -> 
     for strategy in strategies:
         broker_id = strategy_broker_id(strategy)
         market_data = strategy_market_data(strategy)
+        strategy_instance_id, portfolio_id = (
+            _strategy_runtime_instance_context(strategy)
+        )
         futures_policy = (
             strategy.get("futures_execution_policy")
             if isinstance(strategy.get("futures_execution_policy"), dict)
@@ -11718,6 +13034,8 @@ def strategy_executions_for_profile(checks: dict[str, Any], profile_id: str) -> 
         metadata = {
             "broker_id": broker_id,
             "profile_id": normalized_profile,
+            "strategy_instance_id": strategy_instance_id,
+            "portfolio_id": portfolio_id,
             "runner": "StrategyExecutionRunner",
             "market_event_time": market_data.occurred_at,
             "market_received_time": market_data.received_at,
@@ -11801,6 +13119,9 @@ def default_order_intent(checks: dict[str, Any], side: str) -> OrderIntent:
     normalized_side: OrderSide = "SELL" if str(side).upper() == "SELL" else "BUY"
     symbol = str(strategy.get("symbol") or "TEST")
     asset = str(strategy.get("asset") or asset_from_symbol(symbol))
+    strategy_instance_id, portfolio_id = _strategy_runtime_instance_context(
+        strategy
+    )
     return OrderIntent(
         strategy_id=str(strategy.get("strategy_id") or "manual-test"),
         asset=asset,
@@ -11810,7 +13131,15 @@ def default_order_intent(checks: dict[str, Any], side: str) -> OrderIntent:
         reference_price=1000.0,
         mode=current_mode(),
         reason="live test intent",
-        metadata={"broker_id": strategy_broker_id(strategy) if strategy else broker_id_from_symbol(symbol, asset)},
+        metadata={
+            "broker_id": (
+                strategy_broker_id(strategy)
+                if strategy
+                else broker_id_from_symbol(symbol, asset)
+            ),
+            "strategy_instance_id": strategy_instance_id,
+            "portfolio_id": portfolio_id,
+        },
     )
 
 
@@ -11819,6 +13148,34 @@ def intent_readiness_blocker_count(
     intent: OrderIntent,
     reconciliation_summary: dict[str, Any] | None = None,
 ) -> int:
+    if functional_test_execution_requested(intent):
+        metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+        broker_id = str(
+            metadata.get("broker_id")
+            or broker_id_from_symbol(intent.symbol, intent.asset)
+        ).strip().lower()
+        scoped = reconciliation_summary or reconciliation_summary_for_broker(
+            broker_id
+        )
+        checklist_missing = [
+            item
+            for item in checklist_rows()
+            if item.get("required") and not item.get("checked")
+        ]
+        central_control = durable_control_snapshot()
+        blockers = sum(
+            (
+                0 if real_orders_enabled() else 1,
+                0 if not checklist_missing else 1,
+                0 if broker_ready_for_intent(checks, intent) else 1,
+                1 if STATE.get("kill_switch") else 0,
+                1 if central_control.get("halted") else 0,
+                0 if reconciliation_blocker_count(scoped) == 0 else 1,
+            )
+        )
+        if intent_requires_unavailable_capability(intent, scoped):
+            blockers += 1
+        return blockers
     if not checks.get("strategies") or not checks.get("brokers"):
         return int(checks.get("summary", {}).get("blocker_count", 0))
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
@@ -12664,6 +14021,1037 @@ def stable_target_revision(
     return int(digest[:15], 16)
 
 
+def functional_test_execution_requested(intent: OrderIntent) -> bool:
+    """Return whether this order uses the isolated functional-test authority."""
+
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    purpose = str(
+        metadata.get("execution_purpose")
+        or metadata.get("executionPurpose")
+        or metadata.get("execution_profile")
+        or metadata.get("executionProfile")
+        or ""
+    ).strip().upper()
+    return purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE
+
+
+def kis_functional_test_account_id() -> str:
+    """Return the exact live KIS account binding used by shared permits."""
+
+    cano, product_code = split_kis_account(
+        env_value("KIS_ACCOUNT_NO"),
+        env_value("KIS_ACCOUNT_PRODUCT_CODE"),
+    )
+    return kis_account_binding_id(cano, product_code)
+
+
+def _functional_test_document_path(value: object) -> Path:
+    root = FUNCTIONAL_TEST_DOCUMENT_ROOT.expanduser().resolve()
+    text = str(value or "").strip()
+    if not text:
+        raise FunctionalTestContractError(
+            "functional-test-document-path-missing"
+        )
+    requested = Path(text).expanduser()
+    candidate = (
+        requested if requested.is_absolute() else root / requested
+    ).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise FunctionalTestContractError(
+            "functional-test-document-path-outside-shared-root",
+            str(candidate),
+        ) from exc
+    return candidate
+
+
+def _read_functional_test_source(
+    source: object,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    try:
+        return read_functional_test_document(
+            _functional_test_document_path(source)
+        )
+    except FunctionalTestContractError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise FunctionalTestContractError(
+            f"functional-test-{label}-read-failed",
+            type(exc).__name__,
+        ) from exc
+
+
+def functional_test_documents_for_intent(
+    intent: OrderIntent,
+) -> tuple[dict[str, Any] | str | None, dict[str, Any] | str | None, list[str]]:
+    """Re-read only the workspace's active pointers at every safety edge.
+
+    Permit material carried inside an order/runtime request is untrusted: its
+    content hash is an integrity checksum, not an operator signature. Likewise,
+    a reference to immutable history must not outlive the workspace's Stop
+    action. Consequently live admission never accepts inline documents or
+    caller-selected paths. Deleting either active pointer revokes the very next
+    pre-trade/dispatch check.
+    """
+
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    errors: list[str] = []
+    permit: dict[str, Any] | str | None = None
+    activation: dict[str, Any] | str | None = None
+
+    if any(
+        key in metadata
+        for key in (
+            "functionalTestPermit",
+            "functional_test_permit",
+            "functionalTestPermitPath",
+            "functional_test_permit_path",
+            "functionalTestActivation",
+            "functional_test_activation",
+            "functionalTestActivationPath",
+            "functional_test_activation_path",
+            "functionalTestCurrentPath",
+            "functional_test_current_path",
+        )
+    ):
+        errors.append("functional-test-caller-document-override-forbidden")
+
+    try:
+        permit = _read_functional_test_source(
+            FUNCTIONAL_TEST_CURRENT_PERMIT_DOCUMENT,
+            label="permit",
+        )
+    except FunctionalTestContractError as exc:
+        errors.append(str(getattr(exc, "code", "") or type(exc).__name__))
+    try:
+        activation = _read_functional_test_source(
+            FUNCTIONAL_TEST_CURRENT_ACTIVATION_DOCUMENT,
+            label="activation",
+        )
+    except FunctionalTestContractError as exc:
+        errors.append(str(getattr(exc, "code", "") or type(exc).__name__))
+    if permit is None:
+        errors.append("functional-test-permit-required")
+    if activation is None:
+        errors.append("functional-test-live-activation-required")
+    return permit, activation, list(dict.fromkeys(errors))
+
+
+def functional_test_active_permit_binding() -> dict[str, Any]:
+    """Return the strictly parsed binding from the one active Live permit."""
+
+    permit = parse_functional_test_permit(
+        _read_functional_test_source(
+            FUNCTIONAL_TEST_CURRENT_PERMIT_DOCUMENT,
+            label="permit",
+        )
+    )
+    return permit.binding.snapshot()
+
+
+def functional_test_account_fingerprint(account_id: object) -> str:
+    return governance_sha256(
+        {"functionalTestAccount": str(account_id or "")}
+    )
+
+
+def functional_test_durable_authority_status(permit: Any) -> dict[str, Any]:
+    return PROGRAM_LEDGER.functional_test_authority_status(
+        permit_id=str(permit.permit_id or ""),
+        account_fingerprint=functional_test_account_fingerprint(
+            permit.binding.account_id
+        ),
+    )
+
+
+def functional_test_authority_mutation_assessment(
+    *,
+    require_kis_reconciliation: bool = False,
+) -> dict[str, Any]:
+    """Block permit/activation mutation while live authority is in use."""
+
+    blockers: list[str] = []
+    runtime_snapshot = LIVE_CONTINUOUS_CONTROLLER.snapshot()
+    profiles = (
+        runtime_snapshot.get("profiles")
+        if isinstance(runtime_snapshot.get("profiles"), dict)
+        else {}
+    )
+    stock_runtime = (
+        profiles.get("stock")
+        if isinstance(profiles.get("stock"), dict)
+        else {}
+    )
+    runtime_phase = str(stock_runtime.get("phase") or "STOPPED").upper()
+    runtime_active = bool(stock_runtime.get("running")) or runtime_phase in {
+        "STARTING",
+        "RUNNING",
+        "DEGRADED",
+        "DRAINING",
+        "STOPPING",
+    }
+    if runtime_active:
+        blockers.append("functional-test-authority-runtime-active")
+
+    session_id = str(
+        (STATE.get("active_runtime_session_ids") or {}).get("stock") or ""
+    ).strip()
+    session_lifecycle = ""
+    session_execution_purpose = ""
+    if session_id:
+        try:
+            session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+            session_lifecycle = str(
+                session.lifecycle if session is not None else "UNKNOWN"
+            ).upper()
+            session_execution_purpose = str(
+                (
+                    session.metadata.get("executionPurpose")
+                    if session is not None
+                    and isinstance(session.metadata, dict)
+                    else ""
+                )
+                or ""
+            ).upper()
+        except (OSError, sqlite3.Error, ValueError):
+            session_lifecycle = "UNKNOWN"
+        if session_lifecycle in {
+            "STARTING",
+            "RUNNING",
+            "DEGRADED",
+            "DRAINING",
+            "STOPPING",
+            "UNKNOWN",
+        }:
+            blockers.append("functional-test-authority-session-active")
+
+    durable_truth_available = True
+    try:
+        durable_orders = PROGRAM_LEDGER.order_dispatch_rows(5000)
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        durable_orders = []
+        durable_truth_available = False
+        blockers.append("functional-test-durable-order-truth-unavailable")
+    functional_orders = [
+        item
+        for item in [*STATE.get("orders", []), *durable_orders]
+        if isinstance(item, dict)
+        and str(item.get("execution_purpose") or "").upper()
+        == FUNCTIONAL_TEST_EXECUTION_PURPOSE
+    ]
+    pending_orders = [
+        item
+        for item in functional_orders
+        if _restore_order_is_pending_or_unknown(item)
+    ]
+    if pending_orders:
+        blockers.append("functional-test-working-orders-unresolved")
+
+    reconciliation: dict[str, Any] = {}
+    kis_reconciled = not require_kis_reconciliation
+    if require_kis_reconciliation:
+        try:
+            reconciliation = reconciliation_summary_for_broker("kis")
+            broker_cache = (
+                STATE.get("broker_reconciliation")
+                if isinstance(STATE.get("broker_reconciliation"), dict)
+                else {}
+            )
+            broker_errors = [
+                item
+                for item in broker_cache.get("errors", [])
+                if isinstance(item, dict)
+                and str(item.get("broker_id") or "").strip().lower()
+                in {"", "kis"}
+            ]
+            successful_accounts = {
+                str(item).strip().lower()
+                for item in broker_cache.get(
+                    "successful_account_brokers", []
+                )
+            }
+            successful_positions = {
+                str(item).strip().lower()
+                for item in broker_cache.get(
+                    "successful_position_brokers", []
+                )
+            }
+            kis_reconciled = bool(
+                reconciliation_blocker_count(reconciliation) == 0
+                and not broker_errors
+                and "kis" in successful_accounts
+                and "kis" in successful_positions
+            )
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            kis_reconciled = False
+        if not kis_reconciled:
+            blockers.append("functional-test-kis-reconciliation-unresolved")
+
+    return {
+        "allowed": not blockers,
+        "blockers": list(dict.fromkeys(blockers)),
+        "runtime": {
+            "active": runtime_active,
+            "phase": runtime_phase,
+            "executionPurpose": str(
+                stock_runtime.get("executionPurpose") or ""
+            ),
+        },
+        "session": {
+            "sessionId": session_id,
+            "lifecycle": session_lifecycle,
+            "executionPurpose": session_execution_purpose,
+        },
+        "workingOrderCount": len(pending_orders),
+        "durableOrderTruthAvailable": durable_truth_available,
+        "kisReconciled": kis_reconciled,
+        "reconciliation": reconciliation,
+    }
+
+
+def functional_test_runtime_authority_scope() -> dict[str, str]:
+    """Recover the sealed stop scope even when workspace pointers are lost."""
+
+    session_id = str(
+        (STATE.get("active_runtime_session_ids") or {}).get("stock") or ""
+    ).strip()
+    if session_id:
+        try:
+            session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+            metadata = (
+                session.metadata
+                if session is not None and isinstance(session.metadata, dict)
+                else {}
+            )
+            permit_id = str(metadata.get("permitId") or "").strip()
+            fingerprint = str(
+                metadata.get("accountFingerprint") or ""
+            ).strip().lower()
+            if permit_id and fingerprint:
+                return {
+                    "permitId": permit_id,
+                    "accountFingerprint": fingerprint,
+                    "source": "governance-session",
+                }
+        except (OSError, sqlite3.Error, ValueError):
+            pass
+    context = getattr(
+        LIVE_CONTINUOUS_CONTROLLER,
+        "functional_test_context",
+        {},
+    )
+    if isinstance(context, dict):
+        permit_id = str(
+            context.get("functional_test_permit_id") or ""
+        ).strip()
+        fingerprint = str(
+            context.get("functional_test_account_fingerprint") or ""
+        ).strip().lower()
+        if permit_id and fingerprint:
+            return {
+                "permitId": permit_id,
+                "accountFingerprint": fingerprint,
+                "source": "controller-context",
+            }
+    return {}
+
+
+def functional_test_active_authority(
+    *,
+    now: datetime | None = None,
+) -> tuple[Any, Any]:
+    """Return the current, active permit and daily activation.
+
+    Only the two revocable workspace pointers are accepted.  This helper is
+    shared by runtime sealing and final dispatch authorization so a stopped,
+    expired, replaced, or malformed document invalidates the next boundary.
+    """
+
+    current = now or datetime.now(timezone.utc)
+    permit_payload = _read_functional_test_source(
+        FUNCTIONAL_TEST_CURRENT_PERMIT_DOCUMENT,
+        label="permit",
+    )
+    permit = assert_functional_test_permit_active(
+        permit_payload,
+        now=current,
+    )
+    if str(getattr(permit.environment, "value", permit.environment)) != (
+        FUNCTIONAL_TEST_ENVIRONMENT
+    ):
+        raise FunctionalTestContractError(
+            "functional-test-kis-live-environment-required"
+        )
+    activation_payload = _read_functional_test_source(
+        FUNCTIONAL_TEST_CURRENT_ACTIVATION_DOCUMENT,
+        label="activation",
+    )
+    activation = parse_live_activation_token(
+        activation_payload,
+        permit=permit,
+        now=current,
+    )
+    return permit, activation
+
+
+def _functional_test_strategy_for_intent(
+    checks: dict[str, Any],
+    intent: OrderIntent,
+) -> dict[str, Any]:
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    portfolio_id = str(
+        metadata.get("portfolio_id") or metadata.get("portfolioId") or ""
+    ).strip()
+    candidates = [
+        item
+        for item in checks.get("strategies", [])
+        if isinstance(item, dict)
+    ]
+    try:
+        candidates.extend(strategy_rows(portfolio_rows()))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    for strategy in candidates:
+        if str(strategy.get("strategy_id") or "") != str(intent.strategy_id):
+            continue
+        if str(strategy.get("symbol") or "").strip().upper() != str(
+            intent.symbol or ""
+        ).strip().upper():
+            continue
+        gate = (
+            strategy.get("portfolio_gate")
+            if isinstance(strategy.get("portfolio_gate"), dict)
+            else {}
+        )
+        if portfolio_id and str(gate.get("portfolioId") or "") != portfolio_id:
+            continue
+        return strategy
+    return {}
+
+
+def _functional_test_portfolio_for_intent(
+    checks: dict[str, Any],
+    intent: OrderIntent,
+) -> dict[str, Any]:
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    portfolio_id = str(
+        metadata.get("portfolio_id") or metadata.get("portfolioId") or ""
+    ).strip()
+    if not portfolio_id:
+        return {}
+    candidates = [
+        item
+        for item in checks.get("portfolios", [])
+        if isinstance(item, dict)
+    ]
+    try:
+        candidates.extend(portfolio_rows())
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return next(
+        (
+            item
+            for item in candidates
+            if str(
+                item.get("id")
+                or item.get("portfolio_id")
+                or item.get("portfolioId")
+                or ""
+            ).strip()
+            == portfolio_id
+        ),
+        {},
+    )
+
+
+def functional_test_current_binding(
+    checks: dict[str, Any],
+    intent: OrderIntent,
+    *,
+    portfolio_only: bool = False,
+) -> dict[str, Any]:
+    """Derive current target/account scope without trusting intent hashes."""
+
+    strategy = _functional_test_strategy_for_intent(checks, intent)
+    portfolio = _functional_test_portfolio_for_intent(checks, intent)
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    portfolio_id = str(
+        portfolio.get("id")
+        or portfolio.get("portfolio_id")
+        or portfolio.get("portfolioId")
+        or ""
+    ).strip()
+    portfolio_reference = (
+        verified_portfolio_artifact_reference(portfolio)
+        if portfolio
+        else {}
+    )
+    strategy_reference = (
+        strategy.get("artifact_reference")
+        if isinstance(strategy.get("artifact_reference"), dict)
+        else {}
+    )
+    strategy_id = str(strategy.get("strategy_id") or "").strip()
+    strategy_hash = str(
+        strategy_reference.get("artifactHash")
+        or strategy.get("artifact_hash")
+        or ""
+    ).strip().lower()
+    instances = (
+        portfolio.get("strategy_instances")
+        if isinstance(portfolio.get("strategy_instances"), list)
+        else portfolio.get("strategyInstances")
+        if isinstance(portfolio.get("strategyInstances"), list)
+        else []
+    )
+    symbols = {
+        canonical_kis_domestic_symbol(
+            item.get("executionInstrument")
+            or item.get("instrumentId")
+            or item.get("symbol")
+            or item.get("qualifiedSymbol")
+            or ""
+        )
+        for item in instances
+        if isinstance(item, dict)
+    }
+    symbols.discard("")
+    if not symbols and strategy:
+        symbol = canonical_kis_domestic_symbol(
+            strategy.get("execution_instrument")
+            or strategy.get("instrument_id")
+            or strategy.get("symbol")
+            or intent.symbol
+        )
+        if symbol:
+            symbols.add(symbol)
+
+    requested_instance_id = str(
+        metadata.get("strategy_instance_id")
+        or metadata.get("strategyInstanceId")
+        or ""
+    ).strip()
+    matching_instance = next(
+        (
+            item
+            for item in instances
+            if isinstance(item, dict)
+            and str(
+                item.get("sourceStrategyId")
+                or item.get("strategyId")
+                or item.get("strategy_id")
+                or ""
+            ).strip()
+            == strategy_id
+            and str(
+                item.get("symbol")
+                or item.get("qualifiedSymbol")
+                or intent.symbol
+            ).strip().upper()
+            == str(intent.symbol or "").strip().upper()
+            and (
+                not requested_instance_id
+                or str(
+                    item.get("instanceId")
+                    or item.get("strategyInstanceId")
+                    or ""
+                ).strip()
+                == requested_instance_id
+            )
+        ),
+        {},
+    )
+    strategy_instance_id = str(
+        matching_instance.get("instanceId")
+        or matching_instance.get("strategyInstanceId")
+        or strategy.get("strategy_instance_id")
+        or (f"standalone:{strategy_id}" if strategy_id and not portfolio_id else "")
+    ).strip()
+    return {
+        "strategy_artifact_id": (
+            ""
+            if portfolio_only
+            else str(
+                strategy_reference.get("artifactId") or strategy_id
+            ).strip()
+        ),
+        "strategy_artifact_hash": "" if portfolio_only else strategy_hash,
+        "strategy_instance_id": "" if portfolio_only else strategy_instance_id,
+        "portfolio_required": bool(portfolio_id),
+        "portfolio_artifact_id": str(
+            portfolio_reference.get("artifactId") or portfolio_id
+        ).strip(),
+        "portfolio_artifact_hash": str(
+            portfolio_reference.get("artifactHash")
+            or portfolio.get("artifact_hash")
+            or portfolio.get("artifactHash")
+            or ""
+        ).strip().lower(),
+        "portfolio_instance_id": (
+            f"functional-portfolio:{str(portfolio_reference.get('artifactId') or portfolio_id).strip()}:"
+            f"{str(portfolio_reference.get('artifactHash') or '').strip().lower()[:12]}"
+            if portfolio_id
+            else ""
+        ),
+        "account_id": kis_functional_test_account_id(),
+        "symbols": tuple(sorted(symbols)),
+    }
+
+
+def functional_test_global_caps(intent: OrderIntent) -> dict[str, float | int]:
+    """Intersect configured risk with the deliberately tiny SMALL_LIVE profile."""
+
+    account = account_risk_for_intent(
+        intent,
+        maximum_age_seconds=FUNCTIONAL_TEST_RISK_MAX_AGE_SECONDS,
+    )
+    equity = (
+        safe_float(account.get("current_equity"), 0.0)
+        if account.get("known") is True and account.get("fresh") is True
+        else 0.0
+    )
+    settings = STATE.get("risk_settings", {})
+    profile = ENVIRONMENT_PROFILES["SMALL_LIVE"]
+    configured_capital = max(
+        0.0,
+        safe_float(settings.get("strategy_capital_limit_krw"), 0.0),
+    )
+    gross_cap = min(
+        configured_capital,
+        equity * profile.maximum_strategy_capital_pct / 100.0,
+    )
+    order_cap = min(
+        configured_capital,
+        equity * profile.maximum_order_pct / 100.0,
+    )
+    configured_loss_pct = abs(
+        safe_float(settings.get("daily_loss_limit_pct"), 0.0)
+    )
+    loss_pct = min(
+        configured_loss_pct,
+        profile.daily_loss_limit_pct,
+    )
+    return {
+        "max_order_quantity": 1,
+        "max_order_notional": order_cap,
+        "max_gross_exposure": gross_cap,
+        "max_orders": max(
+            1,
+            min(
+                3,
+                int(safe_float(settings.get("max_open_orders"), 0.0)),
+            ),
+        ),
+        "max_open_positions": 1,
+        "max_loss": equity * loss_pct / 100.0,
+    }
+
+
+def functional_test_effective_caps_snapshot() -> dict[str, Any]:
+    """Expose the exact safer permit/global intersection used at order time."""
+
+    intent = OrderIntent(
+        strategy_id="functional-test-cap-preview",
+        asset="KR_STOCK",
+        symbol="005930",
+        side="BUY",
+        quantity=1.0,
+        reference_price=1.0,
+        mode="SMALL_LIVE",
+        reason="functional-test-cap-preview",
+        metadata={"broker_id": "kis"},
+    )
+    global_caps = functional_test_global_caps(intent)
+    permit_caps = LIVE_FUNCTIONAL_TEST_CAPS.snapshot()
+    field_map = {
+        "maxOrderQuantity": "max_order_quantity",
+        "maxOrderNotional": "max_order_notional",
+        "maxGrossExposure": "max_gross_exposure",
+        "maxOrders": "max_orders",
+        "maxOpenPositions": "max_open_positions",
+        "maxLoss": "max_loss",
+    }
+    effective = {
+        public: min(
+            safe_float(permit_caps.get(public), 0.0),
+            safe_float(global_caps.get(internal), 0.0),
+        )
+        for public, internal in field_map.items()
+    }
+    account = account_risk_for_intent(
+        intent,
+        maximum_age_seconds=FUNCTIONAL_TEST_RISK_MAX_AGE_SECONDS,
+    )
+    available = bool(
+        account.get("known") is True and account.get("fresh") is True
+    )
+    return {
+        "available": available,
+        "values": effective,
+        "permitCaps": permit_caps,
+        "reason": (
+            "permit-and-current-account-risk-intersection"
+            if available
+            else "fresh-kis-account-risk-required"
+        ),
+        "observedAt": str(account.get("observed_at") or ""),
+    }
+
+
+def functional_test_risk_snapshot(
+    intent: OrderIntent,
+    *,
+    permit_id: str = "",
+) -> FunctionalTestRiskSnapshot:
+    """Build fresh broker-derived account/position risk for one KIS order."""
+
+    reconciliation = (
+        STATE.get("broker_reconciliation")
+        if isinstance(STATE.get("broker_reconciliation"), dict)
+        else {}
+    )
+    errors = {
+        str(item.get("broker_id") or "").strip().lower()
+        for item in reconciliation.get("errors", [])
+        if isinstance(item, dict)
+    }
+    successful = {
+        str(item).strip().lower()
+        for item in reconciliation.get("successful_position_brokers", [])
+        if str(item).strip()
+    }
+    fetched_age = seconds_since(reconciliation.get("fetched_at"))
+    account = account_risk_for_intent(
+        intent,
+        maximum_age_seconds=FUNCTIONAL_TEST_RISK_MAX_AGE_SECONDS,
+    )
+    rows = [
+        item
+        for item in reconciliation.get("positions", [])
+        if isinstance(item, dict)
+        and str(item.get("broker_id") or "").strip().lower() == "kis"
+    ]
+    gross_exposure = 0.0
+    value_complete = True
+    normalized_symbol = _canonical_restore_instrument("kis", intent.symbol)
+    symbol_quantity = 0.0
+    symbol_value = 0.0
+    open_position_count = 0
+    for row in rows:
+        quantity = _restore_quantity(row)
+        if abs(quantity) <= 1e-12:
+            continue
+        open_position_count += 1
+        raw_value = row.get("broker_value")
+        if raw_value is None:
+            value_complete = False
+            value = 0.0
+        else:
+            value = abs(safe_float(raw_value, 0.0))
+        gross_exposure += value
+        if _canonical_restore_instrument(
+            "kis", str(row.get("symbol") or "")
+        ) == normalized_symbol:
+            symbol_quantity += quantity
+            symbol_value += value
+
+    signed_quantity = intent.quantity if intent.side == "BUY" else -intent.quantity
+    projected_quantity = symbol_quantity + signed_quantity
+    projected_symbol_value = abs(projected_quantity * intent.reference_price)
+    projected_gross = max(
+        0.0,
+        gross_exposure - symbol_value + projected_symbol_value,
+    )
+    opens_new_position = (
+        abs(symbol_quantity) <= 1e-12
+        and abs(projected_quantity) > 1e-12
+    )
+    projected_positions = max(
+        0,
+        open_position_count
+        + (1 if opens_new_position else 0)
+        - (
+            1
+            if abs(symbol_quantity) > 1e-12
+            and abs(projected_quantity) <= 1e-12
+            else 0
+        ),
+    )
+    functional_orders = [
+        item
+        for item in STATE.get("orders", [])
+        if isinstance(item, dict)
+        and str(item.get("execution_purpose") or "").upper()
+        == FUNCTIONAL_TEST_EXECUTION_PURPOSE
+        and (
+            not permit_id
+            or str(
+                (
+                    item.get("functional_test")
+                    if isinstance(item.get("functional_test"), dict)
+                    else {}
+                ).get("permitId")
+                or ""
+            )
+            == permit_id
+        )
+        and str(item.get("state") or "").lower()
+        not in {
+            "risk_blocked",
+            "adapter_blocked",
+            "broker_rejected",
+            "canceled",
+            "retry_exhausted",
+        }
+    ]
+    working_order_count = sum(
+        1 for item in functional_orders if _restore_order_is_pending_or_unknown(item)
+    )
+    reservation_truth_available = True
+    try:
+        durable_order_count = PROGRAM_LEDGER.functional_test_reservation_count(
+            permit_id,
+            exclude_idempotency_key=str(
+                (
+                    intent.metadata
+                    if isinstance(intent.metadata, dict)
+                    else {}
+                ).get("functional_test_reservation_id")
+                or ""
+            ),
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        durable_order_count = 0
+        reservation_truth_available = False
+    durable_equity_truth = False
+    permit_drawdown = 0.0
+    try:
+        active_permit, _active_activation = functional_test_active_authority()
+        if (
+            not permit_id
+            or str(active_permit.permit_id or "") != str(permit_id)
+        ):
+            raise ValueError("functional-test-equity-permit-mismatch")
+        account_fingerprint = governance_sha256(
+            {
+                "functionalTestAccount": str(
+                    active_permit.binding.account_id or ""
+                )
+            }
+        )
+        current_equity = safe_float(account.get("current_equity"), -1.0)
+        observed_at = str(account.get("observed_at") or "").strip()
+        if (
+            account.get("known") is not True
+            or account.get("fresh") is not True
+            or current_equity < 0
+            or not observed_at
+        ):
+            raise ValueError("functional-test-equity-observation-unavailable")
+        equity_scope = PROGRAM_LEDGER.observe_functional_test_equity(
+            permit_id=str(active_permit.permit_id),
+            account_fingerprint=account_fingerprint,
+            current_equity=current_equity,
+            observed_at=observed_at,
+            allow_create=False,
+        )
+        permit_drawdown = max(
+            0.0,
+            safe_float(equity_scope.get("worst_drawdown"), 0.0),
+        )
+        durable_equity_truth = True
+    except (
+        FunctionalTestContractError,
+        OSError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+    ):
+        durable_equity_truth = False
+    daily_pnl = safe_float(account.get("daily_pnl"), 0.0)
+    starting_equity = safe_float(account.get("starting_equity"), 0.0)
+    minimum_pct = safe_float(account.get("minimum_daily_pnl_pct"), 0.0)
+    peak_loss = max(0.0, -(starting_equity * minimum_pct / 100.0))
+    reconciled = bool(
+        "kis" in successful
+        and "kis" not in errors
+        and fetched_age is not None
+        and fetched_age <= FUNCTIONAL_TEST_RISK_MAX_AGE_SECONDS
+        and account.get("known") is True
+        and account.get("fresh") is True
+        and value_complete
+    )
+    return FunctionalTestRiskSnapshot(
+        gross_exposure=gross_exposure,
+        open_position_count=open_position_count,
+        loss=max(0.0, -daily_pnl, peak_loss, permit_drawdown),
+        opens_new_position=opens_new_position,
+        working_order_count=working_order_count,
+        submitted_order_count=max(
+            len(functional_orders),
+            durable_order_count,
+        ),
+        reconciled=(
+            reconciled
+            and reservation_truth_available
+            and durable_equity_truth
+        ),
+        observed_at=str(
+            account.get("observed_at")
+            or reconciliation.get("fetched_at")
+            or ""
+        ),
+        gross_exposure_after=projected_gross,
+        open_position_count_after=projected_positions,
+    )
+
+
+def functional_test_safety_report_for_intent(
+    checks: dict[str, Any],
+    intent: OrderIntent,
+    *,
+    phase: Literal["PRETRADE", "DISPATCH"],
+) -> tuple[FunctionalTestSafetyReport, list[str]]:
+    permit, activation, document_errors = functional_test_documents_for_intent(
+        intent
+    )
+    permit_id = ""
+    portfolio_only = False
+    if isinstance(permit, dict):
+        permit_id = str(permit.get("permitId") or "")
+        binding_payload = (
+            permit.get("binding")
+            if isinstance(permit.get("binding"), dict)
+            else {}
+        )
+        portfolio_only = bool(
+            binding_payload.get("portfolioRequired") is True
+            and not any(
+                str(binding_payload.get(key) or "").strip()
+                for key in (
+                    "strategyArtifactId",
+                    "strategyArtifactHash",
+                    "strategyInstanceId",
+                )
+            )
+        )
+        try:
+            authority_status = PROGRAM_LEDGER.functional_test_authority_status(
+                permit_id=permit_id,
+                account_fingerprint=functional_test_account_fingerprint(
+                    binding_payload.get("accountId")
+                ),
+            )
+            if authority_status.get("closed") is True:
+                document_errors.append("functional-test-authority-closed")
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            document_errors.append(
+                "functional-test-durable-authority-unavailable"
+            )
+    report = evaluate_functional_test_order(
+        permit,
+        current_binding=functional_test_current_binding(
+            checks,
+            intent,
+            portfolio_only=portfolio_only,
+        ),
+        environment=FUNCTIONAL_TEST_ENVIRONMENT,
+        intent=intent,
+        global_caps=functional_test_global_caps(intent),
+        risk=functional_test_risk_snapshot(intent, permit_id=permit_id),
+        operator_confirmed=STATE.get("operator_confirmed") is True,
+        live_activation_payload=activation,
+        phase=phase,
+    )
+    return report, document_errors
+
+
+def _functional_test_report_reason(
+    report: FunctionalTestSafetyReport,
+    document_errors: list[str],
+) -> str:
+    blockers = [*document_errors, *report.blocker_codes]
+    return (
+        "functional-test-authorized"
+        if not blockers
+        else "functional-test-blocked:" + ",".join(dict.fromkeys(blockers))
+    )
+
+
+def functional_test_dispatch_assessment(
+    intent: OrderIntent,
+    *,
+    broker_payload: dict[str, Any] | None = None,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Re-read exact functional-test authority and broker truth for dispatch."""
+
+    if not functional_test_execution_requested(intent):
+        return True, "", {}
+    try:
+        evaluated_intent = intent
+        if isinstance(broker_payload, dict):
+            broker_quantity = safe_float(
+                broker_payload.get("quantity")
+                or broker_payload.get("qty"),
+                0.0,
+            )
+            broker_price = safe_float(broker_payload.get("price"), 0.0)
+            if broker_quantity > 0 and broker_price > 0:
+                evaluated_intent = replace(
+                    intent,
+                    quantity=broker_quantity,
+                    reference_price=broker_price,
+                )
+        portfolios = portfolio_rows()
+        checks = {
+            "portfolios": portfolios,
+            "strategies": strategy_rows(portfolios),
+        }
+        report, document_errors = functional_test_safety_report_for_intent(
+            checks,
+            evaluated_intent,
+            phase="DISPATCH",
+        )
+        reason = _functional_test_report_reason(report, document_errors)
+        payload = report.to_dict()
+        payload["documentErrors"] = list(document_errors)
+        payload["promotionEligible"] = False
+        return report.allowed and not document_errors, reason, payload
+    except Exception as exc:
+        # This edge is immediately upstream of a broker side effect. Unknown
+        # filesystem, parsing, account, or state failures are always blocking.
+        reason = f"functional-test-dispatch-error:{type(exc).__name__}"
+        return False, reason, {
+            "schemaVersion": "live-functional-test-safety-report-v1",
+            "phase": "DISPATCH",
+            "allowed": False,
+            "blockerCodes": [reason],
+            "promotionEligible": False,
+            "fullLiveAllowed": False,
+        }
+
+
+def _block_managed_order_before_dispatch(
+    order: dict[str, Any],
+    managed_order: Any,
+    reason: str,
+) -> tuple[bool, str]:
+    LIVE_OMS.transition(managed_order.order_id, "REJECTED", reason)
+    order.update(
+        {
+            "state": "risk_blocked",
+            "queue_state": "blocked",
+            "reason": reason,
+            "next_retry_at": "-",
+            "updated_at": now_text(),
+        }
+    )
+    return False, reason
+
+
 def live_broker_dispatch_allowed(
     intent: OrderIntent,
     *,
@@ -12676,15 +15064,56 @@ def live_broker_dispatch_allowed(
     normalized_mode = str(intent.mode or "").strip().upper()
     if normalized_mode not in LIVE_BROKER_DISPATCH_MODES:
         return False, "non-live-intent-broker-dispatch-forbidden"
-    if current_mode() not in LIVE_BROKER_DISPATCH_MODES:
+    runtime_mode = current_mode()
+    if runtime_mode not in LIVE_BROKER_DISPATCH_MODES:
         return False, "non-live-runtime-broker-dispatch-forbidden"
+    if runtime_mode != normalized_mode:
+        return False, "live-runtime-intent-mode-mismatch"
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    if functional_test_execution_requested(intent):
+        broker_id = str(
+            metadata.get("broker_id")
+            or broker_id_from_symbol(intent.symbol, intent.asset)
+        ).strip().lower()
+        if normalized_mode != "SMALL_LIVE":
+            return False, "functional-test-small-live-mode-required"
+        if broker_id != "kis":
+            return False, "functional-test-kis-live-route-required"
+        environment = str(
+            metadata.get("functional_test_environment")
+            or metadata.get("functionalTestEnvironment")
+            or metadata.get("environment")
+            or ""
+        ).strip().upper()
+        if environment != FUNCTIONAL_TEST_ENVIRONMENT:
+            return False, "functional-test-kis-live-environment-required"
+        if any(
+            metadata.get(key) is True
+            for key in (
+                "promotion_eligible",
+                "promotionEligible",
+                "use_as_promotion_evidence",
+                "useAsPromotionEvidence",
+                "full_live_requested",
+                "fullLiveRequested",
+            )
+        ):
+            return False, "functional-test-promotion-evidence-forbidden"
+        order_type = str(
+            metadata.get("order_type") or "LIMIT"
+        ).strip().upper()
+        if (
+            ENVIRONMENT_PROFILES["SMALL_LIVE"].market_orders_allowed
+            is not True
+            and order_type in {"01", "MARKET", "MKT"}
+        ):
+            return False, "functional-test-market-order-forbidden"
     if not real_orders_enabled():
         return False, "real-order-route-disabled"
     if not STATE.get("operator_confirmed"):
         return False, "operator-confirmation-required"
     if STATE.get("kill_switch") or durable_control_halt_active(intent):
         return False, "kill-switch-broker-dispatch-forbidden"
-    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     if intent_market_data_age_seconds(metadata, required=True) > 120:
         return False, "market-data-event-stale-or-unverified"
     verified_risk_reducing = False
@@ -12704,6 +15133,54 @@ def live_broker_dispatch_allowed(
     ):
         return False, "reduce-only-position-verification-failed"
     return True, ""
+
+
+def exact_live_canary_scope_dispatch_allowed(
+    intent: OrderIntent,
+    stored_scope: dict[str, Any] | None,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Require the SMALL_LIVE order scope to equal current persisted truth."""
+
+    if intent.mode != "SMALL_LIVE":
+        return True, "", {}
+    expected = dict(stored_scope) if isinstance(stored_scope, dict) else {}
+    if expected.get("eligible") is not True or not str(
+        expected.get("scopeId") or ""
+    ):
+        return False, "live-canary-order-scope-missing", {}
+    try:
+        current = current_live_canary_scope(
+            intent.strategy_id,
+            materialize=False,
+        )
+    except Exception as exc:
+        return (
+            False,
+            f"live-canary-current-scope-error:{type(exc).__name__}",
+            {},
+        )
+    if current.get("eligible") is not True:
+        issues = ",".join(
+            str(item) for item in current.get("issues") or []
+        )
+        return (
+            False,
+            "live-canary-current-scope-invalid:" + (issues or "eligible=false"),
+            current,
+        )
+    compared_fields = (*CANARY_SCOPE_FIELDS, "scopeId")
+    mismatches = [
+        field
+        for field in compared_fields
+        if str(expected.get(field) or "") != str(current.get(field) or "")
+    ]
+    if mismatches:
+        return (
+            False,
+            "live-canary-order-scope-changed:" + ",".join(mismatches),
+            current,
+        )
+    return True, "", current
 
 
 def order_gate_audit_record(
@@ -12802,11 +15279,249 @@ def live_broker_payload(
     }
 
 
+def functional_test_runtime_dispatch_allowed(
+    intent: OrderIntent,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Authorize a FUNCTIONAL_TEST order only from its sealed test session."""
+
+    if not functional_test_execution_requested(intent):
+        return False, "functional-test-execution-purpose-required", {}
+    if intent.mode != "SMALL_LIVE" or current_mode() != "SMALL_LIVE":
+        return False, "functional-test-runtime-small-live-required", {}
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    if str(metadata.get("broker_id") or "").strip().lower() != "kis":
+        return False, "functional-test-runtime-kis-route-required", {}
+    session_id = str(
+        (STATE.get("active_runtime_session_ids") or {}).get("stock") or ""
+    ).strip()
+    claimed_session_id = str(
+        metadata.get("functional_test_session_id")
+        or metadata.get("functionalTestSessionId")
+        or ""
+    ).strip()
+    if not session_id or not claimed_session_id:
+        return False, "functional-test-runtime-session-missing", {}
+    if not secrets.compare_digest(session_id, claimed_session_id):
+        return False, "functional-test-runtime-session-mismatch", {}
+    try:
+        refreshed, refresh_reason, refresh_details = (
+            refresh_functional_test_runtime_preflight(intent)
+        )
+        if not refreshed:
+            return False, refresh_reason, refresh_details
+        authorization = OPERATIONAL_GOVERNANCE.runtime_authorization(
+            session_id,
+            require_fresh_preflight=True,
+        )
+        if authorization.get("allowed") is not True:
+            return (
+                False,
+                "functional-test-runtime-authorization-blocked:"
+                + ",".join(
+                    str(item) for item in authorization.get("reasons", [])
+                ),
+                authorization,
+            )
+        session = (
+            authorization.get("session")
+            if isinstance(authorization.get("session"), dict)
+            else {}
+        )
+        if (
+            str(session.get("profile") or "") != "stock"
+            or str(session.get("mode") or "") != "SMALL_LIVE"
+        ):
+            return False, "functional-test-runtime-profile-mode-mismatch", authorization
+        session_metadata = (
+            session.get("metadata")
+            if isinstance(session.get("metadata"), dict)
+            else {}
+        )
+        if (
+            str(session_metadata.get("executionPurpose") or "")
+            != FUNCTIONAL_TEST_EXECUTION_PURPOSE
+            or session_metadata.get("promotionEligible") is not False
+            or str(session_metadata.get("evidenceClass") or "")
+            != "FUNCTIONAL_TEST_NON_PROMOTION"
+        ):
+            return False, "functional-test-session-purpose-invalid", authorization
+        manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(
+            str(session.get("deploymentManifestHash") or "")
+        )
+        if manifest is None:
+            return False, "functional-test-manifest-missing", authorization
+        manifest_metadata = dict(manifest.metadata)
+        if (
+            str(manifest_metadata.get("executionPurpose") or "")
+            != FUNCTIONAL_TEST_EXECUTION_PURPOSE
+            or manifest_metadata.get("promotionEligible") is not False
+            or manifest_metadata.get("fullLiveAllowed") is not False
+        ):
+            return False, "functional-test-manifest-purpose-invalid", authorization
+
+        permit, activation = functional_test_active_authority()
+        try:
+            authority_status = PROGRAM_LEDGER.functional_test_authority_status(
+                permit_id=str(permit.permit_id or ""),
+                account_fingerprint=functional_test_account_fingerprint(
+                    permit.binding.account_id
+                ),
+            )
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            return (
+                False,
+                "functional-test-durable-authority-unavailable:"
+                + type(exc).__name__,
+                authorization,
+            )
+        if authority_status.get("closed") is True:
+            return (
+                False,
+                "functional-test-authority-closed",
+                {**authorization, "authorityStatus": authority_status},
+            )
+        authority_pairs = (
+            ("permitId", permit.permit_id),
+            ("permitHash", permit.content_hash),
+            ("activationTokenId", activation.token_id),
+            ("activationHash", activation.content_hash),
+        )
+        for key, current_value in authority_pairs:
+            if (
+                str(manifest_metadata.get(key) or "") != str(current_value)
+                or str(session_metadata.get(key) or "") != str(current_value)
+            ):
+                return (
+                    False,
+                    "functional-test-session-authority-changed:" + key,
+                    authorization,
+                )
+
+        portfolio_id = str(
+            metadata.get("portfolio_id")
+            or metadata.get("portfolioId")
+            or ""
+        ).strip()
+        scope = _functional_test_runtime_scope(
+            portfolio_id=portfolio_id,
+            strategy_id=str(intent.strategy_id or ""),
+            permit=permit,
+        )
+        if (
+            str(scope.get("bindingHash") or "")
+            != str(manifest_metadata.get("bindingHash") or "")
+            or str(scope.get("bindingHash") or "")
+            != str(session_metadata.get("bindingHash") or "")
+        ):
+            return False, "functional-test-runtime-binding-changed", authorization
+        if (
+            str(scope.get("accountFingerprint") or "")
+            != str(manifest.account_fingerprint or "")
+            or str(scope.get("accountFingerprint") or "")
+            != str(session_metadata.get("accountFingerprint") or "")
+        ):
+            return False, "functional-test-runtime-account-changed", authorization
+        if (
+            str(scope.get("strategyMemberHash") or "")
+            != str(manifest_metadata.get("strategyMemberHash") or "")
+            or str(scope.get("strategyMemberHash") or "")
+            != str(session_metadata.get("strategyMemberHash") or "")
+        ):
+            return False, "functional-test-runtime-members-changed", authorization
+        if sorted(scope.get("allowedSymbols") or []) != sorted(
+            manifest_metadata.get("allowedSymbols") or []
+        ):
+            return False, "functional-test-runtime-symbol-scope-changed", authorization
+
+        current_values = _functional_test_manifest_values(
+            scope,
+            permit,
+            activation,
+            preflight_ttl_seconds=manifest.preflight_ttl_seconds,
+        )
+        immutable_mismatches = [
+            label
+            for label, current_value, sealed_value in (
+                (
+                    "strategy-artifact",
+                    current_values["strategy_artifact_hash"],
+                    manifest.strategy_artifact_hash,
+                ),
+                (
+                    "portfolio-artifact",
+                    current_values["portfolio_artifact_hash"],
+                    manifest.portfolio_artifact_hash,
+                ),
+                ("build", current_values["build_hash"], manifest.build_hash),
+                (
+                    "risk-policy",
+                    current_values["risk_policy_hash"],
+                    manifest.risk_policy_hash,
+                ),
+                ("config", current_values["config_hash"], manifest.config_hash),
+            )
+            if str(current_value or "") != str(sealed_value or "")
+        ]
+        if immutable_mismatches:
+            return (
+                False,
+                "functional-test-runtime-seal-changed:"
+                + ",".join(immutable_mismatches),
+                authorization,
+            )
+
+        requested_instance = str(
+            metadata.get("strategy_instance_id")
+            or metadata.get("strategyInstanceId")
+            or ""
+        ).strip()
+        normalized_symbol = canonical_kis_domestic_symbol(intent.symbol)
+        matching_member = next(
+            (
+                item
+                for item in scope.get("strategyMembers", [])
+                if isinstance(item, dict)
+                and str(item.get("strategyId") or "")
+                == str(intent.strategy_id or "")
+                and str(item.get("strategyInstanceId") or "")
+                == requested_instance
+                and str(item.get("symbol") or "") == normalized_symbol
+                and str(item.get("brokerId") or "") == "kis"
+            ),
+            None,
+        )
+        if matching_member is None:
+            return False, "functional-test-runtime-sleeve-context-mismatch", authorization
+        authorization["functionalTest"] = {
+            "permitId": permit.permit_id,
+            "permitHash": permit.content_hash,
+            "activationTokenId": activation.token_id,
+            "activationHash": activation.content_hash,
+            "bindingHash": scope.get("bindingHash"),
+            "strategyMemberHash": scope.get("strategyMemberHash"),
+            "promotionEligible": False,
+        }
+        return True, "functional-test-runtime-authorized", authorization
+    except (FunctionalTestContractError, OSError, sqlite3.Error, ValueError) as exc:
+        code = (
+            exc.code
+            if isinstance(exc, FunctionalTestContractError)
+            else type(exc).__name__
+        )
+        return (
+            False,
+            f"functional-test-runtime-authorization-error:{code}",
+            {},
+        )
+
+
 def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str, dict[str, Any]]:
     """Revalidate immutable live session identity at the final side-effect edge."""
 
     if intent.mode not in {"SMALL_LIVE", "FULL_LIVE"}:
         return False, "operational-session-live-mode-required", {}
+    if current_mode() != intent.mode:
+        return False, "operational-runtime-intent-mode-mismatch", {}
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     broker_id = str(
         metadata.get("broker_id")
@@ -12834,12 +15549,131 @@ def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str
                 authorization,
             )
         session = authorization.get("session") if isinstance(authorization.get("session"), dict) else {}
+        if str(session.get("mode") or "").upper() != str(intent.mode).upper():
+            return False, "operational-runtime-mode-mismatch", authorization
         manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(
             str(session.get("deploymentManifestHash") or "")
         )
         if manifest is None:
             return False, "operational-deployment-manifest-missing", authorization
         manifest_metadata = dict(manifest.metadata)
+        manifest_deployment_binding = (
+            dict(manifest_metadata.get("deploymentBinding"))
+            if isinstance(manifest_metadata.get("deploymentBinding"), dict)
+            else {}
+        )
+        if not _live_deployment_binding_is_executable(
+            manifest_deployment_binding,
+            mode=intent.mode,
+        ):
+            return False, "operational-deployment-binding-invalid", authorization
+        if str(manifest_deployment_binding.get("deploymentId") or "") != str(
+            manifest.deployment_id or ""
+        ):
+            return False, "operational-deployment-binding-id-mismatch", authorization
+        if str(manifest_metadata.get("deploymentBindingHash") or "") != str(
+            manifest_deployment_binding.get("bindingHash") or ""
+        ):
+            return False, "operational-deployment-binding-hash-invalid", authorization
+        session_metadata = (
+            session.get("metadata")
+            if isinstance(session.get("metadata"), dict)
+            else {}
+        )
+        if (
+            session_metadata.get("deploymentBinding")
+            != manifest_deployment_binding
+            or str(session_metadata.get("deploymentBindingHash") or "")
+            != str(manifest_deployment_binding.get("bindingHash") or "")
+        ):
+            return False, "operational-session-deployment-binding-mismatch", authorization
+        manifest_paper_bindings = [
+            dict(item)
+            for item in manifest_metadata.get("paperFinalBindings", [])
+            if isinstance(item, dict)
+        ]
+        if (
+            not manifest_paper_bindings
+            or any(item.get("ready") is not True for item in manifest_paper_bindings)
+        ):
+            return False, "operational-paper-final-binding-missing", authorization
+        required_binding_keys = (
+            "strategyId",
+            "strategyInstanceId",
+            "paperEvidenceId",
+            "paperEvidenceHash",
+            "paperEvidenceBundleHash",
+            "paperFinalBindingHash",
+            "paperGovernanceDeploymentId",
+        )
+        if any(
+            any(not str(item.get(key) or "").strip() for key in required_binding_keys)
+            for item in manifest_paper_bindings
+        ):
+            return False, "operational-paper-final-binding-incomplete", authorization
+        if any(
+            str(item.get("paperGovernanceDeploymentId") or "").strip()
+            == str(manifest.deployment_id or "").strip()
+            for item in manifest_paper_bindings
+        ):
+            return False, "operational-paper-live-deployment-not-distinct", authorization
+        hash_keys = (
+            "paperEvidenceHash",
+            "paperEvidenceBundleHash",
+            "paperFinalBindingHash",
+        )
+        if any(
+            any(
+                len(str(item.get(key) or "").strip()) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in str(item.get(key) or "").strip().lower()
+                )
+                for key in hash_keys
+            )
+            for item in manifest_paper_bindings
+        ):
+            return False, "operational-paper-final-binding-hash-invalid", authorization
+        portfolio_binding_required = bool(manifest.portfolio_artifact_hash)
+        if any(
+            (
+                not str(item.get("paperPortfolioArtifactId") or "").strip()
+                or not str(item.get("paperPortfolioArtifactHash") or "").strip()
+                or not str(item.get("paperPortfolioInstanceId") or "").strip()
+            )
+            if portfolio_binding_required
+            else any(
+                str(item.get(key) or "").strip()
+                for key in (
+                    "paperPortfolioArtifactId",
+                    "paperPortfolioArtifactHash",
+                    "paperPortfolioInstanceId",
+                )
+            )
+            for item in manifest_paper_bindings
+        ):
+            return False, "operational-paper-portfolio-binding-invalid", authorization
+        manifest_portfolio_reference = (
+            manifest_metadata.get("portfolioArtifact")
+            if isinstance(manifest_metadata.get("portfolioArtifact"), dict)
+            else {}
+        )
+        if portfolio_binding_required and (
+            str(manifest_portfolio_reference.get("artifactHash") or "").lower()
+            != str(manifest.portfolio_artifact_hash or "").lower()
+            or any(
+                str(item.get("paperPortfolioArtifactId") or "")
+                != str(manifest_portfolio_reference.get("artifactId") or "")
+                or str(item.get("paperPortfolioArtifactHash") or "").lower()
+                != str(manifest.portfolio_artifact_hash or "").lower()
+                for item in manifest_paper_bindings
+            )
+        ):
+            return False, "operational-paper-portfolio-hash-mismatch", authorization
+        if str(manifest_metadata.get("paperFinalBindingsHash") or "") != governance_sha256(
+            manifest_paper_bindings
+        ):
+            return False, "operational-paper-final-binding-hash-invalid", authorization
         manifest_broker_routes = sorted(
             {
                 str(item).strip().lower()
@@ -12863,22 +15697,90 @@ def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str
             members = [
                 {
                     "strategyId": str(manifest_metadata.get("strategyId") or ""),
+                    "strategyInstanceId": str(
+                        manifest_metadata.get("strategyInstanceId") or ""
+                    ),
                     "symbol": str(manifest_metadata.get("symbol") or "").upper(),
                     "brokerId": str(manifest_metadata.get("brokerId") or "").lower(),
                     "artifactHash": manifest.strategy_artifact_hash,
                 }
             ]
+        requested_instance_ids: list[str] = []
+        if metadata.get("multi_strategy") is True:
+            raw_instance_ids = metadata.get("strategy_instance_ids")
+            if not isinstance(raw_instance_ids, (list, tuple)):
+                return (
+                    False,
+                    "operational-multi-strategy-instance-context-invalid",
+                    authorization,
+                )
+            requested_instance_ids = [
+                str(item or "").strip() for item in raw_instance_ids
+            ]
+            if (
+                not requested_instance_ids
+                or any(not item for item in requested_instance_ids)
+                or len(set(requested_instance_ids)) != len(requested_instance_ids)
+            ):
+                return (
+                    False,
+                    "operational-multi-strategy-instance-context-invalid",
+                    authorization,
+                )
+            manifest_symbol_instances = {
+                str(item.get("strategyInstanceId") or "").strip()
+                for item in members
+                if str(item.get("symbol") or "").upper()
+                == str(intent.symbol).upper()
+                and str(item.get("strategyInstanceId") or "").strip()
+            }
+            if not set(requested_instance_ids).issubset(
+                manifest_symbol_instances
+            ):
+                return (
+                    False,
+                    "operational-multi-strategy-instance-context-mismatch",
+                    authorization,
+                )
+        requested_strategy_instance = str(
+            metadata.get("strategy_instance_id")
+            or metadata.get("strategyInstanceId")
+            or ""
+        ).strip()
+        if not requested_strategy_instance:
+            return False, "operational-strategy-instance-context-missing", authorization
+        if (
+            metadata.get("multi_strategy") is True
+            and requested_strategy_instance not in requested_instance_ids
+        ):
+            return (
+                False,
+                "operational-multi-strategy-lead-instance-mismatch",
+                authorization,
+            )
+        matching_identity_members = [
+            item
+            for item in members
+            if str(item.get("strategyId") or "") == str(intent.strategy_id)
+            and str(item.get("symbol") or "").upper()
+            == str(intent.symbol).upper()
+        ]
         member = next(
             (
                 item
-                for item in members
-                if str(item.get("strategyId") or "") == str(intent.strategy_id)
-                and str(item.get("symbol") or "").upper()
-                == str(intent.symbol).upper()
+                for item in matching_identity_members
+                if str(item.get("strategyInstanceId") or "").strip()
+                == requested_strategy_instance
             ),
             None,
         )
         if member is None:
+            if matching_identity_members:
+                return (
+                    False,
+                    "operational-strategy-instance-context-mismatch",
+                    authorization,
+                )
             return False, "operational-strategy-context-mismatch", authorization
         if str(member.get("brokerId") or "").lower() != broker_id:
             return False, "operational-broker-context-mismatch", authorization
@@ -12886,8 +15788,15 @@ def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str
             metadata.get("portfolio_id") or metadata.get("portfolioId") or ""
         )
         manifest_portfolio = str(manifest_metadata.get("portfolioId") or "")
-        if manifest.portfolio_artifact_hash and requested_portfolio != manifest_portfolio:
-            return False, "operational-portfolio-context-mismatch", authorization
+        if manifest.portfolio_artifact_hash:
+            if requested_portfolio != manifest_portfolio:
+                return False, "operational-portfolio-context-mismatch", authorization
+        elif requested_portfolio:
+            return (
+                False,
+                "operational-standalone-portfolio-context-not-empty",
+                authorization,
+            )
         strategies = strategy_rows(portfolio_rows())
         strategy = next(
             (
@@ -12908,10 +15817,40 @@ def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str
         )
         if strategy is None:
             return False, "operational-current-strategy-missing", authorization
+        required_permission = (
+            "live_eligible" if intent.mode == "FULL_LIVE" else "live_small_eligible"
+        )
+        if strategy.get(required_permission) is not True:
+            return False, "operational-current-deployment-permission-revoked", authorization
         current_member_hash = _operational_artifact_hash(strategy)
         if str(member.get("artifactHash") or "") != current_member_hash:
             return False, "operational-strategy-hash-changed", authorization
         current_inputs = _operational_manifest_inputs(strategy)
+        if str(current_inputs.get("deployment_id") or "").strip() != str(
+            manifest.deployment_id or ""
+        ).strip():
+            return False, "operational-deployment-context-changed", authorization
+        current_metadata = (
+            current_inputs.get("metadata")
+            if isinstance(current_inputs.get("metadata"), dict)
+            else {}
+        )
+        if (
+            current_metadata.get("paperFinalBindings")
+            != manifest_metadata.get("paperFinalBindings")
+            or current_metadata.get("paperFinalBindingsHash")
+            != manifest_metadata.get("paperFinalBindingsHash")
+        ):
+            return False, "operational-paper-final-binding-changed", authorization
+        if (
+            current_metadata.get("deploymentBinding")
+            != manifest_deployment_binding
+            or current_metadata.get("deploymentBindingHash")
+            != manifest_metadata.get("deploymentBindingHash")
+        ):
+            return False, "operational-deployment-binding-changed", authorization
+        if current_metadata.get("portfolioArtifact") != manifest_portfolio_reference:
+            return False, "operational-portfolio-reference-changed", authorization
         if current_inputs["strategy_artifact_hash"] != manifest.strategy_artifact_hash:
             return False, "operational-strategy-hash-changed", authorization
         if current_inputs["portfolio_artifact_hash"] != manifest.portfolio_artifact_hash:
@@ -12956,8 +15895,49 @@ def dispatch_live_order_with_checkpoint(
             }
         )
         return False, invariant_reason
+    functional_allowed, functional_reason, functional_report = (
+        functional_test_dispatch_assessment(intent)
+    )
+    if functional_test_execution_requested(intent):
+        order["functional_test_dispatch"] = functional_report
+    if not functional_allowed:
+        return _block_managed_order_before_dispatch(
+            order,
+            managed_order,
+            functional_reason,
+        )
+    functional_execution = functional_test_execution_requested(intent)
+    scope_allowed, scope_reason, current_scope = (
+        (True, "", {})
+        if functional_execution
+        else exact_live_canary_scope_dispatch_allowed(
+            intent,
+            order.get("canary_scope")
+            if isinstance(order.get("canary_scope"), dict)
+            else {},
+        )
+    )
+    order["current_canary_scope"] = current_scope
+    if not scope_allowed:
+        LIVE_OMS.transition(
+            managed_order.order_id,
+            "REJECTED",
+            scope_reason,
+        )
+        order.update(
+            {
+                "state": "risk_blocked",
+                "queue_state": "blocked",
+                "reason": scope_reason,
+                "next_retry_at": "-",
+                "updated_at": now_text(),
+            }
+        )
+        return False, scope_reason
     governance_allowed, governance_reason, governance_authorization = (
-        operational_runtime_dispatch_allowed(intent)
+        functional_test_runtime_dispatch_allowed(intent)
+        if functional_execution
+        else operational_runtime_dispatch_allowed(intent)
     )
     order["runtime_authorization"] = governance_authorization
     if not governance_allowed:
@@ -12976,6 +15956,64 @@ def dispatch_live_order_with_checkpoint(
             }
         )
         return False, governance_reason
+
+    if functional_test_execution_requested(intent):
+        effective_caps = (
+            functional_report.get("effectiveCaps")
+            if isinstance(functional_report.get("effectiveCaps"), dict)
+            else {}
+        )
+        permit_id = str(functional_report.get("permitId") or "").strip()
+        raw_maximum_orders = effective_caps.get("max_orders")
+        try:
+            maximum_orders = int(raw_maximum_orders)
+            if (
+                isinstance(raw_maximum_orders, bool)
+                or float(raw_maximum_orders) != float(maximum_orders)
+                or maximum_orders <= 0
+            ):
+                raise ValueError("invalid maximum orders")
+            reservation = PROGRAM_LEDGER.reserve_functional_test_order(
+                permit_id=permit_id,
+                idempotency_key=str(order.get("idempotency_key") or ""),
+                order_id=str(order.get("order_id") or ""),
+                maximum_orders=maximum_orders,
+                reserved_at=now_text(),
+            )
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            reservation = {
+                "allowed": False,
+                "created": False,
+                "count": -1,
+                "reservation": {},
+                "reason": (
+                    "functional-test-order-reservation-error:"
+                    f"{type(exc).__name__}"
+                ),
+            }
+        order["functional_test_reservation"] = reservation
+        if reservation.get("allowed") is not True:
+            return _block_managed_order_before_dispatch(
+                order,
+                managed_order,
+                str(
+                    reservation.get("reason")
+                    or "functional-test-order-reservation-blocked"
+                ),
+            )
+        intent = replace(
+            intent,
+            metadata={
+                **(
+                    intent.metadata
+                    if isinstance(intent.metadata, dict)
+                    else {}
+                ),
+                "functional_test_reservation_id": str(
+                    order.get("idempotency_key") or ""
+                ),
+            },
+        )
 
     broker_payload = live_broker_payload(
         intent,
@@ -13077,42 +16115,245 @@ def dispatch_live_order_with_checkpoint(
             dry_run=bool(order.get("dry_run")),
         )
         if not dispatch_allowed:
-            LIVE_OMS.mark_unknown(
+            LIVE_OMS.transition(
                 managed_order.order_id,
+                "REJECTED",
                 invariant_reason,
             )
             order.update(
                 {
-                    "state": "unknown",
-                    "queue_state": "reconcile_required",
+                    "state": "risk_blocked",
+                    "queue_state": "blocked",
                     "reason": invariant_reason,
+                    "next_retry_at": "-",
                 }
             )
             return False, invariant_reason
+        scope_allowed, scope_reason, current_scope = (
+            (True, "", {})
+            if functional_execution
+            else exact_live_canary_scope_dispatch_allowed(
+                intent,
+                order.get("canary_scope")
+                if isinstance(order.get("canary_scope"), dict)
+                else {},
+            )
+        )
+        order["current_canary_scope"] = current_scope
+        if not scope_allowed:
+            LIVE_OMS.transition(
+                managed_order.order_id,
+                "REJECTED",
+                scope_reason,
+            )
+            order.update(
+                {
+                    "state": "risk_blocked",
+                    "queue_state": "blocked",
+                    "reason": scope_reason,
+                    "next_retry_at": "-",
+                }
+            )
+            return False, scope_reason
         governance_allowed, governance_reason, governance_authorization = (
-            operational_runtime_dispatch_allowed(intent)
+            functional_test_runtime_dispatch_allowed(intent)
+            if functional_execution
+            else operational_runtime_dispatch_allowed(intent)
         )
         order["runtime_authorization"] = governance_authorization
         if not governance_allowed:
-            LIVE_OMS.mark_unknown(
+            LIVE_OMS.transition(
                 managed_order.order_id,
+                "REJECTED",
                 governance_reason,
             )
             order.update(
                 {
-                    "state": "unknown",
-                    "queue_state": "reconcile_required",
+                    "state": "risk_blocked",
+                    "queue_state": "blocked",
                     "reason": governance_reason,
+                    "next_retry_at": "-",
                 }
             )
             return False, governance_reason
 
-        LIVE_OMS.transition(
-            managed_order.order_id,
-            "SUBMITTING",
-            "broker request dispatch",
+        # Re-read the shared permit, today's live activation, the current
+        # Artifact/account binding, and broker-derived exposure immediately
+        # before the KIS POST. The earlier PRETRADE/DISPATCH reports are
+        # diagnostics only and never become reusable authorization tokens.
+        functional_allowed, functional_reason, functional_report = (
+            functional_test_dispatch_assessment(
+                intent,
+                broker_payload=broker_payload,
+            )
         )
-        broker_response = LiveBrokerRouter().place_order(broker_payload)
+        if functional_test_execution_requested(intent):
+            order["functional_test_dispatch_final"] = functional_report
+        if not functional_allowed:
+            return _block_managed_order_before_dispatch(
+                order,
+                managed_order,
+                functional_reason,
+            )
+
+        # A portfolio intent carries a sealed sleeve-allocation/netting plan.
+        # Reconcile that plan against the latest complete KIS holdings at the
+        # final side-effect boundary; an earlier strategy-cycle validation is
+        # never reusable authority for this POST.
+        portfolio_execution = (
+            intent.metadata.get("portfolio_execution")
+            if isinstance(intent.metadata, dict)
+            and isinstance(intent.metadata.get("portfolio_execution"), dict)
+            else None
+        )
+        if portfolio_execution is not None:
+            try:
+                from .continuous_live import (
+                    validate_portfolio_execution_dispatch,
+                )
+
+                (
+                    portfolio_allowed,
+                    portfolio_reason,
+                    portfolio_report,
+                ) = validate_portfolio_execution_dispatch(intent)
+                order["portfolio_execution_dispatch_final"] = (
+                    dict(portfolio_report)
+                    if isinstance(portfolio_report, dict)
+                    else {}
+                )
+            except Exception as exc:
+                portfolio_allowed = False
+                portfolio_reason = (
+                    "portfolio-execution-dispatch-validation-error:"
+                    + type(exc).__name__
+                )
+                order["portfolio_execution_dispatch_final"] = {
+                    "ok": False,
+                    "errorType": type(exc).__name__,
+                }
+            if not portfolio_allowed:
+                return _block_managed_order_before_dispatch(
+                    order,
+                    managed_order,
+                    str(
+                        portfolio_reason
+                        or "portfolio-execution-dispatch-validation-blocked"
+                    ),
+                )
+
+        with FUNCTIONAL_TEST_AUTHORITY_DISPATCH_LOCK:
+            if functional_execution:
+                try:
+                    final_permit, final_activation = (
+                        functional_test_active_authority()
+                    )
+                    final_account_fingerprint = (
+                        functional_test_account_fingerprint(
+                            final_permit.binding.account_id
+                        )
+                    )
+                    final_authority = (
+                        PROGRAM_LEDGER.functional_test_authority_status(
+                            permit_id=str(final_permit.permit_id or ""),
+                            account_fingerprint=final_account_fingerprint,
+                        )
+                    )
+                except (
+                    FunctionalTestContractError,
+                    OSError,
+                    sqlite3.Error,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    return _block_managed_order_before_dispatch(
+                        order,
+                        managed_order,
+                        "functional-test-final-authority-unavailable:"
+                        + type(exc).__name__,
+                    )
+                order["functional_test_authority_final"] = final_authority
+                if final_authority.get("closed") is True:
+                    return _block_managed_order_before_dispatch(
+                        order,
+                        managed_order,
+                        "functional-test-authority-closed",
+                    )
+                metadata = (
+                    intent.metadata
+                    if isinstance(intent.metadata, dict)
+                    else {}
+                )
+                sealed_authority = {
+                    "permitId": str(
+                        metadata.get("functional_test_permit_id") or ""
+                    ),
+                    "permitHash": str(
+                        metadata.get("functional_test_permit_hash") or ""
+                    ),
+                    "activationTokenId": str(
+                        metadata.get("functional_test_activation_token_id")
+                        or ""
+                    ),
+                    "activationHash": str(
+                        metadata.get("functional_test_activation_hash") or ""
+                    ),
+                    "accountFingerprint": str(
+                        metadata.get("functional_test_account_fingerprint")
+                        or ""
+                    ).lower(),
+                }
+                current_authority = {
+                    "permitId": str(final_permit.permit_id or ""),
+                    "permitHash": str(final_permit.content_hash or ""),
+                    "activationTokenId": str(
+                        final_activation.token_id or ""
+                    ),
+                    "activationHash": str(
+                        final_activation.content_hash or ""
+                    ),
+                    "accountFingerprint": final_account_fingerprint.lower(),
+                }
+                missing_seals = [
+                    key
+                    for key, value in sealed_authority.items()
+                    if not value
+                ]
+                mismatched_seals = [
+                    key
+                    for key, value in sealed_authority.items()
+                    if value
+                    and not secrets.compare_digest(
+                        value,
+                        current_authority[key],
+                    )
+                ]
+                order["functional_test_authority_final"][
+                    "sealedAuthority"
+                ] = sealed_authority
+                order["functional_test_authority_final"][
+                    "currentAuthority"
+                ] = current_authority
+                if missing_seals:
+                    return _block_managed_order_before_dispatch(
+                        order,
+                        managed_order,
+                        "functional-test-final-authority-seal-missing:"
+                        + ",".join(missing_seals),
+                    )
+                if mismatched_seals:
+                    return _block_managed_order_before_dispatch(
+                        order,
+                        managed_order,
+                        "functional-test-final-authority-changed:"
+                        + ",".join(mismatched_seals),
+                    )
+            LIVE_OMS.transition(
+                managed_order.order_id,
+                "SUBMITTING",
+                "broker request dispatch",
+            )
+            broker_response = LiveBrokerRouter().place_order(broker_payload)
         if not isinstance(broker_response, dict):
             broker_response = {}
         order["broker_response"] = broker_response
@@ -13285,6 +16526,19 @@ def dispatch_live_order_with_checkpoint(
             )
             ok = False
             reason = "dispatch-terminal-checkpoint-failed"
+        if functional_test_execution_requested(intent) and isinstance(
+            order.get("functional_test_reservation"),
+            dict,
+        ):
+            try:
+                PROGRAM_LEDGER.update_functional_test_reservation(
+                    str(order.get("idempotency_key") or ""),
+                    str(order.get("state") or "UNKNOWN"),
+                )
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                # The slot was consumed by the atomic INSERT and is never
+                # deleted; an outcome-label failure cannot restore capacity.
+                pass
         order["oms_status"] = LIVE_OMS.orders[
             managed_order.order_id
         ].status
@@ -13329,26 +16583,166 @@ def submit_order_intent(
     else:
         metadata.pop("risk_reducing_claim_rejected", None)
     intent = replace(intent, metadata=metadata)
-    canary_scope = (
-        current_live_canary_scope(
-            intent.strategy_id,
-            materialize=True,
-        )
-        if (
-            broker_id == "binance-futures"
-            and not dry_run
-            and intent.mode == "SMALL_LIVE"
-        )
-        else {}
+    canary_scope_required = (
+        not dry_run
+        and intent.mode == "SMALL_LIVE"
+        and not functional_test_execution_requested(intent)
     )
+    canary_scope: dict[str, Any] = {}
+    if canary_scope_required:
+        try:
+            resolved_canary_scope = current_live_canary_scope(
+                intent.strategy_id,
+                materialize=True,
+            )
+            canary_scope = (
+                dict(resolved_canary_scope)
+                if isinstance(resolved_canary_scope, dict)
+                else {
+                    "schemaVersion": CANARY_SCOPE_SCHEMA_VERSION,
+                    "eligible": False,
+                    "issues": ["scope-response-type-invalid"],
+                }
+            )
+        except Exception as exc:
+            # The broker edge must fail closed while still leaving a durable,
+            # redacted reason in the order/audit trail.  The observed failure
+            # remains attached to this order; successful observations are
+            # deliberately re-read at both dispatch boundaries and must match
+            # this exact scope.
+            canary_scope = {
+                "schemaVersion": CANARY_SCOPE_SCHEMA_VERSION,
+                "eligible": False,
+                "issues": [f"scope-load-error:{type(exc).__name__}"],
+            }
+    canary_scope_failure_reason = ""
+    if canary_scope_required and canary_scope.get("eligible") is not True:
+        scope_issues = [
+            str(item).strip()
+            for item in canary_scope.get("issues") or []
+            if str(item).strip()
+        ]
+        if not canary_scope:
+            canary_scope_failure_reason = "live-canary-scope-missing"
+        else:
+            canary_scope_failure_reason = (
+                "live-canary-scope-invalid:"
+                + ",".join(scope_issues[:5] or ["eligible=false"])
+            )
     if broker_id == "binance-futures":
         metadata["capital_rollout"] = futures_capital_rollout_for_intent(
             checks,
             intent,
         )
     intent = replace(intent, metadata=metadata)
+    functional_preflight_refresh_allowed = True
+    functional_preflight_refresh_reason = (
+        "functional-test-preflight-not-required"
+    )
+    functional_preflight_refresh_report: dict[str, Any] = {}
+    claimed_functional_session = str(
+        metadata.get("functional_test_session_id")
+        or metadata.get("functionalTestSessionId")
+        or ""
+    ).strip()
+    if (
+        functional_test_execution_requested(intent)
+        and not dry_run
+        and claimed_functional_session
+    ):
+        (
+            functional_preflight_refresh_allowed,
+            functional_preflight_refresh_reason,
+            functional_preflight_refresh_report,
+        ) = refresh_functional_test_runtime_preflight(intent)
     RECOVERY_JOURNAL.save(recovery_state_payload(), reason="before-order", idempotency_keys=[str(item.get("idempotency_key") or "") for item in STATE.get("orders", [])])
     ok, order_state, queue_state, reason, risk_report = evaluate_order_gate_with_report(checks, intent.side, dry_run, intent)
+    functional_test_report: dict[str, Any] = {}
+    if functional_test_execution_requested(intent):
+        try:
+            functional_report, document_errors = (
+                functional_test_safety_report_for_intent(
+                    checks,
+                    intent,
+                    phase="PRETRADE",
+                )
+            )
+            functional_reason = _functional_test_report_reason(
+                functional_report,
+                document_errors,
+            )
+            functional_allowed = (
+                functional_report.allowed and not document_errors
+            )
+            functional_test_report = functional_report.to_dict()
+            functional_test_report["documentErrors"] = list(document_errors)
+        except Exception as exc:
+            functional_allowed = False
+            functional_reason = (
+                f"functional-test-pretrade-error:{type(exc).__name__}"
+            )
+            functional_test_report = {
+                "schemaVersion": "live-functional-test-safety-report-v1",
+                "phase": "PRETRADE",
+                "allowed": False,
+                "blockerCodes": [functional_reason],
+                "promotionEligible": False,
+                "fullLiveAllowed": False,
+            }
+        risk_report = PreTradeRiskReport(
+            risk_report.checked_at,
+            (
+                *risk_report.checks,
+                RiskCheck(
+                    "Functional Test Permit",
+                    "pass" if functional_allowed else "fail",
+                    functional_reason,
+                ),
+            ),
+        )
+        if not functional_allowed:
+            ok = False
+            order_state = "risk_blocked"
+            queue_state = "blocked"
+            reason = functional_reason
+        if claimed_functional_session:
+            risk_report = PreTradeRiskReport(
+                risk_report.checked_at,
+                (
+                    *risk_report.checks,
+                    RiskCheck(
+                        "Functional Test Runtime Preflight",
+                        (
+                            "pass"
+                            if functional_preflight_refresh_allowed
+                            else "fail"
+                        ),
+                        functional_preflight_refresh_reason,
+                    ),
+                ),
+            )
+            if not functional_preflight_refresh_allowed:
+                ok = False
+                order_state = "risk_blocked"
+                queue_state = "blocked"
+                reason = functional_preflight_refresh_reason
+    if canary_scope_failure_reason:
+        risk_report = PreTradeRiskReport(
+            risk_report.checked_at,
+            (
+                *risk_report.checks,
+                RiskCheck(
+                    "Live Canary Scope",
+                    "fail",
+                    canary_scope_failure_reason,
+                ),
+            ),
+        )
+        if ok:
+            ok = False
+            order_state = "risk_blocked"
+            queue_state = "blocked"
+            reason = canary_scope_failure_reason
     portfolio_gate = portfolio_gate_for_intent(checks, intent)
     retry_backoff = float(STATE["retry_policy"]["backoff_sec"])
     target_revision = stable_target_revision(
@@ -13505,11 +16899,8 @@ def submit_order_intent(
         "broker_id": broker_id,
         "dry_run": dry_run,
         "mode": intent.mode,
-        "canary_scope": (
-            canary_scope
-            if canary_scope.get("eligible") is True
-            else {}
-        ),
+        "canary_scope": canary_scope if canary_scope_required else {},
+        "canary_scope_error": canary_scope_failure_reason,
         "reason": reason,
         "trace_id": trace_id,
         "risk_report": risk_report.to_dict(),
@@ -13520,6 +16911,26 @@ def submit_order_intent(
             else {}
         ),
     }
+    if isinstance(metadata.get("portfolio_execution"), dict):
+        # Preserve the non-secret sleeve allocation plan in both the durable
+        # dispatch journal and recovery journal.  This allows an ACK received
+        # immediately before a process crash to be attributed after restart.
+        order["portfolio_execution"] = dict(
+            metadata["portfolio_execution"]
+        )
+    if functional_test_execution_requested(intent):
+        order.update(
+            {
+                "execution_purpose": FUNCTIONAL_TEST_EXECUTION_PURPOSE,
+                "promotion_eligible": False,
+                "functional_test": functional_test_report,
+                "functional_test_preflight_refresh": (
+                    functional_preflight_refresh_report
+                    if claimed_functional_session
+                    else {}
+                ),
+            }
+        )
     if runner_report is not None:
         order["runner_report"] = runner_report.to_dict()
     DECISION_TRACE_STORE.append(
@@ -13601,6 +17012,1889 @@ def submit_order_intent(
     return {"ok": ok, "reason": reason, "order": order, "snapshot": snapshot()}
 
 
+def _functional_test_member(
+    strategy: dict[str, Any],
+    *,
+    strategy_instance_id: str,
+    symbol: str,
+) -> dict[str, Any]:
+    """Seal one current KIS sleeve and its minimum verification pins."""
+
+    strategy_id = str(strategy.get("strategy_id") or "").strip()
+    instance_id = str(strategy_instance_id or "").strip()
+    normalized_symbol = canonical_kis_domestic_symbol(symbol)
+    reference = verified_strategy_artifact_reference(strategy)
+    lifecycle = normalize_lifecycle_status(strategy.get("lifecycle_status"))
+    blockers: list[str] = []
+    if not strategy_id:
+        blockers.append("strategy-id-missing")
+    if not instance_id:
+        blockers.append("strategy-instance-id-missing")
+    if not normalized_symbol:
+        blockers.append("kis-domestic-symbol-required")
+    if strategy_broker_id(strategy) != "kis":
+        blockers.append("kis-broker-route-required")
+    if not reference:
+        blockers.append("verified-strategy-artifact-reference-required")
+    if lifecycle in {"paused", "retired"}:
+        blockers.append(f"strategy-lifecycle-{lifecycle}")
+    if strategy.get("backtester_verified") is not True:
+        blockers.append("backtester-verification-pin-required")
+    if strategy.get("paper_trader_verified") is not True:
+        blockers.append("paper-functional-verification-pin-required")
+    if blockers:
+        raise ValueError(
+            f"FUNCTIONAL_TEST Strategy sleeve {strategy_id or '-'} 차단: "
+            + ", ".join(blockers)
+        )
+    verification = (
+        strategy.get("verification")
+        if isinstance(strategy.get("verification"), dict)
+        else {}
+    )
+    return {
+        "strategyId": strategy_id,
+        "strategyInstanceId": instance_id,
+        "symbol": normalized_symbol,
+        "brokerId": "kis",
+        "artifactId": str(reference.get("artifactId") or ""),
+        "artifactHash": str(reference.get("artifactHash") or "").lower(),
+        "artifactContentHash": str(reference.get("contentHash") or "").lower(),
+        "lifecycle": lifecycle,
+        "backtesterVerified": True,
+        "paperTraderVerified": True,
+        "minimumVerificationHash": governance_sha256(
+            {
+                "strategyArtifact": reference,
+                "backtester": verification.get("backtester", {}),
+                "paperTrader": verification.get("paper_trader", {}),
+            }
+        ),
+    }
+
+
+def _functional_test_runtime_scope(
+    *,
+    portfolio_id: str,
+    strategy_id: str,
+    permit: Any,
+) -> dict[str, Any]:
+    """Resolve current catalog truth for a sealed functional runtime."""
+
+    requested_portfolio = str(portfolio_id or "").strip()
+    requested_strategy = str(strategy_id or "").strip()
+    binding = permit.binding.snapshot()
+    if str(binding.get("accountId") or "") != kis_functional_test_account_id():
+        raise ValueError("FUNCTIONAL_TEST permit account binding이 현재 KIS 계좌와 다릅니다.")
+
+    portfolios = portfolio_rows()
+    strategies = strategy_rows(portfolios)
+    portfolio: dict[str, Any] = {}
+    members: list[dict[str, Any]] = []
+    current_binding: dict[str, Any]
+    lead_strategy: dict[str, Any] | None = None
+    portfolio_reference: dict[str, str] = {}
+
+    if binding.get("portfolioRequired") is True:
+        if not requested_portfolio:
+            raise ValueError("Portfolio FUNCTIONAL_TEST에는 portfolio_id가 필요합니다.")
+        portfolio = next(
+            (
+                item
+                for item in portfolios
+                if str(
+                    item.get("id")
+                    or item.get("portfolio_id")
+                    or (item.get("artifact_reference") or {}).get("artifactId")
+                    or ""
+                ).strip()
+                == requested_portfolio
+            ),
+            {},
+        )
+        if not portfolio:
+            raise ValueError("현재 Portfolio Artifact를 찾을 수 없습니다.")
+        portfolio_reference = verified_portfolio_artifact_reference(portfolio)
+        if not portfolio_reference:
+            raise ValueError("검증된 Portfolio Artifact reference가 필요합니다.")
+        raw_instances = portfolio.get("strategy_instances")
+        instances = raw_instances if isinstance(raw_instances, list) else []
+        if not instances:
+            raise ValueError("Portfolio에 실행 가능한 Strategy Instance가 없습니다.")
+        for instance in instances:
+            if not isinstance(instance, dict):
+                raise ValueError("Portfolio Strategy Instance 형식이 올바르지 않습니다.")
+            member_strategy_id = str(
+                instance.get("sourceStrategyId")
+                or instance.get("strategyId")
+                or instance.get("strategy_id")
+                or ""
+            ).strip()
+            member_instance_id = str(
+                instance.get("instanceId")
+                or instance.get("strategyInstanceId")
+                or ""
+            ).strip()
+            member_symbol = canonical_kis_domestic_symbol(
+                instance.get("executionInstrument")
+                or instance.get("instrumentId")
+                or instance.get("qualifiedSymbol")
+                or instance.get("symbol")
+                or ""
+            )
+            source_hash = str(instance.get("sourceArtifactHash") or "").lower()
+            candidates = [
+                item
+                for item in strategies
+                if str(item.get("strategy_id") or "") == member_strategy_id
+            ]
+            if source_hash:
+                candidates = [
+                    item
+                    for item in candidates
+                    if str(
+                        (item.get("artifact_reference") or {}).get("artifactHash")
+                        or item.get("artifact_hash")
+                        or ""
+                    ).lower()
+                    == source_hash
+                ]
+            member_strategy = candidates[0] if candidates else None
+            if member_strategy is None:
+                raise ValueError(
+                    f"Portfolio sleeve {member_strategy_id or '-'}의 현재 Strategy Artifact가 없습니다."
+                )
+            member = _functional_test_member(
+                member_strategy,
+                strategy_instance_id=member_instance_id,
+                symbol=member_symbol,
+            )
+            members.append(member)
+            if member_strategy_id == requested_strategy:
+                lead_strategy = member_strategy
+        if lead_strategy is None:
+            raise ValueError("요청한 lead Strategy가 Portfolio 구성에 없습니다.")
+        raw_targets = portfolio.get("target_portfolio")
+        targets = raw_targets if isinstance(raw_targets, list) else []
+        symbols = {
+            canonical_kis_domestic_symbol(
+                item.get("executionInstrument")
+                or item.get("instrumentId")
+                or item.get("qualifiedSymbol")
+                or item.get("symbol")
+                or ""
+            )
+            for item in [*instances, *targets]
+            if isinstance(item, dict)
+        }
+        symbols.discard("")
+        portfolio_artifact_id = str(
+            portfolio_reference.get("artifactId") or requested_portfolio
+        )
+        portfolio_artifact_hash = str(
+            portfolio_reference.get("artifactHash") or ""
+        ).lower()
+        current_binding = {
+            "strategyArtifactId": "",
+            "strategyArtifactHash": "",
+            "strategyInstanceId": "",
+            "portfolioRequired": True,
+            "portfolioArtifactId": portfolio_artifact_id,
+            "portfolioArtifactHash": portfolio_artifact_hash,
+            "portfolioInstanceId": (
+                f"functional-portfolio:{portfolio_artifact_id}:"
+                f"{portfolio_artifact_hash[:12]}"
+            ),
+            "accountId": kis_functional_test_account_id(),
+            "symbols": sorted(symbols),
+        }
+    else:
+        if requested_portfolio:
+            raise ValueError("Standalone FUNCTIONAL_TEST에는 portfolio_id가 없어야 합니다.")
+        lead_strategy = next(
+            (
+                item
+                for item in strategies
+                if str(item.get("strategy_id") or "") == requested_strategy
+            ),
+            None,
+        )
+        if lead_strategy is None:
+            raise ValueError("현재 standalone Strategy Artifact를 찾을 수 없습니다.")
+        reference = verified_strategy_artifact_reference(lead_strategy)
+        strategy_instance_id = str(
+            lead_strategy.get("strategy_instance_id")
+            or lead_strategy.get("instance_id")
+            or f"standalone:{requested_strategy}"
+        ).strip()
+        symbol = canonical_kis_domestic_symbol(
+            lead_strategy.get("execution_instrument")
+            or lead_strategy.get("instrument_id")
+            or lead_strategy.get("symbol")
+            or ""
+        )
+        members.append(
+            _functional_test_member(
+                lead_strategy,
+                strategy_instance_id=strategy_instance_id,
+                symbol=symbol,
+            )
+        )
+        current_binding = {
+            "strategyArtifactId": str(reference.get("artifactId") or ""),
+            "strategyArtifactHash": str(reference.get("artifactHash") or "").lower(),
+            "strategyInstanceId": strategy_instance_id,
+            "portfolioRequired": False,
+            "portfolioArtifactId": "",
+            "portfolioArtifactHash": "",
+            "portfolioInstanceId": "",
+            "accountId": kis_functional_test_account_id(),
+            "symbols": [symbol],
+        }
+
+    if current_binding != binding:
+        raise ValueError("FUNCTIONAL_TEST permit의 exact Artifact/Instance/계좌/종목 binding이 변경되었습니다.")
+    unique_member_keys = {
+        (
+            str(item.get("strategyId") or ""),
+            str(item.get("strategyInstanceId") or ""),
+            str(item.get("symbol") or ""),
+        )
+        for item in members
+    }
+    if len(unique_member_keys) != len(members):
+        raise ValueError("FUNCTIONAL_TEST Portfolio sleeve identity가 중복되었습니다.")
+    members = sorted(
+        members,
+        key=lambda item: (
+            str(item.get("strategyId") or ""),
+            str(item.get("strategyInstanceId") or ""),
+            str(item.get("symbol") or ""),
+        ),
+    )
+    return {
+        "leadStrategy": lead_strategy,
+        "portfolio": portfolio,
+        "portfolioId": requested_portfolio,
+        "portfolioArtifact": portfolio_reference,
+        "strategyMembers": members,
+        "strategyMemberHash": governance_sha256(members),
+        "allowedSymbols": sorted(str(item) for item in binding.get("symbols") or []),
+        "bindingHash": governance_sha256(binding),
+        "accountFingerprint": governance_sha256(
+            {"functionalTestAccount": str(binding.get("accountId") or "")}
+        ),
+        "runtimeDeploymentId": str(
+            (lead_strategy or {}).get("deployment_id") or ""
+        ),
+    }
+
+
+def _functional_test_manifest_values(
+    scope: dict[str, Any],
+    permit: Any,
+    activation: Any,
+    *,
+    preflight_ttl_seconds: int,
+) -> dict[str, Any]:
+    members = [
+        dict(item)
+        for item in scope.get("strategyMembers", [])
+        if isinstance(item, dict)
+    ]
+    risk_policy_revision = max(
+        1,
+        int(STATE.get("risk_policy_revision") or 1),
+    )
+    risk_policy_hash = governance_sha256(
+        {
+            "settings": STATE.get("risk_settings", {}),
+            "policyRevision": risk_policy_revision,
+            "functionalCaps": permit.caps.snapshot(),
+            "smallLiveProfile": {
+                "maximumOrderPct": ENVIRONMENT_PROFILES[
+                    "SMALL_LIVE"
+                ].maximum_order_pct,
+                "maximumStrategyCapitalPct": ENVIRONMENT_PROFILES[
+                    "SMALL_LIVE"
+                ].maximum_strategy_capital_pct,
+                "dailyLossLimitPct": ENVIRONMENT_PROFILES[
+                    "SMALL_LIVE"
+                ].daily_loss_limit_pct,
+                "marketOrdersAllowed": ENVIRONMENT_PROFILES[
+                    "SMALL_LIVE"
+                ].market_orders_allowed,
+            },
+        }
+    )
+    config_revision = max(1, int(STATE.get("config_revision") or 1))
+    metadata = {
+        "executionPurpose": FUNCTIONAL_TEST_EXECUTION_PURPOSE,
+        "evidenceClass": "FUNCTIONAL_TEST_NON_PROMOTION",
+        "promotionEligible": False,
+        "fullLiveAllowed": False,
+        "environment": FUNCTIONAL_TEST_ENVIRONMENT,
+        "permitId": permit.permit_id,
+        "permitHash": permit.content_hash,
+        "permitEndsAt": permit.ends_at.isoformat(),
+        "activationTokenId": activation.token_id,
+        "activationHash": activation.content_hash,
+        "activationExpiresAt": activation.expires_at.isoformat(),
+        "bindingHash": str(scope.get("bindingHash") or ""),
+        "accountFingerprint": str(scope.get("accountFingerprint") or ""),
+        "portfolioId": str(scope.get("portfolioId") or ""),
+        "portfolioArtifact": dict(
+            scope.get("portfolioArtifact")
+            if isinstance(scope.get("portfolioArtifact"), dict)
+            else {}
+        ),
+        "strategyId": str(
+            (scope.get("leadStrategy") or {}).get("strategy_id")
+            if isinstance(scope.get("leadStrategy"), dict)
+            else ""
+        ),
+        "runtimeDeploymentId": str(scope.get("runtimeDeploymentId") or ""),
+        "strategyMembers": members,
+        "strategyMemberHash": str(scope.get("strategyMemberHash") or ""),
+        "allowedSymbols": list(scope.get("allowedSymbols") or []),
+        "minimumVerificationPins": [
+            {
+                "strategyId": str(item.get("strategyId") or ""),
+                "strategyInstanceId": str(item.get("strategyInstanceId") or ""),
+                "verificationHash": str(item.get("minimumVerificationHash") or ""),
+                "backtesterVerified": True,
+                "paperTraderVerified": True,
+            }
+            for item in members
+        ],
+        "functionalCaps": permit.caps.snapshot(),
+    }
+    strategy_artifact_hash = (
+        str(members[0].get("artifactHash") or "")
+        if not scope.get("portfolioId") and len(members) == 1
+        else governance_sha256(
+            {
+                "portfolioId": str(scope.get("portfolioId") or ""),
+                "members": members,
+            }
+        )
+    )
+    build_hash = governance_sha256(
+        {
+            "runtime": "live-trader-functional-runtime-v1",
+            "adapterContract": broker_adapter_contract(),
+        }
+    )
+    config_hash = governance_sha256(
+        {
+            "executionPurpose": FUNCTIONAL_TEST_EXECUTION_PURPOSE,
+            "permitHash": permit.content_hash,
+            "activationHash": activation.content_hash,
+            "bindingHash": scope.get("bindingHash"),
+            "strategyMemberHash": scope.get("strategyMemberHash"),
+            "allowedSymbols": scope.get("allowedSymbols"),
+            "accountFingerprint": scope.get("accountFingerprint"),
+            "riskPolicyHash": risk_policy_hash,
+            "retryPolicy": STATE.get("retry_policy", {}),
+            "checklist": STATE.get("checklist", {}),
+            "realOrdersEnabled": real_orders_enabled(),
+        }
+    )
+    return {
+        "deployment_id": f"functional-test-{permit.permit_id}",
+        "strategy_artifact_hash": strategy_artifact_hash,
+        "portfolio_artifact_hash": str(
+            (scope.get("portfolioArtifact") or {}).get("artifactHash")
+            if isinstance(scope.get("portfolioArtifact"), dict)
+            else ""
+        ),
+        "account_fingerprint": str(scope.get("accountFingerprint") or ""),
+        "broker_route": "kis",
+        "runtime_version": "live-trader-functional-runtime-v1",
+        "build_hash": build_hash,
+        "execution_adapter": "kis-signed-functional-test-adapter",
+        "execution_adapter_version": "v1",
+        "risk_policy_revision": risk_policy_revision,
+        "risk_policy_hash": risk_policy_hash,
+        "config_revision": config_revision,
+        "config_hash": config_hash,
+        "preflight_ttl_seconds": preflight_ttl_seconds,
+        "metadata": metadata,
+    }
+
+
+def _functional_test_utc_datetime(value: object) -> datetime | None:
+    """Parse one governance timestamp without falling back to local time."""
+
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _functional_test_age_seconds(
+    value: object,
+    *,
+    now: datetime,
+) -> float | None:
+    parsed = _functional_test_utc_datetime(value)
+    if parsed is None:
+        return None
+    return max(0.0, (now - parsed).total_seconds())
+
+
+def _functional_test_preflight_evidence(
+    scope: dict[str, Any],
+    *,
+    permit_id: str,
+    allow_equity_scope_create: bool = False,
+) -> dict[str, Any]:
+    """Collect fresh KIS truth and build immutable preflight evidence."""
+
+    lead_strategy = scope.get("leadStrategy")
+    if not isinstance(lead_strategy, dict):
+        raise ValueError("FUNCTIONAL_TEST lead Strategy를 봉인할 수 없습니다.")
+    reconciliation = refresh_preflight_reconciliation(
+        lead_strategy,
+        maximum_age_seconds=FUNCTIONAL_TEST_RISK_MAX_AGE_SECONDS,
+    )
+    reconciliation_summary = (
+        reconciliation.get("summary")
+        if isinstance(reconciliation.get("summary"), dict)
+        else {}
+    )
+    broker_row = next(
+        (row for row in broker_readiness() if row.broker_id == "kis"),
+        None,
+    )
+    account = broker_account_risk(
+        STATE.get("account_risk")
+        if isinstance(STATE.get("account_risk"), dict)
+        else {},
+        "kis",
+        currency="KRW",
+        maximum_age_seconds=FUNCTIONAL_TEST_RISK_MAX_AGE_SECONDS,
+    )
+    control = durable_control_snapshot()
+    safety_blockers: list[str] = []
+    equity_scope: dict[str, Any] = {}
+    authority_status: dict[str, Any] = {}
+    try:
+        authority_status = PROGRAM_LEDGER.functional_test_authority_status(
+            permit_id=str(permit_id or ""),
+            account_fingerprint=str(scope.get("accountFingerprint") or ""),
+        )
+        if authority_status.get("closed") is True:
+            safety_blockers.append("functional-test-authority-closed")
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        safety_blockers.append("functional-test-durable-authority-unavailable")
+    try:
+        current_equity = safe_float(account.get("current_equity"), -1.0)
+        observed_at = str(account.get("observed_at") or "").strip()
+        if (
+            account.get("known") is not True
+            or account.get("fresh") is not True
+            or current_equity < 0
+            or not observed_at
+        ):
+            raise ValueError("functional-test-equity-observation-unavailable")
+        equity_scope = PROGRAM_LEDGER.observe_functional_test_equity(
+            permit_id=str(permit_id or ""),
+            account_fingerprint=str(scope.get("accountFingerprint") or ""),
+            current_equity=current_equity,
+            observed_at=observed_at,
+            allow_create=allow_equity_scope_create,
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        safety_blockers.append("functional-test-equity-scope-unavailable")
+    if broker_row is None or not broker_row.order_ready:
+        safety_blockers.append("kis-live-order-adapter-not-ready")
+    if reconciliation_summary.get("fresh") is not True:
+        safety_blockers.append("kis-broker-reconciliation-not-fresh")
+    if reconciliation_summary.get("three_way_verified") is not True:
+        safety_blockers.append(
+            "kis-broker-event-ledger-reconciliation-blocked"
+        )
+    if reconciliation.get("errors"):
+        safety_blockers.append("kis-broker-reconciliation-errors")
+    if account.get("known") is not True or account.get("fresh") is not True:
+        safety_blockers.append("kis-account-risk-snapshot-not-fresh")
+    if STATE.get("kill_switch"):
+        safety_blockers.append("kill-switch-active")
+    if control.get("halted") is True:
+        safety_blockers.append("durable-risk-halt-active")
+    if STATE.get("new_entries_blocked"):
+        safety_blockers.append("new-risk-entries-blocked")
+
+    preflight_facts = [
+        (
+            "functional-authority",
+            True,
+            "현재 permit과 당일 활성화 토큰을 고정했습니다.",
+            {},
+        ),
+        (
+            "functional-target-binding",
+            True,
+            "현재 Artifact·Instance·계좌 fingerprint·종목 binding이 permit과 일치합니다.",
+            {
+                "bindingHash": scope.get("bindingHash"),
+                "memberHash": scope.get("strategyMemberHash"),
+            },
+        ),
+        (
+            "minimum-paper-pins",
+            True,
+            "모든 sleeve의 Backtester 및 Paper 기능 검증 pin을 확인했습니다.",
+            {"members": scope.get("strategyMembers")},
+        ),
+        (
+            "kis-live-adapter",
+            "kis-live-order-adapter-not-ready" not in safety_blockers,
+            str(
+                broker_row.detail
+                if broker_row is not None
+                else "KIS adapter unavailable"
+            ),
+            {"orderReady": bool(broker_row and broker_row.order_ready)},
+        ),
+        (
+            "fresh-kis-reconciliation",
+            not any(
+                blocker in safety_blockers
+                for blocker in (
+                    "kis-broker-reconciliation-not-fresh",
+                    "kis-broker-event-ledger-reconciliation-blocked",
+                    "kis-broker-reconciliation-errors",
+                )
+            ),
+            str(reconciliation_summary.get("freshness_detail") or ""),
+            {
+                "summary": reconciliation_summary,
+                "errors": reconciliation.get("errors", []),
+            },
+        ),
+        (
+            "fresh-kis-account-risk",
+            "kis-account-risk-snapshot-not-fresh" not in safety_blockers,
+            "현재 KIS 계좌 risk snapshot freshness를 확인했습니다.",
+            {
+                "known": account.get("known"),
+                "fresh": account.get("fresh"),
+                "observedAt": account.get("observed_at"),
+            },
+        ),
+        (
+            "durable-permit-equity-scope",
+            "functional-test-equity-scope-unavailable"
+            not in safety_blockers,
+            "permit과 계좌에 고정된 누적 손실 원장을 확인했습니다.",
+            {
+                "permitId": permit_id,
+                "accountFingerprint": scope.get("accountFingerprint"),
+                "startingEquity": equity_scope.get("starting_equity"),
+                "peakEquity": equity_scope.get("peak_equity"),
+                "currentEquity": equity_scope.get("current_equity"),
+                "worstDrawdown": equity_scope.get("worst_drawdown"),
+                "lastObservedAt": equity_scope.get("last_observed_at"),
+            },
+        ),
+        (
+            "durable-functional-authority",
+            not any(
+                blocker in safety_blockers
+                for blocker in (
+                    "functional-test-authority-closed",
+                    "functional-test-durable-authority-unavailable",
+                )
+            ),
+            "permit별 내구 주문 권한이 열려 있는지 확인했습니다.",
+            authority_status,
+        ),
+        (
+            "kill-risk-controls",
+            not any(
+                blocker in safety_blockers
+                for blocker in (
+                    "kill-switch-active",
+                    "durable-risk-halt-active",
+                    "new-risk-entries-blocked",
+                )
+            ),
+            "Kill switch, durable halt, 신규 진입 차단이 모두 해제되어 있습니다.",
+            {
+                "killSwitch": STATE.get("kill_switch"),
+                "durableHalt": control.get("halted"),
+                "newEntriesBlocked": STATE.get("new_entries_blocked"),
+            },
+        ),
+    ]
+    checks = [
+        {
+            "checkId": check_id,
+            "status": "PASS" if passed else "FAIL",
+            "detail": detail,
+            "evidenceHash": governance_sha256(evidence),
+        }
+        for check_id, passed, detail, evidence in preflight_facts
+    ]
+    return {
+        "safetyBlockers": safety_blockers,
+        "checks": checks,
+        "reconciliation": reconciliation,
+        "account": account,
+        "equityScope": equity_scope,
+        "reconciliationHash": governance_sha256(
+            {
+                "summary": reconciliation_summary,
+                "positions": reconciliation.get("positions", []),
+                "accounts": reconciliation.get("accounts", []),
+                "errors": reconciliation.get("errors", []),
+            }
+        ),
+        "brokerSnapshotHash": governance_sha256(
+            {
+                "broker": "kis",
+                "accountRisk": {
+                    "known": account.get("known"),
+                    "fresh": account.get("fresh"),
+                    "observedAt": account.get("observed_at"),
+                },
+                "permitEquity": equity_scope,
+                "fetchedAt": (
+                    STATE.get("broker_reconciliation", {}).get("fetched_at")
+                    if isinstance(STATE.get("broker_reconciliation"), dict)
+                    else ""
+                ),
+            }
+        ),
+    }
+
+
+def _create_functional_test_preflight(
+    *,
+    manifest: Any,
+    scope: dict[str, Any],
+    permit: Any,
+    activation: Any,
+    ttl_seconds: int,
+    issued_at: datetime | None = None,
+    allow_equity_scope_create: bool = False,
+) -> tuple[Any, dict[str, Any]]:
+    evidence = _functional_test_preflight_evidence(
+        scope,
+        permit_id=str(permit.permit_id or ""),
+        allow_equity_scope_create=allow_equity_scope_create,
+    )
+    preflight = OPERATIONAL_GOVERNANCE.create_preflight_snapshot(
+        deployment_id=manifest.deployment_id,
+        deployment_manifest_hash=manifest.manifest_hash,
+        checks=evidence["checks"],
+        reconciliation_hash=str(evidence["reconciliationHash"]),
+        broker_snapshot_hash=str(evidence["brokerSnapshotHash"]),
+        ttl_seconds=ttl_seconds,
+        issued_at=issued_at,
+        metadata={
+            "executionPurpose": FUNCTIONAL_TEST_EXECUTION_PURPOSE,
+            "promotionEligible": False,
+            "permitId": permit.permit_id,
+            "permitHash": permit.content_hash,
+            "activationTokenId": activation.token_id,
+            "activationHash": activation.content_hash,
+            "bindingHash": str(scope.get("bindingHash") or ""),
+        },
+    )
+    return preflight, evidence
+
+
+def refresh_functional_test_runtime_preflight(
+    intent: OrderIntent,
+    *,
+    now: datetime | None = None,
+    force: bool = False,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Renew a running FUNCTIONAL_TEST preflight from fresh KIS truth.
+
+    The runtime session and deployment manifest remain immutable.  A renewal
+    creates a new immutable snapshot, then appends a PREFLIGHT_REBOUND event.
+    Any stale broker truth, changed authority/scope/seal, or persistence error
+    blocks the caller before an order can reach the broker.
+    """
+
+    if not functional_test_execution_requested(intent):
+        return True, "functional-test-preflight-not-required", {}
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    else:
+        current_time = current_time.astimezone(timezone.utc)
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    session_id = str(
+        (STATE.get("active_runtime_session_ids") or {}).get("stock") or ""
+    ).strip()
+    claimed_session_id = str(
+        metadata.get("functional_test_session_id")
+        or metadata.get("functionalTestSessionId")
+        or ""
+    ).strip()
+    if not session_id or not claimed_session_id:
+        return False, "functional-test-runtime-session-missing", {}
+    if not secrets.compare_digest(session_id, claimed_session_id):
+        return False, "functional-test-runtime-session-mismatch", {}
+
+    try:
+        with FUNCTIONAL_TEST_PREFLIGHT_LOCK:
+            session_object = OPERATIONAL_GOVERNANCE.get_runtime_session(
+                session_id
+            )
+            if session_object is None:
+                return False, "functional-test-runtime-session-missing", {}
+            session = session_object.to_dict()
+            if (
+                str(session.get("profile") or "") != "stock"
+                or str(session.get("mode") or "") != "SMALL_LIVE"
+                or str(session.get("lifecycle") or "")
+                not in {"RUNNING", "DEGRADED"}
+            ):
+                return (
+                    False,
+                    "functional-test-runtime-session-state-invalid",
+                    {"session": session},
+                )
+            session_metadata = (
+                session.get("metadata")
+                if isinstance(session.get("metadata"), dict)
+                else {}
+            )
+            if (
+                str(session_metadata.get("executionPurpose") or "")
+                != FUNCTIONAL_TEST_EXECUTION_PURPOSE
+                or session_metadata.get("promotionEligible") is not False
+                or str(session_metadata.get("evidenceClass") or "")
+                != "FUNCTIONAL_TEST_NON_PROMOTION"
+            ):
+                return False, "functional-test-session-purpose-invalid", {
+                    "session": session
+                }
+            manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(
+                str(session.get("deploymentManifestHash") or "")
+            )
+            if manifest is None:
+                return False, "functional-test-manifest-missing", {
+                    "session": session
+                }
+            manifest_metadata = dict(manifest.metadata)
+            if (
+                str(manifest_metadata.get("executionPurpose") or "")
+                != FUNCTIONAL_TEST_EXECUTION_PURPOSE
+                or manifest_metadata.get("promotionEligible") is not False
+                or manifest_metadata.get("fullLiveAllowed") is not False
+                or str(manifest.broker_route or "").lower() != "kis"
+            ):
+                return False, "functional-test-manifest-purpose-invalid", {
+                    "session": session
+                }
+
+            permit, activation = functional_test_active_authority(
+                now=current_time
+            )
+            authority_status = functional_test_durable_authority_status(
+                permit
+            )
+            if authority_status.get("closed") is True:
+                return (
+                    False,
+                    "functional-test-authority-closed",
+                    {
+                        "session": session,
+                        "authorityStatus": authority_status,
+                    },
+                )
+            for key, current_value in (
+                ("permitId", permit.permit_id),
+                ("permitHash", permit.content_hash),
+                ("activationTokenId", activation.token_id),
+                ("activationHash", activation.content_hash),
+            ):
+                if (
+                    str(manifest_metadata.get(key) or "")
+                    != str(current_value)
+                    or str(session_metadata.get(key) or "")
+                    != str(current_value)
+                ):
+                    return (
+                        False,
+                        "functional-test-session-authority-changed:" + key,
+                        {"session": session},
+                    )
+
+            portfolio_id = str(
+                metadata.get("portfolio_id")
+                or metadata.get("portfolioId")
+                or ""
+            ).strip()
+            strategy_id = str(intent.strategy_id or "").strip()
+            if (
+                portfolio_id
+                != str(session_metadata.get("portfolioId") or "").strip()
+                or strategy_id
+                != str(session_metadata.get("strategyId") or "").strip()
+            ):
+                return False, "functional-test-runtime-context-changed", {
+                    "session": session
+                }
+            scope = _functional_test_runtime_scope(
+                portfolio_id=portfolio_id,
+                strategy_id=strategy_id,
+                permit=permit,
+            )
+            current_values = _functional_test_manifest_values(
+                scope,
+                permit,
+                activation,
+                preflight_ttl_seconds=manifest.preflight_ttl_seconds,
+            )
+            mismatches = [
+                label
+                for label, current_value, sealed_value in (
+                    (
+                        "binding",
+                        scope.get("bindingHash"),
+                        manifest_metadata.get("bindingHash"),
+                    ),
+                    (
+                        "session-binding",
+                        scope.get("bindingHash"),
+                        session_metadata.get("bindingHash"),
+                    ),
+                    (
+                        "members",
+                        scope.get("strategyMemberHash"),
+                        manifest_metadata.get("strategyMemberHash"),
+                    ),
+                    (
+                        "session-members",
+                        scope.get("strategyMemberHash"),
+                        session_metadata.get("strategyMemberHash"),
+                    ),
+                    (
+                        "account",
+                        scope.get("accountFingerprint"),
+                        manifest.account_fingerprint,
+                    ),
+                    (
+                        "session-account",
+                        scope.get("accountFingerprint"),
+                        session_metadata.get("accountFingerprint"),
+                    ),
+                    (
+                        "strategy",
+                        current_values["strategy_artifact_hash"],
+                        manifest.strategy_artifact_hash,
+                    ),
+                    (
+                        "portfolio",
+                        current_values["portfolio_artifact_hash"],
+                        manifest.portfolio_artifact_hash,
+                    ),
+                    (
+                        "build",
+                        current_values["build_hash"],
+                        manifest.build_hash,
+                    ),
+                    (
+                        "risk",
+                        current_values["risk_policy_hash"],
+                        manifest.risk_policy_hash,
+                    ),
+                    (
+                        "config",
+                        current_values["config_hash"],
+                        manifest.config_hash,
+                    ),
+                )
+                if str(current_value or "") != str(sealed_value or "")
+            ]
+            if sorted(scope.get("allowedSymbols") or []) != sorted(
+                manifest_metadata.get("allowedSymbols") or []
+            ):
+                mismatches.append("symbols")
+            if mismatches:
+                return (
+                    False,
+                    "functional-test-runtime-seal-changed:"
+                    + ",".join(mismatches),
+                    {"session": session},
+                )
+
+            validity = OPERATIONAL_GOVERNANCE.preflight_validity(
+                str(session.get("preflightSnapshotId") or ""),
+                at=current_time,
+            )
+            preflight_payload = (
+                validity.get("snapshot")
+                if isinstance(validity.get("snapshot"), dict)
+                else {}
+            )
+            expires_at = _functional_test_utc_datetime(
+                preflight_payload.get("expiresAt")
+            )
+            remaining_preflight = (
+                (expires_at - current_time).total_seconds()
+                if expires_at is not None
+                else -1.0
+            )
+            reconciliation = (
+                STATE.get("broker_reconciliation")
+                if isinstance(STATE.get("broker_reconciliation"), dict)
+                else {}
+            )
+            reconciliation_summary = (
+                reconciliation.get("summary")
+                if isinstance(reconciliation.get("summary"), dict)
+                else {}
+            )
+            reconciliation_age = _functional_test_age_seconds(
+                reconciliation.get("fetched_at"),
+                now=current_time,
+            )
+            account = broker_account_risk(
+                STATE.get("account_risk")
+                if isinstance(STATE.get("account_risk"), dict)
+                else {},
+                "kis",
+                currency="KRW",
+                maximum_age_seconds=FUNCTIONAL_TEST_RISK_MAX_AGE_SECONDS,
+            )
+            account_age = _functional_test_age_seconds(
+                account.get("observed_at"),
+                now=current_time,
+            )
+            control = durable_control_snapshot()
+            broker_truth_fresh = bool(
+                reconciliation_summary.get("fresh") is True
+                and reconciliation_summary.get("three_way_verified") is True
+                and not reconciliation.get("errors")
+                and reconciliation_age is not None
+                and reconciliation_age
+                <= FUNCTIONAL_TEST_PREFLIGHT_REFRESH_MARGIN_SECONDS
+                and account.get("known") is True
+                and account.get("fresh") is True
+                and account_age is not None
+                and account_age
+                <= FUNCTIONAL_TEST_PREFLIGHT_REFRESH_MARGIN_SECONDS
+                and not STATE.get("kill_switch")
+                and control.get("halted") is not True
+                and not STATE.get("new_entries_blocked")
+            )
+            refresh_margin = min(
+                FUNCTIONAL_TEST_PREFLIGHT_REFRESH_MARGIN_SECONDS,
+                max(5.0, float(manifest.preflight_ttl_seconds) * 0.2),
+            )
+            if (
+                not force
+                and validity.get("valid") is True
+                and remaining_preflight > refresh_margin
+                and broker_truth_fresh
+            ):
+                return True, "functional-test-preflight-current", {
+                    "session": session,
+                    "preflight": preflight_payload,
+                    "action": "REUSED",
+                }
+
+            authority_remaining = int(
+                min(permit.ends_at, activation.expires_at).timestamp()
+                - current_time.timestamp()
+            )
+            if authority_remaining < 2:
+                return False, "functional-test-authority-expiry-imminent", {
+                    "session": session
+                }
+            ttl_seconds = min(
+                int(manifest.preflight_ttl_seconds),
+                300,
+                authority_remaining,
+            )
+            preflight, evidence = _create_functional_test_preflight(
+                manifest=manifest,
+                scope=scope,
+                permit=permit,
+                activation=activation,
+                ttl_seconds=ttl_seconds,
+                issued_at=current_time,
+            )
+            blockers = [
+                str(item)
+                for item in evidence.get("safetyBlockers", [])
+                if str(item)
+            ]
+            if blockers or preflight.status != "PASS":
+                return (
+                    False,
+                    "functional-test-preflight-refresh-blocked:"
+                    + ",".join(blockers or [preflight.status]),
+                    {
+                        "session": session,
+                        "preflight": preflight.to_dict(),
+                        "safetyBlockers": blockers,
+                    },
+                )
+            rebound = OPERATIONAL_GOVERNANCE.rebind_runtime_preflight(
+                session_id,
+                preflight.snapshot_id,
+                actor="live_trader.functional_test.preflight_refresh",
+                occurred_at=current_time,
+            )
+            return True, "functional-test-preflight-refreshed", {
+                "session": rebound.to_dict(),
+                "preflight": preflight.to_dict(),
+                "action": "REFRESHED",
+            }
+    except Exception as exc:
+        code = (
+            exc.code
+            if isinstance(exc, FunctionalTestContractError)
+            else type(exc).__name__
+        )
+        return (
+            False,
+            f"functional-test-preflight-refresh-error:{code}",
+            {},
+        )
+
+
+def _functional_test_execution_poll_fresh(
+    *,
+    now: datetime | None = None,
+) -> tuple[bool, str, dict[str, Any]]:
+    current = now or datetime.now()
+    if current.tzinfo is not None:
+        current = current.astimezone().replace(tzinfo=None)
+    event_state = execution_event_snapshot()
+    age = seconds_since(event_state.get("last_poll"), current)
+    errors = [
+        dict(item)
+        for item in event_state.get("errors", [])
+        if isinstance(item, dict)
+        and str(item.get("broker_id") or "").strip().lower()
+        in {"", "kis"}
+    ]
+    fresh = bool(
+        age is not None
+        and age <= FUNCTIONAL_TEST_EXECUTION_OBSERVATION_MAX_AGE_SECONDS
+        and not errors
+    )
+    return (
+        fresh,
+        (
+            "functional-test-kis-execution-poll-fresh"
+            if fresh
+            else "functional-test-kis-execution-poll-stale"
+        ),
+        {
+            "lastPoll": event_state.get("last_poll"),
+            "ageSeconds": age,
+            "errors": errors,
+        },
+    )
+
+
+def ensure_functional_test_execution_observation() -> tuple[
+    bool,
+    str,
+    dict[str, Any],
+]:
+    """Require REST truth while reserving KIS WS for the controller mux."""
+
+    try:
+        before = LIVE_EXECUTION_STREAMS.snapshot()
+        before_brokers = (
+            before.get("brokers")
+            if isinstance(before.get("brokers"), dict)
+            else {}
+        )
+        before_kis = (
+            before_brokers.get("kis")
+            if isinstance(before_brokers.get("kis"), dict)
+            else {}
+        )
+        if before_kis.get("running") is True:
+            stopped = LIVE_EXECUTION_STREAMS.stop_brokers(
+                ("kis",),
+                timeout=25.0,
+            )
+            stopped_brokers = (
+                stopped.get("brokers")
+                if isinstance(stopped.get("brokers"), dict)
+                else {}
+            )
+            stopped_kis = (
+                stopped_brokers.get("kis")
+                if isinstance(stopped_brokers.get("kis"), dict)
+                else {}
+            )
+            if stopped_kis.get("running") is True:
+                return (
+                    False,
+                    "functional-test-separate-kis-private-stream-still-running",
+                    {
+                        "owned": False,
+                        "privateThreadDisabled": False,
+                        "privateStream": dict(stopped_kis),
+                    },
+                )
+
+        poll_fresh, poll_reason, poll_details = (
+            _functional_test_execution_poll_fresh()
+        )
+        poll_result: dict[str, Any] = {}
+        if not poll_fresh:
+            raw_poll = poll_execution_events(
+                "kis",
+                force_snapshot=True,
+                include_snapshot=False,
+            )
+            poll_result = (
+                dict(raw_poll) if isinstance(raw_poll, dict) else {}
+            )
+            poll_fresh, poll_reason, poll_details = (
+                _functional_test_execution_poll_fresh()
+            )
+        if poll_fresh:
+            return True, poll_reason, {
+                "owned": False,
+                "reused": False,
+                "privateThreadDisabled": True,
+                "observationMode": "KIS_MARKET_PRIVATE_SINGLE_SOCKET_MUX",
+                "privateStream": {},
+                "fallbackPoll": poll_details,
+                "pollCoalesced": poll_result.get("coalesced") is True,
+            }
+        return False, poll_reason, {
+            "owned": False,
+            "reused": False,
+            "privateThreadDisabled": True,
+            "privateStream": {},
+            "fallbackPoll": poll_details,
+        }
+    except Exception as exc:
+        return (
+            False,
+            "functional-test-kis-execution-observation-error:"
+            + type(exc).__name__,
+            {"owned": False},
+        )
+
+
+def ingest_functional_test_kis_private_execution(
+    tr_id: str,
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    """Fail-closed sink for H0STCNI0 on the controller's single socket."""
+
+    return LIVE_EXECUTION_STREAMS.ingest_kis_domestic_fields(tr_id, fields)
+
+
+def _functional_test_runtime_guard_intent(
+    session_id: str,
+) -> OrderIntent:
+    session_object = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+    if session_object is None:
+        raise ValueError("functional runtime session missing")
+    session = session_object.to_dict()
+    metadata = (
+        session.get("metadata")
+        if isinstance(session.get("metadata"), dict)
+        else {}
+    )
+    manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(
+        str(session.get("deploymentManifestHash") or "")
+    )
+    if manifest is None:
+        raise ValueError("functional runtime manifest missing")
+    manifest_metadata = dict(manifest.metadata)
+    members = [
+        dict(item)
+        for item in manifest_metadata.get("strategyMembers", [])
+        if isinstance(item, dict)
+    ]
+    strategy_id = str(metadata.get("strategyId") or "").strip()
+    member = next(
+        (
+            item
+            for item in members
+            if str(item.get("strategyId") or "").strip() == strategy_id
+        ),
+        members[0] if members else {},
+    )
+    symbol = str(
+        member.get("symbol")
+        or next(
+            iter(manifest_metadata.get("allowedSymbols") or []),
+            "",
+        )
+    ).strip()
+    if not strategy_id or not symbol:
+        raise ValueError("functional runtime guard scope is incomplete")
+    return OrderIntent(
+        strategy_id=strategy_id,
+        asset="KR_STOCK",
+        symbol=symbol,
+        side="BUY",
+        quantity=1.0,
+        reference_price=1.0,
+        mode="SMALL_LIVE",
+        reason="functional-test-runtime-guard",
+        metadata={
+            "execution_purpose": FUNCTIONAL_TEST_EXECUTION_PURPOSE,
+            "functional_test_environment": FUNCTIONAL_TEST_ENVIRONMENT,
+            "environment": FUNCTIONAL_TEST_ENVIRONMENT,
+            "broker_id": "kis",
+            "portfolio_id": str(metadata.get("portfolioId") or ""),
+            "strategy_instance_id": str(
+                member.get("strategyInstanceId") or ""
+            ),
+            "functional_test_session_id": session_id,
+        },
+    )
+
+
+def run_functional_test_runtime_guard_cycle(
+    session_id: str,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Poll private execution/account truth, then renew the sealed preflight."""
+
+    if str(
+        (STATE.get("active_runtime_session_ids") or {}).get("stock") or ""
+    ) != str(session_id or ""):
+        return False, "functional-test-runtime-guard-session-inactive", {}
+    try:
+        poll_result = poll_execution_events(
+            "kis",
+            force_snapshot=True,
+            include_snapshot=False,
+        )
+        poll_fresh, poll_reason, poll_details = (
+            _functional_test_execution_poll_fresh()
+        )
+        if not poll_fresh:
+            return False, poll_reason, {
+                "poll": (
+                    dict(poll_result)
+                    if isinstance(poll_result, dict)
+                    else {}
+                ),
+                "freshness": poll_details,
+            }
+        intent = _functional_test_runtime_guard_intent(session_id)
+        allowed, reason, details = refresh_functional_test_runtime_preflight(
+            intent
+        )
+        return allowed, reason, {
+            "poll": {
+                "ok": (
+                    poll_result.get("ok")
+                    if isinstance(poll_result, dict)
+                    else False
+                ),
+                "coalesced": (
+                    poll_result.get("coalesced") is True
+                    if isinstance(poll_result, dict)
+                    else False
+                ),
+            },
+            "freshness": poll_details,
+            "preflight": details,
+        }
+    except Exception as exc:
+        return (
+            False,
+            "functional-test-runtime-guard-error:" + type(exc).__name__,
+            {},
+        )
+
+
+def _functional_test_runtime_guard_worker(
+    session_id: str,
+    stop_event: threading.Event,
+    interval_seconds: float,
+) -> None:
+    previous_reason = ""
+    try:
+        while not stop_event.wait(max(0.05, float(interval_seconds))):
+            allowed, reason, _details = (
+                run_functional_test_runtime_guard_cycle(session_id)
+            )
+            checked_at = datetime.now(timezone.utc).isoformat()
+            with FUNCTIONAL_TEST_RUNTIME_GUARD_LOCK:
+                if session_id != FUNCTIONAL_TEST_RUNTIME_GUARD_SESSION_ID:
+                    break
+                FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS["lastCheckAt"] = (
+                    checked_at
+                )
+                FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS["lastReason"] = reason
+                if allowed:
+                    FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS["lastSuccessAt"] = (
+                        checked_at
+                    )
+                    FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS["failureCount"] = 0
+                else:
+                    FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS["failureCount"] = (
+                        int(
+                            FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS.get(
+                                "failureCount", 0
+                            )
+                        )
+                        + 1
+                    )
+            if not allowed and reason.endswith("session-inactive"):
+                break
+            if reason != previous_reason:
+                append_audit(
+                    "info" if allowed else "danger",
+                    "FUNCTIONAL_TEST Runtime Guard",
+                    (
+                        "KIS 체결·계좌 대조 및 preflight 갱신 정상"
+                        if allowed
+                        else f"신규 주문 차단 상태: {reason}"
+                    ),
+                )
+                previous_reason = reason
+    finally:
+        owned = False
+        with FUNCTIONAL_TEST_RUNTIME_GUARD_LOCK:
+            global FUNCTIONAL_TEST_RUNTIME_GUARD_STREAM_OWNED
+            if session_id == FUNCTIONAL_TEST_RUNTIME_GUARD_SESSION_ID:
+                owned = FUNCTIONAL_TEST_RUNTIME_GUARD_STREAM_OWNED
+                FUNCTIONAL_TEST_RUNTIME_GUARD_STREAM_OWNED = False
+                FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS["running"] = False
+                FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS[
+                    "kisExecutionStreamOwned"
+                ] = False
+        if owned:
+            try:
+                LIVE_EXECUTION_STREAMS.stop_brokers(
+                    ("kis",),
+                    timeout=25.0,
+                )
+            except Exception:
+                pass
+
+
+def start_functional_test_runtime_guard(
+    session_id: str,
+    *,
+    execution_stream_owned: bool,
+    interval_seconds: float = FUNCTIONAL_TEST_RUNTIME_GUARD_INTERVAL_SECONDS,
+) -> dict[str, Any]:
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id:
+        raise ValueError("functional runtime guard session_id is required")
+    stop_functional_test_runtime_guard()
+    global FUNCTIONAL_TEST_RUNTIME_GUARD_STOP
+    global FUNCTIONAL_TEST_RUNTIME_GUARD_THREAD
+    global FUNCTIONAL_TEST_RUNTIME_GUARD_SESSION_ID
+    global FUNCTIONAL_TEST_RUNTIME_GUARD_STREAM_OWNED
+    with FUNCTIONAL_TEST_RUNTIME_GUARD_LOCK:
+        FUNCTIONAL_TEST_RUNTIME_GUARD_STOP = threading.Event()
+        FUNCTIONAL_TEST_RUNTIME_GUARD_SESSION_ID = normalized_session_id
+        FUNCTIONAL_TEST_RUNTIME_GUARD_STREAM_OWNED = bool(
+            execution_stream_owned
+        )
+        FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS.update(
+            {
+                "running": True,
+                "sessionId": normalized_session_id,
+                "lastCheckAt": "",
+                "lastSuccessAt": "",
+                "lastReason": "waiting-first-cycle",
+                "failureCount": 0,
+                "kisExecutionStreamOwned": bool(execution_stream_owned),
+            }
+        )
+        thread = threading.Thread(
+            target=_functional_test_runtime_guard_worker,
+            args=(
+                normalized_session_id,
+                FUNCTIONAL_TEST_RUNTIME_GUARD_STOP,
+                interval_seconds,
+            ),
+            daemon=True,
+            name="functional-test-runtime-guard",
+        )
+        FUNCTIONAL_TEST_RUNTIME_GUARD_THREAD = thread
+        thread.start()
+        return dict(FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS)
+
+
+def stop_functional_test_runtime_guard(
+    *,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    global FUNCTIONAL_TEST_RUNTIME_GUARD_THREAD
+    global FUNCTIONAL_TEST_RUNTIME_GUARD_SESSION_ID
+    with FUNCTIONAL_TEST_RUNTIME_GUARD_LOCK:
+        thread = FUNCTIONAL_TEST_RUNTIME_GUARD_THREAD
+        FUNCTIONAL_TEST_RUNTIME_GUARD_STOP.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=max(0.0, timeout))
+    with FUNCTIONAL_TEST_RUNTIME_GUARD_LOCK:
+        alive = bool(thread and thread.is_alive())
+        if not alive:
+            FUNCTIONAL_TEST_RUNTIME_GUARD_THREAD = None
+            FUNCTIONAL_TEST_RUNTIME_GUARD_SESSION_ID = ""
+            FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS["running"] = False
+        return {
+            **dict(FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS),
+            "stopped": not alive,
+        }
+
+
+def functional_test_runtime_guard_snapshot() -> dict[str, Any]:
+    with FUNCTIONAL_TEST_RUNTIME_GUARD_LOCK:
+        return dict(FUNCTIONAL_TEST_RUNTIME_GUARD_STATUS)
+
+
+def functional_test_runtime_start_allowed(
+    session_id: str,
+    *,
+    portfolio_id: str,
+    strategy_id: str,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Validate the sealed STARTING session before loading any live engine."""
+
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id:
+        return False, "functional-test-start-session-missing", {}
+    if str(
+        (STATE.get("active_runtime_session_ids") or {}).get("stock") or ""
+    ) != normalized_session_id:
+        return False, "functional-test-start-session-not-active", {}
+    try:
+        session_object = OPERATIONAL_GOVERNANCE.get_runtime_session(
+            normalized_session_id
+        )
+        if session_object is None:
+            return False, "functional-test-start-session-missing", {}
+        session = session_object.to_dict()
+        if (
+            str(session.get("lifecycle") or "") != "STARTING"
+            or str(session.get("profile") or "") != "stock"
+            or str(session.get("mode") or "") != "SMALL_LIVE"
+        ):
+            return False, "functional-test-start-session-state-invalid", {"session": session}
+        session_metadata = (
+            session.get("metadata")
+            if isinstance(session.get("metadata"), dict)
+            else {}
+        )
+        if (
+            str(session_metadata.get("executionPurpose") or "")
+            != FUNCTIONAL_TEST_EXECUTION_PURPOSE
+            or session_metadata.get("promotionEligible") is not False
+            or str(session_metadata.get("evidenceClass") or "")
+            != "FUNCTIONAL_TEST_NON_PROMOTION"
+        ):
+            return False, "functional-test-start-purpose-invalid", {"session": session}
+        validity = OPERATIONAL_GOVERNANCE.preflight_validity(
+            str(session.get("preflightSnapshotId") or "")
+        )
+        if validity.get("valid") is not True:
+            return (
+                False,
+                "functional-test-start-preflight-invalid:"
+                + ",".join(str(item) for item in validity.get("reasons", [])),
+                {"session": session, "preflight": validity},
+            )
+        manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(
+            str(session.get("deploymentManifestHash") or "")
+        )
+        if manifest is None:
+            return False, "functional-test-start-manifest-missing", {"session": session}
+        manifest_metadata = dict(manifest.metadata)
+        if (
+            str(manifest_metadata.get("executionPurpose") or "")
+            != FUNCTIONAL_TEST_EXECUTION_PURPOSE
+            or manifest_metadata.get("promotionEligible") is not False
+        ):
+            return False, "functional-test-start-manifest-purpose-invalid", {"session": session}
+        permit, activation = functional_test_active_authority()
+        authority_status = functional_test_durable_authority_status(permit)
+        if authority_status.get("closed") is True:
+            return (
+                False,
+                "functional-test-start-authority-closed",
+                {"session": session, "authorityStatus": authority_status},
+            )
+        for key, value in (
+            ("permitId", permit.permit_id),
+            ("permitHash", permit.content_hash),
+            ("activationTokenId", activation.token_id),
+            ("activationHash", activation.content_hash),
+        ):
+            if (
+                str(session_metadata.get(key) or "") != str(value)
+                or str(manifest_metadata.get(key) or "") != str(value)
+            ):
+                return (
+                    False,
+                    "functional-test-start-authority-changed:" + key,
+                    {"session": session},
+                )
+        scope = _functional_test_runtime_scope(
+            portfolio_id=portfolio_id,
+            strategy_id=strategy_id,
+            permit=permit,
+        )
+        current_values = _functional_test_manifest_values(
+            scope,
+            permit,
+            activation,
+            preflight_ttl_seconds=manifest.preflight_ttl_seconds,
+        )
+        mismatches = [
+            label
+            for label, current_value, sealed_value in (
+                ("binding", scope.get("bindingHash"), manifest_metadata.get("bindingHash")),
+                ("members", scope.get("strategyMemberHash"), manifest_metadata.get("strategyMemberHash")),
+                ("account", scope.get("accountFingerprint"), manifest.account_fingerprint),
+                ("strategy", current_values["strategy_artifact_hash"], manifest.strategy_artifact_hash),
+                ("portfolio", current_values["portfolio_artifact_hash"], manifest.portfolio_artifact_hash),
+                ("build", current_values["build_hash"], manifest.build_hash),
+                ("risk", current_values["risk_policy_hash"], manifest.risk_policy_hash),
+                ("config", current_values["config_hash"], manifest.config_hash),
+            )
+            if str(current_value or "") != str(sealed_value or "")
+        ]
+        if mismatches:
+            return (
+                False,
+                "functional-test-start-seal-changed:" + ",".join(mismatches),
+                {"session": session},
+            )
+        return True, "functional-test-start-authorized", {
+            "session": session,
+            "manifest": manifest.to_dict(),
+            "scope": scope,
+        }
+    except (FunctionalTestContractError, OSError, sqlite3.Error, ValueError) as exc:
+        code = exc.code if isinstance(exc, FunctionalTestContractError) else type(exc).__name__
+        return False, f"functional-test-start-authorization-error:{code}", {}
+
+
+def _recover_orphaned_functional_test_runtime_session(
+    prior_session: object,
+) -> object:
+    """Fail-close an unbound non-terminal session after fresh KIS truth.
+
+    A process crash can leave the append-only governance session in an active
+    lifecycle even though neither the controller nor the in-memory runtime
+    binding survived.  It is unsafe to silently replace that session: a late
+    or unknown broker order may still exist.  Recovery therefore keeps new
+    entries blocked, forces one non-coalesced KIS snapshot, verifies fresh
+    three-way account/position/order truth and zero unresolved functional
+    orders, and only then appends the terminal FAILED event.
+    """
+
+    session_id = str(getattr(prior_session, "session_id", "") or "").strip()
+    lifecycle = str(getattr(prior_session, "lifecycle", "") or "").upper()
+    if not session_id or lifecycle not in {
+        "PREFLIGHT",
+        "STARTING",
+        "RUNNING",
+        "DEGRADED",
+        "DRAINING",
+        "STOPPING",
+    }:
+        raise ValueError("functional-test-orphan-session-scope-invalid")
+
+    initial_assessment = functional_test_authority_mutation_assessment()
+    runtime = (
+        initial_assessment.get("runtime")
+        if isinstance(initial_assessment.get("runtime"), dict)
+        else {}
+    )
+    session = (
+        initial_assessment.get("session")
+        if isinstance(initial_assessment.get("session"), dict)
+        else {}
+    )
+    bound_session_id = str(session.get("sessionId") or "").strip()
+    if runtime.get("active") is True or bound_session_id:
+        raise ValueError(
+            "functional-test-prior-session-still-bound:"
+            + (bound_session_id or str(runtime.get("phase") or "UNKNOWN"))
+        )
+
+    entry_block_was_active = bool(STATE.get("new_entries_blocked"))
+    STATE["new_entries_blocked"] = True
+    try:
+        raw_poll = poll_execution_events(
+            "kis",
+            force_snapshot=True,
+            include_snapshot=False,
+        )
+        poll_result = dict(raw_poll) if isinstance(raw_poll, dict) else {}
+    except Exception as exc:
+        raise ValueError(
+            "functional-test-orphan-recovery-poll-error:"
+            + type(exc).__name__
+        ) from exc
+    if (
+        poll_result.get("ok") is not True
+        or poll_result.get("coalesced") is True
+        or poll_result.get("errors")
+    ):
+        raise ValueError("functional-test-orphan-recovery-poll-incomplete")
+    poll_fresh, poll_reason, poll_details = (
+        _functional_test_execution_poll_fresh()
+    )
+    if not poll_fresh:
+        raise ValueError(
+            "functional-test-orphan-recovery-execution-poll-stale:"
+            + str(poll_reason or "unknown")
+        )
+
+    # A broker refresh may normally release its own transient entry block.
+    # Reassert this recovery fence until the old session is terminal.
+    STATE["new_entries_blocked"] = True
+    assessment = functional_test_authority_mutation_assessment(
+        require_kis_reconciliation=True,
+    )
+    broker_reconciliation = (
+        STATE.get("broker_reconciliation")
+        if isinstance(STATE.get("broker_reconciliation"), dict)
+        else {}
+    )
+    reconciliation_summary = (
+        broker_reconciliation.get("summary")
+        if isinstance(broker_reconciliation.get("summary"), dict)
+        else {}
+    )
+    recovery_blockers = [
+        str(item) for item in assessment.get("blockers", []) if str(item)
+    ]
+    if assessment.get("kisReconciled") is not True:
+        recovery_blockers.append("functional-test-kis-reconciliation-unresolved")
+    if int(assessment.get("workingOrderCount") or 0) != 0:
+        recovery_blockers.append("functional-test-working-orders-unresolved")
+    if reconciliation_summary.get("fresh") is not True:
+        recovery_blockers.append("functional-test-kis-reconciliation-not-fresh")
+    if reconciliation_summary.get("three_way_verified") is not True:
+        recovery_blockers.append("functional-test-kis-three-way-unverified")
+    if broker_reconciliation.get("errors"):
+        recovery_blockers.append("functional-test-kis-reconciliation-errors")
+    if assessment.get("allowed") is not True or recovery_blockers:
+        raise ValueError(
+            "functional-test-orphan-recovery-unresolved:"
+            + ",".join(dict.fromkeys(recovery_blockers or ["assessment-blocked"]))
+        )
+
+    try:
+        recovered = OPERATIONAL_GOVERNANCE.transition_runtime_session(
+            session_id,
+            "FAILED",
+            actor="live_trader.functional_test.recovery",
+            event_type="FUNCTIONAL_TEST_CRASH_RECOVERY_FAILED_CLOSED",
+            payload={
+                "previousLifecycle": lifecycle,
+                "deploymentId": str(
+                    getattr(prior_session, "deployment_id", "") or ""
+                ),
+                "forcedKisPoll": True,
+                "executionPollReason": str(poll_reason or ""),
+                "executionPoll": dict(poll_details),
+                "threeWayVerified": True,
+                "unresolvedWorkingOrderCount": 0,
+                "reason": "controller-and-runtime-binding-absent-after-restart",
+            },
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        raise ValueError(
+            "functional-test-orphan-recovery-transition-failed:"
+            + type(exc).__name__
+        ) from exc
+
+    if (
+        not entry_block_was_active
+        and not STATE.get("manual_new_entries_blocked")
+        and not STATE.get("broker_truth_blocked")
+        and not STATE.get("daily_loss_entries_blocked")
+        and not STATE.get("kill_switch")
+        and not STATE.get("kill_switch_rearm_required")
+        and durable_control_snapshot().get("halted") is not True
+    ):
+        STATE["new_entries_blocked"] = False
+    append_audit(
+        "warn",
+        "FUNCTIONAL_TEST Orphan Recovery",
+        (
+            f"{session_id} ({lifecycle}) 세션을 fresh KIS 3-way 대조와 "
+            "미해결 주문 0건 확인 후 FAILED로 종결했습니다."
+        ),
+    )
+    return recovered
+
+
+def _prepare_functional_test_runtime_session(
+    profile_id: str,
+    mode: Mode,
+    portfolio_id: str,
+    strategy_id: str,
+) -> tuple[object, str]:
+    """Create a separate, immutable non-promotional live test session."""
+
+    if profile_id != "stock" or mode != "SMALL_LIVE":
+        raise ValueError("FUNCTIONAL_TEST requires stock/SMALL_LIVE")
+    if STATE.get("operator_confirmed") is not True:
+        raise ValueError("FUNCTIONAL_TEST runtime 시작 전 운용자 확인이 필요합니다.")
+    if STATE.get("dry_run"):
+        raise ValueError("FUNCTIONAL_TEST 실주문 runtime에서는 Dry Run을 해제해야 합니다.")
+    if not real_orders_enabled():
+        raise ValueError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 필요합니다.")
+    control = durable_control_snapshot()
+    if STATE.get("kill_switch") or control.get("halted") is True:
+        raise ValueError("Kill/Risk 제어가 활성화되어 FUNCTIONAL_TEST를 시작할 수 없습니다.")
+    missing_checklist = [
+        item
+        for item in checklist_rows()
+        if item.get("required") and not item.get("checked")
+    ]
+    if missing_checklist:
+        raise ValueError("필수 Live 안전 체크리스트를 먼저 확인하세요.")
+
+    now = datetime.now(timezone.utc)
+    permit, activation = functional_test_active_authority(now=now)
+    authority_status = functional_test_durable_authority_status(permit)
+    if authority_status.get("closed") is True:
+        raise ValueError(
+            "FUNCTIONAL_TEST permit의 내구 주문 권한이 이미 종료되었습니다."
+        )
+    remaining_seconds = int(
+        min(permit.ends_at, activation.expires_at).timestamp()
+        - now.timestamp()
+    )
+    if remaining_seconds < 2:
+        raise ValueError("FUNCTIONAL_TEST permit/당일 활성화 만료가 임박했습니다.")
+    scope = _functional_test_runtime_scope(
+        portfolio_id=portfolio_id,
+        strategy_id=strategy_id,
+        permit=permit,
+    )
+    lead_strategy = scope.get("leadStrategy")
+    if not isinstance(lead_strategy, dict):
+        raise ValueError("FUNCTIONAL_TEST lead Strategy를 봉인할 수 없습니다.")
+
+    ttl_seconds = min(300, remaining_seconds)
+    values = _functional_test_manifest_values(
+        scope,
+        permit,
+        activation,
+        preflight_ttl_seconds=ttl_seconds,
+    )
+    manifest = OPERATIONAL_GOVERNANCE.create_deployment_manifest(**values)
+    prior_session = OPERATIONAL_GOVERNANCE.latest_runtime_session(
+        manifest.deployment_id
+    )
+    if (
+        prior_session is not None
+        and str(getattr(prior_session, "lifecycle", "") or "").upper()
+        in {
+            "PREFLIGHT",
+            "STARTING",
+            "RUNNING",
+            "DEGRADED",
+            "DRAINING",
+            "STOPPING",
+        }
+    ):
+        prior_session = _recover_orphaned_functional_test_runtime_session(
+            prior_session
+        )
+    try:
+        prior_reservations = PROGRAM_LEDGER.functional_test_reservation_count(
+            str(permit.permit_id or "")
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        raise ValueError(
+            "FUNCTIONAL_TEST 누적 손실 원장 사용 이력을 확인할 수 없습니다."
+        ) from exc
+    allow_equity_scope_create = (
+        prior_session is None and prior_reservations == 0
+    )
+    preflight, evidence = _create_functional_test_preflight(
+        manifest=manifest,
+        scope=scope,
+        permit=permit,
+        activation=activation,
+        ttl_seconds=ttl_seconds,
+        issued_at=now,
+        allow_equity_scope_create=allow_equity_scope_create,
+    )
+    safety_blockers = [
+        str(item)
+        for item in evidence.get("safetyBlockers", [])
+        if str(item)
+    ]
+    if safety_blockers or preflight.status != "PASS":
+        raise ValueError(
+            "FUNCTIONAL_TEST fresh preflight 차단: "
+            + ", ".join(safety_blockers or [preflight.status])
+        )
+
+    session = OPERATIONAL_GOVERNANCE.create_runtime_session(
+        deployment_id=manifest.deployment_id,
+        deployment_manifest_hash=manifest.manifest_hash,
+        profile="stock",
+        mode="SMALL_LIVE",
+        runtime_instance_id=(
+            f"functional-desktop-{os.getpid()}-{secrets.token_hex(8)}"
+        ),
+        preflight_snapshot_id=preflight.snapshot_id,
+        metadata={
+            "executionPurpose": FUNCTIONAL_TEST_EXECUTION_PURPOSE,
+            "evidenceClass": "FUNCTIONAL_TEST_NON_PROMOTION",
+            "promotionEligible": False,
+            "permitId": permit.permit_id,
+            "permitHash": permit.content_hash,
+            "activationTokenId": activation.token_id,
+            "activationHash": activation.content_hash,
+            "bindingHash": str(scope.get("bindingHash") or ""),
+            "accountFingerprint": str(scope.get("accountFingerprint") or ""),
+            "portfolioId": str(scope.get("portfolioId") or ""),
+            "strategyId": str(lead_strategy.get("strategy_id") or ""),
+            "runtimeDeploymentId": str(scope.get("runtimeDeploymentId") or ""),
+            "strategyMemberHash": str(scope.get("strategyMemberHash") or ""),
+            "allowedSymbols": list(scope.get("allowedSymbols") or []),
+        },
+    )
+    session = OPERATIONAL_GOVERNANCE.transition_runtime_session(
+        session.session_id,
+        "STARTING",
+        actor="live_trader.functional_test",
+        event_type="FUNCTIONAL_TEST_RUNTIME_START_REQUESTED",
+        payload={
+            "profile": "stock",
+            "mode": "SMALL_LIVE",
+            "promotionEligible": False,
+        },
+    )
+    STATE.setdefault("active_runtime_session_ids", {})["stock"] = (
+        session.session_id
+    )
+    return session, "FUNCTIONAL_TEST 전용 거버넌스 Session을 생성했습니다."
+
+
 def _prepare_operational_runtime_session(
     profile_id: str,
     mode: Mode,
@@ -13664,7 +18958,65 @@ def _prepare_operational_runtime_session(
         raise ValueError(
             f"요청 profile {profile_id}이 Deployment broker profile {expected_profile}과 일치하지 않습니다."
         )
+    if mode in {"SMALL_LIVE", "FULL_LIVE"}:
+        qualification_gate = paper_live_qualification_gate_for_strategy(strategy)
+        if (
+            qualification_gate.get("required") is not True
+            or qualification_gate.get("ready") is not True
+        ):
+            raise ValueError(
+                "Deployment에 고정된 exact Paper Evidence/Final binding을 "
+                "검증하기 전에는 Live runtime을 시작할 수 없습니다: "
+                + str(qualification_gate.get("detail") or "qualification missing")
+            )
     manifest = ensure_operational_deployment_manifest(strategy)
+    deployment_binding = (
+        dict(manifest.metadata.get("deploymentBinding"))
+        if isinstance(manifest.metadata.get("deploymentBinding"), dict)
+        else {}
+    )
+    if mode in {"SMALL_LIVE", "FULL_LIVE"} and not _live_deployment_binding_is_executable(
+        deployment_binding,
+        mode=mode,
+    ):
+        raise ValueError(
+            "현재 DeploymentStore revision/lifecycle/permission binding을 "
+            "정확히 봉인할 수 없어 Live runtime을 차단했습니다."
+        )
+    paper_bindings = [
+        dict(item)
+        for item in manifest.metadata.get("paperFinalBindings", [])
+        if isinstance(item, dict)
+    ]
+    if mode in {"SMALL_LIVE", "FULL_LIVE"} and (
+        not paper_bindings
+        or any(item.get("ready") is not True for item in paper_bindings)
+    ):
+        raise ValueError(
+            "Portfolio의 모든 Strategy Instance에 exact Paper Final binding이 "
+            "고정되지 않아 Live runtime을 차단했습니다."
+        )
+    if mode in {"SMALL_LIVE", "FULL_LIVE"} and manifest.portfolio_artifact_hash:
+        manifest_portfolio = (
+            manifest.metadata.get("portfolioArtifact")
+            if isinstance(manifest.metadata.get("portfolioArtifact"), dict)
+            else {}
+        )
+        if (
+            str(manifest_portfolio.get("artifactHash") or "").lower()
+            != str(manifest.portfolio_artifact_hash or "").lower()
+            or any(
+                str(item.get("paperPortfolioArtifactId") or "")
+                != str(manifest_portfolio.get("artifactId") or "")
+                or str(item.get("paperPortfolioArtifactHash") or "").lower()
+                != str(manifest.portfolio_artifact_hash or "").lower()
+                for item in paper_bindings
+            )
+        ):
+            raise ValueError(
+                "현재 Portfolio Artifact hash가 Live Deployment/Paper final "
+                "binding과 일치하지 않습니다."
+            )
     latest_preflight = OPERATIONAL_GOVERNANCE.latest_preflight_for_deployment(
         manifest.deployment_id
     )
@@ -13680,6 +19032,32 @@ def _prepare_operational_runtime_session(
                 "Preflight Snapshot이 유효하지 않습니다: "
                 + ", ".join(str(item) for item in validity.get("reasons", []))
             )
+        # Re-resolve from disk after preflight and immediately before creating
+        # the runtime session.  A Deployment revision, permission digest,
+        # Artifact/Paper pin, or exact Portfolio hash changed during preflight
+        # must never inherit the earlier manifest/session authority.
+        current_strategy = _operational_strategy(
+            strategy_rows(portfolio_rows()),
+            deployment_id=actual_deployment,
+            strategy_id=actual_strategy,
+            portfolio_id=actual_portfolio,
+        )
+        if current_strategy is None:
+            raise ValueError(
+                "Preflight 이후 현재 Live Deployment 컨텍스트를 다시 찾을 수 없습니다."
+            )
+        current_manifest_inputs = _operational_manifest_inputs(
+            current_strategy
+        )
+        if not _operational_manifest_matches_inputs(
+            manifest,
+            current_manifest_inputs,
+        ):
+            raise ValueError(
+                "Preflight 중 Deployment revision/permission 또는 exact "
+                "Artifact/Paper/Portfolio binding이 변경되었습니다."
+            )
+        strategy = current_strategy
     session = OPERATIONAL_GOVERNANCE.create_runtime_session(
         deployment_id=manifest.deployment_id,
         deployment_manifest_hash=manifest.manifest_hash,
@@ -13692,6 +19070,15 @@ def _prepare_operational_runtime_session(
             "strategyId": str(strategy.get("strategy_id") or ""),
             "brokerId": strategy_broker_id(strategy),
             "symbol": str(strategy.get("symbol") or ""),
+            "deploymentBinding": deployment_binding,
+            "deploymentBindingHash": str(
+                deployment_binding.get("bindingHash") or ""
+            ),
+            "portfolioArtifact": dict(
+                manifest.metadata.get("portfolioArtifact")
+                if isinstance(manifest.metadata.get("portfolioArtifact"), dict)
+                else {}
+            ),
         },
     )
     session = OPERATIONAL_GOVERNANCE.transition_runtime_session(
@@ -13740,28 +19127,185 @@ def _restore_previous_runtime_session_binding(
         active.pop(profile_id, None)
 
 
+def start_functional_test_runtime(
+    workspace: dict[str, Any],
+    *,
+    confirmed: bool,
+    target_key: str = "",
+) -> dict[str, Any]:
+    """Explicitly start the selected, already activated KIS test runtime.
+
+    The readiness workspace remains incapable of submitting an order. This
+    bridge selects the exact current candidate and enters the separately
+    sealed FUNCTIONAL_TEST SMALL_LIVE runtime. Its permit, activation,
+    reconciliation, account, scope, cap, and final broker-side checks remain
+    mandatory, and its evidence can never be used for promotion.
+    """
+
+    def blocked(reason: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "reason": reason,
+            "runtimeStarted": False,
+            "brokerSubmissionPerformed": False,
+            "promotionEligible": False,
+            "snapshot": snapshot(),
+        }
+
+    if confirmed is not True:
+        return blocked("FUNCTIONAL_TEST runtime 시작은 명시 확인이 필요합니다.")
+    if STATE.get("operator_confirmed") is not True:
+        return blocked("FUNCTIONAL_TEST runtime 시작 전 Live 운용 확인이 필요합니다.")
+
+    # KIS permits only one WebSocket session for the configured app key. The
+    # stock controller owns one feed/supervisor lifecycle, so never attempt to
+    # replace or overlap it from this explicit bridge.  A STOPPING worker is
+    # still an owner until its thread has actually exited.
+    runtime_snapshot = LIVE_CONTINUOUS_CONTROLLER.snapshot()
+    runtime_profiles = (
+        runtime_snapshot.get("profiles")
+        if isinstance(runtime_snapshot.get("profiles"), dict)
+        else {}
+    )
+    stock_runtime = (
+        runtime_profiles.get("stock")
+        if isinstance(runtime_profiles.get("stock"), dict)
+        else {}
+    )
+    stock_phase = str(stock_runtime.get("phase") or "").strip().upper()
+    if stock_runtime.get("running") is True or stock_phase in {
+        "STARTING",
+        "RUNNING",
+        "DEGRADED",
+        "STOPPING",
+    }:
+        purpose = str(
+            stock_runtime.get("executionPurpose") or "STANDARD"
+        ).strip().upper()
+        return blocked(
+            "기존 stock runtime이 KIS WebSocket을 소유하고 있어 "
+            "FUNCTIONAL_TEST 시작을 차단했습니다. 먼저 기존 runtime을 완전히 "
+            f"정지하세요. (phase={stock_phase or 'UNKNOWN'}, purpose={purpose})"
+        )
+    if not isinstance(workspace, dict):
+        return blocked("FUNCTIONAL_TEST workspace snapshot이 없습니다.")
+    if (
+        str(workspace.get("environment") or "").strip().upper()
+        != FUNCTIONAL_TEST_ENVIRONMENT
+    ):
+        return blocked("FUNCTIONAL_TEST workspace 환경이 KIS_LIVE가 아닙니다.")
+    current = (
+        workspace.get("current")
+        if isinstance(workspace.get("current"), dict)
+        else {}
+    )
+    if workspace.get("status") != "ACTIVE" or current.get("ready") is not True:
+        blockers = ", ".join(
+            str(item) for item in current.get("blockers") or []
+        )
+        return blocked(
+            "FUNCTIONAL_TEST 허가와 오늘의 활성화를 먼저 완료하세요."
+            + (f" ({blockers})" if blockers else "")
+        )
+    selected_key = str(current.get("selectedTargetKey") or "").strip()
+    requested_key = str(target_key or "").strip()
+    if not selected_key or (requested_key and requested_key != selected_key):
+        return blocked("요청한 FUNCTIONAL_TEST target이 현재 활성 허가와 다릅니다.")
+    candidates = [
+        item
+        for item in workspace.get("candidates", [])
+        if isinstance(item, dict)
+    ]
+    candidate = next(
+        (item for item in candidates if str(item.get("key") or "") == selected_key),
+        None,
+    )
+    if candidate is None or candidate.get("available") is not True:
+        return blocked("현재 활성 FUNCTIONAL_TEST Artifact binding을 찾을 수 없습니다.")
+    runtime_strategy_id = str(
+        candidate.get("runtimeStrategyId")
+        or candidate.get("strategyId")
+        or ""
+    ).strip()
+    if not runtime_strategy_id:
+        return blocked("FUNCTIONAL_TEST runtime lead Strategy가 없습니다.")
+    portfolio_id = str(candidate.get("portfolioId") or "").strip()
+    result = start_continuous_runtime(
+        "stock",
+        "SMALL_LIVE",
+        portfolio_id,
+        "",
+        runtime_strategy_id,
+        FUNCTIONAL_TEST_EXECUTION_PURPOSE,
+        {
+            "functional_test_target_key": selected_key,
+            "functional_test_portfolio_only": (
+                str(candidate.get("kind") or "").upper() == "PORTFOLIO"
+            ),
+            "promotion_eligible": False,
+            "use_as_promotion_evidence": False,
+            "full_live_requested": False,
+        },
+    )
+    result["runtimeStarted"] = result.get("ok") is True
+    result["brokerSubmissionPerformed"] = False
+    result["promotionEligible"] = False
+    result["executionPurpose"] = FUNCTIONAL_TEST_EXECUTION_PURPOSE
+    result["selectedTargetKey"] = selected_key
+    return result
+
+
 def start_continuous_runtime(
     profile_id: str,
     mode: str,
     portfolio_id: str = "",
     deployment_id: str = "",
     strategy_id: str = "",
+    execution_purpose: str = "",
+    functional_test_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_profile = "stock" if profile_id == "stock" else "crypto"
     normalized_mode = normalize_runtime_mode(mode)
+    normalized_purpose = str(execution_purpose or "").strip().upper()
+    if normalized_purpose not in {"", FUNCTIONAL_TEST_EXECUTION_PURPOSE}:
+        return {
+            "ok": False,
+            "reason": f"unsupported execution purpose: {normalized_purpose}",
+            "snapshot": snapshot(),
+        }
+    if normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE and (
+        normalized_profile != "stock" or normalized_mode != "SMALL_LIVE"
+    ):
+        return {
+            "ok": False,
+            "reason": "FUNCTIONAL_TEST requires stock/SMALL_LIVE",
+            "snapshot": snapshot(),
+        }
     governance_session: object | None = None
     previous_session_id = str(
         (STATE.get("active_runtime_session_ids") or {}).get(normalized_profile)
         or ""
     )
     try:
-        governance_session, _governance_reason = _prepare_operational_runtime_session(
-            normalized_profile,
-            normalized_mode,
-            portfolio_id,
-            deployment_id,
-            strategy_id,
-        )
+        if normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE:
+            governance_session, _governance_reason = (
+                _prepare_functional_test_runtime_session(
+                    normalized_profile,
+                    normalized_mode,
+                    portfolio_id,
+                    strategy_id,
+                )
+            )
+        else:
+            governance_session, _governance_reason = (
+                _prepare_operational_runtime_session(
+                    normalized_profile,
+                    normalized_mode,
+                    portfolio_id,
+                    deployment_id,
+                    strategy_id,
+                )
+            )
     except (OSError, sqlite3.Error, ValueError) as exc:
         STATE["new_entries_blocked"] = True
         append_audit(
@@ -13770,6 +19314,42 @@ def start_continuous_runtime(
             f"{normalized_mode} 시작 차단: {str(exc)[:300]}",
         )
         return {"ok": False, "reason": str(exc), "snapshot": snapshot()}
+    functional_execution_observation: dict[str, Any] = {}
+    functional_execution_stream_owned = False
+    if normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE:
+        stop_functional_test_runtime_guard()
+        (
+            observation_allowed,
+            observation_reason,
+            functional_execution_observation,
+        ) = ensure_functional_test_execution_observation()
+        functional_execution_stream_owned = bool(
+            functional_execution_observation.get("owned")
+        )
+        if not observation_allowed:
+            _finish_operational_runtime_start(
+                governance_session,
+                False,
+                observation_reason,
+            )
+            _restore_previous_runtime_session_binding(
+                normalized_profile,
+                governance_session,
+                previous_session_id,
+            )
+            append_audit(
+                "danger",
+                "FUNCTIONAL_TEST Runtime Guard",
+                f"KIS 체결 관측 시작 차단: {observation_reason}",
+            )
+            return {
+                "ok": False,
+                "reason": observation_reason,
+                "functional_test_execution_observation": (
+                    functional_execution_observation
+                ),
+                "snapshot": snapshot(),
+            }
     session_metadata = (
         dict(getattr(governance_session, "metadata", {}) or {})
         if governance_session is not None
@@ -13782,20 +19362,72 @@ def start_continuous_runtime(
         session_metadata.get("strategyId") or strategy_id or ""
     ).strip()
     bound_deployment_id = str(
-        getattr(governance_session, "deployment_id", "")
+        (
+            session_metadata.get("runtimeDeploymentId")
+            if normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE
+            else getattr(governance_session, "deployment_id", "")
+        )
         or deployment_id
         or ""
     ).strip()
+    controller_functional_context = (
+        {
+            **(
+                functional_test_context
+                if isinstance(functional_test_context, dict)
+                else {}
+            ),
+            "functional_test_session_id": str(
+                getattr(governance_session, "session_id", "") or ""
+            ),
+            "functional_test_permit_id": str(
+                session_metadata.get("permitId") or ""
+            ),
+            "functional_test_permit_hash": str(
+                session_metadata.get("permitHash") or ""
+            ),
+            "functional_test_account_fingerprint": str(
+                session_metadata.get("accountFingerprint") or ""
+            ),
+            "functional_test_activation_token_id": str(
+                session_metadata.get("activationTokenId") or ""
+            ),
+            "functional_test_activation_hash": str(
+                session_metadata.get("activationHash") or ""
+            ),
+            "promotion_eligible": False,
+            "use_as_promotion_evidence": False,
+            "full_live_requested": False,
+        }
+        if normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE
+        else functional_test_context
+    )
     with RUNTIME_CONTROL_LOCK:
         try:
-            result = LIVE_CONTINUOUS_CONTROLLER.start(
+            start_args = (
                 normalized_profile,
                 normalized_mode,
                 bound_portfolio_id,
                 bound_strategy_id,
                 bound_deployment_id,
             )
+            if normalized_purpose or controller_functional_context is not None:
+                result = LIVE_CONTINUOUS_CONTROLLER.start(
+                    *start_args,
+                    normalized_purpose,
+                    controller_functional_context,
+                )
+            else:
+                # Preserve the established controller call contract for every
+                # ordinary runtime. FUNCTIONAL_TEST is the only caller that
+                # needs the two explicit, non-promotional arguments.
+                result = LIVE_CONTINUOUS_CONTROLLER.start(*start_args)
         except Exception as exc:
+            if functional_execution_stream_owned:
+                LIVE_EXECUTION_STREAMS.stop_brokers(
+                    ("kis",),
+                    timeout=25.0,
+                )
             _finish_operational_runtime_start(governance_session, False, str(exc))
             _restore_previous_runtime_session_binding(
                 normalized_profile,
@@ -13816,7 +19448,26 @@ def start_continuous_runtime(
             bool(result.get("ok")),
             str(result.get("reason") or ""),
         )
+        if (
+            result.get("ok")
+            and normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE
+            and governance_session is not None
+        ):
+            result["functional_test_guard"] = (
+                start_functional_test_runtime_guard(
+                    str(getattr(governance_session, "session_id", "") or ""),
+                    execution_stream_owned=functional_execution_stream_owned,
+                )
+            )
+            result["functional_test_execution_observation"] = (
+                functional_execution_observation
+            )
         if not result.get("ok"):
+            if functional_execution_stream_owned:
+                LIVE_EXECUTION_STREAMS.stop_brokers(
+                    ("kis",),
+                    timeout=25.0,
+                )
             _restore_previous_runtime_session_binding(
                 normalized_profile,
                 governance_session,
@@ -13827,6 +19478,10 @@ def start_continuous_runtime(
                 getattr(governance_session, "session_id", "")
             )
         result["snapshot"] = snapshot()
+        result["execution_purpose"] = normalized_purpose
+        result["promotion_eligible"] = (
+            False if normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE else None
+        )
     if bound_portfolio_id and result.get("ok"):
         ArtifactMetadataStore().update(bound_portfolio_id, "portfolio", mark_used=True)
     return result
@@ -13937,6 +19592,10 @@ def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
     # due bar through the supervisor's operation_lock.
     with RUNTIME_CONTROL_LOCK:
         result = LIVE_CONTINUOUS_CONTROLLER.stop(normalized_profile)
+        if "stock" in target_profiles:
+            result["functional_test_guard"] = (
+                stop_functional_test_runtime_guard()
+            )
         with RUNTIME_MODE_LOCK:
             for target in target_profiles:
                 sync_runtime_profile_mode(
@@ -13965,6 +19624,297 @@ def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
                 STATE["new_entries_blocked"] = True
         result["snapshot"] = snapshot()
     return result
+
+
+def stop_functional_test_runtime_safely(
+    *,
+    permit_id: str,
+    account_fingerprint: str,
+) -> dict[str, Any]:
+    """Close order authority before drain; revoke pointers only afterwards.
+
+    The caller may delete the current permit/activation pointers only when
+    this function returns ``ok=True``.  A failed drain or broker
+    reconciliation deliberately leaves the immutable documents available for
+    recovery while the durable authority-close event blocks late orders.
+    """
+
+    normalized_permit = str(permit_id or "").strip()
+    normalized_account = str(account_fingerprint or "").strip().lower()
+    if not normalized_permit or not normalized_account:
+        return {
+            "ok": False,
+            "status": "STOP_FAILED",
+            "reason": "functional-test-stop-scope-required",
+        }
+    before = functional_test_authority_mutation_assessment()
+    runtime = before.get("runtime") if isinstance(before.get("runtime"), dict) else {}
+    session = before.get("session") if isinstance(before.get("session"), dict) else {}
+    execution_purpose = str(runtime.get("executionPurpose") or "").upper()
+    session_purpose = str(session.get("executionPurpose") or "").upper()
+    functional_runtime = FUNCTIONAL_TEST_EXECUTION_PURPOSE in {
+        execution_purpose,
+        session_purpose,
+    }
+    runtime_or_session_active = bool(
+        runtime.get("active") is True
+        or str(session.get("lifecycle") or "").upper()
+        in {"STARTING", "RUNNING", "DEGRADED", "DRAINING", "STOPPING"}
+    )
+    if runtime_or_session_active and not functional_runtime:
+        return {
+            "ok": False,
+            "status": "STOP_FAILED",
+            "reason": "functional-test-stop-nonfunctional-stock-runtime-active",
+            "assessment": before,
+        }
+    try:
+        with FUNCTIONAL_TEST_AUTHORITY_DISPATCH_LOCK:
+            authority = PROGRAM_LEDGER.close_functional_test_authority(
+                permit_id=normalized_permit,
+                account_fingerprint=normalized_account,
+                reason="operator-requested-functional-test-stop",
+                occurred_at=datetime.now(timezone.utc).isoformat(),
+            )
+            STATE["new_entries_blocked"] = True
+            STATE["manual_new_entries_blocked"] = True
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "status": "STOP_FAILED",
+            "reason": "functional-test-authority-close-failed:"
+            + type(exc).__name__,
+        }
+
+    # This in-memory block is an additional broad guard.  The permit-scoped
+    # ProgramLedger event above is the durable source of truth checked at the
+    # final KIS POST boundary and survives process restart.
+    runtime_result: dict[str, Any] = {
+        "ok": True,
+        "reason": "functional-test-runtime-not-running",
+    }
+    if runtime_or_session_active:
+        runtime_result = stop_continuous_runtime("stock")
+        if runtime_result.get("ok") is not True:
+            return {
+                "ok": False,
+                "status": "STOP_FAILED",
+                "reason": "functional-test-runtime-drain-failed",
+                "authority": authority,
+                "runtime": runtime_result,
+            }
+
+    # A final end seals the complete permit, including days that were already
+    # cleanly paused.  Always refresh KIS account/position/order truth before
+    # the workspace may revoke its permit pointer; otherwise a night-time
+    # final end could skip the last three-way reconciliation merely because
+    # no runtime thread or working order is currently visible.
+    requires_reconciliation = True
+    poll_result: dict[str, Any] = {}
+    after = functional_test_authority_mutation_assessment()
+    if requires_reconciliation:
+        try:
+            raw_poll = poll_execution_events(
+                "kis",
+                force_snapshot=True,
+                include_snapshot=False,
+            )
+            poll_result = dict(raw_poll) if isinstance(raw_poll, dict) else {}
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "STOP_FAILED",
+                "reason": "functional-test-stop-reconciliation-error:"
+                + type(exc).__name__,
+                "authority": authority,
+                "runtime": runtime_result,
+            }
+        if (
+            poll_result.get("ok") is not True
+            or poll_result.get("coalesced") is True
+            or poll_result.get("errors")
+        ):
+            return {
+                "ok": False,
+                "status": "STOP_FAILED",
+                "reason": "functional-test-stop-broker-poll-incomplete",
+                "authority": authority,
+                "runtime": runtime_result,
+                "poll": poll_result,
+            }
+        after = functional_test_authority_mutation_assessment(
+            require_kis_reconciliation=True,
+        )
+        if after.get("allowed") is not True:
+            return {
+                "ok": False,
+                "status": "STOP_FAILED",
+                "reason": "functional-test-stop-reconciliation-unresolved:"
+                + ",".join(str(item) for item in after.get("blockers", [])),
+                "authority": authority,
+                "runtime": runtime_result,
+                "poll": poll_result,
+                "assessment": after,
+            }
+    return {
+        "ok": True,
+        "status": "STOPPED",
+        "reason": "functional-test-runtime-drained-and-reconciled",
+        "authority": authority,
+        "runtime": runtime_result,
+        "poll": poll_result,
+        "assessment": after,
+    }
+
+
+def pause_functional_test_runtime_safely(
+    *,
+    permit_id: str,
+    account_fingerprint: str,
+) -> dict[str, Any]:
+    """Drain one functional-test day without closing its multi-day permit.
+
+    The caller must revoke ``current-activation.json`` first while holding
+    ``FUNCTIONAL_TEST_AUTHORITY_DISPATCH_LOCK``.  That revocable document is
+    re-read immediately before every KIS POST, so its absence durably wins a
+    race with a late order.  This routine then drains the runtime/session and
+    always performs a fresh KIS poll plus reconciliation.  Unlike final stop,
+    it never writes an irreversible AUTHORITY_CLOSED event.
+    """
+
+    normalized_permit = str(permit_id or "").strip()
+    normalized_account = str(account_fingerprint or "").strip().lower()
+    if not normalized_permit or not normalized_account:
+        return {
+            "ok": False,
+            "status": "STOP_FAILED",
+            "reason": "functional-test-pause-scope-required",
+        }
+    try:
+        with FUNCTIONAL_TEST_AUTHORITY_DISPATCH_LOCK:
+            if FUNCTIONAL_TEST_CURRENT_ACTIVATION_DOCUMENT.exists():
+                return {
+                    "ok": False,
+                    "status": "STOP_FAILED",
+                    "reason": "functional-test-pause-activation-not-revoked",
+                }
+            authority = PROGRAM_LEDGER.functional_test_authority_status(
+                permit_id=normalized_permit,
+                account_fingerprint=normalized_account,
+            )
+            if authority.get("closed") is True:
+                return {
+                    "ok": False,
+                    "status": "STOP_FAILED",
+                    "reason": "functional-test-pause-authority-already-closed",
+                    "authority": authority,
+                }
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "status": "STOP_FAILED",
+            "reason": "functional-test-pause-authority-check-failed:"
+            + type(exc).__name__,
+        }
+
+    before = functional_test_authority_mutation_assessment()
+    runtime = (
+        before.get("runtime")
+        if isinstance(before.get("runtime"), dict)
+        else {}
+    )
+    session = (
+        before.get("session")
+        if isinstance(before.get("session"), dict)
+        else {}
+    )
+    execution_purpose = str(runtime.get("executionPurpose") or "").upper()
+    session_purpose = str(session.get("executionPurpose") or "").upper()
+    runtime_or_session_active = bool(
+        runtime.get("active") is True
+        or str(session.get("lifecycle") or "").upper()
+        in {"STARTING", "RUNNING", "DEGRADED", "DRAINING", "STOPPING"}
+    )
+    functional_runtime = FUNCTIONAL_TEST_EXECUTION_PURPOSE in {
+        execution_purpose,
+        session_purpose,
+    }
+    if runtime_or_session_active and not functional_runtime:
+        return {
+            "ok": False,
+            "status": "STOP_FAILED",
+            "reason": "functional-test-pause-nonfunctional-stock-runtime-active",
+            "authority": authority,
+            "assessment": before,
+        }
+
+    runtime_result: dict[str, Any] = {
+        "ok": True,
+        "reason": "functional-test-runtime-not-running",
+    }
+    if runtime_or_session_active:
+        runtime_result = stop_continuous_runtime("stock")
+        if runtime_result.get("ok") is not True:
+            return {
+                "ok": False,
+                "status": "STOP_FAILED",
+                "reason": "functional-test-pause-runtime-drain-failed",
+                "authority": authority,
+                "runtime": runtime_result,
+            }
+
+    try:
+        raw_poll = poll_execution_events(
+            "kis",
+            force_snapshot=True,
+            include_snapshot=False,
+        )
+        poll_result = dict(raw_poll) if isinstance(raw_poll, dict) else {}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "STOP_FAILED",
+            "reason": "functional-test-pause-reconciliation-error:"
+            + type(exc).__name__,
+            "authority": authority,
+            "runtime": runtime_result,
+        }
+    if (
+        poll_result.get("ok") is not True
+        or poll_result.get("coalesced") is True
+        or poll_result.get("errors")
+    ):
+        return {
+            "ok": False,
+            "status": "STOP_FAILED",
+            "reason": "functional-test-pause-broker-poll-incomplete",
+            "authority": authority,
+            "runtime": runtime_result,
+            "poll": poll_result,
+        }
+    after = functional_test_authority_mutation_assessment(
+        require_kis_reconciliation=True,
+    )
+    if after.get("allowed") is not True:
+        return {
+            "ok": False,
+            "status": "STOP_FAILED",
+            "reason": "functional-test-pause-reconciliation-unresolved:"
+            + ",".join(str(item) for item in after.get("blockers", [])),
+            "authority": authority,
+            "runtime": runtime_result,
+            "poll": poll_result,
+            "assessment": after,
+        }
+    return {
+        "ok": True,
+        "status": "PAUSED",
+        "reason": "functional-test-day-drained-and-reconciled",
+        "authority": authority,
+        "runtime": runtime_result,
+        "poll": poll_result,
+        "assessment": after,
+    }
 
 
 def start_execution_streams(broker_id: str = "all") -> dict[str, Any]:
@@ -14376,7 +20326,7 @@ def run_multi_strategy_cycle(checks: dict[str, Any], profile_id: str, strategy_e
             metadata={
                 **(source_intent.metadata if isinstance(source_intent.metadata, dict) else {}),
                 "multi_strategy": True,
-                "strategy_instance_id": f"net:{plan.instrument_id}",
+                "strategy_instance_id": lead_signal.strategy_instance_id,
                 "strategy_instance_ids": list(plan.sleeve_targets),
                 "contributing_strategy_ids": [
                     str(item.get("strategy_id") or "")

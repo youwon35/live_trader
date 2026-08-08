@@ -606,7 +606,43 @@ class LiveSafetyCompletionTests(unittest.TestCase):
                 "artifactHash": "a" * 64,
                 "contentHash": "b" * 64,
             },
+            "strategy_instance_id": "standalone:strategy-real-e2e",
+            "paper_live_qualification": {
+                "required": True,
+                "ready": True,
+                "issues": [],
+                "evidenceId": "paper-e2e",
+                "evidenceHash": "c" * 64,
+                "evidenceBundleHash": "e" * 64,
+                "bindingHash": "d" * 64,
+                "paperGovernanceDeploymentId": "paper-deployment-e2e",
+                "strategyArtifactId": "artifact-real-e2e",
+                "strategyArtifactHash": "a" * 64,
+                "strategyInstanceId": "standalone:strategy-real-e2e",
+                "portfolioRequired": False,
+                "portfolioArtifactId": "",
+                "portfolioArtifactHash": "",
+                "portfolioInstanceId": "",
+            },
         }
+        deployment_binding = {
+            "source": "deployment-store",
+            "deploymentId": "dep-real-e2e",
+            "revision": 2,
+            "lifecycle": "before-live-small",
+            "environment": "LIVE",
+            "mode": "SMALL_LIVE",
+            "executionPermissionDigest": "f" * 64,
+            "strategyArtifact": dict(strategy["artifact_reference"]),
+            "portfolioArtifact": {
+                "artifactId": "",
+                "artifactHash": "",
+                "contentHash": "",
+            },
+        }
+        deployment_binding["bindingHash"] = state.governance_sha256(
+            deployment_binding
+        )
         brokers = [
             {
                 "broker_id": "binance",
@@ -689,6 +725,10 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             ), patch.object(
                 state, "strategy_rows", return_value=[strategy]
             ), patch.object(
+                state,
+                "_current_live_deployment_binding",
+                return_value=deployment_binding,
+            ), patch.object(
                 state, "checklist_rows", return_value=[]
             ), patch.object(
                 state, "order_queue_summary", return_value={
@@ -751,11 +791,40 @@ class LiveSafetyCompletionTests(unittest.TestCase):
                     reason="e2e authorization only",
                     metadata={
                         "broker_id": "binance",
+                        "strategy_instance_id": "standalone:strategy-real-e2e",
                         "confirmed_bar_end": datetime.now().astimezone().isoformat(),
                     },
                 )
                 allowed, reason, authorization = (
                     state.operational_runtime_dispatch_allowed(intent)
+                )
+                missing_instance_allowed, missing_instance_reason, _ = (
+                    state.operational_runtime_dispatch_allowed(
+                        OrderIntent(
+                            **{
+                                **intent.__dict__,
+                                "metadata": {
+                                    "broker_id": "binance",
+                                    "confirmed_bar_end": intent.metadata[
+                                        "confirmed_bar_end"
+                                    ],
+                                },
+                            }
+                        )
+                    )
+                )
+                standalone_portfolio_allowed, standalone_portfolio_reason, _ = (
+                    state.operational_runtime_dispatch_allowed(
+                        OrderIntent(
+                            **{
+                                **intent.__dict__,
+                                "metadata": {
+                                    **intent.metadata,
+                                    "portfolio_id": "portfolio-not-authorized",
+                                },
+                            }
+                        )
+                    )
                 )
                 state.STATE["config_revision"] = 18
                 stale_allowed, stale_reason, _ = (
@@ -764,6 +833,16 @@ class LiveSafetyCompletionTests(unittest.TestCase):
 
             self.assertTrue(allowed, reason)
             self.assertTrue(authorization["allowed"])
+            self.assertFalse(missing_instance_allowed)
+            self.assertEqual(
+                "operational-strategy-instance-context-missing",
+                missing_instance_reason,
+            )
+            self.assertFalse(standalone_portfolio_allowed)
+            self.assertEqual(
+                "operational-standalone-portfolio-context-not-empty",
+                standalone_portfolio_reason,
+            )
             self.assertFalse(stale_allowed)
             self.assertEqual(
                 "operational-config-revision-changed",

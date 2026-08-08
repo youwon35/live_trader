@@ -31,9 +31,11 @@ class BinanceSmokeOrderTest(unittest.TestCase):
     def strategy() -> dict[str, object]:
         return {
             "strategy_id": "btc-qualified",
+            "strategy_instance_id": "standalone:btc-qualified",
             "symbol": "BTCUSDT",
             "provider": "binance",
             "live_small_eligible": True,
+            "portfolio_gate": {},
         }
 
     @staticmethod
@@ -71,13 +73,22 @@ class BinanceSmokeOrderTest(unittest.TestCase):
         self.assertTrue(preview["confirmation_token"])
         self.assertFalse(preview["used"])
         self.assertEqual("MARKET", preview["order_type"])
+        self.assertEqual(
+            "standalone:btc-qualified",
+            preview["strategy_instance_id"],
+        )
 
     def test_submit_requires_real_small_live_and_consumes_token_once(self) -> None:
         preview = self.preview()["preview"]
         token = preview["confirmation_token"]
 
         state.STATE["new_entries_blocked"] = False
-        blocked = state.submit_binance_smoke_order(token, confirmed=True)
+        with patch.object(
+            state,
+            "strategy_rows",
+            return_value=[self.strategy()],
+        ), patch.object(state, "snapshot", return_value={}):
+            blocked = state.submit_binance_smoke_order(token, confirmed=True)
         self.assertFalse(blocked["ok"])
         self.assertIn("SMALL_LIVE", blocked["reason"])
 
@@ -105,6 +116,14 @@ class BinanceSmokeOrderTest(unittest.TestCase):
             return_value=self.account(),
         ), patch.object(
             state,
+            "strategy_rows",
+            return_value=[self.strategy()],
+        ), patch.object(
+            state,
+            "snapshot",
+            return_value={},
+        ), patch.object(
+            state,
             "submit_order_intent",
             return_value=acknowledged,
         ) as submit:
@@ -113,6 +132,10 @@ class BinanceSmokeOrderTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         intent = submit.call_args.args[1]
         self.assertEqual("btc-qualified", intent.strategy_id)
+        self.assertEqual(
+            "standalone:btc-qualified",
+            intent.metadata["strategy_instance_id"],
+        )
         self.assertEqual(0.0001, intent.quantity)
         self.assertEqual("BROKER_SMOKE", intent.metadata["order_purpose"])
         self.assertIn("전략 신호 아님", intent.reason)
@@ -121,6 +144,33 @@ class BinanceSmokeOrderTest(unittest.TestCase):
 
         duplicate = state.submit_binance_smoke_order(token, confirmed=True)
         self.assertFalse(duplicate["ok"])
+
+    def test_submit_rejects_stale_preview_instance_before_network(self) -> None:
+        preview = self.preview()["preview"]
+        token = preview["confirmation_token"]
+        replacement = {
+            **self.strategy(),
+            "strategy_instance_id": "standalone:replacement",
+        }
+
+        with patch.object(
+            state,
+            "strategy_rows",
+            return_value=[replacement],
+        ), patch.object(state, "snapshot", return_value={}), patch.object(
+            state,
+            "_binance_ticker_price",
+        ) as ticker, patch.object(
+            state.LiveBrokerRouter,
+            "get_account_snapshot",
+        ) as account, patch.object(state, "submit_order_intent") as submit:
+            result = state.submit_binance_smoke_order(token, confirmed=True)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Instance", result["reason"])
+        ticker.assert_not_called()
+        account.assert_not_called()
+        submit.assert_not_called()
 
 
 if __name__ == "__main__":

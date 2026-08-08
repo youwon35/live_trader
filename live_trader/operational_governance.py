@@ -1220,12 +1220,37 @@ class OperationalGovernanceStore:
             metadata = json.loads(str(row["metadata_json"] or "{}"))
         except json.JSONDecodeError as exc:
             raise ValueError("runtime session metadata is corrupt") from exc
+        preflight_snapshot_id = str(row["preflight_snapshot_id"])
+        preflight_snapshot_hash = str(row["preflight_snapshot_hash"])
+        rebound = connection.execute(
+            """
+            SELECT payload_json
+            FROM live_runtime_events
+            WHERE session_id = ? AND event_type = 'PREFLIGHT_REBOUND'
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (str(session_id),),
+        ).fetchone()
+        if rebound is not None:
+            try:
+                rebound_payload = json.loads(str(rebound["payload_json"] or "{}"))
+            except json.JSONDecodeError as exc:
+                raise ValueError("runtime preflight binding event is corrupt") from exc
+            preflight_snapshot_id = _required_text(
+                rebound_payload.get("preflightSnapshotId"),
+                "preflightSnapshotId",
+            )
+            preflight_snapshot_hash = _required_sha256(
+                rebound_payload.get("preflightSnapshotHash"),
+                "preflightSnapshotHash",
+            )
         return RuntimeSession(
             session_id=str(row["session_id"]),
             deployment_id=str(row["deployment_id"]),
             deployment_manifest_hash=str(row["deployment_manifest_hash"]),
-            preflight_snapshot_id=str(row["preflight_snapshot_id"]),
-            preflight_snapshot_hash=str(row["preflight_snapshot_hash"]),
+            preflight_snapshot_id=preflight_snapshot_id,
+            preflight_snapshot_hash=preflight_snapshot_hash,
             config_revision=int(row["config_revision"]),
             config_hash=str(row["config_hash"]),
             profile=str(row["profile"]),
@@ -1265,6 +1290,81 @@ class OperationalGovernanceStore:
                 event_type=event_type,
                 actor=actor,
                 payload=payload or {},
+                occurred_at=current_time,
+            )
+        updated = self.get_runtime_session(session_id)
+        if updated is None:  # pragma: no cover - committed row invariant
+            raise RuntimeError("runtime session disappeared")
+        return updated
+
+    def rebind_runtime_preflight(
+        self,
+        session_id: str,
+        preflight_snapshot_id: str,
+        *,
+        actor: str,
+        occurred_at: datetime | str | None = None,
+    ) -> RuntimeSession:
+        """Append-only rebind a running session to a fresh exact-scope preflight."""
+
+        current_time = self._now(occurred_at)
+        with self._transaction() as connection:
+            session = self._runtime_session_conn(connection, session_id)
+            if session is None:
+                raise ValueError("runtime session not found")
+            if session.lifecycle not in {"RUNNING", "DEGRADED"}:
+                raise ValueError(
+                    "runtime preflight can only be rebound while RUNNING or DEGRADED"
+                )
+            validity = self._preflight_validity_conn(
+                connection,
+                preflight_snapshot_id,
+                current_time,
+            )
+            if validity.get("valid") is not True:
+                raise ValueError(
+                    "replacement preflight snapshot is not valid: "
+                    + ", ".join(str(item) for item in validity.get("reasons", []))
+                )
+            replacement = self._preflight_conn(connection, preflight_snapshot_id)
+            if replacement is None:  # pragma: no cover - validity invariant
+                raise ValueError("replacement preflight snapshot is missing")
+            if (
+                replacement.deployment_id != session.deployment_id
+                or replacement.deployment_manifest_hash
+                != session.deployment_manifest_hash
+                or replacement.config_revision != session.config_revision
+                or replacement.config_hash != session.config_hash
+            ):
+                raise ValueError(
+                    "replacement preflight snapshot is outside the runtime session scope"
+                )
+            manifest = self._manifest_by_hash_conn(
+                connection,
+                session.deployment_manifest_hash,
+            )
+            if (
+                manifest is None
+                or replacement.account_fingerprint != manifest.account_fingerprint
+            ):
+                raise ValueError(
+                    "replacement preflight account fingerprint does not match the session"
+                )
+            self._append_runtime_event_conn(
+                connection,
+                session.session_id,
+                lifecycle=session.lifecycle,
+                event_type="PREFLIGHT_REBOUND",
+                actor=actor,
+                payload={
+                    "previousPreflightSnapshotId": session.preflight_snapshot_id,
+                    "previousPreflightSnapshotHash": session.preflight_snapshot_hash,
+                    "preflightSnapshotId": replacement.snapshot_id,
+                    "preflightSnapshotHash": replacement.snapshot_hash,
+                    "deploymentManifestHash": session.deployment_manifest_hash,
+                    "configHash": session.config_hash,
+                    "accountFingerprint": replacement.account_fingerprint,
+                },
                 occurred_at=current_time,
             )
         updated = self.get_runtime_session(session_id)

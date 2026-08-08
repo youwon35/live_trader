@@ -58,6 +58,8 @@ class UpbitSmokeOrderTest(unittest.TestCase):
             "broker_id": "upbit",
             "lifecycle_status": "before-live-small",
             "live_small_eligible": True,
+            "strategy_instance_id": "upbit-btc-qualified-instance",
+            "deployment_id": "upbit-btc-live-deployment",
         }
 
     def preview(self) -> dict[str, object]:
@@ -170,6 +172,7 @@ class UpbitSmokeOrderTest(unittest.TestCase):
         state.STATE["dry_run"] = False
         state.STATE["new_entries_blocked"] = False
         state.STATE["kill_switch"] = False
+        state.STATE["operator_confirmed"] = True
         order_payload = {
             "uuid": "upbit-order-1",
             "state": "done",
@@ -181,10 +184,27 @@ class UpbitSmokeOrderTest(unittest.TestCase):
             "get_account_snapshot",
             return_value=self.account_snapshot(),
         ), patch.object(
-            state.LiveBrokerRouter,
-            "place_order",
-            return_value={"ok": True, "statusCode": 201, "json": {"uuid": "upbit-order-1", "state": "wait"}},
-        ) as place_order, patch.object(
+            state,
+            "submit_order_intent",
+            return_value={
+                "ok": True,
+                "reason": "broker-acknowledged",
+                "order": {
+                    "order_id": "LIVE-1",
+                    "state": "acknowledged",
+                    "broker_order_id": "upbit-order-1",
+                    "broker_response": {
+                        "ok": True,
+                        "statusCode": 201,
+                        "json": {
+                            "uuid": "upbit-order-1",
+                            "state": "wait",
+                        },
+                    },
+                },
+                "snapshot": {},
+            },
+        ) as submit_intent, patch.object(
             state.LiveBrokerRouter,
             "get_upbit_order",
             return_value=order_payload,
@@ -201,14 +221,121 @@ class UpbitSmokeOrderTest(unittest.TestCase):
         self.assertEqual(result["order"]["executed_funds"], 5000.0)
         self.assertTrue(result["order"]["used"])
         self.assertEqual(result["order"]["confirmation_token"], "")
-        sent = place_order.call_args.args[0]
-        self.assertEqual(sent["market"], "KRW-BTC")
-        self.assertEqual(sent["strategy_id"], "upbit-btc-qualified")
-        self.assertEqual(sent["order_type"], "price")
-        self.assertEqual(sent["notional"], 5000)
+        submit_intent.assert_called_once()
+        sent = submit_intent.call_args.args[1]
+        self.assertEqual(sent.symbol, "KRW-BTC")
+        self.assertEqual(sent.strategy_id, "upbit-btc-qualified")
+        self.assertEqual(sent.metadata["order_type"], "price")
+        self.assertEqual(sent.notional, 5000)
+        self.assertEqual(submit_intent.call_args.kwargs["dry_run"], False)
 
         duplicate = state.submit_upbit_smoke_order(token, confirmed=True)
         self.assertFalse(duplicate["ok"])
+
+    def test_submit_blocks_before_place_order_when_operational_binding_is_stale(self) -> None:
+        preview = self.preview()["preview"]
+        token = preview["confirmation_token"]
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["dry_run"] = False
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["kill_switch"] = False
+        state.STATE["operator_confirmed"] = True
+        with patch.dict(
+            os.environ,
+            {"LIVE_TRADER_ENABLE_REAL_ORDERS": "true"},
+        ), patch.object(
+            state.LiveBrokerRouter,
+            "get_account_snapshot",
+            return_value=self.account_snapshot(),
+        ), patch.object(
+            state,
+            "submit_order_intent",
+            return_value={
+                "ok": False,
+                "reason": "operational-paper-final-binding-changed",
+                "order": {"state": "risk_blocked"},
+                "snapshot": {},
+            },
+        ) as submit_intent, patch.object(
+            state.LiveBrokerRouter,
+            "place_order",
+        ) as place_order:
+            result = state.submit_upbit_smoke_order(token, confirmed=True)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("operational-paper-final-binding-changed", result["reason"])
+        submit_intent.assert_called_once()
+        place_order.assert_not_called()
+
+    def test_submit_requires_operator_confirmation_before_common_dispatch(self) -> None:
+        preview = self.preview()["preview"]
+        token = preview["confirmation_token"]
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["dry_run"] = False
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["kill_switch"] = False
+        state.STATE["operator_confirmed"] = False
+
+        with patch.dict(
+            os.environ,
+            {"LIVE_TRADER_ENABLE_REAL_ORDERS": "true"},
+        ), patch.object(
+            state,
+            "submit_order_intent",
+        ) as submit_intent, patch.object(
+            state.LiveBrokerRouter,
+            "place_order",
+        ) as place_order:
+            result = state.submit_upbit_smoke_order(token, confirmed=True)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("운용자", result["reason"])
+        submit_intent.assert_not_called()
+        place_order.assert_not_called()
+
+    def test_common_dispatch_unknown_outcome_is_exposed_for_reconciliation(
+        self,
+    ) -> None:
+        preview = self.preview()["preview"]
+        token = preview["confirmation_token"]
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["dry_run"] = False
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["kill_switch"] = False
+        state.STATE["operator_confirmed"] = True
+
+        with patch.dict(
+            os.environ,
+            {"LIVE_TRADER_ENABLE_REAL_ORDERS": "true"},
+        ), patch.object(
+            state.LiveBrokerRouter,
+            "get_account_snapshot",
+            return_value=self.account_snapshot(),
+        ), patch.object(
+            state,
+            "submit_order_intent",
+            return_value={
+                "ok": False,
+                "reason": "network-outcome-unknown",
+                "order": {
+                    "order_id": "LIVE-UNKNOWN-1",
+                    "state": "unknown",
+                    "queue_state": "reconcile_required",
+                },
+                "snapshot": {},
+            },
+        ) as submit_intent, patch.object(
+            state.LiveBrokerRouter,
+            "place_order",
+        ) as direct_place:
+            result = state.submit_upbit_smoke_order(token, confirmed=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("unknown", result["order"]["status"])
+        self.assertIn("조정", result["order"]["status_label"])
+        self.assertTrue(result["order"]["used"])
+        submit_intent.assert_called_once()
+        direct_place.assert_not_called()
 
     def test_market_buy_cancel_with_trades_is_reported_as_filled_remainder_cancelled(self) -> None:
         state.STATE["upbit_smoke_order"] = {

@@ -4,6 +4,8 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
+import sys
 import threading
 import time
 import urllib.error
@@ -13,6 +15,19 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Literal
+
+
+for parent in Path(__file__).resolve().parents:
+    shared_runtime = parent / "packages" / "trading_runtime"
+    if shared_runtime.exists():
+        if str(shared_runtime) not in sys.path:
+            sys.path.insert(0, str(shared_runtime))
+        break
+
+from trading_runtime.kis_rate_limiter import (
+    GLOBAL_KIS_REST_LIMITERS,
+    KisRestRateLimitError,
+)
 
 
 OrderSide = Literal["BUY", "SELL"]
@@ -434,7 +449,15 @@ def build_kis_live_order_request(intent: dict[str, object], *, access_token: str
     )
 
 
-def build_kis_domestic_balance_request(*, access_token: str = "") -> PreparedRequest:
+def build_kis_domestic_balance_request(
+    *,
+    access_token: str = "",
+    context_fk100: str = "",
+    context_nk100: str = "",
+    continuation: str = "",
+) -> PreparedRequest:
+    """Build one page of the official KIS domestic balance request."""
+
     required = ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE")
     blocked = missing_env(*required)
     app_key = env_value("KIS_APP_KEY")
@@ -443,8 +466,11 @@ def build_kis_domestic_balance_request(*, access_token: str = "") -> PreparedReq
     product_code = env_value("KIS_ACCOUNT_PRODUCT_CODE")
     base_url = env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL
     cano, acnt_prdt_cd = split_kis_account(account_no, product_code)
+    normalized_continuation = str(continuation or "").strip().upper()
     if not access_token:
         blocked.append("access_token")
+    if normalized_continuation not in {"", "N"}:
+        blocked.append("continuation")
     query: dict[str, object] = {
         "CANO": cano,
         "ACNT_PRDT_CD": acnt_prdt_cd,
@@ -455,8 +481,8 @@ def build_kis_domestic_balance_request(*, access_token: str = "") -> PreparedReq
         "FUND_STTL_ICLD_YN": "N",
         "FNCG_AMT_AUTO_RDPT_YN": "N",
         "PRCS_DVSN": "00",
-        "CTX_AREA_FK100": "",
-        "CTX_AREA_NK100": "",
+        "CTX_AREA_FK100": str(context_fk100 or ""),
+        "CTX_AREA_NK100": str(context_nk100 or ""),
     }
     headers = {
         "content-type": "application/json; charset=utf-8",
@@ -466,6 +492,8 @@ def build_kis_domestic_balance_request(*, access_token: str = "") -> PreparedReq
         "tr_id": KIS_DOMESTIC_BALANCE_TR_ID,
         "custtype": "P",
     }
+    if normalized_continuation:
+        headers["tr_cont"] = normalized_continuation
     encoded = urllib.parse.urlencode(query)
     return PreparedRequest(
         provider="kis",
@@ -479,6 +507,7 @@ def build_kis_domestic_balance_request(*, access_token: str = "") -> PreparedReq
             "appkey_configured": bool(app_key),
             "appsecret_configured": bool(app_secret),
             "tr_id": KIS_DOMESTIC_BALANCE_TR_ID,
+            "tr_cont": normalized_continuation,
             "custtype": "P",
         },
         body=None,
@@ -1341,6 +1370,7 @@ def _send_kis_http_json(
             else 0
         )
         for attempt in range(retry_count + 1):
+            _acquire_shared_kis_rest_slot(url)
             response = http_json(
                 method,
                 url,
@@ -1356,6 +1386,42 @@ def _send_kis_http_json(
             # ambiguous even when the client only sees a transport failure.
             time.sleep(max(2.1, interval * (2 ** attempt)))
         return response
+
+
+def _acquire_shared_kis_rest_slot(url: str) -> float:
+    """Reserve the correct fail-closed KIS slot immediately before I/O."""
+
+    app_key = env_value("KIS_APP_KEY")
+    if not app_key:
+        raise KisRestRateLimitError(
+            "KIS APP key identity is missing; REST request blocked"
+        )
+    app_key_id = "sha256:" + hashlib.sha256(app_key.encode("utf-8")).hexdigest()
+    endpoint = urllib.parse.urlsplit(str(url or "")).path.rstrip("/")
+    if endpoint == KIS_TOKEN_ENDPOINT.rstrip("/"):
+        # KIS documents tokenP as a separate app-key-scoped 1 request/second
+        # budget. It must not borrow capacity from the normal Live REST pool.
+        return GLOBAL_KIS_REST_LIMITERS.get_token(app_key_id).acquire()
+
+    account_material = "\0".join(
+        (
+            env_value("KIS_ACCOUNT_NO"),
+            env_value("KIS_ACCOUNT_PRODUCT_CODE"),
+        )
+    ).strip("\0")
+    if not account_material:
+        raise KisRestRateLimitError(
+            "KIS account identity is missing; REST request blocked"
+        )
+    account_id = (
+        "sha256:"
+        + hashlib.sha256(account_material.encode("utf-8")).hexdigest()
+    )
+    return GLOBAL_KIS_REST_LIMITERS.get(
+        account_id,
+        app_key_id,
+        "PROD",
+    ).acquire()
 
 
 def _reset_kis_request_pacer() -> None:

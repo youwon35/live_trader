@@ -11,6 +11,7 @@ const viewports = [
 const tabs = [
   { label: "운영 현황", requiredHeadings: ["현재 Deployment", "Preflight 범위·유효성"] },
   { label: "배포·승급", requiredHeadings: ["승급 준비 큐", "데이터·전략 계보"] },
+  { label: "기능시험", requiredHeadings: ["실전 기능시험", "시험 대상과 기간", "기간과 활성화 상태"] },
   { label: "계좌·포지션", requiredHeadings: ["계좌·포지션 3자 대조", "내 계좌·보유 포지션"] },
   { label: "주문·체결", requiredHeadings: ["주문 상태 원장", "주문 타임라인", "체결 원장", "실행 품질"] },
   { label: "리스크·안전", requiredHeadings: ["현재 리스크 사용량", "요청별 재시도 원칙"] },
@@ -64,7 +65,7 @@ try {
     const navigationLabels = await page.locator(".nav-item").allTextContents();
     const normalizedNavigationLabels = navigationLabels.map((label) => label.trim());
     if (JSON.stringify(normalizedNavigationLabels) !== JSON.stringify(expectedNavigationLabels)) {
-      issues.push(`${viewport.name}: navigation must contain exactly the 9 operational menus (${normalizedNavigationLabels.join(", ")})`);
+      issues.push(`${viewport.name}: navigation must contain exactly the 10 operational menus (${normalizedNavigationLabels.join(", ")})`);
     }
 
     const environmentBar = page.locator('[aria-label="LIVE 환경 및 안전 상태"]');
@@ -218,6 +219,17 @@ try {
         }
         if (!await page.getByRole("button", { name: /MONITOR Run/, exact: true }).count()) {
           issues.push(`${viewport.name}/${tab.label}: Deployment-bound MONITOR Run action is missing`);
+        }
+      }
+      if (tab.label === "기능시험") {
+        if (!await page.getByText("promotionEligible=false", { exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: non-promotion boundary is missing`);
+        }
+        if (!await page.getByRole("button", { name: "허가서 준비", exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: permit readiness action is missing`);
+        }
+        if (!await page.getByRole("button", { name: "오늘 활성화", exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: daily activation action is missing`);
         }
       }
       if (tab.label === "감사 기록" && !await page.getByText(/append-only 원장/).count()) {

@@ -20,9 +20,10 @@ from live_trader.execution_streams import parse_upbit_my_order
 from live_trader.program_ledger import ProgramLedger
 from trading_runtime import (
     DeploymentStore,
-    build_paper_portfolio_evidence,
     seal_strategy_artifact,
+    stable_sha256,
 )
+from test_exact_paper_live_binding import exact_evidence_for_artifact
 
 
 class OrderGateTest(unittest.TestCase):
@@ -65,6 +66,11 @@ class OrderGateTest(unittest.TestCase):
         artifact_hash: str = "current-artifact-hash",
         validated_until: str = "2099-01-01T00:00:00+00:00",
     ) -> dict:
+        normalized_artifact_hash = (
+            artifact_hash
+            if len(artifact_hash) == 64
+            else stable_sha256(artifact_hash)
+        )
         return {
             "id": strategy_id,
             "strategy_id": strategy_id,
@@ -82,8 +88,8 @@ class OrderGateTest(unittest.TestCase):
             "promotion": {"stage": lifecycle, "history": []},
             "artifactLock": {
                 "schemaVersion": "strategy-artifact-lock-v1",
-                "lockId": f"lock-{artifact_hash}",
-                "artifactHash": artifact_hash,
+                "lockId": f"lock-{normalized_artifact_hash}",
+                "artifactHash": normalized_artifact_hash,
             },
             "finalTest": {"status": "pass", "passed": True},
             "portfolioCandidate": {"approved": True, "blockers": []},
@@ -115,42 +121,21 @@ class OrderGateTest(unittest.TestCase):
         recovery_verified: bool = True,
         reconciliation_mismatches: int = 0,
         ended_at: str = "2026-07-25T00:00:00+00:00",
-        promotion_source: str = "continuous-live-forward-closed-bar-v2",
-    ) -> None:
-        evidence = build_paper_portfolio_evidence(
+        promotion_source: str = "continuous-live-forward-next-open-v3",
+    ) -> dict:
+        evidence, pins = exact_evidence_for_artifact(
+            artifact_reference_payload,
             evidence_id=evidence_id,
-            strategy_artifact=artifact_reference_payload,
-            portfolio_artifact=None,
-            deployment_id=f"dep:{artifact_reference_payload['id']}:standalone:live",
-            runtime_version="paper-trader-react-v1",
-            started_at="2026-06-25T00:00:00+00:00",
+            observed_days=observed_days,
+            observed_seconds=observed_seconds,
+            regime_count=regime_count,
+            recovery_verified=recovery_verified,
+            reconciliation_mismatches=reconciliation_mismatches,
             ended_at=ended_at,
-            status="submitted",
-            filled_count=5,
-            rejected_count=0,
-            order_count=5,
-            metrics={
-                "paperOrderCount": 5,
-                "forwardObservedDays": observed_days,
-                "forwardElapsedSeconds": observed_seconds,
-                "forwardRegimeCount": regime_count,
-                "recoveryVerified": recovery_verified,
-                "reconciliationMismatches": reconciliation_mismatches,
-            },
-            details={
-                "evidencePolicy": {
-                    "promotionSource": promotion_source,
-                },
-                "lifecyclePolicy": {
-                    "action": "PROMOTE",
-                    "targetStage": "before-live-small",
-                    "inputs": {
-                        "reconciliation_mismatches": reconciliation_mismatches,
-                    },
-                },
-            },
+            promotion_source=promotion_source,
         )
         state.EvidenceStore(artifact_dir).save_paper(evidence)
+        return pins
 
     def run_resume_scenario(
         self,
@@ -158,23 +143,64 @@ class OrderGateTest(unittest.TestCase):
         *,
         evidence_artifact: dict | None = None,
         evidence_options: dict | None = None,
+        persist_live_deployment_permissions: bool = True,
     ) -> tuple[dict, dict, dict]:
         previous_artifact_dir = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact_dir = Path(temp_dir)
             os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
+            artifact_payload = copy.deepcopy(artifact_payload)
+            if evidence_artifact is not None:
+                pins = self.save_resume_evidence(
+                    artifact_dir,
+                    evidence_artifact,
+                    **(evidence_options or {}),
+                )
+                artifact_payload.setdefault("permissions", {}).update(pins)
             artifact_path = artifact_dir / "strategy.json"
             artifact_path.write_text(
                 json.dumps(artifact_payload, ensure_ascii=False),
                 encoding="utf-8",
             )
-            if evidence_artifact is not None:
-                self.save_resume_evidence(
-                    artifact_dir,
-                    evidence_artifact,
-                    **(evidence_options or {}),
-                )
             try:
+                # Paper evidence pins become Live authority only after an
+                # explicit Live Deployment transition.  The production
+                # migration path intentionally refuses to inherit Artifact
+                # permissions, so this fixture models the governance step
+                # instead of relying on the legacy Artifact fallback.
+                (
+                    strategy_dir,
+                    _artifact_path,
+                    raw_payload,
+                    normalized,
+                ) = state.find_strategy_artifact_payload(
+                    artifact_payload["strategy_id"]
+                )
+                assert strategy_dir is not None
+                assert raw_payload is not None
+                assert normalized is not None
+                deployment_store, live_deployment, _portfolio = (
+                    state.ensure_live_deployment(
+                        strategy_dir,
+                        raw_payload,
+                        normalized,
+                    )
+                )
+                if persist_live_deployment_permissions:
+                    deployment_store.transition(
+                        live_deployment["deploymentId"],
+                        lifecycle=state.normalize_lifecycle_status(
+                            normalized.get("lifecycle_status") or "draft"
+                        ),
+                        mode="MONITOR",
+                        permissions=dict(
+                            artifact_payload.get("permissions") or {}
+                        ),
+                        actor="test-live-deployment-governance",
+                        reason=(
+                            "persist exact Paper pins on the Live Deployment"
+                        ),
+                    )
                 with patch("live_trader.state.snapshot", return_value={}), patch(
                     "live_trader.state.append_audit",
                 ):
@@ -422,6 +448,211 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(trace_stages[-1], "ORDER_CREATED" if result["ok"] else "BLOCKED")
         self.assertTrue(state.LIVE_OMS.verify_event_chain(order["oms_order_id"]))
         self.assertFalse(order["idempotency_duplicate"])
+
+    def test_small_live_supported_brokers_record_exact_canary_scope_before_gate(self) -> None:
+        state.STATE["orders"] = []
+        state.STATE["persisted_idempotency_keys"] = []
+        checks = {"summary": {"blocker_count": 0}}
+        blocked_report = state.PreTradeRiskReport(
+            datetime(2026, 8, 4),
+            (state.RiskCheck("unit", "fail", "deliberate block"),),
+        )
+
+        def exact_scope(strategy_id: str, *, materialize: bool) -> dict:
+            self.assertTrue(materialize)
+            return {
+                "schemaVersion": state.CANARY_SCOPE_SCHEMA_VERSION,
+                "eligible": True,
+                "strategyId": strategy_id,
+                "strategyInstanceId": f"{strategy_id}-instance",
+            }
+
+        with patch.object(
+            state,
+            "current_live_canary_scope",
+            side_effect=exact_scope,
+        ) as current_scope, patch.object(
+            state,
+            "evaluate_order_gate_with_report",
+            return_value=(
+                False,
+                "risk_blocked",
+                "blocked",
+                "deliberate-block",
+                blocked_report,
+            ),
+        ), patch.object(
+            state,
+            "dispatch_live_order_with_checkpoint",
+        ) as dispatch, patch(
+            "live_trader.state.snapshot",
+            return_value=checks,
+        ):
+            for revision, (broker_id, symbol, asset) in enumerate(
+                (
+                    ("kis", "069500.KS", "kr-stock"),
+                    ("binance", "BTCUSDT", "CRYPTO"),
+                    ("upbit", "KRW-BTC", "CRYPTO"),
+                ),
+                start=9_876_543,
+            ):
+                strategy_id = f"CANARY-{broker_id.upper()}"
+                intent = state.OrderIntent(
+                    strategy_id=strategy_id,
+                    asset=asset,
+                    symbol=symbol,
+                    side="BUY",
+                    quantity=0.001,
+                    reference_price=60_000,
+                    mode="SMALL_LIVE",
+                    reason="unit canary scope",
+                    metadata={
+                        "broker_id": broker_id,
+                        "strategy_instance_id": f"{strategy_id}-instance",
+                        "portfolio_id": "",
+                        "instrument_id": f"{broker_id}:{symbol}",
+                        "target_revision": revision,
+                    },
+                )
+                result = state.submit_order_intent(
+                    checks,
+                    intent,
+                    dry_run=False,
+                    audit_event=f"{broker_id} canary scope test",
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(
+                    strategy_id,
+                    result["order"]["canary_scope"]["strategyId"],
+                )
+                current_scope.assert_any_call(
+                    strategy_id,
+                    materialize=True,
+                )
+
+        self.assertEqual(3, current_scope.call_count)
+        dispatch.assert_not_called()
+
+    def test_small_live_supported_brokers_block_missing_or_invalid_canary_scope(self) -> None:
+        state.STATE["orders"] = []
+        state.STATE["audit"] = []
+        state.STATE["persisted_idempotency_keys"] = []
+        checks = {"summary": {"blocker_count": 0}}
+        passing_report = state.PreTradeRiskReport(
+            datetime(2026, 8, 4),
+            (state.RiskCheck("unit", "pass", "base gate passed"),),
+        )
+
+        def unavailable_scope(strategy_id: str, *, materialize: bool) -> dict:
+            self.assertTrue(materialize)
+            if strategy_id.endswith("-MISSING"):
+                return {}
+            return {
+                "schemaVersion": state.CANARY_SCOPE_SCHEMA_VERSION,
+                "eligible": False,
+                "issues": ["paper-live-qualification:pin-mismatch"],
+            }
+
+        brokers = (
+            ("kis", "069500.KS", "kr-stock"),
+            ("binance", "BTCUSDT", "CRYPTO"),
+            ("upbit", "KRW-BTC", "CRYPTO"),
+            ("binance-futures", "ETHUSDT", "CRYPTO"),
+        )
+        with patch.object(
+            state,
+            "current_live_canary_scope",
+            side_effect=unavailable_scope,
+        ) as current_scope, patch.object(
+            state,
+            "evaluate_order_gate_with_report",
+            return_value=(
+                True,
+                "approved",
+                "queued",
+                "risk pass",
+                passing_report,
+            ),
+        ), patch.object(
+            state,
+            "dispatch_live_order_with_checkpoint",
+        ) as dispatch, patch(
+            "live_trader.state.snapshot",
+            return_value=checks,
+        ):
+            revision = 10_000_000
+            for broker_id, symbol, asset in brokers:
+                for scope_case in ("MISSING", "INVALID"):
+                    revision += 1
+                    strategy_id = (
+                        f"CANARY-{broker_id.upper()}-{scope_case}"
+                    )
+                    intent = state.OrderIntent(
+                        strategy_id=strategy_id,
+                        asset=asset,
+                        symbol=symbol,
+                        side="BUY",
+                        quantity=0.001,
+                        reference_price=60_000,
+                        mode="SMALL_LIVE",
+                        reason="unit missing canary scope",
+                        metadata={
+                            "broker_id": broker_id,
+                            "strategy_instance_id": (
+                                f"{strategy_id}-instance"
+                            ),
+                            "portfolio_id": "",
+                            "instrument_id": f"{broker_id}:{symbol}",
+                            "target_revision": revision,
+                        },
+                    )
+
+                    result = state.submit_order_intent(
+                        checks,
+                        intent,
+                        dry_run=False,
+                        audit_event=f"{broker_id} invalid scope test",
+                    )
+
+                    self.assertFalse(result["ok"])
+                    order = result["order"]
+                    expected_reason = (
+                        "live-canary-scope-missing"
+                        if scope_case == "MISSING"
+                        else "live-canary-scope-invalid:"
+                        "paper-live-qualification:pin-mismatch"
+                    )
+                    self.assertEqual("risk_blocked", order["state"])
+                    self.assertEqual("blocked", order["queue_state"])
+                    self.assertEqual(expected_reason, order["reason"])
+                    self.assertEqual(
+                        expected_reason,
+                        order["canary_scope_error"],
+                    )
+                    self.assertTrue(
+                        any(
+                            check["label"] == "Live Canary Scope"
+                            and check["status"] == "fail"
+                            and check["detail"] == expected_reason
+                            for check in order["risk_report"]["checks"]
+                        )
+                    )
+                    self.assertIn(
+                        expected_reason,
+                        state.STATE["audit"][-1]["detail"],
+                    )
+                    self.assertIn(
+                        "Live Canary Scope",
+                        state.STATE["audit"][-1]["detail"],
+                    )
+                    current_scope.assert_any_call(
+                        strategy_id,
+                        materialize=True,
+                    )
+
+        self.assertEqual(8, current_scope.call_count)
+        dispatch.assert_not_called()
 
     def test_durable_global_kill_blocks_order_even_if_local_switch_is_off(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1286,9 +1517,36 @@ class OrderGateTest(unittest.TestCase):
         self.assertFalse(deployment["permissions"]["live_allowed"])
         self.assertIn("Paper Trader", resume["reason"])
         self.assertIn(
-            "paper-live-forward-evidence-missing",
-            deployment["permissions"]["resumeEvidence"]["blockers"],
+            "paper-live-deployment-pin-missing",
+            deployment["permissions"]["resumeEvidence"]["blockers"][0],
         )
+
+    def test_artifact_pins_cannot_be_laundered_through_pause_and_resume(self) -> None:
+        artifact = self.resume_artifact("RESUME-ARTIFACT-PINS")
+
+        pause, resume, deployment = self.run_resume_scenario(
+            artifact,
+            evidence_artifact=artifact,
+            persist_live_deployment_permissions=False,
+        )
+
+        self.assertTrue(pause["ok"])
+        self.assertTrue(resume["ok"], resume["reason"])
+        self.assertEqual("papered", deployment["lifecycle"])
+        self.assertFalse(deployment["permissions"]["live_small_eligible"])
+        self.assertIn(
+            "paper-live-deployment-pin-missing",
+            deployment["permissions"]["resumeEvidence"]["blockers"][0],
+        )
+        for key in (
+            "paperEvidenceId",
+            "paperEvidenceHash",
+            "paperEvidenceBundleHash",
+            "paperFinalBindingHash",
+            "paperGovernanceDeploymentId",
+            "paperStrategyInstanceId",
+        ):
+            self.assertNotIn(key, deployment["permissions"])
 
     def test_before_live_small_resume_rejects_stale_revalidation(self) -> None:
         artifact = self.resume_artifact(
@@ -1315,7 +1573,7 @@ class OrderGateTest(unittest.TestCase):
         _pause, resume, deployment = self.run_resume_scenario(
             artifact,
             evidence_artifact=artifact,
-            evidence_options={"ended_at": "2026-07-24T23:59:59+00:00"},
+            evidence_options={"ended_at": "2026-07-24T23:59:00+00:00"},
         )
 
         self.assertTrue(resume["ok"], resume["reason"])
@@ -1345,7 +1603,7 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual("papered", deployment["lifecycle"])
         self.assertFalse(deployment["permissions"]["live_small_eligible"])
         self.assertIn(
-            "paper-evidence-artifact-hash-mismatch",
+            "paper-live-expected-strategy-artifact-hash-mismatch",
             deployment["permissions"]["resumeEvidence"]["blockers"],
         )
 
@@ -1365,7 +1623,7 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual("papered", deployment["lifecycle"])
         self.assertFalse(deployment["permissions"]["live_small_eligible"])
         self.assertIn(
-            "paper-observation-seconds:2505600/2592000",
+            "paper-artifact-observation-window-too-short",
             deployment["permissions"]["resumeEvidence"]["blockers"],
         )
 
@@ -1378,7 +1636,7 @@ class OrderGateTest(unittest.TestCase):
         )
 
         self.assertTrue(resume["ok"], resume["reason"])
-        self.assertEqual("before-live-small", deployment["lifecycle"])
+        self.assertEqual("before-live-small", deployment["lifecycle"], deployment)
         self.assertTrue(deployment["permissions"]["resumeEvidence"]["ready"])
         self.assertTrue(deployment["permissions"]["paper_trader_verified"])
         self.assertTrue(deployment["permissions"]["live_small_eligible"])
@@ -1506,6 +1764,32 @@ class OrderGateTest(unittest.TestCase):
                 },
             })
             artifact_path.write_text(json.dumps(artifact_payload, ensure_ascii=False), encoding="utf-8")
+            paper_evidence, paper_pins = exact_evidence_for_artifact(
+                artifact_payload,
+                evidence_id="paper-live-promote-1",
+            )
+            state.EvidenceStore(artifact_dir).save_paper(paper_evidence)
+            deployment_store = DeploymentStore(artifact_dir)
+            definition = deployment_store.create_definition(
+                deployment_id="dep:LIVE-PROMOTE-1:standalone:live",
+                strategy_artifact=artifact_payload,
+                portfolio_artifact=None,
+                account_id="live-account-unresolved",
+                environment="SMALL_LIVE",
+                symbol="BTCUSDT",
+                route="crypto",
+            )
+            deployment_store.transition(
+                definition["deploymentId"],
+                lifecycle="before-live-small",
+                mode="MONITOR",
+                actor="unit-test",
+                reason="exact Paper final binding pinned",
+                permissions={
+                    **artifact_payload["permissions"],
+                    **paper_pins,
+                },
+            )
             immutable_source = artifact_path.read_bytes()
             ledger = self.use_temp_program_ledger(temp_dir)
             scope = state.current_live_canary_scope(
@@ -1598,8 +1882,8 @@ class OrderGateTest(unittest.TestCase):
             scope["scopeId"],
             evidence["details"]["canaryScope"]["scopeId"],
         )
-        self.assertEqual(scope["scopeId"], post_promotion_scope["scopeId"])
-        self.assertEqual(3, post_promotion_summary["fills"])
+        self.assertNotEqual(scope["scopeId"], post_promotion_scope["scopeId"])
+        self.assertEqual(0, post_promotion_summary["fills"])
         self.assertTrue(evidence["integrity"]["contentHash"])
 
     def test_local_filled_rows_without_broker_events_never_count_as_canary(self) -> None:
@@ -1659,7 +1943,7 @@ class OrderGateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact_dir = Path(temp_dir)
             os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(artifact_dir)
-            payload = {
+            payload = seal_strategy_artifact({
                 "id": "CANARY-RESUME",
                 "strategy_id": "CANARY-RESUME",
                 "name": "Canary Resume",
@@ -1669,15 +1953,40 @@ class OrderGateTest(unittest.TestCase):
                 "plugin": "moving_average_cross",
                 "lifecycle": {"status": "before-live-small"},
                 "permissions": {"live_small_eligible": True},
-            }
+            })
             (artifact_dir / "strategy.json").write_text(
                 json.dumps(payload),
                 encoding="utf-8",
             )
+            paper_evidence, paper_pins = exact_evidence_for_artifact(
+                payload,
+                evidence_id="paper-canary-resume",
+            )
+            state.EvidenceStore(artifact_dir).save_paper(paper_evidence)
+            store = DeploymentStore(artifact_dir)
+            definition = store.create_definition(
+                deployment_id="dep:CANARY-RESUME:standalone:live",
+                strategy_artifact=payload,
+                portfolio_artifact=None,
+                account_id="live-account-unresolved",
+                environment="SMALL_LIVE",
+                symbol="BTCUSDT",
+                route="crypto",
+            )
+            store.transition(
+                definition["deploymentId"],
+                lifecycle="before-live-small",
+                mode="MONITOR",
+                permissions={
+                    **payload["permissions"],
+                    **paper_pins,
+                },
+                actor="unit",
+                reason="exact canary binding",
+            )
             ledger = self.use_temp_program_ledger(temp_dir)
             first_scope = state.current_live_canary_scope(
                 "CANARY-RESUME",
-                materialize=True,
             )
             event_time = (
                 datetime.fromisoformat(
@@ -1717,7 +2026,6 @@ class OrderGateTest(unittest.TestCase):
                 )
             ledger.record_execution_events(events)
             before = state.live_small_execution_summary("CANARY-RESUME")
-            store = DeploymentStore(artifact_dir)
             current = store.list()[0]
             permissions = dict(current.get("permissions") or {})
             store.transition(
@@ -1749,6 +2057,141 @@ class OrderGateTest(unittest.TestCase):
                     os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)
                 else:
                     os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = previous_artifact_dir
+
+    def test_exact_paper_pin_transition_invalidates_prior_canary_fills(self) -> None:
+        previous_artifact_dir = os.environ.get(
+            "LIVE_TRADER_STRATEGY_ARTIFACT_DIR"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_dir = Path(temp_dir)
+            os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = str(
+                artifact_dir
+            )
+            payload = seal_strategy_artifact(
+                {
+                    "id": "CANARY-PIN-CHANGE",
+                    "strategy_id": "CANARY-PIN-CHANGE",
+                    "name": "Canary Pin Change",
+                    "symbol": "BTCUSDT",
+                    "asset": "CRYPTO",
+                    "timeframe": "5m",
+                    "plugin": "moving_average_cross",
+                    "lifecycle": {"status": "before-live-small"},
+                    "permissions": {"live_small_eligible": True},
+                }
+            )
+            (artifact_dir / "strategy.json").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            first_evidence, first_pins = exact_evidence_for_artifact(
+                payload,
+                evidence_id="paper-canary-first",
+            )
+            second_evidence, second_pins = exact_evidence_for_artifact(
+                payload,
+                evidence_id="paper-canary-second",
+            )
+            evidence_store = state.EvidenceStore(artifact_dir)
+            evidence_store.save_paper(first_evidence)
+            evidence_store.save_paper(second_evidence)
+            store = DeploymentStore(artifact_dir)
+            definition = store.create_definition(
+                deployment_id="dep:CANARY-PIN-CHANGE:standalone:live",
+                strategy_artifact=payload,
+                portfolio_artifact=None,
+                account_id="live-account-unresolved",
+                environment="SMALL_LIVE",
+                symbol="BTCUSDT",
+                route="crypto",
+            )
+            first_deployment = store.transition(
+                definition["deploymentId"],
+                lifecycle="before-live-small",
+                mode="MONITOR",
+                permissions={**payload["permissions"], **first_pins},
+                actor="unit",
+                reason="first exact Paper binding",
+            )
+            ledger = self.use_temp_program_ledger(temp_dir)
+            first_scope = state.current_live_canary_scope(
+                "CANARY-PIN-CHANGE"
+            )
+            event_time = (
+                datetime.fromisoformat(
+                    first_scope["beforeLiveSmallAt"].replace("Z", "+00:00")
+                )
+                + timedelta(seconds=1)
+            ).isoformat()
+            state.STATE["orders"] = [
+                {
+                    "strategy_id": "CANARY-PIN-CHANGE",
+                    "state": "acknowledged",
+                    "queue_state": "submitted",
+                    "dry_run": False,
+                    "mode": "SMALL_LIVE",
+                    "broker_id": "binance",
+                    "order_id": f"LOCAL-PIN-{index}",
+                    "broker_order_id": f"BROKER-PIN-{index}",
+                    "created_at": event_time,
+                    "canary_scope": dict(first_scope),
+                }
+                for index in range(3)
+            ]
+            ledger.record_execution_events(
+                [
+                    {
+                        "event_id": f"FILL-PIN-{index}",
+                        "broker_id": "binance",
+                        "order_id": f"LOCAL-PIN-{index}",
+                        "broker_order_id": f"BROKER-PIN-{index}",
+                        "symbol": "BTCUSDT",
+                        "quantity": 0.001,
+                        "price": 100_000,
+                        "state": "filled",
+                        "occurred_at": event_time,
+                    }
+                    for index in range(3)
+                ]
+            )
+            before = state.live_small_execution_summary(
+                "CANARY-PIN-CHANGE"
+            )
+            second_deployment = store.transition(
+                definition["deploymentId"],
+                lifecycle="before-live-small",
+                mode="MONITOR",
+                permissions={**payload["permissions"], **second_pins},
+                actor="unit",
+                reason="replace exact Paper binding",
+            )
+            after = state.live_small_execution_summary(
+                "CANARY-PIN-CHANGE"
+            )
+            try:
+                self.assertEqual(3, before["fills"])
+                self.assertEqual(0, after["fills"])
+                self.assertNotEqual(
+                    first_scope["scopeId"],
+                    after["scope"]["scopeId"],
+                )
+                self.assertEqual(
+                    second_pins["paperFinalBindingHash"],
+                    after["scope"]["paperFinalBindingHash"],
+                )
+                self.assertGreater(
+                    second_deployment["revision"],
+                    first_deployment["revision"],
+                )
+            finally:
+                if previous_artifact_dir is None:
+                    os.environ.pop(
+                        "LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None
+                    )
+                else:
+                    os.environ["LIVE_TRADER_STRATEGY_ARTIFACT_DIR"] = (
+                        previous_artifact_dir
+                    )
 
     def test_submit_test_intent_creates_dry_run_order_when_gate_passes(self) -> None:
         state.STATE["orders"] = []
@@ -1968,6 +2411,7 @@ class OrderGateTest(unittest.TestCase):
             "strategies": [
                 {
                     "strategy_id": "LIVE-RUNNER-BUY",
+                    "strategy_instance_id": "standalone:LIVE-RUNNER-BUY",
                     "name": "Runner Buy",
                     "symbol": "BTCUSDT",
                     "asset": "코인",
@@ -1991,8 +2435,93 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual(order["runner_report"]["signal"], "BUY")
         self.assertTrue(order["risk_report"]["can_submit"])
         self.assertEqual(result["runner_report"]["intent"]["metadata"]["runner"], "StrategyExecutionRunner")
+        self.assertEqual(
+            "standalone:LIVE-RUNNER-BUY",
+            result["runner_report"]["intent"]["metadata"][
+                "strategy_instance_id"
+            ],
+        )
+        self.assertEqual(
+            "",
+            result["runner_report"]["intent"]["metadata"]["portfolio_id"],
+        )
         self.assertEqual(state.STATE["audit"][-1]["event"], "전략 Runner")
         self.assertIn("risk pass", state.STATE["audit"][-1]["detail"])
+
+    def test_portfolio_strategy_cycle_preserves_exact_runtime_context(self) -> None:
+        state.STATE["orders"] = []
+        state.STATE["audit"] = []
+        state.STATE["dry_run"] = True
+        state.STATE["new_entries_blocked"] = False
+        fake_snapshot = {
+            "summary": {"blocker_count": 0, "warning_count": 0},
+            "strategies": [
+                {
+                    "strategy_id": "LIVE-PORTFOLIO-BUY",
+                    "name": "Portfolio Runner Buy",
+                    "symbol": "BTCUSDT",
+                    "asset": "코인",
+                    "plugin": "breakout",
+                    "live_allowed": True,
+                    "signal": "BUY",
+                    "reference_price": 65_000,
+                    "quantity": 0.01,
+                    "portfolio_gate": {
+                        "active": True,
+                        "allowed": True,
+                        "portfolioId": "portfolio-live-exact",
+                        "targetWeight": 0.2,
+                        "policyTargetWeight": 0.2,
+                        "maxSymbolWeightPct": 100,
+                        "instance": {
+                            "instanceId": "portfolio-live-instance"
+                        },
+                    },
+                }
+            ],
+        }
+
+        executions = state.strategy_executions_for_profile(
+            fake_snapshot,
+            "crypto",
+        )
+
+        self.assertEqual(1, len(executions))
+        self.assertIsNotNone(executions[0][1].intent)
+        metadata = executions[0][1].intent.metadata
+        self.assertEqual(
+            "portfolio-live-instance",
+            metadata["strategy_instance_id"],
+        )
+        self.assertEqual("portfolio-live-exact", metadata["portfolio_id"])
+
+    def test_default_order_intent_preserves_exact_runtime_context(self) -> None:
+        checks = {
+            "strategies": [
+                {
+                    "strategy_id": "LIVE-MANUAL-PORTFOLIO",
+                    "strategy_instance_id": "manual-exact-instance",
+                    "symbol": "069500.KS",
+                    "asset": "kr-stock",
+                    "live_allowed": True,
+                    "portfolio_gate": {
+                        "active": True,
+                        "portfolioId": "manual-exact-portfolio",
+                    },
+                }
+            ]
+        }
+
+        intent = state.default_order_intent(checks, "BUY")
+
+        self.assertEqual(
+            "manual-exact-instance",
+            intent.metadata["strategy_instance_id"],
+        )
+        self.assertEqual(
+            "manual-exact-portfolio",
+            intent.metadata["portfolio_id"],
+        )
 
     def test_order_gate_adds_watchdog_blocker_to_risk_report(self) -> None:
         state.STATE["new_entries_blocked"] = False
@@ -2100,6 +2629,99 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual("pass", checks["시장 데이터 신선도"]["status"])
         self.assertEqual("pass", checks["체결 이벤트 동기화"]["status"])
         self.assertEqual(["binance"], report["active_brokers"])
+
+    def test_functional_daily_runtime_guard_does_not_self_stop_over_sixty_seconds(self) -> None:
+        base = datetime(2026, 8, 5, 9, 0, 0)
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["orders"] = []
+        state.STATE["automation"]["stock"].update(
+            {"enabled": True, "provider": "kis", "mode": "SMALL_LIVE"}
+        )
+        state.STATE["automation"]["crypto"].update(
+            {"enabled": False, "mode": "MONITOR"}
+        )
+        continuous = {
+            "profiles": {
+                "stock": {
+                    "running": True,
+                    "phase": "RUNNING",
+                    "lastHeartbeat": base.isoformat(),
+                    "lastDataAt": "",
+                    "engine": {
+                        "latestBars": {
+                            "daily-strategy": {
+                                "endTime": (
+                                    base - timedelta(days=1)
+                                ).isoformat(),
+                                "receivedTime": base.isoformat(),
+                                "timeframe": "1d",
+                            }
+                        }
+                    },
+                }
+            }
+        }
+        streams = {
+            "brokers": {
+                "kis": {
+                    "running": True,
+                    "connected": False,
+                    "lastError": "",
+                }
+            }
+        }
+        brokers = [{"broker_id": "kis", "order_ready": True}]
+        reconciliation = {
+            "status": "pass",
+            "status_label": "정상",
+            "last_run": base.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        queue = {"retryable": 0, "blocked": 0}
+        reports = []
+        with (
+            patch.object(
+                state.LIVE_CONTINUOUS_CONTROLLER,
+                "snapshot",
+                return_value=continuous,
+            ),
+            patch.object(
+                state.LIVE_CONTINUOUS_CONTROLLER,
+                "transition_running",
+            ) as transition,
+            patch.object(
+                state.LIVE_EXECUTION_STREAMS,
+                "snapshot",
+                return_value=streams,
+            ),
+        ):
+            for elapsed in (20, 40, 60):
+                now = base + timedelta(seconds=elapsed)
+                state.STATE["watchdog"]["last_run"] = now.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                # The functional runtime guard completes this read-only KIS
+                # poll every 20 seconds even when no private fill arrives.
+                state.STATE["execution_events"]["last_poll"] = now.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                state.STATE["execution_events"]["errors"] = []
+                report = state.watchdog_snapshot(
+                    brokers,
+                    reconciliation,
+                    queue,
+                    now=now,
+                )
+                reports.append(report)
+                self.assertFalse(state.apply_watchdog_fail_closed(report))
+
+        self.assertTrue(
+            all(item["critical_count"] == 0 for item in reports),
+            reports,
+        )
+        self.assertEqual("SMALL_LIVE", state.STATE["mode"])
+        self.assertFalse(state.STATE["new_entries_blocked"])
+        transition.assert_not_called()
 
     def test_automation_start_is_blocked_by_watchdog_critical(self) -> None:
         fake_snapshot = {
@@ -2881,8 +3503,11 @@ class OrderGateTest(unittest.TestCase):
         }
 
         with patch("live_trader.brokers.issue_kis_access_token", return_value="token"), patch(
-            "live_trader.brokers.send_prepared_request",
-            return_value={"ok": True, "json": payload},
+            "live_trader.brokers.fetch_kis_domestic_balance",
+            return_value=payload,
+        ), patch(
+            "live_trader.brokers.fetch_kis_overseas_balance",
+            return_value={"rt_cd": "0", "output1": [], "output2": []},
         ):
             result = LiveBrokerRouter().poll_execution_events("kis")
 
@@ -3218,13 +3843,13 @@ class OrderGateTest(unittest.TestCase):
                 "strategy_id": "trend", "name": "Trend", "symbol": "BTCUSDT", "asset": "CRYPTO", "plugin": "moving_average_cross",
                 "test_signal": "BUY", "reference_price": 1000, "order_quantity": 1, "live_allowed": True,
                 "instrument_id": "CRYPTO:BINANCE:BTCUSDT", "market_type": "spot", "allow_short": False,
-                "portfolio_gate": {"active": True, "allowed": True, "targetWeight": 0.4, "policyTargetWeight": 0.4, "maxSymbolWeightPct": 100, "instance": {"instanceId": "trend-1"}},
+                "portfolio_gate": {"active": True, "allowed": True, "portfolioId": "portfolio-net", "targetWeight": 0.4, "policyTargetWeight": 0.4, "maxSymbolWeightPct": 100, "instance": {"instanceId": "trend-1"}},
             },
             {
                 "strategy_id": "revert", "name": "Revert", "symbol": "BTCUSDT", "asset": "CRYPTO", "plugin": "rsi_reversion",
                 "test_signal": "SELL", "reference_price": 1000, "order_quantity": 1, "live_allowed": True,
                 "instrument_id": "CRYPTO:BINANCE:BTCUSDT", "market_type": "spot", "allow_short": False,
-                "portfolio_gate": {"active": True, "allowed": True, "targetWeight": 0.3, "policyTargetWeight": 0.3, "maxSymbolWeightPct": 100, "instance": {"instanceId": "revert-1"}},
+                "portfolio_gate": {"active": True, "allowed": True, "portfolioId": "portfolio-net", "targetWeight": 0.3, "policyTargetWeight": 0.3, "maxSymbolWeightPct": 100, "instance": {"instanceId": "revert-1"}},
             },
         ]
         fake_snapshot = {
@@ -3234,7 +3859,15 @@ class OrderGateTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(state, "RECOVERY_JOURNAL", state.RecoveryJournal(Path(temp_dir) / "recovery")):
-                with patch("live_trader.state.snapshot", return_value=fake_snapshot):
+                with patch("live_trader.state.snapshot", return_value=fake_snapshot), patch.object(
+                    state,
+                    "submit_order_intent",
+                    wraps=state.submit_order_intent,
+                ) as submit, patch.object(
+                    state,
+                    "portfolio_gate_for_intent",
+                    return_value={"active": False, "allowed": True},
+                ):
                     result = state.run_strategy_cycle("crypto")
         self.assertTrue(result["ok"])
         self.assertEqual(2, len(result["runner_reports"]))
@@ -3243,6 +3876,13 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual("BUY", result["plans"][0]["side"])
         self.assertEqual({"trend-1": 0.4, "revert-1": 0.0}, result["plans"][0]["sleeve_targets"])
         self.assertEqual(1, len(state.STATE["orders"]))
+        net_intent = submit.call_args.args[1]
+        self.assertEqual("portfolio-net", net_intent.metadata["portfolio_id"])
+        self.assertEqual("trend-1", net_intent.metadata["strategy_instance_id"])
+        self.assertEqual(
+            {"trend-1", "revert-1"},
+            set(net_intent.metadata["strategy_instance_ids"]),
+        )
 
 
 if __name__ == "__main__":

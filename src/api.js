@@ -235,6 +235,54 @@ export async function evaluateValidationSmallLive(validationStrategyInstanceId) 
   });
 }
 
+export async function getFunctionalTestWorkspace() {
+  return request("/api/functional-test", { timeoutMs: 30_000 });
+}
+
+export async function createFunctionalTestPermit(targetKey, durationValue, durationUnit) {
+  return request("/api/functional-test/permit", {
+    method: "POST",
+    body: {
+      targetKey,
+      durationValue,
+      durationUnit,
+    },
+    timeoutMs: 30_000,
+  });
+}
+
+export async function activateFunctionalTestToday(authorizedBy, confirmed = false) {
+  return request("/api/functional-test/activate", {
+    method: "POST",
+    body: { authorizedBy, confirmed },
+    timeoutMs: 30_000,
+  });
+}
+
+export async function startFunctionalTest(targetKey, confirmed = false) {
+  return request("/api/functional-test/start", {
+    method: "POST",
+    body: { targetKey, confirmed },
+    timeoutMs: 180_000,
+  });
+}
+
+export async function pauseFunctionalTestToday(confirmed = false) {
+  return request("/api/functional-test/pause", {
+    method: "POST",
+    body: { confirmed },
+    timeoutMs: 180_000,
+  });
+}
+
+export async function stopFunctionalTest(confirmed = false) {
+  return request("/api/functional-test/stop", {
+    method: "POST",
+    body: { confirmed },
+    timeoutMs: 180_000,
+  });
+}
+
 export async function runStrategyCycle(profileId) {
   return request("/api/strategy-cycle", { method: "POST", body: { profile_id: profileId } });
 }

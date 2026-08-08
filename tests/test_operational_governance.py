@@ -270,6 +270,71 @@ class OperationalGovernanceStoreTests(unittest.TestCase):
             connection.close()
         self.assertEqual(count, 0)
 
+    def test_running_session_rebinds_to_fresh_exact_scope_preflight(self) -> None:
+        manifest = self.create_manifest()
+        initial = self.create_pass_preflight(manifest, ttl_seconds=60)
+        session = self.create_running_live_session(manifest, initial)
+        renewed = self.create_pass_preflight(
+            manifest,
+            issued_at=NOW + timedelta(seconds=55),
+            ttl_seconds=60,
+        )
+
+        rebound = self.store.rebind_runtime_preflight(
+            session.session_id,
+            renewed.snapshot_id,
+            actor="functional-test-supervisor",
+            occurred_at=NOW + timedelta(seconds=55),
+        )
+        authorization = self.store.runtime_authorization(
+            session.session_id,
+            at=NOW + timedelta(seconds=70),
+        )
+
+        self.assertEqual(renewed.snapshot_id, rebound.preflight_snapshot_id)
+        self.assertEqual(renewed.snapshot_hash, rebound.preflight_snapshot_hash)
+        self.assertTrue(authorization["allowed"], authorization["reasons"])
+        events = self.store.runtime_events(session.session_id)
+        self.assertEqual("PREFLIGHT_REBOUND", events[-1].event_type)
+        self.assertEqual(
+            initial.snapshot_hash,
+            events[-1].payload["previousPreflightSnapshotHash"],
+        )
+
+    def test_runtime_preflight_rebind_rejects_expired_or_other_scope_snapshot(self) -> None:
+        manifest = self.create_manifest()
+        initial = self.create_pass_preflight(manifest, ttl_seconds=60)
+        session = self.create_running_live_session(manifest, initial)
+        expired = self.create_pass_preflight(
+            manifest,
+            issued_at=NOW + timedelta(seconds=10),
+            ttl_seconds=30,
+        )
+        with self.assertRaisesRegex(ValueError, "preflight-expired"):
+            self.store.rebind_runtime_preflight(
+                session.session_id,
+                expired.snapshot_id,
+                actor="functional-test-supervisor",
+                occurred_at=NOW + timedelta(seconds=40),
+            )
+
+        other_manifest = self.create_manifest(
+            deployment_id="other-live",
+            created_at=NOW + timedelta(seconds=20),
+        )
+        other = self.create_pass_preflight(
+            other_manifest,
+            issued_at=NOW + timedelta(seconds=20),
+            ttl_seconds=60,
+        )
+        with self.assertRaisesRegex(ValueError, "outside the runtime session scope"):
+            self.store.rebind_runtime_preflight(
+                session.session_id,
+                other.snapshot_id,
+                actor="functional-test-supervisor",
+                occurred_at=NOW + timedelta(seconds=25),
+            )
+
     def test_new_manifest_revision_supersedes_existing_preflight(self) -> None:
         first = self.create_manifest()
         snapshot = self.create_pass_preflight(first)

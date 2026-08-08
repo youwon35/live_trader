@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -15,6 +15,8 @@ import urllib.request
 import uuid
 
 from .live_adapters import binance_timestamp_ms, refresh_binance_time_offset
+from trading_runtime.kis_rate_limiter import GLOBAL_KIS_REST_LIMITERS
+from trading_runtime.kis_websocket_owner import GLOBAL_KIS_WEBSOCKET_OWNERS
 
 
 def _b64url(payload: bytes) -> str:
@@ -136,7 +138,9 @@ def parse_upbit_my_order(payload: Any) -> dict[str, Any] | None:
         "price": price,
         "fee": fee,
         "state": normalized_state,
-        "occurred_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "occurred_at": datetime.now(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z"),
         "raw_type": "upbit_my_order",
         # Upbit exposes order-level cumulative watermarks alongside an
         # execution-level volume/fee.  Keeping both contracts explicit lets
@@ -271,7 +275,9 @@ def parse_kis_domestic_execution(fields: list[str]) -> dict[str, Any] | None:
         "price": price,
         "fee": 0.0,
         "state": "rejected" if rejected else "filled" if filled else "accepted",
-        "occurred_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "occurred_at": datetime.now(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z"),
         "raw_type": "kis_domestic_execution",
     }
 
@@ -297,7 +303,9 @@ def parse_kis_overseas_execution(fields: list[str]) -> dict[str, Any] | None:
         "price": price,
         "fee": 0.0,
         "state": "rejected" if rejected else "filled" if filled else "accepted",
-        "occurred_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "occurred_at": datetime.now(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z"),
         "raw_type": "kis_overseas_execution",
     }
 
@@ -317,7 +325,7 @@ class ExecutionStreamManager:
         self.log_max_bytes = max(1024, int(log_max_bytes))
         self.log_backup_count = max(1, int(log_backup_count))
         self._lock = threading.RLock()
-        self._stop = threading.Event()
+        self._stop_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._events: dict[str, deque[dict[str, Any]]] = {
             "kis": deque(maxlen=1000),
@@ -329,7 +337,6 @@ class ExecutionStreamManager:
 
     def start(self, brokers: Iterable[str] = ("kis", "binance", "upbit")) -> dict[str, Any]:
         with self._lock:
-            self._stop.clear()
             for broker_id in brokers:
                 name = str(broker_id).lower().strip()
                 if name not in {
@@ -342,21 +349,65 @@ class ExecutionStreamManager:
                     and self._threads[name].is_alive()
                 ):
                     continue
-                thread = threading.Thread(target=self._run, args=(name,), daemon=True, name=f"{name}-execution-stream")
+                stop_event = threading.Event()
+                self._stop_events[name] = stop_event
+                thread = threading.Thread(
+                    target=self._run,
+                    args=(name, stop_event),
+                    daemon=True,
+                    name=f"{name}-execution-stream",
+                )
                 self._threads[name] = thread
                 self._status[name] = {"running": True, "connected": False, "lastEventAt": "", "lastError": "", "reconnectCount": 0}
                 thread.start()
         return self.snapshot()
 
-    def stop(self, timeout: float = 5.0) -> dict[str, Any]:
-        self._stop.set()
-        for thread in tuple(self._threads.values()):
+    def stop(
+        self,
+        timeout: float = 5.0,
+        *,
+        brokers: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        selected = {
+            str(item).lower().strip()
+            for item in (
+                tuple(brokers)
+                if brokers is not None
+                else tuple(self._threads)
+            )
+            if str(item).strip()
+        }
+        with self._lock:
+            for name in selected:
+                event = self._stop_events.get(name)
+                if event is not None:
+                    event.set()
+            threads = [
+                thread
+                for name, thread in self._threads.items()
+                if name in selected
+            ]
+        for thread in threads:
             thread.join(timeout=max(0.0, timeout))
         with self._lock:
-            for status in self._status.values():
-                status["running"] = False
-                status["connected"] = False
+            for name in selected:
+                status = self._status.get(name)
+                thread = self._threads.get(name)
+                if status is not None:
+                    status["running"] = bool(thread and thread.is_alive())
+                    if not status["running"]:
+                        status["connected"] = False
         return self.snapshot()
+
+    def stop_brokers(
+        self,
+        brokers: Iterable[str],
+        *,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """Stop only streams owned by one runtime, preserving shared peers."""
+
+        return self.stop(timeout, brokers=brokers)
 
     def drain(self, broker_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -364,6 +415,24 @@ class ExecutionStreamManager:
             rows = list(queue)
             queue.clear()
             return rows
+
+    def ingest_kis_domestic_fields(
+        self,
+        tr_id: str,
+        fields: Iterable[str],
+    ) -> dict[str, Any]:
+        """Accept one H0STCNI0 notice from the shared market/private mux."""
+
+        normalized_tr_id = str(tr_id or "").strip().upper()
+        if normalized_tr_id != "H0STCNI0":
+            raise ValueError("unsupported-kis-private-execution-tr-id")
+        event = parse_kis_domestic_execution(
+            [str(item) for item in fields]
+        )
+        if event is None:
+            raise ValueError("malformed-kis-domestic-execution-notice")
+        self._record("kis", event)
+        return dict(event)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -373,26 +442,31 @@ class ExecutionStreamManager:
                 "brokers": {key: {**value, "queuedEvents": len(self._events.get(key, ()))} for key, value in self._status.items()},
             }
 
-    def _run(self, broker_id: str) -> None:
-        while not self._stop.is_set():
+    def _run(self, broker_id: str, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
             try:
                 if broker_id == "upbit":
-                    self._run_upbit()
+                    self._run_upbit(stop_event)
                 elif broker_id == "binance-futures":
-                    self._run_binance_futures()
+                    self._run_binance_futures(stop_event)
                 elif broker_id == "binance":
-                    self._run_binance()
+                    self._run_binance(stop_event)
                 else:
-                    self._run_kis()
+                    self._run_kis(stop_event)
             except Exception as exc:  # process boundary; status is deliberately credential-free.
                 with self._lock:
                     status = self._status[broker_id]
                     status["connected"] = False
                     status["lastError"] = f"{type(exc).__name__}: {exc}"[:500]
                     status["reconnectCount"] = int(status.get("reconnectCount") or 0) + 1
-                self._stop.wait(2.0)
+                stop_event.wait(2.0)
+        with self._lock:
+            status = self._status.get(broker_id)
+            if status is not None:
+                status["running"] = False
+                status["connected"] = False
 
-    def _run_upbit(self) -> None:
+    def _run_upbit(self, stop_event: threading.Event) -> None:
         import websocket  # type: ignore[import-not-found]
 
         access_key = os.getenv("UPBIT_ACCESS_KEY", "").strip()
@@ -409,7 +483,7 @@ class ExecutionStreamManager:
         with self._lock:
             self._status["upbit"].update({"connected": True, "lastError": ""})
         try:
-            while not self._stop.is_set():
+            while not stop_event.is_set():
                 try:
                     raw = socket.recv()
                 except Exception as exc:
@@ -424,7 +498,7 @@ class ExecutionStreamManager:
         finally:
             socket.close()
 
-    def _run_binance(self) -> None:
+    def _run_binance(self, stop_event: threading.Event) -> None:
         import websocket  # type: ignore[import-not-found]
 
         api_key = os.getenv("BINANCE_API_KEY", "").strip()
@@ -442,7 +516,7 @@ class ExecutionStreamManager:
         with self._lock:
             self._status["binance"].update({"connected": True, "lastError": ""})
         try:
-            while not self._stop.is_set():
+            while not stop_event.is_set():
                 try:
                     raw = socket.recv()
                 except Exception as exc:
@@ -459,7 +533,7 @@ class ExecutionStreamManager:
         finally:
             socket.close()
 
-    def _run_binance_futures(self) -> None:
+    def _run_binance_futures(self, stop_event: threading.Event) -> None:
         import websocket  # type: ignore[import-not-found]
 
         api_key = os.getenv("BINANCE_API_KEY", "").strip()
@@ -499,7 +573,7 @@ class ExecutionStreamManager:
                 {"connected": True, "lastError": ""}
             )
         try:
-            while not self._stop.is_set():
+            while not stop_event.is_set():
                 if time.monotonic() - last_keepalive >= 30 * 60:
                     keepalive = urllib.request.Request(
                         listen_key_url,
@@ -542,7 +616,7 @@ class ExecutionStreamManager:
             except Exception:
                 pass
 
-    def _run_kis(self) -> None:
+    def _run_kis(self, stop_event: threading.Event) -> None:
         import websocket  # type: ignore[import-not-found]
 
         app_key = os.getenv("KIS_APP_KEY", "").strip()
@@ -550,28 +624,71 @@ class ExecutionStreamManager:
         hts_id = os.getenv("KIS_HTS_ID", "").strip()
         if not app_key or not app_secret or not hts_id:
             raise RuntimeError("KIS private stream credentials/HTS ID missing")
+        account_id = (
+            f"{os.getenv('KIS_ACCOUNT_NO', '').strip()}-"
+            f"{os.getenv('KIS_ACCOUNT_PRODUCT_CODE', '').strip()}"
+        )
+        app_key_id = "sha256:" + hashlib.sha256(
+            app_key.encode("utf-8")
+        ).hexdigest()
+        owner_id = f"live_trader:legacy-private:{os.getpid()}:{id(self)}"
+        GLOBAL_KIS_WEBSOCKET_OWNERS.claim(
+            account_id=account_id,
+            app_key_id=app_key_id,
+            owner_id=owner_id,
+            environment="LIVE",
+        )
         request = urllib.request.Request(
             "https://openapi.koreainvestment.com:9443/oauth2/Approval",
             data=json.dumps({"grant_type": "client_credentials", "appkey": app_key, "secretkey": app_secret}).encode(),
             headers={"content-type": "application/json; charset=utf-8"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310 - official fixed endpoint.
-            approval = json.loads(response.read().decode())
+        # KIS throttles Approval independently from normal REST and tokenP.
+        # The app-key-only SQLite bucket is shared with the market-data feed
+        # and every sibling process, so reconnect storms cannot burst here.
+        GLOBAL_KIS_REST_LIMITERS.get_approval(app_key).acquire()
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310 - official fixed endpoint.
+                approval = json.loads(response.read().decode())
+        except Exception:
+            GLOBAL_KIS_WEBSOCKET_OWNERS.release(
+                account_id=account_id,
+                app_key_id=app_key_id,
+                owner_id=owner_id,
+            )
+            raise
         approval_key = str(approval.get("approval_key") or "")
         if not approval_key:
+            GLOBAL_KIS_WEBSOCKET_OWNERS.release(
+                account_id=account_id,
+                app_key_id=app_key_id,
+                owner_id=owner_id,
+            )
             raise RuntimeError("KIS private stream approval failed")
-        socket = websocket.create_connection("ws://ops.koreainvestment.com:21000/tryitout", timeout=20)
-        for tr_id in ("H0STCNI0", "H0GSCNI0"):
-            socket.send(json.dumps({
-                "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
-                "body": {"input": {"tr_id": tr_id, "tr_key": hts_id}},
-            }))
+        try:
+            socket = websocket.create_connection("ws://ops.koreainvestment.com:21000/tryitout", timeout=20)
+            for tr_id in ("H0STCNI0", "H0GSCNI0"):
+                socket.send(json.dumps({
+                    "header": {"approval_key": approval_key, "custtype": "P", "tr_type": "1", "content-type": "utf-8"},
+                    "body": {"input": {"tr_id": tr_id, "tr_key": hts_id}},
+                }))
+        except Exception:
+            try:
+                socket.close()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
+            GLOBAL_KIS_WEBSOCKET_OWNERS.release(
+                account_id=account_id,
+                app_key_id=app_key_id,
+                owner_id=owner_id,
+            )
+            raise
         aes: dict[str, tuple[str, str]] = {}
         with self._lock:
             self._status["kis"].update({"connected": True, "lastError": ""})
         try:
-            while not self._stop.is_set():
+            while not stop_event.is_set():
                 try:
                     raw = socket.recv()
                 except Exception as exc:
@@ -602,6 +719,11 @@ class ExecutionStreamManager:
                     self._record("kis", event)
         finally:
             socket.close()
+            GLOBAL_KIS_WEBSOCKET_OWNERS.release(
+                account_id=account_id,
+                app_key_id=app_key_id,
+                owner_id=owner_id,
+            )
 
     @staticmethod
     def _decrypt_kis(ciphertext: str, key: str, iv: str) -> str:
@@ -616,7 +738,18 @@ class ExecutionStreamManager:
     def _record(self, broker_id: str, event: dict[str, Any]) -> None:
         with self._lock:
             self._events[broker_id].append(dict(event))
-            self._status[broker_id]["lastEventAt"] = str(event.get("occurred_at") or "")
+            status = self._status.setdefault(
+                broker_id,
+                {
+                    "running": False,
+                    "connected": False,
+                    "lastEventAt": "",
+                    "lastError": "",
+                    "reconnectCount": 0,
+                    "source": "external-multiplexed-feed",
+                },
+            )
+            status["lastEventAt"] = str(event.get("occurred_at") or "")
             log_dir = self.data_root / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             path = log_dir / "broker_execution_stream.jsonl"

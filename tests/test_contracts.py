@@ -509,7 +509,7 @@ class StrategyContractTest(unittest.TestCase):
         self.assertEqual(evidence["filledCount"], 1)
         self.assertEqual(evidence["source"], "legacy-embedded")
 
-    def test_external_evidence_and_deployment_override_legacy_artifact_lifecycle(self) -> None:
+    def test_unpinned_external_evidence_never_overrides_deployment_permissions(self) -> None:
         previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -602,20 +602,24 @@ class StrategyContractTest(unittest.TestCase):
                 EvidenceStore(artifact_dir).save_paper(evidence)
 
                 enriched = enrich_strategy_artifact_runtime(artifact_dir, artifact_dir / "strategy.json", strategy_payload)
-                self.assertTrue(normalize_strategy_artifact(enriched)["lineage"]["paper"]["valid"])
+                self.assertFalse(
+                    normalize_strategy_artifact(enriched)["lineage"]["paper"]["valid"]
+                )
                 strategies = load_strategy_artifacts()
 
             loaded = next(item for item in strategies if item["strategy_id"] == "STRAT-EXT-1")
-            self.assertEqual("before-live-small", loaded["lifecycle_status"])
-            self.assertEqual(definition["deploymentId"], loaded["deployment_id"])
-            self.assertEqual("deployment-registry", loaded["deployment_source"])
-            self.assertTrue(loaded["permissions"]["paper_trader_verified"])
-            self.assertTrue(loaded["live_small_eligible"])
-            self.assertTrue(loaded["paper_portfolio_evidence"]["ready"])
-            self.assertEqual("external", loaded["paper_portfolio_evidence"]["source"])
-            self.assertEqual("paper-ext-1", loaded["paper_portfolio_evidence"]["evidenceId"])
+            self.assertEqual("backtested", loaded["lifecycle_status"])
+            self.assertEqual("", loaded["deployment_id"])
+            self.assertEqual("legacy-artifact", loaded["deployment_source"])
+            self.assertFalse(loaded["permissions"]["paper_trader_verified"])
+            self.assertFalse(loaded["live_small_eligible"])
+            self.assertFalse(loaded["paper_live_qualification"]["ready"])
+            self.assertIn(
+                "paper-live-live-environment-deployment-required",
+                loaded["paper_live_qualification"]["issues"][0],
+            )
             self.assertTrue(loaded["lineage"]["backtest"]["valid"])
-            self.assertTrue(loaded["lineage"]["paper"]["valid"])
+            self.assertFalse(loaded["lineage"]["paper"]["valid"])
         finally:
             if previous_artifact is None:
                 os.environ.pop("LIVE_TRADER_STRATEGY_ARTIFACT_DIR", None)

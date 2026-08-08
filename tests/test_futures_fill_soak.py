@@ -298,6 +298,7 @@ class FuturesFillSoakTests(unittest.TestCase):
             rules_provider=rules,
             live_orders_enabled=lambda: True,
             report_writer=MemoryReportWriter(),
+            dispatch_authorizer=lambda _intent: (True, "test-authorized", {}),
         )
 
     def test_preview_is_read_only_and_exposes_exact_start_facts(self) -> None:
@@ -345,6 +346,7 @@ class FuturesFillSoakTests(unittest.TestCase):
             },
             live_orders_enabled=lambda: True,
             report_writer=MemoryReportWriter(),
+            dispatch_authorizer=lambda _intent: (True, "test-authorized", {}),
         )
 
         preview = session.preview()
@@ -358,6 +360,55 @@ class FuturesFillSoakTests(unittest.TestCase):
             "6",
             preview["minimum_order"]["estimated_notional_usdt"],
         )
+
+    def test_missing_operational_authorizer_blocks_before_place_order(self) -> None:
+        clock = FakeClock()
+        router = FakeRouter()
+        session = BinanceFuturesFillSoakSession(
+            config(session_id="bfsoak-no-operational-gate"),
+            router=router,
+            clock=clock,
+            price_provider=lambda _symbol: Decimal("50000"),
+            rules_provider=rules,
+            live_orders_enabled=lambda: True,
+            report_writer=MemoryReportWriter(),
+        )
+
+        report = session.run(authorization(clock))
+
+        self.assertEqual("FAIL", report["status"])
+        self.assertIn(
+            "operational-dispatch-authorizer-missing",
+            report["reason_ids"],
+        )
+        self.assertEqual([], router.place_calls)
+
+    def test_stale_final_binding_authorization_blocks_before_place_order(self) -> None:
+        clock = FakeClock()
+        router = FakeRouter()
+        session = BinanceFuturesFillSoakSession(
+            config(session_id="bfsoak-stale-final-binding"),
+            router=router,
+            clock=clock,
+            price_provider=lambda _symbol: Decimal("50000"),
+            rules_provider=rules,
+            live_orders_enabled=lambda: True,
+            report_writer=MemoryReportWriter(),
+            dispatch_authorizer=lambda _intent: (
+                False,
+                "operational-paper-final-binding-changed",
+                {},
+            ),
+        )
+
+        report = session.run(authorization(clock))
+
+        self.assertEqual("FAIL", report["status"])
+        self.assertIn(
+            "operational-dispatch-authorization-blocked",
+            report["reason_ids"],
+        )
+        self.assertEqual([], router.place_calls)
 
     def test_run_revalidates_preview_and_blocks_new_position(self) -> None:
         clock = FakeClock()
