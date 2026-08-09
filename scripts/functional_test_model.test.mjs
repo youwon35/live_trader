@@ -65,4 +65,14 @@ assert.equal(
   "target, duration, unit, and permit preparation must share the authority-reference lock",
 );
 
+const startExecutionSource = workspaceSource.match(
+  /function startExecution\(\) \{([\s\S]*?)\n  \}\n\n  function pauseToday/,
+)?.[1] || "";
+assert.match(startExecutionSource, /startFunctionalTest\(/);
+assert.doesNotMatch(
+  startExecutionSource,
+  /window\.confirm/,
+  "FUNCTIONAL_TEST_START must use the shared identity-bound confirmation instead of a second browser prompt",
+);
+
 console.log("functional test model tests passed");

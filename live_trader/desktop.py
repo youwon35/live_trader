@@ -5,6 +5,7 @@ import time
 import webbrowser
 from pathlib import Path
 
+from .emergency_stop import DesktopEmergencyStopBridge
 from .server import start_in_thread
 from .env_loader import default_runtime_data_root
 
@@ -29,6 +30,7 @@ def main() -> None:
         window = webview.create_window(
             "[LIVE] Live Trader",
             url,
+            js_api=DesktopEmergencyStopBridge(),
             width=window_state["width"],
             height=window_state["height"],
             x=window_state["x"],

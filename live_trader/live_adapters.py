@@ -40,10 +40,18 @@ KIS_DOMESTIC_CANCEL_ENDPOINT = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 KIS_OVERSEAS_CANCEL_ENDPOINT = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 KIS_DOMESTIC_BALANCE_ENDPOINT = "/uapi/domestic-stock/v1/trading/inquire-balance"
 KIS_OVERSEAS_BALANCE_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-balance"
+KIS_DOMESTIC_EXECUTION_ENDPOINT = (
+    "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+)
 KIS_DOMESTIC_TR_IDS = {"BUY": "TTTC0012U", "SELL": "TTTC0011U"}
 KIS_OVERSEAS_TR_IDS = {"BUY": "TTTT1002U", "SELL": "TTTT1006U"}
 KIS_DOMESTIC_BALANCE_TR_ID = "TTTC8434R"
 KIS_OVERSEAS_BALANCE_TR_ID = "TTTS3012R"
+KIS_DOMESTIC_EXECUTION_TR_IDS = {
+    # Official v1_국내주식-005, within the latest three months (inner).
+    "real": "TTTC0081R",
+    "demo": "VTTC0081R",
+}
 
 BINANCE_BASE_URL = "https://api.binance.com"
 BINANCE_ORDER_ENDPOINT = "/api/v3/order"
@@ -584,6 +592,136 @@ def build_kis_overseas_balance_request(
             "tr_id": KIS_OVERSEAS_BALANCE_TR_ID,
             "tr_cont": normalized_continuation,
             "custtype": "P",
+        },
+        body=None,
+        query=query,
+        blocked_reasons=blocked,
+    )
+
+
+def build_kis_domestic_execution_request(
+    *,
+    access_token: str = "",
+    start_date: str,
+    end_date: str,
+    context_fk100: str = "",
+    context_nk100: str = "",
+    continuation: str = "",
+) -> PreparedRequest:
+    """Build one official domestic order/execution-history page.
+
+    This is a read-only truth query.  It deliberately requests both filled
+    and unfilled orders and leaves ODNO/PDNO blank so a lost POST response is
+    still observable as an *unmatched* official broker order.  Correlation is
+    performed later only by the official ODNO; this builder never guesses a
+    local order from symbol, quantity, or time proximity.
+    """
+
+    required = (
+        "KIS_APP_KEY",
+        "KIS_APP_SECRET",
+        "KIS_ACCOUNT_NO",
+        "KIS_ACCOUNT_PRODUCT_CODE",
+    )
+    blocked = missing_env(*required)
+    app_key = env_value("KIS_APP_KEY")
+    app_secret = env_value("KIS_APP_SECRET")
+    account_no = env_value("KIS_ACCOUNT_NO")
+    product_code = env_value("KIS_ACCOUNT_PRODUCT_CODE")
+    environment_text = (env_value("KIS_ENV") or "real").lower()
+    if environment_text in {"real", "live", "prod", "production"}:
+        environment = "real"
+    elif environment_text in {"demo", "paper", "virtual", "vts"}:
+        environment = "demo"
+    else:
+        environment = ""
+        blocked.append("KIS_ENV")
+    default_base_url = (
+        "https://openapivts.koreainvestment.com:29443"
+        if environment == "demo"
+        else KIS_LIVE_BASE_URL
+    )
+    base_url = env_value("KIS_BASE_URL") or default_base_url
+    cano, acnt_prdt_cd = split_kis_account(account_no, product_code)
+    normalized_start = str(start_date or "").strip()
+    normalized_end = str(end_date or "").strip()
+    normalized_continuation = str(continuation or "").strip().upper()
+    if not access_token:
+        blocked.append("access_token")
+    if (
+        len(normalized_start) != 8
+        or not normalized_start.isdigit()
+    ):
+        blocked.append("start_date")
+    else:
+        try:
+            time.strptime(normalized_start, "%Y%m%d")
+        except ValueError:
+            blocked.append("start_date")
+    if len(normalized_end) != 8 or not normalized_end.isdigit():
+        blocked.append("end_date")
+    else:
+        try:
+            time.strptime(normalized_end, "%Y%m%d")
+        except ValueError:
+            blocked.append("end_date")
+    if (
+        normalized_start
+        and normalized_end
+        and normalized_start > normalized_end
+    ):
+        blocked.append("date_range")
+    if normalized_continuation not in {"", "N"}:
+        blocked.append("continuation")
+    query: dict[str, object] = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": acnt_prdt_cd,
+        "INQR_STRT_DT": normalized_start,
+        "INQR_END_DT": normalized_end,
+        "SLL_BUY_DVSN_CD": "00",
+        "INQR_DVSN": "00",
+        "PDNO": "",
+        "CCLD_DVSN": "00",
+        "ORD_GNO_BRNO": "",
+        "ODNO": "",
+        "INQR_DVSN_3": "00",
+        "INQR_DVSN_1": "",
+        # Account truth must include KRX/NXT/SOR instead of silently omitting
+        # orders that the broker routed away from the legacy KRX venue.
+        "EXCG_ID_DVSN_CD": "ALL",
+        "CTX_AREA_FK100": str(context_fk100 or ""),
+        "CTX_AREA_NK100": str(context_nk100 or ""),
+    }
+    tr_id = KIS_DOMESTIC_EXECUTION_TR_IDS.get(environment, "")
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {access_token}" if access_token else "",
+        "appkey": app_key,
+        "appsecret": app_secret,
+        "tr_id": tr_id,
+        "custtype": "P",
+    }
+    if normalized_continuation:
+        headers["tr_cont"] = normalized_continuation
+    encoded = urllib.parse.urlencode(query)
+    return PreparedRequest(
+        provider="kis",
+        method="GET",
+        url=(
+            f"{base_url.rstrip('/')}{KIS_DOMESTIC_EXECUTION_ENDPOINT}"
+            f"?{encoded}"
+        ),
+        endpoint=KIS_DOMESTIC_EXECUTION_ENDPOINT,
+        headers=headers,
+        safe_headers={
+            "content-type": headers["content-type"],
+            "authorization_configured": bool(access_token),
+            "appkey_configured": bool(app_key),
+            "appsecret_configured": bool(app_secret),
+            "tr_id": tr_id,
+            "tr_cont": normalized_continuation,
+            "custtype": "P",
+            "environment": environment,
         },
         body=None,
         query=query,
@@ -1417,10 +1555,16 @@ def _acquire_shared_kis_rest_slot(url: str) -> float:
         "sha256:"
         + hashlib.sha256(account_material.encode("utf-8")).hexdigest()
     )
+    environment_text = (env_value("KIS_ENV") or "real").lower()
+    limiter_mode = (
+        "VPS"
+        if environment_text in {"demo", "paper", "virtual", "vts"}
+        else "PROD"
+    )
     return GLOBAL_KIS_REST_LIMITERS.get(
         account_id,
         app_key_id,
-        "PROD",
+        limiter_mode,
     ).acquire()
 
 

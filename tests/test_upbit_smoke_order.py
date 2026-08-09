@@ -11,6 +11,11 @@ from live_trader import state
 class UpbitSmokeOrderTest(unittest.TestCase):
     def setUp(self) -> None:
         self.original_state = copy.deepcopy(state.STATE)
+        self.original_real_orders_process_armed = state._REAL_ORDERS_PROCESS_ARMED
+        # These smoke-order tests exercise the post-confirmation broker gates.
+        # Production starts disarmed; the fixture explicitly models a process
+        # that has already completed the REAL_ORDERS_ENABLE confirmation.
+        state._REAL_ORDERS_PROCESS_ARMED = True
         self.env = patch.dict(
             os.environ,
             {
@@ -31,6 +36,7 @@ class UpbitSmokeOrderTest(unittest.TestCase):
         self.strategy_rows.stop()
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
+        state._REAL_ORDERS_PROCESS_ARMED = self.original_real_orders_process_armed
         self.env.stop()
 
     @staticmethod

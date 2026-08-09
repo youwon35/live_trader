@@ -10,12 +10,77 @@ from live_trader.server import (
     create_desktop_server,
     is_recoverable_bind_error,
     json_safe_value,
+    prepare_server_state,
     requests_real_order_enable,
     start_in_thread,
 )
 
 
 class ServerSafetyTests(unittest.TestCase):
+    def test_snapshot_reconnect_is_native_kill_recovery_safe_point(self) -> None:
+        handler = object.__new__(LiveTraderHandler)
+        handler.path = "/api/snapshot"
+        handler.send_json = Mock()
+        with (
+            patch(
+                "live_trader.server.state.recover_durable_emergency_stop"
+            ) as recover,
+            patch(
+                "live_trader.server.state.snapshot",
+                return_value={"kill_switch": True},
+            ),
+            patch(
+                "live_trader.soak_monitor.latest_live_soak_report",
+                return_value={},
+            ),
+        ):
+            handler.do_GET()
+
+        recover.assert_called_once_with()
+        handler.send_json.assert_called_once_with(
+            {"kill_switch": True, "soak_report": {}}
+        )
+
+    def test_generic_runtime_route_cannot_bypass_functional_challenge(self) -> None:
+        handler = object.__new__(LiveTraderHandler)
+        handler.path = "/api/runtime/start"
+        handler.read_json = Mock(
+            return_value={
+                "profile_id": "stock",
+                "mode": "SMALL_LIVE",
+                "execution_purpose": "FUNCTIONAL_TEST",
+                "functional_test_context": {"callerControlled": True},
+            }
+        )
+        handler.send_json = Mock()
+
+        with patch(
+            "live_trader.server.state.start_continuous_runtime"
+        ) as start:
+            handler.do_POST()
+
+        start.assert_not_called()
+        response = handler.send_json.call_args.args[0]
+        self.assertFalse(response["ok"])
+        self.assertFalse(response["runtimeStarted"])
+        self.assertFalse(response["brokerSubmissionPerformed"])
+
+    def test_server_startup_recovers_independent_emergency_latch(self) -> None:
+        with (
+            patch(
+                "live_trader.server.state.disarm_real_orders_for_process_start"
+            ) as disarm,
+            patch("live_trader.daemon.read_daemon_status") as daemon_status,
+            patch("live_trader.server.state.restore_runtime_from_checkpoint") as restore,
+            patch("live_trader.server.state.recover_durable_emergency_stop") as recover,
+        ):
+            prepare_server_state()
+
+        disarm.assert_called_once_with(persist=True)
+        daemon_status.assert_called_once_with(persist=True)
+        restore.assert_called_once_with()
+        recover.assert_called_once_with()
+
     def test_preflight_route_forwards_deployment_and_strategy_scope(self) -> None:
         handler = object.__new__(LiveTraderHandler)
         handler.path = "/api/preflight"

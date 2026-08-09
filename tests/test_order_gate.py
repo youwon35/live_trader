@@ -6,7 +6,7 @@ import threading
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from live_trader import state
 from live_trader.brokers import (
@@ -17,6 +17,7 @@ from live_trader.brokers import (
 )
 from live_trader.audit_store import SQLiteAuditEventStore
 from live_trader.execution_streams import parse_upbit_my_order
+from live_trader.emergency_stop import _reset_emergency_stop_sticky_for_tests
 from live_trader.program_ledger import ProgramLedger
 from trading_runtime import (
     DeploymentStore,
@@ -26,8 +27,23 @@ from trading_runtime import (
 from test_exact_paper_live_binding import exact_evidence_for_artifact
 
 
+def empty_complete_kis_order_truth() -> dict[str, object]:
+    return {
+        "complete": True,
+        "pagination_complete": True,
+        "query_start_date": "20260801",
+        "query_end_date": "20260809",
+        "page_count": 1,
+        "orders": [],
+        "events": [],
+        "correlation_policy": "official-broker-order-id-only",
+        "absence_is_authoritative": True,
+    }
+
+
 class OrderGateTest(unittest.TestCase):
     def setUp(self) -> None:
+        _reset_emergency_stop_sticky_for_tests()
         self.original_state = copy.deepcopy(state.STATE)
         # Durable real-account snapshots must never make order-gate unit tests
         # depend on the developer's current broker balance or daily PnL.
@@ -37,6 +53,12 @@ class OrderGateTest(unittest.TestCase):
         self.original_recovery_journal = state.RECOVERY_JOURNAL
         self.original_decision_trace_store = state.DECISION_TRACE_STORE
         self.recovery_temp_dir = tempfile.TemporaryDirectory()
+        self.previous_emergency_stop_path = os.environ.get(
+            "LIVE_TRADER_EMERGENCY_STOP_PATH"
+        )
+        os.environ["LIVE_TRADER_EMERGENCY_STOP_PATH"] = str(
+            Path(self.recovery_temp_dir.name) / "emergency-stop.json"
+        )
         state.RECOVERY_JOURNAL = state.RecoveryJournal(Path(self.recovery_temp_dir.name) / "recovery-journal")
         state.DECISION_TRACE_STORE = state.DecisionTraceStore(Path(self.recovery_temp_dir.name) / "decision-trace.jsonl")
 
@@ -46,7 +68,14 @@ class OrderGateTest(unittest.TestCase):
         state.STATE.update(copy.deepcopy(self.original_state))
         state.RECOVERY_JOURNAL = self.original_recovery_journal
         state.DECISION_TRACE_STORE = self.original_decision_trace_store
+        if self.previous_emergency_stop_path is None:
+            os.environ.pop("LIVE_TRADER_EMERGENCY_STOP_PATH", None)
+        else:
+            os.environ["LIVE_TRADER_EMERGENCY_STOP_PATH"] = (
+                self.previous_emergency_stop_path
+            )
         self.recovery_temp_dir.cleanup()
+        _reset_emergency_stop_sticky_for_tests()
 
     def use_temp_program_ledger(self, temp_dir: str) -> ProgramLedger:
         self.original_program_ledger = state.PROGRAM_LEDGER
@@ -359,6 +388,168 @@ class OrderGateTest(unittest.TestCase):
         self.assertEqual("unknown_cancel_result", order["state"])
         self.assertEqual("reconcile_required", order["queue_state"])
         self.assertTrue(second["reconciliation_required"])
+
+    def test_kis_cancel_requires_unambiguous_composite_identity(self) -> None:
+        today = datetime.now().strftime("%Y%m%d")
+        cases = [
+            (
+                "legacy",
+                {
+                    "broker_order_id": "700001",
+                    "organization_no": "001",
+                },
+                set(),
+                "kis-cancel-composite-identity-required",
+            ),
+            (
+                "ambiguous",
+                {
+                    "broker_order_id": "700002",
+                    "order_date": today,
+                    "organization_no": "001",
+                    "broker_order_key": f"{today}:001:700002",
+                },
+                {"700002"},
+                "kis-cancel-odno-ambiguous",
+            ),
+        ]
+        for label, identity, ambiguous, expected_reason in cases:
+            with self.subTest(label=label):
+                order = {
+                    "order_id": f"kis-{label}",
+                    "state": "acknowledged",
+                    "queue_state": "submitted",
+                    "dry_run": False,
+                    "broker_id": "kis",
+                    "symbol": "005930",
+                    "asset": "KR_STOCK",
+                    "qty": 1,
+                    **identity,
+                }
+                state.STATE["orders"] = [order]
+                router = Mock()
+                truth = {
+                    "complete": True,
+                    "fresh": True,
+                    "absenceIsAuthoritative": True,
+                    "lastError": "",
+                    "ambiguousBrokerOrderIds": sorted(ambiguous),
+                    "workingOrders": [dict(order)],
+                }
+                with (
+                    patch.object(
+                        state,
+                        "refresh_kis_order_truth_for_kill_switch",
+                        return_value={"ok": True, "truth": truth},
+                    ),
+                    patch.object(state, "LiveBrokerRouter", return_value=router),
+                    patch.object(state, "append_audit"),
+                    patch.object(state, "snapshot", return_value={}),
+                ):
+                    result = state.cancel_order(order["order_id"])
+
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["reconciliation_required"])
+                self.assertEqual(
+                    expected_reason,
+                    result["reason"],
+                )
+                router.cancel_order.assert_not_called()
+
+    def test_kis_cancel_refreshes_and_requires_exact_current_working_row(self) -> None:
+        today = datetime.now().strftime("%Y%m%d")
+        order = {
+            "order_id": "kis-current-working",
+            "state": "acknowledged",
+            "queue_state": "submitted",
+            "dry_run": False,
+            "broker_id": "kis",
+            "broker_order_id": "700010",
+            "broker_order_key": f"{today}:001:700010",
+            "order_date": today,
+            "organization_no": "001",
+            "symbol": "005930",
+            "asset": "KR_STOCK",
+            "qty": 1,
+        }
+        truth = {
+            "complete": True,
+            "fresh": True,
+            "absenceIsAuthoritative": True,
+            "lastError": "",
+            "ambiguousBrokerOrderIds": [],
+            "workingOrders": [dict(order)],
+        }
+        state.STATE["orders"] = [order]
+        router = Mock()
+        router.cancel_order.return_value = {"ok": True, "json": {}}
+        with (
+            patch.object(
+                state,
+                "refresh_kis_order_truth_for_kill_switch",
+                return_value={"ok": True, "truth": truth},
+            ) as refresh,
+            patch.object(state, "LiveBrokerRouter", return_value=router),
+            patch.object(state, "append_audit"),
+            patch.object(state, "queue_live_order_lifecycle_notification"),
+            patch.object(state, "snapshot", return_value={}),
+        ):
+            result = state.cancel_order(order["order_id"])
+
+        self.assertTrue(result["ok"])
+        refresh.assert_called_once_with()
+        router.cancel_order.assert_called_once()
+        self.assertEqual("kis", router.cancel_order.call_args.args[0])
+        self.assertEqual("700010", router.cancel_order.call_args.args[1])
+        self.assertEqual(
+            "001", router.cancel_order.call_args.kwargs["organization_no"]
+        )
+
+    def test_kis_cancel_truth_refresh_failure_posts_zero(self) -> None:
+        today = datetime.now().strftime("%Y%m%d")
+        order = {
+            "order_id": "kis-refresh-failed",
+            "state": "acknowledged",
+            "queue_state": "submitted",
+            "dry_run": False,
+            "broker_id": "kis",
+            "broker_order_id": "700011",
+            "broker_order_key": f"{today}:001:700011",
+            "order_date": today,
+            "organization_no": "001",
+            "symbol": "005930",
+            "asset": "KR_STOCK",
+            "qty": 1,
+        }
+        state.STATE["orders"] = [order]
+        router = Mock()
+        with (
+            patch.object(
+                state,
+                "refresh_kis_order_truth_for_kill_switch",
+                return_value={
+                    "ok": False,
+                    "truth": {
+                        "complete": True,
+                        "fresh": False,
+                        "absenceIsAuthoritative": True,
+                        "lastError": "timeout",
+                        "workingOrders": [dict(order)],
+                    },
+                },
+            ),
+            patch.object(state, "LiveBrokerRouter", return_value=router),
+            patch.object(state, "append_audit"),
+            patch.object(state, "snapshot", return_value={}),
+        ):
+            result = state.cancel_order(order["order_id"])
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["reconciliation_required"])
+        self.assertEqual(
+            "kis-cancel-official-truth-unavailable", result["reason"]
+        )
+        router.cancel_order.assert_not_called()
 
     def test_fill_truth_wins_late_cancel_event(self) -> None:
         order = {
@@ -1398,7 +1589,29 @@ class OrderGateTest(unittest.TestCase):
         state.STATE["mode"] = "SMALL_LIVE"
         state.STATE["new_entries_blocked"] = False
 
-        result = state.set_flag("kill_switch", True)
+        with (
+            patch.object(
+                state,
+                "refresh_kis_order_truth_for_kill_switch",
+                return_value={
+                    "ok": True,
+                    "truth": {
+                        "complete": True,
+                        "fresh": True,
+                        "absenceIsAuthoritative": True,
+                        "lastError": "",
+                        "workingOrders": [],
+                        "ambiguousBrokerOrderIds": [],
+                    },
+                },
+            ),
+            patch.object(
+                state,
+                "run_reconciliation",
+                return_value={"ok": True},
+            ),
+        ):
+            result = state.set_flag("kill_switch", True)
 
         self.assertTrue(result["ok"])
         self.assertEqual(state.STATE["mode"], "MONITOR")
@@ -1418,7 +1631,25 @@ class OrderGateTest(unittest.TestCase):
                 self.assertFalse(rejected["ok"])
                 self.assertTrue(state.STATE[name])
 
-                accepted = state.set_flag(name, False, confirmed=True)
+                action = {
+                    "kill_switch": "KILL_SWITCH_OFF",
+                    "new_entries_blocked": "NEW_ENTRIES_BLOCKED_OFF",
+                    "dry_run": "DRY_RUN_OFF",
+                }[name]
+                issued = state.issue_safety_confirmation(
+                    action,
+                    {"name": name, "value": False},
+                )
+                accepted = state.set_flag(
+                    name,
+                    False,
+                    confirmed=True,
+                    safety_confirmation={
+                        "challengeId": issued["challengeId"],
+                        "token": issued["token"],
+                        "typedPhrase": issued["expectedPhrase"],
+                    },
+                )
                 self.assertTrue(accepted["ok"])
                 self.assertFalse(state.STATE[name])
 
@@ -2824,6 +3055,11 @@ class OrderGateTest(unittest.TestCase):
                     **self.get_account_snapshot(broker_id),
                     "positions": self.list_positions(broker_id),
                     "events": [],
+                    **(
+                        {"execution_truth": empty_complete_kis_order_truth()}
+                        if broker_id == "kis"
+                        else {}
+                    ),
                 }
 
         with patch("live_trader.state.LiveBrokerRouter", return_value=FakeRouter()), patch(
@@ -3169,6 +3405,421 @@ class OrderGateTest(unittest.TestCase):
         self.assertAlmostEqual(200.0, price)
         self.assertAlmostEqual(0.02, fee)
 
+    def test_kis_cumulative_partial_then_final_applies_only_watermark_delta(self) -> None:
+        state.STATE["broker_order_truth"] = {"kis": {}}
+        state.STATE["orders"] = [
+            {
+                "order_id": "LIVE-KIS-1",
+                "oms_order_id": "",
+                "broker_id": "kis",
+                "broker_order_id": "KIS-ORDER-1",
+                "broker_order_key": "20260809:001:KIS-ORDER-1",
+                "order_date": "20260809",
+                "organization_no": "001",
+                "state": "acknowledged",
+                "queue_state": "submitted",
+                "filled_quantity": 0.0,
+                "average_fill_price": 0.0,
+                "fee": 0.0,
+            }
+        ]
+        partial = {
+            "event_id": "kis-partial-1",
+            "broker_id": "kis",
+            "broker_order_id": "KIS-ORDER-1",
+            "state": "partially_filled",
+            "quantity": 1.0,
+            "price": 70_000.0,
+            "fee": 0.0,
+            "raw": {
+                "broker_order_key": "20260809:001:KIS-ORDER-1",
+                "order_date": "20260809",
+                "organization_no": "001",
+                "quantity_mode": "cumulative",
+                "cumulative_quantity": 1.0,
+                "cumulative_average_price": 70_000.0,
+            },
+        }
+        final = {
+            "event_id": "kis-filled-1",
+            "broker_id": "kis",
+            "broker_order_id": "KIS-ORDER-1",
+            "state": "filled",
+            "quantity": 3.0,
+            "price": 71_000.0,
+            "fee": 0.0,
+            "raw": {
+                "broker_order_key": "20260809:001:KIS-ORDER-1",
+                "order_date": "20260809",
+                "organization_no": "001",
+                "quantity_mode": "cumulative",
+                "cumulative_quantity": 3.0,
+                "cumulative_average_price": 71_000.0,
+            },
+        }
+
+        self.assertEqual(1, state.apply_execution_events_to_local_orders([partial]))
+        self.assertEqual(1, state.apply_execution_events_to_local_orders([final]))
+
+        order = state.STATE["orders"][0]
+        self.assertAlmostEqual(3.0, order["filled_quantity"])
+        self.assertAlmostEqual(71_000.0, order["average_fill_price"])
+        self.assertAlmostEqual(2.0, final["quantity"])
+        self.assertAlmostEqual(71_500.0, final["price"])
+        self.assertEqual("incremental", final["applied_quantity_mode"])
+        self.assertEqual("filled", order["state"])
+
+    def test_reused_kis_odno_never_matches_legacy_or_different_date_order(self) -> None:
+        event = {
+            "event_id": "kis-rest:20260809:001:REUSED:fill:1",
+            "broker_id": "kis",
+            "broker_order_id": "REUSED",
+            "state": "filled",
+            "quantity": 1.0,
+            "price": 70_000.0,
+            "fee": 0.0,
+            "raw": {
+                "broker_order_key": "20260809:001:REUSED",
+                "order_date": "20260809",
+                "organization_no": "001",
+                "quantity_mode": "cumulative",
+                "cumulative_quantity": 1.0,
+                "cumulative_average_price": 70_000.0,
+            },
+        }
+        legacy = {
+            "order_id": "LEGACY-LOCAL",
+            "broker_id": "kis",
+            "broker_order_id": "REUSED",
+            "state": "acknowledged",
+            "queue_state": "submitted",
+            "filled_quantity": 0.0,
+        }
+        prior_date = {
+            **legacy,
+            "order_id": "PRIOR-DATE-LOCAL",
+            "broker_order_key": "20260701:001:REUSED",
+            "order_date": "20260701",
+            "organization_no": "001",
+        }
+        state.STATE["broker_order_truth"] = {"kis": {}}
+
+        for local_order in (legacy, prior_date):
+            with self.subTest(order_id=local_order["order_id"]):
+                state.STATE["orders"] = [dict(local_order)]
+                candidate = copy.deepcopy(event)
+                self.assertEqual(
+                    0,
+                    state.apply_execution_events_to_local_orders([candidate]),
+                )
+                self.assertEqual(0.0, state.STATE["orders"][0]["filled_quantity"])
+                trace_id, matched = state.execution_event_trace_context(candidate)
+                self.assertEqual("", trace_id)
+                self.assertIsNone(matched)
+
+    def test_kis_poll_keeps_complete_working_order_truth_and_incomplete_poll_stales_it(self) -> None:
+        official_order = {
+            "broker_order_id": "KIS-WORKING-1",
+            "broker_order_key": "20260809:001:KIS-WORKING-1",
+            "order_date": "20260809",
+            "order_time": "090001",
+            "organization_no": "001",
+            "symbol": "005930",
+            "state": "accepted",
+            "order_quantity": 1.0,
+            "filled_quantity": 0.0,
+            "remaining_quantity": 1.0,
+        }
+        complete = {
+            "complete": True,
+            "pagination_complete": True,
+            "query_start_date": "20260809",
+            "query_end_date": "20260809",
+            "page_count": 1,
+            "orders": [official_order],
+            "events": [],
+            "correlation_policy": "official-broker-order-id-only",
+            "absence_is_authoritative": True,
+        }
+
+        class CompleteRouter:
+            def poll_execution_events(self, _broker_id):
+                return {
+                    "broker_id": "kis",
+                    "accounts": [],
+                    "positions": [],
+                    "events": [],
+                    "orders": [official_order],
+                    "execution_truth": complete,
+                }
+
+        class FailedRouter:
+            def poll_execution_events(self, _broker_id):
+                raise RuntimeError("pagination interrupted")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.use_temp_program_ledger(temp_dir)
+            try:
+                with (
+                    patch("live_trader.state.LiveBrokerRouter", return_value=CompleteRouter()),
+                    patch.object(state.LIVE_EXECUTION_STREAMS, "drain", return_value=[]),
+                    patch("live_trader.state.notify_new_live_fills", return_value=0),
+                    patch("live_trader.state.automatic_live_promotion_sweep", return_value=[]),
+                ):
+                    first = state.poll_execution_events(
+                        "kis",
+                        force_snapshot=True,
+                        include_snapshot=False,
+                    )
+                self.assertTrue(first["ok"])
+                truth = state.kis_order_truth_snapshot()
+                self.assertTrue(truth["complete"])
+                self.assertTrue(truth["fresh"])
+                self.assertEqual(1, truth["workingOrderCount"])
+                self.assertEqual(1, truth["unmatchedWorkingOrderCount"])
+
+                with (
+                    patch("live_trader.state.LiveBrokerRouter", return_value=FailedRouter()),
+                    patch.object(state.LIVE_EXECUTION_STREAMS, "drain", return_value=[]),
+                    patch("live_trader.state.notify_new_live_fills", return_value=0),
+                ):
+                    failed = state.poll_execution_events(
+                        "kis",
+                        force_snapshot=True,
+                        include_snapshot=False,
+                    )
+            finally:
+                self.restore_temp_program_ledger()
+
+        self.assertFalse(failed["ok"])
+        stale_truth = state.kis_order_truth_snapshot()
+        self.assertFalse(stale_truth["fresh"])
+        self.assertEqual(1, stale_truth["workingOrderCount"])
+        self.assertIn("pagination interrupted", stale_truth["lastError"])
+
+    def test_official_unmatched_kis_working_order_blocks_functional_mutation(self) -> None:
+        state.record_complete_kis_order_truth(
+            {
+                "complete": True,
+                "pagination_complete": True,
+                "orders": [
+                    {
+                        "broker_order_id": "KIS-UNMATCHED-1",
+                        "broker_order_key": "20260809:001:KIS-UNMATCHED-1",
+                        "order_date": "20260809",
+                        "organization_no": "001",
+                        "state": "partially_filled",
+                        "remaining_quantity": 2.0,
+                    }
+                ],
+                "absence_is_authoritative": True,
+            }
+        )
+        state.STATE["orders"] = []
+        state.STATE["active_runtime_session_ids"] = {}
+        controller = Mock()
+        controller.snapshot.return_value = {"profiles": {"stock": {"running": False, "phase": "STOPPED"}}}
+        with (
+            patch.object(state, "LIVE_CONTINUOUS_CONTROLLER", controller),
+            patch.object(state.PROGRAM_LEDGER, "order_dispatch_rows", return_value=[]),
+        ):
+            assessment = state.functional_test_authority_mutation_assessment()
+
+        self.assertFalse(assessment["allowed"])
+        self.assertEqual(1, assessment["workingOrderCount"])
+        self.assertIn(
+            "functional-test-working-orders-unresolved",
+            assessment["blockers"],
+        )
+
+    def test_incomplete_paginated_kis_truth_is_fail_closed_and_preserves_last_rows(self) -> None:
+        prior = {
+            "broker_order_id": "KIS-PRIOR-WORKING",
+            "broker_order_key": "20260808:001:KIS-PRIOR-WORKING",
+            "order_date": "20260808",
+            "organization_no": "001",
+            "state": "accepted",
+            "remaining_quantity": 1.0,
+        }
+        state.record_complete_kis_order_truth(
+            {
+                "complete": True,
+                "pagination_complete": True,
+                "orders": [prior],
+                "absence_is_authoritative": True,
+            }
+        )
+
+        class IncompleteRouter:
+            def poll_execution_events(self, _broker_id):
+                return {
+                    "broker_id": "kis",
+                    "accounts": [],
+                    "positions": [],
+                    "events": [],
+                    "execution_truth": {
+                        "complete": True,
+                        "pagination_complete": False,
+                        "orders": [],
+                        "absence_is_authoritative": False,
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.use_temp_program_ledger(temp_dir)
+            try:
+                with (
+                    patch("live_trader.state.LiveBrokerRouter", return_value=IncompleteRouter()),
+                    patch.object(state.LIVE_EXECUTION_STREAMS, "drain", return_value=[]),
+                    patch("live_trader.state.notify_new_live_fills", return_value=0),
+                ):
+                    result = state.poll_execution_events(
+                        "kis",
+                        force_snapshot=True,
+                        include_snapshot=False,
+                    )
+            finally:
+                self.restore_temp_program_ledger()
+
+        self.assertFalse(result["ok"])
+        truth = state.kis_order_truth_snapshot()
+        self.assertFalse(truth["fresh"])
+        self.assertEqual(1, truth["workingOrderCount"])
+        self.assertEqual("KIS-PRIOR-WORKING", truth["workingOrders"][0]["broker_order_id"])
+        self.assertIn("kis-order-truth-incomplete", truth["lastError"])
+
+    def test_official_working_order_wins_over_conflicting_local_completed_state(self) -> None:
+        state.STATE["orders"] = [
+            {
+                "order_id": "LOCAL-COMPLETED",
+                "broker_order_id": "KIS-STILL-WORKING",
+                "broker_order_key": "20260809:001:KIS-STILL-WORKING",
+                "order_date": "20260809",
+                "organization_no": "001",
+                "execution_purpose": state.FUNCTIONAL_TEST_EXECUTION_PURPOSE,
+                "state": "filled",
+                "queue_state": "completed",
+            }
+        ]
+        state.record_complete_kis_order_truth(
+            {
+                "complete": True,
+                "pagination_complete": True,
+                "orders": [
+                    {
+                        "broker_order_id": "KIS-STILL-WORKING",
+                        "broker_order_key": "20260809:001:KIS-STILL-WORKING",
+                        "order_date": "20260809",
+                        "organization_no": "001",
+                        "state": "partially_filled",
+                        "remaining_quantity": 1.0,
+                    }
+                ],
+                "absence_is_authoritative": True,
+            }
+        )
+        controller = Mock()
+        controller.snapshot.return_value = {
+            "profiles": {"stock": {"running": False, "phase": "STOPPED"}}
+        }
+        with patch.object(
+            state,
+            "LIVE_CONTINUOUS_CONTROLLER",
+            controller,
+        ), patch.object(
+            state.PROGRAM_LEDGER,
+            "order_dispatch_rows",
+            return_value=[],
+        ):
+            assessment = state.functional_test_authority_mutation_assessment()
+
+        self.assertFalse(assessment["allowed"])
+        self.assertEqual(1, assessment["workingOrderCount"])
+        self.assertEqual(
+            1,
+            assessment["kisOrderTruth"]["matchedWorkingOrderCount"],
+        )
+
+    def test_ambiguous_reused_odno_is_always_unmatched_and_blocks_mutation(self) -> None:
+        state.STATE["orders"] = [
+            {
+                "order_id": "LOCAL-AMBIGUOUS",
+                "broker_id": "kis",
+                "broker_order_id": "KIS-REUSED",
+                "broker_order_key": "20260809:001:KIS-REUSED",
+                "order_date": "20260809",
+                "organization_no": "001",
+                "execution_purpose": state.FUNCTIONAL_TEST_EXECUTION_PURPOSE,
+                "state": "acknowledged",
+                "queue_state": "submitted",
+            }
+        ]
+        orders = [
+            {
+                "broker_order_id": "KIS-REUSED",
+                "broker_order_key": f"{order_date}:001:KIS-REUSED",
+                "order_date": order_date,
+                "organization_no": "001",
+                "state": "accepted",
+                "remaining_quantity": 1.0,
+            }
+            for order_date in ("20260808", "20260809")
+        ]
+        state.record_complete_kis_order_truth(
+            {
+                "complete": True,
+                "pagination_complete": True,
+                "orders": orders,
+                "ambiguous_broker_order_ids": ["KIS-REUSED"],
+                "absence_is_authoritative": True,
+            }
+        )
+        truth = state.kis_order_truth_snapshot()
+        self.assertEqual(0, truth["matchedWorkingOrderCount"])
+        self.assertEqual(2, truth["unmatchedWorkingOrderCount"])
+        self.assertEqual(
+            0,
+            state.apply_execution_events_to_local_orders(
+                [
+                    {
+                        "event_id": "ambiguous-kis-fill",
+                        "broker_id": "kis",
+                        "broker_order_id": "KIS-REUSED",
+                        "state": "filled",
+                        "quantity": 1.0,
+                        "price": 70_000.0,
+                        "raw": {
+                            "broker_order_key": "20260809:001:KIS-REUSED",
+                            "order_date": "20260809",
+                            "organization_no": "001",
+                        },
+                    }
+                ]
+            ),
+        )
+
+        controller = Mock()
+        controller.snapshot.return_value = {
+            "profiles": {"stock": {"running": False, "phase": "STOPPED"}}
+        }
+        with patch.object(
+            state,
+            "LIVE_CONTINUOUS_CONTROLLER",
+            controller,
+        ), patch.object(
+            state.PROGRAM_LEDGER,
+            "order_dispatch_rows",
+            return_value=[],
+        ):
+            assessment = state.functional_test_authority_mutation_assessment()
+
+        self.assertFalse(assessment["allowed"])
+        self.assertEqual(2, assessment["workingOrderCount"])
+        self.assertIn(
+            "functional-test-working-orders-unresolved",
+            assessment["blockers"],
+        )
+
     def test_open_order_count_excludes_blocked_rejected_and_completed_orders(self) -> None:
         state.STATE["orders"] = [
             {"state": "acknowledged", "queue_state": "submitted"},
@@ -3218,6 +3869,7 @@ class OrderGateTest(unittest.TestCase):
                             "occurred_at": "2026-07-04 11:00:00",
                         }
                     ],
+                    "execution_truth": empty_complete_kis_order_truth(),
                 }
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3315,6 +3967,11 @@ class OrderGateTest(unittest.TestCase):
                             "occurred_at": "2026-07-25 10:00:00",
                         }
                     ],
+                    **(
+                        {"execution_truth": empty_complete_kis_order_truth()}
+                        if broker_id == "kis"
+                        else {}
+                    ),
                 }
 
         fake_router = FakeRouter()
@@ -3397,6 +4054,11 @@ class OrderGateTest(unittest.TestCase):
                     ],
                     "positions": [],
                     "events": [],
+                    **(
+                        {"execution_truth": empty_complete_kis_order_truth()}
+                        if broker_id == "kis"
+                        else {}
+                    ),
                 }
 
         fake_router = ConcurrentRouter()
@@ -3503,6 +4165,16 @@ class OrderGateTest(unittest.TestCase):
         }
 
         with patch("live_trader.brokers.issue_kis_access_token", return_value="token"), patch(
+            "live_trader.brokers.fetch_kis_domestic_order_truth",
+            return_value={
+                "rt_cd": "0",
+                "output1": [],
+                "query_start_date": "20260801",
+                "query_end_date": "20260807",
+                "page_count": 1,
+                "pagination_complete": True,
+            },
+        ), patch(
             "live_trader.brokers.fetch_kis_domestic_balance",
             return_value=payload,
         ), patch(

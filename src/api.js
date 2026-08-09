@@ -1,11 +1,24 @@
 export const API_DEFAULT_TIMEOUT_MS = 15_000;
 export const BROKER_REFRESH_TIMEOUT_MS = 45_000;
 
+export const SAFETY_CONFIRMATION_ACTIONS = Object.freeze({
+  KILL_SWITCH_OFF: "KILL_SWITCH_OFF",
+  DRY_RUN_OFF: "DRY_RUN_OFF",
+  NEW_ENTRIES_BLOCKED_OFF: "NEW_ENTRIES_BLOCKED_OFF",
+  REAL_ORDERS_ENABLE: "REAL_ORDERS_ENABLE",
+  FUNCTIONAL_TEST_START: "FUNCTIONAL_TEST_START",
+  BINANCE_FUTURES_FILL_SOAK_START: "BINANCE_FUTURES_FILL_SOAK_START",
+});
+
+let safetyConfirmationPresenter = null;
+let activeSafetyConfirmationFlow = null;
+
 export class ApiRequestError extends Error {
   constructor(message, code, options = {}) {
     super(message, options);
     this.name = "ApiRequestError";
     this.code = code;
+    this.details = options.details;
   }
 }
 
@@ -15,6 +28,158 @@ export function isApiRequestTimeout(error) {
 
 export function isApiConnectionFailure(error) {
   return error?.code === "NETWORK";
+}
+
+export function isSafetyConfirmationCancelled(error) {
+  return [
+    "SAFETY_CONFIRMATION_CANCELLED",
+    "SAFETY_CONFIRMATION_EXPIRED",
+  ].includes(error?.code);
+}
+
+export function registerSafetyConfirmationPresenter(presenter) {
+  if (typeof presenter !== "function") {
+    throw new TypeError("safety confirmation presenter must be a function");
+  }
+  safetyConfirmationPresenter = presenter;
+  return () => {
+    if (safetyConfirmationPresenter === presenter) safetyConfirmationPresenter = null;
+  };
+}
+
+function normalizedSafetyChallenge(response, action) {
+  const raw = response?.challenge && typeof response.challenge === "object"
+    ? response.challenge
+    : response;
+  const challengeId = String(raw?.challengeId || "");
+  const token = String(raw?.token || "");
+  const expectedPhrase = String(raw?.expectedPhrase || "");
+  const expiresAt = String(raw?.expiresAt || "");
+  const expiresAtMs = Date.parse(expiresAt);
+  if (!challengeId || !token || !expectedPhrase || !Number.isFinite(expiresAtMs)) {
+    throw new ApiRequestError(
+      "2단계 안전 확인 challenge 응답이 올바르지 않습니다.",
+      "SAFETY_CONFIRMATION_INVALID",
+    );
+  }
+  return {
+    action,
+    challengeId,
+    token,
+    expectedPhrase,
+    expiresAt,
+    expiresAtMs,
+    displayContext: raw?.displayContext && typeof raw.displayContext === "object"
+      ? raw.displayContext
+      : {},
+  };
+}
+
+async function runWithSafetyConfirmation(action, context, mutation) {
+  if (typeof safetyConfirmationPresenter !== "function") {
+    throw new ApiRequestError(
+      "2단계 안전 확인 화면을 사용할 수 없습니다.",
+      "SAFETY_CONFIRMATION_UI_UNAVAILABLE",
+    );
+  }
+  if (activeSafetyConfirmationFlow) {
+    throw new ApiRequestError(
+      "다른 2단계 안전 확인이 진행 중입니다.",
+      "SAFETY_CONFIRMATION_BUSY",
+    );
+  }
+
+  const flow = (async () => {
+    const response = await request("/api/safety-confirmation/challenge", {
+      method: "POST",
+      body: { action, context },
+    });
+    if (response?.ok === false) {
+      throw new ApiRequestError(
+        response.reason || "서버가 2단계 안전 확인 발급을 거부했습니다.",
+        "SAFETY_CONFIRMATION_REJECTED",
+        { details: response },
+      );
+    }
+    const challenge = normalizedSafetyChallenge(response, action);
+    if (Date.now() >= challenge.expiresAtMs) {
+      throw new ApiRequestError(
+        "2단계 안전 확인이 만료되었습니다. 다시 시작하세요.",
+        "SAFETY_CONFIRMATION_EXPIRED",
+      );
+    }
+    const decision = await safetyConfirmationPresenter({
+      action: challenge.action,
+      challengeId: challenge.challengeId,
+      expectedPhrase: challenge.expectedPhrase,
+      expiresAt: challenge.expiresAt,
+      displayContext: challenge.displayContext,
+    });
+    if (decision?.confirmed !== true) {
+      throw new ApiRequestError(
+        decision?.expired
+          ? "2단계 안전 확인이 만료되었습니다. 다시 시작하세요."
+          : "2단계 안전 확인이 취소되었습니다.",
+        decision?.expired
+          ? "SAFETY_CONFIRMATION_EXPIRED"
+          : "SAFETY_CONFIRMATION_CANCELLED",
+      );
+    }
+    if (Date.now() >= challenge.expiresAtMs) {
+      throw new ApiRequestError(
+        "2단계 안전 확인이 만료되었습니다. 다시 시작하세요.",
+        "SAFETY_CONFIRMATION_EXPIRED",
+      );
+    }
+    const typedPhrase = String(decision.typedPhrase || "");
+    if (typedPhrase !== challenge.expectedPhrase) {
+      throw new ApiRequestError(
+        "서버가 요구한 확인 문구와 일치하지 않습니다.",
+        "SAFETY_CONFIRMATION_PHRASE_MISMATCH",
+      );
+    }
+    return mutation({
+      challengeId: challenge.challengeId,
+      token: challenge.token,
+      typedPhrase,
+    });
+  })();
+
+  activeSafetyConfirmationFlow = flow;
+  try {
+    return await flow;
+  } finally {
+    if (activeSafetyConfirmationFlow === flow) activeSafetyConfirmationFlow = null;
+  }
+}
+
+function safetyConfirmationPayload(confirmation) {
+  return confirmation
+    ? {
+        safety_confirmation: {
+          challengeId: confirmation.challengeId,
+          token: confirmation.token,
+          typedPhrase: confirmation.typedPhrase,
+        },
+      }
+    : {};
+}
+
+export async function safetyConfirmationValuesDigest(values) {
+  const source = values && typeof values === "object" && !Array.isArray(values) ? values : {};
+  const sortedValues = Object.fromEntries(
+    Object.keys(source).sort().map((key) => [key, source[key]]),
+  );
+  const canonicalJson = JSON.stringify(sortedValues);
+  const subtle = globalThis.crypto?.subtle;
+  if (typeof globalThis.TextEncoder !== "function" || typeof subtle?.digest !== "function") {
+    throw new ApiRequestError(
+      "실전 주문 설정을 안전하게 봉인할 SHA-256 기능을 사용할 수 없습니다.",
+      "SAFETY_CONFIRMATION_DIGEST_UNAVAILABLE",
+    );
+  }
+  const digest = await subtle.digest("SHA-256", new TextEncoder().encode(canonicalJson));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export async function getSnapshot() {
@@ -54,7 +219,23 @@ export async function getEnvSettings() {
 }
 
 export async function saveEnvSettings(values, confirmed = false) {
-  return request("/api/env-settings", { method: "POST", body: { values, confirmed } });
+  const mutation = (confirmation) => request("/api/env-settings", {
+    method: "POST",
+    body: { values, confirmed, ...safetyConfirmationPayload(confirmation) },
+  });
+  const enableRealOrders = String(values?.LIVE_TRADER_ENABLE_REAL_ORDERS || "").toLowerCase() === "true";
+  if (!enableRealOrders) return mutation(null);
+  const settingKeys = Object.keys(values || {}).sort();
+  const valuesDigest = await safetyConfirmationValuesDigest(values);
+  return runWithSafetyConfirmation(
+    SAFETY_CONFIRMATION_ACTIONS.REAL_ORDERS_ENABLE,
+    {
+      settingKeys,
+      enableRealOrders: true,
+      valuesDigest,
+    },
+    mutation,
+  );
 }
 
 export async function setMode(mode) {
@@ -62,7 +243,95 @@ export async function setMode(mode) {
 }
 
 export async function setFlag(name, value, confirmed = false) {
-  return request("/api/flag", { method: "POST", body: { name, value, confirmed } });
+  const mutation = (confirmation) => request("/api/flag", {
+    method: "POST",
+    body: { name, value, confirmed, ...safetyConfirmationPayload(confirmation) },
+  });
+  const safetyAction = value === false
+    ? {
+        kill_switch: SAFETY_CONFIRMATION_ACTIONS.KILL_SWITCH_OFF,
+        dry_run: SAFETY_CONFIRMATION_ACTIONS.DRY_RUN_OFF,
+        new_entries_blocked: SAFETY_CONFIRMATION_ACTIONS.NEW_ENTRIES_BLOCKED_OFF,
+      }[name]
+    : null;
+  return safetyAction
+    ? runWithSafetyConfirmation(safetyAction, { name, value: false }, mutation)
+    : mutation(null);
+}
+
+export function nativeEmergencyStopAvailable() {
+  return typeof globalThis.window?.pywebview?.api?.engage_emergency_stop === "function";
+}
+
+export async function engageNativeEmergencyStop(reason = "operator global Kill Switch") {
+  const bridge = globalThis.window?.pywebview?.api;
+  if (typeof bridge?.engage_emergency_stop !== "function") {
+    throw new ApiRequestError(
+      "독립 긴급정지 브리지를 사용할 수 없습니다. Live Trader 데스크톱에서 다시 시도하세요.",
+      "EMERGENCY_BRIDGE_UNAVAILABLE",
+    );
+  }
+  let result;
+  try {
+    result = await bridge.engage_emergency_stop(reason);
+  } catch (error) {
+    throw new ApiRequestError(
+      "독립 긴급정지 브리지 호출에 실패했습니다.",
+      "EMERGENCY_BRIDGE_FAILED",
+      { cause: error },
+    );
+  }
+  if (result?.ok !== true || result?.active !== true || result?.durable !== true) {
+    throw new ApiRequestError(
+      result?.reason || "독립 긴급정지 래치를 기록하지 못했습니다.",
+      "EMERGENCY_LATCH_FAILED",
+      { details: result && typeof result === "object" ? result : undefined },
+    );
+  }
+  return result;
+}
+
+export async function getNativeEmergencyStopStatus() {
+  const bridge = globalThis.window?.pywebview?.api;
+  const available = nativeEmergencyStopAvailable();
+  if (typeof bridge?.emergency_stop_status !== "function") {
+    return {
+      available,
+      status_available: false,
+      active: false,
+      durable: false,
+      status: "unavailable",
+    };
+  }
+  try {
+    const result = await bridge.emergency_stop_status();
+    if (!result || typeof result !== "object") {
+      return {
+        available,
+        status_available: false,
+        active: false,
+        durable: false,
+        status: "invalid-response",
+      };
+    }
+    return {
+      ...result,
+      available,
+      status_available: true,
+      active: result.active === true,
+      durable: result.durable === true,
+      status: String(result.status || "unknown"),
+    };
+  } catch (error) {
+    return {
+      available,
+      status_available: false,
+      active: false,
+      durable: false,
+      status: "read-failed",
+      reason: error instanceof Error ? error.message : "native emergency status read failed",
+    };
+  }
 }
 
 export async function setAutomationProfile(profileId, enabled, provider, mode) {
@@ -167,12 +436,24 @@ export async function previewBinanceFuturesFillSoak(symbol = "ETHUSDT") {
   });
 }
 
-export async function startBinanceFuturesFillSoak(confirmationToken, confirmed = false) {
-  return request("/api/binance-futures-fill-soak/start", {
-    method: "POST",
-    body: { confirmation_token: confirmationToken, confirmed },
-    timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
-  });
+export async function startBinanceFuturesFillSoak(
+  confirmationToken,
+  confirmed = false,
+  context = {},
+) {
+  return runWithSafetyConfirmation(
+    SAFETY_CONFIRMATION_ACTIONS.BINANCE_FUTURES_FILL_SOAK_START,
+    { symbol: String(context.symbol || "") },
+    (confirmation) => request("/api/binance-futures-fill-soak/start", {
+      method: "POST",
+      body: {
+        confirmation_token: confirmationToken,
+        confirmed,
+        ...safetyConfirmationPayload(confirmation),
+      },
+      timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
+    }),
+  );
 }
 
 export async function stopBinanceFuturesFillSoak() {
@@ -260,11 +541,19 @@ export async function activateFunctionalTestToday(authorizedBy, confirmed = fals
 }
 
 export async function startFunctionalTest(targetKey, confirmed = false) {
-  return request("/api/functional-test/start", {
-    method: "POST",
-    body: { targetKey, confirmed },
-    timeoutMs: 180_000,
-  });
+  return runWithSafetyConfirmation(
+    SAFETY_CONFIRMATION_ACTIONS.FUNCTIONAL_TEST_START,
+    { targetKey },
+    (confirmation) => request("/api/functional-test/start", {
+      method: "POST",
+      body: {
+        targetKey,
+        confirmed,
+        ...safetyConfirmationPayload(confirmation),
+      },
+      timeoutMs: 180_000,
+    }),
+  );
 }
 
 export async function pauseFunctionalTestToday(confirmed = false) {

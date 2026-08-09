@@ -1216,3 +1216,22 @@ API 없이 실제 실행한 기능:
 - 최종 검증은 격리 APPDATA와 `LIVE_TRADER_ENABLE_REAL_ORDERS=false`, Telegram/실인증정보 제거 환경에서 수행했다. Live Python 45개 파일·540개 테스트, 프런트 회귀 7종, Vite production build, Edge 4개 viewport × 10개 탭 40개 UI smoke가 모두 통과했고 overflow·화면 밖 조작부·필수 섹션 누락·콘솔 오류는 0건이었다. 기능시험 확대 캡처에서도 승급 제외 안내, 기간/단위, 당일 담당자, 5개 lifecycle 버튼과 exact binding이 정상 표시됐다.
 - 실제 KIS REST/WebSocket·주문·취소·계좌 변경은 실행하지 않았다. 현재 저장 Artifact 중 기능시험 exact-integrity gate를 통과하지 못한 대상은 UI에서 `사용 불가`로 정직하게 표시되며, 실제 실전 기능시험은 사용자의 별도 명시 승인과 유효한 KIS 설정이 있을 때만 시작해야 한다.
 - 다음 개선 권고는 달력 기간 외에 `최소 확인 거래일 또는 최소 확정봉 수`를 함께 요구하는 이중 완료 조건이다. 특히 일봉 전략은 휴장일이 기간을 소비하므로 `N일 경과`만으로 장시간 작동 검증을 완료했다고 판단하면 안 된다.
+
+## 2026-08-09 KIS 국내 주문·체결 REST truth 보강
+
+- Live의 KIS `poll_execution_events`는 잔고·포지션뿐 아니라 공식 `inquire-daily-ccld` 전체 페이지를 읽는다. 최근 7일(설정 가능 1~31일)의 KRX·NXT·SOR 전체 주문을 대상으로 미체결, 부분체결, 완전체결, 취소, 거부를 공식 ODNO와 주문일·주문조직번호에 묶어 정규화한다. 연속조회 키 누락·반복, 페이지 한도 초과, 필수 수량/체결가 누락, 수량 불일치는 부분 결과를 쓰지 않고 전체 조회를 fail-closed한다.
+- REST 체결은 누적 수량 watermark로 기록하고 상태 계층에서 이미 반영한 누적량을 차감해 증분만 원장에 넣는다. 부분체결 1주 뒤 누적 3주가 와도 총 3주만 반영한다. 같은 ODNO가 조회 기간의 여러 날짜에 재사용되면 공식 truth에는 보존하되 날짜/지점 scope 없는 execution event는 내보내지 않는다.
+- POST 응답 유실로 ODNO를 모르면 종목·수량·시각 근접값으로 주문을 자동 귀속하지 않는다. 완전한 공식 목록을 `UNRESOLVED`와 함께 제공하고 운영자가 공식 식별자를 확인하도록 유지한다. ODNO가 있으면 선택적으로 주문일·주문조직번호까지 사용해 `MATCHED`, `ABSENT`, `AMBIGUOUS`를 추론 없이 판정한다.
+- 2026-08-09에 한국투자증권 공식 샘플을 다시 확인했다. endpoint는 `/uapi/domestic-stock/v1/trading/inquire-daily-ccld`, 최근 3개월 이내 조회 TR ID는 실전 `TTTC0081R`, 모의 `VTTC0081R`, 연속조회 헤더는 `M/F → N`, 전체 체결구분은 `CCLD_DVSN=00`이다. 근거: https://github.com/koreainvestment/open-trading-api/blob/main/examples_llm/domestic_stock/inquire_daily_ccld/inquire_daily_ccld.py
+- 모든 호출은 기존 계좌+앱키 공용 KIS REST limiter를 통과하며 모의 환경은 VPS 버킷으로 분리한다. 전용 mock 회귀와 기존 adapter/pagination 회귀만 수행했고 실제 KIS 네트워크·주문·취소는 호출하지 않았다.
+
+## 2026-08-09 Live P0 실행 권한·전역 Kill 안전 경계
+
+- Windows Live Trader는 코드에 고정된 machine-global named mutex로 단일 앱 인스턴스를 강제한다. KIS 계좌 fingerprint와 기능시험 authority도 프로세스 수명 동안 별도 lease로 소유하며, 같은 계좌·authority의 두 번째 EXE/server는 최종 broker POST 경계에서 차단된다. 환경 변수로 mutex namespace를 갈라 우회할 수 없고 생성·권한 오류도 fail-closed다.
+- API thread와 독립된 원자적 emergency-stop 문서와 pywebview native bridge를 추가했다. Kill ON은 확인 문구 없이 즉시 가능하고, API가 끊겨도 상단 `전역 Kill`이 durable latch를 직접 기록한다. 쓰기·replace·읽기·존재 확인 오류는 프로세스 sticky Kill로 남고, 한 번 초기화된 문서가 삭제되어도 marker가 다음 시작을 fail-closed한다. Kill 호출과 최종 broker POST는 같은 barrier로 선형화되어 이미 시작된 POST가 끝나기 전 Kill 호출이 완료되지 않으며, Kill 반환 뒤 시작되는 POST는 0건이다.
+- API/native Kill은 동일 latch generation recovery로 수렴한다. Runtime을 MONITOR로 내리고 신규 진입을 차단한 뒤 fresh official KIS 주문 truth 조회, 알려진 working 주문 취소, governed session 정지, broker/ledger 대조, audit·Telegram·incident evidence를 수행한다. 포지션 자동 청산은 하지 않는다. 성공 generation은 정확히 한 번만 처리하고, 실패는 5초 bounded retry로 재시도하되 같은 실패 evidence는 반복 전송하지 않고 최초 실패와 최종 성공 전환은 각각 한 번 남긴다.
+- KIS 공식 주문 truth는 complete pagination과 fresh/authoritative absence가 모두 증명될 때만 사용한다. unmatched 또는 ODNO 중복 working 주문은 cleanup/recovery 성공으로 간주하지 않는다. local 주문과 체결·취소는 raw PDNO와 `주문일:주문조직번호:ODNO` composite identity로만 귀속하며 legacy ODNO-only, 전일 ODNO, ambiguous ODNO, incomplete/stale truth는 broker cancel/fill mutation을 0건으로 차단하고 reconciliation-required로 남긴다. 누적 체결량은 Decimal watermark delta로 적용해 partial 1주 뒤 cumulative 3주가 총 3주만 반영된다.
+- Kill OFF, Dry Run OFF, 신규 진입 차단 OFF, 실주문 route ON, KIS 기능시험 시작, Binance Futures fill-soak 시작은 서버가 현재 계좌·Deployment·authority·종목·한도·만료·credential/config revision을 다시 계산해 발급하는 90초 one-time challenge를 요구한다. typed `LIVE <계좌끝4 또는 fingerprint suffix>`와 opaque token을 모두 검증하며 context 변경·만료·재시작·오입력·재사용·동시 중복 submit은 consume-before-mutation으로 fail-closed한다. raw token·문구·secret은 snapshot/audit/log에 저장하지 않는다.
+- 환경 파일에 실주문 ON이 남아 있어도 새 프로세스는 항상 disarmed/OFF로 시작한다. 확인된 REAL_ORDERS_ENABLE mutation만 현재 프로세스를 arm하며, 계정·key·secret·endpoint 변경은 원자적으로 실주문 OFF, Dry Run ON, 신규 진입 차단 ON, 운용자 확인 OFF를 강제한다. 일반 `/api/runtime/start`가 `FUNCTIONAL_TEST` purpose를 위조하는 경로도 private capability와 전용 challenge route에서 이중 차단한다.
+- Binance Futures fill-soak의 위험 증가 entry는 safety mutation lock과 native Kill dispatch boundary 안에서 전체 authorizer를 다시 실행한 뒤에만 POST한다. Kill 중 recovery cover는 `risk_reducing=true`, `reduce_only=true` shape와 현재 broker 포지션 감소 검증을 모두 통과한 경우에만 별도 복구 경로로 허용한다.
+- 모든 검증은 고유 임시 데이터 경로, 실계좌 자격증명 제거, 실주문·Telegram OFF 환경과 mock router로 수행했다. 최종 frozen diff에서 P0 집중 회귀 195/195, 전체 Python unittest 607/607, 프런트 모델/API 회귀 7종, 패널 레이아웃 smoke, 4개 viewport × 10개 탭 UI smoke 40/40, Vite production build가 모두 통과했다. 실제 KIS/Binance/Upbit/Telegram 네트워크·주문·취소·계좌 변경은 한 건도 실행하지 않았다.

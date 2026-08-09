@@ -8,11 +8,12 @@ import threading
 import time
 import urllib.parse
 import uuid
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, ContextManager, Protocol
 
 from .brokers import LiveBrokerRouter, real_orders_enabled
 from .futures_canary import (
@@ -452,6 +453,9 @@ class BinanceFuturesFillSoakSession:
             Callable[[dict[str, object]], tuple[bool, str, dict[str, object]]]
             | None
         ) = None,
+        dispatch_boundary: (
+            Callable[[], ContextManager[dict[str, object]]] | None
+        ) = None,
     ) -> None:
         self.config = config
         self.router: Router = router or LiveBrokerRouter()
@@ -465,6 +469,10 @@ class BinanceFuturesFillSoakSession:
         # There is deliberately no permissive default. Production injects the
         # operational runtime gate and tests must explicitly provide a stub.
         self.dispatch_authorizer = dispatch_authorizer
+        # Production injects a boundary that serializes the final mutable
+        # safety recheck and broker POST with native Kill. Unit-only sessions
+        # may omit it because their routers never reach a real network.
+        self.dispatch_boundary = dispatch_boundary
         self._stop_requested = threading.Event()
         self._run_lock = threading.Lock()
         self._status_lock = threading.Lock()
@@ -513,6 +521,37 @@ class BinanceFuturesFillSoakSession:
                 "operational-dispatch-authorization-blocked",
                 str(reason or "operational runtime authorization denied"),
             )
+
+    def _place_order_at_dispatch_boundary(
+        self,
+        intent: dict[str, object],
+    ) -> dict[str, object]:
+        boundary = (
+            self.dispatch_boundary()
+            if self.dispatch_boundary is not None
+            else nullcontext({})
+        )
+        with boundary as emergency:
+            active = bool(
+                isinstance(emergency, dict)
+                and emergency.get("active") is True
+            )
+            soak_leg = str(intent.get("soak_leg") or "").strip().lower()
+            verified_recovery_shape = bool(
+                soak_leg in {"cover", "recovery-cover"}
+                and intent.get("risk_reducing") is True
+                and intent.get("reduce_only") is True
+            )
+            if active and not verified_recovery_shape:
+                raise FillSoakHalt(
+                    "emergency-stop-latch-broker-dispatch-forbidden"
+                )
+            # Re-run the complete state authorizer only after entering the
+            # same linearization boundary as the irreversible broker call.
+            # A cover still has to prove current broker position reduction;
+            # its metadata shape alone never authorizes it.
+            self._authorize_place_order(intent)
+            return self.router.place_order(intent)
 
     def request_stop(self) -> None:
         self._stop_requested.set()
@@ -1367,8 +1406,7 @@ class BinanceFuturesFillSoakSession:
         }
         self._orders.append(record)
         try:
-            self._authorize_place_order(intent)
-            response = self.router.place_order(intent)
+            response = self._place_order_at_dispatch_boundary(intent)
         except FillSoakHalt:
             record["status"] = "BLOCKED"
             raise
@@ -1739,8 +1777,7 @@ class BinanceFuturesFillSoakSession:
         }
         self._orders.append(record)
         try:
-            self._authorize_place_order(intent)
-            response = self.router.place_order(intent)
+            response = self._place_order_at_dispatch_boundary(intent)
         except FillSoakHalt as exc:
             record["status"] = "BLOCKED"
             return {

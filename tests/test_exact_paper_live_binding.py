@@ -17,7 +17,9 @@ PAPER_APP = ROOT / "apps" / "paper_trader"
 if str(COMMON_PACKAGE) not in sys.path:
     sys.path.insert(0, str(COMMON_PACKAGE))
 if str(COMMON_TESTS) not in sys.path:
-    sys.path.insert(0, str(COMMON_TESTS))
+    # Helpers are available without shadowing this app's same-named tests
+    # during unittest discovery.
+    sys.path.append(str(COMMON_TESTS))
 if str(PAPER_APP) not in sys.path:
     sys.path.insert(0, str(PAPER_APP))
 

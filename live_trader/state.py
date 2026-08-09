@@ -11,10 +11,12 @@ import secrets
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from functools import lru_cache, wraps
 from io import StringIO
 from pathlib import Path
 import sys
@@ -83,7 +85,7 @@ from trading_runtime.functional_test import (
     read_functional_test_document,
 )
 from trading_runtime.operations import ENVIRONMENT_PROFILES
-from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled
+from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled as broker_environment_real_orders_enabled
 from .program_ledger import ProgramLedger
 from .contracts import (
     IGNORED_STRATEGY_FILE_NAMES,
@@ -109,6 +111,14 @@ from .account_risk import (
     update_account_risk_budget,
 )
 from .env_loader import LIVE_TRADER_SECRET_KEYS, default_runtime_data_root
+from .emergency_stop import (
+    clear_emergency_stop,
+    emergency_stop_dispatch_boundary,
+    emergency_stop_active,
+    emergency_stop_status,
+    engage_emergency_stop,
+)
+from .safety_confirmation import SAFETY_CONFIRMATIONS
 from .execution_streams import ExecutionStreamManager
 from .live_adapters import (
     BINANCE_BASE_URL,
@@ -148,6 +158,7 @@ from .functional_test_workspace import (
     kis_account_binding_id,
 )
 from .order_management import OrderIntent, OrderSide
+from .process_safety import hold_kis_dispatch_lease
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
 from trading_runtime.market_calendar import market_session_state
@@ -162,6 +173,7 @@ Mode = Literal["MONITOR", "SMALL_LIVE", "FULL_LIVE"]
 CheckStatus = Literal["pass", "warn", "fail", "na"]
 LIVE_BROKER_DISPATCH_MODES = frozenset({"SMALL_LIVE", "FULL_LIVE"})
 FUNCTIONAL_TEST_EXECUTION_PURPOSE = "FUNCTIONAL_TEST"
+_FUNCTIONAL_TEST_START_CAPABILITY = object()
 FUNCTIONAL_TEST_ENVIRONMENT = "KIS_LIVE"
 FUNCTIONAL_TEST_DOCUMENT_ROOT = default_functional_test_root()
 FUNCTIONAL_TEST_CURRENT_PERMIT_DOCUMENT = (
@@ -182,6 +194,14 @@ BINANCE_FUTURES_SETTINGS_LOCK = threading.RLock()
 # closed-bar cycle.  Public calls acquire this lock before manager/controller
 # locks; they never hold RUNTIME_MODE_LOCK while entering the manager.
 RUNTIME_CONTROL_LOCK = threading.RLock()
+SAFETY_CONFIRMATION_MUTATION_LOCK = threading.RLock()
+DURABLE_EMERGENCY_RECOVERY_LOCK = threading.RLock()
+DURABLE_EMERGENCY_RECOVERY_REVISION = ""
+DURABLE_EMERGENCY_RECOVERY_OUTCOME: dict[str, Any] = {}
+DURABLE_EMERGENCY_RECOVERY_ATTEMPT_REVISION = ""
+DURABLE_EMERGENCY_RECOVERY_LAST_ATTEMPT_MONOTONIC = 0.0
+DURABLE_EMERGENCY_RECOVERY_EVIDENCE_REVISION = ""
+DURABLE_EMERGENCY_RECOVERY_RETRY_SECONDS = 5.0
 BROKER_POLL_LOCK = threading.Lock()
 FUNCTIONAL_TEST_PREFLIGHT_LOCK = threading.RLock()
 # Serializes permit/activation/start/pause/final-end lifecycle mutations in
@@ -195,6 +215,46 @@ FUNCTIONAL_TEST_LIFECYCLE_LOCK = threading.RLock()
 FUNCTIONAL_TEST_AUTHORITY_DISPATCH_LOCK = threading.RLock()
 RUNTIME_MODE_RANK = {"MONITOR": 0, "SMALL_LIVE": 1, "FULL_LIVE": 2}
 PROFESSIONAL_PROMOTION_POLICY = PromotionPolicy()
+_REAL_ORDERS_PROCESS_ARMED = False
+_REAL_ORDERS_PROCESS_ARM_LOCK = threading.RLock()
+
+# A persisted/env true value is configuration, never authority. Every fresh
+# process starts disarmed; only an in-process, consumed confirmation may arm.
+os.environ["LIVE_TRADER_ENABLE_REAL_ORDERS"] = "false"
+
+
+def _serialized_safety_mutation(function: Any) -> Any:
+    """Serialize challenge issuance/consumption with authority mutations."""
+
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with SAFETY_CONFIRMATION_MUTATION_LOCK:
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+def real_orders_enabled() -> bool:
+    with _REAL_ORDERS_PROCESS_ARM_LOCK:
+        return bool(_REAL_ORDERS_PROCESS_ARMED) and bool(
+            broker_environment_real_orders_enabled()
+        )
+
+
+def disarm_real_orders_for_process_start(*, persist: bool = False) -> dict[str, Any]:
+    """Make persisted true non-authoritative across every process restart."""
+
+    global _REAL_ORDERS_PROCESS_ARMED
+    with _REAL_ORDERS_PROCESS_ARM_LOCK:
+        _REAL_ORDERS_PROCESS_ARMED = False
+        os.environ["LIVE_TRADER_ENABLE_REAL_ORDERS"] = "false"
+        if persist:
+            from . import env_settings
+
+            env_settings.save_env_settings(
+                {"LIVE_TRADER_ENABLE_REAL_ORDERS": False}
+            )
+    return {"ok": True, "armed": False, "persistedOff": bool(persist)}
 
 TELEGRAM_DISPATCHER = TelegramDispatcher(
     "live_trader",
@@ -592,6 +652,16 @@ STATE: dict[str, Any] = {
         "observed_position_count": 0,
         "snapshot_changed_brokers": [],
         "snapshot_skipped_brokers": [],
+    },
+    "broker_order_truth": {
+        "kis": {
+            "complete": False,
+            "fresh": False,
+            "observedAt": "",
+            "lastAttemptAt": "",
+            "lastError": "not-polled",
+            "orders": [],
+        }
     },
     "broker_snapshot_poll": {
         "brokers": {},
@@ -4432,6 +4502,7 @@ def apply_watchdog_fail_closed(report: dict[str, Any]) -> bool:
 
 
 def run_watchdog(include_snapshot: bool = True) -> dict[str, Any]:
+    emergency_recovery = recover_durable_emergency_stop()
     brokers = [broker.to_dict() for broker in broker_readiness()]
     reconciliation = reconciliation_snapshot()
     queue = order_queue_summary()
@@ -4467,7 +4538,13 @@ def run_watchdog(include_snapshot: bool = True) -> dict[str, Any]:
     if previous_status != report["status"] and not changed:
         level = "danger" if report["status"] == "fail" else "warn" if report["status"] == "warn" else "info"
         append_audit(level, "Watchdog", f"{report['status_label']}: {STATE['watchdog']['last_action']}")
-    payload = {"ok": report["critical_count"] == 0, "watchdog": watchdog_snapshot(brokers, reconciliation["summary"], queue)}
+    payload = {
+        "ok": report["critical_count"] == 0,
+        "watchdog": watchdog_snapshot(
+            brokers, reconciliation["summary"], queue
+        ),
+        "emergency_stop_recovery": emergency_recovery,
+    }
     if include_snapshot:
         payload["snapshot"] = snapshot()
     return payload
@@ -6165,12 +6242,17 @@ def snapshot() -> dict[str, Any]:
     restart_recovery = restart_recovery_plan_snapshot(reconciliation, continuous_runtime, broker_truth)
     governance = operational_governance_snapshot(strategies)
     durable_audit = durable_audit_rows()
+    emergency = emergency_stop_status()
+    effective_kill_switch = bool(STATE["kill_switch"]) or emergency.get("active") is True
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode": STATE["mode"],
         "dry_run": STATE["dry_run"],
-        "kill_switch": STATE["kill_switch"],
-        "kill_switch_rearm_required": bool(STATE.get("kill_switch_rearm_required")),
+        "kill_switch": effective_kill_switch,
+        "kill_switch_rearm_required": bool(
+            STATE.get("kill_switch_rearm_required")
+        ) or emergency.get("active") is True,
+        "emergency_stop": emergency,
         "new_entries_blocked": STATE["new_entries_blocked"],
         "operator_confirmed": STATE["operator_confirmed"],
         "central_control": durable_control_snapshot(),
@@ -6221,6 +6303,7 @@ def snapshot() -> dict[str, Any]:
         "broker_position_truth": broker_truth,
         "program_ledger": program_ledger_snapshot(),
         "execution_events": execution_event_snapshot(),
+        "broker_order_truth": {"kis": kis_order_truth_snapshot()},
         "upbit_smoke_order": dict(STATE.get("upbit_smoke_order", {})),
         "binance_smoke_order": dict(STATE.get("binance_smoke_order", {})),
         "binance_futures_canary": binance_futures_canary_status(),
@@ -6476,6 +6559,7 @@ def sync_runtime_profile_mode(
     STATE["mode"] = effective_automation_mode()
 
 
+@_serialized_safety_mutation
 def set_mode(mode: str) -> dict[str, Any]:
     with RUNTIME_CONTROL_LOCK:
         return _set_mode_serialized(mode)
@@ -6535,7 +6619,10 @@ def _set_mode_serialized(mode: str) -> dict[str, Any]:
     }
 
 
-def cancel_working_orders_for_kill_switch() -> dict[str, Any]:
+def cancel_working_orders_for_kill_switch(
+    *,
+    kis_truth: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Request cancellation of known working orders without creating exits.
 
     Orders with an ambiguous submit outcome are deliberately left in
@@ -6549,12 +6636,55 @@ def cancel_working_orders_for_kill_switch() -> dict[str, Any]:
         if isinstance(order, dict) and _restore_order_is_pending_or_unknown(order)
     ]
     results: list[dict[str, Any]] = []
+    kis_truth = (
+        dict(kis_truth)
+        if isinstance(kis_truth, dict)
+        else kis_order_truth_snapshot()
+    )
+    kis_truth_authoritative = bool(
+        kis_truth.get("complete") is True
+        and kis_truth.get("fresh") is True
+        and kis_truth.get("absenceIsAuthoritative") is True
+        and not str(kis_truth.get("lastError") or "")
+    )
+    ambiguous_official_ids = {
+        str(item).strip()
+        for item in kis_truth.get("ambiguousBrokerOrderIds", [])
+        if str(item).strip()
+    }
+    candidate_kis_order_keys = {
+        key
+        for order in candidates
+        if str(order.get("broker_id") or "").strip().lower() == "kis"
+        and str(order.get("broker_order_id") or "").strip()
+        not in ambiguous_official_ids
+        and (key := _kis_order_key(order))
+    }
     for order in candidates:
         order_id = str(order.get("order_id") or order.get("oms_order_id") or "")
         broker_order_id = str(order.get("broker_order_id") or "").strip()
         queue_state = str(order.get("queue_state") or "").strip().lower()
         locally_safe = bool(order.get("dry_run"))
         broker_cancelable = bool(broker_order_id and queue_state in {"submitted", "sent", "partially_filled"})
+        broker_id = str(order.get("broker_id") or "").strip().lower()
+        if broker_id == "kis" and (
+            not kis_truth_authoritative
+            or not _kis_order_key(order)
+            or broker_order_id in ambiguous_official_ids
+        ):
+            results.append(
+                {
+                    "order_id": order_id,
+                    "ok": False,
+                    "status": "reconciliation_required",
+                    "reason": (
+                        "KIS 공식 주문 truth가 완전·최신이 아니거나 주문의 "
+                        "date·organization·ODNO composite identity가 없거나 "
+                        "ODNO가 중복되어 자동 취소 POST를 차단했습니다."
+                    ),
+                }
+            )
+            continue
         if not order_id or (not locally_safe and not broker_cancelable):
             results.append(
                 {
@@ -6566,45 +6696,125 @@ def cancel_working_orders_for_kill_switch() -> dict[str, Any]:
             )
             continue
         try:
-            outcome = cancel_order(order_id)
+            outcome = (
+                cancel_order(order_id, _official_kis_truth=kis_truth)
+                if broker_id == "kis"
+                else cancel_order(order_id)
+            )
         except Exception as exc:  # cancellation is best-effort; Kill remains latched
             outcome = {"ok": False, "reason": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        outcome_status = (
+            "cancel_requested"
+            if outcome.get("ok") is True
+            else "reconciliation_required"
+            if outcome.get("reconciliation_required") is True
+            else "cancel_failed"
+        )
         results.append(
             {
                 "order_id": order_id,
                 "ok": outcome.get("ok") is True,
-                "status": "cancel_requested" if outcome.get("ok") is True else "cancel_failed",
+                "status": outcome_status,
                 "reason": str(outcome.get("reason") or ""),
             }
         )
+    uncovered_official_working = [
+        dict(order)
+        for order in kis_truth.get("workingOrders", [])
+        if isinstance(order, dict)
+        and (
+            str(order.get("broker_order_id") or "").strip()
+            in ambiguous_official_ids
+            or _kis_order_key(order) not in candidate_kis_order_keys
+        )
+    ]
+    known_local_keys = _known_local_kis_order_keys()
+    for order in uncovered_official_working:
+        broker_order_id = str(order.get("broker_order_id") or "").strip()
+        broker_order_key = _kis_order_key(order)
+        is_known_local = bool(
+            broker_order_key and broker_order_key in known_local_keys
+        )
+        results.append(
+            {
+                "order_id": f"kis:{broker_order_id or 'unknown'}",
+                "broker_order_id": broker_order_id,
+                "broker_order_key": broker_order_key,
+                "ok": False,
+                "status": "reconciliation_required",
+                "source": "kis-official-order-truth",
+                "reason": (
+                    "공식 KIS working 주문과 로컬 완료 상태가 충돌하여 "
+                    "자동 취소하지 않습니다. 대조 후 수동 조치가 필요합니다."
+                    if is_known_local
+                    else
+                    "공식 KIS working 주문이 로컬 주문에 귀속되지 않아 "
+                    "자동 취소하지 않습니다. 대조 후 수동 조치가 필요합니다."
+                ),
+            }
+        )
+    if not kis_truth_authoritative:
+        results.append(
+            {
+                "order_id": "kis:official-order-truth",
+                "ok": False,
+                "status": "order_truth_unavailable",
+                "source": "kis-official-order-truth",
+                "reason": (
+                    "공식 KIS 주문 조회가 완전·최신·권위 있는 상태가 아니므로 "
+                    "미체결 주문 0건으로 간주하지 않습니다."
+                ),
+            }
+        )
     canceled_count = sum(1 for item in results if item["ok"])
-    unresolved_count = sum(1 for item in results if item["status"] == "reconciliation_required")
+    unresolved_count = sum(
+        1
+        for item in results
+        if item["status"]
+        in {"reconciliation_required", "order_truth_unavailable"}
+    )
     failed_count = sum(1 for item in results if item["status"] == "cancel_failed")
+    cleanup_complete = bool(
+        not failed_count
+        and not unresolved_count
+        and kis_truth_authoritative
+    )
     summary = {
-        "working_count": len(candidates),
+        "working_count": len(candidates) + len(uncovered_official_working),
         "cancel_requested_count": canceled_count,
         "failed_count": failed_count,
         "unresolved_count": unresolved_count,
+        "cleanup_complete": cleanup_complete,
+        "kis_order_truth_authoritative": kis_truth_authoritative,
+        "kis_official_working_count": int(
+            kis_truth.get("workingOrderCount") or 0
+        ),
+        "kis_unmatched_working_count": int(
+            kis_truth.get("unmatchedWorkingOrderCount") or 0
+        ),
+        "kis_order_truth_error": str(kis_truth.get("lastError") or ""),
         "flatten_requested": False,
         "results": results,
     }
     append_audit(
-        "danger" if failed_count or unresolved_count else "warn",
+        "danger" if not cleanup_complete else "warn",
         "Kill Switch 미체결 취소",
         (
-            f"working {len(candidates)}건 · 취소 요청 성공 {canceled_count}건 · "
-            f"실패 {failed_count}건 · 대조 필요 {unresolved_count}건 · 포지션 청산 요청 없음"
+            f"working {summary['working_count']}건 · 취소 요청 성공 {canceled_count}건 · "
+            f"실패 {failed_count}건 · 대조 필요 {unresolved_count}건 · "
+            f"KIS 공식 주문 truth {'확정' if kis_truth_authoritative else '미확정'} · "
+            "포지션 청산 요청 없음"
         ),
     )
     sync_operational_incident(
         code="KILL_CANCEL_INCOMPLETE",
-        active=bool(failed_count or unresolved_count),
+        active=not cleanup_complete,
         severity="CRITICAL",
         title="Kill Switch 미체결 취소 미완료",
         detail=f"취소 실패 {failed_count}건 · 대조 필요 {unresolved_count}건",
         impact=(
             "Kill은 유지되지만 일부 Working Order가 Broker에 남아 있을 수 있습니다."
-            if failed_count or unresolved_count
+            if not cleanup_complete
             else "Working Order 취소 요청이 완료되었습니다."
         ),
     )
@@ -6691,11 +6901,646 @@ def stop_operational_runtime_sessions_for_kill(
     return outcomes
 
 
-def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, Any]:
+SAFETY_CONFIRMATION_ACTIONS = {
+    "KILL_SWITCH_OFF",
+    "DRY_RUN_OFF",
+    "NEW_ENTRIES_BLOCKED_OFF",
+    "REAL_ORDERS_ENABLE",
+    "FUNCTIONAL_TEST_START",
+    "BINANCE_FUTURES_FILL_SOAK_START",
+}
+
+
+def _safety_confirmation_request_context(
+    action: str,
+    request_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    values = request_context if isinstance(request_context, dict) else {}
+    if action in {
+        "KILL_SWITCH_OFF",
+        "DRY_RUN_OFF",
+        "NEW_ENTRIES_BLOCKED_OFF",
+    }:
+        expected_name = {
+            "KILL_SWITCH_OFF": "kill_switch",
+            "DRY_RUN_OFF": "dry_run",
+            "NEW_ENTRIES_BLOCKED_OFF": "new_entries_blocked",
+        }[action]
+        return {"name": expected_name, "value": False}
+    if action == "REAL_ORDERS_ENABLE":
+        keys = values.get("settingKeys") or values.get("setting_keys") or []
+        if not isinstance(keys, list):
+            keys = []
+        proposed_digest = str(
+            values.get("valuesDigest")
+            or values.get("values_digest")
+            or ""
+        ).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", proposed_digest):
+            proposed_digest = "invalid"
+        return {
+            "settingKeys": sorted(
+                {
+                    str(item).strip()
+                    for item in keys
+                    if str(item).strip()
+                }
+            ),
+            "enableRealOrders": True,
+            "proposedValuesDigest": proposed_digest,
+        }
+    if action == "FUNCTIONAL_TEST_START":
+        return {
+            "targetKey": str(
+                values.get("targetKey") or values.get("target_key") or ""
+            ).strip()
+        }
+    if action == "BINANCE_FUTURES_FILL_SOAK_START":
+        return {
+            "symbol": normalize_usdm_symbol(
+                values.get("symbol")
+                or BINANCE_FUTURES_FILL_SOAK_INTERNAL.get("symbol")
+                or "ETHUSDT"
+            )
+        }
+    return {}
+
+
+def _safety_confirmation_identity(action: str) -> dict[str, str]:
+    provider = "GLOBAL"
+    raw_identity = ""
+    human_suffix = ""
+    kis_cano, kis_product = split_kis_account(
+        str(env_value("KIS_ACCOUNT_NO") or ""),
+        str(env_value("KIS_ACCOUNT_PRODUCT_CODE") or ""),
+    )
+    kis_binding = kis_account_binding_id(kis_cano, kis_product)
+    if action == "BINANCE_FUTURES_FILL_SOAK_START":
+        provider = "BINANCE"
+        raw_identity = str(env_value("BINANCE_API_KEY") or "").strip()
+    elif action == "FUNCTIONAL_TEST_START":
+        provider = "KIS"
+        try:
+            permit, _activation = functional_test_active_authority()
+            raw_identity = str(permit.binding.account_id or "").strip()
+        except Exception:
+            raw_identity = ""
+        if not raw_identity:
+            raw_identity = kis_binding
+        human_suffix = "".join(
+            character for character in kis_cano if character.isalnum()
+        )[-4:].upper()
+    else:
+        selected_broker = ""
+        selected_strategy = str(STATE.get("selected_strategy_id") or "")
+        selected_deployment = str(STATE.get("selected_deployment_id") or "")
+        if selected_strategy or selected_deployment:
+            try:
+                selected = next(
+                    (
+                        row
+                        for row in strategy_rows()
+                        if (
+                            selected_strategy
+                            and str(row.get("strategy_id") or "")
+                            == selected_strategy
+                        )
+                        or (
+                            selected_deployment
+                            and str(row.get("deployment_id") or "")
+                            == selected_deployment
+                        )
+                    ),
+                    None,
+                )
+                if isinstance(selected, dict):
+                    selected_broker = strategy_broker_id(selected)
+            except (OSError, RuntimeError, ValueError):
+                selected_broker = ""
+        identity_by_broker = {
+            "kis": ("KIS", kis_binding),
+            "binance": (
+                "BINANCE",
+                str(env_value("BINANCE_API_KEY") or "").strip(),
+            ),
+            "binance-futures": (
+                "BINANCE",
+                str(env_value("BINANCE_API_KEY") or "").strip(),
+            ),
+            "upbit": (
+                "UPBIT",
+                str(env_value("UPBIT_ACCESS_KEY") or "").strip(),
+            ),
+        }
+        if selected_broker in identity_by_broker:
+            provider, raw_identity = identity_by_broker[selected_broker]
+            if provider == "KIS":
+                human_suffix = "".join(
+                    character for character in kis_cano if character.isalnum()
+                )[-4:].upper()
+        else:
+            configured = [
+                {"provider": item_provider, "identity": item_value}
+                for item_provider, item_value in {
+                    "KIS": kis_binding,
+                    "BINANCE": str(env_value("BINANCE_API_KEY") or "").strip(),
+                    "UPBIT": str(env_value("UPBIT_ACCESS_KEY") or "").strip(),
+                }.items()
+                if item_value
+            ]
+            raw_identity = governance_sha256(
+                {
+                    "scope": "GLOBAL",
+                    "accounts": configured,
+                    "environmentFingerprint": _safety_environment_fingerprint(),
+                }
+            )
+    normalized = "".join(character for character in raw_identity if character.isalnum())
+    fingerprint = governance_sha256(
+        {
+            "provider": provider,
+            "identity": normalized or "UNCONFIGURED",
+        }
+    )
+    # KIS account suffix is meaningful to the operator. API-key-derived
+    # identities intentionally expose only a fingerprint suffix.
+    suffix = (
+        human_suffix
+        if provider == "KIS" and human_suffix
+        else fingerprint[-4:].upper()
+    )
+    return {
+        "provider": provider,
+        "fingerprint": fingerprint,
+        "suffix": suffix,
+    }
+
+
+def _safety_environment_fingerprint() -> str:
+    from . import env_settings
+
+    fields = env_settings.env_settings_snapshot().get("fields", [])
+    safe_fields = []
+    for field in fields if isinstance(fields, list) else []:
+        if not isinstance(field, dict):
+            continue
+        safe_fields.append(
+            {
+                "key": str(field.get("key") or ""),
+                "configured": field.get("configured") is True,
+                "value": (
+                    hashlib.sha256(
+                        str(env_value(str(field.get("key") or "")) or "").encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+                    if str(field.get("kind") or "") == "secret"
+                    else str(field.get("value") or "")
+                ),
+            }
+        )
+    return governance_sha256({"fields": safe_fields})
+
+
+def safety_confirmation_values_digest(values: dict[str, Any]) -> str:
+    canonical = {
+        str(key): value
+        for key, value in sorted(
+            (values if isinstance(values, dict) else {}).items(),
+            key=lambda item: str(item[0]),
+        )
+    }
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def safety_confirmation_authoritative_context(
+    action: object,
+    request_context: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    normalized_action = str(action or "").strip().upper()
+    if normalized_action not in SAFETY_CONFIRMATION_ACTIONS:
+        raise ValueError("unknown-safety-confirmation-action")
+    request = _safety_confirmation_request_context(
+        normalized_action,
+        request_context,
+    )
+    identity = _safety_confirmation_identity(normalized_action)
+    context: dict[str, Any] = {
+        "schemaVersion": "live-safety-confirmation-context-v1",
+        "action": normalized_action,
+        "request": request,
+        "accountFingerprint": identity["fingerprint"],
+        "configRevision": int(STATE.get("config_revision") or 0),
+        "mode": str(STATE.get("mode") or "MONITOR"),
+        "selectedDeploymentId": str(STATE.get("selected_deployment_id") or ""),
+        "selectedStrategyId": str(STATE.get("selected_strategy_id") or ""),
+    }
+    if context["selectedDeploymentId"] or context["selectedStrategyId"]:
+        try:
+            selected_row = next(
+                (
+                    row
+                    for row in strategy_rows()
+                    if (
+                        context["selectedStrategyId"]
+                        and str(row.get("strategy_id") or "")
+                        == context["selectedStrategyId"]
+                    )
+                    or (
+                        context["selectedDeploymentId"]
+                        and str(row.get("deployment_id") or "")
+                        == context["selectedDeploymentId"]
+                    )
+                ),
+                None,
+            )
+            context["selectedAuthorityFingerprint"] = governance_sha256(
+                {
+                    "strategyId": str(
+                        (selected_row or {}).get("strategy_id") or ""
+                    ),
+                    "deploymentId": str(
+                        (selected_row or {}).get("deployment_id") or ""
+                    ),
+                    "deploymentRevision": (selected_row or {}).get(
+                        "deployment_revision"
+                    ),
+                    "brokerId": strategy_broker_id(selected_row or {}),
+                    "symbol": str((selected_row or {}).get("symbol") or ""),
+                    "artifactReference": (selected_row or {}).get(
+                        "artifact_reference"
+                    ),
+                    "portfolioGate": (selected_row or {}).get(
+                        "portfolio_gate"
+                    ),
+                }
+            )
+        except (OSError, RuntimeError, ValueError):
+            context["selectedAuthorityFingerprint"] = "unavailable"
+    if normalized_action == "KILL_SWITCH_OFF":
+        emergency = emergency_stop_status()
+        context["currentControl"] = {
+            "killSwitch": bool(STATE.get("kill_switch"))
+            or emergency.get("active") is True,
+            "durableLatchActive": emergency.get("active") is True,
+            "latchUpdatedAt": str(emergency.get("updatedAt") or ""),
+            "latchRevision": str(emergency.get("revision") or ""),
+        }
+    elif normalized_action == "DRY_RUN_OFF":
+        context["currentControl"] = {"dryRun": bool(STATE.get("dry_run"))}
+    elif normalized_action == "NEW_ENTRIES_BLOCKED_OFF":
+        context["currentControl"] = {
+            "newEntriesBlocked": bool(STATE.get("new_entries_blocked"))
+        }
+    elif normalized_action == "REAL_ORDERS_ENABLE":
+        context["environmentFingerprint"] = _safety_environment_fingerprint()
+        context["currentControl"] = {"realOrdersEnabled": real_orders_enabled()}
+    elif normalized_action == "FUNCTIONAL_TEST_START":
+        authority: dict[str, Any]
+        try:
+            permit, activation = functional_test_active_authority()
+            authority = {
+                "permitId": str(permit.permit_id or ""),
+                "permitHash": str(permit.content_hash or ""),
+                "activationTokenId": str(activation.token_id or ""),
+                "activationHash": str(activation.content_hash or ""),
+                "accountFingerprint": functional_test_account_fingerprint(
+                    permit.binding.account_id
+                ),
+                "activationExpiresAt": str(
+                    getattr(activation, "expires_at", "") or ""
+                ),
+            }
+        except Exception as exc:
+            authority = {
+                "unavailable": True,
+                "reason": type(exc).__name__,
+            }
+        caps = functional_test_effective_caps_snapshot()
+        context["functionalAuthority"] = authority
+        context["maxAmount"] = safe_float(
+            (caps.get("values") or {}).get("maxOrderNotional")
+            if isinstance(caps.get("values"), dict)
+            else 0.0,
+            0.0,
+        )
+    elif normalized_action == "BINANCE_FUTURES_FILL_SOAK_START":
+        with BINANCE_FUTURES_FILL_SOAK_LOCK:
+            current = dict(BINANCE_FUTURES_FILL_SOAK_INTERNAL)
+        context["fillSoak"] = {
+            "sessionId": str(current.get("session_id") or ""),
+            "phase": str(current.get("phase") or ""),
+            "symbol": normalize_usdm_symbol(current.get("symbol")),
+            "strategyId": str(STATE.get("selected_strategy_id") or ""),
+            "deploymentId": str(STATE.get("selected_deployment_id") or ""),
+            "maxAmount": str(current.get("target_notional_usdt") or ""),
+            "durationSeconds": int(current.get("duration_seconds") or 0),
+            "previewConfirmationFingerprint": str(
+                current.get("confirmation_token_hash") or ""
+            ),
+            "previewExpiresEpoch": safe_float(
+                current.get("confirmation_expires_epoch"), 0.0
+            ),
+        }
+    expected_phrase = f"LIVE {identity['suffix']}"
+    display = {
+        "action": normalized_action,
+        "provider": identity["provider"],
+        "accountHint": f"••••{identity['suffix']}",
+        "deploymentId": context["selectedDeploymentId"],
+        "strategyId": context["selectedStrategyId"],
+        **(
+            {"symbol": context["fillSoak"]["symbol"], "maxAmount": context["fillSoak"]["maxAmount"]}
+            if normalized_action == "BINANCE_FUTURES_FILL_SOAK_START"
+            else {}
+        ),
+        **(
+            {"maxAmount": context.get("maxAmount", 0.0)}
+            if normalized_action == "FUNCTIONAL_TEST_START"
+            else {}
+        ),
+    }
+    return context, display, expected_phrase
+
+
+@_serialized_safety_mutation
+def issue_safety_confirmation(
+    action: object,
+    request_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        context, display, expected_phrase = (
+            safety_confirmation_authoritative_context(action, request_context)
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "reason": f"safety-confirmation-issue-failed:{type(exc).__name__}",
+        }
+    if (
+        str(action or "").strip().upper() == "REAL_ORDERS_ENABLE"
+        and (context.get("request") or {}).get("proposedValuesDigest")
+        == "invalid"
+    ):
+        return {
+            "ok": False,
+            "reason": "safety-confirmation-values-digest-required",
+        }
+    if (
+        str(action or "").strip().upper() == "FUNCTIONAL_TEST_START"
+        and not str((context.get("request") or {}).get("targetKey") or "").strip()
+    ):
+        return {
+            "ok": False,
+            "reason": "safety-confirmation-functional-target-required",
+        }
+    return SAFETY_CONFIRMATIONS.issue(
+        action=str(action or ""),
+        context=context,
+        expected_phrase=expected_phrase,
+        display_context=display,
+    )
+
+
+def consume_safety_confirmation(
+    action: object,
+    confirmation: dict[str, Any] | None,
+    request_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        context, _display, _expected_phrase = (
+            safety_confirmation_authoritative_context(action, request_context)
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "reason": f"safety-confirmation-context-failed:{type(exc).__name__}",
+        }
+    return SAFETY_CONFIRMATIONS.consume(
+        action=str(action or ""),
+        context=context,
+        confirmation=confirmation,
+    )
+
+
+def _apply_durable_emergency_stop_recovery() -> dict[str, Any]:
+    """Apply an API-independent Kill latch after server/runtime recovery.
+
+    The native bridge can persist Kill while the HTTP API thread is down. On
+    the next API startup we must do more than block new POSTs: force MONITOR,
+    request cancellation of known working orders, reconcile broker truth, and
+    emit durable audit/Telegram evidence. No position-flattening order is ever
+    synthesized here.
+    """
+
+    emergency = emergency_stop_status()
+    if emergency.get("active") is not True:
+        return {
+            "ok": True,
+            "recovered": False,
+            "reason": "emergency-stop-not-active",
+            "emergency_stop": emergency,
+        }
+    with RUNTIME_CONTROL_LOCK:
+        STATE["kill_switch"] = True
+        STATE["kill_switch_rearm_required"] = True
+        STATE["new_entries_blocked"] = True
+        runtime_transition = LIVE_CONTINUOUS_CONTROLLER.transition_running(
+            "MONITOR"
+        )
+        with RUNTIME_MODE_LOCK:
+            for profile_id in ("stock", "crypto"):
+                sync_runtime_profile_mode(
+                    profile_id,
+                    "MONITOR",
+                    action="Durable Kill 복구 MONITOR 전환",
+                )
+        order_truth_refresh = refresh_kis_order_truth_for_kill_switch()
+        cancellation = cancel_working_orders_for_kill_switch(
+            kis_truth=(
+                order_truth_refresh.get("truth")
+                if isinstance(order_truth_refresh.get("truth"), dict)
+                else {}
+            )
+        )
+        governance_sessions = stop_operational_runtime_sessions_for_kill(
+            runtime_transition=runtime_transition,
+            cancellation=cancellation,
+        )
+        try:
+            reconciliation = run_reconciliation(
+                refresh_brokers=True,
+                include_snapshot=False,
+            )
+        except Exception as exc:
+            reconciliation = {
+                "ok": False,
+                "reason": f"kill-reconciliation-error:{type(exc).__name__}",
+            }
+        outcome = {
+            "ok": bool(
+                runtime_transition.get("ok") is True
+                and cancellation.get("cleanup_complete") is True
+                and reconciliation.get("ok") is True
+            ),
+            "recovered": True,
+            "emergency_stop": emergency,
+            "runtime": runtime_transition,
+            "kis_order_truth_refresh": order_truth_refresh,
+            "cancellation": cancellation,
+            "governance_sessions": governance_sessions,
+            "reconciliation": reconciliation,
+            "flatten_requested": False,
+        }
+        return outcome
+
+
+def _emit_durable_emergency_recovery_evidence(
+    outcome: dict[str, Any],
+    emergency: dict[str, Any],
+) -> None:
+    cancellation = (
+        outcome.get("cancellation")
+        if isinstance(outcome.get("cancellation"), dict)
+        else {}
+    )
+    reconciliation = (
+        outcome.get("reconciliation")
+        if isinstance(outcome.get("reconciliation"), dict)
+        else {}
+    )
+    append_audit(
+        "danger" if outcome.get("ok") is not True else "warn",
+        "Kill Switch",
+        (
+            "독립 Kill 래치 복구 "
+            f"{'완료' if outcome.get('ok') is True else '미완료'} · Runtime MONITOR "
+            f"전환 · working {cancellation.get('working_count', 0)}건 취소 요청 · "
+            f"미해결 {cancellation.get('unresolved_count', 0)}건 · Broker 대조 "
+            f"{'완료' if reconciliation.get('ok') is True else '확인 필요'} · "
+            f"cleanup {'완료' if cancellation.get('cleanup_complete') is True else '미완료'} · "
+            "포지션 자동 청산 없음"
+        ),
+    )
+    sync_operational_incident(
+        code="DURABLE_EMERGENCY_STOP_ACTIVE",
+        active=True,
+        severity="CRITICAL",
+        title="독립 Kill 래치 활성",
+        detail=str(emergency.get("reason") or "operator emergency stop"),
+        impact="신규 주문 차단 · Runtime MONITOR · working 주문 취소/대조 필요",
+    )
+
+
+def recover_durable_emergency_stop() -> dict[str, Any]:
+    """Recover a latch generation to completion with bounded safe retries."""
+
+    global DURABLE_EMERGENCY_RECOVERY_REVISION
+    global DURABLE_EMERGENCY_RECOVERY_OUTCOME
+    global DURABLE_EMERGENCY_RECOVERY_ATTEMPT_REVISION
+    global DURABLE_EMERGENCY_RECOVERY_LAST_ATTEMPT_MONOTONIC
+    global DURABLE_EMERGENCY_RECOVERY_EVIDENCE_REVISION
+    emergency = emergency_stop_status()
+    if emergency.get("active") is not True:
+        return {
+            "ok": True,
+            "recovered": False,
+            "reason": "emergency-stop-not-active",
+            "emergency_stop": emergency,
+        }
+    revision = governance_sha256(
+        {
+            "path": str(emergency.get("path") or ""),
+            "revision": str(emergency.get("revision") or ""),
+            "updatedAt": str(emergency.get("updatedAt") or ""),
+            "status": str(emergency.get("status") or ""),
+            "reason": str(emergency.get("reason") or ""),
+        }
+    )
+    with DURABLE_EMERGENCY_RECOVERY_LOCK:
+        if revision == DURABLE_EMERGENCY_RECOVERY_REVISION:
+            return {
+                "ok": DURABLE_EMERGENCY_RECOVERY_OUTCOME.get("ok") is True,
+                "recovered": False,
+                "reason": "emergency-stop-generation-already-recovered",
+                "emergency_stop": emergency,
+                "previous": dict(DURABLE_EMERGENCY_RECOVERY_OUTCOME),
+            }
+        now_monotonic = time.monotonic()
+        if (
+            revision == DURABLE_EMERGENCY_RECOVERY_ATTEMPT_REVISION
+            and now_monotonic - DURABLE_EMERGENCY_RECOVERY_LAST_ATTEMPT_MONOTONIC
+            < DURABLE_EMERGENCY_RECOVERY_RETRY_SECONDS
+        ):
+            return {
+                "ok": False,
+                "recovered": False,
+                "reason": "emergency-stop-recovery-retry-backoff",
+                "retryAfterSeconds": max(
+                    0.0,
+                    DURABLE_EMERGENCY_RECOVERY_RETRY_SECONDS
+                    - (
+                        now_monotonic
+                        - DURABLE_EMERGENCY_RECOVERY_LAST_ATTEMPT_MONOTONIC
+                    ),
+                ),
+                "emergency_stop": emergency,
+                "previous": dict(DURABLE_EMERGENCY_RECOVERY_OUTCOME),
+            }
+        # The lock remains held through all side effects, so concurrent API
+        # reconnect/snapshot requests cannot duplicate broker polling,
+        # cancellation, Telegram, or durable audit evidence.
+        outcome = _apply_durable_emergency_stop_recovery()
+        DURABLE_EMERGENCY_RECOVERY_ATTEMPT_REVISION = revision
+        DURABLE_EMERGENCY_RECOVERY_LAST_ATTEMPT_MONOTONIC = time.monotonic()
+        outcome_class = "success" if outcome.get("ok") is True else "failure"
+        evidence_revision = f"{revision}:{outcome_class}"
+        if evidence_revision != DURABLE_EMERGENCY_RECOVERY_EVIDENCE_REVISION:
+            _emit_durable_emergency_recovery_evidence(outcome, emergency)
+            DURABLE_EMERGENCY_RECOVERY_EVIDENCE_REVISION = evidence_revision
+        if outcome.get("ok") is True:
+            DURABLE_EMERGENCY_RECOVERY_REVISION = revision
+        DURABLE_EMERGENCY_RECOVERY_OUTCOME = {
+            "ok": outcome.get("ok") is True,
+            "recovered": outcome.get("recovered") is True,
+            "cancellationComplete": (
+                (outcome.get("cancellation") or {}).get("cleanup_complete")
+                is True
+                if isinstance(outcome.get("cancellation"), dict)
+                else False
+            ),
+            "reconciliationOk": (
+                (outcome.get("reconciliation") or {}).get("ok") is True
+                if isinstance(outcome.get("reconciliation"), dict)
+                else False
+            ),
+        }
+        return outcome
+
+
+@_serialized_safety_mutation
+def set_flag(
+    name: str,
+    value: bool,
+    *,
+    confirmed: bool = False,
+    safety_confirmation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if name not in {"kill_switch", "new_entries_blocked", "operator_confirmed", "dry_run"}:
         return {"ok": False, "reason": "unknown flag", "snapshot": snapshot()}
+    emergency_active_before = (
+        emergency_stop_active() if name == "kill_switch" else False
+    )
+    current_value = bool(STATE.get(name)) or emergency_active_before
     risky_release = (
-        (name == "kill_switch" and STATE.get(name) is True and not value)
+        (name == "kill_switch" and current_value and not value)
         or (name == "new_entries_blocked" and STATE.get(name) is True and not value)
         or (name == "dry_run" and STATE.get(name) is True and not value)
     )
@@ -6708,7 +7553,62 @@ def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, An
         reason = f"{label}는 명시 확인이 필요합니다."
         append_audit("warn", f"{label} 거부", reason)
         return {"ok": False, "reason": reason, "snapshot": snapshot()}
-    changed = bool(STATE.get(name)) != bool(value)
+    kill_release_revision = ""
+    if risky_release and name == "kill_switch":
+        kill_release_revision = str(
+            emergency_stop_status().get("revision") or ""
+        )
+    if risky_release:
+        action = {
+            "kill_switch": "KILL_SWITCH_OFF",
+            "new_entries_blocked": "NEW_ENTRIES_BLOCKED_OFF",
+            "dry_run": "DRY_RUN_OFF",
+        }[name]
+        challenge = consume_safety_confirmation(
+            action,
+            safety_confirmation,
+            {"name": name, "value": False},
+        )
+        if challenge.get("ok") is not True:
+            reason = str(
+                challenge.get("reason") or "safety-confirmation-required"
+            )
+            append_audit(
+                "warn",
+                "위험 해제 2단계 확인 거부",
+                f"{action} · {reason}",
+            )
+            return {"ok": False, "reason": reason, "snapshot": snapshot()}
+    emergency_action: dict[str, Any] | None = None
+    if name == "kill_switch":
+        emergency_action = (
+            engage_emergency_stop(
+                "operator global Kill Switch",
+                source="live-trader-api",
+            )
+            if value
+            else clear_emergency_stop(
+                confirmed=confirmed,
+                reason="operator confirmed global Kill release",
+                source="live-trader-api",
+                expected_revision=kill_release_revision,
+            )
+        )
+        if not value and emergency_action.get("ok") is not True:
+            # Releasing risk is all-or-nothing: the in-memory switch remains
+            # ON when durable OFF cannot be written and verified.
+            STATE["kill_switch"] = True
+            STATE["kill_switch_rearm_required"] = True
+            return {
+                "ok": False,
+                "reason": str(
+                    emergency_action.get("reason")
+                    or "emergency-stop-release-failed"
+                ),
+                "emergency_stop_action": emergency_action,
+                "snapshot": snapshot(),
+            }
+    changed = current_value != bool(value)
     opens_live_risk = risky_release or (
         name == "operator_confirmed"
         and STATE.get(name) is not True
@@ -6734,57 +7634,150 @@ def set_flag(name: str, value: bool, *, confirmed: bool = False) -> dict[str, An
     append_audit(level, label, f"{label} 값이 {value}(으)로 변경되었습니다.")
     kill_action: dict[str, Any] | None = None
     if name == "kill_switch" and value:
-        with RUNTIME_CONTROL_LOCK:
-            STATE["kill_switch_rearm_required"] = True
-            runtime_transition = LIVE_CONTINUOUS_CONTROLLER.transition_running("MONITOR")
-            with RUNTIME_MODE_LOCK:
-                STATE["new_entries_blocked"] = True
-                for profile_id in ("stock", "crypto"):
-                    sync_runtime_profile_mode(
-                        profile_id,
-                        "MONITOR",
-                        action="Kill Switch fail-closed MONITOR 전환",
-                    )
-            cancellation = cancel_working_orders_for_kill_switch()
-            governance_sessions = stop_operational_runtime_sessions_for_kill(
-                runtime_transition=runtime_transition,
-                cancellation=cancellation,
-            )
-            kill_action = {
-                "runtime": runtime_transition,
-                "cancellation": cancellation,
-                "governance_sessions": governance_sessions,
-                "flatten_requested": False,
-            }
-            append_audit(
-                "danger",
-                "Kill Switch",
-                (
-                    "신규/위험 증가 주문 차단, 런타임 MONITOR 전환, 미체결 취소 요청 완료. "
-                    "포지션 전량 청산은 요청하지 않았습니다."
-                ),
-            )
+        # API Kill and API-down native Kill converge on the same durable
+        # generation recovery path. This makes refresh/cancel/reconcile and
+        # evidence side effects exactly once on success, while preserving the
+        # bounded retry policy when cleanup remains incomplete.
+        kill_action = recover_durable_emergency_stop()
     return {
-        "ok": True,
-        "reason": "flag changed",
+        "ok": (
+            emergency_action is None
+            or emergency_action.get("ok") is True
+        ),
+        "reason": (
+            "flag changed"
+            if emergency_action is None
+            or emergency_action.get("ok") is True
+            else str(
+                emergency_action.get("reason")
+                or "emergency-stop-write-failed"
+            )
+        ),
+        **(
+            {"emergency_stop_action": emergency_action}
+            if emergency_action is not None
+            else {}
+        ),
         **({"kill_switch_action": kill_action} if kill_action is not None else {}),
         "snapshot": snapshot(),
     }
 
 
-def save_environment_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
+@_serialized_safety_mutation
+def save_environment_settings(
+    raw_values: dict[str, Any],
+    *,
+    confirmed: bool = False,
+    safety_confirmation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Persist broker settings and invalidate every stale live authorization."""
 
     from . import env_settings
 
-    submitted = raw_values if isinstance(raw_values, dict) else {}
+    submitted = dict(raw_values) if isinstance(raw_values, dict) else {}
     fields = {field.key: field for field in env_settings.ENV_SETTING_FIELDS}
     before = {
         str(item.get("key") or ""): item
         for item in env_settings.env_settings_snapshot().get("fields", [])
         if isinstance(item, dict)
     }
+    identity_affecting_keys = {
+        field.key
+        for field in env_settings.ENV_SETTING_FIELDS
+        if field.key != "LIVE_TRADER_ENABLE_REAL_ORDERS"
+    }
+    planned_identity_changes: list[str] = []
+    for raw_key, raw_value in submitted.items():
+        key = str(raw_key)
+        field = fields.get(key)
+        if field is None or key not in identity_affecting_keys:
+            continue
+        if field.kind == "secret":
+            if str(raw_value or "").strip():
+                planned_identity_changes.append(key)
+        elif str(raw_value or "").strip() != str(
+            before.get(key, {}).get("value") or field.default
+        ).strip():
+            planned_identity_changes.append(key)
+    real_orders_forced_disabled = bool(
+        real_orders_enabled() and planned_identity_changes
+    )
+    if real_orders_forced_disabled:
+        # Credential/account/endpoint rotation can never inherit the previous
+        # real-order authority. Persist OFF in the same atomic settings write
+        # and require a fresh identity-bound challenge afterward.
+        submitted["LIVE_TRADER_ENABLE_REAL_ORDERS"] = False
+    requests_enable = str(
+        submitted.get("LIVE_TRADER_ENABLE_REAL_ORDERS", "")
+    ).strip().lower() in {"true", "1", "yes", "on"}
+    enabling_real_orders = requests_enable and not real_orders_enabled()
+    if enabling_real_orders:
+        simultaneous_changes: list[str] = []
+        for raw_key, raw_value in submitted.items():
+            key = str(raw_key)
+            if key == "LIVE_TRADER_ENABLE_REAL_ORDERS" or key not in fields:
+                continue
+            field = fields[key]
+            if field.kind == "secret":
+                if str(raw_value or "").strip():
+                    simultaneous_changes.append(key)
+            elif str(raw_value or "").strip() != str(
+                before.get(key, {}).get("value") or field.default
+            ).strip():
+                simultaneous_changes.append(key)
+        if simultaneous_changes:
+            return {
+                "ok": False,
+                "reason": (
+                    "실전 주문 활성화와 계정/브로커 설정 변경을 한 번에 수행할 수 "
+                    "없습니다. 설정을 먼저 저장한 뒤 새 2단계 확인을 발급하세요."
+                ),
+                "changed_keys": [],
+                "settings": env_settings.env_settings_snapshot(),
+                "snapshot": snapshot(),
+            }
+        if confirmed is not True:
+            return {
+                "ok": False,
+                "reason": "실전 주문 활성화는 명시 확인과 2단계 확인이 필요합니다.",
+                "changed_keys": [],
+                "settings": env_settings.env_settings_snapshot(),
+                "snapshot": snapshot(),
+            }
+        challenge = consume_safety_confirmation(
+            "REAL_ORDERS_ENABLE",
+            safety_confirmation,
+            {
+                "settingKeys": sorted(str(key) for key in submitted),
+                "enableRealOrders": True,
+                "valuesDigest": safety_confirmation_values_digest(submitted),
+            },
+        )
+        if challenge.get("ok") is not True:
+            reason = str(
+                challenge.get("reason") or "safety-confirmation-required"
+            )
+            append_audit(
+                "warn",
+                "실전 주문 활성화 2단계 확인 거부",
+                reason,
+            )
+            return {
+                "ok": False,
+                "reason": reason,
+                "changed_keys": [],
+                "settings": env_settings.env_settings_snapshot(),
+                "snapshot": snapshot(),
+            }
     settings = env_settings.save_env_settings(submitted)
+    if "LIVE_TRADER_ENABLE_REAL_ORDERS" in submitted:
+        requested_after_save = str(
+            submitted.get("LIVE_TRADER_ENABLE_REAL_ORDERS") or ""
+        ).strip().lower() in {"true", "1", "yes", "on"}
+        global _REAL_ORDERS_PROCESS_ARMED
+        with _REAL_ORDERS_PROCESS_ARM_LOCK:
+            # Reaching true here necessarily passed the challenge above.
+            _REAL_ORDERS_PROCESS_ARMED = bool(requested_after_save)
     after = {
         str(item.get("key") or ""): item
         for item in settings.get("fields", [])
@@ -6803,6 +7796,11 @@ def save_environment_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
         if str(before.get(key, {}).get("value") or "") != str(after.get(key, {}).get("value") or ""):
             changed_keys.append(key)
     changed_keys = list(dict.fromkeys(changed_keys))
+    if real_orders_forced_disabled:
+        STATE["new_entries_blocked"] = True
+        STATE["manual_new_entries_blocked"] = True
+        STATE["dry_run"] = True
+        STATE["operator_confirmed"] = False
     if changed_keys:
         STATE["config_revision"] = int(STATE.get("config_revision") or 1) + 1
         STATE["latest_preflight_snapshot_id"] = ""
@@ -6821,6 +7819,12 @@ def save_environment_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
         "reason": "environment settings saved",
         "settings": settings,
         "changed_keys": changed_keys,
+        "real_orders_forced_disabled": real_orders_forced_disabled,
+        "forced_disable_reason": (
+            "broker-identity-or-endpoint-changed"
+            if real_orders_forced_disabled
+            else ""
+        ),
         "snapshot": snapshot(),
     }
 
@@ -7584,6 +8588,7 @@ def profile_readiness_blocker_count(
     )
 
 
+@_serialized_safety_mutation
 def set_automation_profile(profile_id: str, enabled: bool, provider: str | None = None, mode: str | None = None) -> dict[str, Any]:
     profile_id = profile_id if profile_id in {"stock", "crypto"} else ""
     if not profile_id:
@@ -7685,6 +8690,7 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
     }
 
 
+@_serialized_safety_mutation
 def set_risk_setting(name: str, value: object) -> dict[str, Any]:
     meta = RISK_SETTING_META.get(name)
     if not meta:
@@ -7717,6 +8723,7 @@ def set_risk_setting(name: str, value: object) -> dict[str, Any]:
     return {"ok": True, "reason": "risk setting changed", "snapshot": snapshot()}
 
 
+@_serialized_safety_mutation
 def set_checklist_item(name: str, value: bool) -> dict[str, Any]:
     keys = {str(item["key"]): item for item in CHECKLIST_ITEMS}
     item = keys.get(name)
@@ -7739,6 +8746,7 @@ def set_checklist_item(name: str, value: bool) -> dict[str, Any]:
     return {"ok": True, "reason": "checklist changed", "snapshot": snapshot()}
 
 
+@_serialized_safety_mutation
 def set_retry_policy(name: str, value: object) -> dict[str, Any]:
     meta = RETRY_POLICY_META.get(name)
     if not meta:
@@ -7947,6 +8955,41 @@ def seed_program_ledger_from_broker_snapshot(refresh_if_empty: bool = True) -> d
     }
 
 
+def execution_event_matches_local_order(
+    event: dict[str, Any],
+    order: dict[str, Any],
+) -> bool:
+    broker_id = str(event.get("broker_id") or "").strip().lower()
+    if broker_id == "kis":
+        broker_order_id = str(event.get("broker_order_id") or "").strip()
+        if (
+            not broker_order_id
+            or broker_order_id in _kis_ambiguous_broker_order_ids()
+        ):
+            return False
+        event_key = _kis_order_key(event)
+        order_key = _kis_order_key(order)
+        return bool(event_key and order_key and event_key == order_key)
+    identifiers = {
+        str(event.get("order_id") or "").strip(),
+        str(event.get("broker_order_id") or "").strip(),
+        str((event.get("raw") or {}).get("identifier") or "").strip()
+        if isinstance(event.get("raw"), dict)
+        else "",
+    } - {"", "-"}
+    return bool(
+        identifiers.intersection(
+            {
+                str(order.get("order_id") or "").strip(),
+                str(order.get("oms_order_id") or "").strip(),
+                str(order.get("broker_order_id") or "").strip(),
+                str(order.get("idempotency_key") or "").strip(),
+            }
+            - {"", "-"}
+        )
+    )
+
+
 def execution_event_trace_context(event: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     identifiers = {
         str(event.get("order_id") or ""),
@@ -7957,15 +9000,12 @@ def execution_event_trace_context(event: dict[str, Any]) -> tuple[str, dict[str,
         (
             item
             for item in STATE.get("orders", [])
-            if identifiers.intersection({
-                str(item.get("order_id") or ""),
-                str(item.get("broker_order_id") or ""),
-                str(item.get("idempotency_key") or ""),
-            }) - {""}
+            if isinstance(item, dict)
+            and execution_event_matches_local_order(event, item)
         ),
         None,
     )
-    if order is None:
+    if order is None and str(event.get("broker_id") or "").lower() != "kis":
         trace_index = STATE.get("order_trace_index", {})
         if isinstance(trace_index, dict):
             for identifier in identifiers - {""}:
@@ -8045,9 +9085,32 @@ def _event_contract_value(
 
 
 def _positive_watermark_delta(total: float, previous: float) -> float:
-    difference = total - previous
+    try:
+        difference = float(Decimal(str(total)) - Decimal(str(previous)))
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        difference = total - previous
     tolerance = max(1e-12, abs(total) * 1e-12)
     return difference if difference > tolerance else 0.0
+
+
+def execution_event_uses_cumulative_watermark(
+    event: dict[str, Any],
+) -> bool:
+    raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
+    broker_id = str(event.get("broker_id") or "").strip().lower()
+    quantity_mode = str(
+        _event_contract_value(event, raw, "quantity_mode") or ""
+    ).strip().lower()
+    cumulative_quantity = _event_contract_value(
+        event,
+        raw,
+        "cumulative_quantity",
+    )
+    return (
+        broker_id == "upbit"
+        or quantity_mode == "cumulative"
+        or cumulative_quantity not in {None, ""}
+    )
 
 
 def execution_event_increment(
@@ -8057,9 +9120,8 @@ def execution_event_increment(
 ) -> tuple[float, float, float]:
     """Resolve a broker event to an incremental fill quantity, price and fee.
 
-    Binance execution reports already carry the last-fill delta and therefore
-    pass through unchanged.  Upbit MyOrder carries order-level cumulative
-    watermarks even when it also includes per-trade values.  The watermarks
+    Delta-only execution reports pass through unchanged. Upbit MyOrder and KIS
+    REST order truth carry order-level cumulative watermarks. The watermarks
     cap the applied delta so a terminal snapshot, reconnect replay, or
     out-of-order trade cannot book the same fill twice.
     """
@@ -8068,7 +9130,7 @@ def execution_event_increment(
     quantity = max(0.0, safe_float(event.get("quantity"), 0.0))
     price = max(0.0, safe_float(event.get("price"), 0.0))
     fee = max(0.0, safe_float(event.get("fee"), 0.0))
-    if str(event.get("broker_id") or "").strip().lower() != "upbit":
+    if not execution_event_uses_cumulative_watermark(event):
         return quantity, price, fee
 
     previous_quantity = max(
@@ -8181,26 +9243,12 @@ def apply_execution_events_to_local_orders(
         if not event_id or event_id in known_event_ids:
             continue
         known_event_ids.add(event_id)
-        identifiers = {
-            str(event.get("order_id") or "").strip(),
-            str(event.get("broker_order_id") or "").strip(),
-            str((event.get("raw") or {}).get("identifier") or "").strip()
-            if isinstance(event.get("raw"), dict)
-            else "",
-        } - {"", "-"}
         order = next(
             (
                 item
                 for item in STATE.get("orders", [])
-                if identifiers.intersection(
-                    {
-                        str(item.get("order_id") or "").strip(),
-                        str(item.get("oms_order_id") or "").strip(),
-                        str(item.get("broker_order_id") or "").strip(),
-                        str(item.get("idempotency_key") or "").strip(),
-                    }
-                    - {"", "-"}
-                )
+                if isinstance(item, dict)
+                and execution_event_matches_local_order(event, item)
             ),
             None,
         )
@@ -8241,7 +9289,7 @@ def apply_execution_events_to_local_orders(
             order,
             managed,
         )
-        if str(event.get("broker_id") or "").strip().lower() == "upbit":
+        if execution_event_uses_cumulative_watermark(event):
             event["reported_quantity"] = safe_float(
                 event.get("quantity"),
                 0.0,
@@ -9007,6 +10055,325 @@ def should_append_execution_sync_audit(
     return should_append
 
 
+def _kis_order_key(payload: object) -> str:
+    item = payload if isinstance(payload, dict) else {}
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    broker_order_id = str(
+        item.get("broker_order_id")
+        or raw.get("broker_order_id")
+        or ""
+    ).strip()
+    order_date = str(
+        item.get("order_date") or raw.get("order_date") or ""
+    ).strip()
+    organization_no = str(
+        item.get("organization_no")
+        or raw.get("organization_no")
+        or ""
+    ).strip().upper()
+    explicit = str(
+        item.get("broker_order_key")
+        or raw.get("broker_order_key")
+        or ""
+    ).strip()
+    if explicit:
+        parts = explicit.split(":")
+        if len(parts) != 3:
+            return ""
+        explicit_date, explicit_org, explicit_id = (
+            parts[0].strip(),
+            parts[1].strip().upper(),
+            parts[2].strip(),
+        )
+        if (
+            len(explicit_date) != 8
+            or not explicit_date.isdigit()
+            or not explicit_org
+            or not explicit_id
+            or (broker_order_id and broker_order_id != explicit_id)
+            or (order_date and order_date != explicit_date)
+            or (organization_no and organization_no != explicit_org)
+        ):
+            return ""
+        return f"{explicit_date}:{explicit_org}:{explicit_id}"
+    if (
+        len(order_date) == 8
+        and order_date.isdigit()
+        and organization_no
+        and broker_order_id
+    ):
+        return f"{order_date}:{organization_no}:{broker_order_id}"
+    return ""
+
+
+def _kis_ambiguous_broker_order_ids() -> set[str]:
+    root = (
+        STATE.get("broker_order_truth")
+        if isinstance(STATE.get("broker_order_truth"), dict)
+        else {}
+    )
+    stored = root.get("kis") if isinstance(root.get("kis"), dict) else {}
+    return {
+        str(item).strip()
+        for item in stored.get("ambiguousBrokerOrderIds", [])
+        if str(item).strip()
+    }
+
+
+def _kis_cancel_identity_is_authoritative(
+    order: dict[str, Any],
+    truth: dict[str, Any],
+) -> tuple[bool, str]:
+    """Require one fresh official working row for the exact cancel identity."""
+
+    if not (
+        truth.get("complete") is True
+        and truth.get("fresh") is True
+        and truth.get("absenceIsAuthoritative") is True
+        and not str(truth.get("lastError") or "")
+    ):
+        return False, "kis-cancel-official-truth-unavailable"
+    order_key = _kis_order_key(order)
+    broker_order_id = str(order.get("broker_order_id") or "").strip()
+    if not order_key or not broker_order_id:
+        return False, "kis-cancel-composite-identity-required"
+    ambiguous_ids = {
+        str(item).strip()
+        for item in truth.get("ambiguousBrokerOrderIds", [])
+        if str(item).strip()
+    }
+    if broker_order_id in ambiguous_ids:
+        return False, "kis-cancel-odno-ambiguous"
+    # The KIS domestic cancel API accepts organization+ODNO but no order date.
+    # Never send an old-day identity: after an ODNO reuse, the wire request
+    # could otherwise target today's different order despite a local date key.
+    order_date = str(order.get("order_date") or "").strip()
+    current_kst_date = datetime.now(
+        timezone(timedelta(hours=9))
+    ).strftime("%Y%m%d")
+    if order_date != current_kst_date:
+        return False, "kis-cancel-order-date-not-current"
+    working_matches = [
+        item
+        for item in truth.get("workingOrders", [])
+        if isinstance(item, dict) and _kis_order_key(item) == order_key
+    ]
+    if len(working_matches) != 1:
+        return False, "kis-cancel-current-working-order-not-confirmed"
+    return True, ""
+
+
+def _known_local_kis_order_keys() -> set[str]:
+    rows = [
+        item for item in STATE.get("orders", []) if isinstance(item, dict)
+    ]
+    try:
+        rows.extend(PROGRAM_LEDGER.order_dispatch_rows(5000))
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        pass
+    return {key for item in rows if (key := _kis_order_key(item))}
+
+
+def mark_kis_order_truth_failure(detail: str) -> None:
+    truth_root = STATE.setdefault("broker_order_truth", {})
+    previous = (
+        dict(truth_root.get("kis"))
+        if isinstance(truth_root.get("kis"), dict)
+        else {}
+    )
+    # Preserve the last complete rows for operator diagnosis/recovery, but
+    # never let an incomplete attempt refresh their authority.
+    truth_root["kis"] = {
+        **previous,
+        "fresh": False,
+        "lastAttemptAt": datetime.now(timezone.utc).isoformat(),
+        "lastError": str(detail or "kis-order-truth-unavailable")[:500],
+    }
+
+
+def record_complete_kis_order_truth(truth: object) -> dict[str, Any]:
+    payload = truth if isinstance(truth, dict) else {}
+    orders = payload.get("orders")
+    if (
+        payload.get("complete") is not True
+        or payload.get("pagination_complete") is not True
+        or payload.get("absence_is_authoritative") is not True
+        or not isinstance(orders, list)
+    ):
+        raise ValueError("kis-order-truth-incomplete")
+    normalized_orders = [dict(item) for item in orders if isinstance(item, dict)]
+    if len(normalized_orders) != len(orders):
+        raise ValueError("kis-order-truth-row-invalid")
+    normalized_keys = [_kis_order_key(item) for item in normalized_orders]
+    if any(not key for key in normalized_keys) or len(set(normalized_keys)) != len(
+        normalized_keys
+    ):
+        raise ValueError("kis-order-truth-composite-key-invalid")
+    raw_ambiguous_ids = payload.get("ambiguous_broker_order_ids", [])
+    if not isinstance(raw_ambiguous_ids, list):
+        raise ValueError("kis-order-truth-ambiguous-id-list-invalid")
+    broker_id_counts: dict[str, int] = {}
+    for item in normalized_orders:
+        broker_order_id = str(item.get("broker_order_id") or "").strip()
+        broker_id_counts[broker_order_id] = (
+            broker_id_counts.get(broker_order_id, 0) + 1
+        )
+    ambiguous_ids = {
+        str(item).strip() for item in raw_ambiguous_ids if str(item).strip()
+    } | {
+        broker_order_id
+        for broker_order_id, count in broker_id_counts.items()
+        if broker_order_id and count > 1
+    }
+    observed_at = datetime.now(timezone.utc).isoformat()
+    truth_root = STATE.setdefault("broker_order_truth", {})
+    truth_root["kis"] = {
+        "complete": True,
+        "fresh": True,
+        "observedAt": observed_at,
+        "lastAttemptAt": observed_at,
+        "lastError": "",
+        "queryStartDate": str(payload.get("query_start_date") or ""),
+        "queryEndDate": str(payload.get("query_end_date") or ""),
+        "pageCount": int(payload.get("page_count") or 0),
+        "orders": normalized_orders,
+        "ambiguousBrokerOrderIds": sorted(
+            ambiguous_ids
+        ),
+        "correlationPolicy": str(payload.get("correlation_policy") or ""),
+        "absenceIsAuthoritative": payload.get("absence_is_authoritative") is True,
+    }
+    return kis_order_truth_snapshot()
+
+
+def kis_order_truth_snapshot(
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    root = (
+        STATE.get("broker_order_truth")
+        if isinstance(STATE.get("broker_order_truth"), dict)
+        else {}
+    )
+    stored = root.get("kis") if isinstance(root.get("kis"), dict) else {}
+    orders = [
+        dict(item)
+        for item in stored.get("orders", [])
+        if isinstance(item, dict)
+    ]
+    working = [
+        item
+        for item in orders
+        if str(item.get("state") or "").strip().lower()
+        in {"accepted", "acknowledged", "new", "open", "partial", "partially_filled", "partially-filled"}
+        and safe_float(item.get("remaining_quantity"), 0.0) > 0
+    ]
+    known_keys = _known_local_kis_order_keys()
+    ambiguous_ids = {
+        str(item).strip()
+        for item in stored.get("ambiguousBrokerOrderIds", [])
+        if str(item).strip()
+    }
+    matched = [
+        item
+        for item in working
+        if str(item.get("broker_order_id") or "").strip()
+        not in ambiguous_ids
+        and _kis_order_key(item) in known_keys
+    ]
+    unmatched = [
+        item
+        for item in working
+        if str(item.get("broker_order_id") or "").strip()
+        in ambiguous_ids
+        or _kis_order_key(item) not in known_keys
+    ]
+    current = now or datetime.now()
+    if current.tzinfo is not None:
+        current = current.astimezone().replace(tzinfo=None)
+    observed_at = str(stored.get("observedAt") or "")
+    age = seconds_since(observed_at, current)
+    complete = stored.get("complete") is True
+    fresh = bool(
+        complete
+        and stored.get("fresh") is True
+        and not str(stored.get("lastError") or "")
+        and age is not None
+        and age <= FUNCTIONAL_TEST_EXECUTION_OBSERVATION_MAX_AGE_SECONDS
+    )
+    return {
+        **stored,
+        "complete": complete,
+        "fresh": fresh,
+        "ageSeconds": age,
+        "orderCount": len(orders),
+        "workingOrderCount": len(working),
+        "matchedWorkingOrderCount": len(matched),
+        "unmatchedWorkingOrderCount": len(unmatched),
+        "workingOrders": working,
+        "unmatchedWorkingOrders": unmatched,
+    }
+
+
+def combined_kis_working_order_count(
+    local_pending_orders: list[dict[str, Any]],
+    *,
+    order_truth: dict[str, Any] | None = None,
+) -> int:
+    """Count the union of local pending and official KIS working orders."""
+
+    truth = order_truth or kis_order_truth_snapshot()
+    official = [
+        item
+        for item in truth.get("workingOrders", [])
+        if isinstance(item, dict)
+    ]
+    official_keys = {
+        _kis_order_key(item)
+        for item in official
+        if _kis_order_key(item)
+    }
+    local_only_count = sum(
+        1
+        for item in local_pending_orders
+        if not _kis_order_key(item)
+        or _kis_order_key(item) not in official_keys
+    )
+    return len(official) + local_only_count
+
+
+def refresh_kis_order_truth_for_kill_switch() -> dict[str, Any]:
+    """Force official KIS order truth before Kill cleanup.
+
+    This intentionally records only the complete, fully paginated official
+    order set. A timeout, malformed response, or partial pagination preserves
+    the previous rows for diagnosis but marks them stale, so cleanup cannot be
+    reported as successful from an absence that KIS did not authoritatively
+    prove.
+    """
+
+    try:
+        result = LiveBrokerRouter().poll_execution_events("kis")
+        if not isinstance(result, dict):
+            raise TypeError("KIS order truth response must be an object")
+        truth = record_complete_kis_order_truth(
+            result.get("execution_truth")
+        )
+        return {
+            "ok": True,
+            "reason": "kis-official-order-truth-refreshed",
+            "truth": truth,
+        }
+    except Exception as exc:  # Kill cleanup must continue fail-closed.
+        detail = f"{type(exc).__name__}: {str(exc)[:400]}"
+        mark_kis_order_truth_failure(detail)
+        return {
+            "ok": False,
+            "reason": f"kis-official-order-truth-unavailable:{detail}",
+            "truth": kis_order_truth_snapshot(),
+        }
+
+
 def _poll_execution_events_unlocked(
     broker_id: str = "all",
     *,
@@ -9056,6 +10423,8 @@ def _poll_execution_events_unlocked(
         except Exception as exc:  # Broker boundary: one adapter must not stop all monitoring.
             detail = f"{type(exc).__name__}: {exc}"[:500]
             errors.append({"broker_id": selected_broker, "detail": detail})
+            if selected_broker == "kis":
+                mark_kis_order_truth_failure(detail)
             mark_broker_snapshot_failure(
                 selected_broker,
                 now_monotonic,
@@ -9081,6 +10450,8 @@ def _poll_execution_events_unlocked(
             exc = result if isinstance(result, Exception) else RuntimeError("broker snapshot response must be an object")
             detail = f"{type(exc).__name__}: {exc}"[:500]
             errors.append({"broker_id": selected_broker, "detail": detail})
+            if selected_broker == "kis":
+                mark_kis_order_truth_failure(detail)
             mark_broker_snapshot_failure(
                 selected_broker,
                 now_monotonic,
@@ -9089,6 +10460,28 @@ def _poll_execution_events_unlocked(
             )
             record_connectivity_state("broker_api", selected_broker, healthy=False)
             continue
+
+        if selected_broker == "kis":
+            try:
+                record_complete_kis_order_truth(
+                    result.get("execution_truth")
+                )
+            except (TypeError, ValueError) as exc:
+                detail = f"KIS order truth: {type(exc).__name__}: {exc}"[:500]
+                errors.append({"broker_id": selected_broker, "detail": detail})
+                mark_kis_order_truth_failure(detail)
+                mark_broker_snapshot_failure(
+                    selected_broker,
+                    now_monotonic,
+                    detail,
+                    interval_seconds=poll_interval,
+                )
+                record_connectivity_state(
+                    "broker_api",
+                    selected_broker,
+                    healthy=False,
+                )
+                continue
 
         rows = result.get("events", [])
         if isinstance(rows, list):
@@ -9190,6 +10583,7 @@ def _poll_execution_events_unlocked(
         "observed_position_count": int(observed["position_count"]),
         "snapshot_changed_brokers": sorted(changed_snapshot_brokers),
         "snapshot_skipped_brokers": sorted(skipped_snapshot_brokers),
+        "kis_order_truth": kis_order_truth_snapshot(),
     }
     STATE["program_ledger"]["last_event_sync"] = now
     telegram_fill_count = notify_new_live_fills(events, existing_event_ids)
@@ -9238,6 +10632,7 @@ def _poll_execution_events_unlocked(
         "local_order_update_count": local_order_updates,
         "telegram_fill_count": telegram_fill_count,
         "automatic_promotion": automatic_results,
+        "kis_order_truth": kis_order_truth_snapshot(),
         **({"snapshot": snapshot()} if include_snapshot else {}),
     }
 
@@ -10079,6 +11474,15 @@ def _authorize_binance_futures_fill_soak_dispatch(
     return False, "fill-soak-dispatch-shape-invalid", {}
 
 
+@contextmanager
+def _binance_futures_fill_soak_dispatch_boundary():
+    """Linearize fill-soak authorization/POST with API mutations and Kill."""
+
+    with SAFETY_CONFIRMATION_MUTATION_LOCK:
+        with emergency_stop_dispatch_boundary() as emergency:
+            yield emergency
+
+
 def preview_binance_futures_fill_soak(
     symbol: object = "ETHUSDT",
 ) -> dict[str, Any]:
@@ -10163,6 +11567,9 @@ def preview_binance_futures_fill_soak(
         session = BINANCE_FUTURES_FILL_SOAK_SESSION_FACTORY(config)
         session.dispatch_authorizer = (
             _authorize_binance_futures_fill_soak_dispatch
+        )
+        session.dispatch_boundary = (
+            _binance_futures_fill_soak_dispatch_boundary
         )
         preview = session.preview()
     except (BrokerNotReadyError, RuntimeError, ValueError) as exc:
@@ -10286,10 +11693,12 @@ def _run_binance_futures_fill_soak(
     )
 
 
+@_serialized_safety_mutation
 def start_binance_futures_fill_soak(
     confirmation_token: object,
     *,
     confirmed: bool,
+    safety_confirmation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     global BINANCE_FUTURES_FILL_SOAK_THREAD
 
@@ -10341,6 +11750,21 @@ def start_binance_futures_fill_soak(
             return {
                 "ok": False,
                 "reason": current["detail"],
+                "fill_soak": binance_futures_fill_soak_status(),
+            }
+
+        challenge = consume_safety_confirmation(
+            "BINANCE_FUTURES_FILL_SOAK_START",
+            safety_confirmation,
+            {"symbol": str(current.get("symbol") or "")},
+        )
+        if challenge.get("ok") is not True:
+            return {
+                "ok": False,
+                "reason": str(
+                    challenge.get("reason")
+                    or "safety-confirmation-required"
+                ),
                 "fill_soak": binance_futures_fill_soak_status(),
             }
 
@@ -11913,6 +13337,7 @@ def refresh_preflight_reconciliation(
     }
 
 
+@_serialized_safety_mutation
 def run_final_preflight(
     deployment_id: str = "",
     strategy_id: str = "",
@@ -13868,6 +15293,8 @@ def current_mode() -> Mode:
 
 
 def durable_global_kill_active() -> bool:
+    if emergency_stop_active():
+        return True
     path = str(os.environ.get("TRADING_CONTROL_STATE_PATH") or "").strip()
     if not path:
         return False
@@ -13878,6 +15305,8 @@ def durable_global_kill_active() -> bool:
 
 
 def durable_control_halt_active(intent: OrderIntent | None = None) -> bool:
+    if emergency_stop_active():
+        return True
     path = str(os.environ.get("TRADING_CONTROL_STATE_PATH") or "").strip()
     if not path:
         return False
@@ -13894,22 +15323,57 @@ def durable_control_halt_active(intent: OrderIntent | None = None) -> bool:
 
 
 def durable_control_snapshot() -> dict[str, Any]:
+    emergency = emergency_stop_status()
     path = str(os.environ.get("TRADING_CONTROL_STATE_PATH") or "").strip()
     if not path:
-        return {"configured": False, "halted": False, "globalKill": False, "scopedKills": {}, "reasons": [], "path": ""}
+        emergency_active = emergency.get("active") is True
+        return {
+            "configured": True,
+            "halted": emergency_active,
+            "globalKill": emergency_active,
+            "scopedKills": {},
+            "reasons": (
+                [str(emergency.get("reason") or "local-emergency-stop-active")]
+                if emergency_active
+                else []
+            ),
+            "path": str(emergency.get("path") or ""),
+            "emergencyStop": emergency,
+            "hubControlConfigured": False,
+        }
     try:
         state = DurableControlState(path).read()
         assessment = DurableControlState(path).halt_assessment(app="live_trader")
+        hub_halted = bool(assessment.get("halted"))
+        emergency_active = emergency.get("active") is True
         return {
             "configured": True,
-            "halted": bool(assessment.get("halted")),
-            "globalKill": state.get("globalKill") is True,
+            "halted": hub_halted or emergency_active,
+            "globalKill": state.get("globalKill") is True or emergency_active,
             "scopedKills": state.get("scopedKills") or {},
-            "reasons": assessment.get("reasons") or [],
+            "reasons": [
+                *(
+                    [str(emergency.get("reason") or "local-emergency-stop-active")]
+                    if emergency_active
+                    else []
+                ),
+                *(assessment.get("reasons") or []),
+            ],
             "path": path,
+            "emergencyStop": emergency,
+            "hubControlConfigured": True,
         }
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return {"configured": True, "halted": True, "globalKill": True, "scopedKills": {}, "reasons": [f"control-state-unavailable:{type(exc).__name__}"], "path": path}
+        return {
+            "configured": True,
+            "halted": True,
+            "globalKill": True,
+            "scopedKills": {},
+            "reasons": [f"control-state-unavailable:{type(exc).__name__}"],
+            "path": path,
+            "emergencyStop": emergency,
+            "hubControlConfigured": True,
+        }
 
 
 def asset_from_symbol(symbol: str) -> str:
@@ -14247,8 +15711,19 @@ def functional_test_authority_mutation_assessment(
         for item in functional_orders
         if _restore_order_is_pending_or_unknown(item)
     ]
-    if pending_orders:
+    order_truth = kis_order_truth_snapshot()
+    working_order_count = combined_kis_working_order_count(
+        pending_orders,
+        order_truth=order_truth,
+    )
+    if working_order_count:
         blockers.append("functional-test-working-orders-unresolved")
+    if require_kis_reconciliation and (
+        order_truth.get("complete") is not True
+        or order_truth.get("fresh") is not True
+        or order_truth.get("absenceIsAuthoritative") is not True
+    ):
+        blockers.append("functional-test-kis-order-truth-unavailable")
 
     reconciliation: dict[str, Any] = {}
     kis_reconciled = not require_kis_reconciliation
@@ -14284,6 +15759,9 @@ def functional_test_authority_mutation_assessment(
                 and not broker_errors
                 and "kis" in successful_accounts
                 and "kis" in successful_positions
+                and order_truth.get("complete") is True
+                and order_truth.get("fresh") is True
+                and order_truth.get("absenceIsAuthoritative") is True
             )
         except (OSError, sqlite3.Error, TypeError, ValueError):
             kis_reconciled = False
@@ -14305,7 +15783,8 @@ def functional_test_authority_mutation_assessment(
             "lifecycle": session_lifecycle,
             "executionPurpose": session_execution_purpose,
         },
-        "workingOrderCount": len(pending_orders),
+        "workingOrderCount": working_order_count,
+        "kisOrderTruth": order_truth,
         "durableOrderTruthAvailable": durable_truth_available,
         "kisReconciled": kis_reconciled,
         "reconciliation": reconciliation,
@@ -14807,8 +16286,17 @@ def functional_test_risk_snapshot(
             "retry_exhausted",
         }
     ]
-    working_order_count = sum(
-        1 for item in functional_orders if _restore_order_is_pending_or_unknown(item)
+    local_kis_pending_orders = [
+        item
+        for item in STATE.get("orders", [])
+        if isinstance(item, dict)
+        and str(item.get("broker_id") or "").strip().lower() == "kis"
+        and _restore_order_is_pending_or_unknown(item)
+    ]
+    order_truth = kis_order_truth_snapshot()
+    working_order_count = combined_kis_working_order_count(
+        local_kis_pending_orders,
+        order_truth=order_truth,
     )
     reservation_truth_available = True
     try:
@@ -14883,6 +16371,9 @@ def functional_test_risk_snapshot(
         and account.get("known") is True
         and account.get("fresh") is True
         and value_complete
+        and order_truth.get("complete") is True
+        and order_truth.get("fresh") is True
+        and order_truth.get("absenceIsAuthoritative") is True
     )
     return FunctionalTestRiskSnapshot(
         gross_exposure=gross_exposure,
@@ -14893,6 +16384,7 @@ def functional_test_risk_snapshot(
         submitted_order_count=max(
             len(functional_orders),
             durable_order_count,
+            int(order_truth.get("orderCount") or 0),
         ),
         reconciled=(
             reconciled
@@ -15133,6 +16625,46 @@ def live_broker_dispatch_allowed(
     ):
         return False, "reduce-only-position-verification-failed"
     return True, ""
+
+
+def kis_cross_process_dispatch_lease(
+    intent: OrderIntent,
+) -> dict[str, object]:
+    """Retain exclusive ownership of the exact KIS account/authority.
+
+    The lease is acquired only at the final broker boundary and then held for
+    this process lifetime. This makes a second server fail closed instead of
+    merely queueing the same account's POST behind the first process.
+    """
+
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    if broker_id != "kis":
+        return {"acquired": True, "kind": "not-kis"}
+    account_id = kis_functional_test_account_id()
+    account_fingerprint = functional_test_account_fingerprint(account_id)
+    authority_id = ""
+    if functional_test_execution_requested(intent):
+        authority_id = governance_sha256(
+            {
+                "permitId": str(
+                    metadata.get("functional_test_permit_id") or ""
+                ),
+                "permitHash": str(
+                    metadata.get("functional_test_permit_hash") or ""
+                ),
+                "activationTokenId": str(
+                    metadata.get("functional_test_activation_token_id") or ""
+                ),
+            }
+        )
+    return hold_kis_dispatch_lease(
+        account_fingerprint,
+        authority_id=authority_id,
+    )
 
 
 def exact_live_canary_scope_dispatch_allowed(
@@ -16243,6 +17775,17 @@ def dispatch_live_order_with_checkpoint(
                 )
 
         with FUNCTIONAL_TEST_AUTHORITY_DISPATCH_LOCK:
+            cross_process_lease = kis_cross_process_dispatch_lease(intent)
+            order["cross_process_dispatch_lease"] = cross_process_lease
+            if cross_process_lease.get("acquired") is not True:
+                return _block_managed_order_before_dispatch(
+                    order,
+                    managed_order,
+                    str(
+                        cross_process_lease.get("reason")
+                        or "kis-cross-process-dispatch-lease-unavailable"
+                    ),
+                )
             if functional_execution:
                 try:
                     final_permit, final_activation = (
@@ -16348,12 +17891,36 @@ def dispatch_live_order_with_checkpoint(
                         "functional-test-final-authority-changed:"
                         + ",".join(mismatched_seals),
                     )
-            LIVE_OMS.transition(
-                managed_order.order_id,
-                "SUBMITTING",
-                "broker request dispatch",
-            )
-            broker_response = LiveBrokerRouter().place_order(broker_payload)
+            # Serialize the final mutable-control check and broker call with
+            # both API risk mutations and the native Kill latch. Native Kill
+            # writes ON first and returns only after any already-in-flight
+            # boundary exits; every later boundary observes ON and POSTs 0.
+            with SAFETY_CONFIRMATION_MUTATION_LOCK:
+                with emergency_stop_dispatch_boundary() as emergency:
+                    if emergency.get("active") is True:
+                        return _block_managed_order_before_dispatch(
+                            order,
+                            managed_order,
+                            "emergency-stop-latch-broker-dispatch-forbidden",
+                        )
+                    final_allowed, final_reason = live_broker_dispatch_allowed(
+                        intent,
+                        dry_run=bool(order.get("dry_run")),
+                    )
+                    if not final_allowed:
+                        return _block_managed_order_before_dispatch(
+                            order,
+                            managed_order,
+                            final_reason,
+                        )
+                    LIVE_OMS.transition(
+                        managed_order.order_id,
+                        "SUBMITTING",
+                        "broker request dispatch",
+                    )
+                    broker_response = LiveBrokerRouter().place_order(
+                        broker_payload
+                    )
         if not isinstance(broker_response, dict):
             broker_response = {}
         order["broker_response"] = broker_response
@@ -16371,6 +17938,37 @@ def dispatch_live_order_with_checkpoint(
             or ""
         )
         if response_ok and broker_order_id:
+            kis_ack_identity: dict[str, str] = {}
+            if broker_id == "kis":
+                output = (
+                    response_payload.get("output")
+                    if isinstance(response_payload.get("output"), dict)
+                    else {}
+                )
+                order_date = str(
+                    output.get("ORD_DT")
+                    or output.get("ORD_DATE")
+                    or datetime.now(timezone(timedelta(hours=9))).strftime(
+                        "%Y%m%d"
+                    )
+                ).strip()
+                organization_no = str(
+                    output.get("KRX_FWDG_ORD_ORGNO")
+                    or output.get("KRX_FWDG_ORD_ORG_NO")
+                    or ""
+                ).strip().upper()
+                broker_order_key = (
+                    f"{order_date}:{organization_no}:{broker_order_id}"
+                    if len(order_date) == 8
+                    and order_date.isdigit()
+                    and organization_no
+                    else ""
+                )
+                kis_ack_identity = {
+                    "order_date": order_date,
+                    "organization_no": organization_no,
+                    "broker_order_key": broker_order_key,
+                }
             LIVE_OMS.acknowledge(
                 managed_order.order_id,
                 broker_order_id,
@@ -16380,6 +17978,7 @@ def dispatch_live_order_with_checkpoint(
                     "state": "acknowledged",
                     "queue_state": "submitted",
                     "broker_order_id": broker_order_id,
+                    **kis_ack_identity,
                     "reason": "broker-acknowledged",
                     "next_retry_at": "-",
                 }
@@ -16393,6 +17992,11 @@ def dispatch_live_order_with_checkpoint(
                 output_payload={
                     "brokerId": broker_id,
                     "brokerOrderId": broker_order_id,
+                    **(
+                        {"brokerOrderKey": kis_ack_identity.get("broker_order_key")}
+                        if kis_ack_identity
+                        else {}
+                    ),
                 },
             )
         elif response_ok:
@@ -18089,10 +19693,14 @@ def _functional_test_execution_poll_fresh(
         and str(item.get("broker_id") or "").strip().lower()
         in {"", "kis"}
     ]
+    order_truth = kis_order_truth_snapshot(now=current)
     fresh = bool(
         age is not None
         and age <= FUNCTIONAL_TEST_EXECUTION_OBSERVATION_MAX_AGE_SECONDS
         and not errors
+        and order_truth.get("complete") is True
+        and order_truth.get("fresh") is True
+        and order_truth.get("absenceIsAuthoritative") is True
     )
     return (
         fresh,
@@ -18105,6 +19713,7 @@ def _functional_test_execution_poll_fresh(
             "lastPoll": event_state.get("last_poll"),
             "ageSeconds": age,
             "errors": errors,
+            "orderTruth": order_truth,
         },
     )
 
@@ -19127,11 +20736,13 @@ def _restore_previous_runtime_session_binding(
         active.pop(profile_id, None)
 
 
+@_serialized_safety_mutation
 def start_functional_test_runtime(
     workspace: dict[str, Any],
     *,
     confirmed: bool,
     target_key: str = "",
+    safety_confirmation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Explicitly start the selected, already activated KIS test runtime.
 
@@ -19230,6 +20841,18 @@ def start_functional_test_runtime(
     if not runtime_strategy_id:
         return blocked("FUNCTIONAL_TEST runtime lead Strategy가 없습니다.")
     portfolio_id = str(candidate.get("portfolioId") or "").strip()
+    challenge = consume_safety_confirmation(
+        "FUNCTIONAL_TEST_START",
+        safety_confirmation,
+        {"targetKey": requested_key or selected_key},
+    )
+    if challenge.get("ok") is not True:
+        return blocked(
+            str(
+                challenge.get("reason")
+                or "safety-confirmation-required"
+            )
+        )
     result = start_continuous_runtime(
         "stock",
         "SMALL_LIVE",
@@ -19246,6 +20869,7 @@ def start_functional_test_runtime(
             "use_as_promotion_evidence": False,
             "full_live_requested": False,
         },
+        _functional_test_capability=_FUNCTIONAL_TEST_START_CAPABILITY,
     )
     result["runtimeStarted"] = result.get("ok") is True
     result["brokerSubmissionPerformed"] = False
@@ -19255,6 +20879,7 @@ def start_functional_test_runtime(
     return result
 
 
+@_serialized_safety_mutation
 def start_continuous_runtime(
     profile_id: str,
     mode: str,
@@ -19263,6 +20888,8 @@ def start_continuous_runtime(
     strategy_id: str = "",
     execution_purpose: str = "",
     functional_test_context: dict[str, Any] | None = None,
+    *,
+    _functional_test_capability: object | None = None,
 ) -> dict[str, Any]:
     normalized_profile = "stock" if profile_id == "stock" else "crypto"
     normalized_mode = normalize_runtime_mode(mode)
@@ -19271,6 +20898,20 @@ def start_continuous_runtime(
         return {
             "ok": False,
             "reason": f"unsupported execution purpose: {normalized_purpose}",
+            "snapshot": snapshot(),
+        }
+    if (
+        normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE
+        and _functional_test_capability is not _FUNCTIONAL_TEST_START_CAPABILITY
+    ):
+        return {
+            "ok": False,
+            "reason": (
+                "FUNCTIONAL_TEST runtime은 전용 2단계 확인 시작 경로에서만 "
+                "실행할 수 있습니다."
+            ),
+            "runtimeStarted": False,
+            "brokerSubmissionPerformed": False,
             "snapshot": snapshot(),
         }
     if normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE and (
@@ -20503,7 +22144,11 @@ def retry_order(order_id: str) -> dict[str, Any]:
     }
 
 
-def cancel_order(order_id: str) -> dict[str, Any]:
+def cancel_order(
+    order_id: str,
+    *,
+    _official_kis_truth: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     order = find_order(order_id)
     if not order:
         return {"ok": False, "reason": "order not found", "snapshot": snapshot()}
@@ -20536,6 +22181,49 @@ def cancel_order(order_id: str) -> dict[str, Any]:
         response_payload = broker_response.get("json") if isinstance(broker_response.get("json"), dict) else {}
         output = response_payload.get("output") if isinstance(response_payload.get("output"), dict) else {}
         broker_id = str(order.get("broker_id") or broker_request.get("broker_id") or broker_id_from_symbol(str(order.get("symbol") or ""), str(order.get("asset") or ""))).lower()
+        if broker_id == "kis":
+            refresh = (
+                {
+                    "ok": True,
+                    "truth": dict(_official_kis_truth),
+                    "reason": "prevalidated-kill-order-truth",
+                }
+                if isinstance(_official_kis_truth, dict)
+                else refresh_kis_order_truth_for_kill_switch()
+            )
+            truth = (
+                dict(refresh.get("truth"))
+                if isinstance(refresh.get("truth"), dict)
+                else {}
+            )
+            identity_allowed, identity_reason = (
+                _kis_cancel_identity_is_authoritative(order, truth)
+            )
+        else:
+            identity_allowed, identity_reason = True, ""
+        if broker_id == "kis" and not identity_allowed:
+            order.update(
+                {
+                    "queue_state": "reconcile_required",
+                    "reason": identity_reason,
+                    "updated_at": now_text(),
+                }
+            )
+            append_audit(
+                "danger",
+                "KIS 주문 취소 차단",
+                (
+                    f"{order_id} · fresh official truth에서 현재의 유일한 "
+                    "date·organization·ODNO working identity를 확정하지 못해 "
+                    "broker cancel POST를 전송하지 않았습니다."
+                ),
+            )
+            return {
+                "ok": False,
+                "reason": identity_reason,
+                "reconciliation_required": True,
+                "snapshot": snapshot(),
+            }
         cancel_request_id = "cancel-" + hashlib.sha256(
             "|".join(
                 (
@@ -20597,7 +22285,12 @@ def cancel_order(order_id: str) -> dict[str, Any]:
                 asset=str(order.get("asset") or broker_request.get("asset") or ""),
                 quantity=order.get("qty") or broker_request.get("quantity") or 0,
                 exchange=str(broker_request.get("exchange") or ""),
-                organization_no=str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("KRX_FWDG_ORD_ORG_NO") or ""),
+                organization_no=str(
+                    order.get("organization_no")
+                    or output.get("KRX_FWDG_ORD_ORGNO")
+                    or output.get("KRX_FWDG_ORD_ORG_NO")
+                    or ""
+                ),
             )
         except Exception as exc:
             reason = f"브로커 주문 취소 결과 불명: {type(exc).__name__}: {exc}"

@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import copy
+import os
 import re
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from live_trader import state
+from live_trader.emergency_stop import (
+    _reset_emergency_stop_sticky_for_tests,
+    engage_emergency_stop,
+)
+from live_trader.process_safety import release_held_leases_for_tests
 from live_trader.order_management import OrderIntent
 from live_trader.program_ledger import ProgramLedger
 from live_trader.risk_engine import PreTradeRiskReport, RiskCheck
@@ -16,6 +23,7 @@ from live_trader.risk_engine import PreTradeRiskReport, RiskCheck
 
 class OrderDispatchSafetyTest(unittest.TestCase):
     def setUp(self) -> None:
+        _reset_emergency_stop_sticky_for_tests()
         self.original_state = copy.deepcopy(state.STATE)
         self.original_ledger = state.PROGRAM_LEDGER
         self.original_recovery = state.RECOVERY_JOURNAL
@@ -23,6 +31,16 @@ class OrderDispatchSafetyTest(unittest.TestCase):
         self.original_oms = state.LIVE_OMS
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
+        self.previous_emergency_stop_path = os.environ.get(
+            "LIVE_TRADER_EMERGENCY_STOP_PATH"
+        )
+        self.previous_process_lock_dir = os.environ.get(
+            "LIVE_TRADER_PROCESS_LOCK_DIR"
+        )
+        os.environ["LIVE_TRADER_EMERGENCY_STOP_PATH"] = str(
+            root / "emergency-stop.json"
+        )
+        os.environ["LIVE_TRADER_PROCESS_LOCK_DIR"] = str(root / "locks")
         self.ledger_path = root / "program-ledger.sqlite3"
         self.ledger = ProgramLedger(self.ledger_path)
         state.PROGRAM_LEDGER = self.ledger
@@ -48,6 +66,20 @@ class OrderDispatchSafetyTest(unittest.TestCase):
         state.LIVE_OMS = self.original_oms
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
+        release_held_leases_for_tests()
+        _reset_emergency_stop_sticky_for_tests()
+        if self.previous_emergency_stop_path is None:
+            os.environ.pop("LIVE_TRADER_EMERGENCY_STOP_PATH", None)
+        else:
+            os.environ["LIVE_TRADER_EMERGENCY_STOP_PATH"] = (
+                self.previous_emergency_stop_path
+            )
+        if self.previous_process_lock_dir is None:
+            os.environ.pop("LIVE_TRADER_PROCESS_LOCK_DIR", None)
+        else:
+            os.environ["LIVE_TRADER_PROCESS_LOCK_DIR"] = (
+                self.previous_process_lock_dir
+            )
         self.temporary.cleanup()
 
     @staticmethod
@@ -206,7 +238,13 @@ class OrderDispatchSafetyTest(unittest.TestCase):
             return {
                 "ok": True,
                 "statusCode": 200,
-                "json": {"output": {"ODNO": "KIS-ACK-1"}},
+                "json": {
+                    "output": {
+                        "ODNO": "KIS-ACK-1",
+                        "ORD_DT": "20260809",
+                        "KRX_FWDG_ORD_ORGNO": "001",
+                    }
+                },
             }
 
         router.place_order.side_effect = place_order
@@ -226,10 +264,157 @@ class OrderDispatchSafetyTest(unittest.TestCase):
         )
         self.assertEqual("acknowledged", durable["state"])
         self.assertEqual("KIS-ACK-1", durable["broker_order_id"])
+        self.assertEqual("20260809", durable["order_date"])
+        self.assertEqual("001", durable["organization_no"])
+        self.assertEqual(
+            "20260809:001:KIS-ACK-1",
+            durable["broker_order_key"],
+        )
         self.assertEqual(
             result["order"]["idempotency_key"],
             durable["broker_request"]["identifier"],
         )
+
+    def test_independent_emergency_latch_blocks_at_final_post_boundary(self) -> None:
+        router = Mock()
+        self.assertTrue(engage_emergency_stop("native kill")["ok"])
+        with patch.object(state, "LiveBrokerRouter", return_value=router):
+            result = self.submit_with_passing_gate(
+                self.intent(target_revision=202)
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            "emergency-stop-latch-broker-dispatch-forbidden",
+            result["reason"],
+        )
+        router.place_order.assert_not_called()
+        durable = self.ledger.order_dispatch_for_idempotency_key(
+            result["order"]["idempotency_key"]
+        )
+        self.assertEqual("risk_blocked", durable["state"])
+
+    def test_deleted_initialized_latch_is_fail_closed_after_process_restart(self) -> None:
+        self.assertTrue(engage_emergency_stop("native kill")["ok"])
+        Path(os.environ["LIVE_TRADER_EMERGENCY_STOP_PATH"]).unlink()
+        _reset_emergency_stop_sticky_for_tests()
+        router = Mock()
+
+        with patch.object(state, "LiveBrokerRouter", return_value=router):
+            result = self.submit_with_passing_gate(
+                self.intent(target_revision=205)
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            "emergency-stop-latch-broker-dispatch-forbidden",
+            result["reason"],
+        )
+        router.place_order.assert_not_called()
+
+    def test_native_kill_linearizes_after_inflight_post_and_blocks_next_post(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        router = Mock()
+
+        def place_order(_payload: dict) -> dict:
+            entered.set()
+            self.assertTrue(release.wait(timeout=5))
+            return {
+                "ok": True,
+                "json": {
+                    "output": {
+                        "ODNO": "INFLIGHT-1",
+                        "ORD_DT": "20260809",
+                        "KRX_FWDG_ORD_ORGNO": "001",
+                    }
+                },
+            }
+
+        router.place_order.side_effect = place_order
+        submit_result: list[dict] = []
+        kill_result: list[dict] = []
+        with patch.object(state, "LiveBrokerRouter", return_value=router):
+            submit_thread = threading.Thread(
+                target=lambda: submit_result.append(
+                    self.submit_with_passing_gate(
+                        self.intent(target_revision=206)
+                    )
+                )
+            )
+            submit_thread.start()
+            self.assertTrue(entered.wait(timeout=5))
+            kill_thread = threading.Thread(
+                target=lambda: kill_result.append(
+                    engage_emergency_stop("concurrent native kill")
+                )
+            )
+            kill_thread.start()
+            # ON is written immediately, but the native call cannot report
+            # completion until the already-entered POST leaves the boundary.
+            self.assertTrue(kill_thread.is_alive())
+            release.set()
+            submit_thread.join(timeout=5)
+            kill_thread.join(timeout=5)
+            self.assertFalse(submit_thread.is_alive())
+            self.assertFalse(kill_thread.is_alive())
+            self.assertTrue(kill_result[0]["active"])
+
+            after_kill = self.submit_with_passing_gate(
+                self.intent(target_revision=207)
+            )
+
+        self.assertTrue(submit_result[0]["ok"])
+        self.assertFalse(after_kill["ok"])
+        self.assertEqual(1, router.place_order.call_count)
+
+    def test_failed_latch_write_is_sticky_and_next_broker_post_is_zero(self) -> None:
+        router = Mock()
+        with patch(
+            "live_trader.emergency_stop._write_atomic",
+            side_effect=PermissionError("control directory denied"),
+        ):
+            latch = engage_emergency_stop("api down native Kill")
+
+        self.assertFalse(latch["ok"])
+        self.assertTrue(latch["active"])
+        with patch.object(state, "LiveBrokerRouter", return_value=router):
+            result = self.submit_with_passing_gate(
+                self.intent(target_revision=204)
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            "emergency-stop-latch-broker-dispatch-forbidden",
+            result["reason"],
+        )
+        router.place_order.assert_not_called()
+
+    def test_cross_process_kis_lease_conflict_blocks_before_post(self) -> None:
+        router = Mock()
+        denied = {
+            "acquired": False,
+            "reason": "process-lease-owned-by-another-process",
+            "kind": "kis-account",
+        }
+        with (
+            patch.object(state, "LiveBrokerRouter", return_value=router),
+            patch.object(
+                state,
+                "kis_cross_process_dispatch_lease",
+                return_value=denied,
+            ),
+        ):
+            result = self.submit_with_passing_gate(
+                self.intent(target_revision=203)
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            "process-lease-owned-by-another-process",
+            result["reason"],
+        )
+        router.place_order.assert_not_called()
 
     def test_scope_revision_change_after_checkpoint_never_reaches_broker(
         self,

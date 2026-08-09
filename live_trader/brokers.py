@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Literal
+from zoneinfo import ZoneInfo
 
 from trading_runtime import compare_futures_policy_to_broker
 
@@ -30,6 +33,7 @@ from .live_adapters import (
     build_binance_spot_order_request,
     build_kis_cancel_order_request,
     build_kis_domestic_balance_request,
+    build_kis_domestic_execution_request,
     build_kis_live_order_request,
     build_kis_overseas_balance_request,
     build_upbit_accounts_request,
@@ -111,6 +115,12 @@ BROKER_SPECS = (
             ("auth_token", "접근 토큰 발급", True, "KIS OAuth token 발급 요청 구현됨"),
             ("account_balance", "계좌 잔고 조회", True, "국내·해외 주식 잔고 조회 요청 구현됨"),
             ("positions", "보유/체결 조회", True, "국내·해외 주식 보유 잔고 조회와 연속조회 구현됨"),
+            (
+                "domestic_order_truth",
+                "국내 주문·체결 REST truth",
+                True,
+                "inquire-daily-ccld 전체 페이지에서 미체결·부분체결·체결·취소·거부를 공식 ODNO 기준으로 확정함",
+            ),
             ("place_order", "현금 주문 전송", True, "국내/해외 주식 실계좌 주문 요청 생성 구현됨"),
             ("cancel_order", "주문 취소/정정", True, "국내/해외 원주문번호 기반 전량 취소 요청 구현됨"),
         ),
@@ -359,7 +369,11 @@ def broker_adapter_contract() -> list[dict[str, str]]:
         {"method": "place_order", "purpose": "서명된 실주문 요청 생성/전송", "status": "interface_ready"},
         {"method": "cancel_order", "purpose": "주문 취소/정정", "status": "interface_ready"},
         {"method": "stream_executions", "purpose": "체결/계좌 이벤트 스트림", "status": "interface_ready"},
-        {"method": "poll_execution_events", "purpose": "체결/계좌 이벤트 폴링", "status": "account_poll_ready"},
+        {
+            "method": "poll_execution_events",
+            "purpose": "공식 주문·체결 truth/계좌 이벤트 폴링",
+            "status": "kis_domestic_order_truth_ready",
+        },
     ]
 
 
@@ -1034,6 +1048,774 @@ def fetch_kis_overseas_balance(
     raise BrokerNotReadyError(
         f"kis 해외주식 잔고 API 조회 실패: {max_pages}페이지 안에 연속조회가 끝나지 않았습니다."
     )
+
+
+KIS_DOMESTIC_ORDER_TRUTH_SCHEMA = "kis-domestic-order-truth-v1"
+_KIS_SEOUL = ZoneInfo("Asia/Seoul")
+
+
+def kis_execution_lookback_days() -> int:
+    """Return the bounded inclusive domestic execution-history window."""
+
+    raw = os.getenv("KIS_EXECUTION_LOOKBACK_DAYS", "7").strip() or "7"
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise BrokerNotReadyError(
+            "KIS_EXECUTION_LOOKBACK_DAYS는 1~31 사이 정수여야 합니다."
+        ) from exc
+    if value < 1 or value > 31:
+        raise BrokerNotReadyError(
+            "KIS_EXECUTION_LOOKBACK_DAYS는 1~31 사이여야 합니다."
+        )
+    return value
+
+
+def fetch_kis_domestic_order_truth(
+    access_token: str,
+    *,
+    start_date: str,
+    end_date: str,
+    max_pages: int = 20,
+) -> dict[str, object]:
+    """Fetch every official ``inquire-daily-ccld`` continuation page.
+
+    An absent order is meaningful only when the response is successful and
+    every page has been consumed.  Broken or repeated context keys therefore
+    fail the complete snapshot instead of publishing a partial order list.
+    Every request still goes through ``send_prepared_request`` and thus the
+    shared KIS account/app-key REST limiter.
+    """
+
+    output1: list[dict[str, object]] = []
+    context_fk100 = ""
+    context_nk100 = ""
+    continuation = ""
+    seen_keys: set[tuple[str, str]] = set()
+    page_count = 0
+    for _ in range(max(1, int(max_pages))):
+        response = send_prepared_request(
+            build_kis_domestic_execution_request(
+                access_token=access_token,
+                start_date=start_date,
+                end_date=end_date,
+                context_fk100=context_fk100,
+                context_nk100=context_nk100,
+                continuation=continuation,
+            )
+        )
+        payload = ensure_kis_payload_ok(response, scope="국내주식 주문·체결")
+        if str(payload.get("rt_cd") or "").strip() != "0":
+            raise BrokerNotReadyError(
+                "kis 국내주식 주문·체결 API 조회 실패: rt_cd=0이 없어 "
+                "성공 응답을 증명할 수 없습니다."
+            )
+        if "output1" not in payload:
+            raise BrokerNotReadyError(
+                "kis 국내주식 주문·체결 API 조회 실패: output1이 없어 "
+                "빈 주문 목록을 증명할 수 없습니다."
+            )
+        page_rows = payload.get("output1")
+        rows = (
+            page_rows
+            if isinstance(page_rows, list)
+            else [page_rows]
+            if isinstance(page_rows, dict)
+            else None
+        )
+        if rows is None:
+            raise BrokerNotReadyError(
+                "kis 국내주식 주문·체결 API 조회 실패: output1 형식이 "
+                "올바르지 않습니다."
+            )
+        for row in rows:
+            if not isinstance(row, dict):
+                raise BrokerNotReadyError(
+                    "kis 국내주식 주문·체결 API 조회 실패: 주문 행 형식이 "
+                    "올바르지 않습니다."
+                )
+            output1.append(dict(row))
+        page_count += 1
+
+        tr_cont = str(response.get("trCont") or "").strip().upper()
+        if tr_cont not in {"", "D", "E", "M", "F"}:
+            raise BrokerNotReadyError(
+                "kis 국내주식 주문·체결 API 조회 실패: 알 수 없는 "
+                f"연속조회 상태({tr_cont})입니다."
+            )
+        if tr_cont not in {"M", "F"}:
+            return {
+                "rt_cd": "0",
+                "output1": output1,
+                "query_start_date": str(start_date),
+                "query_end_date": str(end_date),
+                "page_count": page_count,
+                "pagination_complete": True,
+            }
+        next_fk100 = str(
+            payload.get("ctx_area_fk100")
+            or payload.get("CTX_AREA_FK100")
+            or ""
+        ).strip()
+        next_nk100 = str(
+            payload.get("ctx_area_nk100")
+            or payload.get("CTX_AREA_NK100")
+            or ""
+        ).strip()
+        next_key = (next_fk100, next_nk100)
+        if not any(next_key) or next_key in seen_keys:
+            raise BrokerNotReadyError(
+                "kis 국내주식 주문·체결 API 조회 실패: 연속조회 키가 "
+                "누락되었거나 반복되어 전체 주문 truth를 증명할 수 없습니다."
+            )
+        seen_keys.add(next_key)
+        context_fk100 = next_fk100
+        context_nk100 = next_nk100
+        continuation = "N"
+    raise BrokerNotReadyError(
+        f"kis 국내주식 주문·체결 API 조회 실패: {max_pages}페이지 안에 "
+        "연속조회가 끝나지 않았습니다."
+    )
+
+
+def _kis_truth_value(row: dict[str, object], *keys: str) -> object | None:
+    for key in keys:
+        for candidate in (key, key.upper()):
+            if candidate in row and row[candidate] not in (None, ""):
+                return row[candidate]
+    return None
+
+
+def _kis_truth_decimal(
+    row: dict[str, object],
+    *keys: str,
+    label: str,
+    required: bool = True,
+) -> Decimal:
+    raw = _kis_truth_value(row, *keys)
+    if raw is None:
+        if not required:
+            return Decimal("0")
+        raise BrokerNotReadyError(
+            f"kis 국내주식 주문·체결 행에 {label} 값이 없습니다."
+        )
+    try:
+        value = Decimal(str(raw).replace(",", "").strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise BrokerNotReadyError(
+            f"kis 국내주식 주문·체결 행의 {label} 형식이 올바르지 않습니다."
+        ) from exc
+    if (
+        not value.is_finite()
+        or value < 0
+        or value != value.to_integral_value()
+    ):
+        raise BrokerNotReadyError(
+            f"kis 국내주식 주문·체결 행의 {label} 수량을 신뢰할 수 없습니다."
+        )
+    return value
+
+
+def _kis_truth_price(
+    row: dict[str, object],
+    *,
+    filled: Decimal,
+) -> Decimal:
+    for keys in (
+        ("avg_prvs",),
+        ("avg_ccld_unpr",),
+        ("ccld_unpr",),
+    ):
+        raw = _kis_truth_value(row, *keys)
+        if raw is None:
+            continue
+        try:
+            price = Decimal(str(raw).replace(",", "").strip())
+        except (InvalidOperation, ValueError):
+            continue
+        if price.is_finite() and price > 0:
+            return price
+    amount_raw = _kis_truth_value(row, "tot_ccld_amt")
+    if amount_raw is not None and filled > 0:
+        try:
+            amount = Decimal(str(amount_raw).replace(",", "").strip())
+        except (InvalidOperation, ValueError):
+            amount = Decimal("0")
+        if amount.is_finite() and amount > 0:
+            return amount / filled
+    if filled > 0:
+        raise BrokerNotReadyError(
+            "kis 국내주식 체결 행에 양수 평균 체결가가 없어 fill truth를 "
+            "확정할 수 없습니다."
+        )
+    return Decimal("0")
+
+
+def _decimal_text(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _kis_truth_occurred_at(order_date: str, order_time: str) -> str:
+    normalized_time = order_time if len(order_time) == 6 else "000000"
+    try:
+        local = datetime.strptime(
+            f"{order_date}{normalized_time}",
+            "%Y%m%d%H%M%S",
+        ).replace(tzinfo=_KIS_SEOUL)
+    except ValueError as exc:
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 행의 주문 일시가 올바르지 않습니다."
+        ) from exc
+    return local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _kis_truth_query_window(data: dict[str, object]) -> tuple[str, str]:
+    start = str(data.get("query_start_date") or "").strip()
+    end = str(data.get("query_end_date") or "").strip()
+    for value, label in ((start, "시작일"), (end, "종료일")):
+        try:
+            normalized = datetime.strptime(value, "%Y%m%d").strftime("%Y%m%d")
+        except ValueError as exc:
+            raise BrokerNotReadyError(
+                f"kis 국내주식 주문·체결 truth의 조회 {label}이 올바르지 않습니다."
+            ) from exc
+        if normalized != value:
+            raise BrokerNotReadyError(
+                f"kis 국내주식 주문·체결 truth의 조회 {label} 형식이 올바르지 않습니다."
+            )
+    if start > end:
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 truth의 조회 시작일이 종료일보다 늦습니다."
+        )
+    return start, end
+
+
+def _normalize_kis_domestic_truth_row(
+    row: dict[str, object],
+) -> dict[str, object]:
+    order_date = str(_kis_truth_value(row, "ord_dt") or "").strip()
+    broker_order_id = str(_kis_truth_value(row, "odno") or "").strip()
+    organization_no = str(
+        _kis_truth_value(
+            row,
+            "ord_gno_brno",
+            "krx_fwdg_ord_orgno",
+        )
+        or ""
+    ).strip().upper()
+    symbol_text = str(_kis_truth_value(row, "pdno") or "").strip().upper()
+    if not broker_order_id:
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 행에 공식 ODNO가 없습니다."
+        )
+    if not organization_no:
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 행에 주문조직번호가 없어 공식 주문 "
+            "식별자를 확정할 수 없습니다."
+        )
+    if not symbol_text:
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 행에 종목코드가 없습니다."
+        )
+    if len(order_date) != 8 or not order_date.isdigit():
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 행에 유효한 주문일자가 없습니다."
+        )
+    side_code = str(
+        _kis_truth_value(row, "sll_buy_dvsn_cd") or ""
+    ).strip().upper()
+    side_name = str(
+        _kis_truth_value(row, "sll_buy_dvsn_cd_name") or ""
+    ).strip().upper()
+    if side_code in {"02", "BUY", "B"} or side_name in {"매수", "BUY"}:
+        side = "BUY"
+    elif side_code in {"01", "SELL", "S"} or side_name in {"매도", "SELL"}:
+        side = "SELL"
+    else:
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 행의 매수·매도 구분을 확정할 수 없습니다."
+        )
+
+    requested = _kis_truth_decimal(row, "ord_qty", label="주문수량")
+    filled = _kis_truth_decimal(row, "tot_ccld_qty", label="누적체결수량")
+    remaining = _kis_truth_decimal(row, "rmn_qty", label="미체결수량")
+    rejected = _kis_truth_decimal(
+        row,
+        "rjct_qty",
+        label="거부수량",
+        required=False,
+    )
+    canceled = _kis_truth_decimal(
+        row,
+        "cncl_cfrm_qty",
+        "cnc_cfrm_qty",
+        label="취소확인수량",
+        required=False,
+    )
+    if requested <= 0:
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 행의 주문수량은 0보다 커야 합니다."
+        )
+    if any(value > requested for value in (filled, remaining, rejected, canceled)):
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 행의 상태 수량이 주문수량을 초과합니다."
+        )
+    cancel_flag_text = str(
+        _kis_truth_value(row, "cncl_yn") or ""
+    ).strip().upper()
+    cancel_flag = cancel_flag_text in {"Y", "1", "TRUE"}
+    tolerance = Decimal("0")
+    if filled == requested and remaining == tolerance:
+        if canceled > tolerance or rejected > tolerance or cancel_flag:
+            raise BrokerNotReadyError(
+                "kis 국내주식 완전체결 행에 취소·거부 상태가 함께 있어 "
+                "수량 truth를 확정할 수 없습니다."
+            )
+        state = "filled"
+    elif rejected > tolerance:
+        if (
+            cancel_flag
+            or canceled > tolerance
+            or filled + rejected != requested
+            or remaining != tolerance
+        ):
+            raise BrokerNotReadyError(
+                "kis 국내주식 거부 행의 체결·거부·미체결 수량 상태가 "
+                "일관되지 않습니다."
+            )
+        state = "rejected"
+    elif cancel_flag or canceled > tolerance:
+        if (
+            rejected > tolerance
+            or remaining != tolerance
+            or filled + canceled != requested
+        ):
+            raise BrokerNotReadyError(
+                "kis 국내주식 취소 행의 체결·취소·미체결 수량이 일치하지 "
+                "않습니다."
+            )
+        state = "canceled"
+    else:
+        if (
+            rejected > tolerance
+            or canceled > tolerance
+            or filled + remaining != requested
+        ):
+            raise BrokerNotReadyError(
+                "kis 국내주식 주문 행의 체결·미체결 합계가 주문수량과 "
+                "일치하지 않습니다."
+            )
+        state = "partially_filled" if filled > tolerance else "accepted"
+
+    price = _kis_truth_price(row, filled=filled)
+    order_time = "".join(
+        character
+        for character in str(_kis_truth_value(row, "ord_tmd") or "")
+        if character.isdigit()
+    )
+    if len(order_time) != 6:
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 행의 주문시각 형식이 올바르지 않습니다."
+        )
+    occurred_at = _kis_truth_occurred_at(order_date, order_time)
+    broker_order_key = ":".join(
+        (order_date, organization_no, broker_order_id)
+    )
+    symbol = kis_symbol(symbol_text)
+    return {
+        "broker_id": "kis",
+        "broker_order_id": broker_order_id,
+        "broker_order_key": broker_order_key,
+        "local_order_id": "",
+        "correlation": "official-broker-order-id-only",
+        "order_date": order_date,
+        "order_time": order_time,
+        "organization_no": organization_no,
+        "symbol": symbol,
+        "asset": "한국주식/ETF",
+        "side": side,
+        "requested_quantity": float(requested),
+        "filled_quantity": float(filled),
+        "remaining_quantity": float(remaining),
+        "canceled_quantity": float(canceled),
+        "rejected_quantity": float(rejected),
+        "average_fill_price": float(price),
+        "state": state,
+        "terminal": state in {"filled", "canceled", "rejected"},
+        "occurred_at": occurred_at,
+        "source": "kis_inquire_daily_ccld",
+        "raw": dict(row),
+    }
+
+
+def _kis_truth_progresses(
+    previous: dict[str, object],
+    current: dict[str, object],
+) -> bool:
+    """Return whether ``current`` is a monotonic official order revision."""
+
+    immutable = (
+        "broker_order_id",
+        "broker_order_key",
+        "symbol",
+        "side",
+        "requested_quantity",
+    )
+    if any(previous.get(key) != current.get(key) for key in immutable):
+        return False
+    previous_filled = Decimal(str(previous["filled_quantity"]))
+    current_filled = Decimal(str(current["filled_quantity"]))
+    previous_remaining = Decimal(str(previous["remaining_quantity"]))
+    current_remaining = Decimal(str(current["remaining_quantity"]))
+    if current_filled < previous_filled or current_remaining > previous_remaining:
+        return False
+    if current_filled == previous_filled and current_remaining == previous_remaining:
+        if (
+            previous_filled > 0
+            and previous.get("average_fill_price")
+            != current.get("average_fill_price")
+        ):
+            return False
+        rank = {
+            "accepted": 0,
+            "partially_filled": 1,
+            "canceled": 2,
+            "rejected": 2,
+            "filled": 3,
+        }
+        previous_state = str(previous.get("state"))
+        current_state = str(current.get("state"))
+        previous_rank = rank.get(previous_state, -1)
+        current_rank = rank.get(current_state, -1)
+        return (
+            current_rank > previous_rank
+            or (
+                current_rank == previous_rank
+                and current_state == previous_state
+            )
+        )
+    return True
+
+
+def _kis_truth_events(order: dict[str, object]) -> list[dict[str, object]]:
+    key = str(order["broker_order_key"])
+    filled = Decimal(str(order["filled_quantity"]))
+    price = Decimal(str(order["average_fill_price"]))
+    state = str(order["state"])
+    base_raw = {
+        "raw_type": "kis_domestic_execution_rest_truth",
+        "source": "kis_inquire_daily_ccld",
+        "truth_schema_version": KIS_DOMESTIC_ORDER_TRUTH_SCHEMA,
+        "official_truth_complete": True,
+        "broker_order_key": key,
+        "order_date": order["order_date"],
+        "order_time": order["order_time"],
+        "organization_no": order["organization_no"],
+        "requested_quantity": order["requested_quantity"],
+        "remaining_quantity": order["remaining_quantity"],
+        "canceled_quantity": order["canceled_quantity"],
+        "rejected_quantity": order["rejected_quantity"],
+        "quantity_mode": "cumulative",
+        "cumulative_quantity": order["filled_quantity"],
+        "cumulative_average_price": order["average_fill_price"],
+        "cost_status": "UNKNOWN",
+    }
+
+    def event(
+        event_id: str,
+        event_state: str,
+        quantity: Decimal,
+        event_price: Decimal,
+    ) -> dict[str, object]:
+        return {
+            "event_id": event_id,
+            "broker_id": "kis",
+            "order_id": "",
+            "broker_order_id": order["broker_order_id"],
+            "broker_order_key": key,
+            "symbol": order["symbol"],
+            "side": order["side"],
+            "quantity": float(quantity),
+            "price": float(event_price),
+            "fee": 0.0,
+            "state": event_state,
+            "occurred_at": order["occurred_at"],
+            # The shared BrokerExecutionEvent contract currently reads the
+            # camel-case spelling. Preserve both at this adapter boundary so
+            # durable KIS REST events never lose their official order time.
+            "occurredAt": order["occurred_at"],
+            **base_raw,
+        }
+
+    events: list[dict[str, object]] = []
+    if filled > 0:
+        fill_state = "filled" if state == "filled" else "partially_filled"
+        events.append(
+            event(
+                f"kis-rest:{key}:fill:{_decimal_text(filled)}",
+                fill_state,
+                filled,
+                price,
+            )
+        )
+    if state in {"accepted", "canceled", "rejected"}:
+        status_signature = hashlib.sha256(
+            json.dumps(
+                {
+                    "state": state,
+                    "filled": order["filled_quantity"],
+                    "remaining": order["remaining_quantity"],
+                    "canceled": order["canceled_quantity"],
+                    "rejected": order["rejected_quantity"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        status_event = event(
+            f"kis-rest:{key}:status:{state}:{status_signature}",
+            # The shared normalizer maps broker NEW -> ACKNOWLEDGED. It does
+            # not accept an adapter-specific ACCEPTED literal directly.
+            "new" if state == "accepted" else state,
+            Decimal("0"),
+            Decimal("0"),
+        )
+        # A terminal status is not itself a cumulative fill.  The preceding
+        # fill event carries that watermark and must be applied first.
+        status_event["quantity_mode"] = "delta"
+        status_event["quantity"] = 0.0
+        events.append(status_event)
+    return events
+
+
+def normalize_kis_domestic_order_truth(
+    payload: object,
+) -> dict[str, object]:
+    """Normalize a complete official order snapshot without local guesses."""
+
+    data = payload if isinstance(payload, dict) else {}
+    if data.get("pagination_complete") is not True:
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 truth의 전체 페이지 완료 증거가 없습니다."
+        )
+    if str(data.get("rt_cd") or "").strip() != "0":
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 truth에 rt_cd=0 성공 증거가 없습니다."
+        )
+    query_start_date, query_end_date = _kis_truth_query_window(data)
+    raw_page_count = data.get("page_count")
+    if isinstance(raw_page_count, bool):
+        raw_page_count = None
+    try:
+        page_count_value = Decimal(str(raw_page_count).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 truth의 페이지 수가 올바르지 않습니다."
+        ) from exc
+    if (
+        not page_count_value.is_finite()
+        or page_count_value != page_count_value.to_integral_value()
+        or page_count_value < 1
+    ):
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 truth의 완료 페이지 수가 올바르지 않습니다."
+        )
+    page_count = int(page_count_value)
+    raw_rows = data.get("output1")
+    if not isinstance(raw_rows, list):
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 truth의 output1 형식이 올바르지 않습니다."
+        )
+    selected: dict[str, dict[str, object]] = {}
+    for raw in raw_rows:
+        if not isinstance(raw, dict):
+            raise BrokerNotReadyError(
+                "kis 국내주식 주문·체결 truth에 비정상 주문 행이 있습니다."
+            )
+        current = _normalize_kis_domestic_truth_row(raw)
+        if not query_start_date <= str(current["order_date"]) <= query_end_date:
+            raise BrokerNotReadyError(
+                "kis 국내주식 주문·체결 truth에 조회 범위 밖 주문일자가 "
+                "포함되어 있습니다."
+            )
+        key = str(current["broker_order_key"])
+        previous = selected.get(key)
+        if previous is None or previous == current:
+            selected[key] = current
+            continue
+        if _kis_truth_progresses(previous, current):
+            selected[key] = current
+            continue
+        if _kis_truth_progresses(current, previous):
+            continue
+        raise BrokerNotReadyError(
+            "kis 국내주식 주문·체결 truth에 같은 공식 주문키의 충돌하는 "
+            "행이 있습니다."
+        )
+    orders = sorted(
+        selected.values(),
+        key=lambda item: (
+            str(item["order_date"]),
+            str(item["order_time"]),
+            str(item["broker_order_key"]),
+        ),
+    )
+    order_id_counts: dict[str, int] = {}
+    for order in orders:
+        order_id = str(order["broker_order_id"])
+        order_id_counts[order_id] = order_id_counts.get(order_id, 0) + 1
+    ambiguous_order_ids = sorted(
+        order_id
+        for order_id, count in order_id_counts.items()
+        if count > 1
+    )
+    # The current OMS key is the official ODNO.  If KIS reused an ODNO inside
+    # the bounded history window, emitting either row would let a consumer
+    # bind it to the wrong local order.  Keep both rows in authoritative truth
+    # but withhold events until order date/branch is supplied explicitly.
+    events = [
+        event
+        for order in orders
+        if str(order["broker_order_id"]) not in ambiguous_order_ids
+        for event in _kis_truth_events(order)
+    ]
+    return {
+        "schema_version": KIS_DOMESTIC_ORDER_TRUTH_SCHEMA,
+        "broker_id": "kis",
+        "market": "KR",
+        "complete": True,
+        "pagination_complete": True,
+        "query_start_date": query_start_date,
+        "query_end_date": query_end_date,
+        "page_count": page_count,
+        "order_count": len(orders),
+        "event_count": len(events),
+        "orders": orders,
+        "events": events,
+        "ambiguous_broker_order_ids": ambiguous_order_ids,
+        "correlation_policy": "official-broker-order-id-only",
+        "absence_is_authoritative": True,
+    }
+
+
+def lookup_kis_domestic_order_truth(
+    truth: object,
+    *,
+    broker_order_id: str,
+    order_date: str = "",
+    organization_no: str = "",
+) -> dict[str, object]:
+    """Resolve one restart/ambiguous-POST order by official identity only.
+
+    KIS domestic cash orders do not expose a caller-provided idempotency key.
+    When a POST response is lost there is consequently no safe automatic
+    symbol/time/quantity match.  Returning ``UNRESOLVED`` for a missing ODNO
+    makes that limitation explicit while still exposing the complete official
+    order truth to the recovery workflow/operator.
+    """
+
+    data = truth if isinstance(truth, dict) else {}
+    if (
+        data.get("complete") is not True
+        or data.get("pagination_complete") is not True
+        or data.get("schema_version") != KIS_DOMESTIC_ORDER_TRUTH_SCHEMA
+    ):
+        raise BrokerNotReadyError(
+            "완전한 KIS 국내주식 주문·체결 truth가 아니므로 주문을 "
+            "대조할 수 없습니다."
+        )
+    rows = data.get("orders")
+    if not isinstance(rows, list):
+        raise BrokerNotReadyError(
+            "KIS 국내주식 주문·체결 truth의 orders 형식이 올바르지 않습니다."
+        )
+    normalized_id = str(broker_order_id or "").strip()
+    normalized_date = str(order_date or "").strip()
+    normalized_branch = str(organization_no or "").strip().upper()
+    if not normalized_id:
+        return {
+            "status": "UNRESOLVED",
+            "matched": False,
+            "absence_authoritative": False,
+            "reason": (
+                "KIS POST 응답에서 공식 ODNO를 받지 못했습니다. 종목·수량·"
+                "시각 근접값으로 주문을 자동 귀속하지 않습니다."
+            ),
+            "order": None,
+            "unmatched_official_order_count": len(rows),
+        }
+    query_start_date, query_end_date = _kis_truth_query_window(data)
+    if normalized_date:
+        try:
+            parsed_order_date = datetime.strptime(
+                normalized_date,
+                "%Y%m%d",
+            ).strftime("%Y%m%d")
+        except ValueError:
+            parsed_order_date = ""
+        if (
+            parsed_order_date != normalized_date
+            or not query_start_date <= normalized_date <= query_end_date
+        ):
+            return {
+                "status": "UNRESOLVED",
+                "matched": False,
+                "absence_authoritative": False,
+                "reason": (
+                    "주문일자가 완전 조회 범위 밖이거나 형식이 올바르지 않아 "
+                    "KIS 주문 부재를 확정할 수 없습니다."
+                ),
+                "order": None,
+                "unmatched_official_order_count": len(rows),
+            }
+    matches = [
+        dict(row)
+        for row in rows
+        if isinstance(row, dict)
+        and str(row.get("broker_order_id") or "").strip() == normalized_id
+        and (
+            not normalized_date
+            or str(row.get("order_date") or "").strip() == normalized_date
+        )
+        and (
+            not normalized_branch
+            or str(row.get("organization_no") or "").strip().upper()
+            == normalized_branch
+        )
+    ]
+    if len(matches) == 1:
+        return {
+            "status": "MATCHED",
+            "matched": True,
+            "absence_authoritative": False,
+            "reason": "공식 KIS 주문 식별자로 정확히 대조했습니다.",
+            "order": matches[0],
+            "unmatched_official_order_count": max(0, len(rows) - 1),
+        }
+    if not matches:
+        return {
+            "status": "ABSENT",
+            "matched": False,
+            "absence_authoritative": True,
+            "reason": "완전한 KIS 조회 범위에 해당 공식 주문 식별자가 없습니다.",
+            "order": None,
+            "unmatched_official_order_count": len(rows),
+        }
+    return {
+        "status": "AMBIGUOUS",
+        "matched": False,
+        "absence_authoritative": False,
+        "reason": (
+            "같은 ODNO가 여러 주문일/지점에 존재합니다. 주문일자와 "
+            "주문조직번호를 함께 제공해야 합니다."
+        ),
+        "order": None,
+        "candidate_count": len(matches),
+        "unmatched_official_order_count": len(rows),
+    }
 
 
 def broker_snapshot_events(accounts: list[dict[str, object]], positions: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -2077,6 +2859,17 @@ class LiveBrokerRouter:
         broker_id = broker_id.lower().strip()
         if broker_id == "kis":
             token = issue_kis_access_token()
+            lookback_days = kis_execution_lookback_days()
+            query_end = datetime.now(_KIS_SEOUL).date()
+            query_start = query_end - timedelta(days=lookback_days - 1)
+            execution_payload = fetch_kis_domestic_order_truth(
+                token,
+                start_date=query_start.strftime("%Y%m%d"),
+                end_date=query_end.strftime("%Y%m%d"),
+            )
+            execution_truth = normalize_kis_domestic_order_truth(
+                execution_payload
+            )
             domestic_payload = fetch_kis_domestic_balance(token)
             overseas_payload = fetch_kis_overseas_balance(token)
             accounts = parse_kis_accounts(domestic_payload)
@@ -2084,12 +2877,22 @@ class LiveBrokerRouter:
                 *parse_kis_positions(domestic_payload),
                 *parse_kis_overseas_positions(overseas_payload),
             ]
+            truth_events = execution_truth.get("events")
             return {
                 "broker_id": "kis",
                 "accounts": accounts,
                 "positions": positions,
-                "events": broker_snapshot_events(accounts, positions),
-                "source": "kis_balance_poll",
+                "events": [
+                    *(
+                        truth_events
+                        if isinstance(truth_events, list)
+                        else []
+                    ),
+                    *broker_snapshot_events(accounts, positions),
+                ],
+                "orders": execution_truth.get("orders", []),
+                "execution_truth": execution_truth,
+                "source": "kis_balance_and_domestic_order_truth_poll",
             }
         if broker_id == "binance":
             payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))

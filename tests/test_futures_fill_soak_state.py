@@ -107,6 +107,11 @@ class FuturesFillSoakStateTest(unittest.TestCase):
         response = state.preview_binance_futures_fill_soak("BTCUSDT")
 
         self.assertTrue(response["ok"])
+        session = state.BINANCE_FUTURES_FILL_SOAK_SESSION
+        self.assertIs(
+            state._binance_futures_fill_soak_dispatch_boundary,
+            session.dispatch_boundary,
+        )
         token = response["authorization"]["confirmation_token"]
         self.assertGreater(len(token), 20)
         public_status = state.binance_futures_fill_soak_status()
@@ -130,10 +135,19 @@ class FuturesFillSoakStateTest(unittest.TestCase):
         preview = state.preview_binance_futures_fill_soak("BTCUSDT")
         token = preview["authorization"]["confirmation_token"]
         session = state.BINANCE_FUTURES_FILL_SOAK_SESSION
+        issued = state.issue_safety_confirmation(
+            "BINANCE_FUTURES_FILL_SOAK_START",
+            {"symbol": "BTCUSDT"},
+        )
 
         response = state.start_binance_futures_fill_soak(
             token,
             confirmed=True,
+            safety_confirmation={
+                "challengeId": issued["challengeId"],
+                "token": issued["token"],
+                "typedPhrase": issued["expectedPhrase"],
+            },
         )
         state.BINANCE_FUTURES_FILL_SOAK_THREAD.join(timeout=2)
 

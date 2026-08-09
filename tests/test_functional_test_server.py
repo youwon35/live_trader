@@ -206,7 +206,15 @@ class FunctionalTestServerRoutesTests(unittest.TestCase):
         handler = object.__new__(LiveTraderHandler)
         handler.path = "/api/functional-test/start"
         handler.read_json = Mock(
-            return_value={"confirmed": True, "targetKey": "strategy:one"}
+            return_value={
+                "confirmed": True,
+                "targetKey": "strategy:one",
+                "safety_confirmation": {
+                    "challengeId": "challenge-1",
+                    "token": "token-1",
+                    "typedPhrase": "LIVE 1234",
+                },
+            }
         )
         handler.send_json = Mock()
         workspace = {"status": "ACTIVE", "current": {"ready": True}}
@@ -232,6 +240,11 @@ class FunctionalTestServerRoutesTests(unittest.TestCase):
             workspace,
             confirmed=True,
             target_key="strategy:one",
+            safety_confirmation={
+                "challengeId": "challenge-1",
+                "token": "token-1",
+                "typedPhrase": "LIVE 1234",
+            },
         )
         handler.send_json.assert_called_once_with(expected)
 

@@ -187,10 +187,6 @@ export default function FunctionalTestWorkspace() {
 
   function startExecution() {
     if (!startAcknowledged) return;
-    const confirmed = window.confirm(
-      "FUNCTIONAL_TEST runtime을 시작하시겠습니까? 신호가 발생하면 고정 소액 한도 안에서 실제 KIS 지정가 주문이 전송될 수 있습니다. 이 결과는 승급 Evidence로 사용되지 않습니다.",
-    );
-    if (!confirmed) return;
     setStartAcknowledged(false);
     void runCommand("start", () => startFunctionalTest(
       workspace.current.selectedTargetKey || "",

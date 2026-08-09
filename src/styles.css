@@ -7068,6 +7068,178 @@ body {
   min-height: 36px !important;
 }
 
+:root[data-program="live-trader"] .emergency-stop-feedback {
+  flex: 1 1 260px;
+  max-width: 380px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.25;
+  text-align: right;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+:root[data-program="live-trader"] .emergency-stop-feedback.active {
+  color: var(--danger-soft-text);
+}
+
+:root[data-program="live-trader"] .safety-confirmation-backdrop {
+  position: fixed;
+  z-index: 120;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: color-mix(in srgb, #020617 72%, transparent);
+  backdrop-filter: blur(5px);
+}
+
+:root[data-program="live-trader"] .safety-confirmation-modal {
+  width: min(620px, 100%);
+  max-height: calc(100vh - 36px);
+  overflow: auto;
+  padding: 20px;
+  color: var(--text);
+  background: var(--panel);
+  border: 2px solid color-mix(in srgb, var(--danger) 58%, var(--border));
+  border-radius: var(--radius-lg);
+  box-shadow: 0 28px 80px rgba(2, 6, 23, 0.46);
+}
+
+:root[data-program="live-trader"] .safety-confirmation-modal > header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+:root[data-program="live-trader"] .safety-confirmation-modal > header span,
+:root[data-program="live-trader"] .safety-confirmation-modal form label > span {
+  display: block;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+:root[data-program="live-trader"] .safety-confirmation-modal h2 {
+  margin: 2px 0 0;
+  font-size: 19px;
+  line-height: 1.25;
+}
+
+:root[data-program="live-trader"] .safety-confirmation-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-radius: 50%;
+}
+
+:root[data-program="live-trader"] .safety-confirmation-modal > p {
+  margin: 14px 0;
+  color: var(--text-soft);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+:root[data-program="live-trader"] .safety-confirmation-context {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0 0 16px;
+  overflow: hidden;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+:root[data-program="live-trader"] .safety-confirmation-context > div {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--panel);
+}
+
+:root[data-program="live-trader"] .safety-confirmation-context dt {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+:root[data-program="live-trader"] .safety-confirmation-context dd {
+  margin: 3px 0 0;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+:root[data-program="live-trader"] .safety-confirmation-modal form label {
+  display: grid;
+  gap: 7px;
+}
+
+:root[data-program="live-trader"] .safety-confirmation-modal form code {
+  display: block;
+  padding: 10px 12px;
+  color: var(--danger-soft-text);
+  font-family: var(--font-family);
+  font-size: 14px;
+  font-weight: 850;
+  overflow-wrap: anywhere;
+  background: color-mix(in srgb, var(--danger) 9%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border));
+  border-radius: var(--radius-md);
+}
+
+:root[data-program="live-trader"] .safety-confirmation-modal form input {
+  width: 100%;
+  min-height: 42px;
+  padding: 9px 11px;
+  color: var(--text);
+  background: var(--input-bg, var(--panel));
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+}
+
+:root[data-program="live-trader"] .safety-confirmation-modal form input:focus {
+  border-color: var(--danger);
+  outline: 3px solid color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
+:root[data-program="live-trader"] .safety-confirmation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+:root[data-program="live-trader"] .safety-confirmation-actions .danger-button {
+  margin-right: auto;
+}
+
+@media (max-width: 760px) {
+  :root[data-program="live-trader"] .emergency-stop-feedback {
+    grid-column: 1 / -1;
+    max-width: none;
+    text-align: left;
+  }
+
+  :root[data-program="live-trader"] .safety-confirmation-context {
+    grid-template-columns: 1fr;
+  }
+
+  :root[data-program="live-trader"] .safety-confirmation-actions > button {
+    flex: 1 1 100%;
+  }
+}
+
 :root[data-program="live-trader"] .live-environment-bar {
   position: sticky;
   top: 54px;

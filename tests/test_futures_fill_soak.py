@@ -4,6 +4,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -409,6 +410,88 @@ class FuturesFillSoakTests(unittest.TestCase):
             report["reason_ids"],
         )
         self.assertEqual([], router.place_calls)
+
+    def test_active_kill_boundary_blocks_entry_before_router_post(self) -> None:
+        clock = FakeClock()
+        router = FakeRouter()
+
+        @contextmanager
+        def active_kill():
+            yield {"active": True, "revision": "kill-1"}
+
+        session = BinanceFuturesFillSoakSession(
+            config(session_id="bfsoak-active-kill-entry"),
+            router=router,
+            clock=clock,
+            price_provider=lambda _symbol: Decimal("50000"),
+            rules_provider=rules,
+            live_orders_enabled=lambda: True,
+            report_writer=MemoryReportWriter(),
+            dispatch_authorizer=lambda _intent: (True, "test-authorized", {}),
+            dispatch_boundary=active_kill,
+        )
+
+        report = session.run(authorization(clock))
+
+        self.assertEqual(FAIL, report["status"])
+        self.assertIn(
+            "emergency-stop-latch-broker-dispatch-forbidden",
+            report["reason_ids"],
+        )
+        self.assertEqual([], router.place_calls)
+
+    def test_active_kill_boundary_preserves_verified_reduce_only_cover(self) -> None:
+        clock = FakeClock()
+        router = FakeRouter()
+        router.positions = [
+            {
+                "symbol": "BTCUSDT",
+                "position_side": "SHORT",
+                "broker_qty": -0.0001,
+            }
+        ]
+
+        @contextmanager
+        def active_kill():
+            yield {"active": True, "revision": "kill-2"}
+
+        authorized: list[dict[str, object]] = []
+
+        def authorize(intent: dict[str, object]):
+            authorized.append(dict(intent))
+            return True, "verified-current-position-reduction", {}
+
+        session = BinanceFuturesFillSoakSession(
+            config(session_id="bfsoak-active-kill-cover"),
+            router=router,
+            clock=clock,
+            price_provider=lambda _symbol: Decimal("50000"),
+            rules_provider=rules,
+            live_orders_enabled=lambda: True,
+            report_writer=MemoryReportWriter(),
+            dispatch_authorizer=authorize,
+            dispatch_boundary=active_kill,
+        )
+        intent = {
+            "broker_id": "binance-futures",
+            "strategy_id": "strategy-1",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "quantity": "0.0001",
+            "qty": "0.0001",
+            "position_direction": "short",
+            "risk_reducing": True,
+            "reduce_only": True,
+            "soak_leg": "recovery-cover",
+            "identifier": "ltfs-recovery-cover-test",
+        }
+
+        response = session._place_order_at_dispatch_boundary(intent)
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(1, len(authorized))
+        self.assertEqual(1, len(router.place_calls))
+        self.assertEqual([], router.positions)
 
     def test_run_revalidates_preview_and_blocks_new_position(self) -> None:
         clock = FakeClock()

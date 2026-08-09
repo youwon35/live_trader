@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -9,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from live_trader import env_settings, state
+from live_trader.emergency_stop import engage_emergency_stop
 from live_trader.operational_governance import OperationalGovernanceStore
 from live_trader.order_management import OrderIntent
 
@@ -16,10 +19,43 @@ from live_trader.order_management import OrderIntent
 class LiveSafetyCompletionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_state = copy.deepcopy(state.STATE)
+        self.original_emergency_recovery = (
+            state.DURABLE_EMERGENCY_RECOVERY_REVISION,
+            copy.deepcopy(state.DURABLE_EMERGENCY_RECOVERY_OUTCOME),
+            state.DURABLE_EMERGENCY_RECOVERY_ATTEMPT_REVISION,
+            state.DURABLE_EMERGENCY_RECOVERY_LAST_ATTEMPT_MONOTONIC,
+            state.DURABLE_EMERGENCY_RECOVERY_EVIDENCE_REVISION,
+        )
+        state.DURABLE_EMERGENCY_RECOVERY_REVISION = ""
+        state.DURABLE_EMERGENCY_RECOVERY_OUTCOME = {}
+        state.DURABLE_EMERGENCY_RECOVERY_ATTEMPT_REVISION = ""
+        state.DURABLE_EMERGENCY_RECOVERY_LAST_ATTEMPT_MONOTONIC = 0.0
+        state.DURABLE_EMERGENCY_RECOVERY_EVIDENCE_REVISION = ""
+        self.emergency_temp_dir = tempfile.TemporaryDirectory()
+        self.previous_emergency_stop_path = os.environ.get(
+            "LIVE_TRADER_EMERGENCY_STOP_PATH"
+        )
+        os.environ["LIVE_TRADER_EMERGENCY_STOP_PATH"] = str(
+            Path(self.emergency_temp_dir.name) / "emergency-stop.json"
+        )
 
     def tearDown(self) -> None:
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
+        (
+            state.DURABLE_EMERGENCY_RECOVERY_REVISION,
+            state.DURABLE_EMERGENCY_RECOVERY_OUTCOME,
+            state.DURABLE_EMERGENCY_RECOVERY_ATTEMPT_REVISION,
+            state.DURABLE_EMERGENCY_RECOVERY_LAST_ATTEMPT_MONOTONIC,
+            state.DURABLE_EMERGENCY_RECOVERY_EVIDENCE_REVISION,
+        ) = self.original_emergency_recovery
+        if self.previous_emergency_stop_path is None:
+            os.environ.pop("LIVE_TRADER_EMERGENCY_STOP_PATH", None)
+        else:
+            os.environ["LIVE_TRADER_EMERGENCY_STOP_PATH"] = (
+                self.previous_emergency_stop_path
+            )
+        self.emergency_temp_dir.cleanup()
 
     @staticmethod
     def _intent(*, risk_reducing: bool = False) -> OrderIntent:
@@ -80,6 +116,44 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             state.run_watchdog(include_snapshot=False)
 
         self.assertFalse(incident.call_args.kwargs["active"])
+
+    def test_watchdog_is_api_independent_emergency_recovery_safe_point(self) -> None:
+        healthy = {
+            "status": "pass",
+            "status_label": "정상",
+            "checks": [],
+            "critical_count": 0,
+            "warning_count": 0,
+            "next_actions": [],
+        }
+        recovery = Mock(
+            side_effect=[
+                {"ok": False, "reason": "retry-backoff"},
+                {"ok": True, "recovered": True},
+            ]
+        )
+        with (
+            patch.object(
+                state, "recover_durable_emergency_stop", recovery
+            ),
+            patch.object(state, "broker_readiness", return_value=[]),
+            patch.object(
+                state,
+                "reconciliation_snapshot",
+                return_value={"summary": {}},
+            ),
+            patch.object(state, "order_queue_summary", return_value={}),
+            patch.object(state, "watchdog_snapshot", return_value=healthy),
+            patch.object(state, "apply_watchdog_fail_closed", return_value=False),
+            patch.object(state, "sync_operational_incident"),
+            patch.object(state, "append_audit"),
+        ):
+            first = state.run_watchdog(include_snapshot=False)
+            second = state.run_watchdog(include_snapshot=False)
+
+        self.assertEqual(2, recovery.call_count)
+        self.assertFalse(first["emergency_stop_recovery"]["ok"])
+        self.assertTrue(second["emergency_stop_recovery"]["ok"])
 
     def test_reconciliation_incident_tracks_block_and_recovery(self) -> None:
         blocked_summary = {
@@ -155,6 +229,14 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             },
         ]
         state.STATE["active_runtime_session_ids"] = {"crypto": "session-1"}
+        state.record_complete_kis_order_truth(
+            {
+                "complete": True,
+                "pagination_complete": True,
+                "orders": [],
+                "absence_is_authoritative": True,
+            }
+        )
 
         class FakeGovernance:
             lifecycle = "RUNNING"
@@ -176,9 +258,18 @@ class LiveSafetyCompletionTests(unittest.TestCase):
         cancel = Mock(return_value={"ok": True, "reason": "order canceled"})
         with patch.object(state, "LIVE_CONTINUOUS_CONTROLLER", controller), patch.object(
             state, "OPERATIONAL_GOVERNANCE", governance
+        ), patch.object(
+            state,
+            "refresh_kis_order_truth_for_kill_switch",
+            return_value={
+                "ok": True,
+                "truth": state.kis_order_truth_snapshot(),
+            },
         ), patch.object(state, "cancel_order", cancel), patch.object(
             state, "append_audit"
         ), patch.object(state, "sync_operational_incident"), patch.object(
+            state, "run_reconciliation", return_value={"ok": True}
+        ), patch.object(
             state, "snapshot", return_value={}
         ):
             result = state.set_flag("kill_switch", True)
@@ -194,6 +285,345 @@ class LiveSafetyCompletionTests(unittest.TestCase):
         self.assertEqual(1, action["cancellation"]["unresolved_count"])
         self.assertEqual(["DRAINING", "STOPPING", "STOPPED"], governance.transitions)
         self.assertNotIn("crypto", state.STATE["active_runtime_session_ids"])
+
+    def test_api_kill_refresh_failure_never_posts_kis_cancel(self) -> None:
+        today = datetime.now().strftime("%Y%m%d")
+        order = {
+            "order_id": "kis-kill-refresh-failed",
+            "state": "acknowledged",
+            "queue_state": "submitted",
+            "dry_run": False,
+            "broker_id": "kis",
+            "broker_order_id": "700099",
+            "broker_order_key": f"{today}:001:700099",
+            "order_date": today,
+            "organization_no": "001",
+            "symbol": "005930",
+            "asset": "KR_STOCK",
+            "qty": 1,
+        }
+        stale_truth = {
+            "complete": True,
+            "fresh": False,
+            "absenceIsAuthoritative": True,
+            "lastError": "timeout",
+            "ambiguousBrokerOrderIds": [],
+            "workingOrders": [dict(order)],
+        }
+        state.STATE["orders"] = [order]
+        controller = Mock()
+        controller.transition_running.return_value = {
+            "ok": True,
+            "results": {},
+        }
+        router = Mock()
+        with (
+            patch.object(state, "LIVE_CONTINUOUS_CONTROLLER", controller),
+            patch.object(
+                state,
+                "refresh_kis_order_truth_for_kill_switch",
+                return_value={"ok": False, "truth": stale_truth},
+            ) as truth_refresh,
+            patch.object(state, "LiveBrokerRouter", return_value=router),
+            patch.object(
+                state,
+                "stop_operational_runtime_sessions_for_kill",
+                return_value=[],
+            ),
+            patch.object(state, "append_audit"),
+            patch.object(state, "sync_operational_incident"),
+            patch.object(state, "run_reconciliation", return_value={"ok": True}),
+            patch.object(state, "snapshot", return_value={}),
+        ):
+            result = state.set_flag("kill_switch", True)
+
+        self.assertTrue(result["ok"])
+        truth_refresh.assert_called_once_with()
+        router.cancel_order.assert_not_called()
+        cancellation = result["kill_switch_action"]["cancellation"]
+        self.assertFalse(cancellation["cleanup_complete"])
+        self.assertFalse(cancellation["kis_order_truth_authoritative"])
+        self.assertGreaterEqual(cancellation["unresolved_count"], 1)
+
+    def test_api_kill_success_recovers_generation_exactly_once(self) -> None:
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["new_entries_blocked"] = False
+        truth = {
+            "complete": True,
+            "fresh": True,
+            "absenceIsAuthoritative": True,
+            "lastError": "",
+            "workingOrders": [],
+            "ambiguousBrokerOrderIds": [],
+        }
+        cancellation = {
+            "working_count": 0,
+            "cancel_requested_count": 0,
+            "failed_count": 0,
+            "unresolved_count": 0,
+            "cleanup_complete": True,
+            "flatten_requested": False,
+            "results": [],
+        }
+        controller = Mock()
+        controller.transition_running.return_value = {
+            "ok": True,
+            "results": {},
+        }
+        with (
+            patch.object(state, "LIVE_CONTINUOUS_CONTROLLER", controller),
+            patch.object(
+                state,
+                "refresh_kis_order_truth_for_kill_switch",
+                return_value={"ok": True, "truth": truth},
+            ) as truth_refresh,
+            patch.object(
+                state,
+                "cancel_working_orders_for_kill_switch",
+                return_value=cancellation,
+            ) as cancel,
+            patch.object(
+                state,
+                "stop_operational_runtime_sessions_for_kill",
+                return_value=[],
+            ) as stop_sessions,
+            patch.object(
+                state,
+                "run_reconciliation",
+                return_value={"ok": True},
+            ) as reconcile,
+            patch.object(state, "append_audit"),
+            patch.object(state, "queue_live_audit_telegram"),
+            patch.object(state, "sync_operational_incident"),
+            patch.object(state, "snapshot", return_value={}),
+        ):
+            first = state.set_flag("kill_switch", True)
+            second = state.recover_durable_emergency_stop()
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(first["kill_switch_action"]["ok"])
+        self.assertTrue(first["kill_switch_action"]["recovered"])
+        self.assertFalse(second["recovered"])
+        self.assertEqual(
+            "emergency-stop-generation-already-recovered", second["reason"]
+        )
+        truth_refresh.assert_called_once_with()
+        cancel.assert_called_once_with(kis_truth=truth)
+        stop_sessions.assert_called_once()
+        reconcile.assert_called_once_with(
+            refresh_brokers=True,
+            include_snapshot=False,
+        )
+
+    def test_api_recovery_applies_native_kill_cancel_reconcile_and_telegram_evidence(self) -> None:
+        self.assertTrue(
+            engage_emergency_stop(
+                "api was unavailable",
+                source="pywebview-native-bridge",
+            )["ok"]
+        )
+        state.STATE["mode"] = "SMALL_LIVE"
+        state.STATE["kill_switch"] = False
+        state.STATE["new_entries_blocked"] = False
+        controller = Mock()
+        controller.transition_running.return_value = {
+            "ok": True,
+            "results": {"stock": {}},
+        }
+        cancellation = {
+            "working_count": 2,
+            "cancel_requested_count": 1,
+            "failed_count": 0,
+            "unresolved_count": 1,
+            "cleanup_complete": False,
+            "flatten_requested": False,
+            "results": [],
+        }
+        reconciliation = {"ok": True, "reason": "reconciled"}
+        telegram = Mock(return_value=True)
+        with (
+            patch.object(state, "LIVE_CONTINUOUS_CONTROLLER", controller),
+            patch.object(
+                state,
+                "refresh_kis_order_truth_for_kill_switch",
+                return_value={"ok": True, "truth": {}},
+            ) as truth_refresh,
+            patch.object(
+                state,
+                "cancel_working_orders_for_kill_switch",
+                return_value=cancellation,
+            ) as cancel,
+            patch.object(
+                state,
+                "stop_operational_runtime_sessions_for_kill",
+                return_value=[],
+            ),
+            patch.object(
+                state,
+                "run_reconciliation",
+                return_value=reconciliation,
+            ) as reconcile,
+            patch.object(state, "persist_audit_event"),
+            patch.object(state, "queue_live_audit_telegram", telegram),
+            patch.object(state, "sync_operational_incident"),
+        ):
+            result = state.recover_durable_emergency_stop()
+
+        self.assertTrue(result["recovered"])
+        self.assertFalse(result["ok"])
+        self.assertTrue(state.STATE["kill_switch"])
+        self.assertTrue(state.STATE["new_entries_blocked"])
+        self.assertFalse(result["flatten_requested"])
+        cancel.assert_called_once_with(kis_truth={})
+        truth_refresh.assert_called_once_with()
+        reconcile.assert_called_once_with(
+            refresh_brokers=True,
+            include_snapshot=False,
+        )
+        telegram.assert_called_once()
+        self.assertEqual("Kill Switch", telegram.call_args.args[1])
+
+    def test_failed_native_kill_cleanup_retries_then_deduplicates_success(self) -> None:
+        self.assertTrue(engage_emergency_stop("native kill")["ok"])
+        controller = Mock()
+        controller.transition_running.return_value = {"ok": True, "results": {}}
+        incomplete = {
+            "working_count": 1,
+            "unresolved_count": 1,
+            "cleanup_complete": False,
+        }
+        complete = {
+            "working_count": 0,
+            "unresolved_count": 0,
+            "cleanup_complete": True,
+        }
+        audit = Mock()
+        incident = Mock()
+        with (
+            patch.object(state, "LIVE_CONTINUOUS_CONTROLLER", controller),
+            patch.object(
+                state,
+                "refresh_kis_order_truth_for_kill_switch",
+                return_value={"ok": True},
+            ) as truth,
+            patch.object(
+                state,
+                "cancel_working_orders_for_kill_switch",
+                side_effect=[incomplete, complete],
+            ) as cancel,
+            patch.object(
+                state,
+                "stop_operational_runtime_sessions_for_kill",
+                return_value=[],
+            ),
+            patch.object(
+                state,
+                "run_reconciliation",
+                return_value={"ok": True},
+            ) as reconcile,
+            patch.object(state, "append_audit", audit),
+            patch.object(state, "sync_operational_incident", incident),
+            patch.object(
+                state,
+                "DURABLE_EMERGENCY_RECOVERY_RETRY_SECONDS",
+                0.0,
+            ),
+        ):
+            first = state.recover_durable_emergency_stop()
+            second = state.recover_durable_emergency_stop()
+            third = state.recover_durable_emergency_stop()
+
+        self.assertFalse(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertFalse(third["recovered"])
+        self.assertEqual(
+            "emergency-stop-generation-already-recovered", third["reason"]
+        )
+        self.assertEqual(2, truth.call_count)
+        self.assertEqual(2, cancel.call_count)
+        self.assertEqual(2, reconcile.call_count)
+        self.assertEqual(2, audit.call_count)
+        self.assertEqual(2, incident.call_count)
+        self.assertIn("미완료", str(audit.call_args_list[0]))
+        self.assertIn("완료", str(audit.call_args_list[1]))
+
+    def test_unmatched_official_kis_working_order_keeps_kill_cleanup_incomplete(self) -> None:
+        state.STATE["orders"] = []
+        state.record_complete_kis_order_truth(
+            {
+                "complete": True,
+                "pagination_complete": True,
+                "orders": [
+                    {
+                        "broker_order_id": "KIS-OFFICIAL-UNMATCHED-P0",
+                        "broker_order_key": (
+                            "20260809:001:KIS-OFFICIAL-UNMATCHED-P0"
+                        ),
+                        "order_date": "20260809",
+                        "organization_no": "001",
+                        "state": "accepted",
+                        "remaining_quantity": 1.0,
+                    }
+                ],
+                "absence_is_authoritative": True,
+            }
+        )
+
+        with patch.object(
+            state.PROGRAM_LEDGER,
+            "order_dispatch_rows",
+            return_value=[],
+        ), patch.object(state, "append_audit"), patch.object(
+            state,
+            "sync_operational_incident",
+        ):
+            result = state.cancel_working_orders_for_kill_switch()
+
+        self.assertFalse(result["cleanup_complete"])
+        self.assertTrue(result["kis_order_truth_authoritative"])
+        self.assertEqual(1, result["working_count"])
+        self.assertEqual(1, result["unresolved_count"])
+        self.assertEqual(1, result["kis_unmatched_working_count"])
+        unresolved = result["results"][0]
+        self.assertEqual("reconciliation_required", unresolved["status"])
+        self.assertEqual("kis-official-order-truth", unresolved["source"])
+
+    def test_kill_cleanup_never_cancels_ambiguous_kis_odno(self) -> None:
+        state.STATE["orders"] = [
+            {
+                "order_id": "local-old-order",
+                "broker_id": "kis",
+                "broker_order_id": "700003",
+                "broker_order_key": "20260801:001:700003",
+                "order_date": "20260801",
+                "organization_no": "001",
+                "state": "acknowledged",
+                "queue_state": "submitted",
+                "dry_run": False,
+            }
+        ]
+        truth = {
+            "complete": True,
+            "fresh": True,
+            "absenceIsAuthoritative": True,
+            "ambiguousBrokerOrderIds": ["700003"],
+            "workingOrders": [],
+            "workingOrderCount": 0,
+            "unmatchedWorkingOrderCount": 0,
+        }
+        with (
+            patch.object(state, "kis_order_truth_snapshot", return_value=truth),
+            patch.object(state, "cancel_order") as cancel,
+            patch.object(state, "append_audit"),
+        ):
+            result = state.cancel_working_orders_for_kill_switch()
+
+        cancel.assert_not_called()
+        self.assertFalse(result["cleanup_complete"])
+        self.assertEqual(1, result["unresolved_count"])
+        self.assertEqual(
+            "reconciliation_required", result["results"][0]["status"]
+        )
 
     def test_dispatch_rechecks_kill_real_route_and_risk_increase(self) -> None:
         state.STATE["mode"] = "SMALL_LIVE"
@@ -291,7 +721,7 @@ class LiveSafetyCompletionTests(unittest.TestCase):
         after = {
             "fields": [
                 {"key": "BINANCE_API_SECRET", "value": "", "configured": True},
-                {"key": "LIVE_TRADER_ENABLE_REAL_ORDERS", "value": "true", "configured": True},
+                {"key": "LIVE_TRADER_ENABLE_REAL_ORDERS", "value": "false", "configured": True},
             ]
         }
         audit = Mock()
@@ -303,7 +733,7 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             result = state.save_environment_settings(
                 {
                     "BINANCE_API_SECRET": "never-log-this-secret",
-                    "LIVE_TRADER_ENABLE_REAL_ORDERS": True,
+                    "LIVE_TRADER_ENABLE_REAL_ORDERS": False,
                 }
             )
 
@@ -311,11 +741,73 @@ class LiveSafetyCompletionTests(unittest.TestCase):
         self.assertEqual("", state.STATE["latest_preflight_snapshot_id"])
         self.assertTrue(state.STATE["new_entries_blocked"])
         self.assertCountEqual(
-            ["BINANCE_API_SECRET", "LIVE_TRADER_ENABLE_REAL_ORDERS"],
+            ["BINANCE_API_SECRET"],
             result["changed_keys"],
         )
         audit_text = " ".join(str(item) for item in audit.call_args.args)
         self.assertNotIn("never-log-this-secret", audit_text)
+
+    def test_identity_rotation_forces_real_orders_off_and_rearms_controls(self) -> None:
+        state.STATE["new_entries_blocked"] = False
+        state.STATE["manual_new_entries_blocked"] = False
+        state.STATE["dry_run"] = False
+        state.STATE["operator_confirmed"] = True
+        before = {
+            "fields": [
+                {
+                    "key": "KIS_APP_KEY",
+                    "kind": "secret",
+                    "value": "",
+                    "configured": True,
+                },
+                {
+                    "key": "LIVE_TRADER_ENABLE_REAL_ORDERS",
+                    "kind": "bool",
+                    "value": "true",
+                    "configured": True,
+                },
+            ]
+        }
+        after = {
+            "fields": [
+                *before["fields"][:1],
+                {
+                    "key": "LIVE_TRADER_ENABLE_REAL_ORDERS",
+                    "kind": "bool",
+                    "value": "false",
+                    "configured": True,
+                },
+            ]
+        }
+        with (
+            patch.object(state, "real_orders_enabled", return_value=True),
+            patch.object(
+                env_settings,
+                "env_settings_snapshot",
+                side_effect=[before, after],
+            ),
+            patch.object(
+                env_settings, "save_env_settings", return_value=after
+            ) as save,
+            patch.object(state, "append_audit"),
+            patch.object(state, "snapshot", return_value={}),
+        ):
+            result = state.save_environment_settings(
+                {
+                    "KIS_APP_KEY": "rotated-secret",
+                    "LIVE_TRADER_ENABLE_REAL_ORDERS": True,
+                },
+                confirmed=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["real_orders_forced_disabled"])
+        submitted = save.call_args.args[0]
+        self.assertIs(False, submitted["LIVE_TRADER_ENABLE_REAL_ORDERS"])
+        self.assertTrue(state.STATE["new_entries_blocked"])
+        self.assertTrue(state.STATE["manual_new_entries_blocked"])
+        self.assertTrue(state.STATE["dry_run"])
+        self.assertFalse(state.STATE["operator_confirmed"])
 
     def test_incident_transition_limits_actions_and_redacts_operator_note(self) -> None:
         incident = SimpleNamespace(
@@ -518,10 +1010,19 @@ class LiveSafetyCompletionTests(unittest.TestCase):
         with patch.object(state, "append_audit"), patch.object(
             state, "snapshot", return_value={}
         ):
+            issued = state.issue_safety_confirmation(
+                "NEW_ENTRIES_BLOCKED_OFF",
+                {"name": "new_entries_blocked", "value": False},
+            )
             released = state.set_flag(
                 "new_entries_blocked",
                 False,
                 confirmed=True,
+                safety_confirmation={
+                    "challengeId": issued["challengeId"],
+                    "token": issued["token"],
+                    "typedPhrase": issued["expectedPhrase"],
+                },
             )
 
         self.assertTrue(released["ok"])

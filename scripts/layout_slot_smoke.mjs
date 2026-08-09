@@ -24,7 +24,17 @@ try {
   });
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: /^설정·진단/ }).click();
-  await page.getByRole("button", { name: "레이아웃 편집", exact: true }).click();
+  const layoutEditor = page.locator('[data-layout-control="editor"]');
+  await layoutEditor.waitFor({ state: "visible" });
+  await layoutEditor.locator("xpath=..").getByRole("button", { name: "초기화", exact: true }).click();
+  // The desktop persists layout mode through its API as well as localStorage.
+  // Force a locked -> edit transition so entering edit mode captures a fresh
+  // baseline even when the operator previously saved edit mode.
+  if (await layoutEditor.getAttribute("aria-pressed") === "true") {
+    await layoutEditor.click();
+    await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "locked");
+  }
+  await layoutEditor.click();
   await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "edit");
   await page.getByRole("button", { name: /^리스크·안전/ }).click();
   await page.locator(".operational-safeguards-panel").waitFor({ state: "visible" });

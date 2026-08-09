@@ -191,6 +191,11 @@ def start_functional_test_execution(
             FUNCTIONAL_TEST_WORKSPACE.snapshot(),
             confirmed=payload.get("confirmed") is True,
             target_key=str(payload.get("targetKey") or ""),
+            safety_confirmation=(
+                dict(payload.get("safety_confirmation"))
+                if isinstance(payload.get("safety_confirmation"), dict)
+                else None
+            ),
         )
 
 
@@ -368,6 +373,10 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/snapshot":
             from .soak_monitor import latest_live_soak_report
 
+            # PyWebView can engage the durable latch while this API thread is
+            # unreachable. The first reconnect/snapshot becomes an idempotent
+            # recovery safe point (MONITOR/cancel/reconcile/evidence once).
+            state.recover_durable_emergency_stop()
             self.send_json(
                 {
                     **state.snapshot(),
@@ -486,6 +495,16 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         payload = self.read_json()
+        if parsed.path == "/api/safety-confirmation/challenge":
+            self.send_json(
+                state.issue_safety_confirmation(
+                    payload.get("action"),
+                    dict(payload.get("context"))
+                    if isinstance(payload.get("context"), dict)
+                    else {},
+                )
+            )
+            return
         if parsed.path == "/api/telegram":
             values = payload.get("telegram") if isinstance(payload.get("telegram"), dict) else payload
             save_shared_telegram_settings(values)
@@ -504,6 +523,11 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                     str(payload.get("name", "")),
                     bool(payload.get("value")),
                     confirmed=payload.get("confirmed") is True,
+                    safety_confirmation=(
+                        dict(payload.get("safety_confirmation"))
+                        if isinstance(payload.get("safety_confirmation"), dict)
+                        else None
+                    ),
                 )
             )
             return
@@ -657,6 +681,11 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 state.start_binance_futures_fill_soak(
                     payload.get("confirmation_token", ""),
                     confirmed=payload.get("confirmed") is True,
+                    safety_confirmation=(
+                        dict(payload.get("safety_confirmation"))
+                        if isinstance(payload.get("safety_confirmation"), dict)
+                        else None
+                    ),
                 )
             )
             return
@@ -709,17 +738,31 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             self.send_json(state.run_strategy_cycle(str(payload.get("profile_id", "stock"))))
             return
         if parsed.path == "/api/runtime/start":
+            requested_purpose = str(
+                payload.get("execution_purpose")
+                or payload.get("executionPurpose")
+                or ""
+            ).strip().upper()
+            if requested_purpose == state.FUNCTIONAL_TEST_EXECUTION_PURPOSE:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "reason": (
+                            "FUNCTIONAL_TEST runtime은 /api/functional-test/start "
+                            "전용 2단계 확인 경로만 사용할 수 있습니다."
+                        ),
+                        "runtimeStarted": False,
+                        "brokerSubmissionPerformed": False,
+                    }
+                )
+                return
             self.send_json(state.start_continuous_runtime(
                 str(payload.get("profile_id", "stock")),
                 str(payload.get("mode", "MONITOR")),
                 str(payload.get("portfolio_id", "")),
                 str(payload.get("deployment_id", "")),
                 str(payload.get("strategy_id", "")),
-                str(
-                    payload.get("execution_purpose")
-                    or payload.get("executionPurpose")
-                    or ""
-                ),
+                requested_purpose,
                 (
                     dict(payload.get("functional_test_context"))
                     if isinstance(payload.get("functional_test_context"), dict)
@@ -789,9 +832,17 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(
                 state.save_environment_settings(
-                    payload.get("values", {})
-                    if isinstance(payload.get("values"), dict)
-                    else payload
+                    (
+                        payload.get("values", {})
+                        if isinstance(payload.get("values"), dict)
+                        else payload
+                    ),
+                    confirmed=payload.get("confirmed") is True,
+                    safety_confirmation=(
+                        dict(payload.get("safety_confirmation"))
+                        if isinstance(payload.get("safety_confirmation"), dict)
+                        else None
+                    ),
                 )
             )
             return
@@ -860,8 +911,10 @@ def prepare_server_state() -> None:
     # previous RUNNING state.
     from .daemon import read_daemon_status  # pylint: disable=import-outside-toplevel
 
+    state.disarm_real_orders_for_process_start(persist=True)
     read_daemon_status(persist=True)
     state.restore_runtime_from_checkpoint()
+    state.recover_durable_emergency_stop()
 
 
 def bind_server(host: str, port: int) -> ThreadingHTTPServer:
@@ -916,6 +969,14 @@ def start_in_thread(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tuple
 
 
 def main() -> None:
+    from .process_safety import hold_live_trader_instance_lease
+
+    instance = hold_live_trader_instance_lease()
+    if instance.get("acquired") is not True:
+        raise SystemExit(
+            "Live Trader server 단일 인스턴스 잠금 실패: "
+            + str(instance.get("reason") or "unknown")
+        )
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", default=DEFAULT_PORT, type=int)

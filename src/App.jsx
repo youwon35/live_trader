@@ -38,18 +38,22 @@ import {
 import {
   cancelOrder,
   evaluateValidationSmallLive,
+  engageNativeEmergencyStop,
   getEnvSettings,
+  getNativeEmergencyStopStatus,
   getSnapshot,
   getTelegramConnection,
   getUiSettings,
   getValidationSmallLive,
   isApiConnectionFailure,
+  isApiRequestTimeout,
   loadArtifactMetadata,
   loadSharedSearchPresets,
   applyBinanceFuturesSettings,
   previewBinanceFuturesOrderRisk,
   previewBinanceFuturesSettings,
   previewBinanceFuturesFillSoak,
+  registerSafetyConfirmationPresenter,
   runFinalPreflight,
   runReconciliation,
   runStrategyCycle,
@@ -245,6 +249,7 @@ const fallbackSnapshot = {
   mode: "MONITOR",
   dry_run: true,
   kill_switch: false,
+  emergency_stop: { active: false, durable: false, status: "unknown", available: false },
   new_entries_blocked: true,
   operator_confirmed: false,
   summary: { status: "blocked", blocker_count: 1, warning_count: 0, live_strategy_count: 0, broker_ready_count: 0 },
@@ -363,6 +368,235 @@ const DEFAULT_STRATEGY_DISCOVERY_FILTERS = {
   quick: "all",
   sort: "updated-desc",
 };
+
+function disconnectedSnapshot(nativeEmergency = {}, previousSnapshot = {}) {
+  const reportedEmergency = {
+    available: nativeEmergency.available === true,
+    status_available: nativeEmergency.status_available === true,
+    active: nativeEmergency.active === true,
+    durable: nativeEmergency.durable === true,
+    status: String(nativeEmergency.status || "unavailable"),
+    ...(nativeEmergency.reason ? { reason: String(nativeEmergency.reason) } : {}),
+  };
+  const preserveActiveKill = previousSnapshot.kill_switch === true && reportedEmergency.active !== true;
+  const emergency = preserveActiveKill
+    ? {
+        ...(previousSnapshot.emergency_stop || {}),
+        available: reportedEmergency.available,
+        status_available: reportedEmergency.status_available,
+        active: true,
+        durable: previousSnapshot.emergency_stop?.durable === true,
+        status: "previously-engaged-fail-closed",
+        reason: "API 복구 전에는 이전 Kill 활성 상태를 해제로 간주하지 않습니다.",
+      }
+    : reportedEmergency;
+  return {
+    ...fallbackSnapshot,
+    kill_switch: emergency.active,
+    emergency_stop: emergency,
+  };
+}
+
+const SAFETY_CONFIRMATION_ACTION_LABELS = {
+  KILL_SWITCH_OFF: "전역 Kill 해제",
+  DRY_RUN_OFF: "Dry Run 보호 해제",
+  NEW_ENTRIES_BLOCKED_OFF: "신규 진입 차단 해제",
+  REAL_ORDERS_ENABLE: "실전 주문 라우트 활성화",
+  FUNCTIONAL_TEST_START: "KIS 실전 기능시험 시작",
+  BINANCE_FUTURES_FILL_SOAK_START: "Binance Futures 실체결 Soak 시작",
+};
+
+const SAFETY_CONFIRMATION_CONTEXT_LABELS = {
+  action: "작업",
+  account: "계좌",
+  accountHint: "계좌 식별",
+  accountFingerprint: "계좌 Fingerprint",
+  accountLast4: "계좌 끝 4자리",
+  provider: "브로커",
+  target: "대상",
+  targetKey: "대상 Key",
+  deploymentId: "배포",
+  strategyId: "전략",
+  symbol: "종목",
+  symbols: "종목",
+  maxAmount: "최대 금액",
+  maxNotional: "최대 주문 금액",
+  maxOrderNotional: "최대 주문 금액",
+  settingKeys: "변경 설정",
+  environment: "환경",
+};
+
+function safetyConfirmationContextRows(displayContext) {
+  if (Array.isArray(displayContext)) {
+    return displayContext.map((item, index) => ({
+      label: String(item?.label || item?.key || `항목 ${index + 1}`),
+      value: String(item?.value ?? item?.detail ?? "-"),
+    }));
+  }
+  return Object.entries(displayContext || {}).map(([key, value]) => ({
+    label: SAFETY_CONFIRMATION_CONTEXT_LABELS[key] || key,
+    value: Array.isArray(value)
+      ? value.join(", ")
+      : value && typeof value === "object"
+        ? JSON.stringify(value)
+        : String(value ?? "-"),
+  }));
+}
+
+function SafetyConfirmationModal({ challenge, onResolve, onEmergencyKill }) {
+  const [typedPhrase, setTypedPhrase] = useState("");
+  const [now, setNow] = useState(() => Date.now());
+  const dialogRef = useRef(null);
+  const resolvedRef = useRef(false);
+  const expiresAtMs = Date.parse(challenge.expiresAt || "");
+  const expired = !Number.isFinite(expiresAtMs) || now >= expiresAtMs;
+  const remainingSeconds = Number.isFinite(expiresAtMs)
+    ? Math.max(0, Math.ceil((expiresAtMs - now) / 1000))
+    : 0;
+  const contextRows = safetyConfirmationContextRows(challenge.displayContext);
+  const phraseMatches = typedPhrase === challenge.expectedPhrase;
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    const previouslyFocused = document.activeElement;
+    const keepFocusInside = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        resolveOnce({ confirmed: false });
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) return;
+      const focusable = [...dialog.querySelectorAll(
+        "button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])",
+      )].filter((element) => !element.hidden);
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    dialog?.addEventListener("keydown", keepFocusInside);
+    return () => {
+      dialog?.removeEventListener("keydown", keepFocusInside);
+      if (previouslyFocused instanceof HTMLElement && previouslyFocused.isConnected) {
+        previouslyFocused.focus();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!expired || resolvedRef.current) return;
+    resolvedRef.current = true;
+    onResolve({ confirmed: false, expired: true });
+  }, [expired, onResolve]);
+
+  function resolveOnce(decision) {
+    if (resolvedRef.current) return;
+    resolvedRef.current = true;
+    onResolve(decision);
+  }
+
+  function submit(event) {
+    event.preventDefault();
+    if (expired || !phraseMatches) return;
+    resolveOnce({ confirmed: true, typedPhrase });
+  }
+
+  function engageEmergencyKill() {
+    if (resolvedRef.current) return;
+    resolvedRef.current = true;
+    onResolve({ confirmed: false, emergencyKill: true });
+    onEmergencyKill();
+  }
+
+  return (
+    <div className="safety-confirmation-backdrop" role="presentation">
+      <section
+        aria-describedby="safety-confirmation-description"
+        aria-labelledby="safety-confirmation-title"
+        aria-modal="true"
+        className="safety-confirmation-modal"
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
+        <header>
+          <div className="safety-confirmation-icon"><ShieldAlert size={21} /></div>
+          <div>
+            <span>IDENTITY-BOUND · ONE TIME</span>
+            <h2 id="safety-confirmation-title">
+              {SAFETY_CONFIRMATION_ACTION_LABELS[challenge.action] || "위험 설정 변경"}
+            </h2>
+          </div>
+          <StatusPill tone={expired || remainingSeconds <= 15 ? "danger" : "warning"}>
+            {expired ? "만료" : `${remainingSeconds}초`}
+          </StatusPill>
+        </header>
+
+        <p id="safety-confirmation-description">
+          서버가 현재 계좌·대상·한도를 묶어 만든 일회용 확인입니다. 아래 범위가 맞을 때만 정확한 문구를 입력하세요.
+        </p>
+
+        <dl className="safety-confirmation-context">
+          {contextRows.length ? contextRows.map((row) => (
+            <div key={`${row.label}-${row.value}`}>
+              <dt>{row.label}</dt>
+              <dd>{row.value}</dd>
+            </div>
+          )) : (
+            <div><dt>서버 범위</dt><dd>서버가 현재 authoritative context를 실행 시점에 다시 확인합니다.</dd></div>
+          )}
+          <div><dt>만료 시각</dt><dd>{Number.isFinite(expiresAtMs) ? new Date(expiresAtMs).toLocaleString("ko-KR") : "확인 불가"}</dd></div>
+        </dl>
+
+        <form onSubmit={submit}>
+          <label>
+            <span>아래 문구를 그대로 입력</span>
+            <code>{challenge.expectedPhrase}</code>
+            <input
+              autoComplete="off"
+              autoFocus
+              disabled={expired}
+              onChange={(event) => setTypedPhrase(event.target.value)}
+              placeholder={challenge.expectedPhrase}
+              spellCheck="false"
+              value={typedPhrase}
+            />
+          </label>
+          <div className="safety-confirmation-actions">
+            <button className="danger-button" onClick={engageEmergencyKill} type="button">
+              <CircleStop size={16} /> 전역 Kill 즉시 실행
+            </button>
+            <button
+              className="secondary-button"
+              onClick={() => resolveOnce({ confirmed: false })}
+              type="button"
+            >
+              취소
+            </button>
+            <button className="primary-button" disabled={expired || !phraseMatches} type="submit">
+              범위 확인 후 1회 실행
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
 const MIN_LIVE_CANARY_FILLS = 3;
 const EMPTY_FUTURES_PANEL_SNAPSHOT = Object.freeze({});
 
@@ -1519,6 +1753,9 @@ function App() {
   const [selectedNav, setSelectedNav] = useState(() => readGuidedFlowStep(LIVE_FLOW_STORAGE_KEY, LIVE_FLOW_IDS, "overview"));
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [emergencyFeedback, setEmergencyFeedback] = useState("");
+  const [emergencyAction, setEmergencyAction] = useState("");
+  const [safetyConfirmation, setSafetyConfirmation] = useState(null);
   const [appearance, setAppearance] = useState(readAppearance);
   const [layoutMode, setLayoutMode] = useState(readLayoutMode);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
@@ -1529,6 +1766,9 @@ function App() {
   const workspaceRef = useRef(null);
   const notificationRef = useRef(null);
   const snapshotRequestInFlightRef = useRef(false);
+  const snapshotSafetyEpochRef = useRef(0);
+  const emergencyActionInFlightRef = useRef("");
+  const safetyConfirmationResolverRef = useRef(null);
   const accountRefreshCoordinatorRef = useRef(null);
   if (!accountRefreshCoordinatorRef.current) {
     accountRefreshCoordinatorRef.current = createAccountRefreshCoordinator({
@@ -1539,15 +1779,44 @@ function App() {
 
   useEditablePanels(workspaceRef);
 
+  useEffect(() => {
+    const unregister = registerSafetyConfirmationPresenter((challenge) => new Promise((resolve) => {
+      safetyConfirmationResolverRef.current = {
+        challengeId: challenge.challengeId,
+        resolve,
+      };
+      setSafetyConfirmation(challenge);
+    }));
+    return () => {
+      unregister();
+      const pending = safetyConfirmationResolverRef.current;
+      safetyConfirmationResolverRef.current = null;
+      if (pending) pending.resolve({ confirmed: false });
+    };
+  }, []);
+
+  function resolveSafetyConfirmation(challengeId, decision) {
+    const pending = safetyConfirmationResolverRef.current;
+    if (!pending || pending.challengeId !== challengeId) return;
+    safetyConfirmationResolverRef.current = null;
+    setSafetyConfirmation(null);
+    pending.resolve(decision);
+  }
+
   async function refresh() {
-    if (snapshotRequestInFlightRef.current) return;
+    if (snapshotRequestInFlightRef.current || emergencyActionInFlightRef.current) return;
+    const safetyEpoch = snapshotSafetyEpochRef.current;
     snapshotRequestInFlightRef.current = true;
     try {
       const next = await getSnapshot();
+      if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
       setSnapshot({ ...next, api_connected: true });
       setError("");
     } catch (err) {
-      if (isApiConnectionFailure(err)) setSnapshot(fallbackSnapshot);
+      if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
+      const nativeEmergency = await getNativeEmergencyStopStatus();
+      if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
+      setSnapshot((current) => disconnectedSnapshot(nativeEmergency, current));
       setError(err instanceof Error ? err.message : "API 연결 실패");
     } finally {
       snapshotRequestInFlightRef.current = false;
@@ -1573,10 +1842,17 @@ function App() {
     if (selectedNav !== "accounts" || snapshot.api_connected !== true) return undefined;
     let stopped = false;
     const refreshBrokerAccounts = async () => {
-      if (stopped || accountRefreshCoordinatorRef.current.isRunning()) return;
+      if (
+        stopped
+        || emergencyActionInFlightRef.current
+        || accountRefreshCoordinatorRef.current.isRunning()
+      ) return;
+      const safetyEpoch = snapshotSafetyEpochRef.current;
       try {
         const result = await accountRefreshCoordinatorRef.current.run();
-        if (!stopped && result?.snapshot) setSnapshot({ ...result.snapshot, api_connected: true });
+        if (!stopped && safetyEpoch === snapshotSafetyEpochRef.current && result?.snapshot) {
+          setSnapshot({ ...result.snapshot, api_connected: true });
+        }
       } catch {
         // Background account refresh stays quiet; the normal snapshot poll keeps connection status visible.
       }
@@ -1689,17 +1965,31 @@ function App() {
     };
   }, [notificationsOpen]);
 
-  async function runAction(action) {
+  async function runAction(action, { allowDuringEmergency = false } = {}) {
+    if (emergencyActionInFlightRef.current && !allowDuringEmergency) {
+      return { ok: false, busy: true, reason: "emergency-action-in-progress" };
+    }
+    const safetyEpoch = snapshotSafetyEpochRef.current;
     setLoading(true);
     try {
       const result = await action();
-      setSnapshot({ ...(result.snapshot ?? result), api_connected: true });
-      setError(result.ok === false ? result.reason : "");
+      if (safetyEpoch === snapshotSafetyEpochRef.current) {
+        setSnapshot({ ...(result.snapshot ?? result), api_connected: true });
+        setError(result.ok === false ? result.reason : "");
+      }
       return result;
     } catch (err) {
       const reason = err instanceof Error ? err.message : "요청 실패";
-      if (isApiConnectionFailure(err)) setSnapshot(fallbackSnapshot);
-      setError(reason);
+      if (
+        safetyEpoch === snapshotSafetyEpochRef.current
+        && (isApiConnectionFailure(err) || isApiRequestTimeout(err))
+      ) {
+        const nativeEmergency = await getNativeEmergencyStopStatus();
+        if (safetyEpoch === snapshotSafetyEpochRef.current) {
+          setSnapshot((current) => disconnectedSnapshot(nativeEmergency, current));
+        }
+      }
+      if (safetyEpoch === snapshotSafetyEpochRef.current) setError(reason);
       return { ok: false, reason };
     } finally {
       setLoading(false);
@@ -1762,6 +2052,163 @@ function App() {
   function confirmSafetyChange(message, action) {
     if (!window.confirm(message)) return Promise.resolve({ ok: false, cancelled: true });
     return runAction(action);
+  }
+
+  function beginEmergencyAction(action) {
+    if (emergencyActionInFlightRef.current) return false;
+    emergencyActionInFlightRef.current = action;
+    snapshotSafetyEpochRef.current += 1;
+    setEmergencyAction(action);
+    return true;
+  }
+
+  function finishEmergencyAction(action) {
+    if (emergencyActionInFlightRef.current === action) {
+      emergencyActionInFlightRef.current = "";
+    }
+    setEmergencyAction((current) => (current === action ? "" : current));
+  }
+
+  async function engageGlobalKill() {
+    if (emergencyActionInFlightRef.current) {
+      return { ok: false, busy: true, reason: "emergency-action-in-progress" };
+    }
+    if (!beginEmergencyAction("engage")) {
+      return { ok: false, busy: true, reason: "emergency-action-in-progress" };
+    }
+    const apiWasConnected = snapshot.api_connected === true;
+    setLoading(true);
+    setEmergencyFeedback("독립 긴급정지 래치를 기록하는 중입니다.");
+    let nativeResult = null;
+    let nativeFailClosed = null;
+    try {
+      try {
+        nativeResult = await engageNativeEmergencyStop("operator global Kill Switch");
+        setSnapshot((current) => ({
+          ...current,
+          kill_switch: true,
+          new_entries_blocked: true,
+          emergency_stop: { ...nativeResult, available: true, status_available: true },
+        }));
+        setEmergencyFeedback("독립 Kill 래치가 저장되었습니다. 이후 Broker POST는 차단됩니다.");
+      } catch (nativeError) {
+        const details = nativeError?.details;
+        if (details?.active === true) {
+          nativeFailClosed = details;
+          setSnapshot((current) => ({
+            ...current,
+            kill_switch: true,
+            new_entries_blocked: true,
+            emergency_stop: { ...details, available: true, status_available: true },
+          }));
+        }
+        if (!apiWasConnected) {
+          const reason = nativeError instanceof Error ? nativeError.message : "독립 긴급정지 실패";
+          setEmergencyFeedback(
+            nativeFailClosed
+              ? `Kill 내구 저장 실패 · 현재 프로세스는 Fail-Closed입니다: ${reason}`
+              : `Kill 래치 저장 실패: ${reason}`,
+          );
+          setError(reason);
+          return { ok: false, reason, active: nativeFailClosed?.active === true };
+        }
+      }
+
+      if (apiWasConnected) {
+        const result = await setFlag("kill_switch", true, true);
+        const nextSnapshot = result.snapshot ?? result;
+        const effectiveEmergency = nativeResult || nativeFailClosed;
+        setSnapshot((current) => ({
+          ...current,
+          ...nextSnapshot,
+          api_connected: true,
+          ...(effectiveEmergency?.active === true
+            ? {
+                kill_switch: true,
+                new_entries_blocked: true,
+                emergency_stop: {
+                  ...effectiveEmergency,
+                  available: true,
+                  status_available: true,
+                },
+              }
+            : {}),
+        }));
+        if (result.ok === false) {
+          setError(result.reason || "Kill 후속 정리 실패");
+          setEmergencyFeedback(
+            nativeResult?.ok === true
+              ? "독립 Kill은 유지되지만 Runtime 정리 결과를 확인해야 합니다."
+              : `Kill 실패: ${result.reason || "원인 미확인"}`,
+          );
+        } else {
+          setError("");
+          setEmergencyFeedback("Kill 고정 완료 · 신규 주문 차단 및 Runtime 정리를 요청했습니다.");
+        }
+        return result;
+      }
+      return nativeResult || { ok: false, reason: "독립 긴급정지 실패" };
+    } catch (apiError) {
+      const reason = apiError instanceof Error ? apiError.message : "Kill 후속 정리 실패";
+      const effectiveEmergency = nativeResult || nativeFailClosed;
+      setSnapshot((current) => ({
+        ...current,
+        api_connected: false,
+        kill_switch: effectiveEmergency?.active === true || current.kill_switch === true,
+        new_entries_blocked: effectiveEmergency?.active === true ? true : current.new_entries_blocked,
+        emergency_stop: effectiveEmergency
+          ? { ...effectiveEmergency, available: true, status_available: true }
+          : current.emergency_stop,
+      }));
+      setError(reason);
+      setEmergencyFeedback(
+        nativeResult?.ok === true
+          ? "API 정리는 실패했지만 독립 Kill 래치는 유지됩니다. API 복구 전에는 해제할 수 없습니다."
+          : nativeFailClosed
+            ? "API 정리는 실패했고 내구 저장도 확인되지 않았습니다. 현재 프로세스는 Fail-Closed입니다."
+            : `Kill 실패: ${reason}`,
+      );
+      return { ok: nativeResult?.ok === true, reason };
+    } finally {
+      setLoading(false);
+      finishEmergencyAction("engage");
+    }
+  }
+
+  async function releaseGlobalKill() {
+    if (emergencyActionInFlightRef.current) {
+      return { ok: false, busy: true, reason: "emergency-action-in-progress" };
+    }
+    if (snapshot.api_connected !== true) {
+      setEmergencyFeedback("Kill 해제는 복구된 HTTP API의 안전 확인을 거쳐야 합니다.");
+      return { ok: false, reason: "api-confirmed-release-required" };
+    }
+    if (!beginEmergencyAction("release")) {
+      return { ok: false, busy: true, reason: "emergency-action-in-progress" };
+    }
+    setEmergencyFeedback("Kill 해제 안전 경계를 확인하는 중입니다.");
+    try {
+      const result = await runAction(
+        () => setFlag("kill_switch", false, true),
+        { allowDuringEmergency: true },
+      );
+      if (result?.ok === true) {
+        setEmergencyFeedback("Kill 해제 완료 · 재무장 전까지 다른 LIVE 게이트는 계속 차단합니다.");
+      } else {
+        setEmergencyFeedback(`Kill 해제 실패: ${result?.reason || "원인 미확인"}`);
+      }
+      return result;
+    } finally {
+      finishEmergencyAction("release");
+    }
+  }
+
+  function emergencyKillFromSafetyConfirmation() {
+    if (emergencyActionInFlightRef.current === "release") {
+      setEmergencyFeedback("Kill 해제 확인을 취소했습니다. 현재 Kill은 계속 유지됩니다.");
+      return;
+    }
+    void engageGlobalKill();
   }
 
   function selectDeploymentContext(deploymentId) {
@@ -1853,8 +2300,8 @@ function App() {
         </nav>
         <div className="sidebar-footer">
           <span>전역 Kill</span>
-          <StatusPill tone={snapshot.api_connected ? (snapshot.kill_switch ? "danger" : "success") : "warning"}>
-            {snapshot.api_connected ? (snapshot.kill_switch ? "KILLED" : "NORMAL") : "확인 불가"}
+          <StatusPill tone={snapshot.kill_switch ? "danger" : snapshot.api_connected ? "success" : "warning"}>
+            {snapshot.kill_switch ? "KILLED" : snapshot.api_connected ? "NORMAL" : snapshot.emergency_stop?.available ? "Kill 사용 가능" : "API 끊김"}
           </StatusPill>
         </div>
       </aside>
@@ -1905,17 +2352,35 @@ function App() {
             </div>
             <button
               className={`danger-button emergency-stop-button ${snapshot.kill_switch ? "active" : ""}`}
-              disabled={!snapshot.api_connected}
+              aria-busy={emergencyAction ? "true" : "false"}
+              disabled={Boolean(emergencyAction)}
               type="button"
               onClick={() =>
-                snapshot.kill_switch
-                  ? confirmSafetyChange("긴급 차단을 해제하시겠습니까? 해제 후에도 다른 실거래 게이트는 유지됩니다.", () => setFlag("kill_switch", false, true))
-                  : confirmSafetyChange("전역 Kill Switch를 실행하시겠습니까? 신규 주문과 자동 운영을 차단하지만 포지션 청산 주문은 만들지 않습니다.", () => setFlag("kill_switch", true, true))
+                snapshot.kill_switch && snapshot.api_connected
+                  ? releaseGlobalKill()
+                  : engageGlobalKill()
               }
             >
               <CircleStop size={17} />
-              {snapshot.kill_switch ? "Kill 해제" : "전역 Kill"}
+              {emergencyAction === "engage"
+                ? "Kill 고정 중"
+                : emergencyAction === "release"
+                  ? "Kill 해제 확인 중"
+                  : snapshot.kill_switch && snapshot.api_connected
+                    ? "Kill 해제"
+                    : snapshot.kill_switch
+                      ? "Kill 재고정"
+                      : "전역 Kill"}
             </button>
+            {emergencyFeedback && (
+              <span
+                className={`emergency-stop-feedback ${snapshot.kill_switch ? "active" : ""}`}
+                role="status"
+                title={emergencyFeedback}
+              >
+                {emergencyFeedback}
+              </span>
+            )}
           </div>
         </header>
 
@@ -1945,8 +2410,18 @@ function App() {
           <section className="api-connection-banner" role="alert">
             <Network size={18} />
             <div>
-              <strong>API 연결이 끊어져 모든 상태를 확인 불가로 전환했습니다.</strong>
-              <span>{error}</span>
+              <strong>HTTP API 상태를 확인할 수 없어 거래 Snapshot을 안전 차단 상태로 전환했습니다.</strong>
+              <span>
+                {error} · {snapshot.emergency_stop?.active
+                  ? snapshot.emergency_stop?.durable
+                    ? "독립 Kill 래치는 내구 저장된 상태입니다."
+                    : "독립 Kill은 Fail-Closed지만 내구 저장을 확인해야 합니다."
+                  : snapshot.emergency_stop?.available
+                    ? snapshot.emergency_stop?.status_available
+                      ? "독립 Kill 래치는 현재 해제 상태이며 Kill 실행 경로는 사용 가능합니다."
+                      : "독립 Kill 상태는 확인하지 못했지만 Kill 실행 경로는 사용 가능합니다."
+                    : "독립 Kill은 데스크톱 앱에서만 실행할 수 있습니다."}
+              </span>
             </div>
             <button className="mini-button" type="button" disabled={loading} onClick={refresh}>
               <RefreshCcw size={14} />
@@ -1964,14 +2439,10 @@ function App() {
           onDeploymentSelect={selectDeploymentContext}
           searchQuery={searchQuery}
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
-          onDryRun={() =>
-            snapshot.dry_run
-              ? confirmSafetyChange("Dry Run 보호를 해제하시겠습니까? 이후 주문은 다른 모든 실거래 게이트를 통과해야만 전송됩니다.", () => setFlag("dry_run", false, true))
-              : runAction(() => setFlag("dry_run", true))
-          }
+          onDryRun={() => runAction(() => setFlag("dry_run", !snapshot.dry_run, snapshot.dry_run))}
           onEntryBlock={() =>
             snapshot.new_entries_blocked
-              ? confirmSafetyChange("신규 진입 차단을 해제하시겠습니까? 기존 청산 주문에는 영향을 주지 않습니다.", () => setFlag("new_entries_blocked", false, true))
+              ? runAction(() => setFlag("new_entries_blocked", false, true))
               : runAction(() => setFlag("new_entries_blocked", true))
           }
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
@@ -2010,6 +2481,14 @@ function App() {
           resetWorkspaceLayout={resetWorkspaceLayout}
         />
       </main>
+      {safetyConfirmation && (
+        <SafetyConfirmationModal
+          challenge={safetyConfirmation}
+          key={safetyConfirmation.challengeId}
+          onEmergencyKill={emergencyKillFromSafetyConfirmation}
+          onResolve={(decision) => resolveSafetyConfirmation(safetyConfirmation.challengeId, decision)}
+        />
+      )}
     </div>
   );
 }
@@ -3671,19 +4150,13 @@ function FuturesFillSoakPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
 
   async function startSession() {
     if (!authorizationToken) return;
-    const confirmed = window.confirm(
-      "실제 Binance USD-M 주문을 시작합니다.\n\n"
-      + `${soakSymbol} SHORT 진입·청산 3회(총 6체결), 주문당 5~10 USDT, `
-      + "초기 가용 USDT 100% 상한, 10% 손실 즉시 중단, 최종 평탄화 조건입니다.\n\n"
-      + "계속하시겠습니까?",
-    );
-    if (!confirmed) return;
     setBusy("start");
     setMessage("");
     try {
       const response = await startBinanceFuturesFillSoak(
         authorizationToken,
         true,
+        { symbol: soakSymbol },
       );
       setAuthorizationToken("");
       setView(response.fill_soak || {});
@@ -4660,7 +5133,6 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
     });
     if (!Object.keys(values).length) return;
     const enablingRealOrders = String(values.LIVE_TRADER_ENABLE_REAL_ORDERS || "").toLowerCase() === "true";
-    if (enablingRealOrders && !window.confirm("실전 주문 라우트를 활성화하시겠습니까? API 키·리스크·대조·전략 승인 게이트는 계속 적용됩니다.")) return;
     setSaving(true);
     setMessage("");
     const result = await onSave(values, enablingRealOrders);

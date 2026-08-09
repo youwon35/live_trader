@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import replace
 import tempfile
 import unittest
@@ -10,6 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from live_trader import state
+from live_trader.emergency_stop import _reset_emergency_stop_sticky_for_tests
+from live_trader.process_safety import release_held_leases_for_tests
 from live_trader.continuous_live import LiveContinuousController
 from live_trader.functional_test import FunctionalTestRiskSnapshot
 from live_trader.order_management import OrderIntent
@@ -27,6 +30,8 @@ from trading_runtime.functional_test import (
 
 class FunctionalTestOrderIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
+        _reset_emergency_stop_sticky_for_tests()
+        release_held_leases_for_tests()
         self.original_state = copy.deepcopy(state.STATE)
         self.original_ledger = state.PROGRAM_LEDGER
         self.original_recovery = state.RECOVERY_JOURNAL
@@ -35,6 +40,16 @@ class FunctionalTestOrderIntegrationTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.root = root
+        self.previous_emergency_stop_path = os.environ.get(
+            "LIVE_TRADER_EMERGENCY_STOP_PATH"
+        )
+        self.previous_process_lock_dir = os.environ.get(
+            "LIVE_TRADER_PROCESS_LOCK_DIR"
+        )
+        os.environ["LIVE_TRADER_EMERGENCY_STOP_PATH"] = str(
+            root / "emergency-stop.json"
+        )
+        os.environ["LIVE_TRADER_PROCESS_LOCK_DIR"] = str(root / "locks")
         self.ledger = ProgramLedger(root / "program-ledger.sqlite3")
         state.PROGRAM_LEDGER = self.ledger
         state.RECOVERY_JOURNAL = state.RecoveryJournal(
@@ -60,6 +75,20 @@ class FunctionalTestOrderIntegrationTest(unittest.TestCase):
         state.LIVE_OMS = self.original_oms
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
+        release_held_leases_for_tests()
+        _reset_emergency_stop_sticky_for_tests()
+        if self.previous_emergency_stop_path is None:
+            os.environ.pop("LIVE_TRADER_EMERGENCY_STOP_PATH", None)
+        else:
+            os.environ["LIVE_TRADER_EMERGENCY_STOP_PATH"] = (
+                self.previous_emergency_stop_path
+            )
+        if self.previous_process_lock_dir is None:
+            os.environ.pop("LIVE_TRADER_PROCESS_LOCK_DIR", None)
+        else:
+            os.environ["LIVE_TRADER_PROCESS_LOCK_DIR"] = (
+                self.previous_process_lock_dir
+            )
         self.temporary.cleanup()
 
     @staticmethod
@@ -189,6 +218,17 @@ class FunctionalTestOrderIntegrationTest(unittest.TestCase):
                 },
             ),
             patch.object(state, "seconds_since", return_value=0.0),
+            patch.object(
+                state,
+                "kis_order_truth_snapshot",
+                return_value={
+                    "complete": True,
+                    "fresh": True,
+                    "absenceIsAuthoritative": True,
+                    "orderCount": 0,
+                    "workingOrders": [],
+                },
+            ),
         ):
             risk = state.functional_test_risk_snapshot(
                 intent,
@@ -658,11 +698,32 @@ class FunctionalTestOrderIntegrationTest(unittest.TestCase):
                 "start_continuous_runtime",
                 return_value={"ok": True, "reason": "started"},
             ) as start,
+            patch.object(
+                state,
+                "safety_confirmation_authoritative_context",
+                return_value=(
+                    {
+                        "action": "FUNCTIONAL_TEST_START",
+                        "request": {"targetKey": "portfolio:one"},
+                    },
+                    {},
+                    "LIVE 4321",
+                ),
+            ),
         ):
+            issued = state.issue_safety_confirmation(
+                "FUNCTIONAL_TEST_START",
+                {"targetKey": "portfolio:one"},
+            )
             result = state.start_functional_test_runtime(
                 workspace,
                 confirmed=True,
                 target_key="portfolio:one",
+                safety_confirmation={
+                    "challengeId": issued["challengeId"],
+                    "token": issued["token"],
+                    "typedPhrase": issued["expectedPhrase"],
+                },
             )
 
         self.assertTrue(result["runtimeStarted"])
@@ -682,6 +743,7 @@ class FunctionalTestOrderIntegrationTest(unittest.TestCase):
                 "use_as_promotion_evidence": False,
                 "full_live_requested": False,
             },
+            _functional_test_capability=state._FUNCTIONAL_TEST_START_CAPABILITY,
         )
 
     def test_running_session_renews_kis_preflight_beyond_five_minutes(self) -> None:
