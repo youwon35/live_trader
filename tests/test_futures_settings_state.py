@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 from live_trader import state
 from live_trader.brokers import BrokerNotReadyError
@@ -179,6 +182,59 @@ class FuturesSettingsStateTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(1, len(self.router.configure_calls))
         self.assertIn("자동 재시도하지 않았습니다", result["reason"])
+
+    def test_functional_authority_blocks_preview_without_state_change(self) -> None:
+        before = copy.deepcopy(state.BINANCE_FUTURES_SETTINGS_INTERNAL)
+        with patch.object(
+            state,
+            "_binance_functional_durable_authority_open",
+            return_value=True,
+        ):
+            result = state.preview_binance_futures_settings(
+                "ETHUSDT", "ISOLATED", 1
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(before, state.BINANCE_FUTURES_SETTINGS_INTERNAL)
+        self.assertEqual([], self.router.configure_calls)
+
+    def test_functional_start_waits_for_inflight_settings_sender(self) -> None:
+        preview = state.preview_binance_futures_settings(
+            "ETHUSDT", "ISOLATED", 1
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        start_finished = threading.Event()
+        original_configure = self.router.configure_binance_futures_symbol
+
+        def paused_configure(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return original_configure(*args, **kwargs)
+
+        self.router.configure_binance_futures_symbol = paused_configure
+
+        def apply() -> None:
+            state.apply_binance_futures_settings(
+                preview["authorization"]["confirmation_token"],
+                confirmed=True,
+            )
+
+        def functional_start_boundary() -> None:
+            with state.binance_route_authority_serialization():
+                start_finished.set()
+
+        apply_thread = threading.Thread(target=apply)
+        start_thread = threading.Thread(target=functional_start_boundary)
+        apply_thread.start()
+        self.assertTrue(entered.wait(1))
+        start_thread.start()
+        time.sleep(0.05)
+        self.assertFalse(start_finished.is_set())
+        release.set()
+        apply_thread.join(2)
+        start_thread.join(2)
+        self.assertTrue(start_finished.is_set())
+        self.assertEqual(1, len(self.router.configure_calls))
 
 
 if __name__ == "__main__":

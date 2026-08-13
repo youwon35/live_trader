@@ -3,12 +3,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import inspect
+import io
 import json
 from pathlib import Path
 import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
+import urllib.error
+import urllib.request
 
 from live_trader import state
 from live_trader import execution_streams as execution_stream_module
@@ -32,8 +36,13 @@ class ExecutionStreamTest(unittest.TestCase):
         )
         response = Mock()
         response.read.return_value = b'{"approval_key":"approval"}'
+        response.status = 200
+        response.geturl.return_value = (
+            "https://openapi.koreainvestment.com:9443/oauth2/Approval"
+        )
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
+        opener = Mock()
         socket = Mock()
         stop = threading.Event()
         stop.set()
@@ -41,6 +50,8 @@ class ExecutionStreamTest(unittest.TestCase):
         def open_approval(*_args, **_kwargs):
             order.append("http")
             return response
+
+        opener.open.side_effect = open_approval
 
         with (
             patch.object(
@@ -58,9 +69,12 @@ class ExecutionStreamTest(unittest.TestCase):
                 clear=False,
             ),
             patch(
+                "live_trader.execution_streams.urllib.request.build_opener",
+                return_value=opener,
+            ) as build_opener,
+            patch(
                 "live_trader.execution_streams.urllib.request.urlopen",
-                side_effect=open_approval,
-            ),
+            ) as default_urlopen,
             patch("websocket.create_connection", return_value=socket),
         ):
             manager = ExecutionStreamManager(Path("."))
@@ -75,7 +89,214 @@ class ExecutionStreamTest(unittest.TestCase):
 
         self.assertEqual(["acquire", "http"], order)
         registry.get_approval.assert_called_once_with("shared-app-key")
+        build_opener.assert_called_once()
+        self.assertIsInstance(
+            build_opener.call_args.args[0],
+            execution_stream_module._AuthenticatedBrokerNoRedirectHandler,
+        )
+        opener.open.assert_called_once_with(
+            unittest.mock.ANY,
+            timeout=10,
+        )
+        default_urlopen.assert_not_called()
         socket.close.assert_called_once()
+
+    def test_authenticated_broker_redirects_never_reach_location_socket(self) -> None:
+        redirect_location = "https://attacker.invalid/credential-capture"
+        requests = (
+            urllib.request.Request(
+                "https://fapi.binance.com/fapi/v1/listenKey",
+                data=b"",
+                headers={"X-MBX-APIKEY": "binance-secret-key"},
+                method="POST",
+            ),
+            urllib.request.Request(
+                "https://fapi.binance.com/fapi/v1/listenKey",
+                data=b"",
+                headers={"X-MBX-APIKEY": "binance-secret-key"},
+                method="PUT",
+            ),
+            urllib.request.Request(
+                "https://fapi.binance.com/fapi/v1/listenKey",
+                data=b"",
+                headers={"X-MBX-APIKEY": "binance-secret-key"},
+                method="DELETE",
+            ),
+            urllib.request.Request(
+                "https://openapi.koreainvestment.com:9443/oauth2/Approval",
+                data=b'{"appkey":"kis-key","secretkey":"kis-secret"}',
+                headers={"content-type": "application/json"},
+                method="POST",
+            ),
+        )
+
+        for request in requests:
+            for status in (301, 302, 307, 308):
+                with self.subTest(method=request.method, status=status):
+                    opened: list[tuple[str, bytes | None, dict[str, str]]] = []
+                    opener = Mock()
+
+                    def reject_redirect(candidate, *, timeout):
+                        self.assertEqual(10, timeout)
+                        opened.append(
+                            (
+                                candidate.full_url,
+                                candidate.data,
+                                dict(candidate.header_items()),
+                            )
+                        )
+                        raise urllib.error.HTTPError(
+                            candidate.full_url,
+                            status,
+                            "redirect",
+                            {"Location": redirect_location},
+                            io.BytesIO(),
+                        )
+
+                    opener.open.side_effect = reject_redirect
+                    with (
+                        patch(
+                            "live_trader.execution_streams.urllib.request.build_opener",
+                            return_value=opener,
+                        ) as build_opener,
+                        patch(
+                            "live_trader.execution_streams.urllib.request.urlopen",
+                        ) as default_urlopen,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "redirect is forbidden",
+                        ):
+                            execution_stream_module._open_authenticated_broker_request(
+                                request,
+                                timeout=10,
+                            )
+
+                    build_opener.assert_called_once()
+                    self.assertIsInstance(
+                        build_opener.call_args.args[0],
+                        execution_stream_module._AuthenticatedBrokerNoRedirectHandler,
+                    )
+                    default_urlopen.assert_not_called()
+                    self.assertEqual(1, len(opened))
+                    self.assertEqual(request.full_url, opened[0][0])
+                    self.assertNotEqual(redirect_location, opened[0][0])
+                    if request.full_url.startswith("https://fapi.binance.com"):
+                        self.assertEqual(
+                            "binance-secret-key",
+                            {key.lower(): value for key, value in opened[0][2].items()}[
+                                "x-mbx-apikey"
+                            ],
+                        )
+                    else:
+                        self.assertIn(b"kis-secret", opened[0][1] or b"")
+
+    def test_authenticated_broker_response_requires_exact_effective_url(self) -> None:
+        request = urllib.request.Request(
+            "https://fapi.binance.com/fapi/v1/listenKey",
+            headers={"X-MBX-APIKEY": "binance-secret-key"},
+        )
+        response = Mock(status=200)
+        response.geturl.return_value = request.full_url
+        opener = Mock()
+        opener.open.return_value = response
+
+        with (
+            patch(
+                "live_trader.execution_streams.urllib.request.build_opener",
+                return_value=opener,
+            ),
+            patch(
+                "live_trader.execution_streams.urllib.request.urlopen",
+            ) as default_urlopen,
+        ):
+            opened = execution_stream_module._open_authenticated_broker_request(
+                request,
+                timeout=10,
+            )
+
+        self.assertIs(response, opened)
+        response.close.assert_not_called()
+        default_urlopen.assert_not_called()
+
+        changed_response = Mock(status=200)
+        changed_response.geturl.return_value = "https://attacker.invalid/changed"
+        changed_opener = Mock()
+        changed_opener.open.return_value = changed_response
+        with patch(
+            "live_trader.execution_streams.urllib.request.build_opener",
+            return_value=changed_opener,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "response URL changed"):
+                execution_stream_module._open_authenticated_broker_request(
+                    request,
+                    timeout=10,
+                )
+        changed_response.close.assert_called_once_with()
+
+    def test_all_credentialed_execution_http_calls_use_owned_opener(self) -> None:
+        binance_source = inspect.getsource(
+            ExecutionStreamManager._run_binance_futures
+        )
+        kis_source = inspect.getsource(ExecutionStreamManager._run_kis)
+
+        self.assertNotIn("urllib.request.urlopen", binance_source)
+        self.assertNotIn("urllib.request.urlopen", kis_source)
+        self.assertEqual(
+            3,
+            binance_source.count("_open_authenticated_broker_request("),
+        )
+        self.assertEqual(
+            1,
+            kis_source.count("_open_authenticated_broker_request("),
+        )
+
+    def test_binance_futures_rejects_foreign_origins_before_any_socket(self) -> None:
+        configurations = (
+            {
+                "BINANCE_FUTURES_BASE_URL": "https://attacker.invalid",
+                "BINANCE_FUTURES_STREAM_URL": (
+                    execution_stream_module._BINANCE_FUTURES_PRIVATE_STREAM_BASE
+                ),
+            },
+            {
+                "BINANCE_FUTURES_BASE_URL": (
+                    execution_stream_module._BINANCE_FUTURES_PRIVATE_REST_BASE
+                ),
+                "BINANCE_FUTURES_STREAM_URL": "wss://attacker.invalid/ws",
+            },
+        )
+
+        for configured in configurations:
+            with self.subTest(configured=configured):
+                environment = {
+                    "BINANCE_API_KEY": "binance-secret-key",
+                    **configured,
+                }
+                with (
+                    patch.dict(
+                        execution_stream_module.os.environ,
+                        environment,
+                        clear=False,
+                    ),
+                    patch(
+                        "live_trader.execution_streams.urllib.request.build_opener",
+                    ) as build_opener,
+                    patch(
+                        "live_trader.execution_streams.urllib.request.urlopen",
+                    ) as default_urlopen,
+                    patch("websocket.create_connection") as websocket_open,
+                ):
+                    manager = ExecutionStreamManager(Path("."))
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "official production endpoint",
+                    ):
+                        manager._run_binance_futures(threading.Event())
+
+                build_opener.assert_not_called()
+                default_urlopen.assert_not_called()
+                websocket_open.assert_not_called()
 
     def test_market_feed_limits_before_approval_fetch(self) -> None:
         order: list[str] = []

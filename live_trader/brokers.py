@@ -4,16 +4,19 @@ import hashlib
 import json
 import math
 import os
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 from zoneinfo import ZoneInfo
 
 from trading_runtime import compare_futures_policy_to_broker
 
 from .live_adapters import (
     BINANCE_FUTURES_TEST_ORDER_ENDPOINT,
+    KIS_DOMESTIC_CANCEL_ENDPOINT,
+    KIS_DOMESTIC_ORDER_ENDPOINT,
     build_binance_account_request,
     build_binance_cancel_order_request,
     build_binance_futures_account_request,
@@ -36,20 +39,111 @@ from .live_adapters import (
     build_kis_domestic_execution_request,
     build_kis_live_order_request,
     build_kis_overseas_balance_request,
+    build_kis_overseas_working_orders_request,
+    build_kis_us_live_quote_request,
     build_upbit_accounts_request,
     build_upbit_cancel_order_request,
     build_upbit_order_chance_request,
     build_upbit_order_detail_request,
     build_upbit_order_request,
     issue_kis_access_token,
+    kis_prepared_payload_hash,
     normalize_binance_futures_intent,
     normalize_binance_spot_intent,
     refresh_binance_time_offset,
     send_prepared_request,
 )
+from .binance_order_authority import (
+    BinanceOrderAuthorityError,
+    ordinary_binance_final_mutation_boundary,
+)
+from .upbit_order_authority import (
+    UpbitOrderAuthorityError,
+    ordinary_upbit_final_mutation_boundary,
+)
+from .kis_order_authority import (
+    KisOrderAuthorityError,
+    kill_ordinary_kis_cancel_boundary,
+    kis_authenticated_mutation_preflight,
+    kis_order_authority_binding,
+    kis_read_diagnostic_boundary,
+    ordinary_kis_final_mutation_boundary,
+)
 
 BrokerStatus = Literal["connected", "missing_credentials", "adapter_required", "disabled"]
 CheckStatus = Literal["pass", "warn", "fail"]
+
+
+def build_kis_mutation_authority_intent(
+    prepared: Any,
+    *,
+    operation: str,
+    claim_id: str,
+    owned_order_key: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Seal the exact domestic KIS body against the current state owner."""
+
+    binding = kis_order_authority_binding()
+    from .kis_domestic_functional_get_client import (
+        _credential_configuration_hash,
+        kis_domestic_functional_account_fingerprint,
+    )
+
+    body = prepared.body if isinstance(prepared.body, dict) else {}
+    cano = str(body.get("CANO") or "").strip()
+    product = str(body.get("ACNT_PRDT_CD") or "").strip()
+    account = kis_domestic_functional_account_fingerprint(cano, product)
+    base_url = str(prepared.url or "").removesuffix(str(prepared.endpoint or ""))
+    configured_base_url = (
+        os.getenv("KIS_BASE_URL", "").strip()
+        or "https://openapi.koreainvestment.com:9443"
+    ).rstrip("/")
+    app_key = os.getenv("KIS_APP_KEY", "").strip()
+    app_secret = os.getenv("KIS_APP_SECRET", "").strip()
+    if (
+        base_url != configured_base_url
+        or configured_base_url
+        != "https://openapi.koreainvestment.com:9443"
+        or not app_key
+        or not app_secret
+        or str(prepared.headers.get("appkey") or "") != app_key
+        or str(prepared.headers.get("appsecret") or "") != app_secret
+        or not str(prepared.headers.get("authorization") or "").startswith(
+            "Bearer "
+        )
+    ):
+        raise KisOrderAuthorityError(
+            "KIS prepared credential/origin binding is invalid"
+        )
+    credential = _credential_configuration_hash(
+        app_key=app_key,
+        app_secret=app_secret,
+        account_fingerprint=account,
+    )
+    if (
+        not secrets.compare_digest(account, str(binding["accountFingerprint"]))
+        or not secrets.compare_digest(
+            credential, str(binding["credentialConfigurationHash"])
+        )
+    ):
+        raise KisOrderAuthorityError(
+            "KIS prepared account/credential differs from durable authority"
+        )
+    owned = dict(owned_order_key or {})
+    exact_owned = {
+        "orderDate": str(owned.get("orderDate") or "").strip(),
+        "organizationNo": str(owned.get("organizationNo") or "").strip(),
+        "orderNo": str(owned.get("orderNo") or "").strip(),
+    }
+    return {
+        "operation": str(operation or "").strip().upper(),
+        "claimId": str(claim_id or "").strip(),
+        "ownedOrderKey": exact_owned,
+        "accountFingerprint": account,
+        "credentialConfigurationHash": credential,
+        "endpoint": str(prepared.endpoint),
+        "payloadHash": kis_prepared_payload_hash(prepared),
+    }
 
 
 def send_binance_signed_request(
@@ -1048,6 +1142,641 @@ def fetch_kis_overseas_balance(
     raise BrokerNotReadyError(
         f"kis 해외주식 잔고 API 조회 실패: {max_pages}페이지 안에 연속조회가 끝나지 않았습니다."
     )
+
+
+KIS_OVERSEAS_WORKING_ORDER_TRUTH_SCHEMA = (
+    "kis-overseas-working-order-truth-v1"
+)
+KIS_US_LIVE_QUOTE_SCHEMA = "kis-us-live-quote-v1"
+_KIS_NEW_YORK = ZoneInfo("America/New_York")
+
+
+def _kis_us_quote_clock(
+    clock: Callable[[], datetime] | None,
+) -> datetime:
+    current = clock() if clock is not None else datetime.now(timezone.utc)
+    if not isinstance(current, datetime):
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote 로컬 시계가 datetime을 반환하지 않았습니다."
+        )
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote 로컬 시계에 시간대가 없습니다."
+        )
+    return current
+
+
+def _kis_us_quote_freshness_seconds(value: object) -> float:
+    if isinstance(value, bool):
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote freshness 시간이 올바르지 않습니다."
+        )
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote freshness 시간이 올바르지 않습니다."
+        ) from exc
+    if not parsed.is_finite() or parsed <= 0 or parsed > 5:
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote freshness 시간은 0초 초과 5초 이하여야 합니다."
+        )
+    return float(parsed)
+
+
+def _kis_us_quote_price(row: dict[str, object]) -> Decimal:
+    raw = row.get("last") if "last" in row else row.get("LAST")
+    try:
+        price = Decimal(str(raw).replace(",", "").strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote 현재가 형식이 올바르지 않습니다."
+        ) from exc
+    if not price.is_finite() or price <= 0:
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote 현재가는 유한한 양수여야 합니다."
+        )
+    return price
+
+
+def fetch_kis_us_live_quote(
+    access_token: str,
+    *,
+    symbol: str = "F",
+    exchange: str = "NYSE",
+    freshness_seconds: float = 5.0,
+    clock: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    """Fetch and verify the exact read-only ``F``/``NYSE`` quote.
+
+    The official ``HHDFS00000300`` payload exposes ``rsym`` (D/R + the
+    three-letter exchange + symbol) but no provider trade timestamp.  The
+    returned freshness claim is therefore intentionally limited to the local
+    HTTP observation: the response completed inside a maximum five-second
+    window.  It never asserts that the provider's last trade itself is five
+    seconds old.
+    """
+
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_exchange = str(exchange or "").strip().upper()
+    if normalized_symbol != "F" or normalized_exchange != "NYSE":
+        raise BrokerNotReadyError(
+            "kis 미국주식 live quote는 exact F/NYSE 범위만 허용합니다."
+        )
+    freshness_limit = _kis_us_quote_freshness_seconds(freshness_seconds)
+    started_at = _kis_us_quote_clock(clock)
+    response = send_prepared_request(
+        build_kis_us_live_quote_request(
+            access_token=access_token,
+            symbol=normalized_symbol,
+            exchange=normalized_exchange,
+        ),
+        timeout_seconds=freshness_limit,
+    )
+    observed_at = _kis_us_quote_clock(clock)
+    elapsed_seconds = (
+        observed_at.astimezone(timezone.utc)
+        - started_at.astimezone(timezone.utc)
+    ).total_seconds()
+    if elapsed_seconds < 0 or elapsed_seconds > freshness_limit:
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote 로컬 HTTP 관측이 freshness 시간을 초과했습니다."
+        )
+
+    payload = ensure_kis_payload_ok(response, scope="미국주식 현재체결가")
+    if str(payload.get("rt_cd") or "").strip() != "0":
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote에 rt_cd=0 성공 증거가 없습니다."
+        )
+    row = payload.get("output")
+    if not isinstance(row, dict) or not row:
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote output 형식이 올바르지 않습니다."
+        )
+
+    response_identity = str(
+        row.get("rsym") if "rsym" in row else row.get("RSYM") or ""
+    ).strip().upper()
+    expected_suffix = "NYSF"
+    if (
+        len(response_identity) != len(expected_suffix) + 1
+        or response_identity[0] not in {"D", "R"}
+        or response_identity[1:] != expected_suffix
+    ):
+        raise BrokerNotReadyError(
+            "kis 미국주식 quote 응답 identity가 exact F/NYS가 아닙니다."
+        )
+    for key in ("symb", "SYMB"):
+        if key in row and str(row.get(key) or "").strip().upper() != "F":
+            raise BrokerNotReadyError(
+                "kis 미국주식 quote 응답 종목코드가 F가 아닙니다."
+            )
+    for key in ("excd", "EXCD"):
+        if key in row and str(row.get(key) or "").strip().upper() != "NYS":
+            raise BrokerNotReadyError(
+                "kis 미국주식 quote 응답 거래소코드가 NYS가 아닙니다."
+            )
+
+    price = _kis_us_quote_price(row)
+    observed_utc = observed_at.astimezone(timezone.utc)
+    started_utc = started_at.astimezone(timezone.utc)
+    fresh_until = observed_utc + timedelta(seconds=freshness_limit)
+    return {
+        "schema_version": KIS_US_LIVE_QUOTE_SCHEMA,
+        "broker_id": "kis",
+        "market_group": "US_STOCK",
+        "symbol": "F",
+        "exchange": "NYSE",
+        "quote_exchange": "NYS",
+        "currency": "USD",
+        "price": float(price),
+        "price_text": format(price, "f"),
+        "response_identity": response_identity,
+        "identity_verified": True,
+        "provider_feed_mode": (
+            "delayed-indicator" if response_identity[0] == "D" else "realtime-indicator"
+        ),
+        "request_started_at": started_utc.isoformat().replace("+00:00", "Z"),
+        "observed_at": observed_utc.isoformat().replace("+00:00", "Z"),
+        "observed_at_new_york": observed_at.astimezone(_KIS_NEW_YORK).isoformat(),
+        "round_trip_seconds": elapsed_seconds,
+        "locally_fresh": True,
+        "freshness_seconds": freshness_limit,
+        "fresh_until": fresh_until.isoformat().replace("+00:00", "Z"),
+        "freshness_basis": "local-http-response-observation",
+        "provider_trade_timestamp_available": False,
+        "source": "kis-overseas-price-rest/HHDFS00000300",
+    }
+
+
+def _kis_overseas_truth_now(now: datetime | None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth 기준시각에 시간대가 없습니다."
+        )
+    return current
+
+
+def fetch_kis_overseas_working_order_truth(
+    access_token: str,
+    *,
+    now: datetime | None = None,
+    max_pages: int = 20,
+) -> dict[str, object]:
+    """Fetch every official live ``inquire-nccs`` US working-order page.
+
+    ``TTTS3018R`` has no date filter: with ``OVRS_EXCG_CD=NASD`` its documented
+    scope is all currently unfilled orders across NASDAQ, NYSE and AMEX. An
+    empty result is authoritative only after ``rt_cd=0`` and every FK/NK200
+    continuation page is consumed.
+    """
+
+    current = _kis_overseas_truth_now(now)
+    if isinstance(max_pages, bool):
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth 최대 페이지 수가 올바르지 않습니다."
+        )
+    try:
+        page_limit_value = Decimal(str(max_pages).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth 최대 페이지 수가 올바르지 않습니다."
+        ) from exc
+    if (
+        not page_limit_value.is_finite()
+        or page_limit_value != page_limit_value.to_integral_value()
+        or page_limit_value < 1
+    ):
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth 최대 페이지 수는 1 이상이어야 합니다."
+        )
+    page_limit = int(page_limit_value)
+
+    output: list[dict[str, object]] = []
+    context_fk200 = ""
+    context_nk200 = ""
+    continuation = ""
+    seen_keys: set[tuple[str, str]] = set()
+    page_count = 0
+    for _ in range(page_limit):
+        response = send_prepared_request(
+            build_kis_overseas_working_orders_request(
+                access_token=access_token,
+                context_fk200=context_fk200,
+                context_nk200=context_nk200,
+                continuation=continuation,
+            )
+        )
+        payload = ensure_kis_payload_ok(
+            response,
+            scope="해외주식 미체결 주문",
+        )
+        if str(payload.get("rt_cd") or "").strip() != "0":
+            raise BrokerNotReadyError(
+                "kis 해외주식 미체결 주문 API 조회 실패: rt_cd=0이 없어 "
+                "성공 응답을 증명할 수 없습니다."
+            )
+        if "output" not in payload:
+            raise BrokerNotReadyError(
+                "kis 해외주식 미체결 주문 API 조회 실패: output이 없어 "
+                "빈 주문 목록을 증명할 수 없습니다."
+            )
+        page_rows = payload.get("output")
+        if isinstance(page_rows, list):
+            rows = page_rows
+        elif isinstance(page_rows, dict) and page_rows:
+            # The official sample explicitly wraps a singular output object.
+            rows = [page_rows]
+        else:
+            raise BrokerNotReadyError(
+                "kis 해외주식 미체결 주문 API 조회 실패: output 형식이 "
+                "공식 목록/단일행 형식이 아니거나 빈 객체라 부재를 "
+                "증명할 수 없습니다."
+            )
+        for row in rows:
+            if not isinstance(row, dict):
+                raise BrokerNotReadyError(
+                    "kis 해외주식 미체결 주문 API 조회 실패: 주문 행 "
+                    "형식이 올바르지 않습니다."
+                )
+            output.append(dict(row))
+        page_count += 1
+
+        tr_cont = str(response.get("trCont") or "").strip().upper()
+        if tr_cont not in {"", "D", "E", "M", "F"}:
+            raise BrokerNotReadyError(
+                "kis 해외주식 미체결 주문 API 조회 실패: 알 수 없는 "
+                f"연속조회 상태({tr_cont})입니다."
+            )
+        if tr_cont not in {"M", "F"}:
+            return {
+                "rt_cd": "0",
+                "output": output,
+                "page_count": page_count,
+                "pagination_complete": True,
+                "fetched_at": current.astimezone(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+        next_fk200 = str(
+            payload.get("ctx_area_fk200")
+            or payload.get("CTX_AREA_FK200")
+            or ""
+        ).strip()
+        next_nk200 = str(
+            payload.get("ctx_area_nk200")
+            or payload.get("CTX_AREA_NK200")
+            or ""
+        ).strip()
+        next_key = (next_fk200, next_nk200)
+        if not any(next_key) or next_key in seen_keys:
+            raise BrokerNotReadyError(
+                "kis 해외주식 미체결 주문 API 조회 실패: 연속조회 키가 "
+                "누락되었거나 반복되어 전체 주문 truth를 증명할 수 없습니다."
+            )
+        seen_keys.add(next_key)
+        context_fk200 = next_fk200
+        context_nk200 = next_nk200
+        continuation = "N"
+    raise BrokerNotReadyError(
+        f"kis 해외주식 미체결 주문 API 조회 실패: {page_limit}페이지 "
+        "안에 연속조회가 끝나지 않았습니다."
+    )
+
+
+def _kis_overseas_truth_decimal(
+    row: dict[str, object],
+    *keys: str,
+    label: str,
+    integral: bool,
+) -> Decimal:
+    raw = _kis_truth_value(row, *keys)
+    if raw is None:
+        raise BrokerNotReadyError(
+            f"kis 해외주식 미체결 행에 {label} 값이 없습니다."
+        )
+    try:
+        value = Decimal(str(raw).replace(",", "").strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise BrokerNotReadyError(
+            f"kis 해외주식 미체결 행의 {label} 형식이 올바르지 않습니다."
+        ) from exc
+    if (
+        not value.is_finite()
+        or value < 0
+        or (integral and value != value.to_integral_value())
+    ):
+        raise BrokerNotReadyError(
+            f"kis 해외주식 미체결 행의 {label} 값을 신뢰할 수 없습니다."
+        )
+    return value
+
+
+def _kis_overseas_truth_occurred_at(
+    order_date: str,
+    order_time: str,
+) -> str:
+    try:
+        local = datetime.strptime(
+            f"{order_date}{order_time}",
+            "%Y%m%d%H%M%S",
+        ).replace(tzinfo=_KIS_NEW_YORK)
+    except ValueError as exc:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행의 주문 일시가 올바르지 않습니다."
+        ) from exc
+    return local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_kis_overseas_working_order_row(
+    row: dict[str, object],
+    *,
+    observed_new_york_date: str,
+) -> dict[str, object]:
+    order_date = str(_kis_truth_value(row, "ord_dt") or "").strip()
+    order_time = str(_kis_truth_value(row, "ord_tmd") or "").strip()
+    organization_no = str(
+        _kis_truth_value(row, "ord_gno_brno") or ""
+    ).strip().upper()
+    broker_order_id = str(_kis_truth_value(row, "odno") or "").strip()
+    symbol = str(_kis_truth_value(row, "pdno") or "").strip().upper()
+    exchange = str(
+        _kis_truth_value(row, "ovrs_excg_cd") or ""
+    ).strip().upper()
+    currency = str(
+        _kis_truth_value(row, "tr_crcy_cd") or ""
+    ).strip().upper()
+    try:
+        canonical_order_date = datetime.strptime(
+            order_date,
+            "%Y%m%d",
+        ).strftime("%Y%m%d")
+    except ValueError as exc:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행의 주문일자가 올바르지 않습니다."
+        ) from exc
+    if canonical_order_date != order_date or order_date > observed_new_york_date:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행의 주문일자를 신뢰할 수 없습니다."
+        )
+    if len(order_time) != 6 or not order_time.isdigit():
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행의 주문시각 형식이 올바르지 않습니다."
+        )
+    if not organization_no:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행에 주문조직번호가 없습니다."
+        )
+    if not broker_order_id:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행에 공식 ODNO가 없습니다."
+        )
+    if not symbol:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행에 종목코드가 없습니다."
+        )
+    if exchange not in {"NASD", "NYSE", "AMEX"}:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행의 미국 거래소 코드를 확정할 수 없습니다."
+        )
+    if currency != "USD":
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행의 거래 통화가 USD가 아닙니다."
+        )
+
+    side_code = str(
+        _kis_truth_value(row, "sll_buy_dvsn_cd") or ""
+    ).strip()
+    if side_code == "02":
+        side = "BUY"
+    elif side_code == "01":
+        side = "SELL"
+    else:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행의 매수·매도 코드를 확정할 수 없습니다."
+        )
+
+    requested = _kis_overseas_truth_decimal(
+        row,
+        "ft_ord_qty",
+        label="주문수량",
+        integral=True,
+    )
+    filled = _kis_overseas_truth_decimal(
+        row,
+        "ft_ccld_qty",
+        label="누적체결수량",
+        integral=True,
+    )
+    remaining = _kis_overseas_truth_decimal(
+        row,
+        "nccs_qty",
+        label="미체결수량",
+        integral=True,
+    )
+    order_price = _kis_overseas_truth_decimal(
+        row,
+        "ft_ord_unpr3",
+        label="주문단가",
+        integral=False,
+    )
+    average_fill_price = _kis_overseas_truth_decimal(
+        row,
+        "ft_ccld_unpr3",
+        label="평균체결단가",
+        integral=False,
+    )
+    if requested <= 0:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행의 주문수량은 0보다 커야 합니다."
+        )
+    if remaining <= 0:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 전용 응답에 양수 미체결수량이 없습니다."
+        )
+    if filled + remaining != requested:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행의 체결·미체결 합계가 주문수량과 "
+            "일치하지 않습니다."
+        )
+    if filled > 0 and average_fill_price <= 0:
+        raise BrokerNotReadyError(
+            "kis 해외주식 부분체결 행에 양수 평균체결단가가 없습니다."
+        )
+    if filled == 0 and average_fill_price != 0:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 행에 체결 없이 평균체결단가가 있습니다."
+        )
+
+    broker_order_key = ":".join(
+        (order_date, organization_no, broker_order_id, exchange, symbol)
+    )
+    state = "partially_filled" if filled > 0 else "accepted"
+    return {
+        "broker_id": "kis",
+        "broker_order_id": broker_order_id,
+        "broker_order_key": broker_order_key,
+        "local_order_id": "",
+        "correlation": "official-broker-order-id-only",
+        "order_date": order_date,
+        "order_time": order_time,
+        "organization_no": organization_no,
+        "symbol": symbol,
+        "asset": "미국주식",
+        "exchange": exchange,
+        "currency": currency,
+        "side": side,
+        "requested_quantity": float(requested),
+        "filled_quantity": float(filled),
+        "remaining_quantity": float(remaining),
+        "order_price": float(order_price),
+        "average_fill_price": float(average_fill_price),
+        "state": state,
+        "terminal": False,
+        "working": True,
+        "occurred_at": _kis_overseas_truth_occurred_at(
+            order_date,
+            order_time,
+        ),
+        "source": "kis_overseas_inquire_nccs",
+        "raw": dict(row),
+    }
+
+
+def normalize_kis_overseas_working_order_truth(
+    payload: object,
+) -> dict[str, object]:
+    """Normalize a complete US working-order snapshot without local guesses."""
+
+    data = payload if isinstance(payload, dict) else {}
+    if data.get("pagination_complete") is not True:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth의 전체 페이지 완료 증거가 없습니다."
+        )
+    if str(data.get("rt_cd") or "").strip() != "0":
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth에 rt_cd=0 성공 증거가 없습니다."
+        )
+    fetched_at = str(data.get("fetched_at") or "").strip()
+    if not fetched_at:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth에 조회 기준시각이 없습니다."
+        )
+    try:
+        parsed_fetched_at = datetime.fromisoformat(
+            fetched_at.replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth의 조회 기준시각이 올바르지 않습니다."
+        ) from exc
+    if parsed_fetched_at.tzinfo is None or parsed_fetched_at.utcoffset() is None:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth의 조회 기준시각에 시간대가 없습니다."
+        )
+    observed_new_york_date = parsed_fetched_at.astimezone(
+        _KIS_NEW_YORK
+    ).strftime("%Y%m%d")
+    observed_at = (
+        parsed_fetched_at.astimezone(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+    raw_page_count = data.get("page_count")
+    if isinstance(raw_page_count, bool):
+        raw_page_count = None
+    try:
+        page_count_value = Decimal(str(raw_page_count).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth의 페이지 수가 올바르지 않습니다."
+        ) from exc
+    if (
+        not page_count_value.is_finite()
+        or page_count_value != page_count_value.to_integral_value()
+        or page_count_value < 1
+    ):
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth의 완료 페이지 수가 올바르지 않습니다."
+        )
+    page_count = int(page_count_value)
+
+    raw_rows = data.get("output")
+    if not isinstance(raw_rows, list):
+        raise BrokerNotReadyError(
+            "kis 해외주식 미체결 truth의 output 형식이 올바르지 않습니다."
+        )
+    selected: dict[str, dict[str, object]] = {}
+    for raw in raw_rows:
+        if not isinstance(raw, dict):
+            raise BrokerNotReadyError(
+                "kis 해외주식 미체결 truth에 비정상 주문 행이 있습니다."
+            )
+        current = _normalize_kis_overseas_working_order_row(
+            raw,
+            observed_new_york_date=observed_new_york_date,
+        )
+        key = str(current["broker_order_key"])
+        previous = selected.get(key)
+        if previous is not None and previous != current:
+            raise BrokerNotReadyError(
+                "kis 해외주식 미체결 truth에 같은 공식 주문키의 충돌하는 "
+                "행이 있습니다."
+            )
+        selected[key] = current
+    working_orders = sorted(
+        selected.values(),
+        key=lambda item: (
+            str(item["order_time"]),
+            str(item["broker_order_key"]),
+        ),
+    )
+    order_id_counts: dict[str, int] = {}
+    for order in working_orders:
+        order_id = str(order["broker_order_id"])
+        order_id_counts[order_id] = order_id_counts.get(order_id, 0) + 1
+    ambiguous_order_ids = sorted(
+        order_id
+        for order_id, count in order_id_counts.items()
+        if count > 1
+    )
+    absence_authoritative = not working_orders
+    absence_authority_blockers = (
+        [] if absence_authoritative else ["KIS_US_WORKING_ORDERS_PRESENT"]
+    )
+    return {
+        "schema_version": KIS_OVERSEAS_WORKING_ORDER_TRUTH_SCHEMA,
+        "broker_id": "kis",
+        "market": "US",
+        "complete": True,
+        "pagination_complete": True,
+        "as_of_new_york_date": observed_new_york_date,
+        "page_count": page_count,
+        "order_count": len(working_orders),
+        "working_order_count": len(working_orders),
+        "event_count": 0,
+        "orders": working_orders,
+        "working_orders": working_orders,
+        "events": [],
+        "ambiguous_broker_order_ids": ambiguous_order_ids,
+        "correlation_policy": "official-broker-order-id-only",
+        "query_scope": {
+            "account_wide": True,
+            "working_status": "active-unfilled",
+            "date_filter": None,
+            "exchange": "NASD-all-us-markets",
+        },
+        "account_wide_working_orders_authoritative": True,
+        "accountWideWorkingOrdersAuthoritative": True,
+        "absence_is_authoritative": absence_authoritative,
+        "account_wide_absence_authoritative": absence_authoritative,
+        "accountWideAbsenceAuthoritative": absence_authoritative,
+        "absence_authority_blockers": absence_authority_blockers,
+        "absenceAuthorityBlockers": absence_authority_blockers,
+        "observed_at": observed_at,
+    }
 
 
 KIS_DOMESTIC_ORDER_TRUTH_SCHEMA = "kis-domestic-order-truth-v1"
@@ -2214,8 +2943,9 @@ class LiveBrokerRouter:
     def get_account_snapshot(self, broker_id: str) -> dict[str, object]:
         broker_id = broker_id.lower().strip()
         if broker_id == "kis":
-            token = issue_kis_access_token()
-            payload = fetch_kis_domestic_balance(token)
+            with kis_read_diagnostic_boundary():
+                token = issue_kis_access_token()
+                payload = fetch_kis_domestic_balance(token)
             return {"broker_id": "kis", "accounts": parse_kis_accounts(payload)}
         if broker_id == "binance":
             payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))
@@ -2240,9 +2970,10 @@ class LiveBrokerRouter:
     def list_positions(self, broker_id: str) -> list[dict[str, object]]:
         broker_id = broker_id.lower().strip()
         if broker_id == "kis":
-            token = issue_kis_access_token()
-            domestic_payload = fetch_kis_domestic_balance(token)
-            overseas_payload = fetch_kis_overseas_balance(token)
+            with kis_read_diagnostic_boundary():
+                token = issue_kis_access_token()
+                domestic_payload = fetch_kis_domestic_balance(token)
+                overseas_payload = fetch_kis_overseas_balance(token)
             return [
                 *parse_kis_positions(domestic_payload),
                 *parse_kis_overseas_positions(overseas_payload),
@@ -2269,14 +3000,71 @@ class LiveBrokerRouter:
             raise BrokerNotReadyError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 아니므로 실주문 전송을 차단했습니다.")
         broker_id = str(intent.get("broker_id") or intent.get("broker") or "").lower()
         if broker_id == "kis":
-            token = issue_kis_access_token()
-            return send_prepared_request(build_kis_live_order_request(intent, access_token=token))
+            try:
+                with kis_authenticated_mutation_preflight(mode="ORDINARY"):
+                    token = issue_kis_access_token()
+                    prepared = build_kis_live_order_request(
+                        intent, access_token=token
+                    )
+                    authority_intent = build_kis_mutation_authority_intent(
+                        prepared,
+                        operation="PLACE_ORDER",
+                        claim_id=(
+                            "kis-ordinary-place-" + secrets.token_hex(16)
+                        ),
+                    )
+                    with ordinary_kis_final_mutation_boundary(
+                        operation="PLACE_ORDER", intent=authority_intent
+                    ):
+                        response = send_prepared_request(prepared)
+                    body = (
+                        prepared.body
+                        if isinstance(prepared.body, dict)
+                        else {}
+                    )
+                    cano = str(body.get("CANO") or "").strip()
+                    product = str(
+                        body.get("ACNT_PRDT_CD") or ""
+                    ).strip()
+                    # Persist only a one-way CANO digest.  The state/ledger
+                    # needs an exact account join for a later cancel, while
+                    # snapshots and audit exports must never expose the raw
+                    # account number.
+                    response = dict(response)
+                    response["kisOrderAccountBinding"] = {
+                        "schemaVersion": "kis-order-account-binding/v1",
+                        "accountCanoHash": hashlib.sha256(
+                            cano.encode("utf-8")
+                        ).hexdigest(),
+                        "accountProductCode": product,
+                        "accountFingerprint": str(
+                            authority_intent["accountFingerprint"]
+                        ),
+                        "credentialConfigurationHash": str(
+                            authority_intent[
+                                "credentialConfigurationHash"
+                            ]
+                        ),
+                    }
+                    return response
+            except KisOrderAuthorityError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
         if broker_id == "binance":
             try:
                 normalized_intent = normalize_binance_spot_intent(intent)
             except RuntimeError as exc:
                 raise BrokerNotReadyError(str(exc)) from exc
-            return send_binance_signed_request(lambda: build_binance_spot_order_request(normalized_intent))
+            try:
+                with ordinary_binance_final_mutation_boundary(
+                    operation="SPOT_PLACE_ORDER"
+                ):
+                    return send_binance_signed_request(
+                        lambda: build_binance_spot_order_request(
+                            normalized_intent
+                        )
+                    )
+            except BinanceOrderAuthorityError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
         if broker_id == "binance-futures":
             try:
                 normalized_intent = normalize_binance_futures_intent(
@@ -2313,17 +3101,30 @@ class LiveBrokerRouter:
                     symbol,
                 ),
             )
-            return send_binance_signed_request(
-                lambda: build_binance_futures_order_request(
-                    normalized_intent,
-                    hedge_mode=position_mode.get(
-                        "dualSidePosition"
-                    ) is True,
-                ),
-                futures=True,
-            )
+            try:
+                with ordinary_binance_final_mutation_boundary(
+                    operation="FUTURES_PLACE_ORDER"
+                ):
+                    return send_binance_signed_request(
+                        lambda: build_binance_futures_order_request(
+                            normalized_intent,
+                            hedge_mode=position_mode.get(
+                                "dualSidePosition"
+                            ) is True,
+                        ),
+                        futures=True,
+                    )
+            except BinanceOrderAuthorityError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
         if broker_id == "upbit":
-            return send_prepared_request(build_upbit_order_request(intent))
+            prepared = build_upbit_order_request(intent)
+            try:
+                with ordinary_upbit_final_mutation_boundary(
+                    operation="PLACE_ORDER"
+                ):
+                    return send_prepared_request(prepared)
+            except UpbitOrderAuthorityError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
         raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
 
     def list_open_orders(
@@ -2701,26 +3502,38 @@ class LiveBrokerRouter:
 
         applied: list[str] = []
         if change_margin_type:
-            ensure_response_ok(
-                "binance-futures",
-                send_binance_signed_mutation(
-                    lambda: build_binance_futures_margin_type_change_request(
-                        normalized_symbol,
-                        normalized_margin_type,
+            try:
+                with ordinary_binance_final_mutation_boundary(
+                    operation="FUTURES_MARGIN_TYPE"
+                ):
+                    ensure_response_ok(
+                        "binance-futures",
+                        send_binance_signed_mutation(
+                            lambda: build_binance_futures_margin_type_change_request(
+                                normalized_symbol,
+                                normalized_margin_type,
+                            )
+                        ),
                     )
-                ),
-            )
+            except BinanceOrderAuthorityError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
             applied.append("margin_type")
         if change_leverage:
-            ensure_response_ok(
-                "binance-futures",
-                send_binance_signed_mutation(
-                    lambda: build_binance_futures_leverage_change_request(
-                        normalized_symbol,
-                        normalized_leverage,
+            try:
+                with ordinary_binance_final_mutation_boundary(
+                    operation="FUTURES_LEVERAGE"
+                ):
+                    ensure_response_ok(
+                        "binance-futures",
+                        send_binance_signed_mutation(
+                            lambda: build_binance_futures_leverage_change_request(
+                                normalized_symbol,
+                                normalized_leverage,
+                            )
+                        ),
                     )
-                ),
-            )
+            except BinanceOrderAuthorityError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
             applied.append("leverage")
         return {
             "symbol": normalized_symbol,
@@ -2785,10 +3598,19 @@ class LiveBrokerRouter:
                 )
             return prepared
 
-        return send_binance_signed_request(
-            build_test_request,
-            futures=True,
-        )
+        try:
+            # `/order/test` does not reach the matching engine, but it is a
+            # signed order-capable smoke path and must be mutually exclusive
+            # with the BTCUSDT functional authority just like live orders.
+            with ordinary_binance_final_mutation_boundary(
+                operation="FUTURES_TEST_ORDER"
+            ):
+                return send_binance_signed_request(
+                    build_test_request,
+                    futures=True,
+                )
+        except BinanceOrderAuthorityError as exc:
+            raise BrokerNotReadyError(str(exc)) from exc
 
     def get_upbit_order_chance(self, market: str) -> dict[str, object]:
         payload = ensure_response_ok(
@@ -2813,33 +3635,135 @@ class LiveBrokerRouter:
             raise BrokerNotReadyError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 아니므로 실제 주문 취소 전송을 차단했습니다.")
         broker_id = broker_id.lower().strip()
         if broker_id == "kis":
-            token = issue_kis_access_token()
-            order = {**context, "broker_order_id": broker_order_id}
-            return send_prepared_request(build_kis_cancel_order_request(order, access_token=token))
-        if broker_id == "binance":
-            return send_binance_signed_request(
-                lambda: build_binance_cancel_order_request(
-                    str(context.get("symbol") or ""),
-                    broker_order_id,
-                    client_order_id=bool(context.get("client_order_id")),
-                )
+            sealed_kill_intent = context.pop(
+                "_kis_kill_authority_intent", None
             )
-        if broker_id == "binance-futures":
-            return send_binance_signed_request(
-                lambda: build_binance_futures_cancel_order_request(
-                    str(context.get("symbol") or ""),
-                    broker_order_id,
-                    client_order_id=bool(
-                        context.get("client_order_id")
+            kill_revision = context.pop(
+                "_kis_kill_cancel_expected_revision", None
+            )
+            kill_requested = (
+                sealed_kill_intent is not None or kill_revision is not None
+            )
+            try:
+                preflight = kis_authenticated_mutation_preflight(
+                    mode="KILL_EXACT" if kill_requested else "ORDINARY",
+                    intent=(
+                        sealed_kill_intent
+                        if isinstance(sealed_kill_intent, Mapping)
+                        else None
                     ),
-                ),
-                futures=True,
-            )
+                    expected_revision=(
+                        kill_revision if type(kill_revision) is int else None
+                    ),
+                )
+                with preflight:
+                    token = issue_kis_access_token()
+                    order = {**context, "broker_order_id": broker_order_id}
+                    prepared = build_kis_cancel_order_request(
+                        order, access_token=token
+                    )
+                    domestic_cancel = (
+                        prepared.endpoint == KIS_DOMESTIC_CANCEL_ENDPOINT
+                    )
+                    operation = (
+                        "KILL_ORDINARY_CANCEL"
+                        if kill_requested
+                        else (
+                            "CANCEL_ORDER"
+                            if domestic_cancel
+                            else "OVERSEAS_CANCEL_ORDER"
+                        )
+                    )
+                    if operation == "KILL_ORDINARY_CANCEL" and not domestic_cancel:
+                        raise KisOrderAuthorityError(
+                            "KIS Kill ordinary cancel is restricted to an exact domestic order"
+                        )
+                    claim_id = (
+                        str(sealed_kill_intent.get("claimId") or "")
+                        if isinstance(sealed_kill_intent, Mapping)
+                        else "kis-ordinary-cancel-" + secrets.token_hex(16)
+                    )
+                    authority_intent = build_kis_mutation_authority_intent(
+                        prepared,
+                        operation=operation,
+                        claim_id=claim_id,
+                        owned_order_key=(
+                            {
+                                "orderDate": context.get("order_date"),
+                                "organizationNo": context.get("organization_no"),
+                                "orderNo": broker_order_id,
+                            }
+                            if domestic_cancel
+                            else None
+                        ),
+                    )
+                    if operation == "KILL_ORDINARY_CANCEL":
+                        if (
+                            not isinstance(sealed_kill_intent, Mapping)
+                            or dict(sealed_kill_intent) != authority_intent
+                            or type(kill_revision) is not int
+                        ):
+                            raise KisOrderAuthorityError(
+                                "KIS Kill-cancel reservation changed before broker edge"
+                            )
+                        boundary = kill_ordinary_kis_cancel_boundary(
+                            intent=authority_intent,
+                            expected_revision=kill_revision,
+                        )
+                    else:
+                        boundary = ordinary_kis_final_mutation_boundary(
+                            operation=operation,
+                            intent=authority_intent,
+                        )
+                    with boundary:
+                        return send_prepared_request(prepared)
+            except KisOrderAuthorityError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
+        if broker_id == "binance":
+            try:
+                with ordinary_binance_final_mutation_boundary(
+                    operation="SPOT_CANCEL_ORDER"
+                ):
+                    return send_binance_signed_request(
+                        lambda: build_binance_cancel_order_request(
+                            str(context.get("symbol") or ""),
+                            broker_order_id,
+                            client_order_id=bool(
+                                context.get("client_order_id")
+                            ),
+                        )
+                    )
+            except BinanceOrderAuthorityError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
+        if broker_id == "binance-futures":
+            try:
+                with ordinary_binance_final_mutation_boundary(
+                    operation="FUTURES_CANCEL_ORDER"
+                ):
+                    return send_binance_signed_request(
+                        lambda: build_binance_futures_cancel_order_request(
+                            str(context.get("symbol") or ""),
+                            broker_order_id,
+                            client_order_id=bool(
+                                context.get("client_order_id")
+                            ),
+                        ),
+                        futures=True,
+                    )
+            except BinanceOrderAuthorityError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
         if broker_id == "upbit":
-            return send_prepared_request(build_upbit_cancel_order_request(
+            prepared = build_upbit_cancel_order_request(
                 broker_order_id,
                 identifier=bool(context.get("identifier")),
-            ))
+            )
+            try:
+                with ordinary_upbit_final_mutation_boundary(
+                    operation="CANCEL_ORDER"
+                ):
+                    return send_prepared_request(prepared)
+            except UpbitOrderAuthorityError as exc:
+                raise BrokerNotReadyError(str(exc)) from exc
         raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
 
     def stream_executions(self, broker_id: str) -> dict[str, object]:
@@ -2858,20 +3782,21 @@ class LiveBrokerRouter:
     def poll_execution_events(self, broker_id: str) -> dict[str, object]:
         broker_id = broker_id.lower().strip()
         if broker_id == "kis":
-            token = issue_kis_access_token()
-            lookback_days = kis_execution_lookback_days()
-            query_end = datetime.now(_KIS_SEOUL).date()
-            query_start = query_end - timedelta(days=lookback_days - 1)
-            execution_payload = fetch_kis_domestic_order_truth(
-                token,
-                start_date=query_start.strftime("%Y%m%d"),
-                end_date=query_end.strftime("%Y%m%d"),
-            )
-            execution_truth = normalize_kis_domestic_order_truth(
-                execution_payload
-            )
-            domestic_payload = fetch_kis_domestic_balance(token)
-            overseas_payload = fetch_kis_overseas_balance(token)
+            with kis_read_diagnostic_boundary():
+                token = issue_kis_access_token()
+                lookback_days = kis_execution_lookback_days()
+                query_end = datetime.now(_KIS_SEOUL).date()
+                query_start = query_end - timedelta(days=lookback_days - 1)
+                execution_payload = fetch_kis_domestic_order_truth(
+                    token,
+                    start_date=query_start.strftime("%Y%m%d"),
+                    end_date=query_end.strftime("%Y%m%d"),
+                )
+                execution_truth = normalize_kis_domestic_order_truth(
+                    execution_payload
+                )
+                domestic_payload = fetch_kis_domestic_balance(token)
+                overseas_payload = fetch_kis_overseas_balance(token)
             accounts = parse_kis_accounts(domestic_payload)
             positions = [
                 *parse_kis_positions(domestic_payload),

@@ -115,6 +115,118 @@ def risk(**changes) -> FunctionalTestRiskSnapshot:
 
 
 class FunctionalTestSafetyAdapterTest(unittest.TestCase):
+    def test_us_live_requires_exact_route_hash_and_symbol_exchange_at_action_edge(self) -> None:
+        us_binding = FunctionalTestBinding(
+            strategy_artifact_id="strategy-f",
+            strategy_artifact_hash="d" * 64,
+            strategy_instance_id="standalone:strategy-f",
+            portfolio_required=False,
+            portfolio_artifact_id="",
+            portfolio_artifact_hash="",
+            portfolio_instance_id="",
+            account_id="kis-account-1",
+            symbols=("F",),
+            market_group="US_STOCK",
+            execution_route="KIS_US_LIVE_CONTINUOUS",
+            settlement_currency="USD",
+            exchanges=("NYSE",),
+            symbol_routes=(("F", "NYSE"),),
+        )
+        us_caps = FunctionalTestCaps(
+            max_order_quantity=1,
+            max_order_notional=50,
+            max_gross_exposure=50,
+            max_orders=2,
+            max_open_positions=1,
+            max_loss=2.5,
+        )
+        us_permit = issue_functional_test_permit(
+            binding=us_binding,
+            environment="KIS_LIVE",
+            duration_value=2,
+            duration_unit="HOURS",
+            caps=us_caps,
+            now=NOW,
+        )
+        activation = issue_live_activation_token(
+            permit=us_permit,
+            market_day_close=NOW + timedelta(hours=4),
+            authorized_by="operator-us",
+            now=NOW,
+        )
+        route_hash = us_permit.binding.snapshot()["routeScopeHash"]
+        metadata = {
+            "functional_test_strategy_artifact_id": "strategy-f",
+            "functional_test_strategy_artifact_hash": "d" * 64,
+            "functional_test_strategy_instance_id": "standalone:strategy-f",
+            "account_id": "kis-account-1",
+            "environment": "KIS_LIVE",
+            "marketGroup": "US_STOCK",
+            "executionRoute": "KIS_US_LIVE_CONTINUOUS",
+            "settlementCurrency": "USD",
+            "routeScopeHash": route_hash,
+            "exchange": "NYSE",
+        }
+        us_intent = OrderIntent(
+            strategy_id="strategy-f",
+            asset="미국주식",
+            symbol="F",
+            side="BUY",
+            quantity=1,
+            reference_price=12.5,
+            mode="SMALL_LIVE",
+            reason="functional-test-us",
+            metadata=metadata,
+        )
+        us_risk = FunctionalTestRiskSnapshot(
+            gross_exposure=0,
+            submitted_order_count=0,
+            open_position_count=0,
+            loss=0,
+            opens_new_position=True,
+            working_order_count=0,
+            reconciled=True,
+            observed_at="2026-08-05T00:00:30Z",
+        )
+
+        allowed = evaluate_functional_test_order(
+            us_permit,
+            current_binding=us_binding,
+            environment="KIS_LIVE",
+            intent=us_intent,
+            global_caps=us_caps,
+            risk=us_risk,
+            operator_confirmed=True,
+            live_activation_payload=activation,
+            now=NOW + timedelta(minutes=1),
+        )
+        self.assertTrue(allowed.allowed, allowed.to_dict())
+
+        wrong_exchange = replace(
+            us_intent,
+            metadata={**metadata, "exchange": "NASD"},
+        )
+        blocked = evaluate_functional_test_order(
+            us_permit,
+            current_binding=us_binding,
+            environment="KIS_LIVE",
+            intent=wrong_exchange,
+            global_caps=us_caps,
+            risk=us_risk,
+            operator_confirmed=True,
+            live_activation_payload=activation,
+            now=NOW + timedelta(minutes=1),
+        )
+        self.assertFalse(blocked.allowed)
+        self.assertIn(
+            "functional-test-intent-exchange-mismatch",
+            blocked.blocker_codes,
+        )
+        self.assertIn(
+            "functional-test-exchange-binding-mismatch",
+            blocked.blocker_codes,
+        )
+
     def test_demo_order_uses_stricter_of_global_and_permit_caps(self) -> None:
         report = evaluate_functional_test_order(
             permit(),

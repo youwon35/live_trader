@@ -370,6 +370,18 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             "ok": True,
             "results": {},
         }
+        cleanup_lock_observations: list[tuple[bool, bool, bool]] = []
+
+        def functional_cleanup() -> dict[str, object]:
+            cleanup_lock_observations.append(
+                (
+                    bool(state.SAFETY_CONFIRMATION_MUTATION_LOCK._is_owned()),
+                    state.UPBIT_ORDER_AUTHORITY_MUTATION_LOCK.owned_by_current_thread(),
+                    bool(state.RUNTIME_CONTROL_LOCK._is_owned()),
+                )
+            )
+            return {"ok": True, "state": "NO_ACTIVE_FUNCTIONAL_SESSION"}
+
         with (
             patch.object(state, "LIVE_CONTINUOUS_CONTROLLER", controller),
             patch.object(
@@ -389,13 +401,23 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             ) as stop_sessions,
             patch.object(
                 state,
-                "run_reconciliation",
+                "_run_reconciliation_without_public_fence",
                 return_value={"ok": True},
             ) as reconcile,
             patch.object(state, "append_audit"),
             patch.object(state, "queue_live_audit_telegram"),
             patch.object(state, "sync_operational_incident"),
             patch.object(state, "snapshot", return_value={}),
+            patch.object(
+                state,
+                "_upbit_functional_emergency_cleanup_after_latch",
+                side_effect=functional_cleanup,
+            ) as upbit_cleanup,
+            patch.object(
+                state,
+                "_binance_spot_functional_emergency_cleanup_after_latch",
+                side_effect=functional_cleanup,
+            ) as binance_cleanup,
         ):
             first = state.set_flag("kill_switch", True)
             second = state.recover_durable_emergency_stop()
@@ -414,6 +436,9 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             refresh_brokers=True,
             include_snapshot=False,
         )
+        upbit_cleanup.assert_called_once_with()
+        binance_cleanup.assert_called_once_with()
+        self.assertEqual([(False, False, False), (False, False, False)], cleanup_lock_observations)
 
     def test_api_recovery_applies_native_kill_cancel_reconcile_and_telegram_evidence(self) -> None:
         self.assertTrue(
@@ -460,7 +485,7 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             ),
             patch.object(
                 state,
-                "run_reconciliation",
+                "_run_reconciliation_without_public_fence",
                 return_value=reconciliation,
             ) as reconcile,
             patch.object(state, "persist_audit_event"),
@@ -518,7 +543,7 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             ),
             patch.object(
                 state,
-                "run_reconciliation",
+                "_run_reconciliation_without_public_fence",
                 return_value={"ok": True},
             ) as reconcile,
             patch.object(state, "append_audit", audit),

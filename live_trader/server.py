@@ -6,6 +6,7 @@ import json
 import math
 import mimetypes
 import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +15,11 @@ from urllib.parse import urlparse
 
 from . import env_settings, state
 from .functional_test_workspace import FUNCTIONAL_TEST_WORKSPACE
+from .functional_http_session import (
+    FunctionalHttpSessionAuthority,
+    FunctionalHttpSessionError,
+    normalize_loopback_bind_host,
+)
 from trading_runtime.artifact_metadata import ArtifactMetadataStore
 from trading_runtime.telegram_notifications import save_shared_telegram_settings, verify_telegram_connection
 
@@ -28,6 +34,24 @@ SHARED_SETTINGS_DIR = Path(os.getenv("APPDATA") or Path.home()) / "trading_progr
 STRATEGY_SEARCH_PRESETS_FILE = SHARED_SETTINGS_DIR / "strategy-search-presets.json"
 STRATEGY_SEARCH_PRESET_SCHEMA = "strategy-search-presets-v1"
 STRATEGY_SEARCH_PRESET_LIMIT = 30
+_FUNCTIONAL_STATUS_PATHS = frozenset(
+    {
+        "/api/upbit-functional/status",
+        "/api/binance-spot-functional/status",
+    }
+)
+_FUNCTIONAL_MUTATION_PATHS = frozenset(
+    {
+        "/api/safety-confirmation/challenge",
+        "/api/upbit-functional/start",
+        "/api/upbit-functional/stop",
+        "/api/upbit-functional/recover",
+        "/api/binance-spot-functional/start",
+        "/api/binance-spot-functional/stop",
+        "/api/binance-spot-functional/recover",
+    }
+)
+_FUNCTIONAL_BOOTSTRAP_PATH = "/__lt_native_bootstrap"
 
 
 def functional_test_control_scope() -> dict[str, object]:
@@ -370,6 +394,23 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if self.path.startswith("/") is False or parsed.scheme or parsed.netloc:
+            if parsed.path in (
+                _FUNCTIONAL_STATUS_PATHS
+                | _FUNCTIONAL_MUTATION_PATHS
+                | {_FUNCTIONAL_BOOTSTRAP_PATH}
+            ):
+                self._send_functional_http_denial(
+                    "absolute-form functional request targets are forbidden"
+                )
+                return
+        if parsed.path == _FUNCTIONAL_BOOTSTRAP_PATH:
+            self._handle_native_bootstrap(parsed)
+            return
+        if parsed.path in _FUNCTIONAL_STATUS_PATHS and not self._authorize_functional_http(
+            require_origin=False
+        ):
+            return
         if parsed.path == "/api/snapshot":
             from .soak_monitor import latest_live_soak_report
 
@@ -480,6 +521,14 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             }
             self.send_json(workspace)
             return
+        if parsed.path == "/api/upbit-functional/status":
+            self.send_json(state.upbit_functional_backend_state_status())
+            return
+        if parsed.path == "/api/binance-spot-functional/status":
+            self.send_json(
+                state.binance_spot_functional_backend_state_status()
+            )
+            return
         if parsed.path == "/api/soak-report/latest":
             from .soak_monitor import latest_live_soak_report
 
@@ -494,6 +543,18 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if self.path.startswith("/") is False or parsed.scheme or parsed.netloc:
+            if parsed.path in _FUNCTIONAL_STATUS_PATHS | _FUNCTIONAL_MUTATION_PATHS:
+                self._send_functional_http_denial(
+                    "absolute-form functional request targets are forbidden"
+                )
+                return
+        # Authenticate exact high-risk paths before reading any caller body.
+        # There is no CORS/preflight/bootstrap endpoint for these secrets.
+        if parsed.path in _FUNCTIONAL_MUTATION_PATHS and not self._authorize_functional_http(
+            require_origin=True
+        ):
+            return
         payload = self.read_json()
         if parsed.path == "/api/safety-confirmation/challenge":
             self.send_json(
@@ -600,6 +661,42 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 str(payload.get("deployment_id", "")),
                 str(payload.get("strategy_id", "")),
             ))
+            return
+        if parsed.path == "/api/upbit-functional/start":
+            self.send_json(
+                state.start_upbit_functional_backend_state(dict(payload))
+            )
+            return
+        if parsed.path == "/api/upbit-functional/stop":
+            self.send_json(
+                state.stop_upbit_functional_backend_state(dict(payload))
+            )
+            return
+        if parsed.path == "/api/upbit-functional/recover":
+            self.send_json(
+                state.recover_upbit_functional_backend_state(dict(payload))
+            )
+            return
+        if parsed.path == "/api/binance-spot-functional/start":
+            self.send_json(
+                state.start_binance_spot_functional_backend_state(
+                    dict(payload)
+                )
+            )
+            return
+        if parsed.path == "/api/binance-spot-functional/stop":
+            self.send_json(
+                state.stop_binance_spot_functional_backend_state(
+                    dict(payload)
+                )
+            )
+            return
+        if parsed.path == "/api/binance-spot-functional/recover":
+            self.send_json(
+                state.recover_binance_spot_functional_backend_state(
+                    dict(payload)
+                )
+            )
             return
         if parsed.path == "/api/upbit-smoke-preview":
             self.send_json(
@@ -848,6 +945,89 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         self.send_error(404, "Unknown API endpoint")
 
+    def do_OPTIONS(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path in _FUNCTIONAL_STATUS_PATHS | _FUNCTIONAL_MUTATION_PATHS:
+            self._send_functional_http_denial(
+                "functional HTTP CORS/preflight is forbidden"
+            )
+            return
+        self.send_error(404, "Unknown API endpoint")
+
+    def _functional_http_authority(self) -> FunctionalHttpSessionAuthority:
+        authority = getattr(
+            getattr(self, "server", None),
+            "functional_http_session_authority",
+            None,
+        )
+        if not isinstance(authority, FunctionalHttpSessionAuthority):
+            raise FunctionalHttpSessionError(
+                "trusted functional HTTP session is unavailable"
+            )
+        return authority
+
+    def _handle_native_bootstrap(self, parsed: object) -> None:
+        authority = self._functional_http_authority()
+        query = str(getattr(parsed, "query", "") or "")
+        expected_query = f"nonce={authority.bootstrap_nonce}"
+        host_headers = list(self.headers.get_all("Host") or [])
+        accepted = (
+            query == expected_query
+            and len(host_headers) == 1
+            and authority.consume_native_bootstrap(
+                nonce=query[len("nonce="):],
+                host_header=host_headers[0],
+                peer_host=(self.client_address or ("", 0))[0],
+            )
+        )
+        if not accepted:
+            self._send_functional_http_denial(
+                "native functional HTTP bootstrap is invalid or consumed"
+            )
+            return
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie", authority.set_cookie_header)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _authorize_functional_http(self, *, require_origin: bool) -> bool:
+        try:
+            authority = self._functional_http_authority()
+            authority.assert_request(
+                headers=self.headers,
+                peer_host=(self.client_address or ("", 0))[0],
+                require_origin=require_origin,
+            )
+        except (FunctionalHttpSessionError, AttributeError, TypeError) as exc:
+            self._send_functional_http_denial(str(exc))
+            return False
+        return True
+
+    def _send_functional_http_denial(self, reason: str) -> None:
+        body = json.dumps(
+            {
+                "ok": False,
+                "reason": "trusted-app-session-required",
+                "detail": str(reason or "functional HTTP request denied")[:240],
+                "brokerSubmissionPerformed": False,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.send_response(403)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format: str, *args: object) -> None:
         return
 
@@ -887,6 +1067,7 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(content)
 
@@ -901,8 +1082,23 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+
+def _assert_application_instance_lease_held() -> None:
+    """Reject embedded/standalone production servers without the app lease."""
+
+    from .process_safety import (  # pylint: disable=import-outside-toplevel
+        live_trader_instance_lease_status,
+    )
+
+    status = live_trader_instance_lease_status()
+    if status.get("acquired") is not True:
+        raise RuntimeError(
+            "Live Trader application-instance lease is not held by this process"
+        )
 
 
 def prepare_server_state() -> None:
@@ -911,14 +1107,34 @@ def prepare_server_state() -> None:
     # previous RUNNING state.
     from .daemon import read_daemon_status  # pylint: disable=import-outside-toplevel
 
+    _assert_application_instance_lease_held()
+
     state.disarm_real_orders_for_process_start(persist=True)
     read_daemon_status(persist=True)
     state.restore_runtime_from_checkpoint()
     state.recover_durable_emergency_stop()
+    state.prepare_upbit_functional_backend_state()
+    state.prepare_binance_spot_functional_backend_state()
 
 
 def bind_server(host: str, port: int) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), LiveTraderHandler)
+    normalized_host = normalize_loopback_bind_host(host)
+    _assert_application_instance_lease_held()
+    server_type: type[ThreadingHTTPServer] = ThreadingHTTPServer
+    if normalized_host == "::1":
+        class _IPv6LoopbackThreadingHTTPServer(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+        server_type = _IPv6LoopbackThreadingHTTPServer
+    server = server_type((normalized_host, port), LiveTraderHandler)
+    bound_host, bound_port = server.server_address[:2]
+    server.functional_http_session_authority = (  # type: ignore[attr-defined]
+        FunctionalHttpSessionAuthority.mint(
+            host=bound_host,
+            port=bound_port,
+        )
+    )
+    return server
 
 
 def create_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
@@ -965,7 +1181,10 @@ def start_in_thread(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tuple
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     start_watchdog_thread()
-    return server, f"http://{host}:{server.server_port}"
+    authority = getattr(server, "functional_http_session_authority", None)
+    if not isinstance(authority, FunctionalHttpSessionAuthority):
+        raise RuntimeError("trusted functional HTTP session is unavailable")
+    return server, authority.expected_origin
 
 
 def main() -> None:
@@ -983,7 +1202,13 @@ def main() -> None:
     args = parser.parse_args()
     server = create_server(args.host, args.port)
     start_watchdog_thread()
-    print(f"Live Trader server listening on http://{args.host}:{server.server_port}")
+    authority = getattr(server, "functional_http_session_authority", None)
+    origin = (
+        authority.expected_origin
+        if isinstance(authority, FunctionalHttpSessionAuthority)
+        else "unavailable"
+    )
+    print(f"Live Trader server listening on {origin}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

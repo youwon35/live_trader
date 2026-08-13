@@ -21,6 +21,9 @@ from zoneinfo import ZoneInfo
 from trading_runtime.functional_test import (
     FUNCTIONAL_TEST_MAX_DURATION_DAYS,
     FUNCTIONAL_TEST_MAX_LIVE_ACTIVATION_HOURS,
+    FUNCTIONAL_TEST_US_MAX_GROSS_EXPOSURE_USD,
+    FUNCTIONAL_TEST_US_MAX_LOSS_USD,
+    FUNCTIONAL_TEST_US_MAX_ORDER_NOTIONAL_USD,
     FunctionalTestBinding,
     FunctionalTestCaps,
     FunctionalTestContractError,
@@ -45,7 +48,13 @@ FUNCTIONAL_TEST_ENVIRONMENT = "KIS_LIVE"
 KST = ZoneInfo("Asia/Seoul")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DOMESTIC_SYMBOL = re.compile(r"^\d{6}$")
+_US_SYMBOL = re.compile(r"^[A-Z]{1,8}$")
 _SAFE_PERMIT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
+# This flips only after the live account-wide order truth, owned cancel/SELL,
+# and durable final-flat coordinator pass their integration suite.  Keeping
+# the candidate visible while blocked lets operators see the exact missing
+# release contract without granting real-money authority.
+FUNCTIONAL_TEST_US_LIVE_AVAILABLE = False
 LIVE_FUNCTIONAL_TEST_CAPS = FunctionalTestCaps(
     max_order_quantity=1,
     max_order_notional=100_000.0,
@@ -53,6 +62,14 @@ LIVE_FUNCTIONAL_TEST_CAPS = FunctionalTestCaps(
     max_orders=20,
     max_open_positions=3,
     max_loss=20_000.0,
+)
+US_LIVE_FUNCTIONAL_TEST_CAPS = FunctionalTestCaps(
+    max_order_quantity=1,
+    max_order_notional=FUNCTIONAL_TEST_US_MAX_ORDER_NOTIONAL_USD,
+    max_gross_exposure=FUNCTIONAL_TEST_US_MAX_GROSS_EXPOSURE_USD,
+    max_orders=2,
+    max_open_positions=1,
+    max_loss=FUNCTIONAL_TEST_US_MAX_LOSS_USD,
 )
 
 
@@ -65,6 +82,36 @@ def canonical_kis_domestic_symbol(value: object) -> str:
     if symbol.endswith((".KS", ".KQ")):
         symbol = symbol[:-3]
     return symbol if _DOMESTIC_SYMBOL.fullmatch(symbol) else ""
+
+
+def canonical_kis_us_symbol(value: object) -> str:
+    """Return an unqualified US cash-equity ticker or an empty string."""
+
+    symbol = str(value or "").strip().upper()
+    for prefix in ("NYSE:", "NASDAQ:", "AMEX:"):
+        if symbol.startswith(prefix):
+            symbol = symbol[len(prefix):]
+            break
+    return symbol if _US_SYMBOL.fullmatch(symbol) else ""
+
+
+def _us_exchange(value: Mapping[str, Any]) -> str:
+    parameters = value.get("parameters") if isinstance(value.get("parameters"), Mapping) else {}
+    trader_contract = (
+        value.get("traderContract")
+        if isinstance(value.get("traderContract"), Mapping)
+        else value.get("trader_contract")
+        if isinstance(value.get("trader_contract"), Mapping)
+        else {}
+    )
+    raw = str(
+        value.get("exchange")
+        or value.get("exchangeCode")
+        or trader_contract.get("exchange")
+        or parameters.get("exchange")
+        or ""
+    ).strip().upper()
+    return {"NYS": "NYSE", "NAS": "NASD", "AMS": "AMEX"}.get(raw, raw)
 
 
 def kis_account_binding_id(account_no: object, product_code: object) -> str:
@@ -129,12 +176,34 @@ def _integrity_blockers(value: object, artifact_hash: str) -> list[str]:
     return blockers
 
 
+def _route_sealed_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(binding)
+    route_scope = {
+        "marketGroup": str(result.get("marketGroup") or ""),
+        "executionRoute": str(result.get("executionRoute") or ""),
+        "settlementCurrency": str(result.get("settlementCurrency") or ""),
+        "symbolRoutes": list(result.get("symbolRoutes") or []),
+    }
+    result["routeScopeHash"] = hashlib.sha256(
+        json.dumps(
+            route_scope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return result
+
+
 def _strategy_candidate(strategy: Mapping[str, Any], account_id: str) -> dict[str, Any] | None:
-    symbol = canonical_kis_domestic_symbol(
+    raw_symbol = (
         strategy.get("execution_instrument")
         or strategy.get("instrument_id")
         or strategy.get("symbol")
     )
+    domestic_symbol = canonical_kis_domestic_symbol(raw_symbol)
+    us_symbol = canonical_kis_us_symbol(raw_symbol) if not domestic_symbol else ""
+    symbol = domestic_symbol or us_symbol
     broker = str(strategy.get("broker_id") or "").strip().lower()
     if broker and "kis" not in broker:
         return None
@@ -155,6 +224,18 @@ def _strategy_candidate(strategy: Mapping[str, Any], account_id: str) -> dict[st
         blockers.append("strategy-instance-id-required")
     if not account_id:
         blockers.append("kis-account-binding-required")
+    market_group = "US_STOCK" if us_symbol else "KR_STOCK"
+    exchange = _us_exchange(strategy) if us_symbol else "KRX"
+    timeframe = str(strategy.get("timeframe") or "-").strip().lower()
+    if us_symbol:
+        if symbol != "F":
+            blockers.append("functional-test-us-target-must-be-F")
+        if exchange != "NYSE":
+            blockers.append("functional-test-us-exchange-must-be-NYSE")
+        if timeframe != "5m":
+            blockers.append("functional-test-us-timeframe-must-be-5m")
+        if not FUNCTIONAL_TEST_US_LIVE_AVAILABLE:
+            blockers.append("functional-test-us-live-final-flat-not-released")
     key = f"strategy:{artifact_id}:{instance_id}:{artifact_hash}"
     binding = {
         "strategyArtifactId": artifact_id,
@@ -166,7 +247,27 @@ def _strategy_candidate(strategy: Mapping[str, Any], account_id: str) -> dict[st
         "portfolioInstanceId": "",
         "accountId": account_id,
         "symbols": [symbol],
+        "marketGroup": "KR_STOCK",
+        "executionRoute": "KIS_KR_DEMO_CONTINUOUS",
+        "settlementCurrency": "KRW",
+        "exchanges": ["KRX"],
+        "symbolRoutes": [{"symbol": symbol, "exchange": "KRX"}],
     }
+    if us_symbol:
+        binding.update(
+            {
+                "marketGroup": "US_STOCK",
+                "executionRoute": "KIS_US_LIVE_CONTINUOUS",
+                "settlementCurrency": "USD",
+                "exchanges": [exchange] if exchange else [],
+                "symbolRoutes": (
+                    [{"symbol": symbol, "exchange": exchange}]
+                    if exchange
+                    else []
+                ),
+            }
+        )
+    binding = _route_sealed_binding(binding)
     return {
         "key": key,
         "kind": "STRATEGY",
@@ -174,8 +275,19 @@ def _strategy_candidate(strategy: Mapping[str, Any], account_id: str) -> dict[st
         "strategyId": strategy_id,
         "runtimeStrategyId": strategy_id,
         "portfolioId": "",
-        "timeframe": str(strategy.get("timeframe") or "-").strip(),
+        "timeframe": timeframe,
         "symbols": [symbol],
+        "marketGroup": market_group,
+        "executionRoute": (
+            "KIS_US_LIVE_CONTINUOUS" if us_symbol else "KIS_KR_LIVE"
+        ),
+        "settlementCurrency": "USD" if us_symbol else "KRW",
+        "exchanges": [exchange],
+        "functionalTestCaps": (
+            US_LIVE_FUNCTIONAL_TEST_CAPS.snapshot()
+            if us_symbol
+            else LIVE_FUNCTIONAL_TEST_CAPS.snapshot()
+        ),
         "artifactId": artifact_id,
         "artifactHash": artifact_hash,
         "instanceId": instance_id,
@@ -251,7 +363,16 @@ def _portfolio_candidate(portfolio: Mapping[str, Any], account_id: str) -> dict[
         "portfolioInstanceId": instance_id,
         "accountId": account_id,
         "symbols": symbols,
+        "marketGroup": "KR_STOCK",
+        "executionRoute": "KIS_KR_DEMO_CONTINUOUS",
+        "settlementCurrency": "KRW",
+        "exchanges": ["KRX"],
+        "symbolRoutes": [
+            {"symbol": symbol, "exchange": "KRX"}
+            for symbol in symbols
+        ],
     }
+    binding = _route_sealed_binding(binding)
     return {
         "key": key,
         "kind": "PORTFOLIO",
@@ -595,6 +716,7 @@ class FunctionalTestWorkspace:
                     "선택 아티팩트의 exact binding을 만들 수 없습니다: "
                     + ", ".join(candidate.get("blockers") or [])
                 )
+            is_us_live = candidate.get("marketGroup") == "US_STOCK"
             raw_duration_value = payload.get("durationValue", 6)
             if isinstance(raw_duration_value, bool) or not isinstance(
                 raw_duration_value, int
@@ -602,7 +724,13 @@ class FunctionalTestWorkspace:
                 return self._failure("시험 시간은 정수여야 합니다.")
             duration_value = raw_duration_value
             duration_unit = str(payload.get("durationUnit") or "HOURS").upper()
+            if is_us_live and (duration_value != 2 or duration_unit != "HOURS"):
+                return self._failure(
+                    "미국주식 실전 기능시험은 안전 계약상 정확히 2시간만 허용합니다."
+                )
             binding_payload = candidate["binding"]
+            symbol_routes = binding_payload.get("symbolRoutes")
+            symbol_routes = symbol_routes if isinstance(symbol_routes, list) else []
             binding = FunctionalTestBinding(
                 strategy_artifact_id=str(binding_payload["strategyArtifactId"]),
                 strategy_artifact_hash=str(binding_payload["strategyArtifactHash"]),
@@ -613,6 +741,22 @@ class FunctionalTestWorkspace:
                 portfolio_instance_id=str(binding_payload["portfolioInstanceId"]),
                 account_id=str(binding_payload["accountId"]),
                 symbols=tuple(str(item) for item in binding_payload["symbols"]),
+                market_group=str(binding_payload.get("marketGroup") or ""),
+                execution_route=str(binding_payload.get("executionRoute") or ""),
+                settlement_currency=str(
+                    binding_payload.get("settlementCurrency") or ""
+                ),
+                exchanges=tuple(
+                    str(item) for item in binding_payload.get("exchanges") or []
+                ),
+                symbol_routes=tuple(
+                    (
+                        str(item.get("symbol") or ""),
+                        str(item.get("exchange") or ""),
+                    )
+                    for item in symbol_routes
+                    if isinstance(item, Mapping)
+                ),
             )
             try:
                 permit = issue_functional_test_permit(
@@ -620,7 +764,11 @@ class FunctionalTestWorkspace:
                     environment=FunctionalTestEnvironment.KIS_LIVE,
                     duration_value=duration_value,
                     duration_unit=FunctionalTestDurationUnit(duration_unit),
-                    caps=LIVE_FUNCTIONAL_TEST_CAPS,
+                    caps=(
+                        US_LIVE_FUNCTIONAL_TEST_CAPS
+                        if is_us_live
+                        else LIVE_FUNCTIONAL_TEST_CAPS
+                    ),
                     now=self._now(),
                 )
             except (FunctionalTestContractError, ValueError) as exc:
@@ -674,28 +822,36 @@ class FunctionalTestWorkspace:
                 return self._failure(
                     "오늘의 활성화가 이미 유효합니다. 기존 토큰을 교체할 수 없습니다."
                 )
-            local_now = now.astimezone(KST)
             try:
+                permit = parse_functional_test_permit(
+                    read_functional_test_document(self.current_permit_path)
+                )
+                us_live = permit.binding.market_group == "US_STOCK"
+                calendar_id = "XNYS" if us_live else "XKRX"
+                market_label = "미국" if us_live else "KRX"
+                market_zone = (
+                    ZoneInfo("America/New_York") if us_live else KST
+                )
                 market_open, market_close = session_bounds_utc(
-                    "XKRX",
-                    local_now.date(),
+                    calendar_id,
+                    now.astimezone(market_zone).date(),
                 )
             except (OSError, ValueError) as exc:
                 return self._failure(
-                    "오늘은 XKRX 공식 캘린더의 거래 세션이 아니거나 "
+                    f"오늘은 {calendar_id if 'calendar_id' in locals() else ''} "
+                    "공식 캘린더의 거래 세션이 아니거나 "
                     "캘린더 범위 밖이어서 당일 활성화를 차단했습니다: "
                     f"{type(exc).__name__}"
                 )
             if now < market_open:
                 return self._failure(
-                    "오늘 KRX 정규장이 아직 시작되지 않아 당일 활성화할 수 없습니다."
+                    f"오늘 {market_label} 정규장이 아직 시작되지 않아 당일 활성화할 수 없습니다."
                 )
             if market_close <= now:
-                return self._failure("오늘 KRX 정규장이 종료되어 당일 활성화할 수 없습니다.")
-            try:
-                permit = parse_functional_test_permit(
-                    read_functional_test_document(self.current_permit_path)
+                return self._failure(
+                    f"오늘 {market_label} 정규장이 종료되어 당일 활성화할 수 없습니다."
                 )
+            try:
                 target_key = str(control.get("selectedTargetKey") or "")
                 current_candidate = next(
                     (
@@ -896,8 +1052,11 @@ FUNCTIONAL_TEST_WORKSPACE = FunctionalTestWorkspace()
 __all__ = [
     "FUNCTIONAL_TEST_WORKSPACE",
     "FUNCTIONAL_TEST_WORKSPACE_SCHEMA_VERSION",
+    "FUNCTIONAL_TEST_US_LIVE_AVAILABLE",
     "LIVE_FUNCTIONAL_TEST_CAPS",
+    "US_LIVE_FUNCTIONAL_TEST_CAPS",
     "FunctionalTestWorkspace",
     "canonical_kis_domestic_symbol",
+    "canonical_kis_us_symbol",
     "kis_account_binding_id",
 ]

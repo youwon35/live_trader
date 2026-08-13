@@ -128,6 +128,51 @@ try {
   });
   const challengeExpiry = () => new Date(Date.now() + 60_000).toISOString();
 
+  const functionalRequests = [];
+  globalThis.fetch = async (path, options) => {
+    functionalRequests.push({ path, options });
+    return jsonResponse({ ok: true });
+  };
+  await request("/api/binance-spot-functional/status");
+  assert.equal(
+    functionalRequests.length,
+    1,
+    "protected GET must rely on the HttpOnly cookie without touching the native bridge",
+  );
+  await assert.rejects(
+    request("/api/binance-spot-functional/stop", { method: "POST", body: {} }),
+    (error) => error.code === "TRUSTED_APP_SESSION_UNAVAILABLE",
+  );
+  assert.equal(
+    functionalRequests.length,
+    1,
+    "missing native CSRF bridge must fail before network mutation",
+  );
+  let functionalBridgeCalls = 0;
+  globalThis.pywebview = {
+    api: {
+      functional_http_session: async () => {
+        functionalBridgeCalls += 1;
+        return {
+          ok: true,
+          available: true,
+          csrfHeader: "X-LiveTrader-CSRF",
+          csrfToken: "csrf-token-that-is-long-enough-for-the-native-boundary",
+        };
+      },
+    },
+  };
+  await request("/api/binance-spot-functional/stop", { method: "POST", body: {} });
+  assert.equal(
+    functionalBridgeCalls,
+    1,
+    "a later native bridge must recover after an unavailable first attempt",
+  );
+  assert.equal(
+    functionalRequests.at(-1).options.headers["X-LiveTrader-CSRF"],
+    "csrf-token-that-is-long-enough-for-the-native-boundary",
+  );
+
   let presentedChallenge = null;
   let safetyRequests = [];
   unregisterSafetyPresenter = registerSafetyConfirmationPresenter(async (challenge) => {

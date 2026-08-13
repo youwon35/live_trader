@@ -160,7 +160,10 @@ class LiveContinuousController:
                         "snapshot": state.snapshot(),
                     }
                 if normalized_purpose == state.FUNCTIONAL_TEST_EXECUTION_PURPOSE:
-                    functional_blocker = self._functional_test_spec_blocker(specs)
+                    functional_blocker = self._functional_test_spec_blocker(
+                        specs,
+                        functional_context,
+                    )
                     if functional_blocker:
                         return {
                             "ok": False,
@@ -343,7 +346,14 @@ class LiveContinuousController:
                     "snapshot": state.snapshot(),
                 }
             if normalized_purpose == state.FUNCTIONAL_TEST_EXECUTION_PURPOSE:
-                functional_blocker = self._functional_test_spec_blocker(specs)
+                functional_blocker = self._functional_test_spec_blocker(
+                    specs,
+                    (
+                        functional_scope.get("binding")
+                        if isinstance(functional_scope.get("binding"), dict)
+                        else functional_context
+                    ),
+                )
                 if functional_blocker:
                     return {
                         "ok": False,
@@ -650,7 +660,59 @@ class LiveContinuousController:
         )
 
     @staticmethod
-    def _functional_test_spec_blocker(specs: tuple[Any, ...]) -> str:
+    def _functional_test_spec_blocker(
+        specs: tuple[Any, ...],
+        route_binding: dict[str, Any] | None = None,
+    ) -> str:
+        binding = route_binding if isinstance(route_binding, dict) else {}
+        market_group = str(binding.get("marketGroup") or "").strip().upper()
+        if market_group == "US_STOCK":
+            symbol_routes = binding.get("symbolRoutes")
+            exact_route = (
+                str(binding.get("executionRoute") or "")
+                == "KIS_US_LIVE_CONTINUOUS"
+                and str(binding.get("settlementCurrency") or "") == "USD"
+                and list(binding.get("exchanges") or []) == ["NYSE"]
+                and symbol_routes == [{"symbol": "F", "exchange": "NYSE"}]
+                and len(str(binding.get("routeScopeHash") or "")) == 64
+            )
+            if not exact_route:
+                return "US FUNCTIONAL_TEST exact F/NYSE/USD route binding이 필요합니다."
+            if binding.get("portfolioRequired") is True or len(specs) != 1:
+                return "US FUNCTIONAL_TEST는 F 단일 Strategy만 허용합니다."
+            spec = specs[0]
+            artifact = spec.artifact if isinstance(spec.artifact, dict) else {}
+            parameters = (
+                spec.parameters if isinstance(spec.parameters, dict) else {}
+            )
+            trader_contract = (
+                artifact.get("traderContract")
+                if isinstance(artifact.get("traderContract"), dict)
+                else artifact.get("trader_contract")
+                if isinstance(artifact.get("trader_contract"), dict)
+                else {}
+            )
+            raw_exchange = str(
+                artifact.get("exchange")
+                or artifact.get("exchangeCode")
+                or trader_contract.get("exchange")
+                or parameters.get("exchange")
+                or ""
+            ).strip().upper()
+            exchange = {
+                "NYS": "NYSE",
+                "NAS": "NASD",
+                "AMS": "AMEX",
+            }.get(raw_exchange, raw_exchange)
+            raw_symbol = str(spec.symbol or "").strip().upper()
+            symbol = raw_symbol.removeprefix("NYSE:")
+            if str(spec.broker_id or "").strip().lower() != "kis":
+                return "US FUNCTIONAL_TEST는 KIS broker route만 허용합니다."
+            if symbol != "F" or exchange != "NYSE":
+                return "US FUNCTIONAL_TEST runtime은 exact F/NYSE만 허용합니다."
+            if str(spec.timeframe or "").strip().lower() != "5m":
+                return "US FUNCTIONAL_TEST runtime은 exact 5m Strategy만 허용합니다."
+            return ""
         for spec in specs:
             broker_id = str(spec.broker_id or "").strip().lower()
             symbol = str(spec.symbol or "").strip().upper()
@@ -1723,7 +1785,12 @@ class LiveContinuousController:
                 },
             )
             checks = state.snapshot()
-            result = state.submit_order_intent(checks, intent, dry_run=bool(state.STATE["dry_run"]), audit_event="Continuous Runtime")
+            result = state.submit_order_intent(
+                checks,
+                intent,
+                dry_run=bool(state.STATE["dry_run"]),
+                audit_event="Continuous Runtime",
+            )
             results.append({"strategyId": decision.strategy_id, "signal": decision.signal, "action": result.get("reason"), "ok": result.get("ok")})
         return {"mode": self.mode, "profileId": self.profile_id, "results": results}
 

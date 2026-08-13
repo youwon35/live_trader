@@ -107,6 +107,15 @@ _BINDING_ALIASES = {
     ),
     "account_id": ("account_id", "accountId"),
     "symbols": ("symbols", "allowedSymbols"),
+    "market_group": ("market_group", "marketGroup"),
+    "execution_route": ("execution_route", "executionRoute"),
+    "settlement_currency": (
+        "settlement_currency",
+        "settlementCurrency",
+    ),
+    "exchanges": ("exchanges",),
+    "symbol_routes": ("symbol_routes", "symbolRoutes"),
+    "route_scope_hash": ("route_scope_hash", "routeScopeHash"),
 }
 _INTENT_BINDING_ALIASES = {
     **_BINDING_ALIASES,
@@ -692,6 +701,14 @@ def _assert_shared_action_allowed(
             effective_observation.get("openPositionCountAfter") or 0
         ),
         cumulative_loss=float(effective_observation.get("loss") or 0.0),
+        exchange=str(
+            _first(
+                _object_payload(_value(intent, "metadata", {})),
+                "exchange",
+                "exchangeCode",
+            )
+            or ""
+        ),
         live_activation=live_activation_payload,
     )
 
@@ -924,12 +941,29 @@ def _binding_blockers(
     current_binding: Mapping[str, Any],
 ) -> list[FunctionalTestBlocker]:
     blockers: list[FunctionalTestBlocker] = []
+    route_fields = {
+        "market_group",
+        "execution_route",
+        "settlement_currency",
+        "exchanges",
+        "symbol_routes",
+        "route_scope_hash",
+    }
+    us_route = "US_STOCK" in {
+        str(permit_binding.get("market_group") or "").upper(),
+        str(current_binding.get("market_group") or "").upper(),
+    }
     for field_name in _BINDING_ALIASES:
+        if field_name in route_fields and not us_route:
+            continue
         permit_value = permit_binding.get(field_name)
         current_value = current_binding.get(field_name)
-        if field_name == "symbols":
+        if field_name in {"symbols", "exchanges", "symbol_routes"}:
             permit_symbols = _symbols(permit_value)
             current_symbols = _symbols(current_value)
+            if field_name == "symbol_routes":
+                permit_symbols = _symbol_routes(permit_value)
+                current_symbols = _symbol_routes(current_value)
             if permit_symbols != current_symbols:
                 blockers.append(
                     _blocker(
@@ -1033,6 +1067,55 @@ def _intent_binding_blockers(
                 source="order-intent",
             )
         )
+    if str(binding.get("market_group") or "") == "US_STOCK":
+        route_fields = {
+            "market_group": "functional-test-market-group",
+            "execution_route": "functional-test-execution-route",
+            "settlement_currency": "functional-test-settlement-currency",
+            "route_scope_hash": "functional-test-route-scope-hash",
+        }
+        for field_name, code_prefix in route_fields.items():
+            expected = str(binding.get(field_name) or "")
+            observed = str(
+                _first(metadata, *_BINDING_ALIASES[field_name]) or ""
+            ).strip().upper() if field_name != "route_scope_hash" else str(
+                _first(metadata, *_BINDING_ALIASES[field_name]) or ""
+            ).strip().lower()
+            compared_expected = (
+                expected.lower()
+                if field_name == "route_scope_hash"
+                else expected.upper()
+            )
+            if not observed:
+                blockers.append(
+                    _blocker(
+                        code_prefix + "-missing",
+                        f"US order intent must bind {field_name}",
+                        source="order-intent",
+                    )
+                )
+            elif observed != compared_expected:
+                blockers.append(
+                    _blocker(
+                        code_prefix + "-mismatch",
+                        f"expected={compared_expected!r}, observed={observed!r}",
+                        source="order-intent",
+                    )
+                )
+        expected_exchange = dict(
+            _symbol_routes(binding.get("symbol_routes"))
+        ).get(symbol, "")
+        observed_exchange = str(
+            _first(metadata, "exchange", "exchangeCode") or ""
+        ).strip().upper()
+        if not expected_exchange or observed_exchange != expected_exchange:
+            blockers.append(
+                _blocker(
+                    "functional-test-intent-exchange-mismatch",
+                    f"expected={expected_exchange!r}, observed={observed_exchange!r}",
+                    source="order-intent",
+                )
+            )
     side = str(intent.get("side") or "").strip().upper()
     if side not in {"BUY", "SELL"}:
         blockers.append(
@@ -1067,16 +1150,25 @@ def _intent_binding_blockers(
 
 def _binding_payload(value: Any) -> dict[str, Any]:
     payload = _object_payload(value)
-    return {
-        field_name: (
-            _symbols(_first(payload, *aliases))
-            if field_name == "symbols"
-            else bool(_first(payload, *aliases))
-            if field_name == "portfolio_required"
-            else str(_first(payload, *aliases) or "")
-        )
-        for field_name, aliases in _BINDING_ALIASES.items()
-    }
+    snapshot = getattr(value, "snapshot", None)
+    if callable(snapshot):
+        snap = snapshot()
+        if isinstance(snap, Mapping):
+            # FunctionalTestBinding computes routeScopeHash in snapshot(); it
+            # is deliberately not a caller-supplied dataclass field.
+            payload = {**payload, **dict(snap)}
+    result: dict[str, Any] = {}
+    for field_name, aliases in _BINDING_ALIASES.items():
+        raw = _first(payload, *aliases)
+        if field_name in {"symbols", "exchanges"}:
+            result[field_name] = _symbols(raw)
+        elif field_name == "symbol_routes":
+            result[field_name] = _symbol_routes(raw)
+        elif field_name == "portfolio_required":
+            result[field_name] = bool(raw)
+        else:
+            result[field_name] = str(raw or "")
+    return result
 
 
 def _intent_payload(intent: Any) -> dict[str, Any]:
@@ -1140,6 +1232,23 @@ def _symbols(value: Any) -> tuple[str, ...]:
             }
         )
     )
+
+
+def _symbol_routes(value: Any) -> tuple[tuple[str, str], ...]:
+    values = list(value) if isinstance(value, (list, tuple)) else []
+    routes: list[tuple[str, str]] = []
+    for item in values:
+        if isinstance(item, Mapping):
+            symbol = str(item.get("symbol") or "").strip().upper()
+            exchange = str(item.get("exchange") or "").strip().upper()
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            symbol = str(item[0] or "").strip().upper()
+            exchange = str(item[1] or "").strip().upper()
+        else:
+            continue
+        if symbol and exchange:
+            routes.append((symbol, exchange))
+    return tuple(sorted(set(routes)))
 
 
 def _numeric_cap(payload: Mapping[str, Any], name: str) -> float | None:

@@ -10,7 +10,12 @@ from live_trader.server import bind_server
 
 class ServerResilienceTest(unittest.TestCase):
     def test_slow_broker_refresh_does_not_block_snapshot_health(self) -> None:
-        server = bind_server("127.0.0.1", 0)
+        # Embedded sockets are test-only. Production bind_server requires the
+        # retained machine-global Live Trader application lease.
+        with patch(
+            "live_trader.server._assert_application_instance_lease_held"
+        ):
+            server = bind_server("127.0.0.1", 0)
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
         entered = threading.Event()

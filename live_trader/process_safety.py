@@ -228,6 +228,34 @@ def hold_live_trader_instance_lease() -> dict[str, object]:
     return hold_process_lease("live-trader:application-instance:v1")
 
 
+def held_process_lease_status(scope: str) -> dict[str, object]:
+    """Return only this process's retained lease state.
+
+    Reading the diagnostic lock file is not authority: another process can
+    exit between the read and a mutation.  Production-only composition uses
+    this helper to prove that the current process already owns the retained
+    kernel lease acquired by the official application entrypoint.
+    """
+
+    normalized = str(scope or "").strip().lower()
+    if not normalized:
+        return {"acquired": False, "reason": "process-lease-scope-missing"}
+    with _HELD_LEASES_LOCK:
+        lease = _HELD_LEASES.get(normalized)
+        if lease is None or lease.handle.closed:
+            return {
+                "acquired": False,
+                "reason": "process-lease-not-held-by-current-process",
+            }
+        return lease.status(reused=True)
+
+
+def live_trader_instance_lease_status() -> dict[str, object]:
+    """Prove current-process ownership of the official application lease."""
+
+    return held_process_lease_status("live-trader:application-instance:v1")
+
+
 def hold_kis_dispatch_lease(
     account_fingerprint: str,
     *,

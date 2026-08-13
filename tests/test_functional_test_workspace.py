@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from live_trader.functional_test_workspace import (
     FunctionalTestWorkspace,
     canonical_kis_domestic_symbol,
+    canonical_kis_us_symbol,
     kis_account_binding_id,
 )
 
@@ -73,6 +75,29 @@ def environment() -> dict[str, str]:
     }
 
 
+def us_catalog() -> dict[str, object]:
+    return {
+        "strategies": [
+            {
+                "strategy_id": "us-f-5m-functional",
+                "name": "F 5m Functional",
+                "broker_id": "kis",
+                "provider": "yahoo",
+                "symbol": "F",
+                "exchange": "NYSE",
+                "timeframe": "5m",
+                "strategy_instance_id": "standalone:us-f-5m-functional",
+                "artifact_reference": {
+                    "artifactId": "strategy-us-f-5m-functional",
+                    "artifactHash": "d" * 64,
+                },
+                "artifact_integrity": {"valid": True},
+            }
+        ],
+        "portfolios": [],
+    }
+
+
 class FunctionalTestWorkspaceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
@@ -125,6 +150,92 @@ class FunctionalTestWorkspaceTests(unittest.TestCase):
         self.assertFalse(permit["promotionEligible"])
         self.assertFalse(result["brokerSubmissionPerformed"])
         self.assertTrue(self.workspace.current_permit_path.exists())
+
+    def test_us_f_nyse_candidate_is_visible_but_release_blocked(self) -> None:
+        workspace = FunctionalTestWorkspace(
+            root=Path(self.temporary.name) / "us-blocked",
+            now_provider=lambda: datetime(2026, 8, 5, 15, 0, tzinfo=timezone.utc),
+            catalog_provider=us_catalog,
+            environment_provider=environment,
+        )
+
+        target = workspace.snapshot()["candidates"][0]
+
+        self.assertEqual("US_STOCK", target["marketGroup"])
+        self.assertEqual("KIS_US_LIVE_CONTINUOUS", target["executionRoute"])
+        self.assertEqual(["NYSE"], target["exchanges"])
+        self.assertEqual(50.0, target["functionalTestCaps"]["maxOrderNotional"])
+        self.assertEqual(2.5, target["functionalTestCaps"]["maxLoss"])
+        self.assertFalse(target["available"])
+        self.assertIn(
+            "functional-test-us-live-final-flat-not-released",
+            target["blockers"],
+        )
+        self.assertFalse(
+            workspace.create_permit(
+                {
+                    "targetKey": target["key"],
+                    "durationValue": 2,
+                    "durationUnit": "HOURS",
+                }
+            )["ok"]
+        )
+
+    def test_released_us_f_permit_is_exact_two_hours_and_uses_xnys(self) -> None:
+        now = datetime(2026, 8, 5, 15, 0, tzinfo=timezone.utc)  # 11:00 EDT
+        workspace = FunctionalTestWorkspace(
+            root=Path(self.temporary.name) / "us-released",
+            now_provider=lambda: now,
+            catalog_provider=us_catalog,
+            environment_provider=environment,
+        )
+        with patch(
+            "live_trader.functional_test_workspace.FUNCTIONAL_TEST_US_LIVE_AVAILABLE",
+            True,
+        ):
+            target = workspace.snapshot()["candidates"][0]
+            wrong_duration = workspace.create_permit(
+                {
+                    "targetKey": target["key"],
+                    "durationValue": 3,
+                    "durationUnit": "HOURS",
+                }
+            )
+            self.assertFalse(wrong_duration["ok"])
+            self.assertIn("정확히 2시간", wrong_duration["reason"])
+
+            created = workspace.create_permit(
+                {
+                    "targetKey": target["key"],
+                    "durationValue": 2,
+                    "durationUnit": "HOURS",
+                }
+            )
+            self.assertTrue(created["ok"])
+            permit = created["workspace"]["current"]["permit"]
+            self.assertEqual("KIS_LIVE", permit["environment"])
+            self.assertEqual("US_STOCK", permit["binding"]["marketGroup"])
+            self.assertEqual(
+                "KIS_US_LIVE_CONTINUOUS",
+                permit["binding"]["executionRoute"],
+            )
+            self.assertEqual(
+                [{"symbol": "F", "exchange": "NYSE"}],
+                permit["binding"]["symbolRoutes"],
+            )
+            self.assertEqual(50.0, permit["caps"]["maxGrossExposure"])
+            self.assertEqual(2.5, permit["caps"]["maxLoss"])
+
+            activated = workspace.activate_today(
+                {"authorizedBy": "operator-us", "confirmed": True}
+            )
+            self.assertTrue(activated["ok"])
+            # The exact two-hour permit ends before XNYS close and therefore
+            # bounds the daily activation as well.
+            self.assertEqual(
+                "2026-08-05T17:00:00.000000Z",
+                activated["workspace"]["current"]["activation"]["expiresAt"],
+            )
 
     def test_portfolio_permit_binds_all_domestic_symbols(self) -> None:
         target = next(
@@ -380,6 +491,8 @@ class FunctionalTestWorkspaceTests(unittest.TestCase):
         self.assertEqual("069500", canonical_kis_domestic_symbol("KRX:069500"))
         self.assertEqual("069500", canonical_kis_domestic_symbol("069500.KS"))
         self.assertEqual("", canonical_kis_domestic_symbol("BTCUSDT"))
+        self.assertEqual("F", canonical_kis_us_symbol("NYSE:F"))
+        self.assertEqual("", canonical_kis_us_symbol("BTC-USDT"))
         self.assertEqual(
             kis_account_binding_id("1234-5678", "01"),
             kis_account_binding_id("12345678", "01"),

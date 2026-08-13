@@ -12,6 +12,68 @@ export const SAFETY_CONFIRMATION_ACTIONS = Object.freeze({
 
 let safetyConfirmationPresenter = null;
 let activeSafetyConfirmationFlow = null;
+let functionalHttpSessionPromise = null;
+const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
+  "/api/safety-confirmation/challenge",
+  "/api/upbit-functional/start",
+  "/api/upbit-functional/stop",
+  "/api/upbit-functional/recover",
+  "/api/binance-spot-functional/start",
+  "/api/binance-spot-functional/stop",
+  "/api/binance-spot-functional/recover",
+]);
+const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
+  ...FUNCTIONAL_HTTP_MUTATION_PATHS,
+  "/api/upbit-functional/status",
+  "/api/binance-spot-functional/status",
+]);
+
+async function trustedFunctionalHttpHeaders(path, method) {
+  if (!FUNCTIONAL_HTTP_SESSION_PATHS.has(path)) {
+    return {};
+  }
+  if (String(method || "GET").toUpperCase() === "GET") {
+    // The browser supplies the HttpOnly app-session cookie. A status poll must
+    // never touch (or poison) the native CSRF bridge cache.
+    return {};
+  }
+  if (!functionalHttpSessionPromise) {
+    functionalHttpSessionPromise = (async () => {
+      const bridge = globalThis.window?.pywebview?.api;
+      if (typeof bridge?.functional_http_session !== "function") {
+        throw new ApiRequestError(
+          "네이티브 앱 안전 세션을 확인할 수 없습니다.",
+          "TRUSTED_APP_SESSION_UNAVAILABLE",
+        );
+      }
+      const value = await bridge.functional_http_session();
+      if (
+        value?.ok !== true
+        || value?.available !== true
+        || value?.csrfHeader !== "X-LiveTrader-CSRF"
+        || typeof value?.csrfToken !== "string"
+        || value.csrfToken.length < 40
+        || Object.hasOwn(value, "appSessionToken")
+      ) {
+        throw new ApiRequestError(
+          "네이티브 앱 안전 세션을 확인할 수 없습니다.",
+          "TRUSTED_APP_SESSION_UNAVAILABLE",
+        );
+      }
+      return value.csrfToken;
+    })();
+  }
+  try {
+    const csrfToken = await functionalHttpSessionPromise;
+    return { "X-LiveTrader-CSRF": csrfToken };
+  } catch (error) {
+    // WebView can expose the bridge shortly after the first render. Do not
+    // permanently cache an unavailable/rejected bridge; every attempt remains
+    // fail-closed until a valid native CSRF value is returned.
+    functionalHttpSessionPromise = null;
+    throw error;
+  }
+}
 
 export class ApiRequestError extends Error {
   constructor(message, code, options = {}) {
@@ -624,9 +686,12 @@ export async function request(path, options = {}) {
   const timeoutMs = options.timeoutMs ?? API_DEFAULT_TIMEOUT_MS;
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
+    const method = options.method ?? "GET";
+    const functionalHeaders = await trustedFunctionalHttpHeaders(path, method);
     const response = await fetch(path, {
-      method: options.method ?? "GET",
-      headers: { "Content-Type": "application/json" },
+      method,
+      headers: { "Content-Type": "application/json", ...functionalHeaders },
+      credentials: "same-origin",
       body: options.body ? JSON.stringify(options.body) : undefined,
       signal: controller.signal,
     });

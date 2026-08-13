@@ -29,6 +29,161 @@ from trading_runtime.functional_test import (
 
 
 class FunctionalTestOrderIntegrationTest(unittest.TestCase):
+    @staticmethod
+    def us_live_binding() -> FunctionalTestBinding:
+        return FunctionalTestBinding(
+            strategy_artifact_id="strategy-us-f-5m-functional",
+            strategy_artifact_hash="d" * 64,
+            strategy_instance_id="standalone:us-f-5m-functional",
+            portfolio_required=False,
+            portfolio_artifact_id="",
+            portfolio_artifact_hash="",
+            portfolio_instance_id="",
+            account_id="kis-live-account-hash",
+            symbols=("F",),
+            market_group="US_STOCK",
+            execution_route="KIS_US_LIVE_CONTINUOUS",
+            settlement_currency="USD",
+            exchanges=("NYSE",),
+            symbol_routes=(("F", "NYSE"),),
+        )
+
+    @staticmethod
+    def us_live_strategy(*, exchange: str = "NYSE") -> dict:
+        return {
+            "strategy_id": "strategy-us-f-5m-functional",
+            "strategy_instance_id": "standalone:us-f-5m-functional",
+            "broker_id": "kis",
+            "provider": "yahoo",
+            "symbol": "F",
+            "exchange": exchange,
+            "timeframe": "5m",
+            "artifact_reference": {
+                "artifactId": "strategy-us-f-5m-functional",
+                "artifactHash": "d" * 64,
+            },
+        }
+
+    def test_us_current_binding_is_derived_from_artifact_not_permit_route(self) -> None:
+        intent = OrderIntent(
+            strategy_id="strategy-us-f-5m-functional",
+            asset="US_STOCK",
+            symbol="F",
+            side="BUY",
+            quantity=1,
+            reference_price=12.0,
+            mode="SMALL_LIVE",
+            reason="exact-us-binding",
+            metadata={"broker_id": "kis"},
+        )
+        with (
+            patch.object(
+                state,
+                "functional_test_active_permit_binding",
+                return_value=self.us_live_binding().snapshot(),
+            ),
+            patch.object(
+                state,
+                "_functional_test_strategy_for_intent",
+                return_value=self.us_live_strategy(),
+            ),
+            patch.object(
+                state,
+                "_functional_test_portfolio_for_intent",
+                return_value={},
+            ),
+            patch.object(
+                state,
+                "kis_functional_test_account_id",
+                return_value="kis-live-account-hash",
+            ),
+        ):
+            current = state.functional_test_current_binding({}, intent)
+
+        self.assertEqual(self.us_live_binding().snapshot(), {
+            "strategyArtifactId": current["strategy_artifact_id"],
+            "strategyArtifactHash": current["strategy_artifact_hash"],
+            "strategyInstanceId": current["strategy_instance_id"],
+            "portfolioRequired": current["portfolio_required"],
+            "portfolioArtifactId": current["portfolio_artifact_id"],
+            "portfolioArtifactHash": current["portfolio_artifact_hash"],
+            "portfolioInstanceId": current["portfolio_instance_id"],
+            "accountId": current["account_id"],
+            "symbols": list(current["symbols"]),
+            "marketGroup": current["market_group"],
+            "executionRoute": current["execution_route"],
+            "settlementCurrency": current["settlement_currency"],
+            "exchanges": list(current["exchanges"]),
+            "symbolRoutes": [
+                {"symbol": symbol, "exchange": exchange}
+                for symbol, exchange in current["symbol_routes"]
+            ],
+            "routeScopeHash": current["route_scope_hash"],
+        })
+
+    def test_us_current_binding_rejects_artifact_exchange_tamper(self) -> None:
+        intent = OrderIntent(
+            strategy_id="strategy-us-f-5m-functional",
+            asset="US_STOCK",
+            symbol="F",
+            side="BUY",
+            quantity=1,
+            reference_price=12.0,
+            mode="SMALL_LIVE",
+            reason="tampered-us-binding",
+            metadata={"broker_id": "kis"},
+        )
+        with (
+            patch.object(
+                state,
+                "functional_test_active_permit_binding",
+                return_value=self.us_live_binding().snapshot(),
+            ),
+            patch.object(
+                state,
+                "_functional_test_strategy_for_intent",
+                return_value=self.us_live_strategy(exchange="NASD"),
+            ),
+            patch.object(
+                state,
+                "_functional_test_portfolio_for_intent",
+                return_value={},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "functional-test-us-exchange-must-be-NYSE",
+            ):
+                state.functional_test_current_binding({}, intent)
+
+    def test_us_live_global_caps_do_not_reinterpret_krw_settings_as_usd(self) -> None:
+        intent = OrderIntent(
+            strategy_id="functional-us-f",
+            asset="미국주식",
+            symbol="F",
+            side="BUY",
+            quantity=1,
+            reference_price=12.0,
+            mode="SMALL_LIVE",
+            reason="functional-us-cap-preview",
+            metadata={
+                "broker_id": "kis",
+                "marketGroup": "US_STOCK",
+                "executionRoute": "KIS_US_LIVE_CONTINUOUS",
+                "settlementCurrency": "USD",
+                "exchange": "NYSE",
+            },
+        )
+
+        caps = state.functional_test_global_caps(intent)
+
+        self.assertEqual(1, caps["max_order_quantity"])
+        self.assertEqual(50.0, caps["max_order_notional"])
+        self.assertEqual(50.0, caps["max_gross_exposure"])
+        self.assertEqual(2, caps["max_orders"])
+        self.assertEqual(1, caps["max_open_positions"])
+        self.assertEqual(2.5, caps["max_loss"])
+
     def setUp(self) -> None:
         _reset_emergency_stop_sticky_for_tests()
         release_held_leases_for_tests()
@@ -454,6 +609,25 @@ class FunctionalTestOrderIntegrationTest(unittest.TestCase):
             "scopeId": "1" * 64,
         }
 
+    @staticmethod
+    def kis_account_binding() -> dict[str, str]:
+        return {
+            "schemaVersion": "kis-order-account-binding/v1",
+            "accountCanoHash": "1" * 64,
+            "accountProductCode": "01",
+            "accountFingerprint": "2" * 64,
+            "credentialConfigurationHash": "3" * 64,
+            "environmentRevision": "4" * 64,
+        }
+
+    @classmethod
+    def kis_wire_account_binding(cls) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in cls.kis_account_binding().items()
+            if key != "environmentRevision"
+        }
+
     def submit(
         self,
         intent: OrderIntent,
@@ -466,6 +640,7 @@ class FunctionalTestOrderIntegrationTest(unittest.TestCase):
         broker.place_order.return_value = {
             "ok": True,
             "statusCode": 200,
+            "kisOrderAccountBinding": self.kis_wire_account_binding(),
             "json": {"output": {"ODNO": "FUNCTIONAL-KIS-ACK"}},
         }
         binding_values = bindings or [self.binding()] * len(risks)
@@ -483,6 +658,11 @@ class FunctionalTestOrderIntegrationTest(unittest.TestCase):
             ),
             patch.object(state, "snapshot", return_value={"summary": {}}),
             patch.object(state, "real_orders_enabled", return_value=True),
+            patch.object(
+                state,
+                "_kis_environment_order_account_binding",
+                return_value=self.kis_account_binding(),
+            ),
             patch.object(
                 state,
                 "durable_control_halt_active",
@@ -739,6 +919,15 @@ class FunctionalTestOrderIntegrationTest(unittest.TestCase):
             {
                 "functional_test_target_key": "portfolio:one",
                 "functional_test_portfolio_only": True,
+                "marketGroup": "",
+                "portfolioRequired": False,
+                "symbols": [],
+                "executionRoute": "",
+                "settlementCurrency": "",
+                "exchanges": [],
+                "symbolRoutes": [],
+                "routeScopeHash": "",
+                "exchange": "",
                 "promotion_eligible": False,
                 "use_as_promotion_evidence": False,
                 "full_live_requested": False,

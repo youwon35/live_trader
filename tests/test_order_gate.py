@@ -4,7 +4,7 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -38,6 +38,17 @@ def empty_complete_kis_order_truth() -> dict[str, object]:
         "events": [],
         "correlation_policy": "official-broker-order-id-only",
         "absence_is_authoritative": True,
+    }
+
+
+def exact_kis_order_account_binding() -> dict[str, object]:
+    return {
+        "schemaVersion": "kis-order-account-binding/v1",
+        "accountCanoHash": "a" * 64,
+        "accountProductCode": "01",
+        "accountFingerprint": "b" * 64,
+        "credentialConfigurationHash": "c" * 64,
+        "environmentRevision": "d" * 64,
     }
 
 
@@ -390,7 +401,8 @@ class OrderGateTest(unittest.TestCase):
         self.assertTrue(second["reconciliation_required"])
 
     def test_kis_cancel_requires_unambiguous_composite_identity(self) -> None:
-        today = datetime.now().strftime("%Y%m%d")
+        today = datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d")
+        account_binding = exact_kis_order_account_binding()
         cases = [
             (
                 "legacy",
@@ -399,7 +411,8 @@ class OrderGateTest(unittest.TestCase):
                     "organization_no": "001",
                 },
                 set(),
-                "kis-cancel-composite-identity-required",
+                False,
+                "kis-cancel-order-account-binding-required",
             ),
             (
                 "ambiguous",
@@ -410,10 +423,33 @@ class OrderGateTest(unittest.TestCase):
                     "broker_order_key": f"{today}:001:700002",
                 },
                 {"700002"},
+                False,
+                "kis-cancel-order-account-binding-required",
+            ),
+            (
+                "legacy-exact-binding",
+                {
+                    "broker_order_id": "700003",
+                    "organization_no": "001",
+                },
+                set(),
+                True,
+                "kis-cancel-composite-identity-required",
+            ),
+            (
+                "ambiguous-exact-binding",
+                {
+                    "broker_order_id": "700004",
+                    "order_date": today,
+                    "organization_no": "001",
+                    "broker_order_key": f"{today}:001:700004",
+                },
+                {"700004"},
+                True,
                 "kis-cancel-odno-ambiguous",
             ),
         ]
-        for label, identity, ambiguous, expected_reason in cases:
+        for label, identity, ambiguous, exact_binding, expected_reason in cases:
             with self.subTest(label=label):
                 order = {
                     "order_id": f"kis-{label}",
@@ -426,6 +462,8 @@ class OrderGateTest(unittest.TestCase):
                     "qty": 1,
                     **identity,
                 }
+                if exact_binding:
+                    order["kis_order_account_binding"] = dict(account_binding)
                 state.STATE["orders"] = [order]
                 router = Mock()
                 truth = {
@@ -435,12 +473,18 @@ class OrderGateTest(unittest.TestCase):
                     "lastError": "",
                     "ambiguousBrokerOrderIds": sorted(ambiguous),
                     "workingOrders": [dict(order)],
+                    "accountBinding": dict(account_binding),
                 }
                 with (
                     patch.object(
                         state,
                         "refresh_kis_order_truth_for_kill_switch",
                         return_value={"ok": True, "truth": truth},
+                    ),
+                    patch.object(
+                        state,
+                        "_kis_environment_order_account_binding",
+                        return_value=dict(account_binding),
                     ),
                     patch.object(state, "LiveBrokerRouter", return_value=router),
                     patch.object(state, "append_audit"),
@@ -457,7 +501,8 @@ class OrderGateTest(unittest.TestCase):
                 router.cancel_order.assert_not_called()
 
     def test_kis_cancel_refreshes_and_requires_exact_current_working_row(self) -> None:
-        today = datetime.now().strftime("%Y%m%d")
+        today = datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d")
+        account_binding = exact_kis_order_account_binding()
         order = {
             "order_id": "kis-current-working",
             "state": "acknowledged",
@@ -471,6 +516,7 @@ class OrderGateTest(unittest.TestCase):
             "symbol": "005930",
             "asset": "KR_STOCK",
             "qty": 1,
+            "kis_order_account_binding": dict(account_binding),
         }
         truth = {
             "complete": True,
@@ -479,6 +525,7 @@ class OrderGateTest(unittest.TestCase):
             "lastError": "",
             "ambiguousBrokerOrderIds": [],
             "workingOrders": [dict(order)],
+            "accountBinding": dict(account_binding),
         }
         state.STATE["orders"] = [order]
         router = Mock()
@@ -489,6 +536,11 @@ class OrderGateTest(unittest.TestCase):
                 "refresh_kis_order_truth_for_kill_switch",
                 return_value={"ok": True, "truth": truth},
             ) as refresh,
+            patch.object(
+                state,
+                "_kis_environment_order_account_binding",
+                return_value=dict(account_binding),
+            ),
             patch.object(state, "LiveBrokerRouter", return_value=router),
             patch.object(state, "append_audit"),
             patch.object(state, "queue_live_order_lifecycle_notification"),
@@ -4163,36 +4215,73 @@ class OrderGateTest(unittest.TestCase):
                 }
             ],
         }
+        observed_windows: list[tuple[str, str]] = []
 
-        with patch("live_trader.brokers.issue_kis_access_token", return_value="token"), patch(
-            "live_trader.brokers.fetch_kis_domestic_order_truth",
-            return_value={
+        def domestic_order_truth(
+            _access_token: str, *, start_date: str, end_date: str, **_kwargs
+        ) -> dict[str, object]:
+            observed_windows.append((start_date, end_date))
+            return {
                 "rt_cd": "0",
                 "output1": [],
-                "query_start_date": "20260801",
-                "query_end_date": "20260807",
+                "query_start_date": start_date,
+                "query_end_date": end_date,
                 "page_count": 1,
                 "pagination_complete": True,
-            },
-        ), patch(
-            "live_trader.brokers.fetch_kis_domestic_balance",
-            return_value=payload,
-        ), patch(
-            "live_trader.brokers.fetch_kis_overseas_balance",
-            return_value={"rt_cd": "0", "output1": [], "output2": []},
-        ):
-            result = LiveBrokerRouter().poll_execution_events("kis")
+            }
 
-        self.assertEqual(result["broker_id"], "kis")
-        self.assertEqual(len(result["accounts"]), 1)
-        self.assertEqual(len(result["positions"]), 1)
-        self.assertTrue(any(event["state"] == "account_snapshot" for event in result["events"]))
-        self.assertTrue(
-            any(
-                event["state"] == "position_snapshot" and event["symbol"] == "005930.KS"
-                for event in result["events"]
+        for configured_lookback, expected_days in ((None, 7), ("31", 31)):
+            with self.subTest(lookback_days=expected_days), patch.dict(
+                os.environ, {}, clear=False
+            ), patch(
+                "live_trader.state.live_trader_instance_lease_status",
+                return_value={
+                    "acquired": True,
+                    "scopeHash": "a" * 64,
+                    "ownerPid": os.getpid(),
+                    "acquiredAt": "2026-08-14T00:00:00+00:00",
+                },
+            ), patch(
+                "live_trader.brokers.issue_kis_access_token",
+                return_value="token",
+            ), patch(
+                "live_trader.brokers.fetch_kis_domestic_order_truth",
+                side_effect=domestic_order_truth,
+            ), patch(
+                "live_trader.brokers.fetch_kis_domestic_balance",
+                return_value=payload,
+            ), patch(
+                "live_trader.brokers.fetch_kis_overseas_balance",
+                return_value={"rt_cd": "0", "output1": [], "output2": []},
+            ):
+                if configured_lookback is None:
+                    os.environ.pop("KIS_EXECUTION_LOOKBACK_DAYS", None)
+                else:
+                    os.environ["KIS_EXECUTION_LOOKBACK_DAYS"] = configured_lookback
+                result = LiveBrokerRouter().poll_execution_events("kis")
+
+            start_date, end_date = observed_windows[-1]
+            inclusive_days = (
+                datetime.strptime(end_date, "%Y%m%d")
+                - datetime.strptime(start_date, "%Y%m%d")
+            ).days + 1
+            self.assertEqual(expected_days, inclusive_days)
+            self.assertEqual(result["broker_id"], "kis")
+            self.assertEqual(len(result["accounts"]), 1)
+            self.assertEqual(len(result["positions"]), 1)
+            self.assertTrue(
+                any(
+                    event["state"] == "account_snapshot"
+                    for event in result["events"]
+                )
             )
-        )
+            self.assertTrue(
+                any(
+                    event["state"] == "position_snapshot"
+                    and event["symbol"] == "005930.KS"
+                    for event in result["events"]
+                )
+            )
 
     def test_kis_position_snapshot_includes_read_only_overseas_balance(self) -> None:
         domestic = {
@@ -4216,7 +4305,15 @@ class OrderGateTest(unittest.TestCase):
             ],
             "output2": [],
         }
-        with patch("live_trader.brokers.issue_kis_access_token", return_value="token"), patch(
+        with patch(
+            "live_trader.state.live_trader_instance_lease_status",
+            return_value={
+                "acquired": True,
+                "scopeHash": "a" * 64,
+                "ownerPid": os.getpid(),
+                "acquiredAt": "2026-08-14T00:00:00+00:00",
+            },
+        ), patch("live_trader.brokers.issue_kis_access_token", return_value="token"), patch(
             "live_trader.brokers.send_prepared_request",
             side_effect=[
                 {"ok": True, "json": domestic},
@@ -4298,7 +4395,15 @@ class OrderGateTest(unittest.TestCase):
             "output1": [{"pdno": "005930", "hldg_qty": "1"}],
             "output2": [],
         }
-        with patch("live_trader.brokers.issue_kis_access_token", return_value="token"), patch(
+        with patch(
+            "live_trader.state.live_trader_instance_lease_status",
+            return_value={
+                "acquired": True,
+                "scopeHash": "a" * 64,
+                "ownerPid": os.getpid(),
+                "acquiredAt": "2026-08-14T00:00:00+00:00",
+            },
+        ), patch("live_trader.brokers.issue_kis_access_token", return_value="token"), patch(
             "live_trader.brokers.send_prepared_request",
             side_effect=[
                 {"ok": True, "json": domestic},

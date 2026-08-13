@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import copy
 import json
 import os
 from pathlib import Path
+import secrets
 import sys
 import threading
 import time
@@ -28,6 +30,14 @@ from trading_runtime.kis_rate_limiter import (
     GLOBAL_KIS_REST_LIMITERS,
     KisRestRateLimitError,
 )
+from .kis_order_authority import (
+    KisOrderAuthorityError,
+    consume_kis_read_transport_authority,
+    consume_inherited_kis_transport_authority,
+    require_inherited_kis_transport_authority,
+    require_kis_read_transport_authority,
+    require_kis_token_authority,
+)
 
 
 OrderSide = Literal["BUY", "SELL"]
@@ -40,6 +50,10 @@ KIS_DOMESTIC_CANCEL_ENDPOINT = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 KIS_OVERSEAS_CANCEL_ENDPOINT = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 KIS_DOMESTIC_BALANCE_ENDPOINT = "/uapi/domestic-stock/v1/trading/inquire-balance"
 KIS_OVERSEAS_BALANCE_ENDPOINT = "/uapi/overseas-stock/v1/trading/inquire-balance"
+KIS_OVERSEAS_PRICE_ENDPOINT = "/uapi/overseas-price/v1/quotations/price"
+KIS_OVERSEAS_WORKING_ORDERS_ENDPOINT = (
+    "/uapi/overseas-stock/v1/trading/inquire-nccs"
+)
 KIS_DOMESTIC_EXECUTION_ENDPOINT = (
     "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 )
@@ -47,11 +61,81 @@ KIS_DOMESTIC_TR_IDS = {"BUY": "TTTC0012U", "SELL": "TTTC0011U"}
 KIS_OVERSEAS_TR_IDS = {"BUY": "TTTT1002U", "SELL": "TTTT1006U"}
 KIS_DOMESTIC_BALANCE_TR_ID = "TTTC8434R"
 KIS_OVERSEAS_BALANCE_TR_ID = "TTTS3012R"
+KIS_OVERSEAS_PRICE_TR_ID = "HHDFS00000300"
+KIS_OVERSEAS_WORKING_ORDERS_TR_ID = "TTTS3018R"
 KIS_DOMESTIC_EXECUTION_TR_IDS = {
     # Official v1_국내주식-005, within the latest three months (inner).
     "real": "TTTC0081R",
     "demo": "VTTC0081R",
 }
+_KIS_TRADING_ENDPOINTS = frozenset(
+    {
+        KIS_DOMESTIC_ORDER_ENDPOINT,
+        KIS_DOMESTIC_CANCEL_ENDPOINT,
+        KIS_OVERSEAS_ORDER_ENDPOINT,
+        KIS_OVERSEAS_CANCEL_ENDPOINT,
+    }
+)
+_KIS_OWNED_ENDPOINTS = frozenset(
+    {
+        *_KIS_TRADING_ENDPOINTS,
+        KIS_TOKEN_ENDPOINT,
+        KIS_DOMESTIC_BALANCE_ENDPOINT,
+        KIS_OVERSEAS_BALANCE_ENDPOINT,
+        KIS_OVERSEAS_PRICE_ENDPOINT,
+        KIS_OVERSEAS_WORKING_ORDERS_ENDPOINT,
+        KIS_DOMESTIC_EXECUTION_ENDPOINT,
+        "/uapi/domestic-stock/v1/quotations/inquire-price",
+        "/uapi/domestic-stock/v1/quotations/chk-holiday",
+        "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
+        "/uapi/domestic-stock/v1/trading/inquire-period-profit",
+        "/uapi/domestic-stock/v1/trading/inquire-period-trade-profit",
+        "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl",
+    }
+)
+_KIS_TRADING_TR_IDS = {
+    KIS_DOMESTIC_ORDER_ENDPOINT: frozenset(KIS_DOMESTIC_TR_IDS.values()),
+    KIS_OVERSEAS_ORDER_ENDPOINT: frozenset(KIS_OVERSEAS_TR_IDS.values()),
+    KIS_DOMESTIC_CANCEL_ENDPOINT: frozenset({"TTTC0013U"}),
+    KIS_OVERSEAS_CANCEL_ENDPOINT: frozenset({"TTTT1004U"}),
+}
+_KIS_READ_TR_IDS = {
+    KIS_DOMESTIC_BALANCE_ENDPOINT: frozenset({KIS_DOMESTIC_BALANCE_TR_ID}),
+    KIS_OVERSEAS_BALANCE_ENDPOINT: frozenset({KIS_OVERSEAS_BALANCE_TR_ID}),
+    KIS_OVERSEAS_PRICE_ENDPOINT: frozenset({KIS_OVERSEAS_PRICE_TR_ID}),
+    KIS_OVERSEAS_WORKING_ORDERS_ENDPOINT: frozenset(
+        {KIS_OVERSEAS_WORKING_ORDERS_TR_ID}
+    ),
+    KIS_DOMESTIC_EXECUTION_ENDPOINT: frozenset({"TTTC0081R"}),
+    "/uapi/domestic-stock/v1/quotations/inquire-price": frozenset(
+        {"FHKST01010100"}
+    ),
+    "/uapi/domestic-stock/v1/quotations/chk-holiday": frozenset(
+        {"CTCA0903R"}
+    ),
+    "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice": (
+        frozenset({"FHKST03010230"})
+    ),
+    "/uapi/domestic-stock/v1/trading/inquire-period-profit": frozenset(
+        {"TTTC8708R"}
+    ),
+    "/uapi/domestic-stock/v1/trading/inquire-period-trade-profit": (
+        frozenset({"TTTC8715R"})
+    ),
+    "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl": frozenset(
+        {"TTTC0084R"}
+    ),
+}
+_KIS_TRADING_HEADER_KEYS = frozenset(
+    {
+        "authorization",
+        "appkey",
+        "appsecret",
+        "content-type",
+        "custtype",
+        "tr_id",
+    }
+)
 
 BINANCE_BASE_URL = "https://api.binance.com"
 BINANCE_ORDER_ENDPOINT = "/api/v3/order"
@@ -82,9 +166,56 @@ UPBIT_ACCOUNTS_ENDPOINT = "/v1/accounts"
 UPBIT_ORDER_CHANCE_ENDPOINT = "/v1/orders/chance"
 UPBIT_ORDER_DETAIL_ENDPOINT = "/v1/order"
 
+
+def _official_upbit_mutation_base_url() -> str:
+    """Return the only origin allowed to receive an ordinary Upbit JWT."""
+
+    configured = str(
+        env_value("UPBIT_BASE_URL") or UPBIT_BASE_URL
+    ).strip()
+    if configured != UPBIT_BASE_URL:
+        raise RuntimeError(
+            "ordinary Upbit mutation origin must be exact official production URL"
+        )
+    return UPBIT_BASE_URL
+
+
+def _guard_ordinary_upbit_mutation_edge(prepared: "PreparedRequest") -> None:
+    """Recheck provider/method/endpoint/origin before the physical attempt."""
+
+    if prepared.provider.strip().lower() != "upbit":
+        return
+    method = prepared.method.strip().upper()
+    if method not in {"POST", "DELETE"}:
+        return
+    expected_endpoint = (
+        UPBIT_ORDER_ENDPOINT if method == "POST" else UPBIT_ORDER_DETAIL_ENDPOINT
+    )
+    try:
+        parsed = urllib.parse.urlsplit(prepared.url)
+    except ValueError as exc:
+        raise RuntimeError("ordinary Upbit mutation URL is invalid") from exc
+    if (
+        prepared.endpoint != expected_endpoint
+        or parsed.scheme != "https"
+        or parsed.netloc != "api.upbit.com"
+        or parsed.hostname != "api.upbit.com"
+        or parsed.port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != expected_endpoint
+        or parsed.fragment
+        or (method == "POST" and parsed.query)
+    ):
+        raise RuntimeError(
+            "ordinary Upbit mutation URL must match the exact official endpoint"
+        )
+
 _KIS_TOKEN_CACHE: dict[str, object] = {"key": "", "token": "", "expires_at": 0.0}
 _KIS_TOKEN_LOCK = threading.Lock()
 _KIS_REQUEST_LOCK = threading.Lock()
+_KIS_HTTP_DISPATCH_LOCK = threading.Lock()
+_KIS_HTTP_DISPATCH_LOCAL = threading.local()
 _KIS_REQUEST_LAST_MONOTONIC = 0.0
 _BINANCE_TIME_CACHE: dict[str, object] = {"base_url": "", "offset_ms": 0, "expires_at": 0.0}
 _BINANCE_TIME_LOCK = threading.Lock()
@@ -120,6 +251,17 @@ class PreparedRequest:
             "blocked_reasons": list(self.blocked_reasons),
             "can_send": self.can_send,
         }
+
+
+@dataclass
+class _KisHttpDispatch:
+    """Private, thread-bound, single-call ticket installed after KIS pacing."""
+
+    owner_thread_id: int
+    request_hash: str
+    kind: str
+    nonce: str
+    consumed: bool = False
 
 
 def env_value(name: str) -> str:
@@ -596,6 +738,160 @@ def build_kis_overseas_balance_request(
         body=None,
         query=query,
         blocked_reasons=blocked,
+    )
+
+
+def build_kis_us_live_quote_request(
+    *,
+    access_token: str = "",
+    symbol: str = "F",
+    exchange: str = "NYSE",
+) -> PreparedRequest:
+    """Build the exact read-only KIS US live-test quote request.
+
+    KIS' official overseas-price API uses a three-letter quote exchange code,
+    while orders use the four-letter account exchange code.  This functional
+    path deliberately supports only ``F`` on ``NYSE`` and therefore always
+    sends ``EXCD=NYS``.  It never builds an order-capable request.
+    """
+
+    required = (
+        "KIS_APP_KEY",
+        "KIS_APP_SECRET",
+        "KIS_ACCOUNT_NO",
+        "KIS_ACCOUNT_PRODUCT_CODE",
+    )
+    blocked = missing_env(*required)
+    app_key = env_value("KIS_APP_KEY")
+    app_secret = env_value("KIS_APP_SECRET")
+    base_url = env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL
+    environment = env_value("KIS_ENV").strip().lower() or "real"
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_exchange = str(exchange or "").strip().upper()
+
+    if not access_token:
+        blocked.append("access_token")
+    if environment not in {"real", "live"}:
+        blocked.append("kis_live_environment")
+    if normalized_symbol != "F":
+        blocked.append("exact_symbol_f")
+    if normalized_exchange != "NYSE":
+        blocked.append("exact_exchange_nyse")
+
+    query: dict[str, object] = {
+        "AUTH": "",
+        "EXCD": "NYS",
+        "SYMB": "F",
+    }
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {access_token}" if access_token else "",
+        "appkey": app_key,
+        "appsecret": app_secret,
+        "tr_id": KIS_OVERSEAS_PRICE_TR_ID,
+        "custtype": "P",
+    }
+    encoded = urllib.parse.urlencode(query)
+    return PreparedRequest(
+        provider="kis",
+        method="GET",
+        url=(
+            f"{base_url.rstrip('/')}{KIS_OVERSEAS_PRICE_ENDPOINT}?{encoded}"
+        ),
+        endpoint=KIS_OVERSEAS_PRICE_ENDPOINT,
+        headers=headers,
+        safe_headers={
+            "content-type": headers["content-type"],
+            "authorization_configured": bool(access_token),
+            "appkey_configured": bool(app_key),
+            "appsecret_configured": bool(app_secret),
+            "tr_id": KIS_OVERSEAS_PRICE_TR_ID,
+            "custtype": "P",
+        },
+        body=None,
+        query=query,
+        blocked_reasons=list(dict.fromkeys(blocked)),
+    )
+
+
+def build_kis_overseas_working_orders_request(
+    *,
+    access_token: str = "",
+    context_fk200: str = "",
+    context_nk200: str = "",
+    continuation: str = "",
+) -> PreparedRequest:
+    """Build one official, account-wide US live ``inquire-nccs`` page.
+
+    The KIS contract defines ``NASD`` as all US markets (NASDAQ, NYSE and
+    AMEX). Unlike a date-filtered execution-history query, ``TTTS3018R`` has
+    no date filter and directly returns the account's currently working orders.
+    Pagination is carried by the opaque FK/NK200 pair returned by KIS.
+    """
+
+    required = (
+        "KIS_APP_KEY",
+        "KIS_APP_SECRET",
+        "KIS_ACCOUNT_NO",
+        "KIS_ACCOUNT_PRODUCT_CODE",
+    )
+    blocked = missing_env(*required)
+    app_key = env_value("KIS_APP_KEY")
+    app_secret = env_value("KIS_APP_SECRET")
+    account_no = env_value("KIS_ACCOUNT_NO")
+    product_code = env_value("KIS_ACCOUNT_PRODUCT_CODE")
+    base_url = env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL
+    environment = env_value("KIS_ENV").strip().lower() or "real"
+    cano, acnt_prdt_cd = split_kis_account(account_no, product_code)
+    normalized_continuation = str(continuation or "").strip().upper()
+
+    if not access_token:
+        blocked.append("access_token")
+    if environment not in {"real", "live"}:
+        blocked.append("kis_live_environment")
+    if normalized_continuation not in {"", "N"}:
+        blocked.append("continuation")
+
+    query: dict[str, object] = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": acnt_prdt_cd,
+        "OVRS_EXCG_CD": "NASD",
+        "SORT_SQN": "DS",
+        "CTX_AREA_FK200": str(context_fk200 or ""),
+        "CTX_AREA_NK200": str(context_nk200 or ""),
+    }
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {access_token}" if access_token else "",
+        "appkey": app_key,
+        "appsecret": app_secret,
+        "tr_id": KIS_OVERSEAS_WORKING_ORDERS_TR_ID,
+        "custtype": "P",
+    }
+    if normalized_continuation:
+        headers["tr_cont"] = normalized_continuation
+    encoded = urllib.parse.urlencode(query)
+    return PreparedRequest(
+        provider="kis",
+        method="GET",
+        url=(
+            f"{base_url.rstrip('/')}{KIS_OVERSEAS_WORKING_ORDERS_ENDPOINT}?"
+            f"{encoded}"
+        ),
+        endpoint=KIS_OVERSEAS_WORKING_ORDERS_ENDPOINT,
+        headers=headers,
+        safe_headers={
+            "content-type": headers["content-type"],
+            "authorization_configured": bool(access_token),
+            "appkey_configured": bool(app_key),
+            "appsecret_configured": bool(app_secret),
+            "tr_id": KIS_OVERSEAS_WORKING_ORDERS_TR_ID,
+            "tr_cont": normalized_continuation,
+            "custtype": "P",
+        },
+        body=None,
+        query=query,
+        blocked_reasons=list(dict.fromkeys(blocked)),
     )
 
 
@@ -1332,9 +1628,9 @@ def build_binance_cancel_order_request(symbol: str, broker_order_id: str, *, cli
 
 def build_upbit_order_request(intent: dict[str, object]) -> PreparedRequest:
     blocked = missing_env("UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY")
+    base_url = _official_upbit_mutation_base_url()
     access_key = env_value("UPBIT_ACCESS_KEY")
     secret_key = env_value("UPBIT_SECRET_KEY")
-    base_url = env_value("UPBIT_BASE_URL") or UPBIT_BASE_URL
     market = str(intent.get("market") or intent.get("symbol") or "").strip().upper()
     side = "bid" if normalize_side(intent.get("side")) == "BUY" else "ask"
     ord_type = str(intent.get("order_type") or "limit").strip().lower()
@@ -1366,9 +1662,9 @@ def build_upbit_order_request(intent: dict[str, object]) -> PreparedRequest:
 
 def build_upbit_cancel_order_request(broker_order_id: str, *, identifier: bool = False) -> PreparedRequest:
     blocked = missing_env("UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY")
+    base_url = _official_upbit_mutation_base_url()
     access_key = env_value("UPBIT_ACCESS_KEY")
     secret_key = env_value("UPBIT_SECRET_KEY")
-    base_url = env_value("UPBIT_BASE_URL") or UPBIT_BASE_URL
     normalized_order_id = str(broker_order_id or "").strip()
     query = {"identifier" if identifier else "uuid": normalized_order_id}
     if not normalized_order_id:
@@ -1389,6 +1685,9 @@ def build_upbit_cancel_order_request(broker_order_id: str, *, identifier: bool =
 
 
 def issue_kis_access_token(*, timeout_seconds: float = 10.0) -> str:
+    # Cached bearer material is as sensitive as a new token response and must
+    # never escape the same route-held authority required for tokenP itself.
+    require_kis_token_authority()
     missing = missing_env("KIS_APP_KEY", "KIS_APP_SECRET")
     if missing:
         raise RuntimeError(f"KIS token settings missing: {', '.join(missing)}")
@@ -1476,13 +1775,9 @@ def _kis_rate_limited(response: dict[str, object]) -> bool:
 
 
 def kis_read_rate_limit_retries() -> int:
-    try:
-        configured = int(
-            os.environ.get("KIS_READ_RATE_LIMIT_RETRIES") or 2
-        )
-    except (TypeError, ValueError):
-        configured = 2
-    return min(3, max(0, configured))
+    """Owned KIS reads are terminal one-shot attempts under an exact lease."""
+
+    return 0
 
 
 def _send_kis_http_json(
@@ -1495,6 +1790,15 @@ def _send_kis_http_json(
 ) -> dict[str, object]:
     """Serialize and pace KIS HTTP traffic, including token issuance."""
 
+    frozen_body = copy.deepcopy(body)
+    frozen_headers = copy.deepcopy(headers)
+    kind = _guard_kis_owned_http_edge(
+        method=method,
+        url=url,
+        body=frozen_body,
+        headers=frozen_headers,
+        kis_specific=True,
+    )
     global _KIS_REQUEST_LAST_MONOTONIC
     with _KIS_REQUEST_LOCK:
         interval = kis_request_min_interval_seconds()
@@ -1502,21 +1806,38 @@ def _send_kis_http_json(
         remaining = interval - elapsed
         if remaining > 0:
             time.sleep(remaining)
-        retry_count = (
-            kis_read_rate_limit_retries()
-            if method.strip().upper() == "GET"
-            else 0
-        )
+        # An owned read grant is exact and one-use at the physical edge.
+        # Rate-limit responses are terminal observations; callers may open a
+        # fresh diagnostic boundary only after publication/reconciliation.
+        retry_count = 0
         for attempt in range(retry_count + 1):
             _acquire_shared_kis_rest_slot(url)
-            response = http_json(
-                method,
-                url,
-                body=body,
-                headers=headers,
-                timeout_seconds=timeout_seconds,
+            ticket = _install_kis_http_dispatch(
+                kind=kind,
+                method=method,
+                url=url,
+                body=frozen_body,
+                headers=frozen_headers,
             )
+            try:
+                response = http_json(
+                    method,
+                    url,
+                    body=frozen_body,
+                    headers=frozen_headers,
+                    timeout_seconds=timeout_seconds,
+                )
+            finally:
+                if getattr(_KIS_HTTP_DISPATCH_LOCAL, "ticket", None) is ticket:
+                    del _KIS_HTTP_DISPATCH_LOCAL.ticket
             _KIS_REQUEST_LAST_MONOTONIC = time.monotonic()
+            if kind == "READ" and _kis_rate_limited(response):
+                response = {
+                    **response,
+                    "physicalAttemptCount": 1,
+                    "retryAllowed": False,
+                    "terminalReadLease": True,
+                }
             if not _kis_rate_limited(response) or attempt >= retry_count:
                 return response
             # A read-only balance query is safe to repeat.  Orders and token
@@ -1576,18 +1897,852 @@ def _reset_kis_request_pacer() -> None:
         _KIS_REQUEST_LAST_MONOTONIC = 0.0
 
 
+def _canonical_kis_origin(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(str(value or "").rstrip("/"))
+        port = parsed.port
+    except ValueError as exc:
+        raise KisOrderAuthorityError("KIS URL origin is invalid") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise KisOrderAuthorityError("KIS URL origin is invalid")
+    hostname = parsed.hostname.lower()
+    effective_port = 443 if port is None else port
+    return f"https://{hostname}:{effective_port}"
+
+
+def _kis_actual_url(value: str) -> dict[str, object]:
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        port = parsed.port
+    except ValueError as exc:
+        raise KisOrderAuthorityError("KIS final transport URL is invalid") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or any(ord(character) < 0x20 for character in str(value or ""))
+    ):
+        raise KisOrderAuthorityError("KIS final transport URL is invalid")
+    hostname = parsed.hostname.lower()
+    effective_port = 443 if port is None else port
+    origin = f"https://{hostname}:{effective_port}"
+    official_origin = _canonical_kis_origin(KIS_LIVE_BASE_URL)
+    configured_origin = _canonical_kis_origin(
+        env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL
+    )
+    return {
+        "rawUrl": str(value or ""),
+        "origin": origin,
+        "path": parsed.path,
+        "query": parsed.query,
+        "official": origin == official_origin,
+        "configured": origin == configured_origin,
+        "canonicalUrl": origin + parsed.path + (
+            "?" + parsed.query if parsed.query else ""
+        ),
+    }
+
+
+def _canonical_kis_headers(headers: dict[str, str]) -> dict[str, str]:
+    if type(headers) is not dict:
+        raise KisOrderAuthorityError("KIS final transport headers are invalid")
+    normalized: dict[str, str] = {}
+    for raw_key, raw_value in headers.items():
+        if type(raw_key) is not str or type(raw_value) is not str:
+            raise KisOrderAuthorityError(
+                "KIS final transport headers are invalid"
+            )
+        key = raw_key.strip().lower()
+        if (
+            not key
+            or key in normalized
+            or key != raw_key.lower()
+            or "\r" in raw_value
+            or "\n" in raw_value
+        ):
+            raise KisOrderAuthorityError(
+                "KIS final transport headers are invalid"
+            )
+        normalized[key] = raw_value
+    return normalized
+
+
+def _kis_trading_wire_projection(
+    *,
+    method: str,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> dict[str, object]:
+    actual = _kis_actual_url(url)
+    path = str(actual["path"])
+    normalized_method = str(method or "").strip().upper()
+    normalized_headers = _canonical_kis_headers(headers)
+    body_bytes = _canonical_kis_trading_body_bytes(body)
+    if (
+        path not in _KIS_TRADING_ENDPOINTS
+        or normalized_method != "POST"
+        or actual["official"] is not True
+        or actual["configured"] is not True
+        or str(actual["query"])
+        or str(actual["canonicalUrl"]) != KIS_LIVE_BASE_URL + path
+        or str(actual["rawUrl"]) != KIS_LIVE_BASE_URL + path
+        or set(normalized_headers) != _KIS_TRADING_HEADER_KEYS
+        or normalized_headers.get("content-type")
+        != "application/json; charset=utf-8"
+        or normalized_headers.get("custtype") != "P"
+        or normalized_headers.get("tr_id")
+        not in _KIS_TRADING_TR_IDS[path]
+        or not normalized_headers.get("authorization", "").startswith(
+            "Bearer "
+        )
+        or not normalized_headers["authorization"][7:]
+        or env_value("KIS_ENV").lower() != "real"
+    ):
+        raise KisOrderAuthorityError(
+            "KIS final trading wire tuple is invalid"
+        )
+    return {
+        "schemaVersion": "kis-final-trading-wire/v1",
+        "method": normalized_method,
+        "origin": actual["origin"],
+        "path": path,
+        "query": "",
+        "headers": normalized_headers,
+        "bodySha256": hashlib.sha256(body_bytes).hexdigest(),
+        "bodyLength": len(body_bytes),
+    }
+
+
+def _canonical_kis_trading_body_bytes(
+    body: dict[str, object] | None,
+) -> bytes:
+    if type(body) is not dict:
+        raise KisOrderAuthorityError("KIS trading body is not an exact object")
+    try:
+        return json.dumps(
+            body,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise KisOrderAuthorityError("KIS trading body is invalid") from exc
+
+
+def _kis_wire_hash(
+    *,
+    method: str,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            _kis_trading_wire_projection(
+                method=method, url=url, body=body, headers=headers
+            ),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def kis_prepared_payload_hash(prepared: PreparedRequest) -> str:
+    """Hash the exact KIS method, URL, headers and body sent on the wire."""
+
+    if type(prepared) is not PreparedRequest:
+        raise KisOrderAuthorityError("KIS trading request is not exact")
+    return _kis_wire_hash(
+        method=prepared.method,
+        url=prepared.url,
+        body=prepared.body,
+        headers=prepared.headers,
+    )
+
+
+def _kis_final_mutation_binding_raw(
+    *, body: dict[str, object] | None, headers: dict[str, str]
+) -> tuple[str, str]:
+    """Independently bind the actual final request to live env credentials."""
+
+    from .kis_domestic_functional_get_client import (
+        _credential_configuration_hash,
+        kis_domestic_functional_account_fingerprint,
+    )
+
+    body = body if isinstance(body, dict) else {}
+    account = kis_domestic_functional_account_fingerprint(
+        str(body.get("CANO") or "").strip(),
+        str(body.get("ACNT_PRDT_CD") or "").strip(),
+    )
+    app_key = env_value("KIS_APP_KEY")
+    app_secret = env_value("KIS_APP_SECRET")
+    normalized_headers = _canonical_kis_headers(headers)
+    if (
+        not app_key
+        or not app_secret
+        or normalized_headers.get("appkey") != app_key
+        or normalized_headers.get("appsecret") != app_secret
+        or not normalized_headers.get("authorization", "").startswith(
+            "Bearer "
+        )
+    ):
+        raise KisOrderAuthorityError(
+            "KIS final transport credential/origin binding is invalid"
+        )
+    return account, _credential_configuration_hash(
+        app_key=app_key,
+        app_secret=app_secret,
+        account_fingerprint=account,
+    )
+
+
+def _require_kis_trading_wire_authority(
+    *,
+    method: str,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> dict[str, object]:
+    actual = _kis_actual_url(url)
+    endpoint = str(actual["path"])
+    wire_hash = _kis_wire_hash(
+        method=method, url=url, body=body, headers=headers
+    )
+    account, credential = _kis_final_mutation_binding_raw(
+        body=body, headers=headers
+    )
+    authority = require_inherited_kis_transport_authority(
+        endpoint=endpoint,
+        payload_hash=wire_hash,
+        account_fingerprint=account,
+        credential_configuration_hash=credential,
+    )
+    _validate_kis_operation_wire(
+        operation=str(authority.get("inheritedOperation") or ""),
+        endpoint=endpoint,
+        body=body,
+        headers=headers,
+        owned_order_key=dict(
+            authority.get("inheritedOwnedOrderKey") or {}
+        ),
+    )
+    return dict(authority)
+
+
+def _validate_kis_operation_wire(
+    *,
+    operation: str,
+    endpoint: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+    owned_order_key: dict[str, str],
+) -> None:
+    normalized_headers = _canonical_kis_headers(headers)
+    exact_body = body if type(body) is dict else {}
+    tr_id = normalized_headers.get("tr_id", "")
+    allowed: dict[str, tuple[str, frozenset[str]]] = {
+        "PLACE_ORDER": (
+            endpoint,
+            (
+                frozenset({"TTTC0012U", "TTTC0011U"})
+                if endpoint == KIS_DOMESTIC_ORDER_ENDPOINT
+                else frozenset({"TTTT1002U", "TTTT1006U"})
+            ),
+        ),
+        "NATURAL_BUY": (
+            KIS_DOMESTIC_ORDER_ENDPOINT,
+            frozenset({"TTTC0012U"}),
+        ),
+        "CLEANUP_SELL": (
+            KIS_DOMESTIC_ORDER_ENDPOINT,
+            frozenset({"TTTC0011U"}),
+        ),
+        "CANCEL_ORDER": (
+            KIS_DOMESTIC_CANCEL_ENDPOINT,
+            frozenset({"TTTC0013U"}),
+        ),
+        "CLEANUP_CANCEL": (
+            KIS_DOMESTIC_CANCEL_ENDPOINT,
+            frozenset({"TTTC0013U"}),
+        ),
+        "KILL_ORDINARY_CANCEL": (
+            KIS_DOMESTIC_CANCEL_ENDPOINT,
+            frozenset({"TTTC0013U"}),
+        ),
+        "OVERSEAS_CANCEL_ORDER": (
+            KIS_OVERSEAS_CANCEL_ENDPOINT,
+            frozenset({"TTTT1004U"}),
+        ),
+    }
+    contract = allowed.get(operation)
+    if (
+        contract is None
+        or contract[0] != endpoint
+        or tr_id not in contract[1]
+    ):
+        raise KisOrderAuthorityError(
+            "KIS inherited operation/endpoint/TR/side wire binding is invalid"
+        )
+    if operation in {
+        "CANCEL_ORDER",
+        "CLEANUP_CANCEL",
+        "KILL_ORDINARY_CANCEL",
+    } and (
+        set(owned_order_key)
+        != {"orderDate", "organizationNo", "orderNo"}
+        or str(exact_body.get("KRX_FWDG_ORD_ORGNO") or "")
+        != str(owned_order_key.get("organizationNo") or "")
+        or str(exact_body.get("ORGN_ODNO") or "")
+        != str(owned_order_key.get("orderNo") or "")
+        or str(exact_body.get("RVSE_CNCL_DVSN_CD") or "") != "02"
+        or str(exact_body.get("QTY_ALL_ORD_YN") or "") != "Y"
+        or str(exact_body.get("ORD_UNPR") or "") != "0"
+    ):
+        raise KisOrderAuthorityError(
+            "KIS domestic cancel wire differs from exact owned order"
+        )
+    if operation == "OVERSEAS_CANCEL_ORDER" and (
+        str(exact_body.get("RVSE_CNCL_DVSN_CD") or "") != "02"
+        or str(exact_body.get("OVRS_ORD_UNPR") or "") != "0"
+        or not str(exact_body.get("ORGN_ODNO") or "").strip()
+    ):
+        raise KisOrderAuthorityError(
+            "KIS overseas cancel wire is not exact cancel-only"
+        )
+
+
+def _consume_kis_trading_wire_authority(
+    *,
+    method: str,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> None:
+    """Burn the exact inherited lease at the last edge before the opener."""
+
+    actual = _kis_actual_url(url)
+    wire_hash = _kis_wire_hash(
+        method=method,
+        url=url,
+        body=body,
+        headers=headers,
+    )
+    account, credential = _kis_final_mutation_binding_raw(
+        body=body,
+        headers=headers,
+    )
+    authority = consume_inherited_kis_transport_authority(
+        endpoint=str(actual["path"]),
+        payload_hash=wire_hash,
+        account_fingerprint=account,
+        credential_configuration_hash=credential,
+    )
+    _validate_kis_operation_wire(
+        operation=str(authority.get("inheritedOperation") or ""),
+        endpoint=str(actual["path"]),
+        body=body,
+        headers=headers,
+        owned_order_key=dict(
+            authority.get("inheritedOwnedOrderKey") or {}
+        ),
+    )
+
+
+def _kis_http_request_hash(
+    *,
+    method: str,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> str:
+    """Hash every byte-producing input for the private paced dispatch."""
+
+    actual = _kis_actual_url(url)
+    normalized_headers = _canonical_kis_headers(headers)
+    try:
+        body_bytes = (
+            json.dumps(
+                body,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if body is not None
+            else b""
+        )
+    except (TypeError, ValueError) as exc:
+        raise KisOrderAuthorityError("KIS HTTP body is invalid") from exc
+    projection = {
+        "method": str(method or "").strip().upper(),
+        "url": actual["canonicalUrl"],
+        "headers": normalized_headers,
+        "bodySha256": hashlib.sha256(body_bytes).hexdigest(),
+        "bodyLength": len(body_bytes),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            projection,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _kis_read_final_binding_raw(
+    *,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> tuple[str, str]:
+    """Bind one exact credentialed GET to the configured live account."""
+
+    from .kis_domestic_functional_get_client import (
+        _credential_configuration_hash,
+        kis_domestic_functional_account_fingerprint,
+    )
+
+    if body is not None:
+        raise KisOrderAuthorityError("KIS read transport body is forbidden")
+    actual = _kis_actual_url(url)
+    normalized_headers = _canonical_kis_headers(headers)
+    allowed_headers = {
+        "content-type",
+        "authorization",
+        "appkey",
+        "appsecret",
+        "tr_id",
+        "custtype",
+        "tr_cont",
+    }
+    app_key = env_value("KIS_APP_KEY")
+    app_secret = env_value("KIS_APP_SECRET")
+    if (
+        not app_key
+        or not app_secret
+        or not set(normalized_headers).issubset(allowed_headers)
+        or set(normalized_headers)
+        < {
+            "content-type",
+            "authorization",
+            "appkey",
+            "appsecret",
+            "tr_id",
+            "custtype",
+        }
+        or normalized_headers.get("content-type")
+        != "application/json; charset=utf-8"
+        or not normalized_headers.get("authorization", "").startswith(
+            "Bearer "
+        )
+        or not normalized_headers["authorization"][7:]
+        or normalized_headers.get("appkey") != app_key
+        or normalized_headers.get("appsecret") != app_secret
+        or not normalized_headers.get("tr_id")
+        or normalized_headers.get("tr_id")
+        not in _KIS_READ_TR_IDS.get(str(actual["path"]), frozenset())
+        or normalized_headers.get("custtype") != "P"
+        or normalized_headers.get("tr_cont", "") not in {"", "N"}
+    ):
+        raise KisOrderAuthorityError(
+            "KIS read transport credential/header binding is invalid"
+        )
+    cano, product = split_kis_account(
+        env_value("KIS_ACCOUNT_NO"),
+        env_value("KIS_ACCOUNT_PRODUCT_CODE"),
+    )
+    if not cano or not product:
+        raise KisOrderAuthorityError(
+            "KIS read transport account binding is missing"
+        )
+    pairs = urllib.parse.parse_qsl(
+        str(actual["query"]),
+        keep_blank_values=True,
+        strict_parsing=True,
+    )
+    if len({key for key, _value in pairs}) != len(pairs):
+        raise KisOrderAuthorityError(
+            "KIS read transport query contains duplicate fields"
+        )
+    query = dict(pairs)
+    carries_account = "CANO" in query or "ACNT_PRDT_CD" in query
+    if carries_account and (
+        set({"CANO", "ACNT_PRDT_CD"}) - set(query)
+        or query.get("CANO") != cano
+        or query.get("ACNT_PRDT_CD") != product
+    ):
+        raise KisOrderAuthorityError(
+            "KIS read transport query account changed"
+        )
+    account = kis_domestic_functional_account_fingerprint(cano, product)
+    credential = _credential_configuration_hash(
+        app_key=app_key,
+        app_secret=app_secret,
+        account_fingerprint=account,
+    )
+    return account, credential
+
+
+def _require_kis_read_wire_authority(
+    *,
+    method: str,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> None:
+    actual = _kis_actual_url(url)
+    account, credential = _kis_read_final_binding_raw(
+        url=url,
+        body=body,
+        headers=headers,
+    )
+    require_kis_read_transport_authority(
+        endpoint=str(actual["path"]),
+        request_hash=_kis_http_request_hash(
+            method=method,
+            url=url,
+            body=body,
+            headers=headers,
+        ),
+        account_fingerprint=account,
+        credential_configuration_hash=credential,
+    )
+
+
+def _consume_kis_read_wire_authority(
+    *,
+    method: str,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> None:
+    actual = _kis_actual_url(url)
+    account, credential = _kis_read_final_binding_raw(
+        url=url,
+        body=body,
+        headers=headers,
+    )
+    consume_kis_read_transport_authority(
+        endpoint=str(actual["path"]),
+        request_hash=_kis_http_request_hash(
+            method=method,
+            url=url,
+            body=body,
+            headers=headers,
+        ),
+        account_fingerprint=account,
+        credential_configuration_hash=credential,
+    )
+
+
+def _validate_exact_kis_token_request(
+    *,
+    actual: dict[str, object],
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> None:
+    normalized_headers = _canonical_kis_headers(headers)
+    if (
+        actual["official"] is not True
+        or actual["configured"] is not True
+        or str(actual["query"])
+        or str(actual["canonicalUrl"])
+        != KIS_LIVE_BASE_URL + KIS_TOKEN_ENDPOINT
+        or str(actual["rawUrl"])
+        != KIS_LIVE_BASE_URL + KIS_TOKEN_ENDPOINT
+        or env_value("KIS_ENV").lower() != "real"
+        or set(normalized_headers) != {"content-type"}
+        or normalized_headers.get("content-type")
+        != "application/json; charset=utf-8"
+        or type(body) is not dict
+        or set(body) != {"grant_type", "appkey", "appsecret"}
+        or body.get("grant_type") != "client_credentials"
+        or body.get("appkey") != env_value("KIS_APP_KEY")
+        or body.get("appsecret") != env_value("KIS_APP_SECRET")
+        or not body.get("appkey")
+        or not body.get("appsecret")
+    ):
+        raise KisOrderAuthorityError("KIS token wire tuple is invalid")
+
+
+def _guard_kis_owned_http_edge(
+    *,
+    method: str,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+    kis_specific: bool,
+) -> str:
+    """Classify a KIS URL and fail closed for every unsupported method/path."""
+
+    raw_url = str(url or "")
+    raw_header_names = (
+        {
+            key.strip().lower()
+            for key in headers
+            if isinstance(key, str) and key.strip()
+        }
+        if isinstance(headers, dict)
+        else set()
+    )
+    raw_body_names = (
+        {
+            key.strip().lower()
+            for key in body
+            if isinstance(key, str) and key.strip()
+        }
+        if isinstance(body, dict)
+        else set()
+    )
+    signature_shaped = bool(
+        "appkey" in raw_header_names
+        or "appsecret" in raw_header_names
+        or "tr_id" in raw_header_names
+        or {"appkey", "appsecret"}.issubset(raw_body_names)
+        or {"cano", "acnt_prdt_cd"}.issubset(raw_body_names)
+    )
+    path_hint_shaped = any(
+        endpoint in raw_url for endpoint in _KIS_OWNED_ENDPOINTS
+    )
+    try:
+        parsed = urllib.parse.urlsplit(raw_url)
+        port = parsed.port
+        candidate_origin = (
+            f"{parsed.scheme.lower()}://{parsed.hostname.lower()}:"
+            f"{443 if port is None else port}"
+            if parsed.hostname and parsed.scheme
+            else ""
+        )
+    except ValueError:
+        if kis_specific or signature_shaped or path_hint_shaped:
+            raise KisOrderAuthorityError("KIS URL is invalid") from None
+        return "NON_KIS"
+    path = parsed.path
+    normalized_method = str(method or "").strip().upper()
+    credential_shaped = bool(
+        path in _KIS_OWNED_ENDPOINTS
+        or signature_shaped
+    )
+    official_origin = _canonical_kis_origin(KIS_LIVE_BASE_URL)
+    actual_official = candidate_origin == official_origin
+    try:
+        configured_origin = _canonical_kis_origin(
+            env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL
+        )
+    except KisOrderAuthorityError:
+        if kis_specific or credential_shaped or actual_official:
+            raise KisOrderAuthorityError(
+                "KIS configured origin is invalid"
+            ) from None
+        return "NON_KIS"
+    recognized_origin = candidate_origin in {
+        official_origin,
+        configured_origin,
+    }
+    trading_candidate = path in _KIS_TRADING_ENDPOINTS
+    if not recognized_origin:
+        if kis_specific or credential_shaped:
+            raise KisOrderAuthorityError(
+                "KIS-shaped request origin is not configured"
+            )
+        return "NON_KIS"
+    if type(method) is not str or method != normalized_method:
+        raise KisOrderAuthorityError(
+            "KIS HTTP method is not the exact uppercase wire token"
+        )
+    actual = _kis_actual_url(url)
+    if trading_candidate:
+        _require_kis_trading_wire_authority(
+            method=method, url=url, body=body, headers=headers
+        )
+        return "TRADING"
+    if normalized_method == "GET":
+        normalized_headers = _canonical_kis_headers(headers)
+        credentialed = bool(
+            {
+                "authorization",
+                "appkey",
+                "appsecret",
+            }.intersection(normalized_headers)
+        )
+        if credentialed and (
+            actual["official"] is not True
+            or actual["configured"] is not True
+            or env_value("KIS_ENV").lower() != "real"
+            or str(actual["rawUrl"]) != str(actual["canonicalUrl"])
+        ):
+            raise KisOrderAuthorityError(
+                "KIS credentialed read wire tuple is invalid"
+            )
+        _require_kis_read_wire_authority(
+            method=method,
+            url=url,
+            body=body,
+            headers=headers,
+        )
+        return "READ"
+    if normalized_method == "POST" and path == KIS_TOKEN_ENDPOINT:
+        _validate_exact_kis_token_request(
+            actual=actual,
+            body=body,
+            headers=headers,
+        )
+        require_kis_token_authority()
+        return "TOKEN"
+    raise KisOrderAuthorityError("unsupported KIS method/path is forbidden")
+
+
+def _install_kis_http_dispatch(
+    *,
+    kind: str,
+    method: str,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> _KisHttpDispatch:
+    if getattr(_KIS_HTTP_DISPATCH_LOCAL, "ticket", None) is not None:
+        raise KisOrderAuthorityError("nested KIS HTTP dispatch is forbidden")
+    ticket = _KisHttpDispatch(
+        owner_thread_id=threading.get_ident(),
+        request_hash=_kis_http_request_hash(
+            method=method,
+            url=url,
+            body=body,
+            headers=headers,
+        ),
+        kind=kind,
+        nonce=uuid.uuid4().hex,
+    )
+    _KIS_HTTP_DISPATCH_LOCAL.ticket = ticket
+    return ticket
+
+
+def _consume_kis_http_dispatch(
+    *,
+    kind: str,
+    method: str,
+    url: str,
+    body: dict[str, object] | None,
+    headers: dict[str, str],
+) -> None:
+    ticket = getattr(_KIS_HTTP_DISPATCH_LOCAL, "ticket", None)
+    request_hash = _kis_http_request_hash(
+        method=method,
+        url=url,
+        body=body,
+        headers=headers,
+    )
+    with _KIS_HTTP_DISPATCH_LOCK:
+        if (
+            type(ticket) is not _KisHttpDispatch
+            or ticket.owner_thread_id != threading.get_ident()
+            or ticket.kind != kind
+            or ticket.consumed
+            or not secrets.compare_digest(ticket.request_hash, request_hash)
+        ):
+            raise KisOrderAuthorityError(
+                "KIS HTTP requires one exact paced dispatch capability"
+            )
+        ticket.consumed = True
+
+
+class _KisTradingNoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Turn every redirect into one terminal HTTPError; never follow it."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
 def send_prepared_request(prepared: PreparedRequest, *, timeout_seconds: float = 10.0) -> dict[str, object]:
     if not prepared.can_send:
         return {"ok": False, "status": "blocked", "preview": prepared.preview()}
-    if prepared.provider.strip().lower() == "kis":
+    frozen = PreparedRequest(
+        provider=prepared.provider,
+        method=prepared.method,
+        url=prepared.url,
+        endpoint=prepared.endpoint,
+        headers=copy.deepcopy(prepared.headers),
+        safe_headers=copy.deepcopy(prepared.safe_headers),
+        body=copy.deepcopy(prepared.body),
+        query=copy.deepcopy(prepared.query),
+        blocked_reasons=list(prepared.blocked_reasons),
+    )
+    _guard_ordinary_upbit_mutation_edge(frozen)
+    try:
+        parsed = urllib.parse.urlsplit(frozen.url)
+        port = parsed.port
+        actual_origin = (
+            f"{parsed.scheme.lower()}://{parsed.hostname.lower()}:"
+            f"{443 if port is None else port}"
+            if parsed.hostname and parsed.scheme
+            else ""
+        )
+        kis_url = actual_origin in {
+            _canonical_kis_origin(KIS_LIVE_BASE_URL),
+            _canonical_kis_origin(
+                env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL
+            ),
+        }
+    except (KisOrderAuthorityError, ValueError):
+        kis_url = False
+        parsed = urllib.parse.SplitResult("", "", "", "", "")
+    kis_provider = frozen.provider.strip().lower() == "kis"
+    if kis_url or kis_provider:
+        if (
+            not kis_url
+            or not kis_provider
+            or frozen.endpoint != parsed.path
+            or frozen.method.strip().upper() not in {"GET", "POST"}
+        ):
+            raise KisOrderAuthorityError(
+                "KIS provider/endpoint/method metadata differs from actual URL"
+            )
+        _guard_kis_owned_http_edge(
+            method=frozen.method,
+            url=frozen.url,
+            body=frozen.body,
+            headers=frozen.headers,
+            kis_specific=True,
+        )
         return _send_kis_http_json(
-            prepared.method,
-            prepared.url,
-            body=prepared.body,
-            headers=prepared.headers,
+            frozen.method,
+            frozen.url,
+            body=frozen.body,
+            headers=frozen.headers,
             timeout_seconds=timeout_seconds,
         )
-    return http_json(prepared.method, prepared.url, body=prepared.body, headers=prepared.headers, timeout_seconds=timeout_seconds)
+    return http_json(
+        frozen.method,
+        frozen.url,
+        body=frozen.body,
+        headers=frozen.headers,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def http_json(
@@ -1598,33 +2753,169 @@ def http_json(
     headers: dict[str, str],
     timeout_seconds: float,
 ) -> dict[str, object]:
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    frozen_body = copy.deepcopy(body)
+    frozen_headers = copy.deepcopy(headers)
+    kis_kind = _guard_kis_owned_http_edge(
+        method=method,
+        url=url,
+        body=frozen_body,
+        headers=frozen_headers,
+        kis_specific=False,
+    )
+    kis_trading = kis_kind == "TRADING"
+    # Every broker request uses one owned no-redirect opener.  urllib's
+    # default redirect handler clones all non-content headers to Location,
+    # including Upbit Authorization and Binance X-MBX-APIKEY.  A redirect is
+    # therefore a terminal single-attempt outcome for KIS and crypto alike.
+    kis_request = kis_kind != "NON_KIS"
+    data = (
+        _canonical_kis_trading_body_bytes(frozen_body)
+        if kis_trading
+        else (
+            json.dumps(frozen_body, ensure_ascii=False).encode("utf-8")
+            if frozen_body is not None
+            else None
+        )
+    )
+    request = urllib.request.Request(
+        url, data=data, headers=frozen_headers, method=method
+    )
+    opener = urllib.request.build_opener(
+        _KisTradingNoRedirectHandler()
+    ).open
+    if kis_kind != "NON_KIS":
+        _consume_kis_http_dispatch(
+            kind=kis_kind,
+            method=method,
+            url=url,
+            body=frozen_body,
+            headers=frozen_headers,
+        )
+    if kis_trading:
+        _consume_kis_trading_wire_authority(
+            method=method,
+            url=url,
+            body=frozen_body,
+            headers=frozen_headers,
+        )
+    elif kis_kind == "READ":
+        _consume_kis_read_wire_authority(
+            method=method,
+            url=url,
+            body=frozen_body,
+            headers=frozen_headers,
+        )
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310 - official user-selected broker endpoints.
+        with opener(request, timeout=timeout_seconds) as response:  # noqa: S310 - exact broker URL checked above.
+            status_code = int(response.status)
+            effective_url = str(response.geturl())
+            if effective_url != url or 300 <= status_code <= 399:
+                if kis_request:
+                    raise KisOrderAuthorityError(
+                        "KIS response effective URL changed"
+                    )
+                return {
+                    "ok": False,
+                    "statusCode": status_code,
+                    "text": "HTTP redirect/effective URL change blocked",
+                    "json": {},
+                    "redirectBlocked": True,
+                    "outcomeAmbiguous": method.strip().upper()
+                    in {"POST", "PUT", "PATCH", "DELETE"},
+                    "physicalAttemptCount": 1,
+                    "retryAllowed": False,
+                }
             text = response.read().decode("utf-8", errors="replace")
             return {
-                "ok": 200 <= int(response.status) < 400,
-                "statusCode": int(response.status),
+                "ok": 200 <= status_code < 300,
+                "statusCode": status_code,
                 "text": text,
                 "json": parse_json(text),
                 "trCont": str(response.headers.get("tr_cont") or ""),
             }
     except urllib.error.HTTPError as exc:
-        text = exc.read().decode("utf-8", errors="replace")
-        return {
-            "ok": False,
-            "statusCode": int(exc.code),
-            "text": text,
-            "json": parse_json(text),
-            "trCont": str(exc.headers.get("tr_cont") or "") if exc.headers else "",
-        }
+        try:
+            if 300 <= int(exc.code) <= 399:
+                return {
+                    "ok": False,
+                    "statusCode": int(exc.code),
+                    "text": (
+                        "KIS redirect blocked before follow"
+                        if kis_request
+                        else "HTTP redirect blocked before follow"
+                    ),
+                    "json": {},
+                    "trCont": "",
+                    "redirectBlocked": True,
+                    "outcomeAmbiguous": (
+                        True
+                        if kis_request
+                        else method.strip().upper()
+                        in {"POST", "PUT", "PATCH", "DELETE"}
+                    ),
+                    "physicalAttemptCount": 1,
+                    "retryAllowed": False,
+                }
+            text = exc.read().decode("utf-8", errors="replace")
+            result = {
+                "ok": False,
+                "statusCode": int(exc.code),
+                "text": text,
+                "json": parse_json(text),
+                "trCont": (
+                    str(exc.headers.get("tr_cont") or "")
+                    if exc.headers
+                    else ""
+                ),
+            }
+            if kis_kind in {"TRADING", "READ"}:
+                result.update(
+                    {
+                        "physicalAttemptCount": 1,
+                        "retryAllowed": False,
+                    }
+                )
+                if kis_trading:
+                    result["outcomeAmbiguous"] = True
+            return result
+        finally:
+            exc.close()
     except urllib.error.URLError as exc:
-        return {"ok": False, "statusCode": 0, "text": str(exc.reason), "json": {}}
+        result = {
+            "ok": False,
+            "statusCode": 0,
+            "text": str(exc.reason),
+            "json": {},
+        }
+        if kis_kind in {"TRADING", "READ"}:
+            result.update(
+                {
+                    "physicalAttemptCount": 1,
+                    "retryAllowed": False,
+                }
+            )
+            if kis_trading:
+                result["outcomeAmbiguous"] = True
+        return result
     except TimeoutError as exc:
         # urlopen() may succeed and then time out while response.read() waits.
         # That read timeout is a bare TimeoutError, not urllib.error.URLError.
-        return {"ok": False, "statusCode": 0, "text": str(exc), "json": {}}
+        result = {
+            "ok": False,
+            "statusCode": 0,
+            "text": str(exc),
+            "json": {},
+        }
+        if kis_kind in {"TRADING", "READ"}:
+            result.update(
+                {
+                    "physicalAttemptCount": 1,
+                    "retryAllowed": False,
+                }
+            )
+            if kis_trading:
+                result["outcomeAmbiguous"] = True
+        return result
 
 
 def parse_json(text: str) -> object:

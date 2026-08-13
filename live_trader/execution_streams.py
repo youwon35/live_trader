@@ -11,12 +11,70 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Iterable
+import urllib.error
 import urllib.request
 import uuid
 
 from .live_adapters import binance_timestamp_ms, refresh_binance_time_offset
 from trading_runtime.kis_rate_limiter import GLOBAL_KIS_REST_LIMITERS
 from trading_runtime.kis_websocket_owner import GLOBAL_KIS_WEBSOCKET_OWNERS
+
+
+_AUTHENTICATED_HTTP_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_BINANCE_FUTURES_PRIVATE_REST_BASE = "https://fapi.binance.com"
+_BINANCE_FUTURES_PRIVATE_STREAM_BASE = "wss://fstream.binance.com/ws"
+
+
+class _AuthenticatedBrokerNoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep authenticated broker requests pinned to their original URL."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def _open_authenticated_broker_request(
+    request: urllib.request.Request,
+    *,
+    timeout: float,
+) -> Any:
+    """Open once without redirects and reject any effective-URL change."""
+
+    expected_url = str(request.full_url)
+    opener = urllib.request.build_opener(_AuthenticatedBrokerNoRedirectHandler())
+    try:
+        response = opener.open(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if int(exc.code or 0) in _AUTHENTICATED_HTTP_REDIRECT_STATUSES:
+            exc.close()
+            raise RuntimeError(
+                "Authenticated broker HTTP redirect is forbidden"
+            ) from None
+        raise
+
+    status = getattr(response, "status", None)
+    if not isinstance(status, int):
+        getcode = getattr(response, "getcode", None)
+        status = getcode() if callable(getcode) else None
+    geturl = getattr(response, "geturl", None)
+    effective_url = geturl() if callable(geturl) else None
+    if (
+        status in _AUTHENTICATED_HTTP_REDIRECT_STATUSES
+        or not isinstance(effective_url, str)
+        or effective_url != expected_url
+    ):
+        response.close()
+        raise RuntimeError(
+            "Authenticated broker HTTP response URL changed"
+        )
+    return response
 
 
 def _b64url(payload: bytes) -> str:
@@ -320,7 +378,14 @@ def _float(value: Any) -> float:
 class ExecutionStreamManager:
     """Reconnectable private order/execution streams with a durable audit log."""
 
-    def __init__(self, data_root: Path, *, log_max_bytes: int = 5 * 1024 * 1024, log_backup_count: int = 3) -> None:
+    def __init__(
+        self,
+        data_root: Path,
+        *,
+        log_max_bytes: int = 5 * 1024 * 1024,
+        log_backup_count: int = 3,
+        binance_functional_stream_bridge: Any | None = None,
+    ) -> None:
         self.data_root = Path(data_root)
         self.log_max_bytes = max(1024, int(log_max_bytes))
         self.log_backup_count = max(1, int(log_backup_count))
@@ -334,6 +399,76 @@ class ExecutionStreamManager:
             "upbit": deque(maxlen=1000),
         }
         self._status: dict[str, dict[str, Any]] = {}
+        # Optional and fail-closed.  Ordinary Binance stream consumers retain
+        # their existing queue/audit behavior when no functional bridge is
+        # provided; the continuous functional lane never infers proof from
+        # those ordinary queues.
+        self._binance_functional_stream_bridge = (
+            binance_functional_stream_bridge
+        )
+        self._binance_functional_receive_lock = threading.RLock()
+        self._binance_functional_terminal_condition = threading.Condition()
+        self._binance_functional_terminal_request_id = ""
+        self._binance_functional_terminal_done = False
+        self._binance_functional_terminal_error = ""
+        self._binance_functional_terminal_result: dict[str, Any] = {}
+
+    def begin_binance_functional_terminal_barrier(
+        self,
+        *,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """Receive a same-socket in-band cutoff ACK, then drain and stop.
+
+        A process lock cannot prove the socket receive buffer is empty.  The
+        sole reader sends an application-level ``time`` request on the exact
+        authenticated connection and keeps reading/journaling until its
+        ordered response arrives.  Only that reader may close intake.
+        """
+
+        bridge = self._binance_functional_stream_bridge
+        if bridge is None:
+            raise RuntimeError("Binance functional stream bridge is missing")
+        with self._lock:
+            event = self._stop_events.get("binance")
+            thread = self._threads.get("binance")
+            if event is None or thread is None or not thread.is_alive():
+                raise RuntimeError("Binance functional stream owner is missing")
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        with self._binance_functional_terminal_condition:
+            if (
+                self._binance_functional_terminal_request_id
+                and not self._binance_functional_terminal_done
+            ):
+                raise RuntimeError("Binance terminal barrier is already pending")
+            marker_id = "binance-terminal-" + uuid.uuid4().hex
+            self._binance_functional_terminal_request_id = marker_id
+            self._binance_functional_terminal_done = False
+            self._binance_functional_terminal_error = ""
+            self._binance_functional_terminal_result = {}
+            self._binance_functional_terminal_condition.notify_all()
+            while not self._binance_functional_terminal_done:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Binance in-band terminal marker response timed out"
+                    )
+                self._binance_functional_terminal_condition.wait(remaining)
+            error = self._binance_functional_terminal_error
+            marker_result = dict(self._binance_functional_terminal_result)
+        if error:
+            raise RuntimeError(error)
+        thread.join(timeout=max(0.1, float(timeout)))
+        if thread.is_alive():
+            raise RuntimeError(
+                "Binance functional stream did not stop at terminal barrier"
+            )
+        return {
+            "barrierClosed": True,
+            "readerJoined": True,
+            **marker_result,
+            "stream": bridge.snapshot(),
+        }
 
     def start(self, brokers: Iterable[str] = ("kis", "binance", "upbit")) -> dict[str, Any]:
         with self._lock:
@@ -350,6 +485,12 @@ class ExecutionStreamManager:
                 ):
                     continue
                 stop_event = threading.Event()
+                if name == "binance" and self._binance_functional_stream_bridge is not None:
+                    with self._binance_functional_terminal_condition:
+                        self._binance_functional_terminal_request_id = ""
+                        self._binance_functional_terminal_done = False
+                        self._binance_functional_terminal_error = ""
+                        self._binance_functional_terminal_result = {}
                 self._stop_events[name] = stop_event
                 thread = threading.Thread(
                     target=self._run,
@@ -505,7 +646,14 @@ class ExecutionStreamManager:
         api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
         if not api_key or not api_secret:
             raise RuntimeError("Binance private stream credentials missing")
-        socket = websocket.create_connection("wss://ws-api.binance.com:443/ws-api/v3", timeout=20)
+        bridge = self._binance_functional_stream_bridge
+        # The functional journal's continuity SLA is five seconds.  A
+        # 20-second blocking recv would hide a half-open socket far too long;
+        # ordinary stream behavior remains unchanged when no bridge is bound.
+        socket = websocket.create_connection(
+            "wss://ws-api.binance.com:443/ws-api/v3",
+            timeout=2 if bridge is not None else 20,
+        )
         request_id = str(uuid.uuid4())
         params = binance_stream_subscription_params(api_key, api_secret)
         socket.send(json.dumps({
@@ -513,24 +661,205 @@ class ExecutionStreamManager:
             "method": "userDataStream.subscribe.signature",
             "params": params,
         }))
-        with self._lock:
-            self._status["binance"].update({"connected": True, "lastError": ""})
+        subscription_confirmed = bridge is None
+        liveness_request_id = ""
+        liveness_sent_monotonic = 0.0
+        terminal_sent_id = ""
+        if bridge is None:
+            # Preserve the ordinary stream's existing status semantics.  The
+            # stricter ACK proof below exists only when the isolated
+            # functional bridge was explicitly installed.
+            with self._lock:
+                self._status["binance"].update(
+                    {"connected": True, "lastError": ""}
+                )
         try:
             while not stop_event.is_set():
+                inbound_ticket = ""
+                terminal_ack: dict[str, Any] | None = None
+                if bridge is not None and subscription_confirmed:
+                    with self._binance_functional_terminal_condition:
+                        pending_terminal_id = (
+                            self._binance_functional_terminal_request_id
+                        )
+                    if pending_terminal_id and not terminal_sent_id:
+                        # This write alone proves nothing.  Continue receiving
+                        # every preceding frame until this exact response is
+                        # observed on the same authenticated connection.
+                        socket.send(
+                            json.dumps(
+                                {
+                                    "id": pending_terminal_id,
+                                    "method": "time",
+                                }
+                            )
+                        )
+                        terminal_sent_id = pending_terminal_id
                 try:
-                    raw = socket.recv()
+                    if bridge is None or not subscription_confirmed:
+                        raw = socket.recv()
+                    else:
+                        # Pair the socket receive and durable intake ticket
+                        # under the same state-owned fence.  A terminal barrier
+                        # can therefore never archive while a frame is already
+                        # read but not yet visible as in-flight.
+                        with self._binance_functional_receive_lock:
+                            raw = socket.recv()
+                            begin_inbound = getattr(
+                                bridge, "begin_inbound_frame", None
+                            )
+                            if callable(begin_inbound):
+                                inbound_ticket = begin_inbound()
                 except Exception as exc:
                     if type(exc).__name__ == "WebSocketTimeoutException":
-                        socket.ping()
+                        if bridge is None:
+                            socket.ping()
+                            continue
+                        now_monotonic = time.monotonic()
+                        if liveness_request_id and (
+                            now_monotonic - liveness_sent_monotonic >= 5.0
+                        ):
+                            raise RuntimeError(
+                                "Binance functional stream liveness response deadline missed"
+                            )
+                        if not liveness_request_id:
+                            # Binance WebSocket API ``time`` is an
+                            # application-level round trip on this exact
+                            # authenticated socket.  Only its matching inbound
+                            # response renews durable continuity; the write
+                            # itself proves nothing.
+                            liveness_request_id = str(uuid.uuid4())
+                            liveness_sent_monotonic = now_monotonic
+                            socket.send(
+                                json.dumps(
+                                    {
+                                        "id": liveness_request_id,
+                                        "method": "time",
+                                    }
+                                )
+                            )
                         continue
                     raise
-                payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
-                if payload.get("id") == request_id and int(payload.get("status") or 0) >= 400:
-                    raise RuntimeError(f"Binance user stream subscription failed: {payload.get('error') or payload.get('status')}")
-                event = parse_binance_execution_report(payload)
-                if event:
-                    self._record("binance", event)
+                try:
+                    payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+                    if terminal_sent_id and payload.get("id") == terminal_sent_id:
+                        status = int(payload.get("status") or 0)
+                        result = payload.get("result")
+                        server_time_ms = (
+                            int(result.get("serverTime") or 0)
+                            if isinstance(result, dict)
+                            else 0
+                        )
+                        if status != 200 or server_time_ms <= 0:
+                            raise RuntimeError(
+                                "Binance functional terminal marker response is invalid"
+                            )
+                        if bridge is None:
+                            raise RuntimeError(
+                                "Binance functional terminal marker bridge disappeared"
+                            )
+                        terminal_ack = dict(
+                            bridge.on_terminal_marker(
+                                marker_id=terminal_sent_id,
+                                server_time_ms=server_time_ms,
+                            )
+                        )
+                    elif liveness_request_id and payload.get("id") == liveness_request_id:
+                        status = int(payload.get("status") or 0)
+                        result = payload.get("result")
+                        if (
+                            status != 200
+                            or not isinstance(result, dict)
+                            or int(result.get("serverTime") or 0) <= 0
+                        ):
+                            raise RuntimeError(
+                                "Binance functional stream liveness response is invalid"
+                            )
+                        if bridge is not None:
+                            bridge.on_transport_liveness()
+                        liveness_request_id = ""
+                        liveness_sent_monotonic = 0.0
+                        continue
+                    if terminal_ack is not None:
+                        pass
+                    elif payload.get("id") == request_id:
+                        status = int(payload.get("status") or 0)
+                        if bridge is None:
+                            if status >= 400:
+                                raise RuntimeError(
+                                    "Binance user stream subscription failed: "
+                                    f"{payload.get('error') or payload.get('status')}"
+                                )
+                            continue
+                        if status != 200:
+                            raise RuntimeError(
+                                "Binance user stream subscription failed: "
+                                f"{payload.get('error') or payload.get('status')}"
+                            )
+                        if subscription_confirmed:
+                            raise RuntimeError(
+                                "duplicate Binance user stream subscription ACK"
+                            )
+                        if bridge is not None:
+                            bridge.on_subscription_confirmed()
+                        subscription_confirmed = True
+                        with self._lock:
+                            self._status["binance"].update(
+                                {"connected": True, "lastError": ""}
+                            )
+                        continue
+                    elif not subscription_confirmed:
+                        raise RuntimeError(
+                            "Binance user-data event arrived before subscription ACK"
+                        )
+                    else:
+                        if bridge is not None:
+                            # The durable bridge sees execution, account-position, and
+                            # balance events before the ordinary execution-only parser.
+                            # Unsupported events deliberately tear down and mark a gap.
+                            bridge.on_payload(payload)
+                        event = parse_binance_execution_report(payload)
+                        if event:
+                            self._record("binance", event)
+                finally:
+                    if bridge is not None and inbound_ticket:
+                        finish_inbound = getattr(
+                            bridge, "finish_inbound_frame", None
+                        )
+                        if not callable(finish_inbound):
+                            raise RuntimeError(
+                                "Binance functional inbound fence is incomplete"
+                            )
+                        finish_inbound(inbound_ticket)
+                if terminal_ack is not None:
+                    bridge.close_terminal_intake(timeout_seconds=5.0)
+                    stop_event.set()
+                    terminal_ack.update(
+                        {
+                            "inBandMarkerReceived": True,
+                            "markerConnection": "AUTHENTICATED_BINANCE_WS_API_V3",
+                        }
+                    )
+                    with self._binance_functional_terminal_condition:
+                        self._binance_functional_terminal_result = terminal_ack
+                        self._binance_functional_terminal_done = True
+                        self._binance_functional_terminal_condition.notify_all()
+                    break
         finally:
+            with self._binance_functional_terminal_condition:
+                if (
+                    self._binance_functional_terminal_request_id
+                    and not self._binance_functional_terminal_done
+                ):
+                    self._binance_functional_terminal_error = (
+                        "Binance stream closed before the in-band terminal marker"
+                    )
+                    self._binance_functional_terminal_done = True
+                    self._binance_functional_terminal_condition.notify_all()
+            if bridge is not None:
+                bridge.on_disconnect(
+                    "Binance user stream socket closed or reconnecting"
+                )
             socket.close()
 
     def _run_binance_futures(self, stop_event: threading.Event) -> None:
@@ -543,8 +872,22 @@ class ExecutionStreamManager:
             )
         base_url = (
             os.getenv("BINANCE_FUTURES_BASE_URL", "").strip()
-            or "https://fapi.binance.com"
+            or _BINANCE_FUTURES_PRIVATE_REST_BASE
         ).rstrip("/")
+        stream_base = (
+            os.getenv("BINANCE_FUTURES_STREAM_URL", "").strip()
+            or _BINANCE_FUTURES_PRIVATE_STREAM_BASE
+        ).rstrip("/")
+        if base_url != _BINANCE_FUTURES_PRIVATE_REST_BASE:
+            raise RuntimeError(
+                "Binance Futures private REST origin must be the official "
+                "production endpoint"
+            )
+        if stream_base != _BINANCE_FUTURES_PRIVATE_STREAM_BASE:
+            raise RuntimeError(
+                "Binance Futures private stream origin must be the official "
+                "production endpoint"
+            )
         listen_key_url = f"{base_url}/fapi/v1/listenKey"
         request = urllib.request.Request(
             listen_key_url,
@@ -552,17 +895,16 @@ class ExecutionStreamManager:
             headers={"X-MBX-APIKEY": api_key},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with _open_authenticated_broker_request(
+            request,
+            timeout=10,
+        ) as response:
             payload = json.loads(response.read().decode("utf-8"))
         listen_key = str(payload.get("listenKey") or "")
         if not listen_key:
             raise RuntimeError(
                 "Binance Futures listenKey 발급에 실패했습니다."
             )
-        stream_base = os.getenv(
-            "BINANCE_FUTURES_STREAM_URL",
-            "wss://fstream.binance.com/ws",
-        ).rstrip("/")
         socket = websocket.create_connection(
             f"{stream_base}/{listen_key}",
             timeout=20,
@@ -581,7 +923,7 @@ class ExecutionStreamManager:
                         headers={"X-MBX-APIKEY": api_key},
                         method="PUT",
                     )
-                    with urllib.request.urlopen(
+                    with _open_authenticated_broker_request(
                         keepalive,
                         timeout=10,
                     ):
@@ -611,7 +953,10 @@ class ExecutionStreamManager:
                     headers={"X-MBX-APIKEY": api_key},
                     method="DELETE",
                 )
-                with urllib.request.urlopen(close_request, timeout=10):
+                with _open_authenticated_broker_request(
+                    close_request,
+                    timeout=10,
+                ):
                     pass
             except Exception:
                 pass
@@ -649,7 +994,10 @@ class ExecutionStreamManager:
         # and every sibling process, so reconnect storms cannot burst here.
         GLOBAL_KIS_REST_LIMITERS.get_approval(app_key).acquire()
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310 - official fixed endpoint.
+            with _open_authenticated_broker_request(
+                request,
+                timeout=10,
+            ) as response:
                 approval = json.loads(response.read().decode())
         except Exception:
             GLOBAL_KIS_WEBSOCKET_OWNERS.release(

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import threading
 import unittest
 from unittest.mock import patch
 
 from live_trader import state
+from live_trader import binance_order_authority as binance_authority
 
 
 class FakeFillSoakSession:
@@ -362,6 +364,115 @@ class FuturesFillSoakStateTest(unittest.TestCase):
         broker_gate.assert_not_called()
         scope_gate.assert_not_called()
         runtime_gate.assert_called_once()
+
+    def test_fill_soak_normal_send_and_kill_share_canonical_boundary_without_deadlock(
+        self,
+    ) -> None:
+        normal_has_route = threading.Event()
+        allow_normal_emergency = threading.Event()
+        kill_entered = threading.Event()
+        release_kill = threading.Event()
+        errors: list[BaseException] = []
+        emergency_entries: list[str] = []
+        real_emergency = binance_authority.emergency_stop_dispatch_boundary
+
+        @contextmanager
+        def paused_emergency():
+            name = threading.current_thread().name
+            if name == "normal-binance-send":
+                normal_has_route.set()
+                if not allow_normal_emergency.wait(timeout=2):
+                    raise AssertionError("normal sender was not released")
+            with real_emergency():
+                emergency_entries.append(name)
+                yield {"active": False, "revision": "test-off"}
+
+        @contextmanager
+        def forbidden_emergency_first():
+            raise AssertionError(
+                "fill-soak attempted emergency before Binance route authority"
+            )
+            yield {}  # pragma: no cover
+
+        snapshot = {
+            "functionalAuthorityOpen": False,
+            "functionalPhase": "IDLE",
+            "functionalRevision": 1,
+            "functionalSessionId": "",
+            "functionalAccountFingerprint": "",
+            "applicationInstanceLeaseHeld": True,
+            "ordinaryRoutesClosed": False,
+        }
+
+        def run_normal() -> None:
+            try:
+                with binance_authority.ordinary_binance_final_mutation_boundary(
+                    operation="FUTURES_PLACE_ORDER"
+                ):
+                    pass
+            except BaseException as exc:  # pragma: no cover - watchdog evidence
+                errors.append(exc)
+
+        def run_soak() -> None:
+            try:
+                with state._binance_futures_fill_soak_dispatch_boundary():
+                    # This is the exact nested boundary reached by
+                    # LiveBrokerRouter.place_order().
+                    with binance_authority.ordinary_binance_final_mutation_boundary(
+                        operation="FUTURES_PLACE_ORDER"
+                    ):
+                        pass
+            except BaseException as exc:  # pragma: no cover - watchdog evidence
+                errors.append(exc)
+
+        def run_kill() -> None:
+            try:
+                with real_emergency():
+                    kill_entered.set()
+                    if not release_kill.wait(timeout=2):
+                        raise AssertionError("Kill boundary was not released")
+            except BaseException as exc:  # pragma: no cover - watchdog evidence
+                errors.append(exc)
+
+        with patch.object(
+            binance_authority, "_snapshot", return_value=snapshot
+        ), patch.object(
+            binance_authority,
+            "emergency_stop_dispatch_boundary",
+            paused_emergency,
+        ), patch.object(
+            state,
+            "emergency_stop_dispatch_boundary",
+            forbidden_emergency_first,
+        ):
+            normal = threading.Thread(
+                target=run_normal, name="normal-binance-send", daemon=True
+            )
+            soak = threading.Thread(
+                target=run_soak, name="futures-fill-soak", daemon=True
+            )
+            kill = threading.Thread(
+                target=run_kill, name="durable-kill", daemon=True
+            )
+            normal.start()
+            self.assertTrue(normal_has_route.wait(timeout=1))
+            soak.start()
+            kill.start()
+            self.assertTrue(kill_entered.wait(timeout=1))
+            release_kill.set()
+            kill.join(timeout=1)
+            allow_normal_emergency.set()
+            normal.join(timeout=1)
+            soak.join(timeout=1)
+
+        self.assertFalse(normal.is_alive())
+        self.assertFalse(soak.is_alive())
+        self.assertFalse(kill.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(
+            ["normal-binance-send", "futures-fill-soak"],
+            emergency_entries,
+        )
 
 
 if __name__ == "__main__":

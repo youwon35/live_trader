@@ -1,7 +1,11 @@
 import os
 import unittest
+import urllib.error
 from decimal import Decimal
-from unittest.mock import patch
+from io import BytesIO
+from unittest.mock import MagicMock, Mock, patch
+
+from live_trader.kis_order_authority import KisOrderAuthorityError
 
 from live_trader.live_adapters import (
     BINANCE_ACCOUNT_ENDPOINT,
@@ -10,12 +14,16 @@ from live_trader.live_adapters import (
     KIS_DOMESTIC_BALANCE_ENDPOINT,
     KIS_DOMESTIC_CANCEL_ENDPOINT,
     KIS_DOMESTIC_ORDER_ENDPOINT,
+    KIS_LIVE_BASE_URL,
     KIS_OVERSEAS_BALANCE_ENDPOINT,
+    KIS_OVERSEAS_WORKING_ORDERS_ENDPOINT,
     KIS_OVERSEAS_ORDER_ENDPOINT,
     KisRestRateLimitError,
+    PreparedRequest,
     UPBIT_ACCOUNTS_ENDPOINT,
     UPBIT_ORDER_ENDPOINT,
     UPBIT_ORDER_DETAIL_ENDPOINT,
+    _KisTradingNoRedirectHandler,
     _clear_binance_time_offset_cache,
     _clear_kis_access_token_cache,
     _reset_kis_request_pacer,
@@ -26,6 +34,7 @@ from live_trader.live_adapters import (
     build_kis_cancel_order_request,
     build_kis_live_order_request,
     build_kis_overseas_balance_request,
+    build_kis_overseas_working_orders_request,
     build_upbit_accounts_request,
     build_upbit_cancel_order_request,
     build_upbit_order_request,
@@ -78,8 +87,19 @@ class EnvRestoreMixin:
 
 class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
     def test_response_read_timeout_returns_structured_failure(self) -> None:
-        with patch("live_trader.live_adapters.urllib.request.urlopen") as urlopen:
-            response = urlopen.return_value.__enter__.return_value
+        with patch(
+            "live_trader.live_adapters.urllib.request.build_opener"
+        ) as build_opener, patch(
+            "live_trader.live_adapters.urllib.request.urlopen"
+        ) as default_urlopen:
+            response = (
+                build_opener.return_value.open.return_value
+                .__enter__.return_value
+            )
+            response.status = 200
+            response.geturl.return_value = (
+                "https://broker.example.test/account"
+            )
             response.read.side_effect = TimeoutError("The read operation timed out")
 
             result = http_json(
@@ -93,6 +113,178 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(0, result["statusCode"])
         self.assertEqual("The read operation timed out", result["text"])
+        default_urlopen.assert_not_called()
+
+    def test_crypto_credentials_never_follow_redirects(self) -> None:
+        routes = (
+            (
+                "upbit-get",
+                "GET",
+                "https://api.upbit.com/v1/accounts",
+                None,
+                {"Authorization": "Bearer upbit-private-token"},
+            ),
+            (
+                "upbit-post",
+                "POST",
+                "https://api.upbit.com/v1/orders",
+                {"market": "KRW-BTC", "side": "bid"},
+                {
+                    "Authorization": "Bearer upbit-private-token",
+                    "Content-Type": "application/json",
+                },
+            ),
+            (
+                "binance-get",
+                "GET",
+                "https://api.binance.com/api/v3/account?timestamp=1",
+                None,
+                {"X-MBX-APIKEY": "binance-private-key"},
+            ),
+            (
+                "binance-post",
+                "POST",
+                "https://api.binance.com/api/v3/order?timestamp=1",
+                None,
+                {"X-MBX-APIKEY": "binance-private-key"},
+            ),
+        )
+        location = "https://attacker.invalid/collect"
+        for label, method, url, body, headers in routes:
+            for status in (301, 302, 307, 308):
+                opened_urls: list[str] = []
+                errors: list[urllib.error.HTTPError] = []
+
+                def open_once(request, timeout=None):
+                    opened_urls.append(request.full_url)
+                    error = urllib.error.HTTPError(
+                        request.full_url,
+                        status,
+                        "redirect",
+                        {"Location": location},
+                        BytesIO(b""),
+                    )
+                    errors.append(error)
+                    raise error
+
+                owned_opener = Mock()
+                owned_opener.open.side_effect = open_once
+                with self.subTest(route=label, status=status), patch(
+                    "live_trader.live_adapters.urllib.request.build_opener",
+                    return_value=owned_opener,
+                ) as build_opener, patch(
+                    "live_trader.live_adapters.urllib.request.urlopen"
+                ) as default_urlopen:
+                    result = http_json(
+                        method,
+                        url,
+                        body=body,
+                        headers=headers,
+                        timeout_seconds=1,
+                    )
+                for error in errors:
+                    error.close()
+                self.assertFalse(result["ok"])
+                self.assertEqual(status, result["statusCode"])
+                self.assertTrue(result["redirectBlocked"])
+                self.assertFalse(result["retryAllowed"])
+                self.assertEqual(1, result["physicalAttemptCount"])
+                self.assertEqual(method == "POST", result["outcomeAmbiguous"])
+                self.assertEqual([url], opened_urls)
+                self.assertNotIn(location, opened_urls)
+                self.assertEqual(1, owned_opener.open.call_count)
+                build_opener.assert_called_once()
+                self.assertIsInstance(
+                    build_opener.call_args.args[0],
+                    _KisTradingNoRedirectHandler,
+                )
+                default_urlopen.assert_not_called()
+
+    def test_crypto_no_redirect_opener_preserves_ordinary_success(self) -> None:
+        routes = (
+            (
+                "GET",
+                "https://api.upbit.com/v1/accounts",
+                None,
+                {"Authorization": "Bearer upbit-private-token"},
+            ),
+            (
+                "POST",
+                "https://api.upbit.com/v1/orders",
+                {"market": "KRW-BTC", "side": "bid"},
+                {"Authorization": "Bearer upbit-private-token"},
+            ),
+            (
+                "GET",
+                "https://api.binance.com/api/v3/account?timestamp=1",
+                None,
+                {"X-MBX-APIKEY": "binance-private-key"},
+            ),
+            (
+                "POST",
+                "https://api.binance.com/api/v3/order?timestamp=1",
+                None,
+                {"X-MBX-APIKEY": "binance-private-key"},
+            ),
+        )
+        for method, url, body, headers in routes:
+            owned_opener = MagicMock()
+            response = owned_opener.open.return_value.__enter__.return_value
+            response.status = 200
+            response.geturl.return_value = url
+            response.read.return_value = b'{"accepted":true}'
+            response.headers = {}
+            with self.subTest(method=method, url=url), patch(
+                "live_trader.live_adapters.urllib.request.build_opener",
+                return_value=owned_opener,
+            ) as build_opener, patch(
+                "live_trader.live_adapters.urllib.request.urlopen"
+            ) as default_urlopen:
+                result = http_json(
+                    method,
+                    url,
+                    body=body,
+                    headers=headers,
+                    timeout_seconds=1,
+                )
+            self.assertTrue(result["ok"])
+            self.assertEqual(200, result["statusCode"])
+            self.assertEqual({"accepted": True}, result["json"])
+            self.assertEqual(1, owned_opener.open.call_count)
+            self.assertIsInstance(
+                build_opener.call_args.args[0],
+                _KisTradingNoRedirectHandler,
+            )
+            default_urlopen.assert_not_called()
+
+    def test_crypto_effective_url_change_is_terminal_without_retry(self) -> None:
+        url = "https://api.upbit.com/v1/accounts"
+        location = "https://attacker.invalid/collect"
+        owned_opener = MagicMock()
+        response = owned_opener.open.return_value.__enter__.return_value
+        response.status = 200
+        response.geturl.return_value = location
+        response.headers = {}
+        with patch(
+            "live_trader.live_adapters.urllib.request.build_opener",
+            return_value=owned_opener,
+        ), patch(
+            "live_trader.live_adapters.urllib.request.urlopen"
+        ) as default_urlopen:
+            result = http_json(
+                "GET",
+                url,
+                body=None,
+                headers={"Authorization": "Bearer upbit-private-token"},
+                timeout_seconds=1,
+            )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["redirectBlocked"])
+        self.assertFalse(result["retryAllowed"])
+        self.assertFalse(result["outcomeAmbiguous"])
+        self.assertEqual(1, owned_opener.open.call_count)
+        response.read.assert_not_called()
+        default_urlopen.assert_not_called()
 
     def test_cancel_request_builders_use_official_endpoints_and_identifiers(self) -> None:
         os.environ.update({
@@ -284,7 +476,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
             {
                 "UPBIT_ACCESS_KEY": "upbit-access",
                 "UPBIT_SECRET_KEY": "upbit-secret",
-                "UPBIT_BASE_URL": "https://upbit.example.test",
+                "UPBIT_BASE_URL": "https://api.upbit.com",
             }
         )
 
@@ -301,7 +493,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertTrue(prepared.can_send)
         self.assertEqual(prepared.provider, "upbit")
         self.assertEqual(prepared.endpoint, UPBIT_ORDER_ENDPOINT)
-        self.assertEqual(prepared.url, "https://upbit.example.test" + UPBIT_ORDER_ENDPOINT)
+        self.assertEqual(prepared.url, "https://api.upbit.com" + UPBIT_ORDER_ENDPOINT)
         self.assertEqual(prepared.headers["Content-Type"], "application/json")
         self.assertTrue(prepared.headers["Authorization"].startswith("Bearer "))
         self.assertEqual(prepared.safe_headers["authorization_configured"], True)
@@ -310,6 +502,101 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertEqual(prepared.body["ord_type"], "limit")
         self.assertEqual(prepared.body["volume"], "0.01")
         self.assertEqual(prepared.body["price"], "50000000")
+
+    def test_upbit_mutation_rejects_nonofficial_base_before_jwt_or_socket(self) -> None:
+        invalid_bases = (
+            "https://attacker.invalid",
+            "http://api.upbit.com",
+            "https://api.upbit.com:443",
+            "https://api.upbit.com/proxy",
+            "https://user@api.upbit.com",
+        )
+        builders = (
+            lambda: build_upbit_order_request(
+                {
+                    "market": "KRW-BTC",
+                    "side": "BUY",
+                    "order_type": "price",
+                    "notional": "5000",
+                }
+            ),
+            lambda: build_upbit_cancel_order_request("order-uuid"),
+        )
+
+        for configured in invalid_bases:
+            for builder in builders:
+                with self.subTest(configured=configured, builder=builder):
+                    os.environ.update(
+                        {
+                            "UPBIT_ACCESS_KEY": "upbit-access",
+                            "UPBIT_SECRET_KEY": "upbit-secret",
+                            "UPBIT_BASE_URL": configured,
+                        }
+                    )
+                    with (
+                        patch(
+                            "live_trader.live_adapters.build_upbit_authorization"
+                        ) as jwt,
+                        patch(
+                            "live_trader.live_adapters.urllib.request.build_opener"
+                        ) as build_opener,
+                        patch(
+                            "live_trader.live_adapters.urllib.request.urlopen"
+                        ) as default_urlopen,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "exact official production URL",
+                        ):
+                            builder()
+                    jwt.assert_not_called()
+                    build_opener.assert_not_called()
+                    default_urlopen.assert_not_called()
+
+    def test_upbit_mutation_edge_rejects_forged_foreign_url_socket_zero(self) -> None:
+        for method, endpoint, url, body in (
+            (
+                "POST",
+                UPBIT_ORDER_ENDPOINT,
+                "https://attacker.invalid/v1/orders",
+                {"market": "KRW-BTC", "side": "bid", "ord_type": "price"},
+            ),
+            (
+                "DELETE",
+                UPBIT_ORDER_DETAIL_ENDPOINT,
+                "https://user@api.upbit.com/v1/order?uuid=order-uuid",
+                None,
+            ),
+        ):
+            prepared = PreparedRequest(
+                provider="upbit",
+                method=method,
+                url=url,
+                endpoint=endpoint,
+                headers={"Authorization": "Bearer secret-jwt"},
+                safe_headers={"authorization_configured": True},
+                body=body,
+                query=None,
+                blocked_reasons=[],
+            )
+            with (
+                self.subTest(method=method, url=url),
+                patch("live_trader.live_adapters.http_json") as http_socket,
+                patch(
+                    "live_trader.live_adapters.urllib.request.build_opener"
+                ) as build_opener,
+                patch(
+                    "live_trader.live_adapters.urllib.request.urlopen"
+                ) as default_urlopen,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "exact official endpoint",
+                ):
+                    send_prepared_request(prepared)
+            http_socket.assert_not_called()
+            build_opener.assert_not_called()
+            default_urlopen.assert_not_called()
 
     def test_account_snapshot_requests_are_read_only_and_signed(self) -> None:
         os.environ.update(
@@ -361,17 +648,64 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         self.assertTrue(upbit.headers["Authorization"].startswith("Bearer "))
         self.assertEqual(upbit.safe_headers["authorization_configured"], True)
 
+    def test_kis_overseas_working_orders_request_is_account_wide_and_read_only(self) -> None:
+        os.environ.update(
+            {
+                "KIS_APP_KEY": "kis-app-key",
+                "KIS_APP_SECRET": "kis-app-secret",
+                "KIS_ACCOUNT_NO": "12345678-01",
+                "KIS_ACCOUNT_PRODUCT_CODE": "01",
+                "KIS_BASE_URL": "https://kis.example.test",
+                "KIS_ENV": "real",
+            }
+        )
+
+        prepared = build_kis_overseas_working_orders_request(
+            access_token="token-123",
+            context_fk200="FK-2",
+            context_nk200="NK-2",
+            continuation="N",
+        )
+
+        self.assertTrue(prepared.can_send)
+        self.assertEqual("GET", prepared.method)
+        self.assertEqual(KIS_OVERSEAS_WORKING_ORDERS_ENDPOINT, prepared.endpoint)
+        self.assertEqual("TTTS3018R", prepared.headers["tr_id"])
+        self.assertEqual("N", prepared.headers["tr_cont"])
+        self.assertEqual("NASD", prepared.query["OVRS_EXCG_CD"])
+        self.assertEqual("DS", prepared.query["SORT_SQN"])
+        self.assertEqual("FK-2", prepared.query["CTX_AREA_FK200"])
+        self.assertEqual("NK-2", prepared.query["CTX_AREA_NK200"])
+        self.assertEqual(
+            {
+                "CANO",
+                "ACNT_PRDT_CD",
+                "OVRS_EXCG_CD",
+                "SORT_SQN",
+                "CTX_AREA_FK200",
+                "CTX_AREA_NK200",
+            },
+            set(prepared.query),
+        )
+        self.assertNotIn("authorization", prepared.safe_headers)
+
+        os.environ["KIS_ENV"] = "demo"
+        demo = build_kis_overseas_working_orders_request(access_token="token-123")
+        self.assertFalse(demo.can_send)
+        self.assertIn("kis_live_environment", demo.blocked_reasons)
+
     def test_kis_access_token_is_reused_until_near_expiry(self) -> None:
         os.environ.update(
             {
                 "KIS_APP_KEY": "kis-app-key",
                 "KIS_APP_SECRET": "kis-app-secret",
-                "KIS_BASE_URL": "https://kis.example.test",
+                "KIS_BASE_URL": KIS_LIVE_BASE_URL,
+                "KIS_ENV": "real",
             }
         )
         response = {"json": {"access_token": "token-123", "expires_in": 3600}}
 
-        with patch("live_trader.live_adapters._acquire_shared_kis_rest_slot", return_value=0.0), patch("live_trader.live_adapters.http_json", return_value=response) as request, patch(
+        with patch("live_trader.live_adapters.require_kis_token_authority", return_value={}), patch("live_trader.live_adapters._acquire_shared_kis_rest_slot", return_value=0.0), patch("live_trader.live_adapters.http_json", return_value=response) as request, patch(
             "live_trader.live_adapters.time.monotonic",
             side_effect=[100.0, 100.0, 100.0, 101.0],
         ):
@@ -389,6 +723,7 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
                 "KIS_APP_SECRET": "kis-app-secret",
                 "KIS_ACCOUNT_NO": "12345678-01",
                 "KIS_ACCOUNT_PRODUCT_CODE": "01",
+                "KIS_ENV": "real",
                 "KIS_REQUEST_MIN_INTERVAL_SECONDS": "2.1",
             }
         )
@@ -397,7 +732,10 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         )
         response = {"ok": True, "json": {"rt_cd": "0"}}
 
-        with patch("live_trader.live_adapters._acquire_shared_kis_rest_slot", return_value=0.0), patch(
+        with patch(
+            "live_trader.live_adapters.require_kis_read_transport_authority",
+            return_value={},
+        ), patch("live_trader.live_adapters._acquire_shared_kis_rest_slot", return_value=0.0), patch(
             "live_trader.live_adapters.http_json",
             return_value=response,
         ) as request, patch(
@@ -420,11 +758,15 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
                 "KIS_APP_SECRET": "kis-app-secret",
                 "KIS_ACCOUNT_NO": "12345678-01",
                 "KIS_ACCOUNT_PRODUCT_CODE": "01",
+                "KIS_ENV": "real",
             }
         )
         prepared = build_kis_domestic_balance_request(access_token="token-123")
         events = []
         with patch(
+            "live_trader.live_adapters.require_kis_read_transport_authority",
+            return_value={},
+        ), patch(
             "live_trader.live_adapters.GLOBAL_KIS_REST_LIMITERS.get"
         ) as get_limiter, patch(
             "live_trader.live_adapters.http_json",
@@ -447,6 +789,9 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
         request.assert_called_once()
 
         with patch(
+            "live_trader.live_adapters.require_kis_read_transport_authority",
+            return_value={},
+        ), patch(
             "live_trader.live_adapters.GLOBAL_KIS_REST_LIMITERS.get"
         ) as blocked_limiter, patch(
             "live_trader.live_adapters.http_json"
@@ -463,7 +808,8 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
             {
                 "KIS_APP_KEY": "kis-app-key",
                 "KIS_APP_SECRET": "kis-app-secret",
-                "KIS_BASE_URL": "https://kis.example.test",
+                "KIS_BASE_URL": KIS_LIVE_BASE_URL,
+                "KIS_ENV": "real",
             }
         )
         events = []
@@ -476,6 +822,10 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
             patch(
                 "live_trader.live_adapters.GLOBAL_KIS_REST_LIMITERS.get"
             ) as get_rest_limiter,
+            patch(
+                "live_trader.live_adapters.require_kis_token_authority",
+                return_value={},
+            ),
             patch(
                 "live_trader.live_adapters.http_json",
                 side_effect=lambda *args, **kwargs: (
@@ -501,6 +851,10 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
             patch(
                 "live_trader.live_adapters.GLOBAL_KIS_REST_LIMITERS.get_token"
             ) as blocked_limiter,
+            patch(
+                "live_trader.live_adapters.require_kis_token_authority",
+                return_value={},
+            ),
             patch("live_trader.live_adapters.http_json") as blocked_request,
         ):
             blocked_limiter.return_value.acquire.side_effect = (
@@ -510,13 +864,14 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
                 issue_kis_access_token()
         blocked_request.assert_not_called()
 
-    def test_kis_read_rate_limit_is_retried_but_post_is_not(self) -> None:
+    def test_kis_read_rate_limit_is_terminal_one_shot_and_post_is_not_retried(self) -> None:
         os.environ.update(
             {
                 "KIS_APP_KEY": "kis-app-key",
                 "KIS_APP_SECRET": "kis-app-secret",
                 "KIS_ACCOUNT_NO": "12345678-01",
                 "KIS_ACCOUNT_PRODUCT_CODE": "01",
+                "KIS_ENV": "real",
                 "KIS_REQUEST_MIN_INTERVAL_SECONDS": "2.1",
             }
         )
@@ -532,20 +887,23 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
                 "msg1": "원장에서 허용 가능한 초당 거래건수를 초과하였습니다.",
             },
         }
-        recovered = {"ok": True, "json": {"rt_cd": "0"}}
-
-        with patch("live_trader.live_adapters._acquire_shared_kis_rest_slot", return_value=0.0), patch(
-            "live_trader.live_adapters.http_json",
-            side_effect=[rate_limited, recovered],
+        with patch(
+            "live_trader.live_adapters.require_kis_read_transport_authority",
+            return_value={},
+        ), patch("live_trader.live_adapters._acquire_shared_kis_rest_slot", return_value=0.0), patch(
+            "live_trader.live_adapters.http_json", return_value=rate_limited,
         ) as request, patch(
             "live_trader.live_adapters.time.monotonic",
-            side_effect=[100.0, 100.0, 102.1],
+            side_effect=[100.0, 100.0],
         ), patch("live_trader.live_adapters.time.sleep") as sleep:
             result = send_prepared_request(read_request)
 
-        self.assertEqual(recovered, result)
-        self.assertEqual(2, request.call_count)
-        sleep.assert_called_once_with(2.1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(1, result["physicalAttemptCount"])
+        self.assertFalse(result["retryAllowed"])
+        self.assertTrue(result["terminalReadLease"])
+        request.assert_called_once()
+        sleep.assert_not_called()
 
         order_request = build_kis_live_order_request(
             {
@@ -564,10 +922,12 @@ class LiveAdapterRequestBuilderTest(EnvRestoreMixin, unittest.TestCase):
             "live_trader.live_adapters.time.monotonic",
             side_effect=[200.0, 200.0],
         ), patch("live_trader.live_adapters.time.sleep") as sleep:
-            result = send_prepared_request(order_request)
+            with self.assertRaisesRegex(
+                KisOrderAuthorityError, "inherited final mutation lease"
+            ):
+                send_prepared_request(order_request)
 
-        self.assertEqual(rate_limited, result)
-        request.assert_called_once()
+        request.assert_not_called()
         sleep.assert_not_called()
 
     def test_binance_server_time_offset_is_applied_to_signed_requests(self) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from contextlib import nullcontext
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -814,6 +815,10 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
                 "live_trader.brokers.send_binance_signed_request",
                 side_effect=send,
             ),
+            patch(
+                "live_trader.brokers.ordinary_binance_final_mutation_boundary",
+                side_effect=lambda **_kwargs: nullcontext({}),
+            ),
         ):
             response = LiveBrokerRouter().test_binance_futures_order(
                 normalized
@@ -890,6 +895,10 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
             patch(
                 "live_trader.brokers.build_binance_futures_order_request",
                 return_value=unsafe,
+            ),
+            patch(
+                "live_trader.brokers.ordinary_binance_final_mutation_boundary",
+                side_effect=lambda **_kwargs: nullcontext({}),
             ),
             self.assertRaises(BrokerNotReadyError),
         ):

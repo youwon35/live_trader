@@ -2,6 +2,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+from live_trader import kis_order_authority as kis_order_authority_module
 from live_trader.brokers import (
     BrokerNotReadyError,
     LiveBrokerRouter,
@@ -11,6 +12,32 @@ from live_trader.brokers import (
     parse_kis_overseas_positions,
 )
 from live_trader.live_adapters import build_kis_domestic_balance_request
+from live_trader.kis_order_authority import (
+    _reset_kis_order_authority_reader_for_tests,
+    register_kis_order_authority_reader,
+)
+
+
+def _read_authority_snapshot() -> dict[str, object]:
+    return {
+        "durableAuthorityReadable": True,
+        "functionalAuthorityOpen": False,
+        "functionalPhase": "IDLE",
+        "functionalRevision": 0,
+        "stateRevision": 1,
+        "functionalSessionId": "",
+        "functionalAccountFingerprint": "a" * 64,
+        "credentialConfigurationHash": "b" * 64,
+        "functionalMutationIntent": {},
+        "killOrdinaryCancelAllowed": False,
+        "killOrdinaryCancelRevision": 0,
+        "killOrdinaryCancelIntent": {},
+        "applicationInstanceLeaseHeld": True,
+        "ordinaryRoutesClosed": False,
+        "ownerEpochId": "kis-read-pagination-owner-1",
+        "ownerEpochHash": "e" * 64,
+        "controlReservation": {},
+    }
 
 
 def _holding(index: int) -> dict[str, str]:
@@ -27,6 +54,15 @@ class KisDomesticPaginationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.original_environment = dict(os.environ)
         self.addCleanup(self._restore_environment)
+        self.original_kis_authority_reader = (
+            kis_order_authority_module._AUTHORITY_READER
+        )
+        self.original_kis_kill_cancel_journal_path = (
+            kis_order_authority_module._KILL_CANCEL_JOURNAL_PATH
+        )
+        _reset_kis_order_authority_reader_for_tests()
+        register_kis_order_authority_reader(_read_authority_snapshot)
+        self.addCleanup(self._restore_kis_authority_provider)
         os.environ.update(
             {
                 "KIS_APP_KEY": "app-key",
@@ -40,6 +76,16 @@ class KisDomesticPaginationTest(unittest.TestCase):
     def _restore_environment(self) -> None:
         os.environ.clear()
         os.environ.update(self.original_environment)
+
+    def _restore_kis_authority_provider(self) -> None:
+        _reset_kis_order_authority_reader_for_tests()
+        if self.original_kis_authority_reader is not None:
+            register_kis_order_authority_reader(
+                self.original_kis_authority_reader,
+                kill_cancel_journal_path=(
+                    self.original_kis_kill_cancel_journal_path
+                ),
+            )
 
     def test_builder_carries_both_context_keys_and_continuation_header(self) -> None:
         prepared = build_kis_domestic_balance_request(

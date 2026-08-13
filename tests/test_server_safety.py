@@ -7,6 +7,7 @@ from unittest.mock import Mock, call, patch
 
 from live_trader.server import (
     LiveTraderHandler,
+    bind_server,
     create_desktop_server,
     is_recoverable_bind_error,
     json_safe_value,
@@ -14,6 +15,7 @@ from live_trader.server import (
     requests_real_order_enable,
     start_in_thread,
 )
+from live_trader.functional_http_session import FunctionalHttpSessionAuthority
 
 
 class ServerSafetyTests(unittest.TestCase):
@@ -68,11 +70,21 @@ class ServerSafetyTests(unittest.TestCase):
     def test_server_startup_recovers_independent_emergency_latch(self) -> None:
         with (
             patch(
+                "live_trader.server._assert_application_instance_lease_held"
+            ) as assert_instance,
+            patch(
                 "live_trader.server.state.disarm_real_orders_for_process_start"
             ) as disarm,
             patch("live_trader.daemon.read_daemon_status") as daemon_status,
             patch("live_trader.server.state.restore_runtime_from_checkpoint") as restore,
             patch("live_trader.server.state.recover_durable_emergency_stop") as recover,
+            patch(
+                "live_trader.server.state.prepare_upbit_functional_backend_state"
+            ) as prepare_upbit,
+            patch(
+                "live_trader.server.state."
+                "prepare_binance_spot_functional_backend_state"
+            ) as prepare_binance,
         ):
             prepare_server_state()
 
@@ -80,6 +92,36 @@ class ServerSafetyTests(unittest.TestCase):
         daemon_status.assert_called_once_with(persist=True)
         restore.assert_called_once_with()
         recover.assert_called_once_with()
+        prepare_upbit.assert_called_once_with()
+        prepare_binance.assert_called_once_with()
+        assert_instance.assert_called_once_with()
+
+    def test_server_prepare_rejects_embedded_process_without_instance_lease(self) -> None:
+        with (
+            patch(
+                "live_trader.server._assert_application_instance_lease_held",
+                side_effect=RuntimeError("application-instance lease is not held"),
+            ),
+            patch(
+                "live_trader.server.state."
+                "prepare_binance_spot_functional_backend_state"
+            ) as prepare_binance,
+            self.assertRaisesRegex(RuntimeError, "instance lease"),
+        ):
+            prepare_server_state()
+        prepare_binance.assert_not_called()
+
+    def test_direct_server_bind_rejects_process_without_instance_lease(self) -> None:
+        with (
+            patch(
+                "live_trader.server._assert_application_instance_lease_held",
+                side_effect=RuntimeError("application-instance lease is not held"),
+            ),
+            patch("live_trader.server.ThreadingHTTPServer") as server_class,
+            self.assertRaisesRegex(RuntimeError, "instance lease"),
+        ):
+            bind_server("127.0.0.1", 0)
+        server_class.assert_not_called()
 
     def test_preflight_route_forwards_deployment_and_strategy_scope(self) -> None:
         handler = object.__new__(LiveTraderHandler)
@@ -264,6 +306,11 @@ class ServerSafetyTests(unittest.TestCase):
         _start_watchdog_thread: Mock,
     ) -> None:
         server = Mock(server_port=54321)
+        server.functional_http_session_authority = (
+            FunctionalHttpSessionAuthority.mint(
+                host="127.0.0.1", port=54321
+            )
+        )
         create_desktop_server_mock.return_value = server
 
         returned_server, url = start_in_thread("127.0.0.1", 18795)

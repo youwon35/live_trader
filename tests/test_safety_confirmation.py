@@ -5,11 +5,18 @@ import hashlib
 import threading
 import time
 import unittest
+from email.message import Message
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from live_trader import state
 from live_trader.safety_confirmation import SafetyConfirmationStore
 from live_trader.server import LiveTraderHandler
+from live_trader.functional_http_session import (
+    APP_SESSION_COOKIE,
+    CSRF_HEADER,
+    FunctionalHttpSessionAuthority,
+)
 
 
 def confirmation_payload(challenge: dict[str, object]) -> dict[str, str]:
@@ -718,7 +725,21 @@ class SafetyConfirmationStateTest(unittest.TestCase):
 class SafetyConfirmationServerContractTest(unittest.TestCase):
     def test_challenge_route_forwards_action_and_context(self) -> None:
         handler = object.__new__(LiveTraderHandler)
+        authority = FunctionalHttpSessionAuthority.mint(
+            host="127.0.0.1", port=18795
+        )
         handler.path = "/api/safety-confirmation/challenge"
+        handler.server = SimpleNamespace(
+            functional_http_session_authority=authority
+        )
+        handler.client_address = ("127.0.0.1", 50000)
+        handler.headers = Message()
+        handler.headers["Host"] = authority.expected_host_header
+        handler.headers["Origin"] = authority.expected_origin
+        handler.headers["Cookie"] = (
+            f"{APP_SESSION_COOKIE}={authority.app_session_token}"
+        )
+        handler.headers[CSRF_HEADER] = authority.csrf_token
         handler.read_json = Mock(
             return_value={
                 "action": "FUNCTIONAL_TEST_START",

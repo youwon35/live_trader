@@ -11,9 +11,114 @@ from live_trader.continuous_live import (
     LiveContinuousController,
     LiveContinuousRuntimeManager,
 )
+from live_trader.order_management import OrderIntent
 
 
 class LiveContinuousControllerTest(unittest.TestCase):
+    def test_owned_rlock_tracks_recursive_current_thread_only(self) -> None:
+        lock = state._OwnedRLock()
+        other_thread_owned: list[bool] = []
+
+        self.assertFalse(lock.owned_by_current_thread())
+        self.assertFalse(hasattr(lock, "_is_owned"))
+        with self.assertRaises(RuntimeError):
+            lock.release()
+        self.assertFalse(lock.owned_by_current_thread())
+        with lock:
+            self.assertTrue(lock.owned_by_current_thread())
+            self.assertTrue(lock.acquire())
+            try:
+                self.assertTrue(lock.owned_by_current_thread())
+                observer = threading.Thread(
+                    target=lambda: other_thread_owned.append(
+                        lock.owned_by_current_thread()
+                    )
+                )
+                observer.start()
+                observer.join(1.0)
+                self.assertFalse(observer.is_alive())
+                self.assertEqual([False], other_thread_owned)
+            finally:
+                lock.release()
+            self.assertTrue(lock.owned_by_current_thread())
+        self.assertFalse(lock.owned_by_current_thread())
+
+        with self.assertRaisesRegex(RuntimeError, "owned-rlock-context"):
+            with lock:
+                self.assertTrue(lock.owned_by_current_thread())
+                raise RuntimeError("owned-rlock-context")
+        self.assertFalse(lock.owned_by_current_thread())
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_lock() -> None:
+            with lock:
+                held.set()
+                release.wait(1.0)
+
+        owner = threading.Thread(target=hold_lock)
+        owner.start()
+        self.assertTrue(held.wait(1.0))
+        self.assertFalse(lock.acquire(blocking=False))
+        self.assertFalse(lock.owned_by_current_thread())
+        release.set()
+        owner.join(1.0)
+        self.assertFalse(owner.is_alive())
+        self.assertTrue(lock.acquire(timeout=0.1))
+        lock.release()
+        self.assertFalse(lock.owned_by_current_thread())
+
+    @staticmethod
+    def us_functional_route() -> dict[str, object]:
+        return {
+            "portfolioRequired": False,
+            "marketGroup": "US_STOCK",
+            "executionRoute": "KIS_US_LIVE_CONTINUOUS",
+            "settlementCurrency": "USD",
+            "exchanges": ["NYSE"],
+            "symbolRoutes": [{"symbol": "F", "exchange": "NYSE"}],
+            "routeScopeHash": "a" * 64,
+        }
+
+    def test_us_functional_spec_requires_exact_single_f_nyse_5m(self) -> None:
+        strategy = {
+            "strategy_id": "us-f-functional",
+            "symbol": "F",
+            "exchange": "NYSE",
+            "timeframe": "5m",
+            "provider": "yahoo",
+            "broker_id": "kis",
+            "parameters": {"exchange": "NYSE"},
+        }
+        spec = LiveContinuousController._standalone_spec(strategy)
+
+        self.assertEqual(
+            "",
+            LiveContinuousController._functional_test_spec_blocker(
+                (spec,),
+                self.us_functional_route(),
+            ),
+        )
+
+        tampered = LiveContinuousController._standalone_spec(
+            {**strategy, "exchange": "NASD", "parameters": {"exchange": "NASD"}}
+        )
+        self.assertIn(
+            "F/NYSE",
+            LiveContinuousController._functional_test_spec_blocker(
+                (tampered,),
+                self.us_functional_route(),
+            ),
+        )
+        self.assertIn(
+            "단일 Strategy",
+            LiveContinuousController._functional_test_spec_blocker(
+                (spec, spec),
+                self.us_functional_route(),
+            ),
+        )
+
     def test_standalone_strategy_preserves_binance_runtime_contract(self) -> None:
         strategy = {
             "strategy_id": "btc-live-small",
@@ -877,7 +982,9 @@ class LiveContinuousControllerTest(unittest.TestCase):
 
         def transition_mode(mode: str) -> None:
             self.assertEqual("MONITOR", mode)
-            self.assertTrue(state.RUNTIME_MODE_LOCK._is_owned())  # type: ignore[attr-defined]
+            self.assertTrue(
+                state.RUNTIME_MODE_LOCK.owned_by_current_thread()
+            )
             return None
 
         engine.transition_mode.side_effect = transition_mode
@@ -1074,13 +1181,17 @@ class LiveContinuousControllerTest(unittest.TestCase):
         failures: list[BaseException] = []
 
         def controlled_start(*_args, **_kwargs):
-            self.assertFalse(state.RUNTIME_MODE_LOCK._is_owned())  # type: ignore[attr-defined]
+            self.assertFalse(
+                state.RUNTIME_MODE_LOCK.owned_by_current_thread()
+            )
             start_entered.set()
             self.assertTrue(release_start.wait(2.0))
             return {"ok": True, "reason": "started"}
 
         def controlled_stop(*_args, **_kwargs):
-            self.assertFalse(state.RUNTIME_MODE_LOCK._is_owned())  # type: ignore[attr-defined]
+            self.assertFalse(
+                state.RUNTIME_MODE_LOCK.owned_by_current_thread()
+            )
             stop_entered.set()
             return {
                 "ok": True,
@@ -1147,7 +1258,9 @@ class LiveContinuousControllerTest(unittest.TestCase):
 
         def transition(mode: str) -> dict[str, object]:
             self.assertEqual("MONITOR", mode)
-            self.assertFalse(state.RUNTIME_MODE_LOCK._is_owned())  # type: ignore[attr-defined]
+            self.assertFalse(
+                state.RUNTIME_MODE_LOCK.owned_by_current_thread()
+            )
             return {"ok": True, "results": {}}
 
         with (
@@ -1241,6 +1354,83 @@ class LiveContinuousControllerTest(unittest.TestCase):
         finally:
             state.STATE.clear()
             state.STATE.update(original_state)
+
+    def test_non_dry_continuous_dispatch_is_disabled_before_any_side_effect(self) -> None:
+        for broker_id, symbol, asset in (
+            ("kis", "010140.KS", "KR-STOCK"),
+            ("upbit", "KRW-BTC", "CRYPTO"),
+            ("binance", "BTCUSDT", "CRYPTO"),
+        ):
+            with self.subTest(broker_id=broker_id):
+                intent = OrderIntent(
+                    strategy_id="continuous-lock-order-hold",
+                    asset=asset,
+                    symbol=symbol,
+                    side="BUY",
+                    quantity=1.0,
+                    reference_price=1.0,
+                    mode="SMALL_LIVE",
+                    reason="lock-order HOLD regression",
+                    metadata={"broker_id": broker_id},
+                )
+                with (
+                    patch.object(
+                        state, "refresh_functional_test_runtime_preflight"
+                    ) as preflight,
+                    patch.object(
+                        state.PROGRAM_LEDGER,
+                        "order_dispatch_for_idempotency_key",
+                    ) as ledger_read,
+                    patch.object(state.LIVE_OMS, "create") as oms_create,
+                    patch.object(state, "LiveBrokerRouter") as router,
+                ):
+                    with state.RUNTIME_MODE_LOCK:
+                        result = state.submit_order_intent(
+                            {},
+                            intent,
+                            dry_run=False,
+                            audit_event="Continuous Runtime",
+                        )
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["runtimeDispatchDisabled"])
+                self.assertEqual({}, result["order"])
+                self.assertEqual(
+                    "CONTINUOUS_FINAL_DISPATCH_LOCK_ORDER_UNAVAILABLE:"
+                    + broker_id,
+                    result["reason"],
+                )
+                preflight.assert_not_called()
+                ledger_read.assert_not_called()
+                oms_create.assert_not_called()
+                router.assert_not_called()
+
+    def test_dry_run_continuous_intent_is_not_disabled_by_runtime_lock(self) -> None:
+        intent = OrderIntent(
+            strategy_id="continuous-dry-run",
+            asset="KR-STOCK",
+            symbol="010140.KS",
+            side="BUY",
+            quantity=1.0,
+            reference_price=1.0,
+            mode="SMALL_LIVE",
+            reason="dry run remains available",
+            metadata={"broker_id": "kis"},
+        )
+        with patch.object(
+            state,
+            "futures_risk_reducing_verified",
+            side_effect=RuntimeError("dry-run reached normal gate"),
+        ) as normal_gate:
+            with state.RUNTIME_MODE_LOCK, self.assertRaisesRegex(
+                RuntimeError, "dry-run reached normal gate"
+            ):
+                state.submit_order_intent(
+                    {},
+                    intent,
+                    dry_run=True,
+                    audit_event="Continuous Runtime",
+                )
+        normal_gate.assert_called_once()
 
 
 if __name__ == "__main__":

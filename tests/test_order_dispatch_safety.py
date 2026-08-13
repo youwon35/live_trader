@@ -90,6 +90,20 @@ class OrderDispatchSafetyTest(unittest.TestCase):
         )
 
     @staticmethod
+    def kis_wire_account_binding() -> dict[str, object]:
+        current = state._kis_environment_order_account_binding()
+        return {
+            key: current[key]
+            for key in (
+                "schemaVersion",
+                "accountCanoHash",
+                "accountProductCode",
+                "accountFingerprint",
+                "credentialConfigurationHash",
+            )
+        }
+
+    @staticmethod
     def intent(
         mode: str = "SMALL_LIVE",
         *,
@@ -238,6 +252,7 @@ class OrderDispatchSafetyTest(unittest.TestCase):
             return {
                 "ok": True,
                 "statusCode": 200,
+                "kisOrderAccountBinding": self.kis_wire_account_binding(),
                 "json": {
                     "output": {
                         "ODNO": "KIS-ACK-1",
@@ -322,6 +337,7 @@ class OrderDispatchSafetyTest(unittest.TestCase):
             self.assertTrue(release.wait(timeout=5))
             return {
                 "ok": True,
+                "kisOrderAccountBinding": self.kis_wire_account_binding(),
                 "json": {
                     "output": {
                         "ODNO": "INFLIGHT-1",

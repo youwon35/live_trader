@@ -9,7 +9,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 
 EMERGENCY_STOP_SCHEMA_VERSION = 1
@@ -252,21 +252,28 @@ def engage_emergency_stop(
 ) -> dict[str, Any]:
     """Atomically latch Kill ON. This path never offers a release operation."""
 
-    with _WRITE_LOCK:
-        try:
-            _write_atomic(_document(True, reason=reason, source=source))
-        except OSError as exc:
-            failure_reason = f"emergency-stop-write-failed:{type(exc).__name__}"
-            _set_sticky_fail_closed(failure_reason)
-            result = {
-                "ok": False,
-                "active": True,
-                "durable": False,
-                "status": "write-failed-local-fail-closed",
-                "reason": failure_reason,
-                "path": str(emergency_stop_path()),
-            }
-        else:
+    with _DISPATCH_BOUNDARY_LOCK:
+        # Linearize before the durable ON write.  If a broker mutation already
+        # owns this boundary, it completes before ON exists (POST-wins).  If
+        # Kill owns it first, ON is durably verified before any later broker
+        # boundary can read and send (STOP-wins).  This prevents a stale OFF
+        # snapshot from authorizing a POST after the ON document is visible.
+        with _WRITE_LOCK:
+            try:
+                _write_atomic(_document(True, reason=reason, source=source))
+            except OSError as exc:
+                failure_reason = (
+                    f"emergency-stop-write-failed:{type(exc).__name__}"
+                )
+                _set_sticky_fail_closed(failure_reason)
+                return {
+                    "ok": False,
+                    "active": True,
+                    "durable": False,
+                    "status": "write-failed-local-fail-closed",
+                    "reason": failure_reason,
+                    "path": str(emergency_stop_path()),
+                }
             status = emergency_stop_status()
             if (
                 status.get("active") is not True
@@ -275,18 +282,12 @@ def engage_emergency_stop(
                 _set_sticky_fail_closed(
                     "emergency-stop-write-verification-failed"
                 )
-                result = {
+                return {
                     "ok": False,
                     **status,
                     "reason": "emergency-stop-write-verification-failed",
                 }
-            else:
-                result = {"ok": True, **status}
-    # Establish a linearization point with the final broker boundary. The
-    # durable ON write happens first; returning waits only for an order that
-    # had already entered the irreversible broker call.
-    with _DISPATCH_BOUNDARY_LOCK:
-        return result
+            return {"ok": True, **status}
 
 
 def clear_emergency_stop(
@@ -375,8 +376,29 @@ def _reset_emergency_stop_sticky_for_tests() -> None:
 class DesktopEmergencyStopBridge:
     """Tiny pywebview-native bridge kept independent of the HTTP API thread."""
 
+    def __init__(
+        self,
+        *,
+        functional_http_bootstrap: Callable[[], Mapping[str, str]] | None = None,
+    ) -> None:
+        self._functional_http_bootstrap = functional_http_bootstrap
+
     def engage_emergency_stop(self, reason: str = "desktop emergency stop") -> dict[str, Any]:
         return engage_emergency_stop(reason, source="pywebview-native-bridge")
 
     def emergency_stop_status(self) -> dict[str, Any]:
         return emergency_stop_status()
+
+    def functional_http_session(self) -> dict[str, Any]:
+        """Bootstrap CSRF only through the same-process native WebView API."""
+
+        if self._functional_http_bootstrap is None:
+            return {"ok": False, "available": False}
+        value = dict(self._functional_http_bootstrap())
+        if (
+            not str(value.get("csrfHeader") or "")
+            or not str(value.get("csrfToken") or "")
+            or value.get("appSessionToken") is not None
+        ):
+            return {"ok": False, "available": False}
+        return {"ok": True, "available": True, **value}

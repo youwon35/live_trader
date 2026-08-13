@@ -21,7 +21,7 @@ class UpbitSmokeOrderTest(unittest.TestCase):
             {
                 "UPBIT_ACCESS_KEY": "test-access",
                 "UPBIT_SECRET_KEY": "test-secret",
-                "UPBIT_BASE_URL": "https://upbit.example.test",
+                "UPBIT_BASE_URL": "https://api.upbit.com",
                 "LIVE_TRADER_ENABLE_REAL_ORDERS": "false",
             },
         )

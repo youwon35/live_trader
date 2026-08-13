@@ -4,6 +4,7 @@ import os
 import csv
 import html
 import hashlib
+import hmac
 import json
 import math
 import re
@@ -11,7 +12,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
@@ -20,7 +21,7 @@ from functools import lru_cache, wraps
 from io import StringIO
 from pathlib import Path
 import sys
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -77,15 +78,18 @@ from trading_runtime import (
     record_flight_event,
 )
 from trading_runtime.functional_test import (
+    FunctionalTestBinding,
     FunctionalTestContractError,
+    FunctionalTestEnvironment,
     assert_functional_test_permit_active,
     default_functional_test_root,
+    issue_functional_test_permit,
     parse_functional_test_permit,
     parse_live_activation_token,
     read_functional_test_document,
 )
 from trading_runtime.operations import ENVIRONMENT_PROFILES
-from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, real_orders_enabled as broker_environment_real_orders_enabled
+from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, build_kis_mutation_authority_intent, real_orders_enabled as broker_environment_real_orders_enabled
 from .program_ledger import ProgramLedger
 from .contracts import (
     IGNORED_STRATEGY_FILE_NAMES,
@@ -118,19 +122,39 @@ from .emergency_stop import (
     emergency_stop_status,
     engage_emergency_stop,
 )
+from .binance_order_authority import (
+    binance_functional_authority_open_fail_closed,
+    binance_route_authority_serialization,
+    ordinary_binance_final_mutation_boundary,
+    register_binance_order_authority_reader,
+)
+from .upbit_order_authority import (
+    UPBIT_ROUTE_AUTHORITY_LOCK,
+    ordinary_upbit_final_mutation_boundary,
+    register_upbit_order_authority_reader,
+)
+from .kis_order_authority import (
+    kis_authenticated_mutation_preflight,
+    kis_route_authority_serialization,
+    register_kis_order_authority_reader,
+)
 from .safety_confirmation import SAFETY_CONFIRMATIONS
 from .execution_streams import ExecutionStreamManager
 from .live_adapters import (
     BINANCE_BASE_URL,
     BINANCE_FUTURES_BASE_URL,
     BINANCE_FUTURES_TEST_ORDER_ENDPOINT,
+    KIS_LIVE_BASE_URL,
     binance_symbol_rules,
     build_binance_futures_order_request,
     build_binance_spot_order_request,
     build_kis_live_order_request,
+    build_kis_cancel_order_request,
     build_upbit_order_request,
     env_value,
     http_json,
+    issue_kis_access_token,
+    send_prepared_request,
     split_kis_account,
 )
 from .futures_canary import (
@@ -154,11 +178,17 @@ from .functional_test import (
 )
 from .functional_test_workspace import (
     LIVE_FUNCTIONAL_TEST_CAPS,
+    US_LIVE_FUNCTIONAL_TEST_CAPS,
     canonical_kis_domestic_symbol,
+    canonical_kis_us_symbol,
     kis_account_binding_id,
 )
 from .order_management import OrderIntent, OrderSide
-from .process_safety import hold_kis_dispatch_lease
+from .process_safety import (
+    hold_kis_dispatch_lease,
+    hold_process_lease,
+    live_trader_instance_lease_status,
+)
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
 from trading_runtime.market_calendar import market_session_state
@@ -186,7 +216,53 @@ FUNCTIONAL_TEST_RISK_MAX_AGE_SECONDS = 60.0
 FUNCTIONAL_TEST_PREFLIGHT_REFRESH_MARGIN_SECONDS = 45.0
 FUNCTIONAL_TEST_EXECUTION_OBSERVATION_MAX_AGE_SECONDS = 45.0
 FUNCTIONAL_TEST_RUNTIME_GUARD_INTERVAL_SECONDS = 20.0
-RUNTIME_MODE_LOCK = threading.RLock()
+
+
+class _OwnedRLock:
+    """Project-owned RLock with portable current-thread ownership tracking."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._local = threading.local()
+
+    def acquire(
+        self,
+        blocking: bool = True,
+        timeout: float = -1,
+    ) -> bool:
+        acquired = self._lock.acquire(blocking, timeout)
+        if acquired:
+            self._local.depth = int(
+                getattr(self._local, "depth", 0)
+            ) + 1
+        return acquired
+
+    def release(self) -> None:
+        self._lock.release()
+        depth = int(getattr(self._local, "depth", 0)) - 1
+        if depth > 0:
+            self._local.depth = depth
+        elif hasattr(self._local, "depth"):
+            del self._local.depth
+
+    def owned_by_current_thread(self) -> bool:
+        return int(getattr(self._local, "depth", 0)) > 0
+
+    def __enter__(self) -> "_OwnedRLock":
+        self.acquire()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Any,
+        exc_value: Any,
+        traceback: Any,
+    ) -> bool:
+        self.release()
+        return False
+
+
+RUNTIME_MODE_LOCK = _OwnedRLock()
 BINANCE_FUTURES_CANARY_LOCK = threading.RLock()
 BINANCE_FUTURES_FILL_SOAK_LOCK = threading.RLock()
 BINANCE_FUTURES_SETTINGS_LOCK = threading.RLock()
@@ -213,6 +289,26 @@ FUNCTIONAL_TEST_LIFECYCLE_LOCK = threading.RLock()
 # closure.  If a stop wins this lock, no later order can POST; if an already
 # authorized POST wins, stop waits for its broker outcome before closing.
 FUNCTIONAL_TEST_AUTHORITY_DISPATCH_LOCK = threading.RLock()
+# One lock fences every Upbit order-capable route.  Lock order is deliberately
+# asymmetric and enforced below:
+#
+#   backend manager -> production graph -> UPBIT_ORDER_AUTHORITY_MUTATION_LOCK
+#
+# The final mutation edge takes this lock only for its fresh durable-pointer
+# CAS and immediate broker call.  No code holding this lock may wait for the
+# backend manager or graph; server commands publish/approve their durable
+# fence under this lock, release it, and only then call the manager.  This
+# prevents scheduler-dispatch <-> safety-challenge lock inversion.
+# The neutral broker-edge authority module owns this lock.  Keep the state
+# name as an exact alias for existing ownership assertions and decorators.
+UPBIT_ORDER_AUTHORITY_MUTATION_LOCK = UPBIT_ROUTE_AUTHORITY_LOCK
+_KIS_ROUTE_STATE_REVISION = 1
+_KIS_KILL_CANCEL_REVISION = 0
+_KIS_KILL_CANCEL_INTENT: dict[str, Any] = {}
+_KIS_KILL_CANCEL_ALLOWED = False
+_KIS_CONTROL_RESERVATION: dict[str, Any] = {}
+_KIS_CONTROL_RESERVATION_SCOPE = threading.local()
+_KIS_CONTROL_SUPERSEDED_IDS: set[str] = set()
 RUNTIME_MODE_RANK = {"MONITOR": 0, "SMALL_LIVE": 1, "FULL_LIVE": 2}
 PROFESSIONAL_PROMOTION_POLICY = PromotionPolicy()
 _REAL_ORDERS_PROCESS_ARMED = False
@@ -223,15 +319,347 @@ _REAL_ORDERS_PROCESS_ARM_LOCK = threading.RLock()
 os.environ["LIVE_TRADER_ENABLE_REAL_ORDERS"] = "false"
 
 
+def _runtime_mode_lock_owned() -> bool:
+    """Fail closed if the final sender cannot prove the cycle lock is free."""
+
+    return RUNTIME_MODE_LOCK.owned_by_current_thread()
+
+
 def _serialized_safety_mutation(function: Any) -> Any:
     """Serialize challenge issuance/consumption with authority mutations."""
 
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         with SAFETY_CONFIRMATION_MUTATION_LOCK:
+            result = function(*args, **kwargs)
+        # Kill is a two-phase protocol.  Phase one durably latches ON while
+        # the shared route/safety fences are held.  Only after both locks are
+        # released may the backend manager/graph become the cleanup owner;
+        # this avoids manager->graph->route lock inversion.
+        mutation_name = args[0] if args else kwargs.get("name")
+        mutation_value = (
+            args[1] if len(args) > 1 else kwargs.get("value")
+        )
+        if (
+            function.__name__ == "set_flag"
+            and str(mutation_name or "") == "kill_switch"
+            and bool(mutation_value)
+            and isinstance(result, dict)
+        ):
+            # The wrapped mutation owns SAFETY then UPBIT only long enough to
+            # publish and verify the durable Kill latch.  Recovery owns the
+            # ordinary and functional cleanup graph and therefore runs once,
+            # here, after both outer locks have been released.
+            kill_action = recover_durable_emergency_stop()
+            result = {
+                **result,
+                "kill_switch_action": kill_action,
+                "upbitFunctionalCleanup": kill_action.get(
+                    "upbit_functional_cleanup", {}
+                ),
+                "binanceFunctionalCleanup": kill_action.get(
+                    "binance_functional_cleanup", {}
+                ),
+            }
+        return result
+
+    wrapped._authority_fence = "SAFETY"  # type: ignore[attr-defined]
+    return wrapped
+
+
+def _serialized_upbit_order_authority(function: Any) -> Any:
+    """Fence functional and ordinary Upbit route mutations together."""
+
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with UPBIT_ORDER_AUTHORITY_MUTATION_LOCK:
             return function(*args, **kwargs)
 
+    wrapped._authority_fence = "UPBIT"  # type: ignore[attr-defined]
     return wrapped
+
+
+def _serialized_binance_order_authority(function: Any) -> Any:
+    """Serialize Binance reverse-route state with every final adapter send."""
+
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with binance_route_authority_serialization():
+            return function(*args, **kwargs)
+
+    wrapped._authority_fence = "BINANCE"  # type: ignore[attr-defined]
+    return wrapped
+
+
+def _advance_kis_route_state_revision() -> int:
+    global _KIS_ROUTE_STATE_REVISION
+    _KIS_ROUTE_STATE_REVISION += 1
+    return _KIS_ROUTE_STATE_REVISION
+
+
+def _kis_control_reservation_hash(value: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _serialized_kis_order_authority(function: Any) -> Any:
+    """Place KIS settings after Binance and before emergency in lock order."""
+
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with kis_route_authority_serialization():
+            try:
+                return function(*args, **kwargs)
+            finally:
+                # Any attempted control mutation invalidates a lease sampled
+                # before this serialized boundary, including failed writes.
+                _advance_kis_route_state_revision()
+
+    wrapped._authority_fence = "KIS_DIRECT"  # type: ignore[attr-defined]
+    return wrapped
+
+
+def _two_phase_kis_route_control(
+    kind: str,
+    *,
+    when: Any | None = None,
+):
+    """Reserve/revoke KIS state without waiting on a manager under its lock."""
+
+    normalized_kind = str(kind or "").strip().upper()
+    if normalized_kind not in {"START", "STOP", "SETTINGS"}:
+        raise ValueError("invalid KIS route control kind")
+
+    def decorate(function: Any) -> Any:
+        @wraps(function)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            global _KIS_CONTROL_RESERVATION
+            global _KIS_ROUTE_STATE_REVISION
+            if when is not None and not bool(when(*args, **kwargs)):
+                return function(*args, **kwargs)
+            owns_reservation = False
+            with kis_route_authority_serialization():
+                if _KIS_CONTROL_RESERVATION:
+                    inherited = getattr(
+                        _KIS_CONTROL_RESERVATION_SCOPE,
+                        "reservation",
+                        None,
+                    )
+                    inherited_matches = (
+                        isinstance(inherited, dict)
+                        and inherited == _KIS_CONTROL_RESERVATION
+                        and inherited.get("reservationKind")
+                        == normalized_kind
+                    )
+                    if not inherited_matches and normalized_kind == "STOP":
+                        # STOP is fail-closed and may supersede a START or
+                        # SETTINGS reservation.  The losing operation may
+                        # finish its manager call, but its stale finalizer can
+                        # no longer clear the newer STOP generation.
+                        old_reservation_id = str(
+                            _KIS_CONTROL_RESERVATION.get(
+                                "reservationId"
+                            )
+                            or ""
+                        )
+                        revision = _KIS_ROUTE_STATE_REVISION + 1
+                        reservation_body = {
+                            "reservationId": (
+                                "kis-control-" + secrets.token_hex(16)
+                            ),
+                            "reservationKind": "STOP",
+                            "reservationRevision": revision,
+                            "stateRevision": revision,
+                            "phase": "ARMED_WAIT_PUBLIC",
+                        }
+                        reservation = {
+                            **reservation_body,
+                            "reservationBindingHash": (
+                                _kis_control_reservation_hash(
+                                    reservation_body
+                                )
+                            ),
+                        }
+                        # Build the replacement completely before changing
+                        # either global.  A failed hash/entropy operation
+                        # leaves the old fence intact and not tombstoned.
+                        _KIS_ROUTE_STATE_REVISION = revision
+                        if old_reservation_id:
+                            _KIS_CONTROL_SUPERSEDED_IDS.add(
+                                old_reservation_id
+                            )
+                        _KIS_CONTROL_RESERVATION = dict(reservation)
+                        _KIS_CONTROL_RESERVATION_SCOPE.reservation = dict(
+                            reservation
+                        )
+                        owns_reservation = True
+                    elif not inherited_matches:
+                        raise RuntimeError(
+                            "kis-route-control-reservation-active"
+                        )
+                    else:
+                        reservation = dict(inherited)
+                else:
+                    revision = _advance_kis_route_state_revision()
+                    reservation_body = {
+                        "reservationId": (
+                            "kis-control-" + secrets.token_hex(16)
+                        ),
+                        "reservationKind": normalized_kind,
+                        "reservationRevision": revision,
+                        "stateRevision": revision,
+                        "phase": "ARMED_WAIT_PUBLIC",
+                    }
+                    reservation = {
+                        **reservation_body,
+                        "reservationBindingHash": (
+                            _kis_control_reservation_hash(reservation_body)
+                        ),
+                    }
+                    _KIS_CONTROL_RESERVATION = dict(reservation)
+                    _KIS_CONTROL_RESERVATION_SCOPE.reservation = dict(
+                        reservation
+                    )
+                    owns_reservation = True
+            try:
+                # A controller/manager may run here; the KIS route is not held.
+                return function(*args, **kwargs)
+            finally:
+                if owns_reservation:
+                    with kis_route_authority_serialization():
+                        if _KIS_CONTROL_RESERVATION == reservation:
+                            _KIS_CONTROL_RESERVATION = {}
+                            _advance_kis_route_state_revision()
+                        elif str(
+                            reservation.get("reservationId") or ""
+                        ) in _KIS_CONTROL_SUPERSEDED_IDS:
+                            # A newer fail-closed STOP owns publication and
+                            # revocation.  The stale START/SETTINGS finalizer
+                            # must not clear it or report a false exception.
+                            _KIS_CONTROL_SUPERSEDED_IDS.discard(
+                                str(
+                                    reservation.get("reservationId") or ""
+                                )
+                            )
+                        else:
+                            raise RuntimeError(
+                                "kis-route-control-reservation-changed"
+                            )
+                    try:
+                        del _KIS_CONTROL_RESERVATION_SCOPE.reservation
+                    except AttributeError:
+                        pass
+
+        wrapped._authority_fence = (  # type: ignore[attr-defined]
+            "KIS_TWO_PHASE_" + normalized_kind
+        )
+        return wrapped
+
+    return decorate
+
+
+def _serialized_kis_order_authority_when(predicate: Any):
+    """Conditionally retain the KIS route across a short exact mutation."""
+
+    def decorate(function: Any) -> Any:
+        @wraps(function)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            if not bool(predicate(*args, **kwargs)):
+                return function(*args, **kwargs)
+            with kis_route_authority_serialization():
+                try:
+                    return function(*args, **kwargs)
+                finally:
+                    _advance_kis_route_state_revision()
+
+        wrapped._authority_fence = "KIS_DIRECT"  # type: ignore[attr-defined]
+        return wrapped
+
+    return decorate
+
+
+@contextmanager
+def _kis_manual_cancel_preparation() -> Iterator[Any]:
+    """Fence official truth, checkpoint and one exact KIS cancel together.
+
+    The potentially slow official-order read runs without retaining the KIS
+    route lock.  A signed SETTINGS reservation closes every KIS mutation in
+    that interval, while the outer SAFETY lock prevents account/credential
+    controls from changing.  ``finish`` clears the reservation only after it
+    has reacquired the route and retains that route through the caller's
+    checkpoint and final broker edge.
+    """
+
+    global _KIS_CONTROL_RESERVATION
+    with SAFETY_CONFIRMATION_MUTATION_LOCK:
+        with kis_route_authority_serialization():
+            if _KIS_CONTROL_RESERVATION:
+                raise RuntimeError("kis-route-control-reservation-active")
+            revision = _advance_kis_route_state_revision()
+            reservation_body = {
+                "reservationId": "kis-cancel-" + secrets.token_hex(16),
+                "reservationKind": "SETTINGS",
+                "reservationRevision": revision,
+                "stateRevision": revision,
+                "phase": "ARMED_WAIT_PUBLIC",
+            }
+            reservation = {
+                **reservation_body,
+                "reservationBindingHash": _kis_control_reservation_hash(
+                    reservation_body
+                ),
+            }
+            _KIS_CONTROL_RESERVATION = dict(reservation)
+        transitioned = False
+
+        def finish(callback: Any) -> Any:
+            nonlocal transitioned
+            global _KIS_CONTROL_RESERVATION
+            if transitioned:
+                raise RuntimeError("kis-cancel-final-boundary-already-entered")
+            with kis_route_authority_serialization():
+                if _KIS_CONTROL_RESERVATION != reservation:
+                    raise RuntimeError(
+                        "kis-cancel-control-reservation-changed"
+                    )
+                _KIS_CONTROL_RESERVATION = {}
+                _advance_kis_route_state_revision()
+                transitioned = True
+                # The callback re-enters SAFETY and the KIS route via the
+                # ordinary/Kill final boundary.  Both are RLocks; retaining
+                # them here prevents another sender from crossing the exact
+                # truth/checkpoint/socket interval.
+                return callback()
+
+        try:
+            yield finish
+        finally:
+            if not transitioned:
+                with kis_route_authority_serialization():
+                    if _KIS_CONTROL_RESERVATION != reservation:
+                        raise RuntimeError(
+                            "kis-cancel-control-reservation-changed"
+                        )
+                    _KIS_CONTROL_RESERVATION = {}
+                    _advance_kis_route_state_revision()
+
+
+def _upbit_order_authority_lock_owned() -> bool:
+    return UPBIT_ORDER_AUTHORITY_MUTATION_LOCK.owned_by_current_thread()
+
+
+def _assert_no_upbit_route_lock_before_backend() -> None:
+    if _upbit_order_authority_lock_owned():
+        raise RuntimeError(
+            "upbit-functional-lock-order-route-before-backend-forbidden"
+        )
 
 
 def real_orders_enabled() -> bool:
@@ -485,6 +913,74 @@ PROGRAM_LEDGER_PATH = Path(
     os.environ.get("LIVE_TRADER_PROGRAM_LEDGER_DB") or APP_DATA_ROOT / "logs" / "live_trader_program_ledger.sqlite3"
 )
 PROGRAM_LEDGER = ProgramLedger(PROGRAM_LEDGER_PATH)
+KIS_ORDER_AUTHORITY_DB_PATH = Path(
+    os.environ.get("LIVE_TRADER_KIS_ORDER_AUTHORITY_DB")
+    or APP_DATA_ROOT / "logs" / "kis-order-authority.sqlite3"
+)
+UPBIT_FUNCTIONAL_DATABASE_PATH = Path(
+    os.environ.get("LIVE_TRADER_UPBIT_FUNCTIONAL_DB")
+    or APP_DATA_ROOT / "logs" / "upbit-functional.sqlite3"
+)
+UPBIT_FUNCTIONAL_PUBLICATION_PROOF_PATH = Path(
+    os.environ.get("LIVE_TRADER_UPBIT_FUNCTIONAL_PUBLICATION_PROOF")
+    or Path(__file__).resolve().parents[2]
+    / "backtester"
+    / "tmp"
+    / "crypto-dual-5m-publication-proof-v1.json"
+)
+BINANCE_SPOT_FUNCTIONAL_DATABASE_PATH = Path(
+    os.environ.get("LIVE_TRADER_BINANCE_SPOT_FUNCTIONAL_DB")
+    or APP_DATA_ROOT / "logs" / "binance-spot-functional.sqlite3"
+)
+BINANCE_SPOT_FUNCTIONAL_PUBLICATION_PROOF_PATH = Path(
+    os.environ.get("LIVE_TRADER_BINANCE_SPOT_FUNCTIONAL_PUBLICATION_PROOF")
+    or Path(__file__).resolve().parents[2]
+    / "backtester"
+    / "tmp"
+    / "crypto-dual-5m-publication-proof-v1.json"
+)
+BINANCE_SPOT_FUNCTIONAL_SERVER_SECRET_PATH = Path(
+    os.environ.get("LIVE_TRADER_BINANCE_SPOT_FUNCTIONAL_SERVER_SECRET")
+    or APP_DATA_ROOT / "secrets" / "binance-spot-functional-server.key"
+)
+_BINANCE_SPOT_FUNCTIONAL_STATE_LOCK = threading.RLock()
+_BINANCE_SPOT_FUNCTIONAL_FACADE: Any | None = None
+_BINANCE_SPOT_FUNCTIONAL_PREPARE_STATUS: dict[str, Any] = {
+    "ok": False,
+    "prepared": False,
+    "available": False,
+    "networkOrderPostAllowed": False,
+    "reason": "binance-functional-backend-not-prepared",
+}
+# This is a process-local server capability, never serialized or returned.
+# Client safety-confirmation material is consumed before this attestation is
+# created, so a request cannot forge the manager's operator authority.
+_UPBIT_FUNCTIONAL_OPERATOR_ATTESTATION_SECRET = secrets.token_urlsafe(48)
+_UPBIT_FUNCTIONAL_APPROVAL_RECORD_SECRET = secrets.token_urlsafe(48)
+_UPBIT_FUNCTIONAL_APPROVAL_RECORD_SIGNATURE_ALGORITHM = (
+    "HMAC-SHA256-PROCESS-LOCAL"
+)
+_UPBIT_FUNCTIONAL_APPROVAL_DERIVED_HASH_FIELDS = {
+    "upbit-functional-server-permit-candidate/v1": frozenset(
+        {"candidateHash"}
+    ),
+    "upbit-functional-server-permit-candidate/v2": frozenset(
+        {"candidateHash"}
+    ),
+    "upbit-functional-recovery-candidate/v1": frozenset(
+        {"candidateHash"}
+    ),
+    "upbit-functional-recovery-approval/v1": frozenset({"contentHash"}),
+}
+_UPBIT_FUNCTIONAL_STATE_LOCK = threading.RLock()
+_UPBIT_FUNCTIONAL_APPROVAL_STORE: Any | None = None
+_UPBIT_FUNCTIONAL_PREPARE_STATUS: dict[str, Any] = {
+    "ok": False,
+    "prepared": False,
+    "available": False,
+    "networkOrderPostAllowed": False,
+    "reason": "upbit-functional-backend-not-prepared",
+}
 OPERATIONAL_GOVERNANCE_PATH = Path(
     os.environ.get("LIVE_TRADER_OPERATIONAL_GOVERNANCE_DB")
     or APP_DATA_ROOT / "logs" / "live_trader_operational_governance.sqlite3"
@@ -503,6 +999,1964 @@ DOCTOR_DIAGNOSTICS_LOCK = threading.RLock()
 OPERATOR_CHECKLIST_LOCK = threading.RLock()
 RISK_SETTINGS_LOCK = threading.RLock()
 ACCOUNT_RISK_BUDGET_LOCK = threading.RLock()
+
+
+def _upbit_functional_blocked(reason: str) -> dict[str, Any]:
+    if _upbit_order_authority_lock_owned():
+        # Never wait for manager.status while owning the final POST fence.
+        # The caller still receives the cached fail-closed preparation state.
+        with _UPBIT_FUNCTIONAL_STATE_LOCK:
+            status = dict(_UPBIT_FUNCTIONAL_PREPARE_STATUS)
+        status["liveStatusDeferredByRouteFence"] = True
+    else:
+        status = upbit_functional_backend_state_status()
+    return {
+        "ok": False,
+        "reason": str(reason or "upbit-functional-backend-blocked"),
+        "brokerSubmissionPerformed": False,
+        "status": status,
+    }
+
+
+def _verify_upbit_functional_operator_attestation(
+    value: dict[str, Any],
+) -> bool:
+    signature = str(value.get("serverSignature") or "")
+    return bool(
+        value.get("authenticated") is True
+        and value.get("confirmed") is True
+        and str(value.get("source") or "")
+        == "SERVER_SAFETY_CONFIRMATION"
+        and signature
+        and secrets.compare_digest(
+            signature, _UPBIT_FUNCTIONAL_OPERATOR_ATTESTATION_SECRET
+        )
+    )
+
+
+def _upbit_functional_operator_attestation(action: str) -> dict[str, Any]:
+    return {
+        "authenticated": True,
+        "confirmed": True,
+        "source": "SERVER_SAFETY_CONFIRMATION",
+        "action": str(action or "").strip().upper(),
+        "serverSignature": _UPBIT_FUNCTIONAL_OPERATOR_ATTESTATION_SECRET,
+    }
+
+
+def _verify_upbit_functional_approval_record(
+    value: dict[str, Any],
+) -> bool:
+    if type(value) is not dict:
+        return False
+    signature = value.get("serverSignature")
+    algorithm = value.get("serverSignatureAlgorithm")
+    if (
+        type(signature) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", signature) is None
+        or type(algorithm) is not str
+        or algorithm
+        != _UPBIT_FUNCTIONAL_APPROVAL_RECORD_SIGNATURE_ALGORITHM
+    ):
+        return False
+    try:
+        projection = _upbit_functional_approval_record_projection(value)
+        expected = _upbit_functional_approval_record_signature(projection)
+    except (TypeError, ValueError):
+        return False
+    return secrets.compare_digest(signature, expected)
+
+
+def _upbit_functional_approval_record_projection(
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the exact acyclic body covered by the process-local HMAC.
+
+    Recovery ``candidateHash``/``contentHash`` values are added only after
+    signing and are independently recomputed by the durable approval store.
+    Excluding those schema-owned outer hashes avoids a signature cycle while
+    the two validation layers still bind the complete durable record.
+    """
+
+    if type(value) is not dict or any(type(key) is not str for key in value):
+        raise TypeError("upbit functional approval record must be an exact dict")
+    signature_fields = {
+        key for key in value if key.startswith("serverSignature")
+    }
+    if signature_fields - {"serverSignature", "serverSignatureAlgorithm"}:
+        raise ValueError("unexpected Upbit functional signature field")
+    schema_version = value.get("schemaVersion")
+    if schema_version is not None and type(schema_version) is not str:
+        raise TypeError("Upbit functional approval schema must be a string")
+    derived_fields = _UPBIT_FUNCTIONAL_APPROVAL_DERIVED_HASH_FIELDS.get(
+        schema_version, frozenset()
+    )
+    excluded = {
+        "serverSignature",
+        "serverSignatureAlgorithm",
+        *derived_fields,
+    }
+    return {key: item for key, item in value.items() if key not in excluded}
+
+
+def _upbit_functional_approval_record_signature(
+    projection: dict[str, Any],
+) -> str:
+    canonical = json.dumps(
+        projection,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hmac.new(
+        _UPBIT_FUNCTIONAL_APPROVAL_RECORD_SECRET.encode("utf-8"),
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _sign_upbit_functional_approval_record(
+    value: Any,
+) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise TypeError("upbit functional approval record must be an exact dict")
+    if any(
+        type(key) is str and key.startswith("serverSignature") for key in value
+    ):
+        raise ValueError("Upbit functional approval record is already signed")
+    body = dict(value)
+    projection = _upbit_functional_approval_record_projection(body)
+    return {
+        **body,
+        "serverSignatureAlgorithm": (
+            _UPBIT_FUNCTIONAL_APPROVAL_RECORD_SIGNATURE_ALGORITHM
+        ),
+        "serverSignature": _upbit_functional_approval_record_signature(
+            projection
+        ),
+    }
+
+
+def _upbit_functional_durable_authority_open() -> bool:
+    """Treat an unreadable approval pointer as open, never as permission."""
+
+    with _UPBIT_FUNCTIONAL_STATE_LOCK:
+        store = _UPBIT_FUNCTIONAL_APPROVAL_STORE
+    database_path = Path(getattr(store, "path", UPBIT_FUNCTIONAL_DATABASE_PATH))
+    if database_path.exists():
+        try:
+            with closing(
+                sqlite3.connect(
+                    f"file:{database_path.resolve().as_posix()}?mode=ro",
+                    uri=True,
+                    timeout=1,
+                )
+            ) as connection:
+                active_approval = connection.execute(
+                    """SELECT 1 FROM upbit_functional_approvals
+                    WHERE state IN ('ISSUED','APPROVED','CLAIMED','ACTIVE')
+                    LIMIT 1"""
+                ).fetchone()
+                nonterminal_session = connection.execute(
+                    """SELECT 1 FROM upbit_functional_sessions
+                    WHERE state<>'FINALIZED' LIMIT 1"""
+                ).fetchone()
+                unresolved_or_orphan_claim = connection.execute(
+                    """SELECT 1 FROM upbit_functional_claims c
+                    LEFT JOIN upbit_functional_sessions s
+                    ON s.session_id=c.session_id
+                    WHERE c.state IN ('CLAIMED_PRE_POST',
+                        'POST_MAY_HAVE_CROSSED','AMBIGUOUS')
+                    OR (c.state IN ('ACKNOWLEDGED','RECONCILED')
+                        AND (s.session_id IS NULL OR s.state<>'FINALIZED'))
+                    LIMIT 1"""
+                ).fetchone()
+            if any(
+                value is not None
+                for value in (
+                    active_approval,
+                    nonterminal_session,
+                    unresolved_or_orphan_claim,
+                )
+            ):
+                return True
+        except Exception:
+            # Missing/corrupt tables or an unreadable DB can conceal a live
+            # session, crossed broker boundary, or cleanup residue.
+            return True
+    elif store is None:
+        return False
+    if store is None:
+        return False
+    try:
+        return store.order_authority_pointer() is not None
+    except Exception:
+        return True
+
+
+def _upbit_functional_ordinary_routes_closed() -> bool:
+    smoke = STATE.get("upbit_smoke_order")
+    smoke_row = dict(smoke) if isinstance(smoke, dict) else {}
+    active_runtimes = STATE.get("active_runtime_session_ids")
+    runtime_rows = dict(active_runtimes) if isinstance(active_runtimes, dict) else {}
+    return bool(
+        STATE.get("new_entries_blocked") is True
+        and not real_orders_enabled()
+        and not any(str(value or "").strip() for value in runtime_rows.values())
+        and str(smoke_row.get("status") or "").lower()
+        not in {"ready", "submitting"}
+    )
+
+
+def _upbit_order_authority_snapshot() -> dict[str, Any]:
+    """One fail-closed state view shared by every ordinary Upbit send."""
+
+    try:
+        application = live_trader_instance_lease_status()
+        return {
+            "functionalAuthorityOpen": bool(
+                _upbit_functional_durable_authority_open()
+            ),
+            "applicationInstanceLeaseHeld": (
+                application.get("acquired") is True
+            ),
+            "ordinaryMutationEnabled": real_orders_enabled(),
+            "ordinaryRoutesClosed": (
+                _upbit_functional_ordinary_routes_closed()
+            ),
+        }
+    except Exception:
+        return {
+            "functionalAuthorityOpen": True,
+            "applicationInstanceLeaseHeld": False,
+            "ordinaryMutationEnabled": False,
+            "ordinaryRoutesClosed": False,
+        }
+
+
+# Install exactly one state-owned provider.  The broker router imports only
+# the neutral authority module, so this registration does not create a
+# state <-> brokers cycle.
+register_upbit_order_authority_reader(_upbit_order_authority_snapshot)
+
+
+def _upbit_functional_code_manifest() -> dict[str, Any]:
+    """Seal the exact production implementation used by a first-live run."""
+
+    root = Path(__file__).resolve().parent
+    names = (
+        "binance_order_authority.py",
+        "brokers.py",
+        "continuous_live.py",
+        "emergency_stop.py",
+        "env_loader.py",
+        "env_settings.py",
+        "execution_streams.py",
+        "functional_http_session.py",
+        "live_adapters.py",
+        "process_safety.py",
+        "safety_confirmation.py",
+        "server.py",
+        "state.py",
+        "upbit_continuous_functional.py",
+        "upbit_functional_approval.py",
+        "upbit_functional_backend.py",
+        "upbit_functional_entrypoint.py",
+        "upbit_functional_managed.py",
+        "upbit_functional_mutation.py",
+        "upbit_order_authority.py",
+        "upbit_functional_publication.py",
+        "upbit_functional_sources.py",
+        "upbit_functional_strategy.py",
+        "upbit_functional_transport.py",
+        "upbit_functional_truth.py",
+    )
+    files = {
+        f"live_trader/{name}": hashlib.sha256(
+            (root / name).read_bytes()
+        ).hexdigest()
+        for name in names
+    }
+    shared_permit = (
+        Path(__file__).resolve().parents[3]
+        / "packages"
+        / "trading_runtime"
+        / "trading_runtime"
+        / "functional_test.py"
+    )
+    if not shared_permit.is_file():
+        raise RuntimeError("upbit-functional-shared-permit-source-missing")
+    files[
+        "packages/trading_runtime/trading_runtime/functional_test.py"
+    ] = hashlib.sha256(
+        shared_permit.read_bytes()
+    ).hexdigest()
+    return {
+        "schemaVersion": "upbit-functional-code-manifest/v1",
+        "files": files,
+        "manifestHash": hashlib.sha256(
+            json.dumps(
+                files, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _upbit_functional_candidate_binding(
+    *,
+    permit: Any,
+    selection: dict[str, Any],
+    first_live_bootstrap: dict[str, Any] | None,
+) -> dict[str, Any]:
+    immutable_permit = {
+        "schemaVersion": "upbit-functional-activation-lineage/v1",
+        "environment": permit.environment.value,
+        "binding": permit.binding.snapshot(),
+        "caps": permit.caps.snapshot(),
+        "duration": {
+            "value": permit.duration_value,
+            "unit": permit.duration_unit.value,
+        },
+        "promotionEligible": False,
+    }
+    selection_fields = (
+        "strategyArtifactId",
+        "strategyArtifactHash",
+        "strategyArtifactFileSha256",
+        "strategyInstanceId",
+        "strategyInstanceHash",
+        "strategyInstanceFileSha256",
+        "publicationProofHash",
+        "publicationProofFileSha256",
+        "publishedProvider",
+        "publishedGroup",
+        "publishedSymbol",
+        "publishedStrategyArtifactHash",
+        "publishedStrategyArtifactFileSha256",
+        "publishedStrategyInstanceHash",
+        "publishedStrategyInstanceFileSha256",
+        "strategyPluginId",
+        "strategyShortMa",
+        "strategyLongMa",
+    )
+    return {
+        "schemaVersion": "upbit-functional-server-candidate-binding/v1",
+        "operatorConfirmationBindsCandidateHash": True,
+        "immutablePermit": immutable_permit,
+        "route": {
+            "exchange": "UPBIT_SPOT",
+            "accountFingerprint": permit.binding.account_id,
+            "symbol": "KRW-BTC",
+            "executionRoute": "UPBIT_KRW_SPOT_CONTINUOUS",
+            "interval": "5m",
+        },
+        "selection": {
+            field: selection.get(field) for field in selection_fields
+        },
+        "riskContract": {
+            "maxOrderNotionalKrw": 10000,
+            "maxGrossExposureKrw": 10000,
+            "maxLossKrw": 1000,
+            "strategyBuyCount": 1,
+            "strategySellCount": 1,
+            "shortAllowed": False,
+            "marginAllowed": False,
+            "withdrawalAllowed": False,
+            "promotionEligible": False,
+            "activeDurationSeconds": 7200,
+        },
+        "exclusiveAccountContract": {
+            "exclusiveCredentialedAccountRequired": True,
+            "manualTradingForbidden": True,
+            "botsForbidden": True,
+            "otherApiKeysForbidden": True,
+            "accountWideOrderAndPrivateStreamAuditRequired": True,
+            "causalAmbiguityOutcome": "SAFE_INCOMPLETE",
+        },
+        "firstLiveBootstrap": (
+            dict(first_live_bootstrap)
+            if isinstance(first_live_bootstrap, dict)
+            else None
+        ),
+        "codeManifest": _upbit_functional_code_manifest(),
+    }
+
+
+@_serialized_upbit_order_authority
+def _preissue_upbit_functional_permit_candidate(
+    requested_approval_id: str = "",
+) -> dict[str, Any]:
+    """Create a non-claimable exact permit behind the safety challenge.
+
+    This is an internal server operation.  The caller may either request the
+    already-issued id or leave it blank; it cannot choose a new id, binding,
+    symbol, cap, account fingerprint, or strategy artifact.
+    """
+
+    with _UPBIT_FUNCTIONAL_STATE_LOCK:
+        status = dict(_UPBIT_FUNCTIONAL_PREPARE_STATUS)
+    first_live_eligible = bool(status.get("firstLiveBootstrapEligible"))
+    if (
+        status.get("prepared") is not True
+        or status.get("available") is not True
+        or (
+            status.get("networkOrderPostAllowed") is not True
+            and not first_live_eligible
+        )
+    ):
+        raise RuntimeError("upbit-functional-backend-composite-unavailable")
+    with _UPBIT_FUNCTIONAL_STATE_LOCK:
+        store = _UPBIT_FUNCTIONAL_APPROVAL_STORE
+    if store is None:
+        raise RuntimeError("upbit-functional-approval-store-missing")
+    active = store.active_pointer()
+    if active is not None:
+        raise RuntimeError("upbit-functional-active-approval-already-present")
+    issued = store.issued_pointer()
+    requested = str(requested_approval_id or "").strip()
+    now = datetime.now(timezone.utc)
+    if issued is not None:
+        candidate = parse_functional_test_permit(
+            json.loads(str(issued["permit_json"]))
+        )
+        fresh = bool(
+            candidate.starts_at <= now < candidate.ends_at
+            and (now - candidate.starts_at).total_seconds() <= 240
+        )
+        if fresh:
+            if requested and not secrets.compare_digest(
+                requested, str(issued["approval_id"])
+            ):
+                raise RuntimeError(
+                    "upbit-functional-server-candidate-id-mismatch"
+                )
+            return {
+                "approvalId": str(issued["approval_id"]),
+                "permitId": candidate.permit_id,
+                "permitHash": candidate.content_hash,
+                "candidateHash": str(issued.get("candidate_hash") or ""),
+                "firstLiveBootstrap": bool(
+                    str(issued.get("bootstrap_id") or "")
+                ),
+                "expiresAt": candidate.ends_at.isoformat().replace(
+                    "+00:00", "Z"
+                ),
+            }
+        store.retire_issued_permit(
+            approval_id=str(issued["approval_id"]),
+            detail="candidate expired before typed confirmation",
+        )
+    if requested:
+        # A client-supplied id cannot cause creation of a new authority.
+        raise RuntimeError("upbit-functional-server-candidate-missing")
+    from .upbit_continuous_functional import UpbitPermitScope
+    from .upbit_functional_publication import (
+        load_upbit_functional_selection,
+    )
+    from .upbit_functional_transport import upbit_credential_fingerprint
+
+    account_fingerprint = upbit_credential_fingerprint()
+    selection = load_upbit_functional_selection(
+        UPBIT_FUNCTIONAL_PUBLICATION_PROOF_PATH,
+        account_fingerprint=account_fingerprint,
+    )
+    binding = FunctionalTestBinding(
+        strategy_artifact_id=str(selection["strategyArtifactId"]),
+        strategy_artifact_hash=str(selection["strategyArtifactHash"]),
+        strategy_instance_id=str(selection["strategyInstanceId"]),
+        portfolio_required=False,
+        portfolio_artifact_id="",
+        portfolio_artifact_hash="",
+        portfolio_instance_id="",
+        account_id=account_fingerprint,
+        symbols=("KRW-BTC",),
+        market_group="CRYPTO_SPOT",
+        execution_route="UPBIT_KRW_SPOT_CONTINUOUS",
+        settlement_currency="KRW",
+        exchanges=("UPBIT_SPOT",),
+        symbol_routes=(("KRW-BTC", "UPBIT_SPOT"),),
+    )
+    permit = issue_functional_test_permit(
+        binding=binding,
+        environment=FunctionalTestEnvironment.UPBIT_LIVE,
+        duration_value=2,
+        now=now,
+    )
+    # Reuse the exact production parser before persisting even an inert
+    # candidate.  This binds the publication proof and instance/file hashes.
+    UpbitPermitScope.parse(
+        permit,
+        immutable_selection=selection,
+    )
+    approval_id = "upbit-server-approval-" + secrets.token_hex(16)
+    real_e2e = store.real_e2e_status()
+    bootstrap = (
+        {
+            "bootstrapId": "upbit-first-live-" + secrets.token_hex(16),
+            "sessionNonce": secrets.token_urlsafe(48),
+            "singleUse": True,
+            "realE2EValidatedBeforeStart": False,
+        }
+        if int(real_e2e.get("validated") or 0) == 0
+        else None
+    )
+    candidate_binding = _upbit_functional_candidate_binding(
+        permit=permit,
+        selection=selection,
+        first_live_bootstrap=bootstrap,
+    )
+    candidate_hash = hashlib.sha256(
+        json.dumps(
+            candidate_binding, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    if bootstrap is not None:
+        bootstrap = {**bootstrap, "candidateHash": candidate_hash}
+    issue_record = _sign_upbit_functional_approval_record({
+        "schemaVersion": "upbit-functional-server-permit-candidate/v2",
+        "approvalId": approval_id,
+        "permitId": permit.permit_id,
+        "permitHash": permit.content_hash,
+        "accountFingerprint": account_fingerprint,
+        "executionRoute": "UPBIT_KRW_SPOT_CONTINUOUS",
+        "symbol": "KRW-BTC",
+        "serverManaged": True,
+        "singleUse": True,
+        "issuer": "LIVE_TRADER_SERVER",
+        "issuedAt": now.isoformat().replace("+00:00", "Z"),
+        "nonce": secrets.token_urlsafe(32),
+        "candidateBinding": candidate_binding,
+        "candidateHash": candidate_hash,
+        "firstLiveBootstrap": bootstrap,
+    })
+    stored = store.issue_permit_candidate(permit.to_dict(), issue_record)
+    return {
+        "approvalId": str(stored["approval_id"]),
+        "permitId": permit.permit_id,
+        "permitHash": permit.content_hash,
+        "candidateHash": candidate_hash,
+        "firstLiveBootstrap": bootstrap is not None,
+        "expiresAt": permit.ends_at.isoformat().replace("+00:00", "Z"),
+    }
+
+
+@_serialized_upbit_order_authority
+def _approve_upbit_functional_permit_candidate(
+    approval_id: str,
+) -> dict[str, Any]:
+    with _UPBIT_FUNCTIONAL_STATE_LOCK:
+        store = _UPBIT_FUNCTIONAL_APPROVAL_STORE
+    if store is None:
+        raise RuntimeError("upbit-functional-approval-store-missing")
+    status = store.permit_status(approval_id)
+    if str(status.get("state") or "") == "APPROVED":
+        return status
+    issued = store.issued_pointer()
+    if (
+        issued is None
+        or not secrets.compare_digest(
+            str(issued.get("approval_id") or ""), str(approval_id or "")
+        )
+    ):
+        raise RuntimeError("upbit-functional-server-candidate-missing")
+    permit = parse_functional_test_permit(
+        json.loads(str(issued["permit_json"]))
+    )
+    now = datetime.now(timezone.utc)
+    approval = _sign_upbit_functional_approval_record({
+        "approvalId": str(approval_id),
+        "operatorId": "authenticated-live-trader-operator",
+        "operatorAuthenticated": True,
+        "operatorApproved": True,
+        "permitId": permit.permit_id,
+        "permitHash": permit.content_hash,
+        "candidateHash": str(status.get("candidate_hash") or ""),
+        "accountFingerprint": permit.binding.account_id,
+        "executionRoute": "UPBIT_KRW_SPOT_CONTINUOUS",
+        "symbol": "KRW-BTC",
+        "approvedAt": now.isoformat().replace("+00:00", "Z"),
+        "nonce": secrets.token_urlsafe(32),
+    })
+    return store.approve_issued_permit(
+        approval_id=str(approval_id),
+        approval=approval,
+    )
+
+
+def _preissue_upbit_functional_recovery_candidate(
+    requested_recovery_id: str = "",
+) -> dict[str, Any]:
+    from .upbit_functional_backend import (
+        preissue_upbit_functional_recovery_candidate,
+    )
+
+    with UPBIT_ORDER_AUTHORITY_MUTATION_LOCK:
+        if not _upbit_functional_durable_authority_open():
+            raise RuntimeError(
+                "upbit-functional-recovery-active-approval-missing"
+            )
+        if not _upbit_functional_ordinary_routes_closed():
+            raise RuntimeError(
+                "upbit-functional-recovery-ordinary-routes-not-closed"
+            )
+    _assert_no_upbit_route_lock_before_backend()
+    return preissue_upbit_functional_recovery_candidate(
+        str(requested_recovery_id or "").strip()
+    )
+
+
+def _approve_upbit_functional_recovery_candidate(
+    recovery_id: str,
+) -> dict[str, Any]:
+    from .upbit_functional_backend import (
+        approve_upbit_functional_recovery_candidate,
+    )
+
+    with UPBIT_ORDER_AUTHORITY_MUTATION_LOCK:
+        if not _upbit_functional_ordinary_routes_closed():
+            raise RuntimeError(
+                "upbit-functional-recovery-ordinary-routes-not-closed"
+            )
+    _assert_no_upbit_route_lock_before_backend()
+    return approve_upbit_functional_recovery_candidate(
+        str(recovery_id or "").strip()
+    )
+
+
+@contextmanager
+def _upbit_functional_dispatch_lease(
+    *, session_id: str, claim_id: str
+):
+    """Retain a cross-process session fence across the exact POST boundary."""
+
+    with UPBIT_ORDER_AUTHORITY_MUTATION_LOCK:
+        with emergency_stop_dispatch_boundary() as emergency:
+            if not _upbit_functional_ordinary_routes_closed():
+                raise RuntimeError(
+                    "upbit-functional-dispatch-ordinary-routes-not-closed"
+                )
+            with _UPBIT_FUNCTIONAL_STATE_LOCK:
+                store = _UPBIT_FUNCTIONAL_APPROVAL_STORE
+            if store is None:
+                raise RuntimeError("upbit-functional-approval-store-missing")
+            cleanup_authority = store.cleanup_claim_authority(
+                session_id=str(session_id), claim_id=str(claim_id)
+            )
+            if (
+                emergency.get("active") is True
+                and not cleanup_authority
+            ):
+                raise RuntimeError(
+                    "upbit-functional-dispatch-emergency-stop-active"
+                )
+            pointer = store.active_pointer()
+            if (
+                not isinstance(pointer, dict)
+                or str(pointer.get("claimed_session_id") or "")
+                != str(session_id)
+            ):
+                raise RuntimeError(
+                    "upbit-functional-active-approval-pointer-missing"
+                )
+            if int(pointer.get("cleanup_only") or 0) == 1 and not cleanup_authority:
+                raise RuntimeError(
+                    "upbit-functional-dispatch-cleanup-only-entry-forbidden"
+                )
+            process_lease = hold_process_lease(
+                f"live-trader:upbit-functional-session:{session_id}"
+            )
+
+            def read() -> dict[str, Any]:
+                current = store.active_pointer()
+                current_cleanup_authority = store.cleanup_claim_authority(
+                    session_id=str(session_id), claim_id=str(claim_id)
+                )
+                cleanup_only = bool(
+                    isinstance(current, dict)
+                    and int(current.get("cleanup_only") or 0) == 1
+                )
+                pointer_matches = bool(
+                    isinstance(current, dict)
+                    and str(current.get("claimed_session_id") or "")
+                    == str(session_id)
+                    and str(current.get("permit_hash") or "")
+                    == str(pointer.get("permit_hash") or "")
+                    and (not cleanup_only or current_cleanup_authority)
+                )
+                routes_closed = _upbit_functional_ordinary_routes_closed()
+                return {
+                    "active": process_lease.get("acquired") is True
+                    and pointer_matches
+                    and routes_closed,
+                    "sessionId": str(session_id),
+                    "claimId": str(claim_id),
+                    "permitHash": str(pointer.get("permit_hash") or ""),
+                    "ordinaryRoutesClosed": routes_closed,
+                    "emergencyStopActive": (
+                        emergency.get("active") is True
+                    ),
+                    "killCleanupOnly": cleanup_authority,
+                    "durableCleanupOnly": cleanup_only,
+                    "ownerPid": process_lease.get("ownerPid"),
+                    "scopeHash": process_lease.get("scopeHash"),
+                }
+
+            yield read
+
+
+@contextmanager
+def _ordinary_upbit_final_mutation_boundary(
+    broker_id: str,
+):
+    """Fence an ordinary Upbit POST/DELETE against functional authority."""
+
+    normalized_broker = str(broker_id or "").strip().lower()
+    if normalized_broker in {"binance", "binance-futures"}:
+        # The Binance adapter owns its exact route lock and then the emergency
+        # boundary.  Do not acquire emergency here first: that would invert
+        # the single global order during concurrent Kill.
+        yield {"active": False, "boundaryOwner": "BINANCE_BROKER_EDGE"}
+        return
+    if normalized_broker == "kis":
+        # Retain route -> emergency across the state-layer final check and
+        # broker call.  LiveBrokerRouter re-enters these RLocks in the same
+        # thread and adds the exact endpoint/payload/owner lease; tests that
+        # replace the router still cannot bypass the durable Kill latch.
+        with kis_route_authority_serialization():
+            with emergency_stop_dispatch_boundary() as emergency:
+                yield emergency
+        return
+    if normalized_broker != "upbit":
+        with emergency_stop_dispatch_boundary() as emergency:
+            yield emergency
+        return
+    with ordinary_upbit_final_mutation_boundary(
+        operation="STATE_ORDINARY_MUTATION"
+    ) as authority:
+        yield authority
+
+
+def _request_upbit_functional_cleanup_only(reason: str) -> dict[str, Any]:
+    """Publish STOP/Kill entry revocation before manager cleanup begins."""
+
+    with UPBIT_ORDER_AUTHORITY_MUTATION_LOCK:
+        with _UPBIT_FUNCTIONAL_STATE_LOCK:
+            store = _UPBIT_FUNCTIONAL_APPROVAL_STORE
+        if store is None:
+            if _upbit_functional_durable_authority_open():
+                return {
+                    "ok": False,
+                    "state": "RECONCILIATION_REQUIRED",
+                    "reason": (
+                        "upbit-functional-durable-authority-store-unavailable"
+                    ),
+                }
+            return {"ok": True, "state": "NO_APPROVAL_STORE"}
+        pointer = store.active_pointer()
+        if not isinstance(pointer, dict):
+            return {"ok": True, "state": "NO_ACTIVE_FUNCTIONAL_SESSION"}
+        approval_id = str(pointer.get("approval_id") or "")
+        session_id = str(pointer.get("claimed_session_id") or "")
+        if not approval_id or not session_id:
+            raise RuntimeError(
+                "upbit-functional-cleanup-only-pointer-incomplete"
+            )
+        if int(pointer.get("cleanup_only") or 0) != 1:
+            pointer = store.request_cleanup_only(
+                approval_id=approval_id,
+                session_id=session_id,
+                reason=str(reason),
+            )
+        return {
+            "ok": True,
+            "state": "CLEANUP_ONLY",
+            "approvalId": approval_id,
+            "sessionId": session_id,
+            "cleanupOnly": int(pointer.get("cleanup_only") or 0) == 1,
+        }
+
+
+def _upbit_functional_emergency_cleanup_after_latch() -> dict[str, Any]:
+    """Own functional cancel/flatten after durable Kill is visible."""
+
+    if not emergency_stop_active():
+        return {
+            "ok": False,
+            "state": "RECONCILIATION_REQUIRED",
+            "reason": "emergency-stop-latch-not-observed",
+        }
+    try:
+        latch = _request_upbit_functional_cleanup_only("emergency-stop")
+        from .upbit_functional_backend import (
+            stop_upbit_functional_backend,
+            upbit_functional_backend_status,
+        )
+
+        status = upbit_functional_backend_status()
+        session_id = str(status.get("sessionId") or "")
+        durable_session_id = str(latch.get("sessionId") or "")
+        if (
+            latch.get("ok") is False
+            and str(latch.get("state") or "")
+            == "RECONCILIATION_REQUIRED"
+        ):
+            return {
+                "ok": False,
+                "sessionId": durable_session_id,
+                "state": "RECONCILIATION_REQUIRED",
+                "entryAuthorityRevoked": True,
+                "cleanupOnlyLatch": latch,
+                "cleanupSchedulerOwned": False,
+                "reason": str(
+                    latch.get("reason")
+                    or "upbit-functional-durable-cleanup-unavailable"
+                ),
+            }
+        if (
+            durable_session_id
+            and session_id
+            and not secrets.compare_digest(durable_session_id, session_id)
+        ):
+            return {
+                "ok": False,
+                "sessionId": durable_session_id,
+                "managerSessionId": session_id,
+                "state": "RECONCILIATION_REQUIRED",
+                "entryAuthorityRevoked": True,
+                "cleanupOnlyLatch": latch,
+                "cleanupSchedulerOwned": False,
+                "reason": "upbit-functional-cleanup-manager-session-mismatch",
+            }
+        if not session_id:
+            if durable_session_id or str(
+                latch.get("state") or ""
+            ) == "CLEANUP_ONLY":
+                return {
+                    "ok": False,
+                    "sessionId": durable_session_id,
+                    "state": "RECONCILIATION_REQUIRED",
+                    "entryAuthorityRevoked": True,
+                    "cleanupOnlyLatch": latch,
+                    "cleanupSchedulerOwned": False,
+                    "reason": (
+                        "upbit-functional-durable-cleanup-manager-missing"
+                    ),
+                }
+            return {"ok": True, "state": "NO_ACTIVE_FUNCTIONAL_SESSION"}
+        result = stop_upbit_functional_backend(
+            {
+                "operatorConfirmation": (
+                    _upbit_functional_operator_attestation(
+                        "UPBIT_FUNCTIONAL_STOP"
+                    )
+                )
+            }
+        )
+        terminal = str(
+            ((result.get("status") or {}).get("terminalState") or "")
+        )
+        terminal_complete = terminal in {"FINALIZED", "SAFE_INCOMPLETE"}
+        return {
+            "ok": result.get("ok") is True and terminal_complete,
+            "sessionId": session_id,
+            "state": terminal if terminal_complete else "RECONCILIATION_REQUIRED",
+            "entryAuthorityRevoked": True,
+            "cleanupOnlyLatch": latch,
+            "cleanupSchedulerOwned": not terminal_complete,
+            "result": result,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "state": "RECONCILIATION_REQUIRED",
+            "entryAuthorityRevoked": True,
+            "reason": (
+                "upbit-functional-emergency-cleanup-failed:"
+                + type(exc).__name__
+            ),
+        }
+
+
+def prepare_upbit_functional_backend_state() -> dict[str, Any]:
+    """Prepare the server-owned singleton and run its startup audit.
+
+    No network is opened here. Missing credentials/configuration or an
+    optional-module import failure is represented as an unavailable status.
+    """
+
+    global _UPBIT_FUNCTIONAL_APPROVAL_STORE
+    global _UPBIT_FUNCTIONAL_PREPARE_STATUS
+    with _UPBIT_FUNCTIONAL_STATE_LOCK:
+        configured = {
+            "accessKey": bool(str(env_value("UPBIT_ACCESS_KEY") or "").strip()),
+            "secretKey": bool(str(env_value("UPBIT_SECRET_KEY") or "").strip()),
+            "publicationProof": UPBIT_FUNCTIONAL_PUBLICATION_PROOF_PATH.is_file(),
+        }
+        missing = [key for key, present in configured.items() if not present]
+        if missing:
+            _UPBIT_FUNCTIONAL_PREPARE_STATUS = {
+                "ok": False,
+                "prepared": False,
+                "available": False,
+                "networkOrderPostAllowed": False,
+                "reason": "upbit-functional-configuration-missing:"
+                + ",".join(missing),
+                "configured": configured,
+            }
+            return dict(_UPBIT_FUNCTIONAL_PREPARE_STATUS)
+        try:
+            from .upbit_functional_approval import (
+                DurableUpbitFunctionalApprovalStore,
+            )
+            from .upbit_functional_backend import (
+                prepare_upbit_functional_backend,
+            )
+            from .upbit_functional_transport import (
+                resolve_upbit_functional_base_url,
+                upbit_credential_fingerprint,
+            )
+            from .upbit_functional_publication import (
+                load_upbit_functional_selection,
+            )
+
+            resolve_upbit_functional_base_url()
+            if _UPBIT_FUNCTIONAL_APPROVAL_STORE is None:
+                _UPBIT_FUNCTIONAL_APPROVAL_STORE = (
+                    DurableUpbitFunctionalApprovalStore(
+                        UPBIT_FUNCTIONAL_DATABASE_PATH,
+                        clock=lambda: datetime.now(timezone.utc),
+                        operator_verifier=(
+                            _verify_upbit_functional_approval_record
+                        ),
+                        code_manifest_reader=_upbit_functional_code_manifest,
+                        immutable_selection_reader=lambda: (
+                            load_upbit_functional_selection(
+                                UPBIT_FUNCTIONAL_PUBLICATION_PROOF_PATH,
+                                account_fingerprint=upbit_credential_fingerprint(),
+                            )
+                        ),
+                    )
+                )
+            prepared = prepare_upbit_functional_backend(
+                database_path=UPBIT_FUNCTIONAL_DATABASE_PATH,
+                publication_proof_path=(
+                    UPBIT_FUNCTIONAL_PUBLICATION_PROOF_PATH
+                ),
+                clock=lambda: datetime.now(timezone.utc),
+                approval_store=_UPBIT_FUNCTIONAL_APPROVAL_STORE,
+                sender=send_prepared_request,
+                lease_reader_factory=_upbit_functional_dispatch_lease,
+                operator_confirmation_verifier=(
+                    _verify_upbit_functional_operator_attestation
+                ),
+                ordinary_routes_closed_reader=(
+                    _upbit_functional_ordinary_routes_closed
+                ),
+                emergency_stop_reader=emergency_stop_status,
+                approval_record_signer=(
+                    _sign_upbit_functional_approval_record
+                ),
+            )
+            status = (
+                dict(prepared.get("status"))
+                if isinstance(prepared.get("status"), dict)
+                else {}
+            )
+            _UPBIT_FUNCTIONAL_PREPARE_STATUS = {
+                "ok": True,
+                "prepared": True,
+                **status,
+                "configured": configured,
+            }
+        except Exception as exc:
+            _UPBIT_FUNCTIONAL_PREPARE_STATUS = {
+                "ok": False,
+                "prepared": False,
+                "available": False,
+                "networkOrderPostAllowed": False,
+                "reason": (
+                    "upbit-functional-backend-prepare-failed:"
+                    f"{type(exc).__name__}"
+                ),
+                "configured": configured,
+            }
+        return dict(_UPBIT_FUNCTIONAL_PREPARE_STATUS)
+
+
+def upbit_functional_backend_state_status() -> dict[str, Any]:
+    with _UPBIT_FUNCTIONAL_STATE_LOCK:
+        prepared = dict(_UPBIT_FUNCTIONAL_PREPARE_STATUS)
+    if _upbit_order_authority_lock_owned():
+        return {
+            **prepared,
+            "available": False,
+            "networkOrderPostAllowed": False,
+            "liveStatusDeferredByRouteFence": True,
+            "reason": "upbit-functional-status-deferred-by-route-fence",
+        }
+    if prepared.get("prepared") is not True:
+        return prepared
+    try:
+        from .upbit_functional_backend import (
+            upbit_functional_backend_status,
+        )
+
+        result = {
+            **prepared,
+            **upbit_functional_backend_status(),
+            "prepared": True,
+        }
+        with _UPBIT_FUNCTIONAL_STATE_LOCK:
+            store = _UPBIT_FUNCTIONAL_APPROVAL_STORE
+        if store is not None:
+            try:
+                issued = store.issued_pointer()
+            except Exception:
+                issued = None
+                result["approvalPointerReadable"] = False
+            if issued is not None:
+                result["pendingApprovalId"] = str(
+                    issued.get("approval_id") or ""
+                )
+                result["pendingApprovalState"] = "ISSUED"
+        return result
+    except Exception as exc:
+        return {
+            "ok": False,
+            "prepared": False,
+            "available": False,
+            "networkOrderPostAllowed": False,
+            "reason": (
+                "upbit-functional-backend-status-failed:"
+                f"{type(exc).__name__}"
+            ),
+        }
+
+
+def _validate_upbit_functional_http_command(
+    payload: dict[str, Any], exact: set[str]
+) -> dict[str, Any] | None:
+    if set(payload) != exact:
+        return _upbit_functional_blocked(
+            "upbit-functional-http-command-fields-not-exact"
+        )
+    confirmation = payload.get("operatorConfirmation")
+    if not isinstance(confirmation, dict) or set(confirmation) != {
+        "challengeId",
+        "token",
+        "typedPhrase",
+    }:
+        return _upbit_functional_blocked(
+            "upbit-functional-operator-confirmation-fields-not-exact"
+        )
+    return None
+
+
+def _consume_upbit_functional_operator_confirmation(
+    *, action: str, confirmation: dict[str, Any], context: dict[str, Any]
+) -> dict[str, Any]:
+    with SAFETY_CONFIRMATION_MUTATION_LOCK:
+        return consume_safety_confirmation(action, confirmation, context)
+
+
+@_serialized_safety_mutation
+def start_upbit_functional_backend_state(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    invalid = _validate_upbit_functional_http_command(
+        payload, {"approvalId", "operatorConfirmation"}
+    )
+    if invalid is not None:
+        return invalid
+    approval_id = str(payload.get("approvalId") or "").strip()
+    if not approval_id:
+        return _upbit_functional_blocked(
+            "upbit-functional-approval-id-required"
+        )
+    with FUNCTIONAL_TEST_LIFECYCLE_LOCK:
+        status = upbit_functional_backend_state_status()
+        if status.get("prepared") is not True or status.get("available") is not True:
+            return _upbit_functional_blocked(
+                "upbit-functional-backend-composite-unavailable"
+            )
+        with _UPBIT_FUNCTIONAL_STATE_LOCK:
+            approval_store = _UPBIT_FUNCTIONAL_APPROVAL_STORE
+        if approval_store is None:
+            return _upbit_functional_blocked(
+                "upbit-functional-approval-store-missing"
+            )
+        try:
+            approval_status = approval_store.permit_status(approval_id)
+            candidate_hash = str(
+                approval_status.get("candidate_hash") or ""
+            ).lower()
+        except Exception as exc:
+            return _upbit_functional_blocked(
+                "upbit-functional-approval-read-failed:"
+                + type(exc).__name__
+            )
+        consumed = _consume_upbit_functional_operator_confirmation(
+            action="UPBIT_FUNCTIONAL_START",
+            confirmation=dict(payload["operatorConfirmation"]),
+            context={
+                "approvalId": approval_id,
+                "candidateHash": candidate_hash,
+            },
+        )
+        if consumed.get("ok") is not True:
+            return _upbit_functional_blocked(
+                str(consumed.get("reason") or "safety-confirmation-required")
+            )
+        route_error = ""
+        with UPBIT_ORDER_AUTHORITY_MUTATION_LOCK:
+            if real_orders_enabled():
+                route_error = (
+                    "upbit-functional-global-real-orders-must-remain-disabled"
+                )
+            active_runtimes = STATE.get("active_runtime_session_ids")
+            if not route_error and isinstance(active_runtimes, dict) and any(
+                str(value or "").strip() for value in active_runtimes.values()
+            ):
+                route_error = (
+                    "upbit-functional-ordinary-runtime-must-be-stopped"
+                )
+            smoke = STATE.get("upbit_smoke_order")
+            if not route_error and isinstance(smoke, dict) and str(
+                smoke.get("status") or ""
+            ).lower() in {"ready", "submitting"}:
+                route_error = (
+                    "upbit-functional-upbit-smoke-route-not-closed"
+                )
+            if not route_error:
+                STATE["new_entries_blocked"] = True
+                STATE["manual_new_entries_blocked"] = True
+                try:
+                    _approve_upbit_functional_permit_candidate(approval_id)
+                except Exception as exc:
+                    route_error = (
+                        "upbit-functional-server-approval-failed:"
+                        + type(exc).__name__
+                    )
+            if not route_error and not _upbit_functional_ordinary_routes_closed():
+                route_error = "upbit-functional-ordinary-routes-not-closed"
+        if route_error:
+            return _upbit_functional_blocked(route_error)
+        try:
+            from .upbit_functional_backend import (
+                start_upbit_functional_backend,
+            )
+
+            _assert_no_upbit_route_lock_before_backend()
+            return start_upbit_functional_backend(
+                {
+                    "approvalId": approval_id,
+                    "operatorConfirmation": (
+                        _upbit_functional_operator_attestation(
+                            "UPBIT_FUNCTIONAL_START"
+                        )
+                    ),
+                }
+            )
+        except Exception as exc:
+            return _upbit_functional_blocked(
+                "upbit-functional-start-failed:" + type(exc).__name__
+            )
+
+
+def stop_upbit_functional_backend_state(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    invalid = _validate_upbit_functional_http_command(
+        payload, {"operatorConfirmation"}
+    )
+    if invalid is not None:
+        return invalid
+    with FUNCTIONAL_TEST_LIFECYCLE_LOCK:
+        status = upbit_functional_backend_state_status()
+        if status.get("prepared") is not True:
+            return _upbit_functional_blocked(
+                "upbit-functional-backend-not-prepared"
+            )
+        consumed = _consume_upbit_functional_operator_confirmation(
+            action="UPBIT_FUNCTIONAL_STOP",
+            confirmation=dict(payload["operatorConfirmation"]),
+            context={"sessionId": str(status.get("sessionId") or "")},
+        )
+        if consumed.get("ok") is not True:
+            return _upbit_functional_blocked(
+                str(consumed.get("reason") or "safety-confirmation-required")
+            )
+        try:
+            cleanup_latch = _request_upbit_functional_cleanup_only(
+                "operator-stop"
+            )
+        except Exception as exc:
+            return _upbit_functional_blocked(
+                "upbit-functional-stop-entry-revocation-failed:"
+                + type(exc).__name__
+            )
+        try:
+            from .upbit_functional_backend import stop_upbit_functional_backend
+
+            result = stop_upbit_functional_backend(
+                {
+                    "operatorConfirmation": (
+                        _upbit_functional_operator_attestation(
+                            "UPBIT_FUNCTIONAL_STOP"
+                        )
+                    )
+                }
+            )
+            return {**result, "cleanupOnlyLatch": cleanup_latch}
+        except Exception as exc:
+            return _upbit_functional_blocked(
+                "upbit-functional-stop-failed:" + type(exc).__name__
+            )
+
+
+@_serialized_safety_mutation
+def recover_upbit_functional_backend_state(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    invalid = _validate_upbit_functional_http_command(
+        payload, {"recoveryId", "operatorConfirmation"}
+    )
+    if invalid is not None:
+        return invalid
+    recovery_id = str(payload.get("recoveryId") or "").strip()
+    if not recovery_id:
+        return _upbit_functional_blocked(
+            "upbit-functional-recovery-id-required"
+        )
+    with FUNCTIONAL_TEST_LIFECYCLE_LOCK:
+        status = upbit_functional_backend_state_status()
+        if status.get("prepared") is not True:
+            return _upbit_functional_blocked(
+                "upbit-functional-backend-not-prepared"
+            )
+        consumed = _consume_upbit_functional_operator_confirmation(
+            action="UPBIT_FUNCTIONAL_RECOVER",
+            confirmation=dict(payload["operatorConfirmation"]),
+            context={
+                "recoveryId": recovery_id,
+                "sessionId": str(status.get("sessionId") or ""),
+            },
+        )
+        if consumed.get("ok") is not True:
+            return _upbit_functional_blocked(
+                str(consumed.get("reason") or "safety-confirmation-required")
+            )
+        try:
+            _approve_upbit_functional_recovery_candidate(recovery_id)
+        except Exception as exc:
+            return _upbit_functional_blocked(
+                "upbit-functional-server-recovery-approval-failed:"
+                + type(exc).__name__
+            )
+        try:
+            from .upbit_functional_backend import (
+                recover_upbit_functional_backend,
+            )
+
+            _assert_no_upbit_route_lock_before_backend()
+            return recover_upbit_functional_backend(
+                {
+                    "recoveryId": recovery_id,
+                    "operatorConfirmation": (
+                        _upbit_functional_operator_attestation(
+                            "UPBIT_FUNCTIONAL_RECOVER"
+                        )
+                    ),
+                }
+            )
+        except Exception as exc:
+            return _upbit_functional_blocked(
+                "upbit-functional-recover-failed:" + type(exc).__name__
+            )
+
+
+def _binance_spot_functional_ordinary_routes_closed() -> bool:
+    """Conservative state snapshot used at every functional dispatch edge."""
+
+    active_runtimes = STATE.get("active_runtime_session_ids")
+    runtime_rows = dict(active_runtimes) if isinstance(active_runtimes, dict) else {}
+    smoke = STATE.get("binance_smoke_order")
+    smoke_row = dict(smoke) if isinstance(smoke, dict) else {}
+    canary = STATE.get("binance_futures_canary")
+    canary_row = dict(canary) if isinstance(canary, dict) else {}
+    settings = globals().get("BINANCE_FUTURES_SETTINGS_INTERNAL", {})
+    settings_row = dict(settings) if isinstance(settings, dict) else {}
+    soak = globals().get("BINANCE_FUTURES_FILL_SOAK_INTERNAL", {})
+    soak_row = dict(soak) if isinstance(soak, dict) else {}
+    return bool(
+        STATE.get("new_entries_blocked") is True
+        and not real_orders_enabled()
+        and not any(str(value or "").strip() for value in runtime_rows.values())
+        and str(smoke_row.get("status") or "").lower()
+        not in {"ready", "submitting"}
+        and str(canary_row.get("status") or "").lower()
+        not in {"ready", "submitting", "running", "testing"}
+        and str(settings_row.get("status") or "").upper()
+        not in {"READY", "APPLYING"}
+        and str(soak_row.get("phase") or "").lower()
+        not in {"ready", "starting", "running", "stopping", "cleanup"}
+    )
+
+
+def _binance_order_authority_snapshot() -> dict[str, Any]:
+    """Read the durable Binance permit/control rows without backend locks."""
+
+    try:
+        from .binance_spot_functional_approval import (
+            DurableBinanceSpotApprovedPermitStore,
+        )
+        from .binance_spot_functional_lifecycle import (
+            DurableBinanceSpotFunctionalControl,
+        )
+
+        store = DurableBinanceSpotApprovedPermitStore(
+            BINANCE_SPOT_FUNCTIONAL_DATABASE_PATH,
+            approval_verifier=lambda _value: False,
+        )
+        pointer = store.order_authority_pointer()
+        pointer_row = dict(pointer) if isinstance(pointer, dict) else {}
+        control = DurableBinanceSpotFunctionalControl(
+            BINANCE_SPOT_FUNCTIONAL_DATABASE_PATH
+        ).status()
+        phase = str(control.get("phase") or "IDLE").upper()
+        application = live_trader_instance_lease_status()
+        return {
+            "functionalAuthorityOpen": bool(
+                pointer or phase not in {"IDLE", "FAILED", "FINALIZED"}
+            ),
+            "functionalPhase": phase,
+            "functionalRevision": int(control.get("revision") or 0),
+            "functionalSessionId": str(
+                control.get("sessionId")
+                or pointer_row.get("session_id")
+                or ""
+            ),
+            "functionalAccountFingerprint": str(
+                pointer_row.get("account_fingerprint") or ""
+            ).lower(),
+            "applicationInstanceLeaseHeld": (
+                application.get("acquired") is True
+            ),
+            "ordinaryRoutesClosed": (
+                _binance_spot_functional_ordinary_routes_closed()
+            ),
+        }
+    except Exception:
+        return {
+            "functionalAuthorityOpen": True,
+            "functionalPhase": "UNREADABLE",
+            "functionalRevision": -1,
+            "functionalSessionId": "",
+            "functionalAccountFingerprint": "",
+            "applicationInstanceLeaseHeld": False,
+            "ordinaryRoutesClosed": False,
+        }
+
+
+# One state-owned provider is installed exactly once.  The facade does not
+# register a competing bound-method provider, so ordinary and functional
+# final edges share this same process-global durable view.
+register_binance_order_authority_reader(_binance_order_authority_snapshot)
+
+
+def _kis_environment_order_authority_binding() -> tuple[str, str]:
+    """Derive the KIS account/credential identity from one env snapshot."""
+
+    try:
+        from .kis_domestic_functional_get_client import (
+            _credential_configuration_hash,
+            kis_domestic_functional_account_fingerprint,
+        )
+
+        base_url = (env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL).rstrip("/")
+        if base_url != KIS_LIVE_BASE_URL:
+            return "", ""
+        cano, product = split_kis_account(
+            env_value("KIS_ACCOUNT_NO"),
+            env_value("KIS_ACCOUNT_PRODUCT_CODE"),
+        )
+        account = kis_domestic_functional_account_fingerprint(cano, product)
+        app_key = env_value("KIS_APP_KEY")
+        app_secret = env_value("KIS_APP_SECRET")
+        if not app_key or not app_secret:
+            return "", ""
+        credential = _credential_configuration_hash(
+            app_key=app_key,
+            app_secret=app_secret,
+            account_fingerprint=account,
+        )
+        return account, credential
+    except Exception:
+        return "", ""
+
+
+_KIS_ORDER_ACCOUNT_BINDING_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "accountCanoHash",
+        "accountProductCode",
+        "accountFingerprint",
+        "credentialConfigurationHash",
+        "environmentRevision",
+    }
+)
+
+
+def _kis_environment_order_account_binding() -> dict[str, Any]:
+    """Return the non-secret exact KIS identity used for order ownership."""
+
+    try:
+        from .kis_domestic_functional_get_client import (
+            _credential_configuration_hash,
+            kis_domestic_functional_account_fingerprint,
+        )
+
+        base_url = (env_value("KIS_BASE_URL") or KIS_LIVE_BASE_URL).rstrip(
+            "/"
+        )
+        if base_url != KIS_LIVE_BASE_URL:
+            return {}
+        cano, product = split_kis_account(
+            env_value("KIS_ACCOUNT_NO"),
+            env_value("KIS_ACCOUNT_PRODUCT_CODE"),
+        )
+        app_key = env_value("KIS_APP_KEY")
+        app_secret = env_value("KIS_APP_SECRET")
+        if not cano or not product or not app_key or not app_secret:
+            return {}
+        account = kis_domestic_functional_account_fingerprint(cano, product)
+        credential = _credential_configuration_hash(
+            app_key=app_key,
+            app_secret=app_secret,
+            account_fingerprint=account,
+        )
+        environment_revision = governance_sha256(
+            {
+                "schemaVersion": "kis-order-environment/v1",
+                "baseUrl": base_url,
+                "environment": (
+                    env_value("KIS_ENV") or "real"
+                ).strip().lower(),
+                "accountFingerprint": account,
+                "credentialConfigurationHash": credential,
+            }
+        )
+        return {
+            "schemaVersion": "kis-order-account-binding/v1",
+            "accountCanoHash": hashlib.sha256(
+                cano.encode("utf-8")
+            ).hexdigest(),
+            "accountProductCode": product,
+            "accountFingerprint": account,
+            "credentialConfigurationHash": credential,
+            # A deterministic full hash, rather than the broad application
+            # config counter, keeps a cancel valid across unrelated risk or
+            # checklist changes while still invalidating every account,
+            # credential, origin, or KIS-environment rotation after restart.
+            "environmentRevision": environment_revision,
+        }
+    except Exception:
+        return {}
+
+
+def _normalize_kis_order_account_binding(value: Any) -> dict[str, Any]:
+    """Validate a persisted KIS order/truth account binding exactly."""
+
+    if not isinstance(value, dict) or set(value) != set(
+        _KIS_ORDER_ACCOUNT_BINDING_KEYS
+    ):
+        return {}
+    normalized = {
+        "schemaVersion": value.get("schemaVersion"),
+        "accountCanoHash": value.get("accountCanoHash"),
+        "accountProductCode": value.get("accountProductCode"),
+        "accountFingerprint": value.get("accountFingerprint"),
+        "credentialConfigurationHash": value.get(
+            "credentialConfigurationHash"
+        ),
+        "environmentRevision": value.get("environmentRevision"),
+    }
+    if normalized["schemaVersion"] != "kis-order-account-binding/v1":
+        return {}
+    hashes = (
+        normalized["accountCanoHash"],
+        normalized["accountFingerprint"],
+        normalized["credentialConfigurationHash"],
+    )
+    if any(
+        type(item) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", item) is None
+        for item in hashes
+    ):
+        return {}
+    product = normalized["accountProductCode"]
+    revision = normalized["environmentRevision"]
+    if (
+        type(product) is not str
+        or re.fullmatch(r"[0-9]{2}", product) is None
+        or type(revision) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", revision) is None
+    ):
+        return {}
+    return normalized
+
+
+def _kis_order_account_binding_matches(
+    left: dict[str, Any], right: dict[str, Any]
+) -> bool:
+    """Compare identity material; revision is retained as audit evidence."""
+
+    identity_keys = (
+        "schemaVersion",
+        "accountCanoHash",
+        "accountProductCode",
+        "accountFingerprint",
+        "credentialConfigurationHash",
+        "environmentRevision",
+    )
+    return bool(
+        left
+        and right
+        and all(
+            secrets.compare_digest(str(left[key]), str(right[key]))
+            for key in identity_keys
+        )
+    )
+
+
+def _kis_application_owner_epoch() -> tuple[str, str, bool]:
+    application = live_trader_instance_lease_status()
+    held = application.get("acquired") is True
+    body = {
+        "schemaVersion": "kis-shared-route-owner-epoch/v1",
+        "scopeHash": str(application.get("scopeHash") or ""),
+        "ownerPid": int(application.get("ownerPid") or 0),
+        "acquiredAt": str(application.get("acquiredAt") or ""),
+        "heldByCurrentProcess": held,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            body, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    return "kis-owner-epoch-" + digest[:40], digest, held
+
+
+def _kis_order_authority_snapshot() -> dict[str, Any]:
+    """One state-owned fail-closed view for every domestic KIS mutation.
+
+    The specialized production graph is deliberately still compile-disabled;
+    therefore the shared reader advertises a preactivation authority fence and
+    cannot grant a new order.  Exact Kill cleanup remains possible only after
+    the state layer publishes one short-lived owned-cancel reservation.
+    """
+
+    account, credential = _kis_environment_order_authority_binding()
+    owner_epoch_id, owner_epoch_hash, application_held = (
+        _kis_application_owner_epoch()
+    )
+    return {
+        "durableAuthorityReadable": True,
+        "functionalAuthorityOpen": True,
+        "functionalPhase": "ARMED_WAIT_PUBLIC",
+        "functionalRevision": int(_KIS_ROUTE_STATE_REVISION),
+        "stateRevision": int(_KIS_ROUTE_STATE_REVISION),
+        "functionalSessionId": "",
+        "functionalAccountFingerprint": account,
+        "credentialConfigurationHash": credential,
+        "functionalMutationIntent": {},
+        "killOrdinaryCancelAllowed": bool(_KIS_KILL_CANCEL_ALLOWED),
+        "killOrdinaryCancelRevision": int(_KIS_KILL_CANCEL_REVISION),
+        "killOrdinaryCancelIntent": dict(_KIS_KILL_CANCEL_INTENT),
+        "applicationInstanceLeaseHeld": application_held,
+        "ordinaryRoutesClosed": True,
+        "controlReservation": dict(_KIS_CONTROL_RESERVATION),
+        "ownerEpochId": owner_epoch_id,
+        "ownerEpochHash": owner_epoch_hash,
+        "productionAvailable": False,
+        "networkAvailable": False,
+        "releaseEvidenceAvailable": False,
+    }
+
+
+register_kis_order_authority_reader(
+    _kis_order_authority_snapshot,
+    kill_cancel_journal_path=KIS_ORDER_AUTHORITY_DB_PATH,
+)
+
+
+def _reserve_kis_kill_cancel_authority(
+    intent: dict[str, Any],
+) -> dict[str, int]:
+    """Phase one: publish an exact cancel grant without calling a controller."""
+
+    global _KIS_KILL_CANCEL_ALLOWED
+    global _KIS_KILL_CANCEL_INTENT
+    global _KIS_KILL_CANCEL_REVISION
+    with kis_route_authority_serialization():
+        if emergency_stop_status().get("active") is not True:
+            raise RuntimeError("kis-kill-cancel-requires-durable-kill")
+        if _KIS_KILL_CANCEL_ALLOWED:
+            raise RuntimeError("kis-kill-cancel-reservation-already-active")
+        _KIS_KILL_CANCEL_REVISION += 1
+        _KIS_KILL_CANCEL_INTENT = dict(intent)
+        _KIS_KILL_CANCEL_ALLOWED = True
+        state_revision = _advance_kis_route_state_revision()
+        return {
+            "killRevision": _KIS_KILL_CANCEL_REVISION,
+            "stateRevision": state_revision,
+        }
+
+
+def _revoke_kis_kill_cancel_authority(
+    *, expected_revision: int, expected_intent: dict[str, Any]
+) -> None:
+    """Phase two: revoke after the broker edge has released the route lock."""
+
+    global _KIS_KILL_CANCEL_ALLOWED
+    global _KIS_KILL_CANCEL_INTENT
+    with kis_route_authority_serialization():
+        if (
+            _KIS_KILL_CANCEL_ALLOWED is not True
+            or _KIS_KILL_CANCEL_REVISION != expected_revision
+            or _KIS_KILL_CANCEL_INTENT != expected_intent
+        ):
+            raise RuntimeError("kis-kill-cancel-reservation-changed")
+        _KIS_KILL_CANCEL_ALLOWED = False
+        _KIS_KILL_CANCEL_INTENT = {}
+        _advance_kis_route_state_revision()
+
+
+def _binance_functional_durable_authority_open() -> bool:
+    """Treat an unreadable Binance approval/control pointer as open."""
+
+    return binance_functional_authority_open_fail_closed()
+
+
+def _binance_spot_functional_facade() -> Any:
+    global _BINANCE_SPOT_FUNCTIONAL_FACADE
+    with _BINANCE_SPOT_FUNCTIONAL_STATE_LOCK:
+        if _BINANCE_SPOT_FUNCTIONAL_FACADE is None:
+            from .binance_spot_functional_state import (
+                BinanceSpotFunctionalStateFacade,
+            )
+
+            _BINANCE_SPOT_FUNCTIONAL_FACADE = (
+                BinanceSpotFunctionalStateFacade(
+                    database_path=BINANCE_SPOT_FUNCTIONAL_DATABASE_PATH,
+                    publication_proof_path=(
+                        BINANCE_SPOT_FUNCTIONAL_PUBLICATION_PROOF_PATH
+                    ),
+                    data_root=APP_DATA_ROOT,
+                    server_secret_path=(
+                        BINANCE_SPOT_FUNCTIONAL_SERVER_SECRET_PATH
+                    ),
+                    ordinary_routes_closed_reader=(
+                        _binance_spot_functional_ordinary_routes_closed
+                    ),
+                )
+            )
+        return _BINANCE_SPOT_FUNCTIONAL_FACADE
+
+
+def prepare_binance_spot_functional_backend_state() -> dict[str, Any]:
+    """Prepare only inside the official single-instance server process."""
+
+    global _BINANCE_SPOT_FUNCTIONAL_PREPARE_STATUS
+    try:
+        result = dict(_binance_spot_functional_facade().prepare())
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "prepared": False,
+            "available": False,
+            "networkOrderPostAllowed": False,
+            "reason": "binance-functional-backend-prepare-failed:"
+            + type(exc).__name__,
+        }
+    with _BINANCE_SPOT_FUNCTIONAL_STATE_LOCK:
+        _BINANCE_SPOT_FUNCTIONAL_PREPARE_STATUS = result
+    return dict(result)
+
+
+def binance_spot_functional_backend_state_status() -> dict[str, Any]:
+    with _BINANCE_SPOT_FUNCTIONAL_STATE_LOCK:
+        prepared = dict(_BINANCE_SPOT_FUNCTIONAL_PREPARE_STATUS)
+        facade = _BINANCE_SPOT_FUNCTIONAL_FACADE
+    if facade is None or prepared.get("prepared") is not True:
+        return prepared
+    try:
+        return {**prepared, **dict(facade.status()), "prepared": True}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "prepared": False,
+            "available": False,
+            "networkOrderPostAllowed": False,
+            "reason": "binance-functional-backend-status-failed:"
+            + type(exc).__name__,
+        }
+
+
+def _binance_spot_functional_emergency_cleanup_after_latch() -> dict[str, Any]:
+    """Revoke Binance entry after durable Kill, then retain owned cleanup.
+
+    The caller runs this only after the safety/emergency linearization locks
+    have been released.  ``facade.stop`` takes the canonical Binance route
+    lock, commits control ACTIVE->CLEANUP, and leaves the private lifecycle
+    handle/scheduler alive for exact-owned cancel/flatten.  It never creates a
+    caller signal or touches non-owned baseline inventory.
+    """
+
+    if not emergency_stop_active():
+        return {
+            "ok": False,
+            "state": "RECONCILIATION_REQUIRED",
+            "reason": "emergency-stop-latch-not-observed",
+        }
+    with _BINANCE_SPOT_FUNCTIONAL_STATE_LOCK:
+        facade = _BINANCE_SPOT_FUNCTIONAL_FACADE
+    if facade is None:
+        return {
+            "ok": not _binance_functional_durable_authority_open(),
+            "state": (
+                "NO_ACTIVE_FUNCTIONAL_SESSION"
+                if not _binance_functional_durable_authority_open()
+                else "RECONCILIATION_REQUIRED"
+            ),
+            "entryAuthorityRevoked": (
+                not _binance_functional_durable_authority_open()
+            ),
+        }
+    try:
+        before = dict(facade.order_authority_snapshot())
+        if before.get("functionalAuthorityOpen") is not True:
+            return {
+                "ok": True,
+                "state": "NO_ACTIVE_FUNCTIONAL_SESSION",
+                "entryAuthorityRevoked": True,
+            }
+        result = dict(facade.stop())
+        after = dict(facade.order_authority_snapshot())
+        phase = str(after.get("functionalPhase") or "").upper()
+        entry_revoked = phase in {
+            "CLEANUP",
+            "FINAL_RESET",
+            "FINALIZED",
+            "FAILED",
+            "RECONCILIATION_REQUIRED",
+        }
+        return {
+            "ok": entry_revoked,
+            "state": phase if entry_revoked else "RECONCILIATION_REQUIRED",
+            "sessionId": str(after.get("functionalSessionId") or ""),
+            "entryAuthorityRevoked": entry_revoked,
+            "cleanupSchedulerOwned": bool(
+                entry_revoked and phase in {"CLEANUP", "FINAL_RESET"}
+            ),
+            "result": result,
+        }
+    except Exception as exc:
+        try:
+            after = dict(facade.order_authority_snapshot())
+        except Exception:
+            after = {}
+        phase = str(after.get("functionalPhase") or "UNREADABLE").upper()
+        return {
+            "ok": False,
+            "state": "RECONCILIATION_REQUIRED",
+            "entryAuthorityRevoked": phase != "ACTIVE",
+            "reason": (
+                "binance-functional-emergency-cleanup-failed:"
+                + type(exc).__name__
+            ),
+        }
+
+
+def _binance_spot_functional_blocked(reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "reason": str(reason or "binance-functional-backend-blocked"),
+        "brokerSubmissionPerformed": False,
+        "status": binance_spot_functional_backend_state_status(),
+    }
+
+
+def _preissue_binance_spot_functional_candidate(
+    requested_approval_id: str = "",
+) -> dict[str, Any]:
+    return dict(
+        _binance_spot_functional_facade().preissue(
+            str(requested_approval_id or "")
+        )
+    )
+
+
+def _validate_binance_spot_functional_http_command(
+    payload: dict[str, Any], exact: set[str]
+) -> dict[str, Any] | None:
+    if set(payload) != exact:
+        return _binance_spot_functional_blocked(
+            "binance-functional-http-command-fields-not-exact"
+        )
+    confirmation = payload.get("operatorConfirmation")
+    if not isinstance(confirmation, dict) or set(confirmation) != {
+        "challengeId",
+        "token",
+        "typedPhrase",
+    }:
+        return _binance_spot_functional_blocked(
+            "binance-functional-operator-confirmation-fields-not-exact"
+        )
+    return None
+
+
+def _consume_binance_spot_functional_confirmation(
+    *, action: str, confirmation: dict[str, Any], context: dict[str, Any]
+) -> dict[str, Any]:
+    with SAFETY_CONFIRMATION_MUTATION_LOCK:
+        return consume_safety_confirmation(action, confirmation, context)
+
+
+@_serialized_safety_mutation
+def start_binance_spot_functional_backend_state(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    invalid = _validate_binance_spot_functional_http_command(
+        payload, {"approvalId", "operatorConfirmation"}
+    )
+    if invalid is not None:
+        return invalid
+    approval_id = str(payload.get("approvalId") or "").strip()
+    if not approval_id:
+        return _binance_spot_functional_blocked(
+            "binance-functional-approval-id-required"
+        )
+    status = binance_spot_functional_backend_state_status()
+    if (
+        status.get("prepared") is not True
+        or status.get("candidateIssuanceAvailable") is not True
+    ):
+        return _binance_spot_functional_blocked(
+            "binance-functional-backend-composite-unavailable"
+        )
+    try:
+        selected = _preissue_binance_spot_functional_candidate(approval_id)
+    except Exception as exc:
+        return _binance_spot_functional_blocked(
+            "binance-functional-approved-envelope-unavailable:"
+            + type(exc).__name__
+        )
+    consumed = _consume_binance_spot_functional_confirmation(
+        action="BINANCE_SPOT_FUNCTIONAL_START",
+        confirmation=dict(payload["operatorConfirmation"]),
+        context={
+            "approvalId": approval_id,
+            "bootstrapId": str(
+                selected.get("firstLiveBootstrapId") or ""
+            ),
+            "bootstrapHash": str(
+                selected.get("firstLiveBootstrapHash") or ""
+            ),
+            "sessionNonceHash": str(
+                selected.get("firstLiveSessionNonceHash") or ""
+            ),
+            "codeHash": str(selected.get("firstLiveCodeHash") or ""),
+            "accountFingerprint": str(
+                selected.get("accountFingerprint") or ""
+            ),
+            "bindingHash": str(selected.get("bindingHash") or ""),
+        },
+    )
+    if consumed.get("ok") is not True:
+        return _binance_spot_functional_blocked(
+            str(consumed.get("reason") or "safety-confirmation-required")
+        )
+    # State changes are committed before entering the backend graph.  The
+    # graph never calls back while a shared safety/route lock is held.
+    STATE["new_entries_blocked"] = True
+    STATE["manual_new_entries_blocked"] = True
+    if not _binance_spot_functional_ordinary_routes_closed():
+        return _binance_spot_functional_blocked(
+            "binance-functional-ordinary-routes-not-closed"
+        )
+    try:
+        return dict(_binance_spot_functional_facade().start(approval_id))
+    except Exception as exc:
+        return _binance_spot_functional_blocked(
+            "binance-functional-start-failed:" + type(exc).__name__
+        )
+
+
+def stop_binance_spot_functional_backend_state(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    invalid = _validate_binance_spot_functional_http_command(
+        payload, {"operatorConfirmation"}
+    )
+    if invalid is not None:
+        return invalid
+    status = binance_spot_functional_backend_state_status()
+    if status.get("prepared") is not True:
+        return _binance_spot_functional_blocked(
+            "binance-functional-backend-not-prepared"
+        )
+    consumed = _consume_binance_spot_functional_confirmation(
+        action="BINANCE_SPOT_FUNCTIONAL_STOP",
+        confirmation=dict(payload["operatorConfirmation"]),
+        context={"sessionId": str(status.get("sessionId") or "")},
+    )
+    if consumed.get("ok") is not True:
+        return _binance_spot_functional_blocked(
+            str(consumed.get("reason") or "safety-confirmation-required")
+        )
+    try:
+        return dict(_binance_spot_functional_facade().stop())
+    except Exception as exc:
+        return _binance_spot_functional_blocked(
+            "binance-functional-stop-failed:" + type(exc).__name__
+        )
+
+
+@_serialized_safety_mutation
+def recover_binance_spot_functional_backend_state(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    invalid = _validate_binance_spot_functional_http_command(
+        payload, {"operatorConfirmation"}
+    )
+    if invalid is not None:
+        return invalid
+    status = binance_spot_functional_backend_state_status()
+    if status.get("prepared") is not True:
+        return _binance_spot_functional_blocked(
+            "binance-functional-backend-not-prepared"
+        )
+    consumed = _consume_binance_spot_functional_confirmation(
+        action="BINANCE_SPOT_FUNCTIONAL_RECOVER",
+        confirmation=dict(payload["operatorConfirmation"]),
+        context={"sessionId": str(status.get("sessionId") or "")},
+    )
+    if consumed.get("ok") is not True:
+        return _binance_spot_functional_blocked(
+            str(consumed.get("reason") or "safety-confirmation-required")
+        )
+    if not _binance_spot_functional_ordinary_routes_closed():
+        return _binance_spot_functional_blocked(
+            "binance-functional-ordinary-routes-not-closed"
+        )
+    try:
+        return dict(_binance_spot_functional_facade().recover())
+    except Exception as exc:
+        return _binance_spot_functional_blocked(
+            "binance-functional-recover-failed:" + type(exc).__name__
+        )
 
 
 def read_json_document(path: Path) -> dict[str, Any]:
@@ -4466,6 +6920,14 @@ def watchdog_snapshot(
     }
 
 
+@_serialized_safety_mutation
+@_two_phase_kis_route_control(
+    "STOP",
+    when=lambda report: (
+        isinstance(report, dict)
+        and int(report.get("critical_count", 0)) > 0
+    ),
+)
 def apply_watchdog_fail_closed(report: dict[str, Any]) -> bool:
     if int(report.get("critical_count", 0)) <= 0:
         return False
@@ -6560,6 +9022,7 @@ def sync_runtime_profile_mode(
 
 
 @_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
 def set_mode(mode: str) -> dict[str, Any]:
     with RUNTIME_CONTROL_LOCK:
         return _set_mode_serialized(mode)
@@ -6697,7 +9160,11 @@ def cancel_working_orders_for_kill_switch(
             continue
         try:
             outcome = (
-                cancel_order(order_id, _official_kis_truth=kis_truth)
+                cancel_order(
+                    order_id,
+                    _official_kis_truth=kis_truth,
+                    _kill_cleanup=True,
+                )
                 if broker_id == "kis"
                 else cancel_order(order_id)
             )
@@ -6907,6 +9374,12 @@ SAFETY_CONFIRMATION_ACTIONS = {
     "NEW_ENTRIES_BLOCKED_OFF",
     "REAL_ORDERS_ENABLE",
     "FUNCTIONAL_TEST_START",
+    "UPBIT_FUNCTIONAL_START",
+    "UPBIT_FUNCTIONAL_STOP",
+    "UPBIT_FUNCTIONAL_RECOVER",
+    "BINANCE_SPOT_FUNCTIONAL_START",
+    "BINANCE_SPOT_FUNCTIONAL_STOP",
+    "BINANCE_SPOT_FUNCTIONAL_RECOVER",
     "BINANCE_FUTURES_FILL_SOAK_START",
 }
 
@@ -6955,6 +9428,69 @@ def _safety_confirmation_request_context(
                 values.get("targetKey") or values.get("target_key") or ""
             ).strip()
         }
+    if action == "UPBIT_FUNCTIONAL_START":
+        return {
+            "approvalId": str(
+                values.get("approvalId") or values.get("approval_id") or ""
+            ).strip(),
+            "candidateHash": str(
+                values.get("candidateHash")
+                or values.get("candidate_hash")
+                or ""
+            ).strip().lower(),
+        }
+    if action == "UPBIT_FUNCTIONAL_STOP":
+        return {
+            "sessionId": str(
+                values.get("sessionId") or values.get("session_id") or ""
+            ).strip()
+        }
+    if action == "UPBIT_FUNCTIONAL_RECOVER":
+        return {
+            "recoveryId": str(
+                values.get("recoveryId") or values.get("recovery_id") or ""
+            ).strip(),
+            "sessionId": str(
+                values.get("sessionId") or values.get("session_id") or ""
+            ).strip(),
+        }
+    if action == "BINANCE_SPOT_FUNCTIONAL_START":
+        return {
+            "approvalId": str(
+                values.get("approvalId") or values.get("approval_id") or ""
+            ).strip(),
+            "bootstrapId": str(
+                values.get("bootstrapId") or values.get("bootstrap_id") or ""
+            ).strip(),
+            "bootstrapHash": str(
+                values.get("bootstrapHash") or values.get("bootstrap_hash") or ""
+            ).strip().lower(),
+            "sessionNonceHash": str(
+                values.get("sessionNonceHash")
+                or values.get("session_nonce_hash")
+                or ""
+            ).strip().lower(),
+            "codeHash": str(
+                values.get("codeHash") or values.get("code_hash") or ""
+            ).strip().lower(),
+            "accountFingerprint": str(
+                values.get("accountFingerprint")
+                or values.get("account_fingerprint")
+                or ""
+            ).strip().lower(),
+            "bindingHash": str(
+                values.get("bindingHash") or values.get("binding_hash") or ""
+            ).strip().lower(),
+        }
+    if action in {
+        "BINANCE_SPOT_FUNCTIONAL_STOP",
+        "BINANCE_SPOT_FUNCTIONAL_RECOVER",
+    }:
+        return {
+            "sessionId": str(
+                values.get("sessionId") or values.get("session_id") or ""
+            ).strip()
+        }
     if action == "BINANCE_FUTURES_FILL_SOAK_START":
         return {
             "symbol": normalize_usdm_symbol(
@@ -6976,6 +9512,20 @@ def _safety_confirmation_identity(action: str) -> dict[str, str]:
     )
     kis_binding = kis_account_binding_id(kis_cano, kis_product)
     if action == "BINANCE_FUTURES_FILL_SOAK_START":
+        provider = "BINANCE"
+        raw_identity = str(env_value("BINANCE_API_KEY") or "").strip()
+    elif action in {
+        "UPBIT_FUNCTIONAL_START",
+        "UPBIT_FUNCTIONAL_STOP",
+        "UPBIT_FUNCTIONAL_RECOVER",
+    }:
+        provider = "UPBIT"
+        raw_identity = str(env_value("UPBIT_ACCESS_KEY") or "").strip()
+    elif action in {
+        "BINANCE_SPOT_FUNCTIONAL_START",
+        "BINANCE_SPOT_FUNCTIONAL_STOP",
+        "BINANCE_SPOT_FUNCTIONAL_RECOVER",
+    }:
         provider = "BINANCE"
         raw_identity = str(env_value("BINANCE_API_KEY") or "").strip()
     elif action == "FUNCTIONAL_TEST_START":
@@ -7231,6 +9781,44 @@ def safety_confirmation_authoritative_context(
             else 0.0,
             0.0,
         )
+    elif normalized_action in {
+        "UPBIT_FUNCTIONAL_START",
+        "UPBIT_FUNCTIONAL_STOP",
+        "UPBIT_FUNCTIONAL_RECOVER",
+    }:
+        backend = upbit_functional_backend_state_status()
+        context["upbitFunctional"] = {
+            "prepared": backend.get("prepared") is True,
+            "available": backend.get("available") is True,
+            "networkOrderPostAllowed": (
+                backend.get("networkOrderPostAllowed") is True
+            ),
+            "approvalId": str(backend.get("approvalId") or ""),
+            "sessionId": str(backend.get("sessionId") or ""),
+            "generation": int(backend.get("generation") or 0),
+            "terminalState": str(backend.get("terminalState") or ""),
+        }
+    elif normalized_action in {
+        "BINANCE_SPOT_FUNCTIONAL_START",
+        "BINANCE_SPOT_FUNCTIONAL_STOP",
+        "BINANCE_SPOT_FUNCTIONAL_RECOVER",
+    }:
+        backend = binance_spot_functional_backend_state_status()
+        context["binanceSpotFunctional"] = {
+            "prepared": backend.get("prepared") is True,
+            "available": backend.get("available") is True,
+            "networkOrderPostAllowed": (
+                backend.get("networkOrderPostAllowed") is True
+            ),
+            "approvalId": str(
+                backend.get("approvalId")
+                or backend.get("pendingApprovalId")
+                or ""
+            ),
+            "sessionId": str(backend.get("sessionId") or ""),
+            "generation": int(backend.get("generation") or 0),
+            "terminalState": str(backend.get("terminalState") or ""),
+        }
     elif normalized_action == "BINANCE_FUTURES_FILL_SOAK_START":
         with BINANCE_FUTURES_FILL_SOAK_LOCK:
             current = dict(BINANCE_FUTURES_FILL_SOAK_INTERNAL)
@@ -7266,6 +9854,42 @@ def safety_confirmation_authoritative_context(
             if normalized_action == "FUNCTIONAL_TEST_START"
             else {}
         ),
+        **(
+            {
+                "symbol": "KRW-BTC",
+                "maxAmount": "10000 KRW",
+                "sessionId": str(
+                    (context.get("upbitFunctional") or {}).get("sessionId")
+                    or ""
+                ),
+            }
+            if normalized_action
+            in {
+                "UPBIT_FUNCTIONAL_START",
+                "UPBIT_FUNCTIONAL_STOP",
+                "UPBIT_FUNCTIONAL_RECOVER",
+            }
+            else {}
+        ),
+        **(
+            {
+                "symbol": "BTCUSDT",
+                "maxAmount": "10 USDT",
+                "sessionId": str(
+                    (context.get("binanceSpotFunctional") or {}).get(
+                        "sessionId"
+                    )
+                    or ""
+                ),
+            }
+            if normalized_action
+            in {
+                "BINANCE_SPOT_FUNCTIONAL_START",
+                "BINANCE_SPOT_FUNCTIONAL_STOP",
+                "BINANCE_SPOT_FUNCTIONAL_RECOVER",
+            }
+            else {}
+        ),
     }
     return context, display, expected_phrase
 
@@ -7275,9 +9899,92 @@ def issue_safety_confirmation(
     action: object,
     request_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    normalized_action = str(action or "").strip().upper()
+    effective_request = (
+        dict(request_context) if isinstance(request_context, dict) else {}
+    )
+    preissued: dict[str, Any] = {}
+    if normalized_action == "UPBIT_FUNCTIONAL_START":
+        try:
+            preissued = _preissue_upbit_functional_permit_candidate(
+                str(
+                    effective_request.get("approvalId")
+                    or effective_request.get("approval_id")
+                    or ""
+                )
+            )
+            effective_request = {
+                "approvalId": str(preissued["approvalId"]),
+                "candidateHash": str(preissued["candidateHash"]),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": (
+                    "safety-confirmation-upbit-preissue-failed:"
+                    f"{type(exc).__name__}"
+                ),
+            }
+    elif normalized_action == "BINANCE_SPOT_FUNCTIONAL_START":
+        try:
+            preissued = _preissue_binance_spot_functional_candidate(
+                str(
+                    effective_request.get("approvalId")
+                    or effective_request.get("approval_id")
+                    or ""
+                )
+            )
+            effective_request = {
+                "approvalId": str(preissued["approvalId"]),
+                "bootstrapId": str(
+                    preissued.get("firstLiveBootstrapId") or ""
+                ),
+                "bootstrapHash": str(
+                    preissued.get("firstLiveBootstrapHash") or ""
+                ),
+                "sessionNonceHash": str(
+                    preissued.get("firstLiveSessionNonceHash") or ""
+                ),
+                "codeHash": str(preissued.get("firstLiveCodeHash") or ""),
+                "accountFingerprint": str(
+                    preissued.get("accountFingerprint") or ""
+                ),
+                "bindingHash": str(preissued.get("bindingHash") or ""),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": (
+                    "safety-confirmation-binance-functional-preissue-failed:"
+                    f"{type(exc).__name__}"
+                ),
+            }
+    elif normalized_action == "UPBIT_FUNCTIONAL_RECOVER":
+        try:
+            preissued = _preissue_upbit_functional_recovery_candidate(
+                str(
+                    effective_request.get("recoveryId")
+                    or effective_request.get("recovery_id")
+                    or ""
+                )
+            )
+            effective_request = {
+                "recoveryId": str(preissued["recoveryId"]),
+                "sessionId": str(preissued["sessionId"]),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": (
+                    "safety-confirmation-upbit-recovery-preissue-failed:"
+                    f"{type(exc).__name__}"
+                ),
+            }
     try:
         context, display, expected_phrase = (
-            safety_confirmation_authoritative_context(action, request_context)
+            safety_confirmation_authoritative_context(
+                action, effective_request
+            )
         )
     except (OSError, RuntimeError, ValueError) as exc:
         return {
@@ -7301,12 +10008,113 @@ def issue_safety_confirmation(
             "ok": False,
             "reason": "safety-confirmation-functional-target-required",
         }
-    return SAFETY_CONFIRMATIONS.issue(
+    request = context.get("request") or {}
+    if (
+        normalized_action == "UPBIT_FUNCTIONAL_START"
+        and (
+            not str(request.get("approvalId") or "").strip()
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(request.get("candidateHash") or "").strip().lower(),
+            )
+        )
+    ):
+        return {
+            "ok": False,
+            "reason": "safety-confirmation-upbit-approval-required",
+        }
+    if (
+        normalized_action == "UPBIT_FUNCTIONAL_STOP"
+        and not str(request.get("sessionId") or "").strip()
+    ):
+        return {
+            "ok": False,
+            "reason": "safety-confirmation-upbit-session-required",
+        }
+    if normalized_action == "UPBIT_FUNCTIONAL_RECOVER" and (
+        not str(request.get("recoveryId") or "").strip()
+        or not str(request.get("sessionId") or "").strip()
+    ):
+        return {
+            "ok": False,
+            "reason": "safety-confirmation-upbit-recovery-required",
+        }
+    if (
+        normalized_action == "BINANCE_SPOT_FUNCTIONAL_START"
+        and (
+            not str(request.get("approvalId") or "").strip()
+            or not str(request.get("bootstrapId") or "").strip()
+            or any(
+                not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(request.get(field) or "").strip().lower(),
+                )
+                for field in (
+                    "bootstrapHash",
+                    "sessionNonceHash",
+                    "codeHash",
+                    "accountFingerprint",
+                    "bindingHash",
+                )
+            )
+        )
+    ):
+        return {
+            "ok": False,
+            "reason": "safety-confirmation-binance-approval-required",
+        }
+    if normalized_action in {
+        "BINANCE_SPOT_FUNCTIONAL_STOP",
+        "BINANCE_SPOT_FUNCTIONAL_RECOVER",
+    } and not str(request.get("sessionId") or "").strip():
+        return {
+            "ok": False,
+            "reason": "safety-confirmation-binance-session-required",
+        }
+    result = SAFETY_CONFIRMATIONS.issue(
         action=str(action or ""),
         context=context,
         expected_phrase=expected_phrase,
         display_context=display,
     )
+    if normalized_action == "UPBIT_FUNCTIONAL_START" and result.get("ok") is True:
+        result["approvalId"] = str(preissued.get("approvalId") or "")
+        result["candidateHash"] = str(preissued.get("candidateHash") or "")
+        result["permitExpiresAt"] = str(preissued.get("expiresAt") or "")
+    elif (
+        normalized_action == "UPBIT_FUNCTIONAL_RECOVER"
+        and result.get("ok") is True
+    ):
+        result["recoveryId"] = str(preissued.get("recoveryId") or "")
+        result["sessionId"] = str(preissued.get("sessionId") or "")
+        result["recoveryExpiresAt"] = str(
+            preissued.get("expiresAt") or ""
+        )
+    elif (
+        normalized_action == "BINANCE_SPOT_FUNCTIONAL_START"
+        and result.get("ok") is True
+    ):
+        result["approvalId"] = str(preissued.get("approvalId") or "")
+        result["permitExpiresAt"] = str(
+            preissued.get("permitExpiresAt") or ""
+        )
+        result["bootstrapId"] = str(
+            preissued.get("firstLiveBootstrapId") or ""
+        )
+        result["bootstrapHash"] = str(
+            preissued.get("firstLiveBootstrapHash") or ""
+        )
+        result["sessionNonceHash"] = str(
+            preissued.get("firstLiveSessionNonceHash") or ""
+        )
+        result["codeHash"] = str(
+            preissued.get("firstLiveCodeHash") or ""
+        )
+        result["accountFingerprint"] = str(
+            preissued.get("accountFingerprint") or ""
+        )
+        result["bindingHash"] = str(preissued.get("bindingHash") or "")
+    return result
 
 
 def consume_safety_confirmation(
@@ -7348,58 +10156,118 @@ def _apply_durable_emergency_stop_recovery() -> dict[str, Any]:
             "reason": "emergency-stop-not-active",
             "emergency_stop": emergency,
         }
-    with RUNTIME_CONTROL_LOCK:
+    # Phase A publishes the already-durable Kill state under SAFETY, then
+    # releases it before any controller can wait for RUNTIME_MODE_LOCK.  A
+    # due-bar final mutation sees the durable latch and returns socket-zero;
+    # there is no SAFETY <-> RUNTIME inversion.
+    with SAFETY_CONFIRMATION_MUTATION_LOCK:
         STATE["kill_switch"] = True
         STATE["kill_switch_rearm_required"] = True
         STATE["new_entries_blocked"] = True
-        runtime_transition = LIVE_CONTINUOUS_CONTROLLER.transition_running(
-            "MONITOR"
-        )
-        with RUNTIME_MODE_LOCK:
-            for profile_id in ("stock", "crypto"):
-                sync_runtime_profile_mode(
-                    profile_id,
-                    "MONITOR",
-                    action="Durable Kill 복구 MONITOR 전환",
-                )
-        order_truth_refresh = refresh_kis_order_truth_for_kill_switch()
-        cancellation = cancel_working_orders_for_kill_switch(
-            kis_truth=(
-                order_truth_refresh.get("truth")
-                if isinstance(order_truth_refresh.get("truth"), dict)
-                else {}
+        kill_generation = str(emergency.get("revision") or "")
+    try:
+        with RUNTIME_CONTROL_LOCK:
+            transition_result = (
+                LIVE_CONTINUOUS_CONTROLLER.transition_running("MONITOR")
             )
-        )
-        governance_sessions = stop_operational_runtime_sessions_for_kill(
-            runtime_transition=runtime_transition,
-            cancellation=cancellation,
-        )
-        try:
-            reconciliation = run_reconciliation(
-                refresh_brokers=True,
-                include_snapshot=False,
-            )
-        except Exception as exc:
-            reconciliation = {
-                "ok": False,
-                "reason": f"kill-reconciliation-error:{type(exc).__name__}",
-            }
-        outcome = {
-            "ok": bool(
-                runtime_transition.get("ok") is True
-                and cancellation.get("cleanup_complete") is True
-                and reconciliation.get("ok") is True
+            if not isinstance(transition_result, dict):
+                raise TypeError("runtime transition result must be an object")
+            runtime_transition = dict(transition_result)
+            with RUNTIME_MODE_LOCK:
+                for profile_id in ("stock", "crypto"):
+                    sync_runtime_profile_mode(
+                        profile_id,
+                        "MONITOR",
+                        action="Durable Kill 복구 MONITOR 전환",
+                    )
+    except Exception as exc:
+        # The durable Kill is already authoritative.  A controller failure
+        # must be evidence, not an exception that skips broker truth,
+        # exact-owned cancellation, and reconciliation.
+        runtime_transition = {
+            "ok": False,
+            "results": {},
+            "reason": (
+                "kill-runtime-transition-error:"
+                + type(exc).__name__
             ),
-            "recovered": True,
-            "emergency_stop": emergency,
-            "runtime": runtime_transition,
-            "kis_order_truth_refresh": order_truth_refresh,
-            "cancellation": cancellation,
-            "governance_sessions": governance_sessions,
-            "reconciliation": reconciliation,
-            "flatten_requested": False,
+            "errorType": type(exc).__name__,
         }
-        return outcome
+    with SAFETY_CONFIRMATION_MUTATION_LOCK:
+        current_emergency = emergency_stop_status()
+        if (
+            current_emergency.get("active") is not True
+            or str(current_emergency.get("revision") or "")
+            != kill_generation
+        ):
+            STATE["kill_switch"] = True
+            STATE["kill_switch_rearm_required"] = True
+            STATE["new_entries_blocked"] = True
+            return {
+                "ok": False,
+                "recovered": True,
+                "reason": "emergency-stop-generation-changed",
+                "emergency_stop": current_emergency,
+                "runtime": runtime_transition,
+            }
+    # Do not retain SAFETY or the runtime manager lock while broker reads,
+    # exact cancel boundaries, or reconciliation acquire their own canonical
+    # locks.  The generation CAS above proves which durable Kill owns this
+    # cleanup attempt; every later exact socket edge rechecks the latch.
+    order_truth_refresh = refresh_kis_order_truth_for_kill_switch()
+    cancellation = cancel_working_orders_for_kill_switch(
+        kis_truth=(
+            order_truth_refresh.get("truth")
+            if isinstance(order_truth_refresh.get("truth"), dict)
+            else {}
+        )
+    )
+    governance_sessions = stop_operational_runtime_sessions_for_kill(
+        runtime_transition=runtime_transition,
+        cancellation=cancellation,
+    )
+    try:
+        reconciliation = _run_reconciliation_without_public_fence(
+            refresh_brokers=True,
+            include_snapshot=False,
+        )
+    except Exception as exc:
+        reconciliation = {
+            "ok": False,
+            "reason": f"kill-reconciliation-error:{type(exc).__name__}",
+        }
+    outcome = {
+        "ok": bool(
+            runtime_transition.get("ok") is True
+            and cancellation.get("cleanup_complete") is True
+            and reconciliation.get("ok") is True
+        ),
+        "recovered": True,
+        "emergency_stop": emergency,
+        "runtime": runtime_transition,
+        "kis_order_truth_refresh": order_truth_refresh,
+        "cancellation": cancellation,
+        "governance_sessions": governance_sessions,
+        "reconciliation": reconciliation,
+        "flatten_requested": False,
+    }
+    # Functional owners are deliberately attached only after the ordinary
+    # runtime/control lock is released.  Their cleanup paths take exchange
+    # route and backend locks, so invoking them inside RUNTIME_CONTROL_LOCK
+    # would invert the global lock order.
+    upbit_cleanup = _upbit_functional_emergency_cleanup_after_latch()
+    binance_cleanup = _binance_spot_functional_emergency_cleanup_after_latch()
+    outcome = {
+        **outcome,
+        "upbit_functional_cleanup": upbit_cleanup,
+        "binance_functional_cleanup": binance_cleanup,
+    }
+    outcome["ok"] = bool(
+        outcome.get("ok") is True
+        and upbit_cleanup.get("ok") is True
+        and binance_cleanup.get("ok") is True
+    )
+    return outcome
 
 
 def _emit_durable_emergency_recovery_evidence(
@@ -7526,6 +10394,9 @@ def recover_durable_emergency_stop() -> dict[str, Any]:
 
 
 @_serialized_safety_mutation
+@_serialized_upbit_order_authority
+@_serialized_binance_order_authority
+@_serialized_kis_order_authority
 def set_flag(
     name: str,
     value: bool,
@@ -7535,6 +10406,26 @@ def set_flag(
 ) -> dict[str, Any]:
     if name not in {"kill_switch", "new_entries_blocked", "operator_confirmed", "dry_run"}:
         return {"ok": False, "reason": "unknown flag", "snapshot": snapshot()}
+    if (
+        name == "new_entries_blocked"
+        and not bool(value)
+        and _upbit_functional_durable_authority_open()
+    ):
+        return {
+            "ok": False,
+            "reason": "upbit-functional-session-keeps-new-entries-blocked",
+            "snapshot": snapshot(),
+        }
+    if (
+        name == "new_entries_blocked"
+        and not bool(value)
+        and _binance_functional_durable_authority_open()
+    ):
+        return {
+            "ok": False,
+            "reason": "binance-functional-session-keeps-new-entries-blocked",
+            "snapshot": snapshot(),
+        }
     emergency_active_before = (
         emergency_stop_active() if name == "kill_switch" else False
     )
@@ -7632,13 +10523,6 @@ def set_flag(
     }[name]
     level = "info" if name == "dry_run" and value else ("warn" if value else "info")
     append_audit(level, label, f"{label} 값이 {value}(으)로 변경되었습니다.")
-    kill_action: dict[str, Any] | None = None
-    if name == "kill_switch" and value:
-        # API Kill and API-down native Kill converge on the same durable
-        # generation recovery path. This makes refresh/cancel/reconcile and
-        # evidence side effects exactly once on success, while preserving the
-        # bounded retry policy when cleanup remains incomplete.
-        kill_action = recover_durable_emergency_stop()
     return {
         "ok": (
             emergency_action is None
@@ -7658,12 +10542,14 @@ def set_flag(
             if emergency_action is not None
             else {}
         ),
-        **({"kill_switch_action": kill_action} if kill_action is not None else {}),
         "snapshot": snapshot(),
     }
 
 
 @_serialized_safety_mutation
+@_serialized_upbit_order_authority
+@_serialized_binance_order_authority
+@_serialized_kis_order_authority
 def save_environment_settings(
     raw_values: dict[str, Any],
     *,
@@ -7675,6 +10561,46 @@ def save_environment_settings(
     from . import env_settings
 
     submitted = dict(raw_values) if isinstance(raw_values, dict) else {}
+    binance_identity_keys = {
+        "BINANCE_API_KEY",
+        "BINANCE_API_SECRET",
+        "BINANCE_BASE_URL",
+        "BINANCE_FUTURES_BASE_URL",
+        "LIVE_TRADER_ENABLE_REAL_ORDERS",
+    }
+    if (
+        any(key in submitted for key in binance_identity_keys)
+        and _binance_functional_durable_authority_open()
+    ):
+        return {
+            "ok": False,
+            "reason": (
+                "binance-functional-session-blocks-global-order-or-identity-change"
+            ),
+            "changed_keys": [],
+            "snapshot": snapshot(),
+        }
+    if _upbit_functional_durable_authority_open() and (
+        any(
+            key in submitted
+            for key in {
+                "UPBIT_ACCESS_KEY",
+                "UPBIT_SECRET_KEY",
+                "UPBIT_BASE_URL",
+            }
+        )
+        or str(
+            submitted.get("LIVE_TRADER_ENABLE_REAL_ORDERS", "")
+        ).strip().lower()
+        in {"true", "1", "yes", "on"}
+    ):
+        return {
+            "ok": False,
+            "reason": (
+                "upbit-functional-session-blocks-global-order-or-identity-change"
+            ),
+            "snapshot": snapshot(),
+        }
     fields = {field.key: field for field in env_settings.ENV_SETTING_FIELDS}
     before = {
         str(item.get("key") or ""): item
@@ -7920,6 +10846,8 @@ def ensure_live_deployment(
     return store, current or {}, portfolio_payload
 
 
+@_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
 def promote_strategy_to_live(strategy_id: str) -> dict[str, Any]:
     strategy_id = str(strategy_id or "").strip()
     if not strategy_id:
@@ -8366,6 +11294,8 @@ def paper_live_forward_resume_assessment(
     }
 
 
+@_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
 def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, Any]:
     strategy_id = str(strategy_id or "").strip()
     action = str(action or "").strip().lower()
@@ -8589,6 +11519,7 @@ def profile_readiness_blocker_count(
 
 
 @_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
 def set_automation_profile(profile_id: str, enabled: bool, provider: str | None = None, mode: str | None = None) -> dict[str, Any]:
     profile_id = profile_id if profile_id in {"stock", "crypto"} else ""
     if not profile_id:
@@ -8691,6 +11622,9 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
 
 
 @_serialized_safety_mutation
+@_serialized_upbit_order_authority
+@_serialized_binance_order_authority
+@_serialized_kis_order_authority
 def set_risk_setting(name: str, value: object) -> dict[str, Any]:
     meta = RISK_SETTING_META.get(name)
     if not meta:
@@ -8724,6 +11658,9 @@ def set_risk_setting(name: str, value: object) -> dict[str, Any]:
 
 
 @_serialized_safety_mutation
+@_serialized_upbit_order_authority
+@_serialized_binance_order_authority
+@_serialized_kis_order_authority
 def set_checklist_item(name: str, value: bool) -> dict[str, Any]:
     keys = {str(item["key"]): item for item in CHECKLIST_ITEMS}
     item = keys.get(name)
@@ -8747,6 +11684,9 @@ def set_checklist_item(name: str, value: bool) -> dict[str, Any]:
 
 
 @_serialized_safety_mutation
+@_serialized_upbit_order_authority
+@_serialized_binance_order_authority
+@_serialized_kis_order_authority
 def set_retry_policy(name: str, value: object) -> dict[str, Any]:
     meta = RETRY_POLICY_META.get(name)
     if not meta:
@@ -8918,7 +11858,11 @@ def refresh_account_risk_budget(
     return budget
 
 
-def seed_program_ledger_from_broker_snapshot(refresh_if_empty: bool = True) -> dict[str, Any]:
+@_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
+def seed_program_ledger_from_broker_snapshot(
+    refresh_if_empty: bool = True,
+) -> dict[str, Any]:
     broker_data = STATE.get("broker_reconciliation", {})
     accounts = broker_data.get("accounts", []) if isinstance(broker_data, dict) else []
     positions_data = broker_data.get("positions", []) if isinstance(broker_data, dict) else []
@@ -10133,6 +13077,25 @@ def _kis_cancel_identity_is_authoritative(
         and not str(truth.get("lastError") or "")
     ):
         return False, "kis-cancel-official-truth-unavailable"
+    order_account = _normalize_kis_order_account_binding(
+        order.get("kis_order_account_binding")
+    )
+    truth_account = _normalize_kis_order_account_binding(
+        truth.get("accountBinding")
+    )
+    current_account = _normalize_kis_order_account_binding(
+        _kis_environment_order_account_binding()
+    )
+    if not order_account:
+        return False, "kis-cancel-order-account-binding-required"
+    if not truth_account:
+        return False, "kis-cancel-truth-account-binding-required"
+    if not current_account:
+        return False, "kis-cancel-current-account-binding-unavailable"
+    if not _kis_order_account_binding_matches(order_account, truth_account):
+        return False, "kis-cancel-order-truth-account-binding-mismatch"
+    if not _kis_order_account_binding_matches(order_account, current_account):
+        return False, "kis-cancel-current-account-binding-changed"
     order_key = _kis_order_key(order)
     broker_order_id = str(order.get("broker_order_id") or "").strip()
     if not order_key or not broker_order_id:
@@ -10225,6 +13188,11 @@ def record_complete_kis_order_truth(truth: object) -> dict[str, Any]:
         for broker_order_id, count in broker_id_counts.items()
         if broker_order_id and count > 1
     }
+    account_binding = _normalize_kis_order_account_binding(
+        _kis_environment_order_account_binding()
+    )
+    if not account_binding:
+        raise ValueError("kis-order-truth-account-binding-unavailable")
     observed_at = datetime.now(timezone.utc).isoformat()
     truth_root = STATE.setdefault("broker_order_truth", {})
     truth_root["kis"] = {
@@ -10242,6 +13210,7 @@ def record_complete_kis_order_truth(truth: object) -> dict[str, Any]:
         ),
         "correlationPolicy": str(payload.get("correlation_policy") or ""),
         "absenceIsAuthoritative": payload.get("absence_is_authoritative") is True,
+        "accountBinding": account_binding,
     }
     return kis_order_truth_snapshot()
 
@@ -10637,6 +13606,13 @@ def _poll_execution_events_unlocked(
     }
 
 
+def _poll_includes_kis(
+    broker_id: str = "all", **_kwargs: Any
+) -> bool:
+    return str(broker_id or "").strip().lower() in {"", "all", "kis"}
+
+
+@_two_phase_kis_route_control("SETTINGS", when=_poll_includes_kis)
 def poll_execution_events(
     broker_id: str = "all",
     *,
@@ -10984,11 +13960,18 @@ def preview_binance_futures_order_risk(
     }
 
 
+@_serialized_binance_order_authority
 def preview_binance_futures_settings(
     symbol: object = "ETHUSDT",
     margin_type: object = "ISOLATED",
     leverage: object = 1,
 ) -> dict[str, Any]:
+    if _binance_functional_durable_authority_open():
+        return {
+            "ok": False,
+            "reason": "binance-functional-authority-blocks-futures-settings-preview",
+            "settings": binance_futures_settings_status(),
+        }
     normalized_symbol = normalize_usdm_symbol(symbol)
     normalized_margin_type = str(margin_type or "").strip().upper()
     try:
@@ -11113,11 +14096,18 @@ def preview_binance_futures_settings(
     }
 
 
+@_serialized_binance_order_authority
 def apply_binance_futures_settings(
     confirmation_token: object,
     *,
     confirmed: bool,
 ) -> dict[str, Any]:
+    if _binance_functional_durable_authority_open():
+        return {
+            "ok": False,
+            "reason": "binance-functional-authority-blocks-futures-settings-apply",
+            "settings": binance_futures_settings_status(),
+        }
     token = str(confirmation_token or "")
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with BINANCE_FUTURES_SETTINGS_LOCK:
@@ -11479,8 +14469,14 @@ def _binance_futures_fill_soak_dispatch_boundary():
     """Linearize fill-soak authorization/POST with API mutations and Kill."""
 
     with SAFETY_CONFIRMATION_MUTATION_LOCK:
-        with emergency_stop_dispatch_boundary() as emergency:
-            yield emergency
+        # Canonical Binance order is route authority -> emergency.  The
+        # LiveBrokerRouter's nested final edge reuses this thread-local lease,
+        # so there is one fresh durable authority read and no emergency/route
+        # inversion with normal sends or Kill.
+        with ordinary_binance_final_mutation_boundary(
+            operation="FUTURES_FILL_SOAK"
+        ) as authority:
+            yield authority
 
 
 def preview_binance_futures_fill_soak(
@@ -12704,10 +15700,21 @@ def approved_upbit_smoke_strategy(strategy_id: object) -> dict[str, Any] | None:
     )
 
 
+@_serialized_safety_mutation
+@_serialized_upbit_order_authority
 def preview_upbit_smoke_order(
     strategy_id: object,
     notional_krw: object = UPBIT_SMOKE_MIN_KRW,
 ) -> dict[str, Any]:
+    if _upbit_functional_durable_authority_open():
+        reason = "Upbit 연속 기능시험 권한이 활성 상태라 smoke 주문 경로가 닫혀 있습니다."
+        _upbit_smoke_order_view(
+            status="blocked",
+            status_label="기능시험 격리",
+            detail=reason,
+            confirmation_token="",
+        )
+        return {"ok": False, "reason": reason, "snapshot": snapshot()}
     strategy = approved_upbit_smoke_strategy(strategy_id)
     if strategy is None:
         reason = "선택한 Upbit KRW-BTC Strategy Instance가 before-live-small 및 검증 evidence를 통과하지 못했습니다."
@@ -12826,7 +15833,15 @@ def preview_upbit_smoke_order(
     return {"ok": ready, "reason": detail, "preview": state_row, "snapshot": snapshot()}
 
 
+@_serialized_safety_mutation
+@_serialized_upbit_order_authority
 def submit_upbit_smoke_order(confirmation_token: object, *, confirmed: bool) -> dict[str, Any]:
+    if _upbit_functional_durable_authority_open():
+        return {
+            "ok": False,
+            "reason": "upbit-functional-session-closes-smoke-order-route",
+            "snapshot": snapshot(),
+        }
     preview = dict(STATE.get("upbit_smoke_order", {}))
     token = str(confirmation_token or "")
     if not confirmed or not token or not secrets.compare_digest(token, str(preview.get("confirmation_token") or "")):
@@ -13067,7 +16082,7 @@ def refresh_upbit_smoke_order() -> dict[str, Any]:
     return {"ok": True, "reason": detail_text, "order": dict(STATE["upbit_smoke_order"]), "snapshot": snapshot()}
 
 
-def run_reconciliation(
+def _run_reconciliation_without_public_fence(
     *,
     refresh_brokers: bool = True,
     include_snapshot: bool = True,
@@ -13142,6 +16157,26 @@ def run_reconciliation(
         "automatic_promotion": automatic_results,
         **({"snapshot": snapshot()} if include_snapshot else {}),
     }
+
+
+@_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
+def run_reconciliation(
+    *,
+    refresh_brokers: bool = True,
+    include_snapshot: bool = True,
+) -> dict[str, Any]:
+    """Publish a KIS control reservation around broker-truth mutation.
+
+    Durable Kill recovery calls the private body only after the Kill latch has
+    already closed ordinary entry.  That path can hold the runtime manager
+    lock, so it must never reacquire the KIS route in reverse order.
+    """
+
+    return _run_reconciliation_without_public_fence(
+        refresh_brokers=refresh_brokers,
+        include_snapshot=include_snapshot,
+    )
 
 
 PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS = 60
@@ -13338,6 +16373,7 @@ def refresh_preflight_reconciliation(
 
 
 @_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
 def run_final_preflight(
     deployment_id: str = "",
     strategy_id: str = "",
@@ -15946,6 +18982,69 @@ def _functional_test_portfolio_for_intent(
     )
 
 
+def _functional_test_us_strategy_route(
+    strategy: dict[str, Any],
+) -> dict[str, Any]:
+    """Derive the released US live route from current artifact truth.
+
+    The signed permit is deliberately not an input.  This prevents a valid
+    permit from teaching the runtime which exchange to use after the selected
+    Strategy artifact has changed or lost its exact route metadata.
+    """
+
+    parameters = (
+        strategy.get("parameters")
+        if isinstance(strategy.get("parameters"), dict)
+        else {}
+    )
+    trader_contract = (
+        strategy.get("traderContract")
+        if isinstance(strategy.get("traderContract"), dict)
+        else strategy.get("trader_contract")
+        if isinstance(strategy.get("trader_contract"), dict)
+        else {}
+    )
+    symbol = canonical_kis_us_symbol(
+        strategy.get("execution_instrument")
+        or strategy.get("instrument_id")
+        or strategy.get("symbol")
+        or ""
+    )
+    raw_exchange = str(
+        strategy.get("exchange")
+        or strategy.get("exchangeCode")
+        or trader_contract.get("exchange")
+        or parameters.get("exchange")
+        or ""
+    ).strip().upper()
+    exchange = {
+        "NYS": "NYSE",
+        "NAS": "NASD",
+        "AMS": "AMEX",
+    }.get(raw_exchange, raw_exchange)
+    timeframe = str(strategy.get("timeframe") or "").strip().lower()
+    blockers: list[str] = []
+    if strategy_broker_id(strategy) != "kis":
+        blockers.append("kis-broker-route-required")
+    if symbol != "F":
+        blockers.append("functional-test-us-symbol-must-be-F")
+    if exchange != "NYSE":
+        blockers.append("functional-test-us-exchange-must-be-NYSE")
+    if timeframe != "5m":
+        blockers.append("functional-test-us-timeframe-must-be-5m")
+    if blockers:
+        raise ValueError("functional-test-us-current-artifact-route:" + ",".join(blockers))
+    return {
+        "marketGroup": "US_STOCK",
+        "executionRoute": "KIS_US_LIVE_CONTINUOUS",
+        "settlementCurrency": "USD",
+        "exchanges": ("NYSE",),
+        "symbolRoutes": (("F", "NYSE"),),
+        "symbol": "F",
+        "timeframe": "5m",
+    }
+
+
 def functional_test_current_binding(
     checks: dict[str, Any],
     intent: OrderIntent,
@@ -15954,6 +19053,13 @@ def functional_test_current_binding(
 ) -> dict[str, Any]:
     """Derive current target/account scope without trusting intent hashes."""
 
+    permit_binding: dict[str, Any] = {}
+    try:
+        permit_binding = functional_test_active_permit_binding()
+    except (FunctionalTestContractError, OSError, ValueError):
+        permit_binding = {}
+    market_group = str(permit_binding.get("marketGroup") or "").upper()
+    us_live = market_group == "US_STOCK"
     strategy = _functional_test_strategy_for_intent(checks, intent)
     portfolio = _functional_test_portfolio_for_intent(checks, intent)
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
@@ -15986,8 +19092,11 @@ def functional_test_current_binding(
         if isinstance(portfolio.get("strategyInstances"), list)
         else []
     )
+    canonical_symbol = (
+        canonical_kis_us_symbol if us_live else canonical_kis_domestic_symbol
+    )
     symbols = {
-        canonical_kis_domestic_symbol(
+        canonical_symbol(
             item.get("executionInstrument")
             or item.get("instrumentId")
             or item.get("symbol")
@@ -15999,7 +19108,7 @@ def functional_test_current_binding(
     }
     symbols.discard("")
     if not symbols and strategy:
-        symbol = canonical_kis_domestic_symbol(
+        symbol = canonical_symbol(
             strategy.get("execution_instrument")
             or strategy.get("instrument_id")
             or strategy.get("symbol")
@@ -16049,7 +19158,7 @@ def functional_test_current_binding(
         or strategy.get("strategy_instance_id")
         or (f"standalone:{strategy_id}" if strategy_id and not portfolio_id else "")
     ).strip()
-    return {
+    result = {
         "strategy_artifact_id": (
             ""
             if portfolio_only
@@ -16078,6 +19187,42 @@ def functional_test_current_binding(
         "account_id": kis_functional_test_account_id(),
         "symbols": tuple(sorted(symbols)),
     }
+    if us_live:
+        if portfolio_id or portfolio_only:
+            raise ValueError("functional-test-us-live-strategy-only")
+        route = _functional_test_us_strategy_route(strategy)
+        if tuple(sorted(symbols)) != (route["symbol"],):
+            raise ValueError("functional-test-us-current-artifact-symbol-mismatch")
+        sealed_route = FunctionalTestBinding(
+            strategy_artifact_id=str(result["strategy_artifact_id"]),
+            strategy_artifact_hash=str(result["strategy_artifact_hash"]),
+            strategy_instance_id=str(result["strategy_instance_id"]),
+            portfolio_required=False,
+            portfolio_artifact_id="",
+            portfolio_artifact_hash="",
+            portfolio_instance_id="",
+            account_id=str(result["account_id"]),
+            symbols=("F",),
+            market_group=str(route["marketGroup"]),
+            execution_route=str(route["executionRoute"]),
+            settlement_currency=str(route["settlementCurrency"]),
+            exchanges=tuple(route["exchanges"]),
+            symbol_routes=tuple(route["symbolRoutes"]),
+        ).snapshot()
+        result.update(
+            {
+                "market_group": sealed_route["marketGroup"],
+                "execution_route": sealed_route["executionRoute"],
+                "settlement_currency": sealed_route["settlementCurrency"],
+                "exchanges": tuple(sealed_route["exchanges"]),
+                "symbol_routes": tuple(
+                    (str(item["symbol"]), str(item["exchange"]))
+                    for item in sealed_route["symbolRoutes"]
+                ),
+                "route_scope_hash": sealed_route["routeScopeHash"],
+            }
+        )
+    return result
 
 
 def functional_test_global_caps(intent: OrderIntent) -> dict[str, float | int]:
@@ -16113,6 +19258,17 @@ def functional_test_global_caps(intent: OrderIntent) -> dict[str, float | int]:
         configured_loss_pct,
         profile.daily_loss_limit_pct,
     )
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    us_live = str(metadata.get("marketGroup") or "").upper() == "US_STOCK"
+    if us_live:
+        return {
+            "max_order_quantity": 1,
+            "max_order_notional": US_LIVE_FUNCTIONAL_TEST_CAPS.max_order_notional,
+            "max_gross_exposure": US_LIVE_FUNCTIONAL_TEST_CAPS.max_gross_exposure,
+            "max_orders": US_LIVE_FUNCTIONAL_TEST_CAPS.max_orders,
+            "max_open_positions": US_LIVE_FUNCTIONAL_TEST_CAPS.max_open_positions,
+            "max_loss": US_LIVE_FUNCTIONAL_TEST_CAPS.max_loss,
+        }
     return {
         "max_order_quantity": 1,
         "max_order_notional": order_cap,
@@ -16549,6 +19705,13 @@ def live_broker_dispatch_allowed(
     *,
     dry_run: bool,
 ) -> tuple[bool, str]:
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker_id = str(
+        metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    if broker_id == "kis" and _KIS_CONTROL_RESERVATION:
+        return False, "kis-route-control-reservation-active"
     if dry_run:
         return False, "dry-run-broker-dispatch-forbidden"
     if STATE.get("dry_run"):
@@ -16561,12 +19724,7 @@ def live_broker_dispatch_allowed(
         return False, "non-live-runtime-broker-dispatch-forbidden"
     if runtime_mode != normalized_mode:
         return False, "live-runtime-intent-mode-mismatch"
-    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     if functional_test_execution_requested(intent):
-        broker_id = str(
-            metadata.get("broker_id")
-            or broker_id_from_symbol(intent.symbol, intent.asset)
-        ).strip().lower()
         if normalized_mode != "SMALL_LIVE":
             return False, "functional-test-small-live-mode-required"
         if broker_id != "kis":
@@ -17407,6 +20565,26 @@ def dispatch_live_order_with_checkpoint(
 ) -> tuple[bool, str]:
     """Checkpoint an intent before dispatch and durably close its outcome."""
 
+    initial_metadata = (
+        intent.metadata if isinstance(intent.metadata, dict) else {}
+    )
+    initial_broker_id = str(
+        initial_metadata.get("broker_id")
+        or broker_id_from_symbol(intent.symbol, intent.asset)
+    ).strip().lower()
+    if not bool(order.get("dry_run")) and _runtime_mode_lock_owned():
+        # ContinuousRuntimeSupervisor retains RUNTIME_MODE_LOCK for the whole
+        # evaluated cycle.  Until controls are migrated to a durable A/B/C
+        # protocol, entering SAFETY here would invert against mode/STOP/Kill.
+        # Block before a functional slot, ProgramLedger checkpoint, broker
+        # read, token request, or trading socket is possible.
+        return _block_managed_order_before_dispatch(
+            order,
+            managed_order,
+            "CONTINUOUS_FINAL_DISPATCH_LOCK_ORDER_UNAVAILABLE:"
+            + initial_broker_id,
+        )
+
     dispatch_allowed, invariant_reason = live_broker_dispatch_allowed(
         intent,
         dry_run=bool(order.get("dry_run")),
@@ -17896,7 +21074,9 @@ def dispatch_live_order_with_checkpoint(
             # writes ON first and returns only after any already-in-flight
             # boundary exits; every later boundary observes ON and POSTs 0.
             with SAFETY_CONFIRMATION_MUTATION_LOCK:
-                with emergency_stop_dispatch_boundary() as emergency:
+                with _ordinary_upbit_final_mutation_boundary(
+                    broker_id
+                ) as emergency:
                     if emergency.get("active") is True:
                         return _block_managed_order_before_dispatch(
                             order,
@@ -17921,6 +21101,77 @@ def dispatch_live_order_with_checkpoint(
                     broker_response = LiveBrokerRouter().place_order(
                         broker_payload
                     )
+                    if broker_id == "kis":
+                        response_dict = (
+                            dict(broker_response)
+                            if isinstance(broker_response, dict)
+                            else {}
+                        )
+                        response_account_binding = (
+                            response_dict.get("kisOrderAccountBinding")
+                        )
+                        current_account_binding = (
+                            _normalize_kis_order_account_binding(
+                                _kis_environment_order_account_binding()
+                            )
+                        )
+                        normalized_account_binding = (
+                            _normalize_kis_order_account_binding(
+                                {
+                                    **(
+                                        response_account_binding
+                                        if isinstance(
+                                            response_account_binding, dict
+                                        )
+                                        else {}
+                                    ),
+                                    "environmentRevision": str(
+                                        current_account_binding.get(
+                                            "environmentRevision"
+                                        )
+                                        or ""
+                                    ),
+                                }
+                            )
+                        )
+                        if (
+                            not normalized_account_binding
+                            or not current_account_binding
+                            or not _kis_order_account_binding_matches(
+                                normalized_account_binding,
+                                current_account_binding,
+                            )
+                        ):
+                            # A socket may already have crossed, so the only
+                            # safe outcome is UNKNOWN.  Never synthesize an
+                            # account binding after leaving this final lock.
+                            broker_response = {
+                                **(
+                                    response_dict
+                                ),
+                                "ok": False,
+                                "outcomeAmbiguous": True,
+                                "physicalAttemptCount": max(
+                                    1,
+                                    int(
+                                        safe_float(
+                                            (
+                                                response_dict
+                                            ).get("physicalAttemptCount"),
+                                            0.0,
+                                        )
+                                    ),
+                                ),
+                                "retryAllowed": False,
+                                "accountBindingError": (
+                                    "kis-order-ack-account-binding-missing-"
+                                    "or-changed"
+                                ),
+                            }
+                        else:
+                            order["kis_order_account_binding"] = dict(
+                                normalized_account_binding
+                            )
         if not isinstance(broker_response, dict):
             broker_response = {}
         order["broker_response"] = broker_response
@@ -18020,6 +21271,49 @@ def dispatch_live_order_with_checkpoint(
                 decision="UNKNOWN",
                 reasons=(reason,),
                 output_payload={"brokerId": broker_id},
+            )
+        elif (
+            broker_response.get("outcomeAmbiguous") is True
+            or int(
+                safe_float(
+                    broker_response.get("physicalAttemptCount"), 0.0
+                )
+            )
+            > 0
+        ):
+            reason = "broker-dispatch-outcome-ambiguous"
+            LIVE_OMS.mark_unknown(
+                managed_order.order_id,
+                "broker dispatch may have crossed; reconcile before retry",
+            )
+            order.update(
+                {
+                    "state": "unknown",
+                    "queue_state": "reconcile_required",
+                    "reason": reason,
+                    "broker_outcome_ambiguous": True,
+                    "physical_attempt_count": int(
+                        safe_float(
+                            broker_response.get("physicalAttemptCount"),
+                            0.0,
+                        )
+                    ),
+                    "next_retry_at": "-",
+                }
+            )
+            ok = False
+            DECISION_TRACE_STORE.append(
+                trace_id=trace_id,
+                stage="BLOCKED",
+                decision="UNKNOWN",
+                reasons=(reason,),
+                output_payload={
+                    "brokerId": broker_id,
+                    "outcomeAmbiguous": True,
+                    "physicalAttemptCount": order[
+                        "physical_attempt_count"
+                    ],
+                },
             )
         elif int(
             safe_float(broker_response.get("statusCode"), 0.0)
@@ -18157,6 +21451,25 @@ def submit_order_intent(
     audit_event: str,
     runner_report: StrategyExecutionResult | None = None,
 ) -> dict[str, Any]:
+    if not dry_run and _runtime_mode_lock_owned():
+        metadata = (
+            dict(intent.metadata)
+            if isinstance(intent.metadata, dict)
+            else {}
+        )
+        broker_id = str(
+            metadata.get("broker_id")
+            or broker_id_from_symbol(intent.symbol, intent.asset)
+        ).strip().lower()
+        return {
+            "ok": False,
+            "reason": (
+                "CONTINUOUS_FINAL_DISPATCH_LOCK_ORDER_UNAVAILABLE:"
+                + broker_id
+            ),
+            "order": {},
+            "runtimeDispatchDisabled": True,
+        }
     metadata = dict(intent.metadata) if isinstance(intent.metadata, dict) else {}
     bar_time = str(metadata.get("confirmed_bar_end") or datetime.now(timezone.utc).isoformat())
     try:
@@ -18621,12 +21934,19 @@ def _functional_test_member(
     *,
     strategy_instance_id: str,
     symbol: str,
+    market_group: str = "",
 ) -> dict[str, Any]:
     """Seal one current KIS sleeve and its minimum verification pins."""
 
     strategy_id = str(strategy.get("strategy_id") or "").strip()
     instance_id = str(strategy_instance_id or "").strip()
-    normalized_symbol = canonical_kis_domestic_symbol(symbol)
+    us_live = str(market_group or "").strip().upper() == "US_STOCK"
+    route = _functional_test_us_strategy_route(strategy) if us_live else {}
+    normalized_symbol = (
+        canonical_kis_us_symbol(symbol)
+        if us_live
+        else canonical_kis_domestic_symbol(symbol)
+    )
     reference = verified_strategy_artifact_reference(strategy)
     lifecycle = normalize_lifecycle_status(strategy.get("lifecycle_status"))
     blockers: list[str] = []
@@ -18635,7 +21955,11 @@ def _functional_test_member(
     if not instance_id:
         blockers.append("strategy-instance-id-missing")
     if not normalized_symbol:
-        blockers.append("kis-domestic-symbol-required")
+        blockers.append(
+            "kis-us-symbol-required" if us_live else "kis-domestic-symbol-required"
+        )
+    if us_live and normalized_symbol != str(route.get("symbol") or ""):
+        blockers.append("functional-test-us-symbol-route-mismatch")
     if strategy_broker_id(strategy) != "kis":
         blockers.append("kis-broker-route-required")
     if not reference:
@@ -18656,7 +21980,7 @@ def _functional_test_member(
         if isinstance(strategy.get("verification"), dict)
         else {}
     )
-    return {
+    result = {
         "strategyId": strategy_id,
         "strategyInstanceId": instance_id,
         "symbol": normalized_symbol,
@@ -18675,6 +21999,17 @@ def _functional_test_member(
             }
         ),
     }
+    if us_live:
+        result.update(
+            {
+                "marketGroup": "US_STOCK",
+                "executionRoute": "KIS_US_LIVE_CONTINUOUS",
+                "settlementCurrency": "USD",
+                "exchange": "NYSE",
+                "timeframe": "5m",
+            }
+        )
+    return result
 
 
 def _functional_test_runtime_scope(
@@ -18688,8 +22023,14 @@ def _functional_test_runtime_scope(
     requested_portfolio = str(portfolio_id or "").strip()
     requested_strategy = str(strategy_id or "").strip()
     binding = permit.binding.snapshot()
+    market_group = str(binding.get("marketGroup") or "").strip().upper()
+    us_live = market_group == "US_STOCK"
     if str(binding.get("accountId") or "") != kis_functional_test_account_id():
         raise ValueError("FUNCTIONAL_TEST permit account binding이 현재 KIS 계좌와 다릅니다.")
+    if us_live and (
+        binding.get("portfolioRequired") is True or requested_portfolio
+    ):
+        raise ValueError("functional-test-us-live-strategy-only")
 
     portfolios = portfolio_rows()
     strategies = strategy_rows(portfolios)
@@ -18772,6 +22113,7 @@ def _functional_test_runtime_scope(
                 member_strategy,
                 strategy_instance_id=member_instance_id,
                 symbol=member_symbol,
+                market_group=market_group,
             )
             members.append(member)
             if member_strategy_id == requested_strategy:
@@ -18831,30 +22173,61 @@ def _functional_test_runtime_scope(
             or lead_strategy.get("instance_id")
             or f"standalone:{requested_strategy}"
         ).strip()
-        symbol = canonical_kis_domestic_symbol(
-            lead_strategy.get("execution_instrument")
-            or lead_strategy.get("instrument_id")
-            or lead_strategy.get("symbol")
-            or ""
+        route = _functional_test_us_strategy_route(lead_strategy) if us_live else {}
+        symbol = (
+            canonical_kis_us_symbol(
+                lead_strategy.get("execution_instrument")
+                or lead_strategy.get("instrument_id")
+                or lead_strategy.get("symbol")
+                or ""
+            )
+            if us_live
+            else canonical_kis_domestic_symbol(
+                lead_strategy.get("execution_instrument")
+                or lead_strategy.get("instrument_id")
+                or lead_strategy.get("symbol")
+                or ""
+            )
         )
         members.append(
             _functional_test_member(
                 lead_strategy,
                 strategy_instance_id=strategy_instance_id,
                 symbol=symbol,
+                market_group=market_group,
             )
         )
-        current_binding = {
-            "strategyArtifactId": str(reference.get("artifactId") or ""),
-            "strategyArtifactHash": str(reference.get("artifactHash") or "").lower(),
-            "strategyInstanceId": strategy_instance_id,
-            "portfolioRequired": False,
-            "portfolioArtifactId": "",
-            "portfolioArtifactHash": "",
-            "portfolioInstanceId": "",
-            "accountId": kis_functional_test_account_id(),
-            "symbols": [symbol],
-        }
+        if us_live:
+            current_binding = FunctionalTestBinding(
+                strategy_artifact_id=str(reference.get("artifactId") or ""),
+                strategy_artifact_hash=str(
+                    reference.get("artifactHash") or ""
+                ).lower(),
+                strategy_instance_id=strategy_instance_id,
+                portfolio_required=False,
+                portfolio_artifact_id="",
+                portfolio_artifact_hash="",
+                portfolio_instance_id="",
+                account_id=kis_functional_test_account_id(),
+                symbols=(symbol,),
+                market_group=str(route.get("marketGroup") or ""),
+                execution_route=str(route.get("executionRoute") or ""),
+                settlement_currency=str(route.get("settlementCurrency") or ""),
+                exchanges=tuple(route.get("exchanges") or ()),
+                symbol_routes=tuple(route.get("symbolRoutes") or ()),
+            ).snapshot()
+        else:
+            current_binding = {
+                "strategyArtifactId": str(reference.get("artifactId") or ""),
+                "strategyArtifactHash": str(reference.get("artifactHash") or "").lower(),
+                "strategyInstanceId": strategy_instance_id,
+                "portfolioRequired": False,
+                "portfolioArtifactId": "",
+                "portfolioArtifactHash": "",
+                "portfolioInstanceId": "",
+                "accountId": kis_functional_test_account_id(),
+                "symbols": [symbol],
+            }
 
     if current_binding != binding:
         raise ValueError("FUNCTIONAL_TEST permit의 exact Artifact/Instance/계좌/종목 binding이 변경되었습니다.")
@@ -18884,6 +22257,7 @@ def _functional_test_runtime_scope(
         "strategyMembers": members,
         "strategyMemberHash": governance_sha256(members),
         "allowedSymbols": sorted(str(item) for item in binding.get("symbols") or []),
+        "binding": dict(binding),
         "bindingHash": governance_sha256(binding),
         "accountFingerprint": governance_sha256(
             {"functionalTestAccount": str(binding.get("accountId") or "")}
@@ -20841,6 +24215,11 @@ def start_functional_test_runtime(
     if not runtime_strategy_id:
         return blocked("FUNCTIONAL_TEST runtime lead Strategy가 없습니다.")
     portfolio_id = str(candidate.get("portfolioId") or "").strip()
+    candidate_binding = (
+        candidate.get("binding")
+        if isinstance(candidate.get("binding"), dict)
+        else {}
+    )
     challenge = consume_safety_confirmation(
         "FUNCTIONAL_TEST_START",
         safety_confirmation,
@@ -20865,6 +24244,31 @@ def start_functional_test_runtime(
             "functional_test_portfolio_only": (
                 str(candidate.get("kind") or "").upper() == "PORTFOLIO"
             ),
+            "marketGroup": str(candidate_binding.get("marketGroup") or ""),
+            "portfolioRequired": bool(
+                candidate_binding.get("portfolioRequired") is True
+            ),
+            "symbols": list(candidate_binding.get("symbols") or []),
+            "executionRoute": str(
+                candidate_binding.get("executionRoute") or ""
+            ),
+            "settlementCurrency": str(
+                candidate_binding.get("settlementCurrency") or ""
+            ),
+            "exchanges": list(candidate_binding.get("exchanges") or []),
+            "symbolRoutes": list(candidate_binding.get("symbolRoutes") or []),
+            "routeScopeHash": str(
+                candidate_binding.get("routeScopeHash") or ""
+            ),
+            "exchange": str(
+                (
+                    (candidate_binding.get("symbolRoutes") or [{}])[0]
+                    if isinstance(candidate_binding.get("symbolRoutes"), list)
+                    and candidate_binding.get("symbolRoutes")
+                    else {}
+                ).get("exchange")
+                or ""
+            ),
             "promotion_eligible": False,
             "use_as_promotion_evidence": False,
             "full_live_requested": False,
@@ -20880,6 +24284,8 @@ def start_functional_test_runtime(
 
 
 @_serialized_safety_mutation
+@_serialized_upbit_order_authority
+@_two_phase_kis_route_control("START")
 def start_continuous_runtime(
     profile_id: str,
     mode: str,
@@ -20894,6 +24300,14 @@ def start_continuous_runtime(
     normalized_profile = "stock" if profile_id == "stock" else "crypto"
     normalized_mode = normalize_runtime_mode(mode)
     normalized_purpose = str(execution_purpose or "").strip().upper()
+    if _upbit_functional_durable_authority_open():
+        return {
+            "ok": False,
+            "reason": "upbit-functional-session-closes-ordinary-runtime-route",
+            "runtimeStarted": False,
+            "brokerSubmissionPerformed": False,
+            "snapshot": snapshot(),
+        }
     if normalized_purpose not in {"", FUNCTIONAL_TEST_EXECUTION_PURPOSE}:
         return {
             "ok": False,
@@ -21190,6 +24604,7 @@ def run_validation_small_live_once(
     }
 
 
+@_two_phase_kis_route_control("STOP")
 def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
     normalized_profile = (
         profile_id if profile_id in {"stock", "crypto"} else ""
@@ -21593,6 +25008,8 @@ def recovery_state_payload() -> dict[str, Any]:
     }
 
 
+@_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
 def run_recovery_drill() -> dict[str, Any]:
     checkpoint = RECOVERY_JOURNAL.save(recovery_state_payload(), reason="operator-recovery-drill", idempotency_keys=[str(item.get("idempotency_key") or "") for item in STATE.get("orders", [])])
     loaded = RECOVERY_JOURNAL.load_latest()
@@ -21728,6 +25145,8 @@ def restore_runtime_from_checkpoint() -> dict[str, Any]:
     return dict(STATE["recovery_status"])
 
 
+@_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
 def run_shadow_live(payload: dict[str, Any]) -> dict[str, Any]:
     checks = snapshot()
     intent = default_order_intent(checks, str(payload.get("side") or "BUY"))
@@ -21775,6 +25194,8 @@ def runtime_operational_readiness(strategies: list[dict[str, Any]], portfolios: 
     })
 
 
+@_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
 def run_policy_replay(payload: dict[str, Any]) -> dict[str, Any]:
     checks = snapshot()
     intent = default_order_intent(checks, str(payload.get("side") or "BUY"))
@@ -22144,10 +25565,11 @@ def retry_order(order_id: str) -> dict[str, Any]:
     }
 
 
-def cancel_order(
+def _cancel_order_after_kis_route_selection(
     order_id: str,
     *,
     _official_kis_truth: dict[str, Any] | None = None,
+    _kill_cleanup: bool = False,
 ) -> dict[str, Any]:
     order = find_order(order_id)
     if not order:
@@ -22277,21 +25699,136 @@ def cancel_order(
                 STATE["new_entries_blocked"] = True
                 append_audit("error", "주문 취소 실패", f"{order_id} · 취소 요청 checkpoint 저장 실패")
                 return {"ok": False, "reason": "cancel-request-checkpoint-failed", "snapshot": snapshot()}
+        kis_kill_intent: dict[str, Any] | None = None
+        kis_kill_revision = 0
         try:
-            cancel_response = LiveBrokerRouter().cancel_order(
-                broker_id,
-                broker_order_id,
-                symbol=str(order.get("symbol") or broker_request.get("symbol") or ""),
-                asset=str(order.get("asset") or broker_request.get("asset") or ""),
-                quantity=order.get("qty") or broker_request.get("quantity") or 0,
-                exchange=str(broker_request.get("exchange") or ""),
-                organization_no=str(
-                    order.get("organization_no")
-                    or output.get("KRX_FWDG_ORD_ORGNO")
-                    or output.get("KRX_FWDG_ORD_ORG_NO")
-                    or ""
-                ),
-            )
+            with SAFETY_CONFIRMATION_MUTATION_LOCK:
+                with _ordinary_upbit_final_mutation_boundary(
+                    broker_id
+                ) as emergency:
+                    if broker_id == "kis" and _kill_cleanup:
+                        # Route -> emergency is already held.  Token issuance,
+                        # exact wire sealing, durable reservation, socket and
+                        # revocation therefore form one uninterrupted KIS
+                        # mutation critical section.
+                        with kis_authenticated_mutation_preflight(
+                            mode="KILL_PREPARE"
+                        ):
+                            token = issue_kis_access_token()
+                            prepared_cancel = build_kis_cancel_order_request(
+                                {
+                                    "broker_order_id": broker_order_id,
+                                    "symbol": str(
+                                        order.get("symbol")
+                                        or broker_request.get("symbol")
+                                        or ""
+                                    ),
+                                    "asset": str(
+                                        order.get("asset")
+                                        or broker_request.get("asset")
+                                        or ""
+                                    ),
+                                    "quantity": order.get("qty")
+                                    or broker_request.get("quantity")
+                                    or 0,
+                                    "exchange": str(
+                                        broker_request.get("exchange") or ""
+                                    ),
+                                    "organization_no": str(
+                                        order.get("organization_no")
+                                        or output.get("KRX_FWDG_ORD_ORGNO")
+                                        or output.get("KRX_FWDG_ORD_ORG_NO")
+                                        or ""
+                                    ),
+                                },
+                                access_token=token,
+                            )
+                            kis_kill_intent = (
+                                build_kis_mutation_authority_intent(
+                                    prepared_cancel,
+                                    operation="KILL_ORDINARY_CANCEL",
+                                    claim_id=(
+                                        "kis-kill-cancel-"
+                                        + secrets.token_hex(16)
+                                    ),
+                                    owned_order_key={
+                                        "orderDate": str(
+                                            order.get("order_date") or ""
+                                        ),
+                                        "organizationNo": str(
+                                            order.get("organization_no")
+                                            or output.get(
+                                                "KRX_FWDG_ORD_ORGNO"
+                                            )
+                                            or output.get(
+                                                "KRX_FWDG_ORD_ORG_NO"
+                                            )
+                                            or ""
+                                        ),
+                                        "orderNo": broker_order_id,
+                                    },
+                                )
+                            )
+                    if broker_id == "kis" and kis_kill_intent is not None:
+                        reservation = _reserve_kis_kill_cancel_authority(
+                            kis_kill_intent
+                        )
+                        kis_kill_revision = int(
+                            reservation["killRevision"]
+                        )
+                    try:
+                        if (
+                            emergency.get("active") is True
+                            and not (
+                                broker_id == "kis"
+                                and kis_kill_intent is not None
+                                and kis_kill_revision > 0
+                            )
+                        ):
+                            raise RuntimeError(
+                                "emergency-stop-latch-broker-cancel-forbidden"
+                            )
+                        if broker_id == "upbit" and not real_orders_enabled():
+                            raise RuntimeError(
+                                "ordinary-upbit-cancel-real-orders-disabled"
+                            )
+                        cancel_response = LiveBrokerRouter().cancel_order(
+                            broker_id,
+                            broker_order_id,
+                            symbol=str(order.get("symbol") or broker_request.get("symbol") or ""),
+                            asset=str(order.get("asset") or broker_request.get("asset") or ""),
+                            quantity=order.get("qty") or broker_request.get("quantity") or 0,
+                            exchange=str(broker_request.get("exchange") or ""),
+                            organization_no=str(
+                                order.get("organization_no")
+                                or output.get("KRX_FWDG_ORD_ORGNO")
+                                or output.get("KRX_FWDG_ORD_ORG_NO")
+                                or ""
+                            ),
+                            order_date=str(order.get("order_date") or ""),
+                            **(
+                                {
+                                    "_kis_kill_authority_intent": kis_kill_intent,
+                                    "_kis_kill_cancel_expected_revision": (
+                                        kis_kill_revision
+                                    ),
+                                }
+                                if kis_kill_intent is not None
+                                else {}
+                            ),
+                        )
+                    finally:
+                        if kis_kill_intent is not None and kis_kill_revision:
+                            # Re-enter the same RLock before releasing the
+                            # outer route+emergency boundary.  No settings,
+                            # STOP, Kill, ordinary, or functional mutation can
+                            # cross between the exact socket outcome and grant
+                            # revocation.
+                            _revoke_kis_kill_cancel_authority(
+                                expected_revision=kis_kill_revision,
+                                expected_intent=kis_kill_intent,
+                            )
+                            kis_kill_revision = 0
         except Exception as exc:
             reason = f"브로커 주문 취소 결과 불명: {type(exc).__name__}: {exc}"
             order.update(
@@ -22386,3 +25923,52 @@ def cancel_order(
             message_final=True,
         )
     return {"ok": True, "reason": "order canceled", "snapshot": snapshot()}
+
+
+def cancel_order(
+    order_id: str,
+    *,
+    _official_kis_truth: dict[str, Any] | None = None,
+    _kill_cleanup: bool = False,
+) -> dict[str, Any]:
+    """Cancel one order with a truth-to-socket fence for every KIS route."""
+
+    order = find_order(order_id)
+    if order is None:
+        return {"ok": False, "reason": "order not found", "snapshot": snapshot()}
+    broker_request = (
+        order.get("broker_request")
+        if isinstance(order.get("broker_request"), dict)
+        else {}
+    )
+    broker_id = str(
+        order.get("broker_id")
+        or broker_request.get("broker_id")
+        or broker_id_from_symbol(
+            str(order.get("symbol") or ""),
+            str(order.get("asset") or ""),
+        )
+    ).strip().lower()
+    if broker_id != "kis":
+        return _cancel_order_after_kis_route_selection(
+            order_id,
+            _official_kis_truth=_official_kis_truth,
+            _kill_cleanup=_kill_cleanup,
+        )
+
+    with _kis_manual_cancel_preparation() as finish:
+        official_truth = _official_kis_truth
+        if not isinstance(official_truth, dict):
+            refresh = refresh_kis_order_truth_for_kill_switch()
+            official_truth = (
+                dict(refresh.get("truth"))
+                if isinstance(refresh.get("truth"), dict)
+                else {}
+            )
+        return finish(
+            lambda: _cancel_order_after_kis_route_selection(
+                order_id,
+                _official_kis_truth=official_truth,
+                _kill_cleanup=_kill_cleanup,
+            )
+        )

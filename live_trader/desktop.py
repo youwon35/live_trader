@@ -8,6 +8,7 @@ from pathlib import Path
 from .emergency_stop import DesktopEmergencyStopBridge
 from .server import start_in_thread
 from .env_loader import default_runtime_data_root
+from .process_safety import live_trader_instance_lease_status
 
 WINDOW_STATE_VERSION = 4
 DEFAULT_WINDOW_WIDTH = 1360
@@ -19,6 +20,10 @@ MIN_WINDOW_HEIGHT = 760
 
 
 def main() -> None:
+    if live_trader_instance_lease_status().get("acquired") is not True:
+        raise RuntimeError(
+            "Live Trader desktop requires the official application-instance lease"
+        )
     server, url = start_in_thread()
     webview_started_at: float | None = None
     window_was_visible = False
@@ -27,10 +32,19 @@ def main() -> None:
         import webview
 
         window_state = _load_window_state()
+        authority = getattr(
+            server, "functional_http_session_authority", None
+        )
+        if authority is None:
+            raise RuntimeError(
+                "trusted functional HTTP session was not attached to server"
+            )
         window = webview.create_window(
             "[LIVE] Live Trader",
-            url,
-            js_api=DesktopEmergencyStopBridge(),
+            authority.native_bootstrap_url,
+            js_api=DesktopEmergencyStopBridge(
+                functional_http_bootstrap=authority.trusted_native_bootstrap
+            ),
             width=window_state["width"],
             height=window_state["height"],
             x=window_state["x"],
