@@ -40,10 +40,8 @@ _APPROVAL_FIELDS = frozenset(
         "nonce",
         "activationResealAuthorized",
         "activeDurationSeconds",
-        "exclusiveAccountConfirmed",
-        "noManualTradingConfirmed",
-        "noBotsConfirmed",
-        "noOtherApiKeysConfirmed",
+        "accountExclusivityProofRequired",
+        "accountWideCausalClosureProofRequired",
         "firstLiveBootstrapAuthorized",
         "firstLiveBootstrapRequired",
         "firstLiveBootstrapId",
@@ -231,10 +229,9 @@ class DurableBinanceSpotApprovedPermitStore:
             or approval_attestation.get("operatorApproved") is not True
             or approval_attestation.get("activationResealAuthorized") is not True
             or int(approval_attestation.get("activeDurationSeconds") or 0) != 7200
-            or approval_attestation.get("exclusiveAccountConfirmed") is not True
-            or approval_attestation.get("noManualTradingConfirmed") is not True
-            or approval_attestation.get("noBotsConfirmed") is not True
-            or approval_attestation.get("noOtherApiKeysConfirmed") is not True
+            or approval_attestation.get("accountExclusivityProofRequired") is not True
+            or approval_attestation.get("accountWideCausalClosureProofRequired")
+            is not True
             or approval_attestation.get("firstLiveBootstrapAuthorized") is not True
             or not self.approval_verifier(dict(approval_attestation))
         ):
@@ -508,10 +505,12 @@ class DurableBinanceSpotApprovedPermitStore:
                 and approval_attestation.get("activationResealAuthorized") is True
                 and int(approval_attestation.get("activeDurationSeconds") or 0)
                 == 7200
-                and approval_attestation.get("exclusiveAccountConfirmed") is True
-                and approval_attestation.get("noManualTradingConfirmed") is True
-                and approval_attestation.get("noBotsConfirmed") is True
-                and approval_attestation.get("noOtherApiKeysConfirmed") is True
+                and approval_attestation.get("accountExclusivityProofRequired")
+                is True
+                and approval_attestation.get(
+                    "accountWideCausalClosureProofRequired"
+                )
+                is True
                 and approval_attestation.get("firstLiveBootstrapAuthorized") is True
                 and bootstrap_required
                 == bool(row["first_live_bootstrap_required"])

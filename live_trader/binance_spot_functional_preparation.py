@@ -42,6 +42,19 @@ from .binance_spot_functional_lifecycle import (
 from .binance_spot_functional_mutation import (
     BinanceSpotFunctionalMutationEdge,
 )
+from .binance_spot_functional_exclusivity import (
+    BinanceSpotExclusivityGuard,
+    DurableBinanceSpotExclusivityProofStore,
+    verify_exclusivity_proof,
+    verify_global_first_live_authority,
+)
+from .binance_spot_functional_exclusivity_provider import (
+    BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT,
+    DurableBinanceSpotExclusivityProofProvider,
+    DurableCursorBoundBinanceSpotExclusivityVerifier,
+    PinnedEd25519BinanceSpotExclusivityVerifier,
+    build_binance_spot_exclusivity_injection,
+)
 
 
 HOLD_PREPARATION_SCHEMA_VERSION = (
@@ -100,6 +113,18 @@ _SERVICE_HOOKS = (
     "finalize",
 )
 _MUTATION_HOOKS = ("__call__", "_dispatch_under_lease")
+_EXCLUSIVITY_STORE_HOOKS = ("record", "record_for", "session_records")
+_EXCLUSIVITY_GUARD_HOOKS = (
+    "status",
+    "verify_and_record",
+    "session_records",
+)
+_EXCLUSIVITY_PROVIDER_HOOKS = (
+    "request_descriptor",
+    "read_strict",
+    "consumed_payload_verified",
+    "status",
+)
 
 
 def _canonical(value: Mapping[str, Any]) -> bytes:
@@ -166,6 +191,31 @@ def binance_spot_functional_hold_preparation_status(
         "singleAttemptMutation": _hooks_available(
             BinanceSpotFunctionalMutationEdge, _MUTATION_HOOKS
         ),
+        "durableExclusivityProofs": _hooks_available(
+            DurableBinanceSpotExclusivityProofStore,
+            _EXCLUSIVITY_STORE_HOOKS,
+        ),
+        "independentExclusivityGuard": _hooks_available(
+            BinanceSpotExclusivityGuard,
+            _EXCLUSIVITY_GUARD_HOOKS,
+        ),
+        "detachedProofVerifier": callable(verify_exclusivity_proof),
+        "globalAuthorityVerifier": callable(
+            verify_global_first_live_authority
+        ),
+        "publicKeyOnlyExclusivityVerifier": callable(
+            PinnedEd25519BinanceSpotExclusivityVerifier
+        ),
+        "durableExclusivityProvider": _hooks_available(
+            DurableBinanceSpotExclusivityProofProvider,
+            _EXCLUSIVITY_PROVIDER_HOOKS,
+        ),
+        "cursorBoundExclusivityVerifier": callable(
+            DurableCursorBoundBinanceSpotExclusivityVerifier
+        ),
+        "productionExclusivityInjectionBuilder": callable(
+            build_binance_spot_exclusivity_injection
+        ),
         "ownerMetricBaseline": callable(owner_metrics),
         "exactPermitParser": callable(getattr(ExactPermit, "parse", None)),
     }
@@ -180,6 +230,10 @@ def binance_spot_functional_hold_preparation_status(
         and str(MAX_OWNER_LOSS) == "1"
         and _SHA256_RE.fullmatch(
             str(BOOTSTRAP_DB_SCHEMA_FINGERPRINT).lower()
+        )
+        is not None
+        and _SHA256_RE.fullmatch(
+            str(BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT).lower()
         )
         is not None
     )
@@ -204,6 +258,28 @@ def binance_spot_functional_hold_preparation_status(
         "manualTradingAllowed": False,
         "externalBotsAllowed": False,
         "otherApiKeysAllowed": False,
+        "operatorAttestationCountsAsExclusivityProof": False,
+        "exclusivityVerifierKeyPolicy": "PINNED_ED25519_PUBLIC_KEY_ONLY",
+        "exclusivityPrivateKeyAllowedInTradingProcess": False,
+        "exclusivityProofDelivery": "HASH_ADDRESSED_DURABLE_DIRECTORY",
+        "exclusivityRequestDelivery": "DURABLE_REQUEST_OUTBOX",
+        "exclusivityCursorSchemaFingerprint": (
+            BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT
+        ),
+        "exclusivityCursorPathIdentityPinned": True,
+        "exclusivityReplayPolicy": "SIGNED_SEQUENCE_AND_CURSOR_HASH_CHAIN",
+        "detachedPinnedExclusivityProofRequiredAt": [
+            "BASELINE",
+            "ACTIVATION",
+            "PRE_POST",
+            "TERMINAL",
+        ],
+        "terminalAccountWideCausalClosureRequired": True,
+        "globalFirstLiveAuthorityRequiredAt": [
+            "ACTIVATION",
+            "FINAL_PRE_POST",
+            "MUTATION_FINAL_PRE_MARKER",
+        ],
         "futuresAllowed": False,
         "marginAllowed": False,
         "borrowAllowed": False,

@@ -371,8 +371,14 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             "results": {},
         }
         cleanup_lock_observations: list[tuple[bool, bool, bool]] = []
+        cleanup_call_order: list[str] = []
+
+        def global_cleanup(_reason: str) -> dict[str, object]:
+            cleanup_call_order.append("global")
+            return {"ok": True, "entryAuthorityRevoked": True}
 
         def functional_cleanup() -> dict[str, object]:
+            cleanup_call_order.append("broker")
             cleanup_lock_observations.append(
                 (
                     bool(state.SAFETY_CONFIRMATION_MUTATION_LOCK._is_owned()),
@@ -404,6 +410,11 @@ class LiveSafetyCompletionTests(unittest.TestCase):
                 "_run_reconciliation_without_public_fence",
                 return_value={"ok": True},
             ) as reconcile,
+            patch.object(
+                state,
+                "_revoke_crypto_first_live_entry_before_cleanup",
+                side_effect=global_cleanup,
+            ) as global_revoke,
             patch.object(state, "append_audit"),
             patch.object(state, "queue_live_audit_telegram"),
             patch.object(state, "sync_operational_incident"),
@@ -436,8 +447,10 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             refresh_brokers=True,
             include_snapshot=False,
         )
+        global_revoke.assert_called_once_with("durable-emergency-stop")
         upbit_cleanup.assert_called_once_with()
         binance_cleanup.assert_called_once_with()
+        self.assertEqual(["global", "broker", "broker"], cleanup_call_order)
         self.assertEqual([(False, False, False), (False, False, False)], cleanup_lock_observations)
 
     def test_api_recovery_applies_native_kill_cancel_reconcile_and_telegram_evidence(self) -> None:
@@ -546,6 +559,11 @@ class LiveSafetyCompletionTests(unittest.TestCase):
                 "_run_reconciliation_without_public_fence",
                 return_value={"ok": True},
             ) as reconcile,
+            patch.object(
+                state,
+                "_revoke_crypto_first_live_entry_before_cleanup",
+                return_value={"ok": True, "entryAuthorityRevoked": True},
+            ) as global_revoke,
             patch.object(state, "append_audit", audit),
             patch.object(state, "sync_operational_incident", incident),
             patch.object(
@@ -567,6 +585,7 @@ class LiveSafetyCompletionTests(unittest.TestCase):
         self.assertEqual(2, truth.call_count)
         self.assertEqual(2, cancel.call_count)
         self.assertEqual(2, reconcile.call_count)
+        self.assertEqual(2, global_revoke.call_count)
         self.assertEqual(2, audit.call_count)
         self.assertEqual(2, incident.call_count)
         self.assertIn("미완료", str(audit.call_args_list[0]))

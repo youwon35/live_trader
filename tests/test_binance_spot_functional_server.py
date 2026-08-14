@@ -247,6 +247,11 @@ class BinanceSpotFunctionalServerTest(unittest.TestCase):
             ) as consume,
             patch.object(
                 state,
+                "_crypto_first_live_official_candidate_hold",
+                return_value="",
+            ),
+            patch.object(
+                state,
                 "_binance_spot_functional_ordinary_routes_closed",
                 return_value=True,
             ),
@@ -366,6 +371,11 @@ class BinanceSpotFunctionalServerTest(unittest.TestCase):
             ),
             patch.object(
                 state,
+                "_revoke_crypto_first_live_entry_before_cleanup",
+                return_value={"ok": True, "entryAuthorityRevoked": True},
+            ),
+            patch.object(
+                state,
                 "_upbit_functional_emergency_cleanup_after_latch",
                 return_value={"ok": True},
             ),
@@ -419,6 +429,147 @@ class BinanceSpotFunctionalServerTest(unittest.TestCase):
         self.assertTrue(result["cleanupSchedulerOwned"])
         self.assertEqual("CLEANUP", result["state"])
         facade.stop.assert_called_once_with()
+
+    def test_kill_reconciliation_snapshot_never_claims_revocation(self) -> None:
+        facade = Mock()
+        facade.order_authority_snapshot.side_effect = [
+            {
+                "functionalAuthorityOpen": True,
+                "functionalPhase": "ACTIVE",
+            },
+            {
+                "functionalAuthorityOpen": False,
+                "functionalPhase": "RECONCILIATION_REQUIRED",
+            },
+        ]
+        facade.stop.return_value = {"ok": True}
+        with (
+            patch.object(state, "emergency_stop_active", return_value=True),
+            patch.object(state, "_BINANCE_SPOT_FUNCTIONAL_FACADE", facade),
+        ):
+            result = (
+                state._binance_spot_functional_emergency_cleanup_after_latch()
+            )
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["entryAuthorityRevoked"])
+        self.assertFalse(result["cleanupSchedulerOwned"])
+        self.assertEqual("RECONCILIATION_REQUIRED", result["state"])
+
+    def test_kill_unreadable_snapshot_never_claims_revocation(self) -> None:
+        facade = Mock()
+        facade.order_authority_snapshot.side_effect = [
+            {
+                "functionalAuthorityOpen": True,
+                "functionalPhase": "ACTIVE",
+            },
+            RuntimeError("snapshot-unreadable"),
+            {
+                "functionalAuthorityOpen": True,
+                "functionalPhase": "UNREADABLE",
+            },
+        ]
+        facade.stop.return_value = {"ok": True}
+        with (
+            patch.object(state, "emergency_stop_active", return_value=True),
+            patch.object(state, "_BINANCE_SPOT_FUNCTIONAL_FACADE", facade),
+        ):
+            result = (
+                state._binance_spot_functional_emergency_cleanup_after_latch()
+            )
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["entryAuthorityRevoked"])
+        self.assertEqual("RECONCILIATION_REQUIRED", result["state"])
+
+    def test_kill_failed_phase_requires_exact_closed_snapshot(self) -> None:
+        for authority_open, expected_revoked in ((True, False), (False, True)):
+            with self.subTest(authority_open=authority_open):
+                facade = Mock()
+                facade.order_authority_snapshot.side_effect = [
+                    {
+                        "functionalAuthorityOpen": True,
+                        "functionalPhase": "ACTIVE",
+                        "functionalSessionId": "session-failed-proof",
+                    },
+                    {
+                        "functionalAuthorityOpen": authority_open,
+                        "functionalPhase": "FAILED",
+                        "functionalSessionId": "session-failed-proof",
+                    },
+                ]
+                facade.stop.return_value = {"ok": False}
+                with (
+                    patch.object(
+                        state, "emergency_stop_active", return_value=True
+                    ),
+                    patch.object(
+                        state, "_BINANCE_SPOT_FUNCTIONAL_FACADE", facade
+                    ),
+                ):
+                    result = (
+                        state._binance_spot_functional_emergency_cleanup_after_latch()
+                    )
+                self.assertFalse(result["ok"])
+                self.assertEqual(
+                    expected_revoked, result["entryAuthorityRevoked"]
+                )
+
+    def test_kill_early_reconciliation_is_not_closed(self) -> None:
+        facade = Mock()
+        facade.order_authority_snapshot.return_value = {
+            "functionalAuthorityOpen": False,
+            "functionalPhase": "RECONCILIATION_REQUIRED",
+        }
+        with (
+            patch.object(state, "emergency_stop_active", return_value=True),
+            patch.object(state, "_BINANCE_SPOT_FUNCTIONAL_FACADE", facade),
+        ):
+            result = (
+                state._binance_spot_functional_emergency_cleanup_after_latch()
+            )
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["entryAuthorityRevoked"])
+        facade.stop.assert_not_called()
+
+    def test_kill_early_non_boolean_authority_is_never_closed(self) -> None:
+        for hostile in (None, "false", 0, "missing"):
+            with self.subTest(hostile=hostile):
+                facade = Mock()
+                snapshot = {"functionalPhase": "IDLE"}
+                if hostile != "missing":
+                    snapshot["functionalAuthorityOpen"] = hostile
+                facade.order_authority_snapshot.return_value = snapshot
+                with (
+                    patch.object(
+                        state, "emergency_stop_active", return_value=True
+                    ),
+                    patch.object(
+                        state, "_BINANCE_SPOT_FUNCTIONAL_FACADE", facade
+                    ),
+                ):
+                    result = (
+                        state._binance_spot_functional_emergency_cleanup_after_latch()
+                    )
+                self.assertFalse(result["ok"])
+                self.assertFalse(result["entryAuthorityRevoked"])
+                facade.stop.assert_not_called()
+
+    def test_missing_facade_samples_durable_authority_once(self) -> None:
+        durable_open = Mock(return_value=False)
+        with (
+            patch.object(state, "emergency_stop_active", return_value=True),
+            patch.object(state, "_BINANCE_SPOT_FUNCTIONAL_FACADE", None),
+            patch.object(
+                state,
+                "_binance_functional_durable_authority_open",
+                durable_open,
+            ),
+        ):
+            result = (
+                state._binance_spot_functional_emergency_cleanup_after_latch()
+            )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["entryAuthorityRevoked"])
+        durable_open.assert_called_once_with()
 
 
 if __name__ == "__main__":

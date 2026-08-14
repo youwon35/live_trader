@@ -51,6 +51,37 @@ def exact_authority(**updates: object) -> dict[str, object]:
     return result
 
 
+def exact_global_authority(**updates: object) -> dict[str, object]:
+    projection: dict[str, object] = {
+        "schemaVersion": "crypto-first-live-binance-authority-snapshot/v1",
+        "scope": "CRYPTO_FIRST_LIVE_GLOBAL",
+        "lane": "BINANCE_SPOT",
+        "phase": "ACTIVE",
+        "runId": "crypto-run-binance-mutation-0001",
+        "sessionId": SESSION_ID,
+        "permitId": PERMIT_ID,
+        "permitHash": PERMIT_HASH,
+        "accountFingerprint": ACCOUNT_FINGERPRINT,
+        "ownerLeaseActive": True,
+        "entryAuthorityOpen": True,
+        "hardStopEpoch": 1_800_007_200.0,
+        "revision": 1,
+        "observedEpoch": 1_800_000_000.0,
+    }
+    projection.update(updates)
+    return {
+        **projection,
+        "authorityHash": hashlib.sha256(
+            json.dumps(
+                projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def call_context(**updates: object) -> dict[str, object]:
     action = updates.pop("action", buy_action()) if "buy_action" in globals() else {}
     result: dict[str, object] = {
@@ -449,6 +480,102 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
                 **call_context(),
             )
         self.assertEqual(["durable-cas", "send"], events)
+
+    def test_global_authority_is_verified_before_durable_marker_and_send(self) -> None:
+        claim = durable_claim()
+        events: list[str] = []
+
+        def global_reader(**request: object) -> dict[str, object]:
+            self.assertEqual("MUTATION_FINAL_PRE_MARKER", request["purpose"])
+            self.assertEqual(SESSION_ID, request["session_id"])
+            self.assertEqual(PERMIT_ID, request["permit_id"])
+            self.assertEqual(PERMIT_HASH, request["permit_hash"])
+            self.assertEqual(ACCOUNT_FINGERPRINT, request["account_fingerprint"])
+            self.assertFalse(request["cleanup_only"])
+            events.append("global-authority")
+            return exact_global_authority()
+
+        def marker(claim_id: str) -> None:
+            self.assertEqual("claim-mutation-0001", claim_id)
+            claim["state"] = "POST_MAY_HAVE_CROSSED"
+            events.append("durable-marker")
+
+        edge = BinanceSpotFunctionalMutationEdge(
+            authority_reader=exact_authority,
+            claim_reader=lambda _: claim,
+            claim_marker=marker,
+            global_first_live_authority_reader=global_reader,
+            sender=lambda _: events.append("send")
+            or {
+                "ok": True,
+                "json": {
+                    "orderId": "101",
+                    "clientOrderId": OWNER + "b",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "type": "MARKET",
+                    "status": "FILLED",
+                },
+            },
+            allow_mock_transport=True,
+            clock=lambda: 1_800_000_000.0,
+        )
+        with self.ready_env():
+            edge(buy_action(), lambda: None, **call_context())
+        self.assertEqual(
+            ["global-authority", "durable-marker", "send"], events
+        )
+
+    def test_swapped_stale_or_closed_global_authority_never_marks_or_sends(self) -> None:
+        hostile_snapshots = (
+            exact_global_authority(sessionId="bnsft-swapped-session-0001"),
+            exact_global_authority(observedEpoch=1_799_999_990.0),
+            exact_global_authority(entryAuthorityOpen=False),
+            exact_global_authority(hardStopEpoch=1_800_000_000.0),
+        )
+        for snapshot in hostile_snapshots:
+            with self.subTest(snapshot=snapshot):
+                claim = durable_claim()
+                events: list[str] = []
+                edge = BinanceSpotFunctionalMutationEdge(
+                    authority_reader=exact_authority,
+                    claim_reader=lambda _: claim,
+                    claim_marker=lambda _: events.append("durable-marker"),
+                    global_first_live_authority_reader=(
+                        lambda **_request: snapshot
+                    ),
+                    sender=lambda _: events.append("send")
+                    or {"ok": True, "json": {}},
+                    allow_mock_transport=True,
+                    clock=lambda: 1_800_000_000.0,
+                )
+                with self.ready_env(), self.assertRaises(
+                    BinanceSpotFunctionalMutationNotSent
+                ):
+                    edge(buy_action(), lambda: None, **call_context())
+                self.assertEqual([], events)
+
+    def test_global_authority_reader_failure_never_marks_or_sends(self) -> None:
+        claim = durable_claim()
+        events: list[str] = []
+
+        def failed_reader(**_request: object) -> dict[str, object]:
+            raise TimeoutError("coordinator authority unavailable")
+
+        edge = BinanceSpotFunctionalMutationEdge(
+            authority_reader=exact_authority,
+            claim_reader=lambda _: claim,
+            claim_marker=lambda _: events.append("durable-marker"),
+            global_first_live_authority_reader=failed_reader,
+            sender=lambda _: events.append("send") or {"ok": True, "json": {}},
+            allow_mock_transport=True,
+            clock=lambda: 1_800_000_000.0,
+        )
+        with self.ready_env(), self.assertRaisesRegex(
+            BinanceSpotFunctionalMutationNotSent, "failed closed"
+        ):
+            edge(buy_action(), lambda: None, **call_context())
+        self.assertEqual([], events)
 
     def test_global_real_orders_true_closes_functional_edge(self) -> None:
         with self.ready_env(), patch.dict(

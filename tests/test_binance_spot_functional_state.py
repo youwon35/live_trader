@@ -11,6 +11,9 @@ from live_trader.binance_spot_functional_state import (
     BinanceSpotFunctionalStateFacade,
     load_or_create_server_secret,
 )
+from live_trader.binance_spot_functional_exclusivity_provider import (
+    BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT,
+)
 
 
 class BinanceSpotFunctionalStateFacadeTest(unittest.TestCase):
@@ -179,6 +182,77 @@ class BinanceSpotFunctionalStateFacadeTest(unittest.TestCase):
             self.assertTrue(reader()["active"])
             store.authority_pointer.return_value["session_id"] = "other"
             self.assertFalse(reader()["active"])
+
+    def test_durable_provider_gate_requires_schema_and_path_identity_pins(
+        self,
+    ) -> None:
+        pin = {
+            "schemaVersion": "binance-account-exclusivity-verifier-pin/v1",
+            "verifierId": "binance-verifier-0001",
+            "keyId": "binance-authority-key-0001",
+            "algorithm": "ED25519_RFC8032_SHA512",
+            "verifierType": "PINNED_ED25519_DURABLE_BINANCE_EXCLUSIVITY_V1",
+            "verifierCodeSha256": "a" * 64,
+            "verifierConfigSha256": "b" * 64,
+            "keyFingerprintSha256": "c" * 64,
+            "authorityPinned": True,
+        }
+
+        class Verifier:
+            @staticmethod
+            def identity():
+                return dict(pin)
+
+        class Reader:
+            def __init__(self) -> None:
+                self.value = {
+                    "injectionReady": True,
+                    "asymmetricPublicKeyOnly": True,
+                    "durableProofSource": True,
+                    "durableRequestOutbox": True,
+                    "durableConsumerCursor": True,
+                    "restartVerifiable": True,
+                    "signingPrimitivePresent": False,
+                    "networkOrderPostAllowed": False,
+                }
+
+            def __call__(self, **_kwargs):
+                raise AssertionError("gate snapshot must not read a proof")
+
+            def status(self):
+                return dict(self.value)
+
+        reader = Reader()
+        root = Path(self.temporary.name)
+        facade = BinanceSpotFunctionalStateFacade(
+            database_path=root / "provider-gate.sqlite3",
+            publication_proof_path=self.proof,
+            data_root=root,
+            server_secret_path=root / "provider-gate.key",
+            ordinary_routes_closed_reader=lambda: True,
+            account_exclusivity_proof_reader=reader,
+            account_exclusivity_verifier=Verifier(),
+            account_exclusivity_verifier_pin=pin,
+            account_identity_fingerprint="d" * 64,
+        )
+        self.assertFalse(
+            facade._first_live_gate_snapshot()[
+                "accountExclusivityDurableProviderReady"
+            ]
+        )
+        reader.value.update(
+            {
+                "cursorSchemaFingerprint": (
+                    BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT
+                ),
+                "cursorPathIdentityPinned": True,
+            }
+        )
+        self.assertTrue(
+            facade._first_live_gate_snapshot()[
+                "accountExclusivityDurableProviderReady"
+            ]
+        )
 
 
 if __name__ == "__main__":

@@ -461,12 +461,14 @@ class UpbitFunctionalServerContractTest(unittest.TestCase):
             result = state._upbit_functional_emergency_cleanup_after_latch()
         self.assertFalse(result["ok"])
         self.assertEqual("RECONCILIATION_REQUIRED", result["state"])
+        self.assertFalse(result["entryAuthorityRevoked"])
 
     def test_kill_latch_and_manager_session_mismatch_stops_neither(self) -> None:
         latch = {
             "ok": True,
             "state": "CLEANUP_ONLY",
             "sessionId": "upbit-cleanup-session-a-0001",
+            "cleanupOnly": True,
         }
         with (
             patch.object(state, "emergency_stop_active", return_value=True),
@@ -491,7 +493,22 @@ class UpbitFunctionalServerContractTest(unittest.TestCase):
             result = state._upbit_functional_emergency_cleanup_after_latch()
         self.assertFalse(result["ok"])
         self.assertEqual("RECONCILIATION_REQUIRED", result["state"])
+        self.assertTrue(result["entryAuthorityRevoked"])
         stop.assert_not_called()
+
+    def test_kill_cleanup_exception_never_claims_entry_revocation(self) -> None:
+        with (
+            patch.object(state, "emergency_stop_active", return_value=True),
+            patch.object(
+                state,
+                "_request_upbit_functional_cleanup_only",
+                side_effect=RuntimeError("durable-store-unreadable"),
+            ),
+        ):
+            result = state._upbit_functional_emergency_cleanup_after_latch()
+        self.assertFalse(result["ok"])
+        self.assertEqual("RECONCILIATION_REQUIRED", result["state"])
+        self.assertFalse(result["entryAuthorityRevoked"])
 
     def test_stop_durably_revokes_entry_before_waiting_for_manager(self) -> None:
         calls: list[str] = []
@@ -516,6 +533,11 @@ class UpbitFunctionalServerContractTest(unittest.TestCase):
                 state,
                 "_consume_upbit_functional_operator_confirmation",
                 return_value={"ok": True},
+            ),
+            patch.object(
+                state,
+                "_revoke_crypto_first_live_entry_before_cleanup",
+                return_value={"ok": True, "entryAuthorityRevoked": True},
             ),
             patch.object(
                 state,
@@ -899,6 +921,10 @@ class UpbitFunctionalServerContractTest(unittest.TestCase):
                 "start_upbit_functional_backend",
                 return_value={"ok": True},
             ) as start, patch.object(
+                state,
+                "_crypto_first_live_official_candidate_hold",
+                return_value="",
+            ), patch.object(
                 state,
                 "_approve_upbit_functional_permit_candidate",
                 return_value={"state": "APPROVED"},

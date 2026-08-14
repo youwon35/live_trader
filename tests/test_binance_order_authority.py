@@ -7,11 +7,12 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from live_trader.binance_order_authority import (
     BinanceOrderAuthorityError,
     _reset_binance_order_authority_reader_for_tests,
+    binance_functional_authority_open_fail_closed,
     binance_route_authority_serialization,
     functional_binance_final_mutation_boundary,
     ordinary_binance_final_mutation_boundary,
@@ -82,6 +83,36 @@ class BinanceOrderAuthorityTest(unittest.TestCase):
                 operation="SPOT_PLACE_ORDER"
             ):
                 self.fail("ordinary sender must not be reached")
+
+    def test_authority_open_helper_requires_an_exact_boolean(self) -> None:
+        self.assertFalse(binance_functional_authority_open_fail_closed())
+        self.snapshot["functionalAuthorityOpen"] = True
+        self.assertTrue(binance_functional_authority_open_fail_closed())
+        for hostile in (None, "false", 0):
+            with self.subTest(hostile=hostile):
+                self.snapshot["functionalAuthorityOpen"] = hostile
+                self.assertTrue(
+                    binance_functional_authority_open_fail_closed()
+                )
+        self.snapshot.pop("functionalAuthorityOpen")
+        self.assertTrue(binance_functional_authority_open_fail_closed())
+
+    def test_non_boolean_authority_blocks_ordinary_boundary_and_sender(
+        self,
+    ) -> None:
+        for hostile in (None, "false", 0, "missing"):
+            with self.subTest(hostile=hostile):
+                if hostile == "missing":
+                    self.snapshot.pop("functionalAuthorityOpen", None)
+                else:
+                    self.snapshot["functionalAuthorityOpen"] = hostile
+                sender = Mock()
+                with self.assertRaises(BinanceOrderAuthorityError):
+                    with ordinary_binance_final_mutation_boundary(
+                        operation="SPOT_PLACE_ORDER"
+                    ):
+                        sender()
+                sender.assert_not_called()
 
     def test_futures_test_order_smoke_cannot_reach_signed_post(self) -> None:
         from live_trader.brokers import (

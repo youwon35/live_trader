@@ -103,6 +103,10 @@ class ServerSafetyTests(unittest.TestCase):
             ) as disarm,
             patch("live_trader.daemon.read_daemon_status") as daemon_status,
             patch("live_trader.server.state.restore_runtime_from_checkpoint") as restore,
+            patch(
+                "live_trader.server.state."
+                "prepare_crypto_first_live_coordinator_state"
+            ) as prepare_crypto,
             patch("live_trader.server.state.recover_durable_emergency_stop") as recover,
             patch(
                 "live_trader.server.state.prepare_upbit_functional_backend_state"
@@ -112,15 +116,38 @@ class ServerSafetyTests(unittest.TestCase):
                 "prepare_binance_spot_functional_backend_state"
             ) as prepare_binance,
         ):
+            sequence: list[str] = []
+            disarm.side_effect = lambda **_kwargs: sequence.append("disarm")
+            daemon_status.side_effect = (
+                lambda **_kwargs: sequence.append("daemon")
+            )
+            restore.side_effect = lambda: sequence.append("restore")
+            prepare_crypto.side_effect = lambda: sequence.append("crypto")
+            recover.side_effect = lambda: sequence.append("recover")
+            prepare_upbit.side_effect = lambda: sequence.append("upbit")
+            prepare_binance.side_effect = lambda: sequence.append("binance")
             prepare_server_state()
 
         disarm.assert_called_once_with(persist=True)
         daemon_status.assert_called_once_with(persist=True)
         restore.assert_called_once_with()
+        prepare_crypto.assert_called_once_with()
         recover.assert_called_once_with()
         prepare_upbit.assert_called_once_with()
         prepare_binance.assert_called_once_with()
         assert_instance.assert_called_once_with()
+        self.assertEqual(
+            [
+                "disarm",
+                "daemon",
+                "restore",
+                "crypto",
+                "recover",
+                "upbit",
+                "binance",
+            ],
+            sequence,
+        )
 
     def test_server_prepare_rejects_embedded_process_without_instance_lease(self) -> None:
         with (

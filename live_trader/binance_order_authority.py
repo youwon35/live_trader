@@ -67,7 +67,12 @@ def _snapshot() -> dict[str, Any]:
 
 def binance_functional_authority_open_fail_closed() -> bool:
     try:
-        return _snapshot().get("functionalAuthorityOpen") is True
+        authority_open = _snapshot().get("functionalAuthorityOpen")
+        if type(authority_open) is not bool:
+            raise BinanceOrderAuthorityError(
+                "durable Binance authority state is not boolean"
+            )
+        return authority_open
     except Exception:
         return True
 
@@ -106,7 +111,7 @@ def ordinary_binance_final_mutation_boundary(
                 raise BinanceOrderAuthorityError(
                     "Binance mutation requires the official application lease"
                 )
-            if snapshot.get("functionalAuthorityOpen") is True:
+            if snapshot.get("functionalAuthorityOpen") is not False:
                 raise BinanceOrderAuthorityError(
                     "ordinary Binance mutation blocked by functional authority"
                 )

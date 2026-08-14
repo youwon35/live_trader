@@ -21,10 +21,14 @@ from .upbit_continuous_functional import (
     EVIDENCE_CLASS,
     EXECUTION_PURPOSE,
     EXECUTION_ROUTE,
+    GlobalFirstLiveAuthorityReader,
     SYMBOL,
     UpbitBrokerPostNotSent,
+    UpbitFunctionalBlocked,
     UpbitFunctionalError,
+    UpbitPermitScope,
     _stable_hash,
+    verify_upbit_global_first_live_authority,
 )
 from .upbit_functional_transport import (
     build_upbit_functional_authorization,
@@ -43,6 +47,12 @@ _SELL_FIELDS = frozenset({"market", "side", "ord_type", "volume", "identifier"})
 
 class UpbitFunctionalMutationNotSent(UpbitBrokerPostNotSent):
     pass
+
+
+class UpbitGlobalFirstLiveFenceNotSent(UpbitFunctionalMutationNotSent):
+    """The shared owner vanished after core preflight but before transport."""
+
+    requires_cleanup = True
 
 
 class UpbitFunctionalMutationOutcomeUnknown(UpbitFunctionalError):
@@ -237,6 +247,12 @@ class UpbitFunctionalMutationEdge:
         authority_reader: Callable[[], Mapping[str, Any]],
         claim_reader: Callable[[str], Mapping[str, Any]],
         post_boundary_marker: Callable[[str, str], Mapping[str, Any]],
+        global_first_live_authority_reader: (
+            GlobalFirstLiveAuthorityReader | None
+        ) = None,
+        global_first_live_owner_identity_hash: str = "",
+        global_first_live_scope: UpbitPermitScope | None = None,
+        clock: Callable[[], Any] | None = None,
         sender: Callable[[PreparedRequest], Mapping[str, Any]] = send_prepared_request,
         allow_mock_transport: bool = False,
     ) -> None:
@@ -260,6 +276,31 @@ class UpbitFunctionalMutationEdge:
         self.authority_reader = authority_reader
         self.claim_reader = claim_reader
         self.post_boundary_marker = post_boundary_marker
+        self.global_first_live_authority_reader = (
+            global_first_live_authority_reader
+        )
+        self.global_first_live_owner_identity_hash = _text(
+            global_first_live_owner_identity_hash
+        ).lower()
+        self.global_first_live_scope = global_first_live_scope
+        self.clock = clock
+        if global_first_live_authority_reader is not None and (
+            global_first_live_scope is None
+            or clock is None
+            or global_first_live_scope.permit_id != self.permit_id
+            or global_first_live_scope.permit_hash != self.permit_hash
+            or global_first_live_scope.route_scope_hash
+            != self.route_scope_hash
+            or global_first_live_scope.account_fingerprint
+            != self.account_fingerprint
+            or _HASH_RE.fullmatch(
+                self.global_first_live_owner_identity_hash
+            )
+            is None
+        ):
+            raise ValueError(
+                "upbit-mutation-global-first-live-wiring-invalid"
+            )
         self.sender = sender
         self.allow_mock_transport = bool(allow_mock_transport)
 
@@ -407,6 +448,28 @@ class UpbitFunctionalMutationEdge:
             raise UpbitFunctionalMutationNotSent(
                 "upbit-mutation-durable-identifier-mismatch"
             )
+        if self.global_first_live_authority_reader is not None:
+            try:
+                verify_upbit_global_first_live_authority(
+                    self.global_first_live_authority_reader,
+                    scope=self.global_first_live_scope,
+                    session_id=self.session_id,
+                    owner_identity_hash=(
+                        self.global_first_live_owner_identity_hash
+                    ),
+                    action=action,
+                    cleanup=action in {
+                        "CLEANUP_SELL",
+                        "CLEANUP_CANCEL",
+                    },
+                    now=self.clock(),
+                    claim_id=claim_id,
+                    request_hash=request_hash,
+                )
+            except UpbitFunctionalBlocked as exc:
+                raise UpbitGlobalFirstLiveFenceNotSent(
+                    "upbit-mutation-global-first-live-dispatch-fence-closed"
+                ) from exc
 
     def _send_once(
         self,
@@ -537,6 +600,7 @@ __all__ = [
     "UPBIT_FUNCTIONAL_MUTATION_AVAILABLE",
     "UpbitFunctionalMutationEdge",
     "UpbitFunctionalMutationNotSent",
+    "UpbitGlobalFirstLiveFenceNotSent",
     "UpbitFunctionalMutationOutcomeUnknown",
     "UpbitFunctionalMutationRequest",
     "build_upbit_functional_cancel_request",

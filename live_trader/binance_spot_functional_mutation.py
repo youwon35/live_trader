@@ -16,10 +16,15 @@ import os
 import json
 import re
 import secrets
+import time
 from typing import Any, Callable, Mapping
 import urllib.parse
 
 from .binance_spot_continuous_functional import EVIDENCE_CLASS
+from .binance_spot_functional_exclusivity import (
+    BinanceSpotExclusivityError,
+    verify_global_first_live_authority,
+)
 from .binance_spot_functional_transport import (
     assert_binance_spot_production_origin,
     binance_api_key_fingerprint,
@@ -353,8 +358,12 @@ class BinanceSpotFunctionalMutationEdge:
         claim_reader: Callable[[str], Mapping[str, Any]],
         claim_marker: Callable[[str], None] | None = None,
         dispatch_lease_factory: Callable[..., Any] | None = None,
+        global_first_live_authority_reader: (
+            Callable[..., Mapping[str, Any]] | None
+        ) = None,
         sender: Callable[[PreparedRequest], Mapping[str, Any]] = send_prepared_request,
         allow_mock_transport: bool = False,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if allow_mock_transport and sender is send_prepared_request:
             raise ValueError("mock transport requires an explicitly injected sender")
@@ -363,7 +372,11 @@ class BinanceSpotFunctionalMutationEdge:
         self.claim_reader = claim_reader
         self.claim_marker = claim_marker
         self.dispatch_lease_factory = dispatch_lease_factory
+        self.global_first_live_authority_reader = (
+            global_first_live_authority_reader
+        )
         self.allow_mock_transport = bool(allow_mock_transport)
+        self.clock = clock
 
     def _assert_exact_authority(
         self,
@@ -575,6 +588,38 @@ class BinanceSpotFunctionalMutationEdge:
             account_fingerprint=account_fingerprint,
             authority_revision=authority_revision,
         )
+        global_reader = self.global_first_live_authority_reader
+        if global_reader is None and not self.allow_mock_transport:
+            raise BinanceSpotFunctionalMutationNotSent(
+                "production mutation edge lacks global first-live authority"
+            )
+        if global_reader is not None:
+            cleanup_only = action.get("cleanupOnly") is True
+            try:
+                global_snapshot = global_reader(
+                    purpose="MUTATION_FINAL_PRE_MARKER",
+                    session_id=_text(session_id),
+                    permit_id=_text(permit_id),
+                    permit_hash=_text(permit_hash).lower(),
+                    account_fingerprint=_text(account_fingerprint).lower(),
+                    cleanup_only=cleanup_only,
+                )
+                verify_global_first_live_authority(
+                    global_snapshot,
+                    purpose="MUTATION_FINAL_PRE_MARKER",
+                    session_id=session_id,
+                    permit_id=permit_id,
+                    permit_hash=permit_hash,
+                    account_fingerprint=account_fingerprint,
+                    cleanup_only=cleanup_only,
+                    now_epoch=float(self.clock()),
+                )
+            except BinanceSpotExclusivityError as exc:
+                raise BinanceSpotFunctionalMutationNotSent(str(exc)) from exc
+            except Exception as exc:
+                raise BinanceSpotFunctionalMutationNotSent(
+                    "global first-live authority reader failed closed"
+                ) from exc
         prepared = build_binance_spot_functional_mutation_request(
             action,
             expected_account_fingerprint=account_fingerprint,

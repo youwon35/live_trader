@@ -17,9 +17,11 @@ from typing import Any, Callable, Mapping
 
 from .upbit_continuous_functional import (
     AccountExclusivityProofVerifier,
+    GlobalFirstLiveAuthorityReader,
     UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
     UPBIT_CONTINUOUS_FUNCTIONAL_AVAILABLE,
     UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED,
+    UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED,
     UpbitContinuousFunctionalService,
     UpbitFunctionalBlocked,
     UpbitFunctionalLedger,
@@ -60,6 +62,7 @@ def production_entrypoint_status() -> dict[str, Any]:
             and UPBIT_CONTINUOUS_FUNCTIONAL_AVAILABLE
             and UPBIT_FUNCTIONAL_MUTATION_AVAILABLE
             and verifier_ready
+            and UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED
         ),
         "route": UPBIT_FUNCTIONAL_ROUTE_KEY,
         "reason": (
@@ -75,6 +78,9 @@ def production_entrypoint_status() -> dict[str, Any]:
             UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED
         ),
         "accountExclusivityPreSendReady": verifier_ready,
+        "globalFirstLiveDispatchFenceReleased": (
+            UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED
+        ),
         "ordinaryLiveRouteChanged": False,
         "upbitSmokeRouteChanged": False,
         "legacyOneShotImported": False,
@@ -107,6 +113,10 @@ class UpbitFunctionalProductionGraph:
         account_exclusivity_proof_reader: Callable[..., Mapping[str, Any]] | None = None,
         account_exclusivity_verifier: AccountExclusivityProofVerifier | None = None,
         account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+        global_first_live_authority_reader: (
+            GlobalFirstLiveAuthorityReader | None
+        ) = None,
+        global_first_live_owner_identity_hash: str = "",
         _capability: object | None = None,
     ) -> None:
         if _capability not in {
@@ -146,6 +156,23 @@ class UpbitFunctionalProductionGraph:
                 self.account_exclusivity_verifier_pin,
             )
         )
+        self.global_first_live_authority_reader = (
+            global_first_live_authority_reader
+        )
+        self.global_first_live_owner_identity_hash = str(
+            global_first_live_owner_identity_hash or ""
+        ).strip().lower()
+        if (
+            _capability is _GRAPH_CONSTRUCTION_CAPABILITY
+            and UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED
+            and (
+                not callable(self.global_first_live_authority_reader)
+                or len(self.global_first_live_owner_identity_hash) != 64
+            )
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-global-first-live-fence-required"
+            )
         self.lease_reader_factory = lease_reader_factory
         self.sender = sender
         self.approved_permit_reader = approved_permit_reader
@@ -182,6 +209,18 @@ class UpbitFunctionalProductionGraph:
                 "accountExclusivityProofSourceWired": callable(
                     self.account_exclusivity_proof_reader
                 ),
+                "globalFirstLiveDispatchFence": {
+                    "wired": callable(
+                        self.global_first_live_authority_reader
+                    ),
+                    "ownerIdentityBound": bool(
+                        len(self.global_first_live_owner_identity_hash) == 64
+                    ),
+                    "releaseLatch": (
+                        UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED
+                    ),
+                    "networkOrderPostAllowed": False,
+                },
                 "controller": self.controller.snapshot(),
                 "startupAudit": dict(self._startup_audit),
             }
@@ -442,6 +481,14 @@ class UpbitFunctionalProductionGraph:
                     session_id, claim_id
                 ),
                 post_boundary_marker=self.ledger.mark_post_may_have_crossed,
+                global_first_live_authority_reader=(
+                    self.global_first_live_authority_reader
+                ),
+                global_first_live_owner_identity_hash=(
+                    self.global_first_live_owner_identity_hash
+                ),
+                global_first_live_scope=scope,
+                clock=self.clock,
                 sender=self.sender,
             )
             result = self.controller.start(
@@ -462,6 +509,12 @@ class UpbitFunctionalProductionGraph:
                 ),
                 terminal_stream_barrier=self._terminal_stream_barrier,
                 clock=self.clock,
+                global_first_live_authority_reader=(
+                    self.global_first_live_authority_reader
+                ),
+                global_first_live_owner_identity_hash=(
+                    self.global_first_live_owner_identity_hash
+                ),
                 **(
                     {
                         "account_exclusivity_verifier": (
@@ -1063,6 +1116,17 @@ class UpbitFunctionalProductionGraph:
                 session_id, claim_id
             ),
             post_boundary_marker=self.ledger.mark_post_may_have_crossed,
+            global_first_live_authority_reader=(
+                self.global_first_live_authority_reader
+            ),
+            global_first_live_owner_identity_hash=(
+                self.global_first_live_owner_identity_hash
+            ),
+            global_first_live_scope=UpbitPermitScope.parse(
+                permit,
+                immutable_selection=self._selection_reader(),
+            ),
+            clock=self.clock,
             sender=self.sender,
         )
         service: UpbitContinuousFunctionalService | None = None
@@ -1087,6 +1151,12 @@ class UpbitFunctionalProductionGraph:
                 ),
                 terminal_stream_barrier=self._terminal_stream_barrier,
                 clock=self.clock,
+                global_first_live_authority_reader=(
+                    self.global_first_live_authority_reader
+                ),
+                global_first_live_owner_identity_hash=(
+                    self.global_first_live_owner_identity_hash
+                ),
                 **(
                     {
                         "account_exclusivity_verifier": (

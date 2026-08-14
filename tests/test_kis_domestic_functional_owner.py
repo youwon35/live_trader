@@ -206,6 +206,23 @@ class _Fixture:
 
 
 class KisDomesticFunctionalOwnerTest(unittest.TestCase):
+    def test_production_process_safety_pin_matches_exact_audited_file(self):
+        expected = (
+            "175b2074e983c74d67ce4178784ac3fd8a7db5aa1e1e9477dd1f2a8bb66ffa80"
+        )
+        process_safety_path = (
+            Path(__file__).parents[1] / "live_trader" / "process_safety.py"
+        )
+        actual = hashlib.sha256(process_safety_path.read_bytes()).hexdigest()
+        status = owner_component_status()
+
+        self.assertEqual(expected, actual)
+        self.assertEqual(expected, status["pinnedProcessSafetyFileHash"])
+        self.assertFalse(status["productionAvailable"])
+        self.assertFalse(status["networkAvailable"])
+        self.assertFalse(status["mutationAvailable"])
+        self.assertFalse(status["networkOrderPostAllowed"])
+
     def test_first_acquire_heartbeat_guard_and_clean_release(self):
         fixture = _Fixture()
         try:

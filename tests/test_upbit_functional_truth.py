@@ -185,6 +185,7 @@ class OfficialUpbitFunctionalTruthReaderTest(unittest.TestCase):
         self.assertEqual(1, len(calls))
         call = calls[0]
         self.assertEqual("upbit-functional-session-0001", call["session_id"])
+        self.assertEqual("PREFLIGHT", call["phase"])
         self.assertEqual(ACCOUNT, call["account_fingerprint"])
         self.assertEqual(NOW - timedelta(hours=1), call["session_started_at"])
         self.assertEqual(NOW, call["observation_started_at"])

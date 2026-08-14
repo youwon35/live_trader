@@ -34,7 +34,7 @@ DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 30
 _SCOPE = "live-trader:kis-domestic-functional-owner:kr-live-continuous:v1"
 _SCOPE_HASH = hashlib.sha256(_SCOPE.encode("utf-8")).hexdigest()
 _PINNED_PROCESS_SAFETY_FILE_HASH = (
-    "edd46ece1ab16a643e3a0a9886eefe9ec439c7c317d04eed70abb87bb13e2a03"
+    "175b2074e983c74d67ce4178784ac3fd8a7db5aa1e1e9477dd1f2a8bb66ffa80"
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _COMPONENTS = (

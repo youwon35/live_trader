@@ -11,7 +11,9 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
+import re
 import secrets
 import threading
 import time
@@ -20,6 +22,7 @@ from typing import Any, Callable, Mapping
 
 from .upbit_continuous_functional import (
     AccountExclusivityProofVerifier,
+    GlobalFirstLiveAuthorityReader,
     UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
     UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED,
     UpbitFunctionalBlocked,
@@ -58,6 +61,142 @@ _SCHEDULER_START_ATTEMPTS = 3
 _BACKEND_SINGLETON_LOCK = threading.RLock()
 _BACKEND_SINGLETON: "UpbitFunctionalBackendManager | None" = None
 _BACKEND_CONSTRUCTION_CAPABILITY = object()
+_LOWER_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_OWNER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,160}$")
+_CRYPTO_OWNER_FIELDS = {
+    "pid",
+    "processStartEpoch",
+    "bootId",
+    "applicationLeaseEpoch",
+    "accountLeaseScope",
+}
+_LEGACY_OWNER_FIELDS = {
+    "schemaVersion",
+    "scopeHash",
+    "ownerPid",
+    "acquiredAt",
+}
+
+
+def _validated_owner_process_identity(
+    value: Mapping[str, Any] | None,
+    *,
+    expected_account_fingerprint: str = "",
+) -> tuple[dict[str, Any], str] | None:
+    """Normalize only the two server-owned identity contracts.
+
+    The crypto form deliberately mirrors the coordinator's normalized JSON,
+    so its SHA256 is byte-for-byte identical to ``ownerIdentityHash``.
+    Exotic scalars and JSON fallback stringification are never accepted.
+    """
+
+    if not isinstance(value, Mapping):
+        return None
+    identity = dict(value)
+    normalized: dict[str, Any]
+    if set(identity) == _LEGACY_OWNER_FIELDS:
+        scope_hash = identity.get("scopeHash")
+        owner_pid = identity.get("ownerPid")
+        acquired_text = identity.get("acquiredAt")
+        if (
+            identity.get("schemaVersion")
+            != "upbit-functional-process-owner/v1"
+            or type(scope_hash) is not str
+            or _LOWER_HASH_RE.fullmatch(scope_hash) is None
+            or type(owner_pid) is not int
+            or isinstance(owner_pid, bool)
+            or owner_pid <= 0
+            or type(acquired_text) is not str
+            or acquired_text != acquired_text.strip()
+        ):
+            return None
+        try:
+            acquired_at = datetime.fromisoformat(
+                acquired_text.replace("Z", "+00:00")
+            )
+            acquired_epoch = acquired_at.timestamp()
+        except (OSError, OverflowError, TypeError, ValueError):
+            return None
+        if (
+            acquired_at.tzinfo is None
+            or not math.isfinite(acquired_epoch)
+            or acquired_epoch <= 0
+        ):
+            return None
+        normalized = {
+            "schemaVersion": "upbit-functional-process-owner/v1",
+            "scopeHash": scope_hash,
+            "ownerPid": owner_pid,
+            "acquiredAt": acquired_text,
+        }
+    elif set(identity) == _CRYPTO_OWNER_FIELDS:
+        pid = identity.get("pid")
+        process_start_raw = identity.get("processStartEpoch")
+        application_lease_raw = identity.get("applicationLeaseEpoch")
+        boot_id = identity.get("bootId")
+        account_scope = identity.get("accountLeaseScope")
+        if (
+            type(pid) is not int
+            or isinstance(pid, bool)
+            or pid != os.getpid()
+            or isinstance(process_start_raw, bool)
+            or type(process_start_raw) not in {int, float}
+            or isinstance(application_lease_raw, bool)
+            or type(application_lease_raw) not in {int, float}
+            or type(boot_id) is not str
+            or boot_id != boot_id.strip()
+            or _OWNER_ID_RE.fullmatch(boot_id) is None
+            or type(account_scope) is not str
+            or account_scope != account_scope.strip()
+            or re.fullmatch(
+                r"crypto-first-live-account:UPBIT:[0-9a-f]{64}",
+                account_scope,
+            )
+            is None
+        ):
+            return None
+        if (
+            expected_account_fingerprint
+            and (
+                _LOWER_HASH_RE.fullmatch(expected_account_fingerprint)
+                is None
+                or account_scope
+                != (
+                    "crypto-first-live-account:UPBIT:"
+                    + expected_account_fingerprint
+                )
+            )
+        ):
+            return None
+        process_start = float(process_start_raw)
+        application_lease = float(application_lease_raw)
+        if (
+            not math.isfinite(process_start)
+            or process_start <= 0
+            or not math.isfinite(application_lease)
+            or application_lease <= process_start
+        ):
+            return None
+        normalized = {
+            "pid": pid,
+            "processStartEpoch": process_start,
+            "bootId": boot_id,
+            "applicationLeaseEpoch": application_lease,
+            "accountLeaseScope": account_scope,
+        }
+    else:
+        return None
+    try:
+        encoded = json.dumps(
+            normalized,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return normalized, hashlib.sha256(encoded).hexdigest()
 
 
 def upbit_functional_composite_available() -> bool:
@@ -268,6 +407,9 @@ class UpbitFunctionalBackendManager:
         account_exclusivity_proof_reader: Callable[..., Mapping[str, Any]] | None = None,
         account_exclusivity_verifier: AccountExclusivityProofVerifier | None = None,
         account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+        global_first_live_authority_reader: (
+            GlobalFirstLiveAuthorityReader | None
+        ) = None,
         owner_process_identity: Mapping[str, Any] | None = None,
         allow_mock_graph: bool = False,
         _capability: object | None = None,
@@ -297,6 +439,14 @@ class UpbitFunctionalBackendManager:
             if isinstance(account_exclusivity_verifier_pin, Mapping)
             else None
         )
+        self._global_first_live_authority_reader = (
+            global_first_live_authority_reader
+        )
+        account_fingerprint = upbit_credential_fingerprint()
+        if not account_fingerprint:
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-backend-account-credential-missing"
+            )
         process_identity = (
             dict(owner_process_identity)
             if isinstance(owner_process_identity, Mapping)
@@ -305,41 +455,23 @@ class UpbitFunctionalBackendManager:
                 "ownerPid": os.getpid(),
             }
         )
-        try:
-            acquired_at = datetime.fromisoformat(
-                str(process_identity.get("acquiredAt") or "").replace(
-                    "Z", "+00:00"
-                )
-            )
-        except (TypeError, ValueError):
-            acquired_at = None
-        try:
-            owner_pid = int(process_identity.get("ownerPid") or 0)
-        except (TypeError, ValueError):
-            owner_pid = 0
-        scope_hash = str(process_identity.get("scopeHash") or "").lower()
-        self._owner_process_identity_durable = bool(
-            process_identity.get("schemaVersion")
-            == "upbit-functional-process-owner/v1"
-            and len(scope_hash) == 64
-            and all(
-                character in "0123456789abcdef"
-                for character in scope_hash
-            )
-            and owner_pid > 0
-            and acquired_at is not None
-            and acquired_at.tzinfo is not None
+        validated_process_identity = _validated_owner_process_identity(
+            process_identity,
+            expected_account_fingerprint=account_fingerprint,
         )
-        self._owner_process_identity_hash = hashlib.sha256(
-            json.dumps(
-                process_identity,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
+        self._owner_process_identity = (
+            dict(validated_process_identity[0])
+            if validated_process_identity is not None
+            else {}
+        )
+        self._owner_process_identity_durable = bool(
+            validated_process_identity is not None
+        )
+        self._owner_process_identity_hash = (
+            validated_process_identity[1]
+            if validated_process_identity is not None
+            else ""
+        )
         self._durable_owner_lease_required = bool(
             getattr(approval_store, "durable_owner_lease_required", False)
         )
@@ -396,11 +528,6 @@ class UpbitFunctionalBackendManager:
         self._scheduler: threading.Thread | None = None
         self._terminal_state = "IDLE"
         self._terminal_detail = ""
-        account_fingerprint = upbit_credential_fingerprint()
-        if not account_fingerprint:
-            raise UpbitFunctionalBlocked(
-                "upbit-functional-backend-account-credential-missing"
-            )
         self.websocket_source = websocket_source or (
             OfficialUpbitFunctionalMyOrderPump(
                 expected_account_fingerprint=account_fingerprint,
@@ -456,6 +583,12 @@ class UpbitFunctionalBackendManager:
             ),
             account_exclusivity_verifier_pin=(
                 self._account_exclusivity_verifier_pin
+            ),
+            global_first_live_authority_reader=(
+                self._global_first_live_authority_reader
+            ),
+            global_first_live_owner_identity_hash=(
+                self._owner_process_identity_hash
             ),
             **({"allow_mock_graph": True} if allow_mock_graph else {}),
         )
@@ -613,6 +746,13 @@ class UpbitFunctionalBackendManager:
                 for character in self._owner_process_identity_hash
             )
         )
+        global_fence = graph.get("globalFirstLiveDispatchFence")
+        global_fence_wired = bool(
+            isinstance(global_fence, Mapping)
+            and global_fence.get("wired") is True
+            and global_fence.get("ownerIdentityBound") is True
+            and callable(self._global_first_live_authority_reader)
+        )
         blockers = []
         if store.get("prepared") is not True:
             blockers.append("APPROVAL_STORE_PREREQUISITES_INCOMPLETE")
@@ -624,6 +764,8 @@ class UpbitFunctionalBackendManager:
             blockers.append("DURABLE_OWNER_LEASE_NOT_REQUIRED")
         if not process_identity_ready:
             blockers.append("PROCESS_IDENTITY_NOT_DURABLE")
+        if not global_fence_wired:
+            blockers.append("GLOBAL_FIRST_LIVE_DISPATCH_FENCE_MISSING")
         return {
             "prepared": not blockers,
             "blockers": blockers,
@@ -637,6 +779,11 @@ class UpbitFunctionalBackendManager:
             "proofSourceWired": proof_source_wired,
             "ownerLease": dict(owner) if isinstance(owner, Mapping) else {},
             "processIdentityHash": self._owner_process_identity_hash,
+            "globalFirstLiveDispatchFence": (
+                dict(global_fence)
+                if isinstance(global_fence, Mapping)
+                else {}
+            ),
         }
 
     def _acquire_durable_owner_locked(
@@ -1741,6 +1888,9 @@ def prepare_upbit_functional_backend(
     account_exclusivity_proof_reader: Callable[..., Mapping[str, Any]] | None = None,
     account_exclusivity_verifier: AccountExclusivityProofVerifier | None = None,
     account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+    global_first_live_authority_reader: (
+        GlobalFirstLiveAuthorityReader | None
+    ) = None,
     owner_process_identity: Mapping[str, Any] | None = None,
     allow_mock_graph: bool = False,
 ) -> dict[str, Any]:
@@ -1791,6 +1941,9 @@ def prepare_upbit_functional_backend(
                 ),
                 account_exclusivity_verifier_pin=(
                     account_exclusivity_verifier_pin
+                ),
+                global_first_live_authority_reader=(
+                    global_first_live_authority_reader
                 ),
                 owner_process_identity=owner_process_identity,
                 allow_mock_graph=allow_mock_graph,

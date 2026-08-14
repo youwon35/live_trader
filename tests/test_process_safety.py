@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import errno
 import os
 import subprocess
@@ -20,10 +21,17 @@ from live_trader.emergency_stop import (
     engage_emergency_stop,
 )
 from live_trader.process_safety import (
+    ProcessSafetyAuthorityError,
+    _authoritative_current_process_identity,
     _windows_mutex_name,
+    crypto_first_live_account_lease_status,
+    crypto_first_live_owner_identity,
+    hold_crypto_first_live_account_lease,
     hold_kis_dispatch_lease,
     hold_live_trader_instance_lease,
+    hold_process_lease,
     release_held_leases_for_tests,
+    verify_crypto_first_live_owner_identity,
 )
 
 
@@ -167,21 +175,36 @@ class CrossProcessLeaseTests(unittest.TestCase):
             },
         )
         self.environment.start()
+        self.application_scope = (
+            f"live-trader:application-instance:test:{os.getpid()}:{id(self)}"
+        )
+        self.application_scope_patch = patch(
+            "live_trader.process_safety._APPLICATION_INSTANCE_SCOPE",
+            self.application_scope,
+        )
+        self.application_scope_patch.start()
         release_held_leases_for_tests()
 
     def tearDown(self) -> None:
         release_held_leases_for_tests()
+        self.application_scope_patch.stop()
         self.environment.stop()
         self.temporary.cleanup()
 
-    def _holding_child(self, expression: str) -> subprocess.Popen[str]:
+    def _holding_child_result(
+        self, expression: str
+    ) -> tuple[subprocess.Popen[str], dict[str, object]]:
         ready = Path(self.temporary.name) / f"ready-{time.time_ns()}.json"
         script = (
             "import json, os, time; from pathlib import Path; "
             f"os.environ['LIVE_TRADER_PROCESS_LOCK_DIR']={str(self.lock_root)!r}; "
             "os.environ['LIVE_TRADER_PROCESS_LOCK_NAMESPACE']='child-bypass-attempt'; "
+            "import live_trader.process_safety as process_safety; "
+            "process_safety._APPLICATION_INSTANCE_SCOPE="
+            f"{self.application_scope!r}; "
             "from live_trader.process_safety import "
-            "hold_kis_dispatch_lease, hold_live_trader_instance_lease; "
+            "hold_crypto_first_live_account_lease, hold_kis_dispatch_lease, "
+            "hold_live_trader_instance_lease, hold_process_lease; "
             f"result={expression}; "
             f"Path({str(ready)!r}).write_text(json.dumps(result), encoding='utf-8'); "
             "time.sleep(15)"
@@ -200,7 +223,14 @@ class CrossProcessLeaseTests(unittest.TestCase):
             error = child.stderr.read() if child.stderr else ""
             self._stop_child(child)
             self.fail(error or "child lease process did not become ready")
-        self.assertTrue(json.loads(ready.read_text(encoding="utf-8"))["acquired"])
+        result = json.loads(ready.read_text(encoding="utf-8"))
+        if result.get("acquired") is not True:
+            self._stop_child(child)
+            self.fail(f"child lease was not acquired: {result!r}")
+        return child, result
+
+    def _holding_child(self, expression: str) -> subprocess.Popen[str]:
+        child, _result = self._holding_child_result(expression)
         return child
 
     @staticmethod
@@ -260,6 +290,223 @@ class CrossProcessLeaseTests(unittest.TestCase):
             authority_id="permit-1",
         )
         self.assertTrue(acquired_after_exit["acquired"])
+
+    @staticmethod
+    def _crypto_fingerprint(label: str = "account") -> str:
+        return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+    def test_crypto_account_requires_official_application_lease(self) -> None:
+        fingerprint = self._crypto_fingerprint()
+
+        result = hold_crypto_first_live_account_lease(
+            "UPBIT", fingerprint
+        )
+
+        self.assertFalse(result["acquired"])
+        self.assertEqual(
+            "official-application-instance-lease-not-held",
+            result["reason"],
+        )
+
+    def test_crypto_account_scope_lane_and_hash_are_exact(self) -> None:
+        fingerprint = self._crypto_fingerprint()
+        invalid = (
+            ("upbit", fingerprint, "lane-not-exact"),
+            ("FUTURES", fingerprint, "lane-not-exact"),
+            ("UPBIT", fingerprint.upper(), "fingerprint-not-exact"),
+            ("BINANCE_SPOT", "abc", "fingerprint-not-exact"),
+        )
+
+        for lane, account, reason in invalid:
+            with self.subTest(lane=lane, account=account):
+                result = hold_crypto_first_live_account_lease(lane, account)
+                self.assertFalse(result["acquired"])
+                self.assertIn(reason, result["reason"])
+
+    def test_crypto_account_status_and_owner_identity_are_exact(self) -> None:
+        fingerprint = self._crypto_fingerprint("upbit-primary")
+        self.assertTrue(hold_live_trader_instance_lease()["acquired"])
+
+        acquired = hold_crypto_first_live_account_lease(
+            "UPBIT", fingerprint
+        )
+        status = crypto_first_live_account_lease_status(
+            "UPBIT", fingerprint
+        )
+        identity = crypto_first_live_owner_identity(
+            "UPBIT", fingerprint
+        )
+
+        exact_scope = f"crypto-first-live-account:UPBIT:{fingerprint}"
+        self.assertTrue(acquired["acquired"])
+        self.assertTrue(status["acquired"])
+        self.assertTrue(status["reused"])
+        self.assertEqual(exact_scope, status["accountLeaseScope"])
+        self.assertEqual(
+            {
+                "pid",
+                "processStartEpoch",
+                "bootId",
+                "applicationLeaseEpoch",
+                "accountLeaseScope",
+            },
+            set(identity),
+        )
+        self.assertEqual(os.getpid(), identity["pid"])
+        self.assertEqual(exact_scope, identity["accountLeaseScope"])
+        self.assertGreater(
+            identity["applicationLeaseEpoch"],
+            identity["processStartEpoch"],
+        )
+        release_held_leases_for_tests()
+        released = crypto_first_live_account_lease_status(
+            "UPBIT", fingerprint
+        )
+        self.assertFalse(released["acquired"])
+        self.assertEqual(
+            "official-application-instance-lease-not-held",
+            released["reason"],
+        )
+
+    def test_owner_identity_verifier_rechecks_current_kernel_identity(self) -> None:
+        fingerprint = self._crypto_fingerprint("binance-primary")
+        self.assertTrue(hold_live_trader_instance_lease()["acquired"])
+        acquired = hold_crypto_first_live_account_lease(
+            "BINANCE_SPOT", fingerprint
+        )
+        identity = dict(acquired["ownerIdentity"])
+        canonical = json.dumps(
+            identity,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        request = {
+            "schemaVersion": "crypto-first-live-owner-identity/v1",
+            "purpose": "DISPATCH_ENTRY_ORDER",
+            "scope": "CRYPTO_FIRST_LIVE_GLOBAL",
+            "runId": "crypto-first-live-run-test-0001",
+            "lane": "BINANCE_SPOT",
+            "accountFingerprint": fingerprint,
+            "ownerIdentity": identity,
+            "ownerIdentityHash": hashlib.sha256(
+                canonical.encode("utf-8")
+            ).hexdigest(),
+            "ownerEpoch": 1,
+            "coordinatorRevision": 2,
+        }
+
+        self.assertTrue(verify_crypto_first_live_owner_identity(request))
+        request["ownerIdentity"] = {
+            **identity,
+            "pid": int(identity["pid"]) + 1,
+        }
+        self.assertFalse(verify_crypto_first_live_owner_identity(request))
+
+    def test_unauthoritative_application_identity_fails_closed(self) -> None:
+        fingerprint = self._crypto_fingerprint("no-authority")
+        with patch(
+            "live_trader.process_safety."
+            "_authoritative_current_process_identity",
+            side_effect=ProcessSafetyAuthorityError("unavailable"),
+        ):
+            self.assertTrue(hold_live_trader_instance_lease()["acquired"])
+            blocked = hold_crypto_first_live_account_lease(
+                "UPBIT", fingerprint
+            )
+
+        self.assertFalse(blocked["acquired"])
+        self.assertEqual(
+            "application-instance-identity-not-authoritative",
+            blocked["reason"],
+        )
+
+    def test_changed_boot_identity_invalidates_current_application_lease(self) -> None:
+        fingerprint = self._crypto_fingerprint("changed-boot")
+        self.assertTrue(hold_live_trader_instance_lease()["acquired"])
+        current = _authoritative_current_process_identity()
+        changed = {**current, "bootId": "windows-boot-changed-00000001"}
+
+        with patch(
+            "live_trader.process_safety."
+            "_authoritative_current_process_identity",
+            return_value=changed,
+        ):
+            blocked = hold_crypto_first_live_account_lease(
+                "UPBIT", fingerprint
+            )
+
+        self.assertFalse(blocked["acquired"])
+        self.assertEqual(
+            "application-instance-owner-identity-changed",
+            blocked["reason"],
+        )
+
+    def test_same_crypto_account_has_one_cross_process_owner(self) -> None:
+        fingerprint = self._crypto_fingerprint("cross-process")
+        scope = f"crypto-first-live-account:UPBIT:{fingerprint}"
+        self.assertTrue(hold_live_trader_instance_lease()["acquired"])
+        child = self._holding_child(f"hold_process_lease({scope!r})")
+        try:
+            blocked = hold_crypto_first_live_account_lease(
+                "UPBIT", fingerprint
+            )
+            self.assertFalse(blocked["acquired"])
+            self.assertEqual(
+                "crypto-first-live-account-owned-by-another-process",
+                blocked["reason"],
+            )
+        finally:
+            self._stop_child(child)
+
+        self.assertTrue(
+            hold_crypto_first_live_account_lease(
+                "UPBIT", fingerprint
+            )["acquired"]
+        )
+
+    def test_process_restart_rotates_authoritative_owner_identity(self) -> None:
+        fingerprint = self._crypto_fingerprint("restart")
+        expression = (
+            "(hold_live_trader_instance_lease(), "
+            "hold_crypto_first_live_account_lease("
+            f"'BINANCE_SPOT', {fingerprint!r}))[1]"
+        )
+        child, child_result = self._holding_child_result(expression)
+        child_identity = dict(child_result["ownerIdentity"])
+        self._stop_child(child)
+
+        self.assertTrue(hold_live_trader_instance_lease()["acquired"])
+        current = hold_crypto_first_live_account_lease(
+            "BINANCE_SPOT", fingerprint
+        )
+        current_identity = dict(current["ownerIdentity"])
+
+        self.assertNotEqual(child_identity["pid"], current_identity["pid"])
+        self.assertNotEqual(
+            child_identity["processStartEpoch"],
+            current_identity["processStartEpoch"],
+        )
+        self.assertEqual(child_identity["bootId"], current_identity["bootId"])
+
+    def test_kernel_identity_is_stable_during_current_process(self) -> None:
+        first = _authoritative_current_process_identity()
+        second = _authoritative_current_process_identity()
+
+        self.assertTrue(first["authoritative"])
+        self.assertEqual(first["pid"], second["pid"])
+        self.assertEqual(first["bootId"], second["bootId"])
+        self.assertAlmostEqual(
+            first["processStartEpoch"],
+            second["processStartEpoch"],
+            places=6,
+        )
+        if os.name == "nt":
+            self.assertEqual(
+                "GetProcessTimes+NtQuerySystemInformation",
+                first["source"],
+            )
 
 
 if __name__ == "__main__":

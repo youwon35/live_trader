@@ -3156,6 +3156,10 @@ class KisSharedRouteIntegrationTests(unittest.TestCase):
             return_value={"ok": True},
         ), patch.object(
             state,
+            "_revoke_crypto_first_live_entry_before_cleanup",
+            return_value={"ok": True, "entryAuthorityRevoked": True},
+        ) as global_revoke, patch.object(
+            state,
             "_upbit_functional_emergency_cleanup_after_latch",
             return_value={"ok": True},
         ), patch.object(
@@ -3192,6 +3196,7 @@ class KisSharedRouteIntegrationTests(unittest.TestCase):
             self.assertFalse(mode.is_alive())
         self.assertEqual([(False, False)], lock_observations)
         self.assertEqual([(False, True)], transition_lock_observations)
+        global_revoke.assert_called_once_with("durable-emergency-stop")
         self.assertTrue(recovery_results and recovery_results[0].get("ok"))
         self.assertTrue(mode_results and mode_results[0].get("ok"))
 
@@ -3250,6 +3255,10 @@ class KisSharedRouteIntegrationTests(unittest.TestCase):
             return_value={"ok": True},
         ), patch.object(
             state,
+            "_revoke_crypto_first_live_entry_before_cleanup",
+            return_value={"ok": True, "entryAuthorityRevoked": True},
+        ) as global_revoke, patch.object(
+            state,
             "_upbit_functional_emergency_cleanup_after_latch",
             return_value={"ok": True},
         ), patch.object(
@@ -3277,6 +3286,7 @@ class KisSharedRouteIntegrationTests(unittest.TestCase):
             recovery.join(2)
             self.assertFalse(cycle.is_alive())
             self.assertFalse(recovery.is_alive())
+        global_revoke.assert_called_once_with("durable-emergency-stop")
         self.assertTrue(results and results[0].get("ok"))
 
     def test_kill_generation_change_during_phase_b_skips_every_cleanup_edge(self) -> None:

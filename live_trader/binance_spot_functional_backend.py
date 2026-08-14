@@ -42,6 +42,25 @@ from .binance_spot_functional_lifecycle import (
     composite_production_available,
     production_entrypoint_status,
 )
+from .binance_spot_functional_exclusivity import (
+    BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
+    BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED,
+    BINANCE_SPOT_ACCOUNT_WIDE_CAUSAL_AUTHORITY_AVAILABLE,
+    BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED,
+    BinanceSpotExclusivityGuard,
+    BinanceSpotExclusivityVerifier,
+    DurableBinanceSpotExclusivityProofStore,
+)
+from .binance_spot_functional_exclusivity_provider import (
+    BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT,
+    BINANCE_SPOT_EXCLUSIVITY_PROVIDER_PRODUCTION_RELEASED,
+    BINANCE_SPOT_EXCLUSIVITY_SIGNING_PRIMITIVE_PRESENT,
+    BinanceSpotExclusivityInjection,
+    DurableBinanceSpotExclusivityProofProvider,
+    DurableCursorBoundBinanceSpotExclusivityVerifier,
+    PinnedEd25519BinanceSpotExclusivityVerifier,
+    build_binance_spot_exclusivity_injection,
+)
 from .binance_spot_functional_scheduler import (
     BinanceSpotFunctionalManagedScheduler,
 )
@@ -151,6 +170,12 @@ def binance_spot_functional_composite_available() -> bool:
             BINANCE_SPOT_FUNCTIONAL_ORDINARY_FENCE_AVAILABLE,
             BINANCE_SPOT_FUNCTIONAL_EMERGENCY_FENCE_AVAILABLE,
             BINANCE_SPOT_FUNCTIONAL_EXCLUSIVE_ACCOUNT_AVAILABLE,
+            BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
+            BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED,
+            BINANCE_SPOT_ACCOUNT_WIDE_CAUSAL_AUTHORITY_AVAILABLE,
+            BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED,
+            BINANCE_SPOT_EXCLUSIVITY_PROVIDER_PRODUCTION_RELEASED,
+            not BINANCE_SPOT_EXCLUSIVITY_SIGNING_PRIMITIVE_PRESENT,
             BINANCE_SPOT_FUNCTIONAL_ROOT_INTEGRATION_RELEASED,
         )
     )
@@ -168,6 +193,12 @@ def binance_spot_first_live_bootstrap_available() -> bool:
             BINANCE_SPOT_FUNCTIONAL_ORDINARY_FENCE_AVAILABLE,
             BINANCE_SPOT_FUNCTIONAL_EMERGENCY_FENCE_AVAILABLE,
             BINANCE_SPOT_FUNCTIONAL_EXCLUSIVE_ACCOUNT_AVAILABLE,
+            BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
+            BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED,
+            BINANCE_SPOT_ACCOUNT_WIDE_CAUSAL_AUTHORITY_AVAILABLE,
+            BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED,
+            BINANCE_SPOT_EXCLUSIVITY_PROVIDER_PRODUCTION_RELEASED,
+            not BINANCE_SPOT_EXCLUSIVITY_SIGNING_PRIMITIVE_PRESENT,
             BINANCE_SPOT_FUNCTIONAL_ROOT_INTEGRATION_RELEASED,
             not BINANCE_SPOT_FUNCTIONAL_REAL_E2E_AVAILABLE,
         )
@@ -1586,6 +1617,17 @@ def build_binance_spot_functional_production_backend(
     server_record_signer: Callable[[Mapping[str, Any]], Mapping[str, Any]],
     route_lock_reader: Callable[[], Mapping[str, Any]],
     dispatch_lease_factory: Callable[..., Any],
+    account_exclusivity_proof_reader: (
+        Callable[..., Mapping[str, Any]] | None
+    ) = None,
+    account_exclusivity_verifier: (
+        BinanceSpotExclusivityVerifier | None
+    ) = None,
+    account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+    account_identity_fingerprint: str = "",
+    global_first_live_authority_reader: (
+        Callable[..., Mapping[str, Any]] | None
+    ) = None,
     first_live_gate_reader: Callable[[], Mapping[str, Any]] | None = None,
     production_code_hash_reader: Callable[[], str] = (
         default_binance_spot_functional_code_hash
@@ -1624,6 +1666,14 @@ def build_binance_spot_functional_production_backend(
     store = DurableBinanceSpotApprovedPermitStore(
         database_path, approval_verifier=approval_verifier, clock=clock
     )
+    exclusivity_guard = BinanceSpotExclusivityGuard(
+        store=DurableBinanceSpotExclusivityProofStore(database_path),
+        proof_reader=account_exclusivity_proof_reader,
+        verifier=account_exclusivity_verifier,
+        verifier_pin=account_exclusivity_verifier_pin,
+        account_identity_fingerprint=account_identity_fingerprint,
+        clock=clock,
+    )
     if (
         BINANCE_SPOT_FUNCTIONAL_FIRST_LIVE_BOOTSTRAP_AVAILABLE
         and first_live_gate_reader is None
@@ -1638,10 +1688,13 @@ def build_binance_spot_functional_production_backend(
             "ordinaryBinanceRoutesClosed": False,
             "emergencyKillInactive": False,
             "applicationInstanceLeaseHeld": False,
-            "exclusiveAccountConfirmed": False,
-            "noManualTradingConfirmed": False,
-            "noBotsConfirmed": False,
-            "noOtherApiKeysConfirmed": False,
+            "operatorApprovalBound": False,
+            "accountExclusivityVerifierReady": False,
+            "accountExclusivityDurableProviderReady": False,
+            "accountExclusivitySigningPrimitiveAbsent": True,
+            "accountExclusivityAuthorityPinned": False,
+            "accountIdentityPinned": False,
+            "globalFirstLiveAuthorityReaderWired": False,
             "realE2EAvailable": BINANCE_SPOT_FUNCTIONAL_REAL_E2E_AVAILABLE,
             "firstLiveBootstrapFeatureEnabled": False,
         }
@@ -1680,6 +1733,10 @@ def build_binance_spot_functional_production_backend(
         ),
         stream_terminal_retirer=bridge.retire_terminal_session,
         dispatch_lease_factory=dispatch_lease_factory,
+        account_exclusivity_guard=exclusivity_guard,
+        global_first_live_authority_reader=(
+            global_first_live_authority_reader
+        ),
         startup_owner_process_absence_attested=startup_owner_absence,
         permit_approval_verifier=approval_verifier,
         activation_permit_issuer=lambda binding, activated_epoch: (
@@ -1840,16 +1897,28 @@ def recover_binance_spot_functional_backend(
 
 
 __all__ = [
+    "BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED",
+    "BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED",
+    "BINANCE_SPOT_ACCOUNT_WIDE_CAUSAL_AUTHORITY_AVAILABLE",
+    "BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED",
+    "BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT",
+    "BINANCE_SPOT_EXCLUSIVITY_PROVIDER_PRODUCTION_RELEASED",
+    "BINANCE_SPOT_EXCLUSIVITY_SIGNING_PRIMITIVE_PRESENT",
     "BINANCE_SPOT_FUNCTIONAL_BACKEND_AVAILABLE",
     "BINANCE_SPOT_FUNCTIONAL_REAL_E2E_AVAILABLE",
     "BINANCE_SPOT_FUNCTIONAL_ROOT_INTEGRATION_RELEASED",
     "BINANCE_SPOT_FUNCTIONAL_STATE_SERVER_AVAILABLE",
     "BinanceSpotFunctionalBackendError",
     "BinanceSpotFunctionalBackendManager",
+    "BinanceSpotExclusivityInjection",
+    "DurableBinanceSpotExclusivityProofProvider",
+    "DurableCursorBoundBinanceSpotExclusivityVerifier",
+    "PinnedEd25519BinanceSpotExclusivityVerifier",
     "binance_spot_functional_backend_status",
     "binance_spot_functional_composite_available",
     "binance_spot_functional_hold_preparation_status",
     "build_binance_spot_functional_production_backend",
+    "build_binance_spot_exclusivity_injection",
     "issue_binance_spot_functional_permit",
     "prepare_binance_spot_functional_backend",
     "preissue_binance_spot_functional_candidate",

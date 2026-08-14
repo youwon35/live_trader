@@ -31,6 +31,17 @@ from .binance_spot_continuous_functional import (
 from .binance_spot_functional_approval import (
     DurableBinanceSpotApprovedPermitStore,
 )
+from .binance_spot_functional_exclusivity import (
+    BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
+    BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED,
+    BINANCE_SPOT_ACCOUNT_WIDE_CAUSAL_AUTHORITY_AVAILABLE,
+    BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED,
+    BinanceSpotExclusivityGuard,
+)
+from .binance_spot_functional_exclusivity_provider import (
+    BINANCE_SPOT_EXCLUSIVITY_PROVIDER_PRODUCTION_RELEASED,
+    BINANCE_SPOT_EXCLUSIVITY_SIGNING_PRIMITIVE_PRESENT,
+)
 
 
 PRODUCTION_LIFECYCLE_AVAILABLE = False
@@ -60,6 +71,12 @@ def composite_production_available() -> bool:
             PRODUCTION_SIGNAL_SCHEDULER_AVAILABLE,
             PRODUCTION_STARTUP_RECOVERY_AVAILABLE,
             PRODUCTION_STATE_SERVER_WIRING_AVAILABLE,
+            BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
+            BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED,
+            BINANCE_SPOT_ACCOUNT_WIDE_CAUSAL_AUTHORITY_AVAILABLE,
+            BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED,
+            BINANCE_SPOT_EXCLUSIVITY_PROVIDER_PRODUCTION_RELEASED,
+            not BINANCE_SPOT_EXCLUSIVITY_SIGNING_PRIMITIVE_PRESENT,
         )
     )
 
@@ -1532,6 +1549,9 @@ class BinanceSpotFunctionalLifecycleManager:
                     "ownerTokenHash": _secret_hash(owner_token),
                 },
             )
+            self.service.assert_activation_guards(
+                _text(started["sessionId"]), permit_payload
+            )
             if self.stream_owner_binder is not None:
                 self.stream_owner_binder(
                     _owner_prefix(_text(started["sessionId"])),
@@ -2509,8 +2529,10 @@ def production_entrypoint_status() -> dict[str, object]:
         "route": ROUTE_KEY,
         "reason": (
             "production remains gated: ordinary Binance Spot/Futures final "
-            "mutation isolation needs explicit approval, activation-relative "
-            "exact-two-hour E2E is unproven, and live credential E2E has not run"
+            "mutation isolation, pinned independent account-exclusivity/causal "
+            "proof authority, and the global first-live dispatch fence are not "
+            "released; activation-relative exact-two-hour credentialed E2E is "
+            "also unproven"
         ),
         "ordinaryLiveRouteChanged": False,
         "smokeRouteChanged": False,
@@ -2525,6 +2547,24 @@ def production_entrypoint_status() -> dict[str, object]:
             "signalScheduler": PRODUCTION_SIGNAL_SCHEDULER_AVAILABLE,
             "startupRecovery": PRODUCTION_STARTUP_RECOVERY_AVAILABLE,
             "stateServerWiring": PRODUCTION_STATE_SERVER_WIRING_AVAILABLE,
+            "accountExclusivityAuthorityPinned": (
+                BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED
+            ),
+            "accountExclusivityVerifierWired": (
+                BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED
+            ),
+            "accountWideCausalAuthorityAvailable": (
+                BINANCE_SPOT_ACCOUNT_WIDE_CAUSAL_AUTHORITY_AVAILABLE
+            ),
+            "globalFirstLiveAuthorityWired": (
+                BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED
+            ),
+            "durablePublicKeyExclusivityProviderReleased": (
+                BINANCE_SPOT_EXCLUSIVITY_PROVIDER_PRODUCTION_RELEASED
+            ),
+            "exclusivitySigningPrimitiveAbsent": (
+                not BINANCE_SPOT_EXCLUSIVITY_SIGNING_PRIMITIVE_PRESENT
+            ),
             "ordinaryBinanceFinalMutationIsolation": False,
             "activationRelativeTwoHourE2E": False,
             "credentialedLiveE2E": False,
@@ -2545,6 +2585,10 @@ def build_binance_spot_production_lifecycle(
     stream_startup_recovery_latcher: Callable[..., Mapping[str, Any]] | None = None,
     stream_terminal_retirer: Callable[..., Mapping[str, Any]] | None = None,
     dispatch_lease_factory: Callable[..., Any] | None = None,
+    account_exclusivity_guard: BinanceSpotExclusivityGuard | None = None,
+    global_first_live_authority_reader: (
+        Callable[..., Mapping[str, Any]] | None
+    ) = None,
     permit_approval_verifier: Callable[[Mapping[str, Any]], bool] | None = None,
     signal_reader: Callable[[], Mapping[str, Any] | None] | None = None,
     startup_owner_process_absence_attested: bool = False,
@@ -2618,6 +2662,10 @@ def build_binance_spot_production_lifecycle(
         binding_reader=binding_reader,
         authority_reader=control.authority_snapshot,
         publication_verifier=publication_verifier,
+        account_exclusivity_guard=account_exclusivity_guard,
+        global_first_live_authority_reader=(
+            global_first_live_authority_reader
+        ),
         clock=clock,
     )
     client = OfficialBinanceSpotGetClient(
@@ -2642,6 +2690,9 @@ def build_binance_spot_production_lifecycle(
                 claim_id, now_epoch=float(clock())
             ),
             dispatch_lease_factory=dispatch_lease_factory,
+            global_first_live_authority_reader=(
+                global_first_live_authority_reader
+            ),
         ),
         permit_store=permit_store,
         signal_reader=BinanceSpotOfficialNaturalSignalReader(

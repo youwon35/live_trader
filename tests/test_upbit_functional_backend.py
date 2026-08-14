@@ -17,6 +17,9 @@ from live_trader import upbit_continuous_functional as core
 from live_trader import upbit_functional_backend as backend
 from live_trader import upbit_functional_entrypoint as entrypoint
 from live_trader import upbit_functional_mutation as mutation
+from live_trader.crypto_first_live_coordinator import (
+    DurableCryptoFirstLiveCoordinator,
+)
 from live_trader.upbit_continuous_functional import UpbitFunctionalBlocked
 from live_trader.upbit_functional_approval import (
     DurableUpbitFunctionalApprovalStore,
@@ -95,6 +98,104 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
                     operator_confirmation_verifier=lambda _value: True,
                 )
             self.assertFalse(database.exists())
+
+    def test_crypto_owner_identity_hash_matches_coordinator_exactly(self) -> None:
+        identity = {
+            "pid": os.getpid(),
+            "processStartEpoch": NOW.timestamp() - 30,
+            "bootId": "windows-boot-upbit-owner-0001",
+            "applicationLeaseEpoch": NOW.timestamp() - 20,
+            "accountLeaseScope": (
+                "crypto-first-live-account:UPBIT:" + ACCOUNT
+            ),
+        }
+        backend_value = backend._validated_owner_process_identity(
+            identity,
+            expected_account_fingerprint=ACCOUNT,
+        )
+        self.assertIsNotNone(backend_value)
+        coordinator_identity, _serialized, coordinator_hash = (
+            DurableCryptoFirstLiveCoordinator._normalize_owner_identity(
+                identity,
+                lane="UPBIT",
+                account_fingerprint=ACCOUNT,
+            )
+        )
+        self.assertEqual(coordinator_identity, backend_value[0])
+        self.assertEqual(coordinator_hash, backend_value[1])
+
+    def test_legacy_owner_identity_remains_exactly_validated(self) -> None:
+        identity = {
+            "schemaVersion": "upbit-functional-process-owner/v1",
+            "scopeHash": "1" * 64,
+            "ownerPid": os.getpid(),
+            "acquiredAt": NOW.isoformat().replace("+00:00", "Z"),
+        }
+        value = backend._validated_owner_process_identity(identity)
+        self.assertIsNotNone(value)
+        expected = hashlib.sha256(
+            json.dumps(
+                identity,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(identity, value[0])
+        self.assertEqual(expected, value[1])
+
+    def test_malformed_or_exotic_owner_identity_fails_closed(self) -> None:
+        exact = {
+            "pid": os.getpid(),
+            "processStartEpoch": NOW.timestamp() - 30,
+            "bootId": "windows-boot-upbit-owner-0001",
+            "applicationLeaseEpoch": NOW.timestamp() - 20,
+            "accountLeaseScope": (
+                "crypto-first-live-account:UPBIT:" + ACCOUNT
+            ),
+        }
+
+        class StringLike:
+            def __str__(self) -> str:
+                return "windows-boot-upbit-owner-0001"
+
+        malformed = (
+            {**exact, "extra": "field"},
+            {**exact, "pid": True},
+            {**exact, "pid": os.getpid() + 1},
+            {**exact, "processStartEpoch": "1.0"},
+            {**exact, "processStartEpoch": float("nan")},
+            {**exact, "applicationLeaseEpoch": exact["processStartEpoch"]},
+            {**exact, "bootId": StringLike()},
+            {
+                **exact,
+                "accountLeaseScope": (
+                    "crypto-first-live-account:UPBIT:" + "9" * 64
+                ),
+            },
+            {
+                "schemaVersion": "upbit-functional-process-owner/v1",
+                "scopeHash": "1" * 64,
+                "ownerPid": str(os.getpid()),
+                "acquiredAt": NOW.isoformat(),
+            },
+            {
+                "schemaVersion": "upbit-functional-process-owner/v1",
+                "scopeHash": "1" * 64,
+                "ownerPid": os.getpid(),
+                "acquiredAt": NOW.isoformat(),
+                "extra": False,
+            },
+        )
+        for value in malformed:
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    backend._validated_owner_process_identity(
+                        value,
+                        expected_account_fingerprint=ACCOUNT,
+                    )
+                )
 
     @staticmethod
     def _preclaim_manager(store):
@@ -282,6 +383,7 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
         manager._account_exclusivity_proof_reader = lambda **_kwargs: {}
         manager._owner_process_identity_hash = "d" * 64
         manager._owner_process_identity_durable = True
+        manager._global_first_live_authority_reader = lambda _request: {}
         manager._durable_owner_lease_required = True
         manager._approval_id = ""
         manager._session_id = ""
@@ -324,6 +426,12 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
                 return {
                     "accountExclusivityVerifier": dict(verifier_status),
                     "accountExclusivityProofSourceWired": True,
+                    "globalFirstLiveDispatchFence": {
+                        "wired": True,
+                        "ownerIdentityBound": True,
+                        "releaseLatch": False,
+                        "networkOrderPostAllowed": False,
+                    },
                     "startupAudit": {},
                 }
 
@@ -1032,9 +1140,45 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
                     ),
                 )
 
+            def global_first_live_authority(request):
+                body = {
+                    "schemaVersion": (
+                        "upbit-global-first-live-dispatch-authority/v1"
+                    ),
+                    "scope": "CRYPTO_FIRST_LIVE_GLOBAL",
+                    "lane": "UPBIT",
+                    "phase": (
+                        "CLEANUP_ONLY"
+                        if request["cleanup"]
+                        else "ACTIVE"
+                    ),
+                    "runId": request["runId"],
+                    "sessionId": request["sessionId"],
+                    "permitId": request["permitId"],
+                    "permitHash": request["permitHash"],
+                    "accountFingerprint": request["accountFingerprint"],
+                    "routeScopeHash": request["routeScopeHash"],
+                    "ownerIdentityHash": request["ownerIdentityHash"],
+                    "ownerLeaseActive": True,
+                    "entryAuthorityOpen": not request["cleanup"],
+                    "cleanupAuthorityOpen": request["cleanup"],
+                    "hardStopEpoch": functional_permit.ends_at.timestamp(),
+                    "ownerLeaseExpiresEpoch": fake.now.timestamp() + 30,
+                    "revision": 1,
+                    "observedEpoch": fake.now.timestamp(),
+                    "killSwitch": False,
+                    "stopRequested": False,
+                }
+                return {**body, "authorityHash": core._strict_stable_hash(body)}
+
             with (
                 patch.dict(os.environ, environment, clear=False),
                 patch.object(core, "UPBIT_CONTINUOUS_FUNCTIONAL_AVAILABLE", True),
+                patch.object(
+                    core,
+                    "UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED",
+                    True,
+                ),
                 patch.object(
                     core,
                     "UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED",
@@ -1045,6 +1189,11 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
                 ),
                 patch.object(
                     entrypoint, "UPBIT_FUNCTIONAL_ENTRYPOINT_AVAILABLE", True
+                ),
+                patch.object(
+                    entrypoint,
+                    "UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED",
+                    True,
                 ),
                 patch.object(
                     entrypoint, "UPBIT_CONTINUOUS_FUNCTIONAL_AVAILABLE", True
@@ -1112,7 +1261,24 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
                     == "verified",
                     websocket_source=stream,
                     candle_source=candles,
+                    global_first_live_authority_reader=(
+                        global_first_live_authority
+                    ),
+                    owner_process_identity={
+                        "pid": os.getpid(),
+                        "processStartEpoch": fake.now.timestamp() - 30,
+                        "bootId": "windows-boot-upbit-test-0001",
+                        "applicationLeaseEpoch": fake.now.timestamp() - 20,
+                        "accountLeaseScope": (
+                            "crypto-first-live-account:UPBIT:" + ACCOUNT
+                        ),
+                    },
                     allow_mock_graph=True,
+                )
+                self.assertTrue(manager._owner_process_identity_durable)
+                self.assertRegex(
+                    manager._owner_process_identity_hash,
+                    r"^[0-9a-f]{64}$",
                 )
                 manager.graph._selection_reader = fake.immutable_selection
                 # Production constructs/audits the singleton before issuing

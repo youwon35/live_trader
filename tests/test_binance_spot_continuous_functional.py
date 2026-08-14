@@ -37,6 +37,102 @@ ACCOUNT_FINGERPRINT = hashlib.sha256(
 ).hexdigest()
 
 
+def _hash(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+class FakeVerifiedExclusivityGuard:
+    def __init__(self, *, terminal_causal_closure: bool = True) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.records: list[dict[str, object]] = []
+        self.terminal_causal_closure = bool(terminal_causal_closure)
+
+    def verify_and_record(self, **request: object) -> dict[str, object]:
+        self.calls.append(dict(request))
+        causal = bool(
+            request["phase"] == "TERMINAL"
+            and self.terminal_causal_closure
+        )
+        proof = {
+            "schemaVersion": "test-binance-exclusivity-proof/v1",
+            "phase": request["phase"],
+            "sessionId": request["session_id"],
+            "permitId": request["permit_id"],
+            "permitHash": request["permit_hash"],
+            "credentialFingerprint": request["credential_fingerprint"],
+            "boundaryId": request["boundary_id"],
+            "boundaryHash": request["boundary_hash"],
+            "causalClosureProven": causal,
+        }
+        proof_hash = _hash(proof)
+        self.records.append(
+            {
+                "session_id": request["session_id"],
+                "phase": request["phase"],
+                "boundary_id": request["boundary_id"],
+                "proof_hash": proof_hash,
+                "proof": proof,
+            }
+        )
+        return {
+            "verified": True,
+            "phase": request["phase"],
+            "sessionId": request["session_id"],
+            "boundaryId": request["boundary_id"],
+            "proofId": f"proof-{len(self.calls):08d}",
+            "proofHash": proof_hash,
+            "observedEpoch": 0.0,
+            "exclusiveAccountConfirmed": True,
+            "noManualTradingConfirmed": True,
+            "noBotsConfirmed": True,
+            "noOtherApiKeysConfirmed": True,
+            "accountWideCausalClosureProven": (
+                causal
+            ),
+            "proof": proof,
+            "durable": True,
+            "durableProofHash": proof_hash,
+            "restartVerifiable": True,
+        }
+
+    def session_records(self, session_id: str) -> list[dict[str, object]]:
+        return [
+            dict(row)
+            for row in self.records
+            if row["session_id"] == session_id
+        ]
+
+
+def global_authority_reader(clock: "Clock"):
+    def read(**request: object) -> dict[str, object]:
+        projection: dict[str, object] = {
+            "schemaVersion": "crypto-first-live-binance-authority-snapshot/v1",
+            "scope": "CRYPTO_FIRST_LIVE_GLOBAL",
+            "lane": "BINANCE_SPOT",
+            "phase": "ACTIVE",
+            "runId": "crypto-run-binance-test-0001",
+            "sessionId": request["session_id"],
+            "permitId": request["permit_id"],
+            "permitHash": request["permit_hash"],
+            "accountFingerprint": request["account_fingerprint"],
+            "ownerLeaseActive": True,
+            "entryAuthorityOpen": True,
+            "hardStopEpoch": clock() + 7200.0,
+            "revision": 1,
+            "observedEpoch": clock(),
+        }
+        return {**projection, "authorityHash": _hash(projection)}
+
+    return read
+
+
 def permission_proof() -> dict[str, object]:
     proof: dict[str, object] = {
         "accountCanTrade": True,
@@ -528,6 +624,8 @@ class BinanceSpotContinuousFunctionalTest(unittest.TestCase):
         self.ledger = DurableFunctionalLedger(
             Path(self.temporary.name) / "binance-functional.sqlite3"
         )
+        self.exclusivity_guard = FakeVerifiedExclusivityGuard()
+        self.global_authority_reader = global_authority_reader(self.clock)
         self.service = BinanceSpotContinuousFunctionalService(
             ledger=self.ledger,
             binding_reader=lambda: binding(),
@@ -541,6 +639,10 @@ class BinanceSpotContinuousFunctionalTest(unittest.TestCase):
                 "publicationProofHash": "3" * 64,
                 "publicationProofFileSha256": "4" * 64,
             },
+            account_exclusivity_guard=self.exclusivity_guard,
+            global_first_live_authority_reader=(
+                self.global_authority_reader
+            ),
             clock=self.clock,
             monotonic_clock=self.clock,
         )
@@ -559,7 +661,74 @@ class BinanceSpotContinuousFunctionalTest(unittest.TestCase):
             capability_hash=str(result["functionalCapabilityHash"]),
             activePermitHash=str(permit(self.clock)["permitHash"]),
         )
+        self.service.assert_activation_guards(
+            session_id, permit(self.clock)
+        )
         return session_id, capability
+
+    def dispatched_round_trip_ready_for_finalize(
+        self,
+    ) -> tuple[str, str, dict[str, object]]:
+        session_id, capability = self.start()
+        buy = self.service.observe_bar(
+            session_id,
+            capability,
+            permit(self.clock),
+            truth(self.clock),
+            rules(),
+            bar(self.clock, "BUY"),
+        )
+        buy_claim_id = str(buy["claim"]["claim_id"])
+        buy_id = str(buy["action"]["clientOrderId"])
+        self.service.dispatch_claim(
+            session_id,
+            capability,
+            permit(self.clock),
+            truth(self.clock),
+            rules(),
+            buy_claim_id,
+            submitter=lambda _action: buy_order(buy_id),
+        )
+        self.clock.value += 300
+        after_buy = truth(
+            self.clock,
+            base="0.00115000",
+            quote="91",
+            closed_orders=[buy_order(buy_id)],
+            fills=[buy_fill(buy_id)],
+        )
+        sell = self.service.observe_bar(
+            session_id,
+            capability,
+            permit(self.clock),
+            after_buy,
+            rules(),
+            bar(self.clock, "SELL"),
+        )
+        sell_claim_id = str(sell["claim"]["claim_id"])
+        sell_id = str(sell["action"]["clientOrderId"])
+        self.service.dispatch_claim(
+            session_id,
+            capability,
+            permit(self.clock),
+            after_buy,
+            rules(),
+            sell_claim_id,
+            submitter=lambda _action: sell_order(sell_id),
+        )
+        self.current_authority = authority(final=True)
+        self.clock.value += 7200
+        return (
+            session_id,
+            capability,
+            truth(
+                self.clock,
+                base="0.00100000",
+                quote="100.15",
+                closed_orders=[buy_order(buy_id), sell_order(sell_id)],
+                fills=[buy_fill(buy_id), sell_fill(sell_id)],
+            ),
+        )
 
     def test_production_lane_stays_unavailable_and_is_not_wired(self) -> None:
         self.assertFalse(PRODUCTION_AVAILABLE)
@@ -601,6 +770,10 @@ class BinanceSpotContinuousFunctionalTest(unittest.TestCase):
                 "publicationProofHash": "3" * 64,
                 "publicationProofFileSha256": "4" * 64,
             },
+            account_exclusivity_guard=self.exclusivity_guard,
+            global_first_live_authority_reader=(
+                self.global_authority_reader
+            ),
             clock=self.clock,
         )
         with self.assertRaisesRegex(BinanceSpotBoundaryBlocked, "artifactFileSha256"):
@@ -1235,6 +1408,10 @@ class BinanceSpotContinuousFunctionalTest(unittest.TestCase):
                 "publicationProofHash": "3" * 64,
                 "publicationProofFileSha256": "4" * 64,
             },
+            account_exclusivity_guard=self.exclusivity_guard,
+            global_first_live_authority_reader=(
+                self.global_authority_reader
+            ),
             clock=self.clock,
         )
         self.assertEqual("CLAIMED", restarted.ledger.action(first["claim"]["claim_id"])["state"])
@@ -1263,59 +1440,8 @@ class BinanceSpotContinuousFunctionalTest(unittest.TestCase):
         self.assertTrue(final["evidence"]["functionalCapabilityReset"])
 
     def test_complete_buy_sell_fee_truth_finalizes_and_keeps_entry_blocked(self) -> None:
-        session_id, capability = self.start()
-        buy = self.service.observe_bar(
-            session_id,
-            capability,
-            permit(self.clock),
-            truth(self.clock),
-            rules(),
-            bar(self.clock, "BUY"),
-        )
-        buy_claim_id = str(buy["claim"]["claim_id"])
-        buy_id = str(buy["action"]["clientOrderId"])
-        self.ledger.transition_action(
-            buy_claim_id,
-            expected_state="CLAIMED",
-            state="ACKNOWLEDGED",
-            now_epoch=self.clock(),
-            broker_order_id="binance-buy-order-0001",
-        )
-        self.clock.value += 300
-        after_buy = truth(
-            self.clock,
-            base="0.00115000",
-            quote="91",
-            closed_orders=[buy_order(buy_id)],
-            fills=[buy_fill(buy_id)],
-        )
-        sell = self.service.observe_bar(
-            session_id,
-            capability,
-            permit(self.clock),
-            after_buy,
-            rules(),
-            bar(self.clock, "SELL"),
-        )
-        sell_claim_id = str(sell["claim"]["claim_id"])
-        sell_id = str(sell["action"]["clientOrderId"])
-        self.ledger.transition_action(
-            sell_claim_id,
-            expected_state="CLAIMED",
-            state="ACKNOWLEDGED",
-            now_epoch=self.clock(),
-            broker_order_id="binance-sell-order-0001",
-        )
-        self.current_authority = authority(final=True)
-        # PASS requires an activation-relative full two-hour observation;
-        # completing BUY/SELL wiring early is safe evidence, not a full soak.
-        self.clock.value += 7200
-        final_truth = truth(
-            self.clock,
-            base="0.00100000",
-            quote="100.15",
-            closed_orders=[buy_order(buy_id), sell_order(sell_id)],
-            fills=[buy_fill(buy_id), sell_fill(sell_id)],
+        session_id, capability, final_truth = (
+            self.dispatched_round_trip_ready_for_finalize()
         )
         final = self.service.finalize(
             session_id, capability, permit(self.clock), final_truth, rules()
@@ -1327,15 +1453,73 @@ class BinanceSpotContinuousFunctionalTest(unittest.TestCase):
         self.assertEqual(2, final["evidence"]["reconciledActionCount"])
         self.assertFalse(final["evidence"]["productionAvailable"])
         self.assertEqual(
+            "PASS_FULL_ROUND_TRIP",
+            final["evidence"]["outcome"],
+        )
+        self.assertTrue(
+            final["evidence"]["accountWideCausalClosureProven"]
+        )
+        self.assertFalse(
+            final["evidence"]["nativeAccountWideCausalClosureProven"]
+        )
+        self.assertTrue(final["evidence"]["functionalWiringPassed"])
+        self.assertTrue(
+            final["evidence"]["accountExclusivityPhaseChainComplete"]
+        )
+        self.assertTrue(
+            final["evidence"]["accountExclusivityRestartVerifiable"]
+        )
+        self.assertEqual(5, final["evidence"]["accountExclusivityPhaseProofCount"])
+        self.assertTrue(final["evidence"]["runtimeClockConsistencyProven"])
+        self.assertEqual("7500", final["evidence"]["monotonicRuntimeSeconds"])
+
+    def test_terminal_causal_false_can_finalize_but_can_never_pass(self) -> None:
+        self.exclusivity_guard.terminal_causal_closure = False
+        session_id, capability, final_truth = (
+            self.dispatched_round_trip_ready_for_finalize()
+        )
+        final = self.service.finalize(
+            session_id, capability, permit(self.clock), final_truth, rules()
+        )
+        self.assertEqual("FINALIZED", final["status"])
+        self.assertEqual(
             "SAFE_INCOMPLETE_ACCOUNT_WIDE_CAUSAL_CLOSURE_UNPROVEN",
             final["evidence"]["outcome"],
         )
-        self.assertFalse(
-            final["evidence"]["accountWideCausalClosureProven"]
+        self.assertTrue(
+            final["evidence"]["accountExclusivityPhaseChainComplete"]
         )
-        self.assertTrue(final["evidence"]["functionalWiringPassed"])
-        self.assertTrue(final["evidence"]["runtimeClockConsistencyProven"])
-        self.assertEqual("7500", final["evidence"]["monotonicRuntimeSeconds"])
+        self.assertFalse(final["evidence"]["accountWideCausalClosureProven"])
+        self.assertFalse(final["evidence"]["functionalWiringPassed"])
+
+    def test_missing_pre_post_phase_proof_can_finalize_but_can_never_pass(self) -> None:
+        session_id, capability, final_truth = (
+            self.dispatched_round_trip_ready_for_finalize()
+        )
+        removed = False
+        retained: list[dict[str, object]] = []
+        for row in self.exclusivity_guard.records:
+            if row["phase"] == "PRE_POST" and not removed:
+                removed = True
+                continue
+            retained.append(row)
+        self.exclusivity_guard.records = retained
+        self.assertTrue(removed)
+        final = self.service.finalize(
+            session_id, capability, permit(self.clock), final_truth, rules()
+        )
+        self.assertEqual("FINALIZED", final["status"])
+        self.assertEqual(
+            "SAFE_INCOMPLETE_ACCOUNT_EXCLUSIVITY_PHASE_CHAIN_UNPROVEN",
+            final["evidence"]["outcome"],
+        )
+        self.assertFalse(
+            final["evidence"]["accountExclusivityPhaseChainComplete"]
+        )
+        self.assertFalse(
+            final["evidence"]["accountExclusivityRestartVerifiable"]
+        )
+        self.assertFalse(final["evidence"]["functionalWiringPassed"])
 
     def test_post_round_trip_buy_signal_is_no_reentry_not_runner_exception(self) -> None:
         session_id, capability = self.start()

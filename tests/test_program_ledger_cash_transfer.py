@@ -1,36 +1,63 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
-import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
 from unittest import mock
 
+from live_trader.binance_cash_transfer_evidence import (
+    BinanceCashTransferEvidenceVerifier,
+)
 from live_trader.program_ledger import ProgramLedger
+
+
+ACCOUNT = hashlib.sha256(b"configured-binance-account").hexdigest()
+API_KEY = hashlib.sha256(b"configured-binance-api-key").hexdigest()
+TRAN_ID = 11415955596
 
 
 class ProgramLedgerCashTransferTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.release_patch = mock.patch(
-            "live_trader.program_ledger."
-            "BINANCE_CASH_TRANSFER_ADJUSTMENT_RELEASED",
-            True,
-        )
-        self.release_patch.start()
+        self.release_patches = [
+            mock.patch(
+                "live_trader.program_ledger."
+                "BINANCE_CASH_TRANSFER_ADJUSTMENT_RELEASED",
+                True,
+            ),
+            mock.patch(
+                "live_trader.program_ledger."
+                "BINANCE_CASH_TRANSFER_CONSUMPTION_RELEASED",
+                True,
+            ),
+            mock.patch(
+                "live_trader.binance_cash_transfer_evidence."
+                "BINANCE_CASH_TRANSFER_EVIDENCE_RELEASED",
+                True,
+            ),
+        ]
+        for patcher in self.release_patches:
+            patcher.start()
         self.temporary = tempfile.TemporaryDirectory()
         self.path = Path(self.temporary.name) / "ledger.sqlite3"
-        self.ledger = ProgramLedger(
-            self.path,
-            cash_transfer_authority_verifier=lambda value: (
-                value.get("officialTransfer", {}).get("tranId")
-                == "binance-transfer-0001"
-                and value.get("accountFingerprint")
-                == hashlib.sha256(b"account").hexdigest()
+        self.now = datetime.now(timezone.utc)
+        self.evidence_verifier = BinanceCashTransferEvidenceVerifier(
+            configured_account_fingerprint=ACCOUNT,
+            configured_api_key_fingerprint=API_KEY,
+            signed_get_verifier=lambda value: (
+                value.get("detachedCaptureHash")
+                == hashlib.sha256(b"signed-capture").hexdigest()
             ),
+            idle_barrier_verifier=lambda value: (
+                value.get("detachedEvidenceHash")
+                == hashlib.sha256(b"idle-barrier").hexdigest()
+            ),
+            clock=lambda: self.now,
         )
+        self.ledger = self.new_ledger()
         self.ledger.replace_cash_rows(
             [
                 {
@@ -57,38 +84,118 @@ class ProgramLedgerCashTransferTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
-        self.release_patch.stop()
+        for patcher in reversed(self.release_patches):
+            patcher.stop()
 
-    def apply(self) -> dict[str, object]:
-        observed = datetime.now(timezone.utc).isoformat()
-        evidence = {
-            "schemaVersion": "binance-spot-futures-cash-transfer-truth/v1",
-            "accountFingerprint": hashlib.sha256(b"account").hexdigest(),
-            "spotCash": "13.8049427",
-            "futuresCash": "10",
+    def new_ledger(self) -> ProgramLedger:
+        return ProgramLedger(
+            self.path,
+            cash_transfer_authority_verifier=(
+                self.evidence_verifier.verify_ledger_authority_request
+            ),
+            cash_transfer_high_water_verifier=(
+                self.evidence_verifier.verify_high_water_request
+            ),
+        )
+
+    def envelope(self) -> dict[str, object]:
+        observed = self.now.isoformat()
+        request_timestamp = int(self.now.timestamp() * 1000)
+        return {
+            "schemaVersion": "binance-universal-transfer-signed-get/v1",
+            "accountFingerprint": ACCOUNT,
+            "apiKeyFingerprint": API_KEY,
+            "method": "GET",
+            "path": "/sapi/v1/asset/transfer",
+            "securityType": "USER_DATA",
+            "signed": True,
+            "transferType": "MAIN_UMFUTURE",
+            "queryStartTime": int(
+                (self.now - timedelta(days=30)).timestamp() * 1000
+            ),
+            "queryEndTime": int(
+                (self.now - timedelta(seconds=1)).timestamp() * 1000
+            ),
+            "pageSize": 100,
+            "pages": [
+                {
+                    "current": 1,
+                    "httpStatus": 200,
+                    "total": 1,
+                    "rows": [
+                        {
+                            "asset": "USDT",
+                            "amount": "10.00000000",
+                            "type": "MAIN_UMFUTURE",
+                            "status": "CONFIRMED",
+                            "tranId": TRAN_ID,
+                            "timestamp": int(
+                                (self.now - timedelta(days=15)).timestamp()
+                                * 1000
+                            ),
+                        }
+                    ],
+                    "requestTimestamp": request_timestamp,
+                    "receivedAt": observed,
+                    "requestHash": hashlib.sha256(b"request").hexdigest(),
+                    "responseHash": hashlib.sha256(b"response").hexdigest(),
+                }
+            ],
+            "allPagesComplete": True,
+            "requestCount": 1,
+            "retryCount": 0,
+            "redirectCount": 0,
+            "mutationCount": 0,
+            "observedAt": observed,
+            "detachedCaptureHash": hashlib.sha256(
+                b"signed-capture"
+            ).hexdigest(),
+        }
+
+    def barrier(self) -> dict[str, object]:
+        return {
+            "schemaVersion": "binance-cash-transfer-idle-barrier/v1",
+            "barrierId": "global-idle-barrier-0001",
+            "accountFingerprint": ACCOUNT,
+            "apiKeyFingerprint": API_KEY,
+            "coordinatorPhase": "IDLE",
+            "coordinatorRevision": 9,
+            "globalLeaseState": "IDLE",
+            "activeOwnerCount": 0,
+            "mutationInFlightCount": 0,
             "spotOpenOrderCount": 0,
             "futuresOpenOrderCount": 0,
             "futuresPositionCount": 0,
-            "signedGetComplete": True,
-            "observedAt": observed,
-            "officialTransfer": {
-                "tranId": "binance-transfer-0001",
-                "asset": "USDT",
-                "amount": "10",
-                "fromAccount": "SPOT",
-                "toAccount": "USD_M_FUTURES",
-                "status": "CONFIRMED",
-                "eventTime": "2026-07-31T00:00:00+00:00",
-            },
+            "spotCash": "13.80494270",
+            "futuresCash": "10.00000000",
+            "observedAt": self.now.isoformat(),
+            "detachedEvidenceHash": hashlib.sha256(
+                b"idle-barrier"
+            ).hexdigest(),
         }
-        encoded = json.dumps(
-            evidence,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode()
-        return self.ledger.apply_binance_spot_futures_cash_transfer_adjustment(
+
+    def certified(self) -> dict[str, object]:
+        return self.evidence_verifier.certify(
+            expected_tran_id=TRAN_ID,
+            signed_get_envelope=self.envelope(),
+            idle_barrier_evidence=self.barrier(),
+            prior_consumed_high_water=(
+                self.ledger.cash_transfer_consumption_high_water(
+                    account_fingerprint=ACCOUNT,
+                    api_key_fingerprint=API_KEY,
+                )
+            ),
+        )
+
+    def apply(
+        self,
+        *,
+        ledger: ProgramLedger | None = None,
+        certified: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        target = ledger or self.ledger
+        proof = certified or self.certified()
+        return target.apply_binance_spot_futures_cash_transfer_adjustment(
             source_account="Binance Spot",
             destination_account="Binance USD-M Futures",
             amount="10",
@@ -96,12 +203,17 @@ class ProgramLedgerCashTransferTests(unittest.TestCase):
             source_cash_after="13.8049427",
             destination_cash_before="0",
             destination_cash_after="10",
-            observed_at=observed,
-            truth_evidence=evidence,
-            truth_hash=hashlib.sha256(encoded).hexdigest(),
+            observed_at=self.now.isoformat(),
+            truth_evidence=proof["truthEvidence"],
+            truth_hash=proof["truthHash"],
         )
 
-    def test_exact_two_leg_adjustment_preserves_unrelated_rows(self) -> None:
+    def assert_original_balances(self) -> None:
+        rows = {row["broker_id"]: row for row in self.ledger.cash_rows()}
+        self.assertEqual(23.8049427, rows["binance"]["cash"])
+        self.assertEqual(0.0, rows["binance-futures"]["cash"])
+
+    def test_exact_two_leg_adjustment_and_consumption_are_one_commit(self) -> None:
         result = self.apply()
 
         self.assertTrue(result["ok"])
@@ -109,70 +221,92 @@ class ProgramLedgerCashTransferTests(unittest.TestCase):
         self.assertEqual(13.8049427, rows["binance"]["cash"])
         self.assertEqual(10.0, rows["binance-futures"]["cash"])
         self.assertEqual(49973.17, rows["upbit"]["cash"])
-        evidence = self.ledger.cash_transfer_adjustment_rows()
-        self.assertEqual(1, len(evidence))
-        self.assertEqual(result["contentHash"], evidence[0]["content_hash"])
+        adjustments = self.ledger.cash_transfer_adjustment_rows()
+        consumptions = self.ledger.cash_transfer_consumption_rows()
+        self.assertEqual(1, len(adjustments))
+        self.assertEqual(1, len(consumptions))
+        self.assertEqual(result["contentHash"], adjustments[0]["content_hash"])
+        self.assertEqual(
+            result["consumptionHeadHash"], consumptions[0]["content_hash"]
+        )
+        high = self.ledger.cash_transfer_consumption_high_water(
+            account_fingerprint=ACCOUNT,
+            api_key_fingerprint=API_KEY,
+        )
+        self.assertEqual(1, high["revision"])
+        self.assertEqual(str(TRAN_ID), high["tranId"])
+        self.assertEqual(result["consumptionKey"], high["consumptionKey"])
 
-    def test_production_release_latch_keeps_adjustment_inert(self) -> None:
-        with mock.patch(
-            "live_trader.program_ledger."
-            "BINANCE_CASH_TRANSFER_ADJUSTMENT_RELEASED",
-            False,
+    def test_both_production_latches_are_independently_required(self) -> None:
+        for field, message in (
+            (
+                "BINANCE_CASH_TRANSFER_ADJUSTMENT_RELEASED",
+                "adjustment-not-released",
+            ),
+            (
+                "BINANCE_CASH_TRANSFER_CONSUMPTION_RELEASED",
+                "consumption-not-released",
+            ),
         ):
-            with self.assertRaisesRegex(ValueError, "adjustment-not-released"):
-                self.apply()
-        rows = {row["broker_id"]: row for row in self.ledger.cash_rows()}
-        self.assertEqual(23.8049427, rows["binance"]["cash"])
-        self.assertEqual(0.0, rows["binance-futures"]["cash"])
+            with self.subTest(field=field), mock.patch(
+                f"live_trader.program_ledger.{field}", False
+            ):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.apply()
+                self.assert_original_balances()
+                self.assertEqual([], self.ledger.cash_transfer_consumption_rows())
 
-    def test_authority_is_required_before_any_ledger_mutation(self) -> None:
-        self.ledger.cash_transfer_authority_verifier = None
-        with self.assertRaisesRegex(ValueError, "authority-unverified"):
-            self.apply()
-        rows = {row["broker_id"]: row for row in self.ledger.cash_rows()}
-        self.assertEqual(23.8049427, rows["binance"]["cash"])
-        self.assertEqual(0.0, rows["binance-futures"]["cash"])
+    def test_both_independent_verifiers_are_required(self) -> None:
+        proof = self.certified()
+        cases = (
+            (
+                ProgramLedger(
+                    self.path,
+                    cash_transfer_high_water_verifier=(
+                        self.evidence_verifier.verify_high_water_request
+                    ),
+                ),
+                "authority-unverified",
+            ),
+            (
+                ProgramLedger(
+                    self.path,
+                    cash_transfer_authority_verifier=(
+                        self.evidence_verifier.verify_ledger_authority_request
+                    ),
+                ),
+                "high-water-unverified",
+            ),
+        )
+        for ledger, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.apply(ledger=ledger, certified=proof)
+                self.assert_original_balances()
+                self.assertEqual([], self.ledger.cash_transfer_consumption_rows())
 
-    def test_adjustment_evidence_is_append_only(self) -> None:
+    def test_replay_is_rejected_by_unique_consumed_high_water(self) -> None:
+        proof = self.certified()
+        self.apply(certified=proof)
+        with self.assertRaisesRegex(
+            ValueError, "consumed-high-water-cas-changed"
+        ):
+            self.apply(certified=proof)
+        self.assertEqual(1, len(self.ledger.cash_transfer_adjustment_rows()))
+        self.assertEqual(1, len(self.ledger.cash_transfer_consumption_rows()))
+
+    def test_adjustment_and_consumption_evidence_are_append_only(self) -> None:
         self.apply()
         conn = sqlite3.connect(self.path)
         try:
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute("DELETE FROM cash_transfer_adjustments")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("DELETE FROM binance_cash_transfer_consumptions")
         finally:
             conn.close()
-        self.assertEqual(1, len(self.ledger.cash_transfer_adjustment_rows()))
 
-    def test_stale_or_wrong_amount_fails_without_mutation(self) -> None:
-        with self.assertRaisesRegex(ValueError, "amount-must-be-exact-10-usdt"):
-            self.ledger.apply_binance_spot_futures_cash_transfer_adjustment(
-                source_account="Binance Spot",
-                destination_account="Binance USD-M Futures",
-                amount="9",
-                source_cash_before="23.8049427",
-                source_cash_after="13.8049427",
-                destination_cash_before="0",
-                destination_cash_after="10",
-                observed_at="2026-08-14T13:30:00+00:00",
-                truth_evidence={
-                    "schemaVersion": "binance-spot-futures-cash-transfer-truth/v1",
-                    "accountFingerprint": hashlib.sha256(b"account").hexdigest(),
-                    "spotCash": "13.8049427",
-                    "futuresCash": "10",
-                    "spotOpenOrderCount": 0,
-                    "futuresOpenOrderCount": 0,
-                    "futuresPositionCount": 0,
-                    "signedGetComplete": True,
-                    "observedAt": "2026-08-14T13:30:00+00:00",
-                },
-                truth_hash=hashlib.sha256(b"truth").hexdigest(),
-            )
-        rows = {row["broker_id"]: row for row in self.ledger.cash_rows()}
-        self.assertEqual(23.8049427, rows["binance"]["cash"])
-        self.assertEqual(0.0, rows["binance-futures"]["cash"])
-        self.assertEqual([], self.ledger.cash_transfer_adjustment_rows())
-
-    def test_second_leg_sql_failure_rolls_back_first_leg_and_evidence(self) -> None:
+    def test_second_leg_sql_failure_rolls_back_all_four_writes(self) -> None:
         conn = sqlite3.connect(self.path)
         try:
             conn.execute(
@@ -189,10 +323,82 @@ class ProgramLedgerCashTransferTests(unittest.TestCase):
 
         with self.assertRaises(sqlite3.IntegrityError):
             self.apply()
-        rows = {row["broker_id"]: row for row in self.ledger.cash_rows()}
-        self.assertEqual(23.8049427, rows["binance"]["cash"])
-        self.assertEqual(0.0, rows["binance-futures"]["cash"])
+        self.assert_original_balances()
         self.assertEqual([], self.ledger.cash_transfer_adjustment_rows())
+        self.assertEqual([], self.ledger.cash_transfer_consumption_rows())
+
+    def test_consumption_insert_failure_rolls_back_both_legs_and_adjustment(self) -> None:
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute(
+                """
+                CREATE TRIGGER fail_consumption_insert
+                BEFORE INSERT ON binance_cash_transfer_consumptions
+                BEGIN SELECT RAISE(ABORT, 'injected-consumption-failure'); END
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.apply()
+        self.assert_original_balances()
+        self.assertEqual([], self.ledger.cash_transfer_adjustment_rows())
+        self.assertEqual([], self.ledger.cash_transfer_consumption_rows())
+
+    def test_concurrent_replay_has_exactly_one_winner(self) -> None:
+        proof = self.certified()
+        ledgers = (self.new_ledger(), self.new_ledger())
+
+        def attempt(ledger: ProgramLedger) -> str:
+            try:
+                self.apply(ledger=ledger, certified=proof)
+                return "ok"
+            except (ValueError, sqlite3.Error) as exc:
+                return str(exc)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(attempt, ledgers))
+        self.assertEqual(1, results.count("ok"), results)
+        self.assertEqual(1, len(self.ledger.cash_transfer_adjustment_rows()))
+        self.assertEqual(1, len(self.ledger.cash_transfer_consumption_rows()))
+
+    def test_tampered_consumption_chain_fails_closed(self) -> None:
+        self.apply()
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute(
+                "DROP TRIGGER binance_cash_transfer_consumptions_no_update"
+            )
+            conn.execute(
+                """
+                UPDATE binance_cash_transfer_consumptions
+                SET content_json='{}' WHERE sequence=1
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ValueError, "consumption-chain-invalid"):
+            self.ledger.cash_transfer_consumption_rows()
+
+    def test_restored_adjustment_without_consumption_lineage_fails_closed(self) -> None:
+        self.apply()
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute(
+                "DROP TRIGGER binance_cash_transfer_consumptions_no_delete"
+            )
+            conn.execute("DELETE FROM binance_cash_transfer_consumptions")
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ValueError, "lineage-incomplete"):
+            self.ledger.cash_transfer_consumption_high_water(
+                account_fingerprint=ACCOUNT,
+                api_key_fingerprint=API_KEY,
+            )
 
     def test_legacy_wholesale_seed_is_atomic_even_though_public_route_is_closed(self) -> None:
         self.ledger.replace_position_rows(

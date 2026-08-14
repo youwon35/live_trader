@@ -36,10 +36,13 @@ _GATE_FIELDS = frozenset(
         "ordinaryBinanceRoutesClosed",
         "emergencyKillInactive",
         "applicationInstanceLeaseHeld",
-        "exclusiveAccountConfirmed",
-        "noManualTradingConfirmed",
-        "noBotsConfirmed",
-        "noOtherApiKeysConfirmed",
+        "operatorApprovalBound",
+        "accountExclusivityVerifierReady",
+        "accountExclusivityDurableProviderReady",
+        "accountExclusivitySigningPrimitiveAbsent",
+        "accountExclusivityAuthorityPinned",
+        "accountIdentityPinned",
+        "globalFirstLiveAuthorityReaderWired",
         "realE2EAvailable",
         "firstLiveBootstrapFeatureEnabled",
     }
@@ -1024,6 +1027,8 @@ def default_binance_spot_functional_code_paths() -> tuple[Path, ...]:
         "binance_spot_functional_approval.py",
         "binance_spot_functional_backend.py",
         "binance_spot_functional_bootstrap.py",
+        "binance_spot_functional_exclusivity.py",
+        "binance_spot_functional_exclusivity_provider.py",
         "binance_spot_functional_lifecycle.py",
         "binance_spot_functional_mutation.py",
         "binance_spot_functional_preparation.py",
@@ -1035,6 +1040,9 @@ def default_binance_spot_functional_code_paths() -> tuple[Path, ...]:
         "binance_spot_stream_journal.py",
         "brokers.py",
         "continuous_live.py",
+        "crypto_first_live_coordinator.py",
+        "crypto_first_live_high_water.py",
+        "crypto_first_live_runtime.py",
         "emergency_stop.py",
         "env_loader.py",
         "env_settings.py",
@@ -1156,12 +1164,7 @@ class DurableBinanceSpotFirstLiveBootstrapStore:
             raise BinanceSpotFirstLiveBootstrapError(
                 "first-live prerequisite fields are not exact"
             )
-        operator_fields = {
-            "exclusiveAccountConfirmed",
-            "noManualTradingConfirmed",
-            "noBotsConfirmed",
-            "noOtherApiKeysConfirmed",
-        }
+        operator_fields = {"operatorApprovalBound"}
         required_true = _GATE_FIELDS - {"realE2EAvailable"}
         if not require_operator_contract:
             # ISSUED is inert.  The exact bootstrap id/hash/session-nonce hash
@@ -1736,14 +1739,110 @@ class DurableBinanceSpotFirstLiveBootstrapStore:
             raise BinanceSpotFirstLiveBootstrapError(
                 "durable terminal official truth is malformed"
             ) from exc
+        if not all(
+            isinstance(item, Mapping)
+            for item in (
+                terminal_truth,
+                binding,
+                bootstrap_binding,
+                bootstrap_record,
+            )
+        ):
+            raise BinanceSpotFirstLiveBootstrapError(
+                "durable terminal official truth objects are malformed"
+            )
+        terminal_exclusivity_proof = terminal_truth.get(
+            "accountExclusivityProof"
+        )
+        evidence_exclusivity_proof = evidence.get(
+            "accountExclusivityProof"
+        )
+        terminal_causal_component = (
+            terminal_exclusivity_proof.get("accountWideCausalAudit")
+            if isinstance(terminal_exclusivity_proof, Mapping)
+            else None
+        )
+        exclusivity_hash = _text(
+            evidence.get("accountExclusivityProofHash")
+        ).lower()
         terminal_hash = _text(terminal_row["truth_hash"]).lower()
         trusted_now = _terminal_decimal(self.clock(), label="trusted current epoch")
         if (
             terminal_row is None
-            or not isinstance(terminal_truth, Mapping)
-            or not isinstance(binding, Mapping)
-            or not isinstance(bootstrap_binding, Mapping)
-            or not isinstance(bootstrap_record, Mapping)
+            or not isinstance(terminal_exclusivity_proof, Mapping)
+            or not isinstance(evidence_exclusivity_proof, Mapping)
+            or dict(terminal_exclusivity_proof)
+            != dict(evidence_exclusivity_proof)
+            or _SHA256_RE.fullmatch(exclusivity_hash) is None
+            or not secrets.compare_digest(
+                _hash_document(terminal_exclusivity_proof), exclusivity_hash
+            )
+            or not secrets.compare_digest(
+                _text(
+                    terminal_truth.get("accountExclusivityProofHash")
+                ).lower(),
+                exclusivity_hash,
+            )
+            or not isinstance(terminal_causal_component, Mapping)
+            or (
+                terminal_causal_component.get("causalClosureProven") is True
+            )
+            != (terminal_truth.get("accountWideCausalClosureProven") is True)
+            or (
+                terminal_truth.get("accountWideCausalClosureProven") is True
+            )
+            != (evidence.get("accountWideCausalClosureProven") is True)
+            or (
+                terminal_truth.get("accountExclusivityPhaseChainComplete")
+                is True
+            )
+            != (
+                evidence.get("accountExclusivityPhaseChainComplete") is True
+            )
+            or (
+                terminal_truth.get("accountExclusivityRestartVerifiable")
+                is True
+            )
+            != (
+                evidence.get("accountExclusivityRestartVerifiable") is True
+            )
+            or not secrets.compare_digest(
+                _text(
+                    terminal_truth.get("accountExclusivityPhaseChainHash")
+                ).lower(),
+                _text(
+                    evidence.get("accountExclusivityPhaseChainHash")
+                ).lower(),
+            )
+            or int(
+                terminal_truth.get("accountExclusivityPhaseProofCount") or 0
+            )
+            != int(evidence.get("accountExclusivityPhaseProofCount") or 0)
+            or int(
+                terminal_truth.get(
+                    "accountExclusivityPhaseProofRequiredCount"
+                )
+                or 0
+            )
+            != int(
+                evidence.get("accountExclusivityPhaseProofRequiredCount") or 0
+            )
+            or int(evidence.get("accountExclusivityPhaseProofCount") or 0)
+            != 3
+            + sum(
+                1
+                for action in actions
+                if _text(action["action_kind"]).upper() in {"BUY", "SELL"}
+            )
+            or int(
+                evidence.get("accountExclusivityPhaseProofRequiredCount") or 0
+            )
+            != 3
+            + sum(
+                1
+                for action in actions
+                if _text(action["action_kind"]).upper() in {"BUY", "SELL"}
+            )
             or _text(bootstrap["state"]).upper() != "ACTIVE"
             or _text(bootstrap["session_id"]) != _text(session_id)
             or _text(bootstrap["active_permit_id"]) != _text(session["permit_id"])
@@ -2596,15 +2695,31 @@ class DurableBinanceSpotFirstLiveBootstrapStore:
             and evidence.get("baselineRestoredWithinExchangePrecision") is True
             and evidence.get("externalActivityAbsent") is True
             and evidence.get("privateStreamGapRecoveredCleanupOnly") is False
-            and evidence.get("exclusiveAccountOperatorAttested") is True
-            and evidence.get("noManualTradingAttested") is True
-            and evidence.get("noExternalBotsAttested") is True
-            and evidence.get("noOtherApiKeysAttested") is True
-            and outcome
-            in {
-                "PASS_FULL_ROUND_TRIP",
-                "SAFE_INCOMPLETE_ACCOUNT_WIDE_CAUSAL_CLOSURE_UNPROVEN",
-            }
+            and evidence.get("exclusiveAccountOperatorAttested") is False
+            and evidence.get("exclusiveAccountIndependentlyProven") is True
+            and evidence.get("noManualTradingAttested") is False
+            and evidence.get("noManualTradingIndependentlyProven") is True
+            and evidence.get("noExternalBotsAttested") is False
+            and evidence.get("noExternalBotsIndependentlyProven") is True
+            and evidence.get("noOtherApiKeysAttested") is False
+            and evidence.get("noOtherApiKeysIndependentlyProven") is True
+            and evidence.get("accountExclusivityProofDurable") is True
+            and _SHA256_RE.fullmatch(
+                _text(evidence.get("accountExclusivityProofHash")).lower()
+            )
+            is not None
+            and evidence.get("accountExclusivityPhaseChainComplete") is True
+            and evidence.get("accountExclusivityRestartVerifiable") is True
+            and _SHA256_RE.fullmatch(
+                _text(evidence.get("accountExclusivityPhaseChainHash")).lower()
+            )
+            is not None
+            and int(evidence.get("accountExclusivityPhaseProofCount") or 0) >= 4
+            and int(evidence.get("accountExclusivityPhaseProofCount") or 0)
+            == int(
+                evidence.get("accountExclusivityPhaseProofRequiredCount") or 0
+            )
+            and outcome == "PASS_FULL_ROUND_TRIP"
         )
         eligible = bool(
             functional_wiring_passed

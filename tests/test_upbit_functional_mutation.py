@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timedelta, timezone
 import os
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +28,8 @@ PERMIT_HASH = "b" * 64
 ROUTE_SCOPE_HASH = "d" * 64
 SESSION_SCOPE_HASH = "e" * 64
 CLAIM_ID = "upbit-claim-mutation-0001"
+NOW = datetime(2026, 8, 15, 1, 0, tzinfo=timezone.utc)
+OWNER = "f" * 64
 
 
 def buy_payload(**updates: str) -> dict[str, str]:
@@ -71,7 +75,15 @@ class UpbitFunctionalMutationTest(unittest.TestCase):
         authority_reader=authority,
         action: str = "STRATEGY_BUY",
         session_state: str = "ACTIVE",
+        global_reader=None,
     ) -> UpbitFunctionalMutationEdge:
+        scope = SimpleNamespace(
+            permit_id=PERMIT_ID,
+            permit_hash=PERMIT_HASH,
+            route_scope_hash=ROUTE_SCOPE_HASH,
+            account_fingerprint=ACCOUNT,
+            ends_at=NOW + timedelta(hours=2),
+        )
         return UpbitFunctionalMutationEdge(
             session_id=SESSION,
             account_fingerprint=ACCOUNT,
@@ -99,6 +111,14 @@ class UpbitFunctionalMutationTest(unittest.TestCase):
                 "claimId": claim_id,
                 "state": "POST_MAY_HAVE_CROSSED",
             },
+            global_first_live_authority_reader=global_reader,
+            global_first_live_owner_identity_hash=(
+                OWNER if global_reader is not None else ""
+            ),
+            global_first_live_scope=(
+                scope if global_reader is not None else None
+            ),
+            clock=(lambda: NOW) if global_reader is not None else None,
             sender=sender,
             allow_mock_transport=allow_mock_transport,
         )
@@ -316,6 +336,62 @@ class UpbitFunctionalMutationTest(unittest.TestCase):
                 request_hash=request_hash,
             )
         self.assertEqual(1, calls)
+
+    def test_global_first_live_fence_rechecks_at_final_sender_edge(self) -> None:
+        sends: list[object] = []
+        request_hash = _stable_hash(
+            {
+                key: value
+                for key, value in buy_payload().items()
+                if key != "identifier"
+            }
+        )
+
+        def closed_fence(request):
+            body = {
+                "schemaVersion": (
+                    "upbit-global-first-live-dispatch-authority/v1"
+                ),
+                "scope": "CRYPTO_FIRST_LIVE_GLOBAL",
+                "lane": "UPBIT",
+                "phase": "ACTIVE",
+                "runId": SESSION,
+                "sessionId": SESSION,
+                "permitId": PERMIT_ID,
+                "permitHash": PERMIT_HASH,
+                "accountFingerprint": ACCOUNT,
+                "routeScopeHash": ROUTE_SCOPE_HASH,
+                "ownerIdentityHash": OWNER,
+                "ownerLeaseActive": True,
+                "entryAuthorityOpen": False,
+                "cleanupAuthorityOpen": False,
+                "hardStopEpoch": (NOW + timedelta(hours=2)).timestamp(),
+                "ownerLeaseExpiresEpoch": NOW.timestamp() + 30,
+                "revision": 9,
+                "observedEpoch": NOW.timestamp(),
+                "killSwitch": False,
+                "stopRequested": False,
+            }
+            return {**body, "authorityHash": _stable_hash(body)}
+
+        edge = self.edge(
+            sender=lambda request: sends.append(request) or {},
+            request_hash=request_hash,
+            allow_mock_transport=True,
+            global_reader=closed_fence,
+        )
+        with self.ready_env(), self.assertRaisesRegex(
+            UpbitFunctionalMutationNotSent,
+            "global-first-live-dispatch-fence-closed",
+        ):
+            edge.post(
+                buy_payload(),
+                functional_capability=RAW_CAPABILITY,
+                functional_action="STRATEGY_BUY",
+                claim_id=CLAIM_ID,
+                request_hash=request_hash,
+            )
+        self.assertEqual([], sends)
 
 
 if __name__ == "__main__":

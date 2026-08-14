@@ -918,6 +918,7 @@ class OfficialUpbitFunctionalTruthReader:
             )
             proof = self.account_exclusivity_proof_reader(
                 session_id=session_id,
+                phase=_upper(phase),
                 account_fingerprint=self.account_fingerprint,
                 session_started_at=_utc(
                     self.session_started_at, "session-started-at"

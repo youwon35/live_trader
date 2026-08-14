@@ -185,9 +185,12 @@ from .functional_test_workspace import (
 )
 from .order_management import OrderIntent, OrderSide
 from .process_safety import (
+    crypto_first_live_owner_identity,
+    hold_crypto_first_live_account_lease,
     hold_kis_dispatch_lease,
     hold_process_lease,
     live_trader_instance_lease_status,
+    verify_crypto_first_live_owner_identity,
 )
 from .risk_engine import PreTradeContext, PreTradeRiskGate, PreTradeRiskReport, RecentOrder, RiskCheck
 from trading_runtime.strategy_runner import StrategyExecutionResult, StrategyExecutionRunner, StrategyMarketData
@@ -943,6 +946,38 @@ BINANCE_SPOT_FUNCTIONAL_SERVER_SECRET_PATH = Path(
     os.environ.get("LIVE_TRADER_BINANCE_SPOT_FUNCTIONAL_SERVER_SECRET")
     or APP_DATA_ROOT / "secrets" / "binance-spot-functional-server.key"
 )
+CRYPTO_FIRST_LIVE_COORDINATOR_PATH = Path(
+    os.environ.get("LIVE_TRADER_CRYPTO_FIRST_LIVE_COORDINATOR_DB")
+    or APP_DATA_ROOT / "logs" / "crypto-first-live-coordinator.sqlite3"
+)
+CRYPTO_FIRST_LIVE_HIGH_WATER_PATH = Path(
+    os.environ.get("LIVE_TRADER_CRYPTO_FIRST_LIVE_HIGH_WATER_DB")
+    or APP_DATA_ROOT / "logs" / "crypto-first-live-high-water.sqlite3"
+)
+_CRYPTO_FIRST_LIVE_STATE_LOCK = threading.RLock()
+_CRYPTO_FIRST_LIVE_RUNTIME: Any | None = None
+_CRYPTO_FIRST_LIVE_PREPARE_STATUS: dict[str, Any] = {
+    "ok": False,
+    "prepared": False,
+    "available": False,
+    "safeHold": True,
+    "networkOrderPostAllowed": False,
+    "reason": "crypto-first-live-coordinator-not-prepared",
+}
+_CRYPTO_FIRST_LIVE_ACCOUNT_LEASES: dict[str, dict[str, Any]] = {}
+_UPBIT_ACCOUNT_EXCLUSIVITY_INJECTION: Any | None = None
+_UPBIT_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS: dict[str, Any] = {
+    "ready": False,
+    "networkAllowed": False,
+    "cursorStoreHardeningReleased": False,
+    "reason": "upbit-account-exclusivity-injection-not-prepared",
+}
+_BINANCE_ACCOUNT_EXCLUSIVITY_INJECTION: Any | None = None
+_BINANCE_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS: dict[str, Any] = {
+    "injectionReady": False,
+    "networkOrderPostAllowed": False,
+    "reason": "binance-account-exclusivity-injection-not-prepared",
+}
 _BINANCE_SPOT_FUNCTIONAL_STATE_LOCK = threading.RLock()
 _BINANCE_SPOT_FUNCTIONAL_FACADE: Any | None = None
 _BINANCE_SPOT_FUNCTIONAL_PREPARE_STATUS: dict[str, Any] = {
@@ -1249,6 +1284,9 @@ def _upbit_functional_code_manifest() -> dict[str, Any]:
         "binance_order_authority.py",
         "brokers.py",
         "continuous_live.py",
+        "crypto_first_live_coordinator.py",
+        "crypto_first_live_high_water.py",
+        "crypto_first_live_runtime.py",
         "emergency_stop.py",
         "env_loader.py",
         "env_settings.py",
@@ -1260,6 +1298,7 @@ def _upbit_functional_code_manifest() -> dict[str, Any]:
         "server.py",
         "state.py",
         "upbit_continuous_functional.py",
+        "upbit_account_exclusivity.py",
         "upbit_functional_approval.py",
         "upbit_functional_backend.py",
         "upbit_functional_entrypoint.py",
@@ -1393,6 +1432,10 @@ def _preissue_upbit_functional_permit_candidate(
     already-issued id or leave it blank; it cannot choose a new id, binding,
     symbol, cap, account fingerprint, or strategy artifact.
     """
+
+    global_hold = _crypto_first_live_official_candidate_hold("UPBIT")
+    if global_hold:
+        raise RuntimeError(global_hold)
 
     with _UPBIT_FUNCTIONAL_STATE_LOCK:
         status = dict(_UPBIT_FUNCTIONAL_PREPARE_STATUS)
@@ -1786,6 +1829,8 @@ def _upbit_functional_emergency_cleanup_after_latch() -> dict[str, Any]:
             "state": "RECONCILIATION_REQUIRED",
             "reason": "emergency-stop-latch-not-observed",
         }
+    durable_cleanup_proven = False
+    durable_session_id = ""
     try:
         latch = _request_upbit_functional_cleanup_only("emergency-stop")
         from .upbit_functional_backend import (
@@ -1796,6 +1841,12 @@ def _upbit_functional_emergency_cleanup_after_latch() -> dict[str, Any]:
         status = upbit_functional_backend_status()
         session_id = str(status.get("sessionId") or "")
         durable_session_id = str(latch.get("sessionId") or "")
+        durable_cleanup_proven = bool(
+            latch.get("ok") is True
+            and str(latch.get("state") or "") == "CLEANUP_ONLY"
+            and latch.get("cleanupOnly") is True
+            and durable_session_id
+        )
         if (
             latch.get("ok") is False
             and str(latch.get("state") or "")
@@ -1805,7 +1856,7 @@ def _upbit_functional_emergency_cleanup_after_latch() -> dict[str, Any]:
                 "ok": False,
                 "sessionId": durable_session_id,
                 "state": "RECONCILIATION_REQUIRED",
-                "entryAuthorityRevoked": True,
+                "entryAuthorityRevoked": False,
                 "cleanupOnlyLatch": latch,
                 "cleanupSchedulerOwned": False,
                 "reason": str(
@@ -1823,7 +1874,7 @@ def _upbit_functional_emergency_cleanup_after_latch() -> dict[str, Any]:
                 "sessionId": durable_session_id,
                 "managerSessionId": session_id,
                 "state": "RECONCILIATION_REQUIRED",
-                "entryAuthorityRevoked": True,
+                "entryAuthorityRevoked": durable_cleanup_proven,
                 "cleanupOnlyLatch": latch,
                 "cleanupSchedulerOwned": False,
                 "reason": "upbit-functional-cleanup-manager-session-mismatch",
@@ -1836,7 +1887,7 @@ def _upbit_functional_emergency_cleanup_after_latch() -> dict[str, Any]:
                     "ok": False,
                     "sessionId": durable_session_id,
                     "state": "RECONCILIATION_REQUIRED",
-                    "entryAuthorityRevoked": True,
+                    "entryAuthorityRevoked": durable_cleanup_proven,
                     "cleanupOnlyLatch": latch,
                     "cleanupSchedulerOwned": False,
                     "reason": (
@@ -1858,23 +1909,487 @@ def _upbit_functional_emergency_cleanup_after_latch() -> dict[str, Any]:
         )
         terminal_complete = terminal in {"FINALIZED", "SAFE_INCOMPLETE"}
         return {
-            "ok": result.get("ok") is True and terminal_complete,
+            "ok": bool(
+                durable_cleanup_proven
+                and result.get("ok") is True
+                and terminal_complete
+            ),
             "sessionId": session_id,
             "state": terminal if terminal_complete else "RECONCILIATION_REQUIRED",
-            "entryAuthorityRevoked": True,
+            "entryAuthorityRevoked": durable_cleanup_proven,
             "cleanupOnlyLatch": latch,
-            "cleanupSchedulerOwned": not terminal_complete,
+            "cleanupSchedulerOwned": bool(
+                durable_cleanup_proven and not terminal_complete
+            ),
             "result": result,
         }
     except Exception as exc:
         return {
             "ok": False,
             "state": "RECONCILIATION_REQUIRED",
-            "entryAuthorityRevoked": True,
+            "entryAuthorityRevoked": durable_cleanup_proven,
+            "sessionId": durable_session_id,
             "reason": (
                 "upbit-functional-emergency-cleanup-failed:"
                 + type(exc).__name__
             ),
+        }
+
+
+def _crypto_first_live_installation_validator(
+    request: dict[str, Any],
+) -> bool:
+    """Cross-audit both broker stores before accepting an empty coordinator."""
+
+    try:
+        return bool(
+            request.get("requiredCrossAudit")
+            == "UPBIT_AND_BINANCE_NONTERMINAL_POINTERS_ABSENT"
+            and not _upbit_functional_durable_authority_open()
+            and not _binance_functional_durable_authority_open()
+        )
+    except Exception:
+        return False
+
+
+def _crypto_first_live_owner_hash(value: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _prepare_upbit_account_exclusivity_injection(
+    *,
+    account_fingerprint: str,
+    owner_identity: dict[str, Any],
+) -> tuple[Any | None, dict[str, Any]]:
+    """Build the verification-only proof consumer when every pin exists."""
+
+    global _UPBIT_ACCOUNT_EXCLUSIVITY_INJECTION
+    global _UPBIT_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS
+    configured = {
+        "proofDirectory": str(
+            os.environ.get("LIVE_TRADER_UPBIT_EXCLUSIVITY_PROOF_DIR") or ""
+        ).strip(),
+        "cursorDatabase": str(
+            os.environ.get("LIVE_TRADER_UPBIT_EXCLUSIVITY_CURSOR_DB") or ""
+        ).strip(),
+        "publicKey": str(
+            os.environ.get("LIVE_TRADER_UPBIT_EXCLUSIVITY_PUBLIC_KEY") or ""
+        ).strip(),
+        "verifierPin": str(
+            os.environ.get("LIVE_TRADER_UPBIT_EXCLUSIVITY_VERIFIER_PIN") or ""
+        ).strip(),
+        "verifierId": str(
+            os.environ.get("LIVE_TRADER_UPBIT_EXCLUSIVITY_VERIFIER_ID") or ""
+        ).strip(),
+        "keyId": str(
+            os.environ.get("LIVE_TRADER_UPBIT_EXCLUSIVITY_KEY_ID") or ""
+        ).strip(),
+        "authorityJournalId": str(
+            os.environ.get(
+                "LIVE_TRADER_UPBIT_EXCLUSIVITY_AUTHORITY_JOURNAL_ID"
+            )
+            or ""
+        ).strip(),
+    }
+    missing = [key for key, value in configured.items() if not value]
+    # Start false and promote only from the provider's exact code-owned schema
+    # fingerprint plus durable/path-identity checks below.  Missing config or
+    # any drift therefore remains an explicit HOLD.
+    cursor_hardening_released = False
+    if missing:
+        _UPBIT_ACCOUNT_EXCLUSIVITY_INJECTION = None
+        _UPBIT_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS = {
+            "ready": False,
+            "networkAllowed": False,
+            "cursorStoreHardeningReleased": cursor_hardening_released,
+            "reason": "upbit-account-exclusivity-configuration-missing:"
+            + ",".join(missing),
+        }
+        return None, dict(_UPBIT_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS)
+    try:
+        from .upbit_account_exclusivity import (
+            UPBIT_ACCOUNT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT,
+            build_upbit_account_exclusivity_injection,
+            upbit_spot_credential_binding_sha256,
+        )
+        from .upbit_functional_transport import upbit_credential_fingerprint
+
+        access_key = str(env_value("UPBIT_ACCESS_KEY") or "")
+        secret_key = str(env_value("UPBIT_SECRET_KEY") or "")
+        credential_binding = upbit_spot_credential_binding_sha256(
+            access_key, secret_key
+        )
+        owner_hash = _crypto_first_live_owner_hash(owner_identity)
+        injection = build_upbit_account_exclusivity_injection(
+            proof_directory=Path(configured["proofDirectory"]),
+            cursor_database_path=Path(configured["cursorDatabase"]),
+            public_key_path=Path(configured["publicKey"]),
+            verifier_pin_path=Path(configured["verifierPin"]),
+            verifier_id=configured["verifierId"],
+            key_id=configured["keyId"],
+            authority_journal_id=configured["authorityJournalId"],
+            expected_account_fingerprint=account_fingerprint,
+            expected_credential_binding_sha256=credential_binding,
+            expected_server_owner_identity_sha256=owner_hash,
+            account_fingerprint_reader=upbit_credential_fingerprint,
+            credential_binding_reader=lambda: (
+                upbit_spot_credential_binding_sha256(
+                    str(env_value("UPBIT_ACCESS_KEY") or ""),
+                    str(env_value("UPBIT_SECRET_KEY") or ""),
+                )
+            ),
+            server_owner_identity_reader=lambda: (
+                _crypto_first_live_owner_hash(
+                    crypto_first_live_owner_identity(
+                        "UPBIT", account_fingerprint
+                    )
+                )
+            ),
+            clock=lambda: datetime.now(timezone.utc),
+        )
+        _UPBIT_ACCOUNT_EXCLUSIVITY_INJECTION = injection
+        provider_status = dict(injection.status())
+        cursor_hardening_released = bool(
+            provider_status.get("injectionReady") is True
+            and provider_status.get("durable") is True
+            and provider_status.get("restartVerifiable") is True
+            and provider_status.get("cursorPathIdentityPinned") is True
+            and provider_status.get("cursorSchemaFingerprint")
+            == UPBIT_ACCOUNT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT
+            and provider_status.get("networkOrderPostAllowed") is False
+        )
+        _UPBIT_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS = {
+            **provider_status,
+            "ready": cursor_hardening_released,
+            "networkAllowed": False,
+            "cursorStoreHardeningReleased": cursor_hardening_released,
+            "productionReleased": False,
+        }
+    except Exception as exc:
+        _UPBIT_ACCOUNT_EXCLUSIVITY_INJECTION = None
+        _UPBIT_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS = {
+            "ready": False,
+            "networkAllowed": False,
+            "cursorStoreHardeningReleased": cursor_hardening_released,
+            "reason": "upbit-account-exclusivity-prepare-failed:"
+            + type(exc).__name__,
+        }
+    return (
+        _UPBIT_ACCOUNT_EXCLUSIVITY_INJECTION,
+        dict(_UPBIT_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS),
+    )
+
+
+def _prepare_binance_account_exclusivity_injection(
+    *,
+    credential_fingerprint: str,
+    owner_identity: dict[str, Any],
+) -> tuple[Any | None, dict[str, Any]]:
+    """Conditionally compose Binance's public-key-only proof provider."""
+
+    global _BINANCE_ACCOUNT_EXCLUSIVITY_INJECTION
+    global _BINANCE_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS
+    configured = {
+        "proofDirectory": str(
+            os.environ.get("LIVE_TRADER_BINANCE_EXCLUSIVITY_PROOF_DIR") or ""
+        ).strip(),
+        "cursorDatabase": str(
+            os.environ.get("LIVE_TRADER_BINANCE_EXCLUSIVITY_CURSOR_DB") or ""
+        ).strip(),
+        "publicKey": str(
+            os.environ.get("LIVE_TRADER_BINANCE_EXCLUSIVITY_PUBLIC_KEY") or ""
+        ).strip(),
+        "verifierPin": str(
+            os.environ.get("LIVE_TRADER_BINANCE_EXCLUSIVITY_VERIFIER_PIN") or ""
+        ).strip(),
+        "verifierId": str(
+            os.environ.get("LIVE_TRADER_BINANCE_EXCLUSIVITY_VERIFIER_ID") or ""
+        ).strip(),
+        "keyId": str(
+            os.environ.get("LIVE_TRADER_BINANCE_EXCLUSIVITY_KEY_ID") or ""
+        ).strip(),
+        "authorityJournalId": str(
+            os.environ.get(
+                "LIVE_TRADER_BINANCE_EXCLUSIVITY_AUTHORITY_JOURNAL_ID"
+            )
+            or ""
+        ).strip(),
+        "accountIdentityFingerprint": str(
+            os.environ.get(
+                "LIVE_TRADER_BINANCE_ACCOUNT_IDENTITY_FINGERPRINT"
+            )
+            or ""
+        ).strip().lower(),
+    }
+    missing = [key for key, value in configured.items() if not value]
+    if missing:
+        _BINANCE_ACCOUNT_EXCLUSIVITY_INJECTION = None
+        _BINANCE_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS = {
+            "injectionReady": False,
+            "networkOrderPostAllowed": False,
+            "reason": "binance-account-exclusivity-configuration-missing:"
+            + ",".join(missing),
+        }
+        return None, dict(_BINANCE_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS)
+    try:
+        from .binance_spot_functional_exclusivity_provider import (
+            build_binance_spot_exclusivity_injection,
+        )
+        from .binance_spot_functional_transport import (
+            binance_api_key_fingerprint,
+        )
+
+        account_identity = configured["accountIdentityFingerprint"]
+        owner_hash = _crypto_first_live_owner_hash(owner_identity)
+        injection = build_binance_spot_exclusivity_injection(
+            proof_directory=Path(configured["proofDirectory"]),
+            cursor_database_path=Path(configured["cursorDatabase"]),
+            public_key_path=Path(configured["publicKey"]),
+            verifier_pin_path=Path(configured["verifierPin"]),
+            verifier_id=configured["verifierId"],
+            key_id=configured["keyId"],
+            authority_journal_id=configured["authorityJournalId"],
+            expected_account_identity_fingerprint=account_identity,
+            expected_credential_fingerprint=credential_fingerprint,
+            expected_server_owner_identity_sha256=owner_hash,
+            account_identity_reader=lambda: str(
+                os.environ.get(
+                    "LIVE_TRADER_BINANCE_ACCOUNT_IDENTITY_FINGERPRINT"
+                )
+                or ""
+            ).strip().lower(),
+            credential_fingerprint_reader=lambda: (
+                binance_api_key_fingerprint(
+                    str(env_value("BINANCE_API_KEY") or "")
+                )
+            ),
+            server_owner_identity_reader=lambda: (
+                _crypto_first_live_owner_hash(
+                    crypto_first_live_owner_identity(
+                        "BINANCE_SPOT", credential_fingerprint
+                    )
+                )
+            ),
+            clock=time.time,
+        )
+        _BINANCE_ACCOUNT_EXCLUSIVITY_INJECTION = injection
+        _BINANCE_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS = {
+            **injection.status(),
+            "networkOrderPostAllowed": False,
+        }
+    except Exception as exc:
+        _BINANCE_ACCOUNT_EXCLUSIVITY_INJECTION = None
+        _BINANCE_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS = {
+            "injectionReady": False,
+            "networkOrderPostAllowed": False,
+            "reason": "binance-account-exclusivity-prepare-failed:"
+            + type(exc).__name__,
+        }
+    return (
+        _BINANCE_ACCOUNT_EXCLUSIVITY_INJECTION,
+        dict(_BINANCE_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS),
+    )
+
+
+def prepare_crypto_first_live_coordinator_state() -> dict[str, Any]:
+    """Audit the global authority before either broker backend is prepared."""
+
+    global _CRYPTO_FIRST_LIVE_RUNTIME
+    global _CRYPTO_FIRST_LIVE_PREPARE_STATUS
+    global _CRYPTO_FIRST_LIVE_ACCOUNT_LEASES
+    with _CRYPTO_FIRST_LIVE_STATE_LOCK:
+        try:
+            from .binance_spot_functional_transport import (
+                binance_api_key_fingerprint,
+            )
+            from .crypto_first_live_coordinator import (
+                DurableCryptoFirstLiveCoordinator,
+            )
+            from .crypto_first_live_high_water import (
+                DurableCryptoFirstLiveHighWaterAnchor,
+            )
+            from .crypto_first_live_runtime import (
+                CryptoFirstLiveRuntime,
+                InProcessRouteLockAuthority,
+            )
+            from .upbit_functional_transport import (
+                upbit_credential_fingerprint,
+            )
+
+            if _CRYPTO_FIRST_LIVE_RUNTIME is None:
+                route_authority = InProcessRouteLockAuthority()
+                high_water = DurableCryptoFirstLiveHighWaterAnchor(
+                    CRYPTO_FIRST_LIVE_HIGH_WATER_PATH
+                )
+                coordinator = DurableCryptoFirstLiveCoordinator(
+                    CRYPTO_FIRST_LIVE_COORDINATOR_PATH,
+                    high_water_anchor=high_water,
+                    installation_validator=(
+                        _crypto_first_live_installation_validator
+                    ),
+                    owner_identity_verifier=(
+                        verify_crypto_first_live_owner_identity
+                    ),
+                    route_lock_verifier=route_authority.verify,
+                )
+                _CRYPTO_FIRST_LIVE_RUNTIME = CryptoFirstLiveRuntime(
+                    coordinator=coordinator,
+                    route_lock_authority=route_authority,
+                    account_lease_holder=(
+                        hold_crypto_first_live_account_lease
+                    ),
+                    owner_identity_reader=crypto_first_live_owner_identity,
+                    upbit_route_boundary=(
+                        lambda: UPBIT_ORDER_AUTHORITY_MUTATION_LOCK
+                    ),
+                    binance_route_boundary=(
+                        binance_route_authority_serialization
+                    ),
+                    kill_switch_reader=lambda: bool(
+                        STATE.get("kill_switch")
+                        or emergency_stop_active()
+                    ),
+                )
+            prepared = dict(_CRYPTO_FIRST_LIVE_RUNTIME.prepare())
+            binance_api_key = str(env_value("BINANCE_API_KEY") or "")
+            account_fingerprints = {
+                "UPBIT": upbit_credential_fingerprint(),
+                "BINANCE_SPOT": (
+                    binance_api_key_fingerprint(binance_api_key)
+                    if binance_api_key
+                    else ""
+                ),
+            }
+            leases: dict[str, dict[str, Any]] = {}
+            for lane, fingerprint in account_fingerprints.items():
+                if not fingerprint:
+                    leases[lane] = {
+                        "acquired": False,
+                        "reason": "crypto-first-live-account-credential-missing",
+                    }
+                    continue
+                leases[lane] = dict(
+                    hold_crypto_first_live_account_lease(lane, fingerprint)
+                )
+            _CRYPTO_FIRST_LIVE_ACCOUNT_LEASES = leases
+            _CRYPTO_FIRST_LIVE_PREPARE_STATUS = {
+                **prepared,
+                "accountLeases": leases,
+                "upbitAccountExclusivity": dict(
+                    _UPBIT_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS
+                ),
+                "binanceAccountExclusivity": dict(
+                    _BINANCE_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS
+                ),
+                "startReservationCompositionConnected": False,
+                "heartbeatCompositionConnected": False,
+                "terminalFinalizeCompositionConnected": False,
+                "networkOrderPostAllowed": False,
+            }
+        except Exception as exc:
+            _CRYPTO_FIRST_LIVE_PREPARE_STATUS = {
+                "ok": False,
+                "prepared": False,
+                "available": False,
+                "safeHold": True,
+                "networkOrderPostAllowed": False,
+                "reason": "crypto-first-live-coordinator-prepare-failed:"
+                + type(exc).__name__,
+            }
+        return dict(_CRYPTO_FIRST_LIVE_PREPARE_STATUS)
+
+
+def crypto_first_live_coordinator_state_status() -> dict[str, Any]:
+    with _CRYPTO_FIRST_LIVE_STATE_LOCK:
+        runtime = _CRYPTO_FIRST_LIVE_RUNTIME
+        prepared = dict(_CRYPTO_FIRST_LIVE_PREPARE_STATUS)
+    if runtime is None:
+        return prepared
+    try:
+        return {**prepared, **dict(runtime.status())}
+    except Exception as exc:
+        return {
+            **prepared,
+            "ok": False,
+            "available": False,
+            "networkOrderPostAllowed": False,
+            "reason": "crypto-first-live-status-failed:"
+            + type(exc).__name__,
+        }
+
+
+def _crypto_first_live_official_candidate_hold(lane: str) -> str:
+    """Hold official candidate/start before any broker permit mutation.
+
+    Unit-level broker graphs may run with injected transports without the
+    application-instance lease.  The official server always owns that lease,
+    and therefore must also own a fully composed global reservation lifecycle.
+    Until reservation, heartbeat, and terminal evidence authorities are wired,
+    it fails before creating/approving a broker candidate.
+    """
+
+    application = live_trader_instance_lease_status()
+    if application.get("acquired") is not True:
+        return "crypto-first-live-application-instance-lease-required"
+    normalized_lane = str(lane or "").strip().upper()
+    with _CRYPTO_FIRST_LIVE_STATE_LOCK:
+        runtime = _CRYPTO_FIRST_LIVE_RUNTIME
+        prepared = dict(_CRYPTO_FIRST_LIVE_PREPARE_STATUS)
+    if runtime is None or prepared.get("prepared") is not True:
+        return "crypto-first-live-startup-audit-not-prepared"
+    status = runtime.status()
+    coordinator = (
+        dict(status.get("coordinator"))
+        if isinstance(status.get("coordinator"), dict)
+        else {}
+    )
+    if (
+        prepared.get("startReservationCompositionConnected") is not True
+        or prepared.get("heartbeatCompositionConnected") is not True
+        or prepared.get("terminalFinalizeCompositionConnected") is not True
+    ):
+        return "crypto-first-live-reservation-lifecycle-not-composed"
+    if not runtime.production_entry_released():
+        return "crypto-first-live-production-release-held"
+    if (
+        coordinator.get("phase") != "ACTIVE"
+        or coordinator.get("lane") != normalized_lane
+        or status.get("processMemoryOwnerMatches") is not True
+    ):
+        return "crypto-first-live-active-owner-required-before-broker-start"
+    return ""
+
+
+def _revoke_crypto_first_live_entry_before_cleanup(
+    reason: str,
+) -> dict[str, Any]:
+    with _CRYPTO_FIRST_LIVE_STATE_LOCK:
+        runtime = _CRYPTO_FIRST_LIVE_RUNTIME
+    if runtime is None:
+        return {
+            "ok": False,
+            "entryAuthorityRevoked": False,
+            "state": "RECONCILIATION_REQUIRED",
+            "reason": "crypto-first-live-entry-revocation-unverifiable:"
+            "runtime-not-prepared",
+        }
+    try:
+        return dict(runtime.revoke_entry_before_cleanup(reason))
+    except Exception as exc:
+        return {
+            "ok": False,
+            "entryAuthorityRevoked": False,
+            "state": "RECONCILIATION_REQUIRED",
+            "reason": "crypto-first-live-entry-revocation-failed:"
+            + type(exc).__name__,
         }
 
 
@@ -1921,6 +2436,36 @@ def prepare_upbit_functional_backend_state() -> dict[str, Any]:
             )
 
             resolve_upbit_functional_base_url()
+            account_fingerprint = upbit_credential_fingerprint()
+            account_lease = dict(
+                hold_crypto_first_live_account_lease(
+                    "UPBIT", account_fingerprint
+                )
+            )
+            owner_process_identity = None
+            injection = None
+            if account_lease.get("acquired") is True:
+                owner_process_identity = crypto_first_live_owner_identity(
+                    "UPBIT", account_fingerprint
+                )
+                injection, exclusivity_status = (
+                    _prepare_upbit_account_exclusivity_injection(
+                        account_fingerprint=account_fingerprint,
+                        owner_identity=owner_process_identity,
+                    )
+                )
+            else:
+                exclusivity_status = {
+                    "ready": False,
+                    "networkAllowed": False,
+                    "cursorStoreHardeningReleased": False,
+                    "reason": str(
+                        account_lease.get("reason")
+                        or "upbit-account-os-lease-unavailable"
+                    ),
+                }
+            with _CRYPTO_FIRST_LIVE_STATE_LOCK:
+                crypto_runtime = _CRYPTO_FIRST_LIVE_RUNTIME
             if _UPBIT_FUNCTIONAL_APPROVAL_STORE is None:
                 _UPBIT_FUNCTIONAL_APPROVAL_STORE = (
                     DurableUpbitFunctionalApprovalStore(
@@ -1957,6 +2502,30 @@ def prepare_upbit_functional_backend_state() -> dict[str, Any]:
                 approval_record_signer=(
                     _sign_upbit_functional_approval_record
                 ),
+                account_exclusivity_proof_reader=(
+                    injection.proof_reader
+                    if injection is not None
+                    else None
+                ),
+                account_exclusivity_verifier=(
+                    injection.verifier
+                    if injection is not None
+                    else None
+                ),
+                account_exclusivity_verifier_pin=(
+                    injection.verifier_pin
+                    if injection is not None
+                    else None
+                ),
+                global_first_live_authority_reader=(
+                    crypto_runtime.upbit_authority
+                    if crypto_runtime is not None
+                    else None
+                ),
+                # The exact five fields are shared with coordinator owner
+                # verification and the detached proof owner hash.  No raw
+                # process/account lease handle or coordinator token is copied.
+                owner_process_identity=owner_process_identity,
             )
             status = (
                 dict(prepared.get("status"))
@@ -1968,6 +2537,10 @@ def prepare_upbit_functional_backend_state() -> dict[str, Any]:
                 "prepared": True,
                 **status,
                 "configured": configured,
+                "cryptoFirstLive": (
+                    crypto_first_live_coordinator_state_status()
+                ),
+                "accountExclusivity": exclusivity_status,
             }
         except Exception as exc:
             _UPBIT_FUNCTIONAL_PREPARE_STATUS = {
@@ -2074,6 +2647,9 @@ def start_upbit_functional_backend_state(
         return _upbit_functional_blocked(
             "upbit-functional-approval-id-required"
         )
+    global_hold = _crypto_first_live_official_candidate_hold("UPBIT")
+    if global_hold:
+        return _upbit_functional_blocked(global_hold)
     with FUNCTIONAL_TEST_LIFECYCLE_LOCK:
         status = upbit_functional_backend_state_status()
         if status.get("prepared") is not True or status.get("available") is not True:
@@ -2187,6 +2763,14 @@ def stop_upbit_functional_backend_state(
             return _upbit_functional_blocked(
                 str(consumed.get("reason") or "safety-confirmation-required")
             )
+        # Global entry is revoked first.  Broker cleanup still runs if this
+        # audit fails so a damaged coordinator can never strand open orders;
+        # the combined result remains reconciliation-required/fail-closed.
+        global_cleanup_latch = (
+            _revoke_crypto_first_live_entry_before_cleanup(
+                "upbit-operator-stop"
+            )
+        )
         try:
             cleanup_latch = _request_upbit_functional_cleanup_only(
                 "operator-stop"
@@ -2208,7 +2792,15 @@ def stop_upbit_functional_backend_state(
                     )
                 }
             )
-            return {**result, "cleanupOnlyLatch": cleanup_latch}
+            return {
+                **result,
+                "ok": bool(
+                    result.get("ok") is True
+                    and global_cleanup_latch.get("ok") is True
+                ),
+                "cleanupOnlyLatch": cleanup_latch,
+                "globalFirstLiveCleanupLatch": global_cleanup_latch,
+            }
         except Exception as exc:
             return _upbit_functional_blocked(
                 "upbit-functional-stop-failed:" + type(exc).__name__
@@ -2646,6 +3238,49 @@ def _binance_spot_functional_facade() -> Any:
             from .binance_spot_functional_state import (
                 BinanceSpotFunctionalStateFacade,
             )
+            from .binance_spot_functional_transport import (
+                binance_api_key_fingerprint,
+            )
+
+            api_key = str(env_value("BINANCE_API_KEY") or "")
+            credential_fingerprint = (
+                binance_api_key_fingerprint(api_key) if api_key else ""
+            )
+            account_lease: dict[str, Any] = {
+                "acquired": False,
+                "reason": "binance-account-credential-missing",
+            }
+            if credential_fingerprint:
+                account_lease = dict(
+                    hold_crypto_first_live_account_lease(
+                        "BINANCE_SPOT", credential_fingerprint
+                    )
+                )
+            exclusivity_kwargs: dict[str, Any] = {
+                "account_exclusivity_proof_reader": None,
+                "account_exclusivity_verifier": None,
+                "account_exclusivity_verifier_pin": None,
+                "account_identity_fingerprint": str(
+                    os.environ.get(
+                        "LIVE_TRADER_BINANCE_ACCOUNT_IDENTITY_FINGERPRINT"
+                    )
+                    or ""
+                ).strip().lower(),
+            }
+            if account_lease.get("acquired") is True:
+                owner_identity = crypto_first_live_owner_identity(
+                    "BINANCE_SPOT", credential_fingerprint
+                )
+                injection, _injection_status = (
+                    _prepare_binance_account_exclusivity_injection(
+                        credential_fingerprint=credential_fingerprint,
+                        owner_identity=owner_identity,
+                    )
+                )
+                if injection is not None:
+                    exclusivity_kwargs = dict(injection.facade_kwargs())
+            with _CRYPTO_FIRST_LIVE_STATE_LOCK:
+                crypto_runtime = _CRYPTO_FIRST_LIVE_RUNTIME
 
             _BINANCE_SPOT_FUNCTIONAL_FACADE = (
                 BinanceSpotFunctionalStateFacade(
@@ -2660,6 +3295,12 @@ def _binance_spot_functional_facade() -> Any:
                     ordinary_routes_closed_reader=(
                         _binance_spot_functional_ordinary_routes_closed
                     ),
+                    **exclusivity_kwargs,
+                    global_first_live_authority_reader=(
+                        crypto_runtime.binance_authority
+                        if crypto_runtime is not None
+                        else None
+                    ),
                 )
             )
         return _BINANCE_SPOT_FUNCTIONAL_FACADE
@@ -2671,6 +3312,13 @@ def prepare_binance_spot_functional_backend_state() -> dict[str, Any]:
     global _BINANCE_SPOT_FUNCTIONAL_PREPARE_STATUS
     try:
         result = dict(_binance_spot_functional_facade().prepare())
+        result["accountExclusivity"] = dict(
+            _BINANCE_ACCOUNT_EXCLUSIVITY_PREPARE_STATUS
+        )
+        result["cryptoFirstLive"] = (
+            crypto_first_live_coordinator_state_status()
+        )
+        result["networkOrderPostAllowed"] = False
     except Exception as exc:
         result = {
             "ok": False,
@@ -2723,55 +3371,98 @@ def _binance_spot_functional_emergency_cleanup_after_latch() -> dict[str, Any]:
     with _BINANCE_SPOT_FUNCTIONAL_STATE_LOCK:
         facade = _BINANCE_SPOT_FUNCTIONAL_FACADE
     if facade is None:
+        durable_authority_open = _binance_functional_durable_authority_open()
         return {
-            "ok": not _binance_functional_durable_authority_open(),
+            "ok": not durable_authority_open,
             "state": (
                 "NO_ACTIVE_FUNCTIONAL_SESSION"
-                if not _binance_functional_durable_authority_open()
+                if not durable_authority_open
                 else "RECONCILIATION_REQUIRED"
             ),
-            "entryAuthorityRevoked": (
-                not _binance_functional_durable_authority_open()
-            ),
+            "entryAuthorityRevoked": not durable_authority_open,
         }
     try:
         before = dict(facade.order_authority_snapshot())
-        if before.get("functionalAuthorityOpen") is not True:
+        before_authority_open = before.get("functionalAuthorityOpen")
+        if before_authority_open is not True:
+            before_phase = str(
+                before.get("functionalPhase") or "UNREADABLE"
+            ).upper()
+            if (
+                before_authority_open is False
+                and before_phase in {"IDLE", "FINALIZED"}
+            ):
+                return {
+                    "ok": True,
+                    "state": "NO_ACTIVE_FUNCTIONAL_SESSION",
+                    "entryAuthorityRevoked": True,
+                }
+            if (
+                before_authority_open is False
+                and before_phase == "FAILED"
+            ):
+                return {
+                    "ok": False,
+                    "state": "FAILED",
+                    "entryAuthorityRevoked": True,
+                    "cleanupSchedulerOwned": False,
+                    "reason": "binance-functional-terminal-failed",
+                }
             return {
-                "ok": True,
-                "state": "NO_ACTIVE_FUNCTIONAL_SESSION",
-                "entryAuthorityRevoked": True,
+                "ok": False,
+                "state": "RECONCILIATION_REQUIRED",
+                "entryAuthorityRevoked": False,
+                "cleanupSchedulerOwned": False,
+                "reason": "binance-functional-authority-snapshot-inconsistent",
             }
+        before_session_id = str(
+            before.get("functionalSessionId") or ""
+        )
         result = dict(facade.stop())
         after = dict(facade.order_authority_snapshot())
         phase = str(after.get("functionalPhase") or "").upper()
-        entry_revoked = phase in {
-            "CLEANUP",
-            "FINAL_RESET",
-            "FINALIZED",
-            "FAILED",
-            "RECONCILIATION_REQUIRED",
-        }
+        authority_open = after.get("functionalAuthorityOpen")
+        after_session_id = str(
+            after.get("functionalSessionId") or ""
+        )
+        session_matches = bool(
+            before_session_id
+            and after_session_id
+            and secrets.compare_digest(
+                before_session_id, after_session_id
+            )
+        )
+        cleanup_proven = bool(
+            phase in {"CLEANUP", "FINAL_RESET"}
+            and authority_open is True
+            and session_matches
+        )
+        terminal_proven = bool(
+            phase in {"FINALIZED", "FAILED"}
+            and authority_open is False
+            and session_matches
+        )
+        entry_revoked = cleanup_proven or terminal_proven
+        cleanup_ok = bool(
+            result.get("ok") is True
+            and entry_revoked
+            and phase != "FAILED"
+        )
         return {
-            "ok": entry_revoked,
+            "ok": cleanup_ok,
             "state": phase if entry_revoked else "RECONCILIATION_REQUIRED",
-            "sessionId": str(after.get("functionalSessionId") or ""),
+            "sessionId": after_session_id,
             "entryAuthorityRevoked": entry_revoked,
             "cleanupSchedulerOwned": bool(
-                entry_revoked and phase in {"CLEANUP", "FINAL_RESET"}
+                cleanup_proven
             ),
             "result": result,
         }
     except Exception as exc:
-        try:
-            after = dict(facade.order_authority_snapshot())
-        except Exception:
-            after = {}
-        phase = str(after.get("functionalPhase") or "UNREADABLE").upper()
         return {
             "ok": False,
             "state": "RECONCILIATION_REQUIRED",
-            "entryAuthorityRevoked": phase != "ACTIVE",
+            "entryAuthorityRevoked": False,
             "reason": (
                 "binance-functional-emergency-cleanup-failed:"
                 + type(exc).__name__
@@ -2791,6 +3482,11 @@ def _binance_spot_functional_blocked(reason: str) -> dict[str, Any]:
 def _preissue_binance_spot_functional_candidate(
     requested_approval_id: str = "",
 ) -> dict[str, Any]:
+    global_hold = _crypto_first_live_official_candidate_hold(
+        "BINANCE_SPOT"
+    )
+    if global_hold:
+        raise RuntimeError(global_hold)
     return dict(
         _binance_spot_functional_facade().preissue(
             str(requested_approval_id or "")
@@ -2838,6 +3534,11 @@ def start_binance_spot_functional_backend_state(
         return _binance_spot_functional_blocked(
             "binance-functional-approval-id-required"
         )
+    global_hold = _crypto_first_live_official_candidate_hold(
+        "BINANCE_SPOT"
+    )
+    if global_hold:
+        return _binance_spot_functional_blocked(global_hold)
     status = binance_spot_functional_backend_state_status()
     if (
         status.get("prepared") is not True
@@ -2916,8 +3617,19 @@ def stop_binance_spot_functional_backend_state(
         return _binance_spot_functional_blocked(
             str(consumed.get("reason") or "safety-confirmation-required")
         )
+    global_cleanup_latch = _revoke_crypto_first_live_entry_before_cleanup(
+        "binance-operator-stop"
+    )
     try:
-        return dict(_binance_spot_functional_facade().stop())
+        result = dict(_binance_spot_functional_facade().stop())
+        return {
+            **result,
+            "ok": bool(
+                result.get("ok") is True
+                and global_cleanup_latch.get("ok") is True
+            ),
+            "globalFirstLiveCleanupLatch": global_cleanup_latch,
+        }
     except Exception as exc:
         return _binance_spot_functional_blocked(
             "binance-functional-stop-failed:" + type(exc).__name__
@@ -10255,15 +10967,20 @@ def _apply_durable_emergency_stop_recovery() -> dict[str, Any]:
     # runtime/control lock is released.  Their cleanup paths take exchange
     # route and backend locks, so invoking them inside RUNTIME_CONTROL_LOCK
     # would invert the global lock order.
+    global_crypto_cleanup = _revoke_crypto_first_live_entry_before_cleanup(
+        "durable-emergency-stop"
+    )
     upbit_cleanup = _upbit_functional_emergency_cleanup_after_latch()
     binance_cleanup = _binance_spot_functional_emergency_cleanup_after_latch()
     outcome = {
         **outcome,
+        "crypto_first_live_cleanup": global_crypto_cleanup,
         "upbit_functional_cleanup": upbit_cleanup,
         "binance_functional_cleanup": binance_cleanup,
     }
     outcome["ok"] = bool(
         outcome.get("ok") is True
+        and global_crypto_cleanup.get("ok") is True
         and upbit_cleanup.get("ok") is True
         and binance_cleanup.get("ok") is True
     )

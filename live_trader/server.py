@@ -1115,6 +1115,10 @@ def prepare_server_state() -> None:
     state.disarm_real_orders_for_process_start(persist=True)
     read_daemon_status(persist=True)
     state.restore_runtime_from_checkpoint()
+    # The shared crypto coordinator must audit any crash-left owner before
+    # Kill recovery or either broker singleton can expose a cleanup/dispatch
+    # reader.  A persisted Kill then revokes this global entry first.
+    state.prepare_crypto_first_live_coordinator_state()
     state.recover_durable_emergency_stop()
     state.prepare_upbit_functional_backend_state()
     state.prepare_binance_spot_functional_backend_state()

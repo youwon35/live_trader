@@ -25,6 +25,7 @@ from live_trader.upbit_continuous_functional import _stable_hash
 NOW = datetime(2026, 8, 13, 1, 0, tzinfo=timezone.utc)
 ACTIVATED_AT = NOW + timedelta(minutes=10)
 ACCOUNT = "c" * 64
+GLOBAL_OWNER = "8" * 64
 TEST_EXCLUSIVITY_SECRET = b"offline-upbit-exclusivity-test-authority-v1"
 TEST_EXCLUSIVITY_VERIFIER_PIN = {
     "schemaVersion": "upbit-account-exclusivity-verifier-pin/v1",
@@ -711,7 +712,13 @@ class UpbitContinuousFunctionalTest(unittest.TestCase):
             clock=self.fake.clock,
         )
 
-    def activate(self, *, account_authority: bool = True):
+    def activate(
+        self,
+        *,
+        account_authority: bool = True,
+        global_authority_reader=None,
+        global_owner_identity_hash: str = "",
+    ):
         service = subject._activate_for_test(
             permit=self.permit,
             ledger=self.ledger,
@@ -731,6 +738,10 @@ class UpbitContinuousFunctionalTest(unittest.TestCase):
             ),
             account_exclusivity_verifier_pin=(
                 TEST_EXCLUSIVITY_VERIFIER_PIN if account_authority else None
+            ),
+            global_first_live_authority_reader=global_authority_reader,
+            global_first_live_owner_identity_hash=(
+                global_owner_identity_hash
             ),
         )
         self.fake.real_orders = True
@@ -1387,6 +1398,59 @@ class UpbitContinuousFunctionalTest(unittest.TestCase):
         durable = self.ledger.session(self.fake.session_id)
         self.assertEqual("CLEANUP", durable["state"])
         self.assertEqual(1, durable["account_exclusivity_breach"])
+
+    def test_global_fence_loss_at_final_prepost_latches_cleanup_socket_zero(
+        self,
+    ) -> None:
+        def authority_reader(request):
+            entry_open = request["action"] == "ACTIVATE"
+            body = {
+                "schemaVersion": (
+                    subject.GLOBAL_FIRST_LIVE_AUTHORITY_SCHEMA_VERSION
+                ),
+                "scope": subject.GLOBAL_FIRST_LIVE_SCOPE,
+                "lane": "UPBIT",
+                "phase": "ACTIVE",
+                "runId": request["runId"],
+                "sessionId": request["sessionId"],
+                "permitId": request["permitId"],
+                "permitHash": request["permitHash"],
+                "accountFingerprint": request["accountFingerprint"],
+                "routeScopeHash": request["routeScopeHash"],
+                "ownerIdentityHash": request["ownerIdentityHash"],
+                "ownerLeaseActive": True,
+                "entryAuthorityOpen": entry_open,
+                "cleanupAuthorityOpen": False,
+                "hardStopEpoch": self.permit.ends_at.timestamp(),
+                "ownerLeaseExpiresEpoch": self.fake.now.timestamp() + 30,
+                "revision": 2,
+                "observedEpoch": self.fake.now.timestamp(),
+                "killSwitch": False,
+                "stopRequested": False,
+            }
+            return {
+                **body,
+                "authorityHash": subject._strict_stable_hash(body),
+            }
+
+        service = self.activate(
+            global_authority_reader=authority_reader,
+            global_owner_identity_hash=GLOBAL_OWNER,
+        )
+        with self.assertRaisesRegex(
+            subject.UpbitFunctionalBlocked,
+            "global-first-live-dispatch-fence-closed",
+        ):
+            service.on_bar(self.bar("BUY"))
+        self.assertEqual(0, self.fake.post_calls)
+        self.assertEqual(
+            "BLOCKED_BEFORE_POST",
+            self.ledger.claims(self.fake.session_id)[0]["state"],
+        )
+        self.assertEqual(
+            "CLEANUP",
+            self.ledger.session(self.fake.session_id)["state"],
+        )
 
     def test_cleanup_sell_remains_allowed_after_exclusivity_proof_loss(self) -> None:
         service = self.activate()

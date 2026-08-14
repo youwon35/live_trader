@@ -54,10 +54,13 @@ class BinanceSpotFirstLiveBootstrapTest(unittest.TestCase):
             "ordinaryBinanceRoutesClosed": True,
             "emergencyKillInactive": True,
             "applicationInstanceLeaseHeld": True,
-            "exclusiveAccountConfirmed": True,
-            "noManualTradingConfirmed": True,
-            "noBotsConfirmed": True,
-            "noOtherApiKeysConfirmed": True,
+            "operatorApprovalBound": True,
+            "accountExclusivityVerifierReady": True,
+            "accountExclusivityDurableProviderReady": True,
+            "accountExclusivitySigningPrimitiveAbsent": True,
+            "accountExclusivityAuthorityPinned": True,
+            "accountIdentityPinned": True,
+            "globalFirstLiveAuthorityReaderWired": True,
             "realE2EAvailable": False,
             "firstLiveBootstrapFeatureEnabled": True,
         }
@@ -138,6 +141,15 @@ class BinanceSpotFirstLiveBootstrapTest(unittest.TestCase):
         self, *, session_id: str, permit_id: str, permit_hash: str
     ) -> dict[str, object]:
         activated = float(self.clock())
+        proof: dict[str, object] = {
+            "schemaVersion": "test-binance-exclusivity-proof/v1",
+            "sessionId": session_id,
+            "permitId": permit_id,
+            "permitHash": permit_hash,
+            "phase": "TERMINAL",
+            "accountWideCausalAudit": {"causalClosureProven": True},
+        }
+        proof_hash = canonical_hash(proof)
         return {
             "sessionId": session_id,
             "permitId": permit_id,
@@ -168,12 +180,24 @@ class BinanceSpotFirstLiveBootstrapTest(unittest.TestCase):
             "functionalWiringPassed": True,
             "feesQuoteExact": True,
             "ownerLoss": "0.25",
-            "exclusiveAccountOperatorAttested": True,
-            "noManualTradingAttested": True,
-            "noExternalBotsAttested": True,
-            "noOtherApiKeysAttested": True,
+            "exclusiveAccountOperatorAttested": False,
+            "exclusiveAccountIndependentlyProven": True,
+            "noManualTradingAttested": False,
+            "noManualTradingIndependentlyProven": True,
+            "noExternalBotsAttested": False,
+            "noExternalBotsIndependentlyProven": True,
+            "noOtherApiKeysAttested": False,
+            "noOtherApiKeysIndependentlyProven": True,
             "accountWideCausalClosureProven": True,
             "otherApiKeysAbsenceAuthoritativelyProven": True,
+            "accountExclusivityProof": proof,
+            "accountExclusivityProofHash": proof_hash,
+            "accountExclusivityProofDurable": True,
+            "accountExclusivityPhaseChainComplete": True,
+            "accountExclusivityPhaseChainHash": "8" * 64,
+            "accountExclusivityPhaseProofCount": 5,
+            "accountExclusivityPhaseProofRequiredCount": 5,
+            "accountExclusivityRestartVerifiable": True,
         }
 
     @staticmethod
@@ -208,6 +232,14 @@ class BinanceSpotFirstLiveBootstrapTest(unittest.TestCase):
         evaluation_observed_mismatch: bool = False,
         post_expiry_server_time: bool = False,
     ) -> None:
+        proof = dict(evidence.get("accountExclusivityProof") or {})
+        proof["accountWideCausalAudit"] = {
+            "causalClosureProven": (
+                evidence.get("accountWideCausalClosureProven") is True
+            )
+        }
+        evidence["accountExclusivityProof"] = proof
+        evidence["accountExclusivityProofHash"] = canonical_hash(proof)
         session_id = str(evidence["sessionId"])
         baseline_epoch = float(evidence["activatedEpoch"])
         cutoff_epoch = float(evidence["activeEndsEpoch"]) - (
@@ -672,6 +704,27 @@ class BinanceSpotFirstLiveBootstrapTest(unittest.TestCase):
             "externalActivityAbsent": True,
             "accountWideCausalClosureProven": bool(
                 evidence.get("accountWideCausalClosureProven")
+            ),
+            "accountExclusivityProof": dict(
+                evidence.get("accountExclusivityProof") or {}
+            ),
+            "accountExclusivityProofHash": str(
+                evidence.get("accountExclusivityProofHash") or ""
+            ),
+            "accountExclusivityPhaseChainComplete": bool(
+                evidence.get("accountExclusivityPhaseChainComplete")
+            ),
+            "accountExclusivityPhaseChainHash": str(
+                evidence.get("accountExclusivityPhaseChainHash") or ""
+            ),
+            "accountExclusivityPhaseProofCount": int(
+                evidence.get("accountExclusivityPhaseProofCount") or 0
+            ),
+            "accountExclusivityPhaseProofRequiredCount": int(
+                evidence.get("accountExclusivityPhaseProofRequiredCount") or 0
+            ),
+            "accountExclusivityRestartVerifiable": bool(
+                evidence.get("accountExclusivityRestartVerifiable")
             ),
             "streamSessionId": session_id,
             "streamPermitId": str(evidence["permitId"]),
@@ -1828,7 +1881,7 @@ class BinanceSpotFirstLiveBootstrapTest(unittest.TestCase):
             evidence_hash=canonical_hash(evidence),
         )
         self.assertEqual("CONSUMED", consumed["state"])
-        self.assertEqual(1, consumed["functional_wiring_passed"])
+        self.assertEqual(0, consumed["functional_wiring_passed"])
         self.assertEqual(0, consumed["e2e_evidence_eligible"])
 
     def test_wiring_pass_requires_every_runtime_risk_and_cleanup_proof(self) -> None:
@@ -2205,7 +2258,12 @@ class BinanceSpotFirstLiveBootstrapTest(unittest.TestCase):
             "/live_trader/emergency_stop.py",
             "/live_trader/binance_spot_functional_mutation.py",
             "/live_trader/binance_spot_functional_transport.py",
+            "/live_trader/binance_spot_functional_exclusivity.py",
+            "/live_trader/binance_spot_functional_exclusivity_provider.py",
             "/live_trader/continuous_live.py",
+            "/live_trader/crypto_first_live_coordinator.py",
+            "/live_trader/crypto_first_live_high_water.py",
+            "/live_trader/crypto_first_live_runtime.py",
             "/live_trader/env_loader.py",
             "/live_trader/env_settings.py",
             "/live_trader/safety_confirmation.py",

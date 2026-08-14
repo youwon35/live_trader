@@ -37,6 +37,12 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+from .binance_spot_functional_exclusivity import (
+    BinanceSpotExclusivityError,
+    BinanceSpotExclusivityGuard,
+    verify_global_first_live_authority,
+)
+
 
 PRODUCTION_AVAILABLE = False
 SCHEMA_VERSION = "binance-spot-continuous-functional-v1"
@@ -1440,8 +1446,11 @@ class DurableFunctionalLedger:
         *,
         now_epoch: float,
         activation_fence: Mapping[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> tuple[dict[str, Any], str]:
-        session_id = f"bnsft-{secrets.token_hex(16)}"
+        session_id = _text(session_id) or f"bnsft-{secrets.token_hex(16)}"
+        if not session_id.startswith("bnsft-") or _SAFE_ID_RE.fullmatch(session_id) is None:
+            raise BinanceSpotBoundaryBlocked("functional session identity is invalid")
         capability = secrets.token_urlsafe(32)
         capability_hash = hashlib.sha256(capability.encode("utf-8")).hexdigest()
         binding_json = _canonical_json(permit.binding.payload())
@@ -2478,6 +2487,10 @@ class BinanceSpotContinuousFunctionalService:
         binding_reader: Callable[[], Mapping[str, Any]],
         authority_reader: Callable[[], Mapping[str, Any]],
         publication_verifier: Callable[[ExactBinding], Mapping[str, Any]],
+        account_exclusivity_guard: BinanceSpotExclusivityGuard | None = None,
+        global_first_live_authority_reader: (
+            Callable[..., Mapping[str, Any]] | None
+        ) = None,
         clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -2485,6 +2498,10 @@ class BinanceSpotContinuousFunctionalService:
         self.binding_reader = binding_reader
         self.authority_reader = authority_reader
         self.publication_verifier = publication_verifier
+        self.account_exclusivity_guard = account_exclusivity_guard
+        self.global_first_live_authority_reader = (
+            global_first_live_authority_reader
+        )
         self.clock = clock
         self.monotonic_clock = monotonic_clock
         self._lock = threading.RLock()
@@ -2492,6 +2509,236 @@ class BinanceSpotContinuousFunctionalService:
         # witness and therefore can finish cleanup safely, but can never claim
         # that the uninterrupted two-hour wiring observation was completed.
         self._monotonic_started: dict[str, float] = {}
+
+    def _require_exclusivity(
+        self,
+        *,
+        phase: str,
+        session_id: str,
+        permit: ExactPermit,
+        boundary_id: str,
+        boundary_hash: str,
+        coverage_started_epoch: float,
+        require_causal_closure: bool = False,
+    ) -> dict[str, Any]:
+        guard = self.account_exclusivity_guard
+        if guard is None:
+            raise BinanceSpotBoundaryBlocked(
+                "independent Binance account-exclusivity guard is not wired"
+            )
+        try:
+            return dict(
+                guard.verify_and_record(
+                    phase=phase,
+                    session_id=session_id,
+                    permit_id=permit.permit_id,
+                    permit_hash=permit.permit_hash,
+                    credential_fingerprint=permit.binding.account_fingerprint,
+                    boundary_id=boundary_id,
+                    boundary_hash=boundary_hash,
+                    coverage_started_epoch=coverage_started_epoch,
+                    require_causal_closure=require_causal_closure,
+                )
+            )
+        except BinanceSpotExclusivityError as exc:
+            raise BinanceSpotBoundaryBlocked(str(exc)) from exc
+
+    def _require_global_first_live_authority(
+        self,
+        *,
+        purpose: str,
+        session_id: str,
+        permit: ExactPermit,
+        cleanup_only: bool,
+    ) -> dict[str, Any]:
+        reader = self.global_first_live_authority_reader
+        if reader is None:
+            raise BinanceSpotBoundaryBlocked(
+                "global crypto first-live authority reader is not wired"
+            )
+        now = float(self.clock())
+        try:
+            snapshot = reader(
+                purpose=_text(purpose).upper(),
+                session_id=_text(session_id),
+                permit_id=permit.permit_id,
+                permit_hash=permit.permit_hash,
+                account_fingerprint=permit.binding.account_fingerprint,
+                cleanup_only=bool(cleanup_only),
+            )
+            return verify_global_first_live_authority(
+                snapshot,
+                purpose=purpose,
+                session_id=session_id,
+                permit_id=permit.permit_id,
+                permit_hash=permit.permit_hash,
+                account_fingerprint=permit.binding.account_fingerprint,
+                cleanup_only=cleanup_only,
+                now_epoch=now,
+            )
+        except BinanceSpotExclusivityError as exc:
+            raise BinanceSpotBoundaryBlocked(str(exc)) from exc
+        except Exception as exc:
+            raise BinanceSpotBoundaryBlocked(
+                "global crypto first-live authority reader failed closed"
+            ) from exc
+
+    def assert_activation_guards(
+        self,
+        session_id: str,
+        permit_payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Re-prove exact session exclusivity immediately before ACTIVE."""
+
+        with self._lock:
+            session = self.ledger.session(session_id)
+            permit = ExactPermit.parse(permit_payload, now_epoch=float(self.clock()))
+            if (
+                _text(session.get("permit_id")) != permit.permit_id
+                or not secrets.compare_digest(
+                    _text(session.get("permit_hash")), permit.permit_hash
+                )
+            ):
+                raise BinanceSpotBoundaryBlocked(
+                    "activation exclusivity session permit changed"
+                )
+            proof = self._require_exclusivity(
+                phase="ACTIVATION",
+                session_id=session_id,
+                permit=permit,
+                boundary_id=f"{session_id}:activation",
+                boundary_hash=_text(session["binding_hash"]).lower(),
+                coverage_started_epoch=float(session["started_epoch"]),
+            )
+            authority = self._require_global_first_live_authority(
+                purpose="ACTIVATION",
+                session_id=session_id,
+                permit=permit,
+                cleanup_only=False,
+            )
+            return {"exclusivity": proof, "globalAuthority": authority}
+
+    def _exclusivity_phase_chain(
+        self,
+        *,
+        session_id: str,
+        permit: ExactPermit,
+        actions: list[dict[str, Any]],
+        terminal_proof: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Re-verify the durable proof chain without blocking safe cleanup."""
+
+        guard = self.account_exclusivity_guard
+        if guard is None or not callable(getattr(guard, "session_records", None)):
+            return {
+                "complete": False,
+                "restartVerifiable": False,
+                "recordCount": 0,
+                "phaseChainHash": "",
+                "reason": "EXCLUSIVITY_PHASE_RECORD_READER_MISSING",
+            }
+        try:
+            rows = list(guard.session_records(session_id))
+        except Exception:
+            return {
+                "complete": False,
+                "restartVerifiable": False,
+                "recordCount": 0,
+                "phaseChainHash": "",
+                "reason": "EXCLUSIVITY_PHASE_RECORD_REVERIFY_FAILED",
+            }
+        expected: dict[tuple[str, str], str | None] = {
+            ("BASELINE", f"{session_id}:baseline"): None,
+            ("ACTIVATION", f"{session_id}:activation"): None,
+            ("TERMINAL", f"{session_id}:terminal"): _text(
+                terminal_proof.get("boundaryHash")
+            ).lower(),
+        }
+        try:
+            for action in actions:
+                sealed = json.loads(_text(action.get("sealed_action_json")))
+                if (
+                    isinstance(sealed, Mapping)
+                    and sealed.get("cleanupOnly") is False
+                    and _upper(sealed.get("kind")) in {"BUY", "SELL"}
+                ):
+                    expected[("PRE_POST", _text(action.get("claim_id")))] = (
+                        _stable_hash(dict(sealed))
+                    )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {
+                "complete": False,
+                "restartVerifiable": False,
+                "recordCount": len(rows),
+                "phaseChainHash": "",
+                "reason": "EXCLUSIVITY_PHASE_ACTION_SEAL_MALFORMED",
+            }
+
+        summaries: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        valid = True
+        for row in rows:
+            proof = row.get("proof") if isinstance(row, Mapping) else None
+            if not isinstance(proof, Mapping):
+                valid = False
+                continue
+            phase = _upper(proof.get("phase"))
+            boundary_id = _text(proof.get("boundaryId"))
+            key = (phase, boundary_id)
+            proof_hash = _text(
+                row.get("proof_hash") or row.get("proofHash")
+            ).lower()
+            expected_boundary_hash = expected.get(key)
+            current_valid = bool(
+                key in expected
+                and key not in seen
+                and _SHA256_RE.fullmatch(proof_hash) is not None
+                and secrets.compare_digest(_stable_hash(dict(proof)), proof_hash)
+                and _text(proof.get("sessionId")) == session_id
+                and _text(proof.get("permitId")) == permit.permit_id
+                and secrets.compare_digest(
+                    _text(proof.get("permitHash")).lower(), permit.permit_hash
+                )
+                and secrets.compare_digest(
+                    _text(proof.get("credentialFingerprint")).lower(),
+                    permit.binding.account_fingerprint,
+                )
+                and (
+                    expected_boundary_hash is None
+                    or secrets.compare_digest(
+                        _text(proof.get("boundaryHash")).lower(),
+                        expected_boundary_hash,
+                    )
+                )
+            )
+            if key == ("TERMINAL", f"{session_id}:terminal"):
+                current_valid = bool(
+                    current_valid
+                    and dict(proof) == dict(terminal_proof)
+                )
+            valid = valid and current_valid
+            seen.add(key)
+            summaries.append(
+                {
+                    "phase": phase,
+                    "boundaryId": boundary_id,
+                    "boundaryHash": _text(proof.get("boundaryHash")).lower(),
+                    "proofHash": proof_hash,
+                }
+            )
+        summaries.sort(key=lambda item: (item["phase"], item["boundaryId"]))
+        complete = bool(valid and seen == set(expected) and len(rows) == len(expected))
+        return {
+            "complete": complete,
+            "restartVerifiable": complete,
+            "recordCount": len(rows),
+            "requiredRecordCount": len(expected),
+            "phaseChainHash": (
+                _stable_hash({"records": summaries}) if complete else ""
+            ),
+            "records": summaries if complete else [],
+            "reason": "VERIFIED" if complete else "EXCLUSIVITY_PHASE_CHAIN_INCOMPLETE",
+        }
 
     def _read_binding(self, expected: ExactBinding) -> None:
         if ExactBinding.parse(self.binding_reader()) != expected:
@@ -2556,6 +2803,20 @@ class BinanceSpotContinuousFunctionalService:
             raise BinanceSpotBoundaryBlocked(
                 "account-wide external activity absence is unproven"
             )
+        session_id = f"bnsft-{secrets.token_hex(16)}"
+        baseline_boundary_hash = (
+            truth.official_rest_truth_hash
+            if _SHA256_RE.fullmatch(truth.official_rest_truth_hash)
+            else _stable_hash(dict(account_truth))
+        )
+        self._require_exclusivity(
+            phase="BASELINE",
+            session_id=session_id,
+            permit=permit,
+            boundary_id=f"{session_id}:baseline",
+            boundary_hash=baseline_boundary_hash,
+            coverage_started_epoch=truth.history_baseline_epoch,
+        )
         session, capability = self.ledger.create_session(
             permit,
             truth,
@@ -2565,6 +2826,7 @@ class BinanceSpotContinuousFunctionalService:
             # seconds even if prestart REST/publication checks take time.
             now_epoch=permit.issued_epoch,
             activation_fence=activation_fence,
+            session_id=session_id,
         )
         with self._lock:
             self._monotonic_started[_text(session["session_id"])] = float(
@@ -3289,6 +3551,21 @@ class BinanceSpotContinuousFunctionalService:
             # Final mutable authority and exact binding re-read occurs after
             # SUBMITTING was committed and immediately before the callable.
             try:
+                if not cleanup_only:
+                    self._require_exclusivity(
+                        phase="PRE_POST",
+                        session_id=session_id,
+                        permit=permit,
+                        boundary_id=_text(claim_id),
+                        boundary_hash=_stable_hash(dict(action)),
+                        coverage_started_epoch=float(session["started_epoch"]),
+                    )
+                    self._require_global_first_live_authority(
+                        purpose="FINAL_PRE_POST",
+                        session_id=session_id,
+                        permit=permit,
+                        cleanup_only=False,
+                    )
                 authority_final = FunctionalAuthority.parse(self.authority_reader())
                 authority_final.assert_dispatch(
                     permit,
@@ -3834,6 +4111,32 @@ class BinanceSpotContinuousFunctionalService:
                         "terminal FILLED leg lacks exact positive aggregate fill truth"
                     )
                 filled_kinds.add(_upper(action["action_kind"]))
+            terminal_exclusivity = self._require_exclusivity(
+                phase="TERMINAL",
+                session_id=session_id,
+                permit=permit,
+                boundary_id=f"{session_id}:terminal",
+                boundary_hash=(
+                    truth.official_rest_truth_hash
+                    if _SHA256_RE.fullmatch(truth.official_rest_truth_hash)
+                    else _stable_hash(dict(account_truth))
+                ),
+                coverage_started_epoch=float(session["started_epoch"]),
+                # A signed SAFE_INCOMPLETE proof may honestly report that a
+                # causal account-wide terminal barrier is unavailable.  It may
+                # finalize cleanup, but can never become PASS/REAL_E2E.
+                require_causal_closure=False,
+            )
+            independent_causal_closure_proven = bool(
+                terminal_exclusivity.get("accountWideCausalClosureProven")
+                is True
+            )
+            exclusivity_phase_chain = self._exclusivity_phase_chain(
+                session_id=session_id,
+                permit=permit,
+                actions=actions,
+                terminal_proof=dict(terminal_exclusivity.get("proof") or {}),
+            )
             if {"BUY", "SELL"}.issubset(filled_kinds):
                 if not metrics["feesQuoteExact"]:
                     raise BinanceSpotBoundaryBlocked(
@@ -3859,7 +4162,14 @@ class BinanceSpotContinuousFunctionalService:
                 outcome = "SAFE_INCOMPLETE_EARLY_TERMINATION"
             elif (
                 outcome == "PASS_FULL_ROUND_TRIP"
-                and not truth.account_wide_causal_closure_proven
+                and exclusivity_phase_chain.get("complete") is not True
+            ):
+                outcome = (
+                    "SAFE_INCOMPLETE_ACCOUNT_EXCLUSIVITY_PHASE_CHAIN_UNPROVEN"
+                )
+            elif (
+                outcome == "PASS_FULL_ROUND_TRIP"
+                and not independent_causal_closure_proven
             ):
                 # Binance documents neither a causal ordering guarantee
                 # between the generic WebSocket time RPC and account events,
@@ -3912,6 +4222,10 @@ class BinanceSpotContinuousFunctionalService:
                 and orderable_residual_zero
                 and not truth.open_orders
                 and truth.external_activity_absent
+                and terminal_exclusivity.get("verified") is True
+                and exclusivity_phase_chain.get("complete") is True
+                and exclusivity_phase_chain.get("restartVerifiable") is True
+                and independent_causal_closure_proven
                 and not recovered_stream_gap
                 and _SHA256_RE.fullmatch(truth.stream_journal_seal_hash)
                 is not None
@@ -3952,8 +4266,32 @@ class BinanceSpotContinuousFunctionalService:
                     truth.fee_quote_valuation_complete
                 ),
                 "externalActivityAbsent": truth.external_activity_absent,
-                "accountWideCausalClosureProven": (
+                "nativeAccountWideCausalClosureProven": (
                     truth.account_wide_causal_closure_proven
+                ),
+                "accountWideCausalClosureProven": (
+                    independent_causal_closure_proven
+                ),
+                "accountExclusivityProof": dict(
+                    terminal_exclusivity.get("proof") or {}
+                ),
+                "accountExclusivityProofHash": _text(
+                    terminal_exclusivity.get("proofHash")
+                ).lower(),
+                "accountExclusivityPhaseChainComplete": (
+                    exclusivity_phase_chain.get("complete") is True
+                ),
+                "accountExclusivityPhaseChainHash": _text(
+                    exclusivity_phase_chain.get("phaseChainHash")
+                ).lower(),
+                "accountExclusivityPhaseProofCount": int(
+                    exclusivity_phase_chain.get("recordCount") or 0
+                ),
+                "accountExclusivityPhaseProofRequiredCount": int(
+                    exclusivity_phase_chain.get("requiredRecordCount") or 0
+                ),
+                "accountExclusivityRestartVerifiable": (
+                    exclusivity_phase_chain.get("restartVerifiable") is True
                 ),
                 "streamSessionId": truth.stream_session_id,
                 "streamPermitId": truth.stream_permit_id,
@@ -4035,14 +4373,56 @@ class BinanceSpotContinuousFunctionalService:
                     exact_two_hour_runtime_complete
                 ),
                 "exclusiveAccountRequired": True,
-                "exclusiveAccountOperatorAttested": True,
-                "noManualTradingAttested": True,
-                "noExternalBotsAttested": True,
-                "noOtherApiKeysAttested": True,
+                "exclusiveAccountOperatorAttested": False,
+                "exclusiveAccountIndependentlyProven": (
+                    terminal_exclusivity.get("exclusiveAccountConfirmed")
+                    is True
+                ),
+                "noManualTradingAttested": False,
+                "noManualTradingIndependentlyProven": (
+                    terminal_exclusivity.get("noManualTradingConfirmed") is True
+                ),
+                "noExternalBotsAttested": False,
+                "noExternalBotsIndependentlyProven": (
+                    terminal_exclusivity.get("noBotsConfirmed") is True
+                ),
+                "noOtherApiKeysAttested": False,
+                "noOtherApiKeysIndependentlyProven": (
+                    terminal_exclusivity.get("noOtherApiKeysConfirmed") is True
+                ),
                 "accountWideCausalClosureProven": (
+                    independent_causal_closure_proven
+                ),
+                "nativeAccountWideCausalClosureProven": (
                     truth.account_wide_causal_closure_proven
                 ),
-                "otherApiKeysAbsenceAuthoritativelyProven": False,
+                "otherApiKeysAbsenceAuthoritativelyProven": (
+                    terminal_exclusivity.get("noOtherApiKeysConfirmed") is True
+                ),
+                "accountExclusivityProof": dict(
+                    terminal_exclusivity.get("proof") or {}
+                ),
+                "accountExclusivityProofHash": _text(
+                    terminal_exclusivity.get("proofHash")
+                ).lower(),
+                "accountExclusivityProofDurable": (
+                    terminal_exclusivity.get("durable") is True
+                ),
+                "accountExclusivityPhaseChainComplete": (
+                    exclusivity_phase_chain.get("complete") is True
+                ),
+                "accountExclusivityPhaseChainHash": _text(
+                    exclusivity_phase_chain.get("phaseChainHash")
+                ).lower(),
+                "accountExclusivityPhaseProofCount": int(
+                    exclusivity_phase_chain.get("recordCount") or 0
+                ),
+                "accountExclusivityPhaseProofRequiredCount": int(
+                    exclusivity_phase_chain.get("requiredRecordCount") or 0
+                ),
+                "accountExclusivityRestartVerifiable": (
+                    exclusivity_phase_chain.get("restartVerifiable") is True
+                ),
                 "privateStreamGapRecoveredCleanupOnly": recovered_stream_gap,
                 "streamGapEvidenceHash": (
                     truth.stream_gap_evidence_hash if recovered_stream_gap else ""

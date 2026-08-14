@@ -26,6 +26,9 @@ from live_trader.binance_spot_functional_bootstrap import (
 from live_trader.binance_spot_functional_preparation import (
     HOLD_PREPARATION_SCHEMA_VERSION,
 )
+from live_trader.binance_spot_functional_exclusivity_provider import (
+    BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT,
+)
 from tests.test_binance_spot_continuous_functional import (
     ACCOUNT_FINGERPRINT,
     binding,
@@ -52,9 +55,19 @@ class BinanceSpotFunctionalPreparationTests(unittest.TestCase):
             default_binance_spot_functional_code_hash(),
             status["productionCodeHash"],
         )
-        self.assertIn(
-            "binance_spot_functional_preparation.py",
-            {path.name for path in default_binance_spot_functional_code_paths()},
+        self.assertTrue(
+            {
+                "binance_spot_functional_preparation.py",
+                "binance_spot_functional_exclusivity_provider.py",
+                "crypto_first_live_coordinator.py",
+                "crypto_first_live_high_water.py",
+                "crypto_first_live_runtime.py",
+            }.issubset(
+                {
+                    path.name
+                    for path in default_binance_spot_functional_code_paths()
+                }
+            )
         )
         contract = dict(status["preparationContract"])
         calculated = hashlib.sha256(
@@ -71,6 +84,11 @@ class BinanceSpotFunctionalPreparationTests(unittest.TestCase):
         self.assertEqual(10800, contract["cleanupDeadlineFromActivationSeconds"])
         self.assertEqual("IMMUTABLE_BASELINE", contract["preexistingBaseBalancePolicy"])
         self.assertEqual("SESSION_OWNED_DELTA_ONLY", contract["cleanupQuantityPolicy"])
+        self.assertEqual(
+            BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT,
+            contract["exclusivityCursorSchemaFingerprint"],
+        )
+        self.assertTrue(contract["exclusivityCursorPathIdentityPinned"])
         self.assertFalse(contract["promotionEligible"])
 
     def test_root_release_latch_blocks_full_and_first_live_composites(self) -> None:
@@ -82,6 +100,12 @@ class BinanceSpotFunctionalPreparationTests(unittest.TestCase):
             "BINANCE_SPOT_FUNCTIONAL_ORDINARY_FENCE_AVAILABLE": True,
             "BINANCE_SPOT_FUNCTIONAL_EMERGENCY_FENCE_AVAILABLE": True,
             "BINANCE_SPOT_FUNCTIONAL_EXCLUSIVE_ACCOUNT_AVAILABLE": True,
+            "BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED": True,
+            "BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED": True,
+            "BINANCE_SPOT_ACCOUNT_WIDE_CAUSAL_AUTHORITY_AVAILABLE": True,
+            "BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED": True,
+            "BINANCE_SPOT_EXCLUSIVITY_PROVIDER_PRODUCTION_RELEASED": True,
+            "BINANCE_SPOT_EXCLUSIVITY_SIGNING_PRIMITIVE_PRESENT": False,
         }
         with ExitStack() as stack:
             stack.enter_context(

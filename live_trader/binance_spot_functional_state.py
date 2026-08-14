@@ -41,6 +41,13 @@ from .binance_spot_functional_lifecycle import (
     DurableBinanceSpotFunctionalControl,
     composite_production_available,
 )
+from .binance_spot_functional_exclusivity import (
+    BinanceSpotExclusivityVerifier,
+    verifier_wiring_status,
+)
+from .binance_spot_functional_exclusivity_provider import (
+    BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT,
+)
 from .binance_order_authority import (
     binance_route_authority_serialization,
     functional_binance_final_mutation_boundary,
@@ -128,12 +135,38 @@ class BinanceSpotFunctionalStateFacade:
         data_root: str | Path,
         server_secret_path: str | Path,
         ordinary_routes_closed_reader: Callable[[], bool],
+        account_exclusivity_proof_reader: (
+            Callable[..., Mapping[str, Any]] | None
+        ) = None,
+        account_exclusivity_verifier: (
+            BinanceSpotExclusivityVerifier | None
+        ) = None,
+        account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+        account_identity_fingerprint: str = "",
+        global_first_live_authority_reader: (
+            Callable[..., Mapping[str, Any]] | None
+        ) = None,
     ) -> None:
         self.database_path = Path(database_path)
         self.publication_proof_path = Path(publication_proof_path)
         self.data_root = Path(data_root)
         self.server_secret_path = Path(server_secret_path)
         self.ordinary_routes_closed_reader = ordinary_routes_closed_reader
+        self.account_exclusivity_proof_reader = (
+            account_exclusivity_proof_reader
+        )
+        self.account_exclusivity_verifier = account_exclusivity_verifier
+        self.account_exclusivity_verifier_pin = (
+            dict(account_exclusivity_verifier_pin)
+            if isinstance(account_exclusivity_verifier_pin, Mapping)
+            else None
+        )
+        self.account_identity_fingerprint = str(
+            account_identity_fingerprint or ""
+        ).strip().lower()
+        self.global_first_live_authority_reader = (
+            global_first_live_authority_reader
+        )
         self._lock = threading.RLock()
         self._dispatch_lock = threading.RLock()
         self._authority_reader = self.order_authority_snapshot
@@ -266,7 +299,7 @@ class BinanceSpotFunctionalStateFacade:
             }
 
     def _first_live_gate_snapshot(self) -> dict[str, Any]:
-        """Derive operator exclusivity only from a validated durable approval."""
+        """Report verifier wiring; operator approval is never exclusivity proof."""
 
         try:
             store = self._store or DurableBinanceSpotApprovedPermitStore(
@@ -286,6 +319,30 @@ class BinanceSpotFunctionalStateFacade:
         )
         emergency = emergency_stop_status()
         application = live_trader_instance_lease_status()
+        exclusivity = verifier_wiring_status(
+            self.account_exclusivity_verifier,
+            self.account_exclusivity_verifier_pin,
+            self.account_identity_fingerprint,
+        )
+        try:
+            provider_status = dict(
+                self.account_exclusivity_proof_reader.status()  # type: ignore[union-attr]
+            )
+        except Exception:
+            provider_status = {}
+        durable_provider_ready = bool(
+            provider_status.get("injectionReady") is True
+            and provider_status.get("asymmetricPublicKeyOnly") is True
+            and provider_status.get("durableProofSource") is True
+            and provider_status.get("durableRequestOutbox") is True
+            and provider_status.get("durableConsumerCursor") is True
+            and provider_status.get("restartVerifiable") is True
+            and provider_status.get("cursorSchemaFingerprint")
+            == BINANCE_SPOT_EXCLUSIVITY_CURSOR_SCHEMA_FINGERPRINT
+            and provider_status.get("cursorPathIdentityPinned") is True
+            and provider_status.get("signingPrimitivePresent") is False
+            and provider_status.get("networkOrderPostAllowed") is False
+        )
         return {
             "allOtherProductionComponentsAvailable": bool(
                 composite_production_available()
@@ -302,10 +359,26 @@ class BinanceSpotFunctionalStateFacade:
             "applicationInstanceLeaseHeld": (
                 application.get("acquired") is True
             ),
-            "exclusiveAccountConfirmed": approved_contract,
-            "noManualTradingConfirmed": approved_contract,
-            "noBotsConfirmed": approved_contract,
-            "noOtherApiKeysConfirmed": approved_contract,
+            "operatorApprovalBound": approved_contract,
+            "accountExclusivityVerifierReady": (
+                exclusivity.get("ready") is True
+                and callable(self.account_exclusivity_proof_reader)
+            ),
+            "accountExclusivityDurableProviderReady": (
+                durable_provider_ready
+            ),
+            "accountExclusivitySigningPrimitiveAbsent": (
+                provider_status.get("signingPrimitivePresent") is False
+            ),
+            "accountExclusivityAuthorityPinned": (
+                exclusivity.get("authorityPinned") is True
+            ),
+            "accountIdentityPinned": (
+                exclusivity.get("accountIdentityPinned") is True
+            ),
+            "globalFirstLiveAuthorityReaderWired": callable(
+                self.global_first_live_authority_reader
+            ),
             "realE2EAvailable": BINANCE_SPOT_FUNCTIONAL_REAL_E2E_AVAILABLE,
             "firstLiveBootstrapFeatureEnabled": (
                 BINANCE_SPOT_FUNCTIONAL_FIRST_LIVE_BOOTSTRAP_AVAILABLE
@@ -408,6 +481,21 @@ class BinanceSpotFunctionalStateFacade:
                     server_record_signer=self._sign_server_record,
                     route_lock_reader=self._route_snapshot,
                     dispatch_lease_factory=self.dispatch_lease,
+                    account_exclusivity_proof_reader=(
+                        self.account_exclusivity_proof_reader
+                    ),
+                    account_exclusivity_verifier=(
+                        self.account_exclusivity_verifier
+                    ),
+                    account_exclusivity_verifier_pin=(
+                        self.account_exclusivity_verifier_pin
+                    ),
+                    account_identity_fingerprint=(
+                        self.account_identity_fingerprint
+                    ),
+                    global_first_live_authority_reader=(
+                        self.global_first_live_authority_reader
+                    ),
                     first_live_gate_reader=self._first_live_gate_snapshot,
                     terminal_callback=lambda _value: None,
                 )
@@ -518,10 +606,10 @@ class BinanceSpotFunctionalStateFacade:
             "approvedAt": _utc_now(),
             "activationResealAuthorized": True,
             "activeDurationSeconds": 7200,
-            "exclusiveAccountConfirmed": True,
-            "noManualTradingConfirmed": True,
-            "noBotsConfirmed": True,
-            "noOtherApiKeysConfirmed": True,
+            # Operator approval acknowledges that detached proof is mandatory;
+            # it never self-attests account/API/manual/bot exclusivity.
+            "accountExclusivityProofRequired": True,
+            "accountWideCausalClosureProofRequired": True,
             "firstLiveBootstrapAuthorized": True,
             "firstLiveBootstrapRequired": bool(
                 candidate.get("first_live_bootstrap_required")

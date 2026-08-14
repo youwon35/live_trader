@@ -22,6 +22,7 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import hmac
 import json
+import math
 from pathlib import Path
 import re
 import secrets
@@ -44,6 +45,7 @@ from trading_runtime.functional_test import (
 UPBIT_CONTINUOUS_FUNCTIONAL_AVAILABLE = False
 UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED = False
 UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED = False
+UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED = False
 UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_STATUS = "HOLD"
 SCHEMA_VERSION = "upbit-continuous-functional-v1"
 EVIDENCE_CLASS = "FUNCTIONAL_TEST_NON_PROMOTION"
@@ -59,6 +61,12 @@ MAX_CLEANUP_ACTION_GENERATIONS = 12
 ACCOUNT_EXCLUSIVITY_PROOF_SCHEMA_VERSION = (
     "upbit-functional-account-exclusivity-proof/v1"
 )
+ACCOUNT_EXCLUSIVITY_PROOF_SCHEMA_VERSION_V2 = (
+    "upbit-functional-account-exclusivity-proof/v2"
+)
+ACCOUNT_EXCLUSIVITY_PROOF_REQUEST_SCHEMA_VERSION = (
+    "upbit-functional-account-exclusivity-proof-request/v1"
+)
 ACCOUNT_EXCLUSIVITY_VERIFIER_PIN_SCHEMA_VERSION = (
     "upbit-account-exclusivity-verifier-pin/v1"
 )
@@ -71,6 +79,15 @@ ACCOUNT_MANUAL_TRADE_AUDIT_SOURCE = (
 ACCOUNT_BOT_REGISTRY_SOURCE = (
     "SERVER_OWNED_UPBIT_ACCOUNT_BOT_REGISTRY_V1"
 )
+GLOBAL_FIRST_LIVE_AUTHORITY_SCHEMA_VERSION = (
+    "upbit-global-first-live-dispatch-authority/v1"
+)
+GLOBAL_FIRST_LIVE_AUTHORITY_REQUEST_SCHEMA_VERSION = (
+    "upbit-global-first-live-dispatch-authority-request/v1"
+)
+GLOBAL_FIRST_LIVE_SCOPE = "CRYPTO_FIRST_LIVE_GLOBAL"
+GLOBAL_FIRST_LIVE_MAX_SNAPSHOT_AGE_SECONDS = 5
+GLOBAL_FIRST_LIVE_MAX_OWNER_LEASE_SECONDS = 60
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
@@ -115,6 +132,11 @@ class AccountExclusivityProofVerifier(Protocol):
         signature: str,
         verifier_pin: Mapping[str, Any],
     ) -> bool: ...
+
+
+GlobalFirstLiveAuthorityReader = Callable[
+    [Mapping[str, Any]], Mapping[str, Any]
+]
 
 
 def _text(value: object) -> str:
@@ -398,6 +420,8 @@ def _canonical_exclusivity_component(
     account_fingerprint: str,
     coverage_started_at: str,
     coverage_ended_at: str,
+    credential_binding_sha256: str = "",
+    server_owner_identity_sha256: str = "",
 ) -> dict[str, Any] | None:
     count_fields = {
         "apiKeyInventory": (
@@ -424,7 +448,15 @@ def _canonical_exclusivity_component(
         "authorityArtifactHash",
         "evidenceHash",
     }
-    if not isinstance(value, Mapping) or set(value) != common_keys | set(count_fields):
+    binding_fields: tuple[str, ...] = ()
+    if credential_binding_sha256 or server_owner_identity_sha256:
+        if name == "apiKeyInventory":
+            binding_fields = ("authorizedCredentialBindingSha256",)
+        elif name == "botRegistry":
+            binding_fields = ("authorizedServerOwnerIdentitySha256",)
+    if not isinstance(value, Mapping) or set(value) != (
+        common_keys | set(count_fields) | set(binding_fields)
+    ):
         return None
     row = dict(value)
     if (
@@ -464,6 +496,32 @@ def _canonical_exclusivity_component(
             or int(row[field]) < 0
             for field in count_fields
         )
+        or (
+            name == "apiKeyInventory"
+            and binding_fields
+            and (
+                not _exact_lower_hash(
+                    row.get("authorizedCredentialBindingSha256")
+                )
+                or not hmac.compare_digest(
+                    row["authorizedCredentialBindingSha256"],
+                    credential_binding_sha256,
+                )
+            )
+        )
+        or (
+            name == "botRegistry"
+            and binding_fields
+            and (
+                not _exact_lower_hash(
+                    row.get("authorizedServerOwnerIdentitySha256")
+                )
+                or not hmac.compare_digest(
+                    row["authorizedServerOwnerIdentitySha256"],
+                    server_owner_identity_sha256,
+                )
+            )
+        )
     ):
         return None
     if name == "apiKeyInventory" and (
@@ -493,6 +551,32 @@ def _canonical_exclusivity_component(
     return row
 
 
+def _account_exclusivity_request_payload(
+    *,
+    session_id: str,
+    phase: str,
+    account_fingerprint: str,
+    credential_binding_sha256: str,
+    server_owner_identity_sha256: str,
+    session_started_at: datetime,
+    observation_started_at: datetime,
+    observed_at: datetime,
+) -> dict[str, Any]:
+    """Canonical request an independent authority must sign exactly once."""
+
+    return {
+        "schemaVersion": ACCOUNT_EXCLUSIVITY_PROOF_REQUEST_SCHEMA_VERSION,
+        "sessionId": session_id,
+        "phase": _upper(phase),
+        "accountFingerprint": account_fingerprint,
+        "credentialBindingSha256": credential_binding_sha256,
+        "serverOwnerIdentitySha256": server_owner_identity_sha256,
+        "sessionStartedAt": _utc_text(session_started_at),
+        "observationStartedAt": _utc_text(observation_started_at),
+        "observedAt": _utc_text(observed_at),
+    }
+
+
 def _verify_account_exclusivity_proof(
     value: object,
     *,
@@ -503,6 +587,7 @@ def _verify_account_exclusivity_proof(
     observed_at: datetime,
     verifier: AccountExclusivityProofVerifier | None,
     verifier_pin: Mapping[str, Any] | None,
+    phase: str = "",
 ) -> tuple[dict[str, Any], str, bool]:
     """Normalize and independently verify exact signed primitive evidence."""
 
@@ -512,7 +597,7 @@ def _verify_account_exclusivity_proof(
             reason="PROOF_MISSING",
         )
     raw = dict(value)
-    top_keys = {
+    legacy_top_keys = {
         "schemaVersion",
         "sessionId",
         "accountFingerprint",
@@ -526,12 +611,26 @@ def _verify_account_exclusivity_proof(
         "payloadHash",
         "signature",
     }
+    production_top_keys = legacy_top_keys | {
+        "phase",
+        "credentialBindingSha256",
+        "serverOwnerIdentitySha256",
+        "proofRequestHash",
+        "authorityJournalId",
+        "authoritySequence",
+        "previousAuthorityProofHash",
+    }
     normalized_pin = _normalized_account_exclusivity_verifier_pin(verifier_pin)
     started_text = _utc_text(session_started_at)
     observation_started_text = _utc_text(observation_started_at)
     observed_text = _utc_text(observed_at)
+    production_v2 = (
+        raw.get("schemaVersion")
+        == ACCOUNT_EXCLUSIVITY_PROOF_SCHEMA_VERSION_V2
+    )
+    expected_top_keys = production_top_keys if production_v2 else legacy_top_keys
     if (
-        set(raw) != top_keys
+        set(raw) != expected_top_keys
         or any(
             not _exact_json_string(raw.get(field))
             for field in (
@@ -545,7 +644,11 @@ def _verify_account_exclusivity_proof(
                 "signature",
             )
         )
-        or raw.get("schemaVersion") != ACCOUNT_EXCLUSIVITY_PROOF_SCHEMA_VERSION
+        or raw.get("schemaVersion")
+        not in {
+            ACCOUNT_EXCLUSIVITY_PROOF_SCHEMA_VERSION,
+            ACCOUNT_EXCLUSIVITY_PROOF_SCHEMA_VERSION_V2,
+        }
         or raw.get("sessionId") != session_id
         or not _exact_lower_hash(raw.get("accountFingerprint"))
         or not hmac.compare_digest(raw["accountFingerprint"], account_fingerprint)
@@ -561,6 +664,65 @@ def _verify_account_exclusivity_proof(
             raw_value=raw,
             reason="PROOF_BINDING_OR_AUTHORITY_UNVERIFIABLE",
         )
+    credential_binding_sha256 = ""
+    server_owner_identity_sha256 = ""
+    if production_v2:
+        credential_binding_sha256 = _text(
+            raw.get("credentialBindingSha256")
+        )
+        server_owner_identity_sha256 = _text(
+            raw.get("serverOwnerIdentitySha256")
+        )
+        requested_phase = _upper(phase)
+        try:
+            authority_sequence = int(raw.get("authoritySequence"))
+        except (TypeError, ValueError):
+            authority_sequence = 0
+        request_payload = _account_exclusivity_request_payload(
+            session_id=session_id,
+            phase=requested_phase,
+            account_fingerprint=account_fingerprint,
+            credential_binding_sha256=credential_binding_sha256,
+            server_owner_identity_sha256=server_owner_identity_sha256,
+            session_started_at=session_started_at,
+            observation_started_at=observation_started_at,
+            observed_at=observed_at,
+        )
+        if (
+            not requested_phase
+            or any(
+                type(raw.get(field)) is not str
+                for field in (
+                    "phase",
+                    "credentialBindingSha256",
+                    "serverOwnerIdentitySha256",
+                    "proofRequestHash",
+                    "authorityJournalId",
+                    "previousAuthorityProofHash",
+                )
+            )
+            or raw.get("phase") != requested_phase
+            or not _exact_lower_hash(credential_binding_sha256)
+            or not _exact_lower_hash(server_owner_identity_sha256)
+            or not _exact_lower_hash(raw.get("proofRequestHash"))
+            or not hmac.compare_digest(
+                raw["proofRequestHash"],
+                _strict_stable_hash(request_payload),
+            )
+            or _SAFE_ID_RE.fullmatch(
+                _text(raw.get("authorityJournalId"))
+            )
+            is None
+            or type(raw.get("authoritySequence")) is not int
+            or authority_sequence < 1
+            or not _exact_lower_hash(
+                raw.get("previousAuthorityProofHash")
+            )
+        ):
+            return _invalid_account_exclusivity_proof(
+                raw_value=raw,
+                reason="PRODUCTION_REQUEST_OR_CHAIN_BINDING_INVALID",
+            )
     try:
         runtime_identity = verifier.identity()
     except Exception:
@@ -603,6 +765,8 @@ def _verify_account_exclusivity_proof(
             account_fingerprint=account_fingerprint,
             coverage_started_at=started_text,
             coverage_ended_at=observed_text,
+            credential_binding_sha256=credential_binding_sha256,
+            server_owner_identity_sha256=server_owner_identity_sha256,
         )
         if component is None:
             return _invalid_account_exclusivity_proof(
@@ -685,6 +849,7 @@ def _account_exclusivity_evidence_complete(
                 value.get("finalObservedAt"),
                 "upbit-terminal-observed-at",
             ),
+            phase="FINAL",
             verifier=verifier,
             verifier_pin=verifier_pin,
         )
@@ -701,6 +866,186 @@ def _account_exclusivity_evidence_complete(
         )
     except (TypeError, ValueError, UpbitFunctionalBlocked):
         return False
+
+
+def verify_upbit_global_first_live_authority(
+    reader: GlobalFirstLiveAuthorityReader,
+    *,
+    scope: "UpbitPermitScope",
+    session_id: str,
+    owner_identity_hash: str,
+    action: str,
+    cleanup: bool,
+    now: datetime,
+    claim_id: str = "",
+    request_hash: str = "",
+) -> dict[str, Any]:
+    """Verify the shared coordinator adapter without importing it.
+
+    The callback is server-owned and receives only a canonical request.  Its
+    response must be an exact, self-hashed projection of durable coordinator
+    authority.  Natural entries require ACTIVE/open/fresh authority; cleanup
+    permits ACTIVE or CLEANUP_ONLY but explicitly forbids entry authority.
+    """
+
+    owner_hash = _require_hash(
+        owner_identity_hash, "upbit-global-owner-identity-hash"
+    )
+    normalized_action = _upper(action)
+    if not normalized_action or not callable(reader):
+        raise UpbitFunctionalBlocked(
+            "upbit-global-first-live-authority-reader-required"
+        )
+    request = {
+        "schemaVersion": GLOBAL_FIRST_LIVE_AUTHORITY_REQUEST_SCHEMA_VERSION,
+        "scope": GLOBAL_FIRST_LIVE_SCOPE,
+        "lane": "UPBIT",
+        "action": normalized_action,
+        "cleanup": bool(cleanup),
+        "runId": session_id,
+        "sessionId": session_id,
+        "permitId": scope.permit_id,
+        "permitHash": scope.permit_hash,
+        "accountFingerprint": scope.account_fingerprint,
+        "routeScopeHash": scope.route_scope_hash,
+        "ownerIdentityHash": owner_hash,
+        "claimId": _text(claim_id),
+        "requestHash": _text(request_hash).lower(),
+    }
+    try:
+        raw = reader(dict(request))
+    except Exception as exc:
+        raise UpbitFunctionalBlocked(
+            "upbit-global-first-live-authority-unavailable"
+        ) from exc
+    expected_keys = {
+        "schemaVersion",
+        "scope",
+        "lane",
+        "phase",
+        "runId",
+        "sessionId",
+        "permitId",
+        "permitHash",
+        "accountFingerprint",
+        "routeScopeHash",
+        "ownerIdentityHash",
+        "ownerLeaseActive",
+        "entryAuthorityOpen",
+        "cleanupAuthorityOpen",
+        "hardStopEpoch",
+        "ownerLeaseExpiresEpoch",
+        "revision",
+        "observedEpoch",
+        "killSwitch",
+        "stopRequested",
+        "authorityHash",
+    }
+    if not isinstance(raw, Mapping) or set(raw) != expected_keys:
+        raise UpbitFunctionalBlocked(
+            "upbit-global-first-live-authority-shape-invalid"
+        )
+    value = dict(raw)
+    body = {key: item for key, item in value.items() if key != "authorityHash"}
+    exact = {
+        "schemaVersion": GLOBAL_FIRST_LIVE_AUTHORITY_SCHEMA_VERSION,
+        "scope": GLOBAL_FIRST_LIVE_SCOPE,
+        "lane": "UPBIT",
+        "sessionId": session_id,
+        "permitId": scope.permit_id,
+        "permitHash": scope.permit_hash,
+        "accountFingerprint": scope.account_fingerprint,
+        "routeScopeHash": scope.route_scope_hash,
+        "ownerIdentityHash": owner_hash,
+    }
+    if any(
+        type(value.get(field)) is not str
+        or not hmac.compare_digest(value[field], expected)
+        for field, expected in exact.items()
+    ):
+        raise UpbitFunctionalBlocked(
+            "upbit-global-first-live-authority-identity-mismatch"
+        )
+    if (
+        type(value.get("runId")) is not str
+        or _SAFE_ID_RE.fullmatch(value["runId"]) is None
+    ):
+        raise UpbitFunctionalBlocked(
+            "upbit-global-first-live-authority-run-id-invalid"
+        )
+    if (
+        not _exact_lower_hash(value.get("authorityHash"))
+        or not hmac.compare_digest(
+            value["authorityHash"], _strict_stable_hash(body)
+        )
+        or any(
+            type(value.get(field)) is not bool
+            for field in (
+                "ownerLeaseActive",
+                "entryAuthorityOpen",
+                "cleanupAuthorityOpen",
+                "killSwitch",
+                "stopRequested",
+            )
+        )
+        or isinstance(value.get("revision"), bool)
+        or not isinstance(value.get("revision"), int)
+        or int(value["revision"]) < 1
+    ):
+        raise UpbitFunctionalBlocked(
+            "upbit-global-first-live-authority-integrity-invalid"
+        )
+    try:
+        observed_epoch = float(value["observedEpoch"])
+        lease_expires_epoch = float(value["ownerLeaseExpiresEpoch"])
+        hard_stop_epoch = float(value["hardStopEpoch"])
+    except (TypeError, ValueError) as exc:
+        raise UpbitFunctionalBlocked(
+            "upbit-global-first-live-authority-time-invalid"
+        ) from exc
+    now_epoch = _utc(now, "upbit-global-current-time").timestamp()
+    if (
+        any(
+            isinstance(value.get(field), bool)
+            or not math.isfinite(parsed)
+            for field, parsed in (
+                ("observedEpoch", observed_epoch),
+                ("ownerLeaseExpiresEpoch", lease_expires_epoch),
+                ("hardStopEpoch", hard_stop_epoch),
+            )
+        )
+        or observed_epoch > now_epoch
+        or now_epoch - observed_epoch
+        > GLOBAL_FIRST_LIVE_MAX_SNAPSHOT_AGE_SECONDS
+        or value.get("ownerLeaseActive") is not True
+        or lease_expires_epoch <= now_epoch
+        or lease_expires_epoch - now_epoch
+        > GLOBAL_FIRST_LIVE_MAX_OWNER_LEASE_SECONDS
+        or abs(hard_stop_epoch - scope.ends_at.timestamp()) > 0.001
+    ):
+        raise UpbitFunctionalBlocked(
+            "upbit-global-first-live-authority-stale-or-expired"
+        )
+    phase = _upper(value.get("phase"))
+    if cleanup:
+        valid_phase = phase in {"ACTIVE", "CLEANUP_ONLY"}
+        phase_authority = bool(
+            value.get("entryAuthorityOpen") is False
+            and value.get("cleanupAuthorityOpen") is True
+        )
+    else:
+        valid_phase = phase == "ACTIVE" and now_epoch < hard_stop_epoch
+        phase_authority = bool(
+            value.get("entryAuthorityOpen") is True
+            and value.get("cleanupAuthorityOpen") is False
+            and value.get("killSwitch") is False
+            and value.get("stopRequested") is False
+        )
+    if not valid_phase or not phase_authority:
+        raise UpbitFunctionalBlocked(
+            "upbit-global-first-live-dispatch-fence-closed"
+        )
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -1282,6 +1627,7 @@ class UpbitTruth:
             AccountExclusivityProofVerifier | None
         ) = None,
         account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+        truth_phase: str = "",
     ) -> "UpbitTruth":
         if _upper(value.get("broker")) != "UPBIT":
             raise UpbitFunctionalBlocked("upbit-truth-broker-mismatch")
@@ -1612,6 +1958,7 @@ class UpbitTruth:
                 observed_at=observed_at,
                 verifier=account_exclusivity_verifier,
                 verifier_pin=account_exclusivity_verifier_pin,
+                phase=truth_phase,
             )
         else:
             (
@@ -3127,6 +3474,10 @@ class UpbitContinuousFunctionalService:
             AccountExclusivityProofVerifier | None
         ),
         account_exclusivity_verifier_pin: Mapping[str, Any] | None,
+        global_first_live_authority_reader: (
+            GlobalFirstLiveAuthorityReader | None
+        ),
+        global_first_live_owner_identity_hash: str,
         capability: object,
         runtime_capability_secret: str,
     ) -> None:
@@ -3156,6 +3507,12 @@ class UpbitContinuousFunctionalService:
             if isinstance(account_exclusivity_verifier_pin, Mapping)
             else None
         )
+        self.global_first_live_authority_reader = (
+            global_first_live_authority_reader
+        )
+        self.global_first_live_owner_identity_hash = _text(
+            global_first_live_owner_identity_hash
+        ).lower()
         self._capability = capability
         self.__runtime_capability_secret = runtime_capability_secret
 
@@ -3183,6 +3540,10 @@ class UpbitContinuousFunctionalService:
             AccountExclusivityProofVerifier | None
         ) = None,
         account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+        global_first_live_authority_reader: (
+            GlobalFirstLiveAuthorityReader | None
+        ) = None,
+        global_first_live_owner_identity_hash: str = "",
         _capability: object | None = None,
     ) -> "UpbitContinuousFunctionalService":
         capability = _capability
@@ -3192,6 +3553,16 @@ class UpbitContinuousFunctionalService:
             if not UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED:
                 raise UpbitFunctionalBlocked(
                     "upbit-account-exclusivity-authority-unpinned"
+                )
+            if (
+                not UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED
+                or not callable(global_first_live_authority_reader)
+                or not _exact_lower_hash(
+                    global_first_live_owner_identity_hash
+                )
+            ):
+                raise UpbitFunctionalBlocked(
+                    "upbit-global-first-live-dispatch-fence-not-released"
                 )
             capability = _ACTIVATION_CAPABILITY
         if (
@@ -3254,6 +3625,16 @@ class UpbitContinuousFunctionalService:
         now = _utc(clock(), "upbit-current-time")
         if not (scope.starts_at <= now < scope.ends_at):
             raise UpbitFunctionalBlocked("upbit-permit-not-active")
+        if global_first_live_authority_reader is not None:
+            verify_upbit_global_first_live_authority(
+                global_first_live_authority_reader,
+                scope=scope,
+                session_id=session_id,
+                owner_identity_hash=global_first_live_owner_identity_hash,
+                action="ACTIVATE",
+                cleanup=False,
+                now=now,
+            )
         runtime = dict(runtime_reader())
         cls._assert_runtime(
             runtime,
@@ -3277,6 +3658,7 @@ class UpbitContinuousFunctionalService:
             account_exclusivity_verifier_pin=(
                 account_exclusivity_verifier_pin
             ),
+            truth_phase="BASELINE",
         )
         if truth.account_exclusivity_proof_verified is not True:
             raise UpbitFunctionalBlocked(
@@ -3328,6 +3710,12 @@ class UpbitContinuousFunctionalService:
             account_exclusivity_verifier_pin=(
                 account_exclusivity_verifier_pin
             ),
+            global_first_live_authority_reader=(
+                global_first_live_authority_reader
+            ),
+            global_first_live_owner_identity_hash=(
+                global_first_live_owner_identity_hash
+            ),
             capability=capability,
             runtime_capability_secret=runtime_capability_secret,
         )
@@ -3357,6 +3745,10 @@ class UpbitContinuousFunctionalService:
             AccountExclusivityProofVerifier | None
         ) = None,
         account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+        global_first_live_authority_reader: (
+            GlobalFirstLiveAuthorityReader | None
+        ) = None,
+        global_first_live_owner_identity_hash: str = "",
         _capability: object | None = None,
     ) -> "UpbitContinuousFunctionalService":
         capability = _capability
@@ -3364,6 +3756,16 @@ class UpbitContinuousFunctionalService:
             if not UPBIT_CONTINUOUS_FUNCTIONAL_AVAILABLE:
                 raise UpbitFunctionalBlocked(
                     "upbit-continuous-functional-availability-false"
+                )
+            if (
+                not UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED
+                or not callable(global_first_live_authority_reader)
+                or not _exact_lower_hash(
+                    global_first_live_owner_identity_hash
+                )
+            ):
+                raise UpbitFunctionalBlocked(
+                    "upbit-global-first-live-dispatch-fence-not-released"
                 )
             capability = _ACTIVATION_CAPABILITY
         if (
@@ -3421,6 +3823,16 @@ class UpbitContinuousFunctionalService:
             immutable_selection=immutable_selection_reader(),
         )
         now = _utc(clock(), "upbit-current-time")
+        if global_first_live_authority_reader is not None:
+            verify_upbit_global_first_live_authority(
+                global_first_live_authority_reader,
+                scope=scope,
+                session_id=session_id,
+                owner_identity_hash=global_first_live_owner_identity_hash,
+                action="REATTACH_CLEANUP",
+                cleanup=True,
+                now=now,
+            )
         attestation = dict(owner_recovery_attestation)
         exact = {
             "schemaVersion": "upbit-functional-recovery-approval/v1",
@@ -3555,6 +3967,12 @@ class UpbitContinuousFunctionalService:
             account_exclusivity_verifier_pin=(
                 account_exclusivity_verifier_pin
             ),
+            global_first_live_authority_reader=(
+                global_first_live_authority_reader
+            ),
+            global_first_live_owner_identity_hash=(
+                global_first_live_owner_identity_hash
+            ),
             capability=capability,
             runtime_capability_secret=runtime_capability_secret,
         )
@@ -3679,7 +4097,7 @@ class UpbitContinuousFunctionalService:
                 if identifier
             )
         )
-        return UpbitTruth.parse(
+        truth = UpbitTruth.parse(
             self.truth_reader(
                 session_id=self.session_id,
                 phase=phase,
@@ -3695,17 +4113,31 @@ class UpbitContinuousFunctionalService:
             account_exclusivity_verifier_pin=(
                 self.account_exclusivity_verifier_pin
             ),
+            truth_phase=phase,
         )
+        if truth.account_exclusivity_proof_verified is not True:
+            # Proof loss never disables risk-reducing cleanup, but it is a
+            # sticky durability fact: this session can no longer claim
+            # continuously exclusive account ownership.
+            current = self.ledger.session(self.session_id)
+            if int(current.get("account_exclusivity_breach") or 0) == 0:
+                self.ledger.latch_account_exclusivity_breach(
+                    self.session_id,
+                    phase=phase,
+                )
+        return truth
 
     def _require_natural_buy_exclusivity(
         self, truth: UpbitTruth, *, phase: str
     ) -> None:
         if truth.account_exclusivity_proof_verified is True:
             return
-        self.ledger.latch_account_exclusivity_breach(
-            self.session_id,
-            phase=phase,
-        )
+        current = self.ledger.session(self.session_id)
+        if int(current.get("account_exclusivity_breach") or 0) == 0:
+            self.ledger.latch_account_exclusivity_breach(
+                self.session_id,
+                phase=phase,
+            )
         raise UpbitFunctionalBlocked(
             "upbit-natural-buy-account-exclusivity-proof-required"
         )
@@ -3998,6 +4430,30 @@ class UpbitContinuousFunctionalService:
                         dispatch_truth,
                         phase="FINAL_PRE_POST",
                     )
+                if self.global_first_live_authority_reader is not None:
+                    try:
+                        verify_upbit_global_first_live_authority(
+                            self.global_first_live_authority_reader,
+                            scope=self.scope,
+                            session_id=self.session_id,
+                            owner_identity_hash=(
+                                self.global_first_live_owner_identity_hash
+                            ),
+                            action=leg.slot,
+                            cleanup=cleanup,
+                            now=self.clock(),
+                            claim_id=claim["claimId"],
+                            request_hash=claim["requestHash"],
+                        )
+                    except UpbitFunctionalBlocked:
+                        if not cleanup:
+                            self.ledger.enter_cleanup(
+                                self.session_id,
+                                reason=(
+                                    "global-first-live-dispatch-fence-lost"
+                                ),
+                            )
+                        raise
                 dispatch_payload = self._validate_leg(
                     leg,
                     dispatch_truth,
@@ -4061,6 +4517,14 @@ class UpbitContinuousFunctionalService:
                 claim["claimId"],
                 state="BLOCKED_BEFORE_POST",
             )
+            if (
+                not cleanup
+                and getattr(exc, "requires_cleanup", False) is True
+            ):
+                self.ledger.enter_cleanup(
+                    self.session_id,
+                    reason="global-first-live-dispatch-fence-lost",
+                )
             raise UpbitFunctionalBlocked(
                 "upbit-broker-adapter-proved-post-not-sent"
             ) from exc
@@ -5223,12 +5687,16 @@ def _activate_for_test(**kwargs: Any) -> UpbitContinuousFunctionalService:
 
 
 __all__ = [
+    "ACCOUNT_EXCLUSIVITY_PROOF_SCHEMA_VERSION_V2",
     "EVIDENCE_CLASS",
     "EXECUTION_ROUTE",
+    "GLOBAL_FIRST_LIVE_AUTHORITY_SCHEMA_VERSION",
+    "GLOBAL_FIRST_LIVE_SCOPE",
+    "GlobalFirstLiveAuthorityReader",
     "UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED",
     "UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_STATUS",
     "UPBIT_CONTINUOUS_FUNCTIONAL_AVAILABLE",
-    "UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED",
+    "UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED",
     "UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED",
     "FinalizedFiveMinuteBar",
     "UpbitContinuousFunctionalService",
@@ -5243,4 +5711,5 @@ __all__ = [
     "UpbitTruth",
     "account_exclusivity_verifier_wiring_status",
     "activate_upbit_continuous_functional",
+    "verify_upbit_global_first_live_authority",
 ]

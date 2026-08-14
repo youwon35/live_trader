@@ -27,8 +27,10 @@ from live_trader.binance_spot_functional_mutation import (
 from live_trader.binance_spot_functional_transport import binance_api_key_fingerprint
 from tests.test_binance_spot_continuous_functional import (
     Clock,
+    FakeVerifiedExclusivityGuard,
     bar,
     binding,
+    global_authority_reader,
     permit,
     rules,
     truth,
@@ -160,6 +162,10 @@ class BinanceSpotFunctionalLifecycleTest(unittest.TestCase):
                 "publicationProofHash": "3" * 64,
                 "publicationProofFileSha256": "4" * 64,
             },
+            account_exclusivity_guard=FakeVerifiedExclusivityGuard(),
+            global_first_live_authority_reader=(
+                global_authority_reader(self.clock)
+            ),
             clock=self.clock,
             monotonic_clock=self.clock,
         )

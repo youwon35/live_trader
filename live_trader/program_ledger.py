@@ -12,8 +12,22 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Callable, Mapping
 
+from .binance_cash_transfer_evidence import (
+    AUTHORITY_SCHEMA as BINANCE_TRANSFER_AUTHORITY_SCHEMA,
+    HIGH_WATER_REQUEST_SCHEMA as BINANCE_TRANSFER_HIGH_WATER_REQUEST_SCHEMA,
+    HIGH_WATER_SCHEMA as BINANCE_TRANSFER_HIGH_WATER_SCHEMA,
+    INTERNAL_SUCCESS_RESULT as BINANCE_TRANSFER_SUCCESS_RESULT,
+    OFFICIAL_SUCCESS_STATUS as BINANCE_TRANSFER_SUCCESS_STATUS,
+    OFFICIAL_TRANSFER_TYPE as BINANCE_TRANSFER_TYPE,
+    TRUTH_SCHEMA as BINANCE_TRANSFER_TRUTH_SCHEMA,
+    content_hash as binance_transfer_content_hash,
+    normalized_transfer_fields as binance_transfer_record_fields,
+    truth_fields as binance_transfer_truth_fields,
+)
+
 
 BINANCE_CASH_TRANSFER_ADJUSTMENT_RELEASED = False
+BINANCE_CASH_TRANSFER_CONSUMPTION_RELEASED = False
 MAX_CASH_TRANSFER_TRUTH_AGE_SECONDS = 30.0
 
 
@@ -82,10 +96,16 @@ class ProgramLedger:
         cash_transfer_authority_verifier: (
             Callable[[Mapping[str, Any]], bool] | None
         ) = None,
+        cash_transfer_high_water_verifier: (
+            Callable[[Mapping[str, Any]], bool] | None
+        ) = None,
     ) -> None:
         self.path = Path(path)
         self.cash_transfer_authority_verifier = (
             cash_transfer_authority_verifier
+        )
+        self.cash_transfer_high_water_verifier = (
+            cash_transfer_high_water_verifier
         )
         self.ensure_schema()
 
@@ -406,6 +426,63 @@ class ProgramLedger:
                 BEFORE DELETE ON cash_transfer_adjustments
                 BEGIN
                     SELECT RAISE(ABORT, 'cash-transfer-adjustments-append-only');
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS binance_cash_transfer_consumptions (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    consumption_key TEXT NOT NULL UNIQUE,
+                    adjustment_id TEXT NOT NULL UNIQUE,
+                    account_fingerprint TEXT NOT NULL,
+                    api_key_fingerprint TEXT NOT NULL,
+                    transfer_type TEXT NOT NULL,
+                    transfer_timestamp INTEGER NOT NULL,
+                    transfer_id TEXT NOT NULL,
+                    truth_hash TEXT NOT NULL UNIQUE,
+                    previous_hash TEXT NOT NULL,
+                    content_json TEXT NOT NULL,
+                    content_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (adjustment_id)
+                        REFERENCES cash_transfer_adjustments(adjustment_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    binance_cash_transfer_consumptions_official_idx
+                ON binance_cash_transfer_consumptions(
+                    account_fingerprint, api_key_fingerprint,
+                    transfer_type, transfer_timestamp, transfer_id
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS
+                    binance_cash_transfer_consumptions_no_update
+                BEFORE UPDATE ON binance_cash_transfer_consumptions
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'binance-cash-transfer-consumptions-append-only'
+                    );
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS
+                    binance_cash_transfer_consumptions_no_delete
+                BEFORE DELETE ON binance_cash_transfer_consumptions
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'binance-cash-transfer-consumptions-append-only'
+                    );
                 END
                 """
             )
@@ -766,6 +843,8 @@ class ProgramLedger:
 
         if not BINANCE_CASH_TRANSFER_ADJUSTMENT_RELEASED:
             raise ValueError("binance-cash-transfer-adjustment-not-released")
+        if not BINANCE_CASH_TRANSFER_CONSUMPTION_RELEASED:
+            raise ValueError("binance-cash-transfer-consumption-not-released")
 
         source_name = str(source_account or "").strip()
         destination_name = str(destination_account or "").strip()
@@ -793,73 +872,94 @@ class ProgramLedger:
                 "binance-cash-transfer-destination-arithmetic-mismatch"
             )
         observed = _utc_observation_text(observed_at)
+        observed_datetime = datetime.fromisoformat(observed)
+        current_datetime = datetime.now(timezone.utc)
         evidence = dict(truth_evidence)
-        if set(evidence) != {
-            "schemaVersion",
-            "accountFingerprint",
-            "spotCash",
-            "futuresCash",
-            "spotOpenOrderCount",
-            "futuresOpenOrderCount",
-            "futuresPositionCount",
-            "signedGetComplete",
-            "observedAt",
-            "officialTransfer",
-        }:
+        if set(evidence) != set(binance_transfer_truth_fields()):
             raise ValueError("binance-cash-transfer-truth-fields-not-exact")
         account_fingerprint = str(
             evidence.get("accountFingerprint") or ""
-        ).strip()
+        ).strip().lower()
+        api_key_fingerprint = str(
+            evidence.get("apiKeyFingerprint") or ""
+        ).strip().lower()
+        for label, fingerprint in (
+            ("account", account_fingerprint),
+            ("api-key", api_key_fingerprint),
+        ):
+            if len(fingerprint) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in fingerprint
+            ):
+                raise ValueError(
+                    f"binance-cash-transfer-{label}-fingerprint-invalid"
+                )
         transfer = evidence.get("officialTransfer")
-        if not isinstance(transfer, dict) or set(transfer) != {
-            "tranId",
-            "asset",
-            "amount",
-            "fromAccount",
-            "toAccount",
-            "status",
-            "eventTime",
-        }:
-            raise ValueError("binance-cash-transfer-record-fields-not-exact")
-        transfer_id = str(transfer.get("tranId") or "").strip()
-        transfer_event = _utc_observation_text(transfer.get("eventTime"))
-        observed_datetime = datetime.fromisoformat(observed)
-        transfer_datetime = datetime.fromisoformat(transfer_event)
-        current_datetime = datetime.now(timezone.utc)
         if (
-            evidence.get("schemaVersion")
-            != "binance-spot-futures-cash-transfer-truth/v1"
+            not isinstance(transfer, dict)
+            or set(transfer) != set(binance_transfer_record_fields())
+        ):
+            raise ValueError("binance-cash-transfer-record-fields-not-exact")
+        transfer_id_value = transfer.get("tranId")
+        transfer_timestamp = transfer.get("timestamp")
+        if type(transfer_id_value) is not int or transfer_id_value <= 0:
+            raise ValueError("binance-cash-transfer-record-id-invalid")
+        if type(transfer_timestamp) is not int or transfer_timestamp <= 0:
+            raise ValueError("binance-cash-transfer-record-time-invalid")
+        transfer_id = str(transfer_id_value)
+        transfer_event = _utc_observation_text(transfer.get("eventTime"))
+        transfer_datetime = datetime.fromisoformat(transfer_event)
+        expected_event = datetime.fromtimestamp(
+            transfer_timestamp / 1000, tz=timezone.utc
+        ).isoformat()
+        consumption_key = str(
+            evidence.get("consumptionKey") or ""
+        ).strip().lower()
+        expected_consumption_key = hashlib.sha256(
+            (
+                account_fingerprint
+                + "\x00"
+                + api_key_fingerprint
+                + "\x00"
+                + BINANCE_TRANSFER_TYPE
+                + "\x00"
+                + transfer_id
+                + "\x00"
+                + str(transfer_timestamp)
+            ).encode("utf-8")
+        ).hexdigest()
+        prior_high_water = evidence.get("priorConsumedHighWater")
+        if not isinstance(prior_high_water, dict):
+            raise ValueError("binance-cash-transfer-high-water-invalid")
+        if (
+            evidence.get("schemaVersion") != BINANCE_TRANSFER_TRUTH_SCHEMA
             or evidence.get("signedGetComplete") is not True
+            or evidence.get("coordinatorPhase") != "IDLE"
+            or evidence.get("globalLeaseState") != "IDLE"
             or evidence.get("spotOpenOrderCount") != 0
             or evidence.get("futuresOpenOrderCount") != 0
             or evidence.get("futuresPositionCount") != 0
-            or str(evidence.get("spotCash") or "").strip()
-            != str(source_after)
-            or str(evidence.get("futuresCash") or "").strip()
-            != str(destination_after)
+            or not self._decimal_equal(evidence.get("spotCash"), source_after)
+            or not self._decimal_equal(
+                evidence.get("futuresCash"), destination_after
+            )
             or _utc_observation_text(evidence.get("observedAt")) != observed
-            or len(account_fingerprint) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in account_fingerprint
-            )
-            or not transfer_id
-            or len(transfer_id) > 160
-            or any(
-                character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
-                for character in transfer_id
-            )
-            or str(transfer.get("asset") or "").strip() != "USDT"
+            or transfer.get("asset") != "USDT"
             or not self._decimal_equal(transfer.get("amount"), amount_value)
-            or str(transfer.get("fromAccount") or "").strip() != "SPOT"
-            or str(transfer.get("toAccount") or "").strip()
-            != "USD_M_FUTURES"
-            or str(transfer.get("status") or "").strip() != "CONFIRMED"
+            or transfer.get("type") != BINANCE_TRANSFER_TYPE
+            or transfer.get("status") != BINANCE_TRANSFER_SUCCESS_STATUS
+            or transfer.get("result") != BINANCE_TRANSFER_SUCCESS_RESULT
+            or transfer_event != expected_event
             or transfer_datetime > observed_datetime
             or observed_datetime > current_datetime
             or (
                 current_datetime - observed_datetime
             ).total_seconds() > MAX_CASH_TRANSFER_TRUTH_AGE_SECONDS
+            or consumption_key != expected_consumption_key
+            or str(evidence.get("signedGetEnvelopeHash") or "").strip()
+            != binance_transfer_content_hash(evidence["signedGetEnvelope"])
+            or str(evidence.get("idleBarrierHash") or "").strip()
+            != binance_transfer_content_hash(evidence["idleBarrierEvidence"])
         ):
             raise ValueError("binance-cash-transfer-truth-not-exact")
         truth_evidence_json = json.dumps(
@@ -882,12 +982,13 @@ class ProgramLedger:
             raise ValueError("binance-cash-transfer-truth-hash-mismatch")
 
         authority_request = {
-            "schemaVersion": "binance-cash-transfer-adjustment-authority/v1",
+            "schemaVersion": BINANCE_TRANSFER_AUTHORITY_SCHEMA,
             "sourceBrokerId": "binance",
             "destinationBrokerId": "binance-futures",
             "sourceAccount": source_name,
             "destinationAccount": destination_name,
             "accountFingerprint": account_fingerprint,
+            "apiKeyFingerprint": api_key_fingerprint,
             "amount": str(amount_value),
             "sourceCashBefore": str(source_before),
             "sourceCashAfter": str(source_after),
@@ -895,11 +996,46 @@ class ProgramLedger:
             "destinationCashAfter": str(destination_after),
             "observedAt": observed,
             "officialTransfer": dict(transfer),
+            "consumptionKey": consumption_key,
+            "priorConsumedHighWater": dict(prior_high_water),
+            "truthEvidence": evidence,
             "truthHash": normalized_truth_hash,
         }
         verifier = self.cash_transfer_authority_verifier
-        if verifier is None or verifier(authority_request) is not True:
+        try:
+            authority_verified = (
+                verifier(authority_request) if verifier is not None else False
+            )
+        except BaseException as exc:
+            raise ValueError(
+                "binance-cash-transfer-authority-unverified"
+            ) from exc
+        if authority_verified is not True:
             raise ValueError("binance-cash-transfer-authority-unverified")
+        high_water_request = {
+            "schemaVersion": BINANCE_TRANSFER_HIGH_WATER_REQUEST_SCHEMA,
+            "accountFingerprint": account_fingerprint,
+            "apiKeyFingerprint": api_key_fingerprint,
+            "transferType": BINANCE_TRANSFER_TYPE,
+            "transferTimestamp": transfer_timestamp,
+            "tranId": transfer_id_value,
+            "consumptionKey": consumption_key,
+            "priorConsumedHighWater": dict(prior_high_water),
+            "truthHash": normalized_truth_hash,
+        }
+        high_water_verifier = self.cash_transfer_high_water_verifier
+        try:
+            high_water_verified = (
+                high_water_verifier(high_water_request)
+                if high_water_verifier is not None
+                else False
+            )
+        except BaseException as exc:
+            raise ValueError(
+                "binance-cash-transfer-high-water-unverified"
+            ) from exc
+        if high_water_verified is not True:
+            raise ValueError("binance-cash-transfer-high-water-unverified")
 
         adjustment_id = "cash-transfer-adjustment-" + uuid.uuid4().hex
         created_at = now_text()
@@ -922,20 +1058,50 @@ class ProgramLedger:
             ).fetchone()
             if source_row is None or destination_row is None:
                 raise ValueError("binance-cash-transfer-durable-legs-missing")
-            prior_transfers = conn.execute(
-                "SELECT truth_evidence_json FROM cash_transfer_adjustments"
-            ).fetchall()
-            for prior in prior_transfers:
-                prior_evidence = json.loads(str(prior[0]))
-                prior_transfer = prior_evidence.get("officialTransfer")
-                if (
-                    isinstance(prior_transfer, dict)
-                    and str(prior_transfer.get("tranId") or "").strip()
-                    == transfer_id
-                ):
-                    raise ValueError(
-                        "binance-cash-transfer-record-already-consumed"
-                    )
+            durable_high_water = self._cash_transfer_consumption_high_water_conn(
+                conn,
+                account_fingerprint=account_fingerprint,
+                api_key_fingerprint=api_key_fingerprint,
+            )
+            if json.dumps(
+                durable_high_water,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ) != json.dumps(
+                prior_high_water,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ):
+                raise ValueError(
+                    "binance-cash-transfer-consumed-high-water-cas-changed"
+                )
+            duplicate = conn.execute(
+                """
+                SELECT 1 FROM binance_cash_transfer_consumptions
+                WHERE consumption_key=? OR (
+                    account_fingerprint=? AND api_key_fingerprint=?
+                    AND transfer_type=? AND transfer_timestamp=?
+                    AND transfer_id=?
+                )
+                LIMIT 1
+                """,
+                (
+                    consumption_key,
+                    account_fingerprint,
+                    api_key_fingerprint,
+                    BINANCE_TRANSFER_TYPE,
+                    transfer_timestamp,
+                    transfer_id,
+                ),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValueError(
+                    "binance-cash-transfer-record-already-consumed"
+                )
             if not self._decimal_equal(source_row["cash"], source_before):
                 raise ValueError("binance-cash-transfer-source-cas-changed")
             if not self._decimal_equal(
@@ -950,7 +1116,7 @@ class ProgramLedger:
             ).fetchone()
             previous_hash = str(previous_row[0]) if previous_row is not None else ""
             content = {
-                "schemaVersion": "program-ledger-cash-transfer-adjustment/v1",
+                "schemaVersion": "program-ledger-cash-transfer-adjustment/v2",
                 "adjustmentId": adjustment_id,
                 "sourceBrokerId": "binance",
                 "sourceAccount": source_name,
@@ -964,6 +1130,7 @@ class ProgramLedger:
                 "destinationCashAfter": str(destination_after),
                 "observedAt": observed,
                 "truthHash": normalized_truth_hash,
+                "consumptionKey": consumption_key,
                 "previousHash": previous_hash,
             }
             content_json = json.dumps(
@@ -975,6 +1142,40 @@ class ProgramLedger:
             )
             content_hash = hashlib.sha256(
                 content_json.encode("utf-8")
+            ).hexdigest()
+            prior_consumption_row = conn.execute(
+                """
+                SELECT content_hash FROM binance_cash_transfer_consumptions
+                ORDER BY sequence DESC LIMIT 1
+                """
+            ).fetchone()
+            prior_consumption_hash = (
+                str(prior_consumption_row[0])
+                if prior_consumption_row is not None
+                else ""
+            )
+            consumption_content = {
+                "schemaVersion":
+                    "program-ledger-binance-transfer-consumption/v1",
+                "consumptionKey": consumption_key,
+                "adjustmentId": adjustment_id,
+                "accountFingerprint": account_fingerprint,
+                "apiKeyFingerprint": api_key_fingerprint,
+                "transferType": BINANCE_TRANSFER_TYPE,
+                "transferTimestamp": transfer_timestamp,
+                "tranId": transfer_id,
+                "truthHash": normalized_truth_hash,
+                "previousHash": prior_consumption_hash,
+            }
+            consumption_content_json = json.dumps(
+                consumption_content,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            consumption_content_hash = hashlib.sha256(
+                consumption_content_json.encode("utf-8")
             ).hexdigest()
             source_updated = conn.execute(
                 """
@@ -1039,6 +1240,30 @@ class ProgramLedger:
                     created_at,
                 ),
             )
+            conn.execute(
+                """
+                INSERT INTO binance_cash_transfer_consumptions(
+                    consumption_key, adjustment_id, account_fingerprint,
+                    api_key_fingerprint, transfer_type,
+                    transfer_timestamp, transfer_id, truth_hash,
+                    previous_hash, content_json, content_hash, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    consumption_key,
+                    adjustment_id,
+                    account_fingerprint,
+                    api_key_fingerprint,
+                    BINANCE_TRANSFER_TYPE,
+                    transfer_timestamp,
+                    transfer_id,
+                    normalized_truth_hash,
+                    prior_consumption_hash,
+                    consumption_content_json,
+                    consumption_content_hash,
+                    created_at,
+                ),
+            )
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -1050,9 +1275,220 @@ class ProgramLedger:
             "ok": True,
             "adjustmentId": adjustment_id,
             "contentHash": content_hash,
+            "consumptionKey": consumption_key,
+            "consumptionHeadHash": consumption_content_hash,
             "sourceCash": str(source_after),
             "destinationCash": str(destination_after),
         }
+
+    @staticmethod
+    def _validated_cash_transfer_consumption_rows_conn(
+        conn: sqlite3.Connection,
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT sequence, consumption_key, adjustment_id,
+                   account_fingerprint, api_key_fingerprint,
+                   transfer_type, transfer_timestamp, transfer_id,
+                   truth_hash, previous_hash, content_json,
+                   content_hash, created_at
+            FROM binance_cash_transfer_consumptions
+            ORDER BY sequence
+            """
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        previous_hash = ""
+        previous_sequence = 0
+        seen_keys: set[str] = set()
+        seen_records: set[tuple[str, str, str, int, str]] = set()
+        for raw in rows:
+            row = dict(raw)
+            sequence = int(row["sequence"])
+            content_json = str(row["content_json"])
+            calculated_hash = hashlib.sha256(
+                content_json.encode("utf-8")
+            ).hexdigest()
+            try:
+                content = json.loads(content_json)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "binance-cash-transfer-consumption-chain-invalid"
+                ) from exc
+            record_key = (
+                str(row["account_fingerprint"]),
+                str(row["api_key_fingerprint"]),
+                str(row["transfer_type"]),
+                int(row["transfer_timestamp"]),
+                str(row["transfer_id"]),
+            )
+            if (
+                sequence <= previous_sequence
+                or str(row["previous_hash"]) != previous_hash
+                or str(row["consumption_key"]) in seen_keys
+                or record_key in seen_records
+                or not secrets.compare_digest(
+                    str(row["content_hash"]), calculated_hash
+                )
+                or not isinstance(content, dict)
+                or set(content)
+                != {
+                    "schemaVersion",
+                    "consumptionKey",
+                    "adjustmentId",
+                    "accountFingerprint",
+                    "apiKeyFingerprint",
+                    "transferType",
+                    "transferTimestamp",
+                    "tranId",
+                    "truthHash",
+                    "previousHash",
+                }
+                or content.get("schemaVersion")
+                != "program-ledger-binance-transfer-consumption/v1"
+                or content.get("consumptionKey") != row["consumption_key"]
+                or content.get("adjustmentId") != row["adjustment_id"]
+                or content.get("accountFingerprint")
+                != row["account_fingerprint"]
+                or content.get("apiKeyFingerprint")
+                != row["api_key_fingerprint"]
+                or content.get("transferType") != row["transfer_type"]
+                or content.get("transferTimestamp")
+                != row["transfer_timestamp"]
+                or content.get("tranId") != row["transfer_id"]
+                or content.get("truthHash") != row["truth_hash"]
+                or content.get("previousHash") != previous_hash
+            ):
+                raise ValueError(
+                    "binance-cash-transfer-consumption-chain-invalid"
+                )
+            adjustment = conn.execute(
+                """
+                SELECT truth_hash, content_json
+                FROM cash_transfer_adjustments WHERE adjustment_id=?
+                """,
+                (row["adjustment_id"],),
+            ).fetchone()
+            if adjustment is None:
+                raise ValueError(
+                    "binance-cash-transfer-consumption-adjustment-missing"
+                )
+            try:
+                adjustment_content = json.loads(str(adjustment["content_json"]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "binance-cash-transfer-consumption-adjustment-invalid"
+                ) from exc
+            if (
+                str(adjustment["truth_hash"]) != row["truth_hash"]
+                or not isinstance(adjustment_content, dict)
+                or adjustment_content.get("consumptionKey")
+                != row["consumption_key"]
+            ):
+                raise ValueError(
+                    "binance-cash-transfer-consumption-adjustment-invalid"
+                )
+            result.append(row)
+            seen_keys.add(str(row["consumption_key"]))
+            seen_records.add(record_key)
+            previous_hash = calculated_hash
+            previous_sequence = sequence
+        adjustment_ids = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT adjustment_id FROM cash_transfer_adjustments"
+            ).fetchall()
+        }
+        consumption_adjustment_ids = {
+            str(row["adjustment_id"]) for row in result
+        }
+        if adjustment_ids != consumption_adjustment_ids:
+            raise ValueError(
+                "binance-cash-transfer-consumption-lineage-incomplete"
+            )
+        return result
+
+    @classmethod
+    def _cash_transfer_consumption_high_water_conn(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        account_fingerprint: str,
+        api_key_fingerprint: str,
+    ) -> dict[str, Any]:
+        rows = cls._validated_cash_transfer_consumption_rows_conn(conn)
+        scoped = [
+            row
+            for row in rows
+            if row["account_fingerprint"] == account_fingerprint
+            and row["api_key_fingerprint"] == api_key_fingerprint
+            and row["transfer_type"] == BINANCE_TRANSFER_TYPE
+        ]
+        if not scoped:
+            return {
+                "schemaVersion": BINANCE_TRANSFER_HIGH_WATER_SCHEMA,
+                "revision": 0,
+                "accountFingerprint": account_fingerprint,
+                "apiKeyFingerprint": api_key_fingerprint,
+                "transferType": BINANCE_TRANSFER_TYPE,
+                "transferTimestamp": 0,
+                "tranId": "",
+                "consumptionKey": "",
+                "headHash": "",
+            }
+        prior_order = (0, 0)
+        for row in scoped:
+            try:
+                current_order = (
+                    int(row["transfer_timestamp"]),
+                    int(row["transfer_id"]),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "binance-cash-transfer-consumption-order-invalid"
+                ) from exc
+            if current_order <= prior_order:
+                raise ValueError(
+                    "binance-cash-transfer-consumption-order-invalid"
+                )
+            prior_order = current_order
+        latest = scoped[-1]
+        return {
+            "schemaVersion": BINANCE_TRANSFER_HIGH_WATER_SCHEMA,
+            "revision": len(scoped),
+            "accountFingerprint": account_fingerprint,
+            "apiKeyFingerprint": api_key_fingerprint,
+            "transferType": BINANCE_TRANSFER_TYPE,
+            "transferTimestamp": int(latest["transfer_timestamp"]),
+            "tranId": str(latest["transfer_id"]),
+            "consumptionKey": str(latest["consumption_key"]),
+            "headHash": str(latest["content_hash"]),
+        }
+
+    def cash_transfer_consumption_high_water(
+        self,
+        *,
+        account_fingerprint: str,
+        api_key_fingerprint: str,
+    ) -> dict[str, Any]:
+        account = str(account_fingerprint or "").strip().lower()
+        api_key = str(api_key_fingerprint or "").strip().lower()
+        for label, value in (("account", account), ("api-key", api_key)):
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError(
+                    f"binance-cash-transfer-{label}-fingerprint-invalid"
+                )
+        with self.connection() as conn:
+            return self._cash_transfer_consumption_high_water_conn(
+                conn,
+                account_fingerprint=account,
+                api_key_fingerprint=api_key,
+            )
+
+    def cash_transfer_consumption_rows(self) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return self._validated_cash_transfer_consumption_rows_conn(conn)
 
     def cash_transfer_adjustment_rows(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
