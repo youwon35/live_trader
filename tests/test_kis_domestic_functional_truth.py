@@ -13,6 +13,7 @@ from live_trader.kis_domestic_functional_get_client import (
     kis_domestic_functional_account_fingerprint,
 )
 from live_trader.kis_domestic_functional_truth import (
+    HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
     KisDomesticFunctionalTruthBlocked,
     KisDomesticFunctionalTruthReader,
     production_entrypoint_status,
@@ -418,6 +419,100 @@ class KisDomesticFunctionalTruthTest(unittest.TestCase):
         self.assertEqual("0", truth["normalized"]["ownerLossKrw"])
         self.assertEqual("26", truth["minimumGetPacingFloorSeconds"])
         self.assertEqual(14, truth["officialGetRequestCount"])
+        endpoints = truth["rawCaptures"][0]["endpoints"]
+        self.assertEqual(
+            HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+            endpoints["holiday"]["paginationScope"],
+        )
+        self.assertFalse(endpoints["holiday"]["allAvailablePagesClaimed"])
+        self.assertFalse(endpoints["holiday"]["continuationFollowAllowed"])
+        self.assertEqual(1, endpoints["holiday"]["maximumPhysicalPages"])
+
+    def test_holiday_is_exact_target_date_first_page_proof_and_never_follows_continuation(self) -> None:
+        fixture = _fixture()
+        first = fixture["CTCA0903R"][0]
+        first["trCont"] = "F"
+        first["body"]["ctx_area_fk"] = "DO-NOT-FOLLOW"
+        first["body"]["ctx_area_nk"] = "DO-NOT-FOLLOW"
+        fixture["CTCA0903R"].append(
+            _response(
+                {
+                    "rt_cd": "0",
+                    "output": [{"bass_dt": "20260814", "opnd_yn": "Y"}],
+                },
+                tr_cont="D",
+            )
+        )
+        client = _Client(fixture)
+
+        truth = self._read(client)
+
+        holiday_calls = [
+            call for call in client.calls if call["tr_id"] == "CTCA0903R"
+        ]
+        self.assertEqual(2, len(holiday_calls))
+        for call in holiday_calls:
+            self.assertEqual("", call["continuation"])
+            self.assertEqual(
+                {"BASS_DT": YMD, "CTX_AREA_FK": "", "CTX_AREA_NK": ""},
+                call["query"],
+            )
+        for capture in truth["rawCaptures"]:
+            holiday = capture["endpoints"]["holiday"]
+            self.assertEqual(1, len(holiday["pages"]))
+            self.assertEqual("F", holiday["pages"][0]["continuationReceived"])
+            self.assertEqual(
+                HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+                holiday["paginationScope"],
+            )
+            self.assertFalse(holiday["allAvailablePagesClaimed"])
+            self.assertFalse(holiday["continuationFollowAllowed"])
+            self.assertEqual(YMD, holiday["targetDate"])
+        self.assertTrue(truth["normalized"]["holidayTargetDateFirstPageProofComplete"])
+        self.assertFalse(truth["normalized"]["holidayAllAvailablePagesClaimed"])
+
+    def test_holiday_first_page_missing_duplicate_or_closed_target_fails_without_follow(self) -> None:
+        cases = (
+            ("missing", [{"bass_dt": "20260814", "opnd_yn": "Y"}]),
+            (
+                "duplicate",
+                [
+                    {"bass_dt": YMD, "opnd_yn": "Y"},
+                    {"bass_dt": YMD, "opnd_yn": "Y"},
+                ],
+            ),
+            ("closed", [{"bass_dt": YMD, "opnd_yn": "N"}]),
+        )
+        for label, rows in cases:
+            with self.subTest(label=label):
+                fixture = _fixture()
+                holiday = fixture["CTCA0903R"][0]
+                holiday["trCont"] = "F"
+                holiday["body"]["output"] = rows
+                holiday["body"]["ctx_area_fk"] = "DO-NOT-FOLLOW"
+                holiday["body"]["ctx_area_nk"] = "DO-NOT-FOLLOW"
+                fixture["CTCA0903R"].append(
+                    _response(
+                        {
+                            "rt_cd": "0",
+                            "output": [{"bass_dt": YMD, "opnd_yn": "Y"}],
+                        },
+                        tr_cont="D",
+                    )
+                )
+                client = _Client(fixture)
+                with self.assertRaisesRegex(
+                    KisDomesticFunctionalTruthBlocked,
+                    "holiday first page",
+                ):
+                    self._read(client)
+                holiday_calls = [
+                    call for call in client.calls if call["tr_id"] == "CTCA0903R"
+                ]
+                self.assertEqual(1, len(holiday_calls))
+                self.assertEqual("", holiday_calls[0]["continuation"])
+                self.assertEqual("", holiday_calls[0]["query"]["CTX_AREA_FK"])
+                self.assertEqual("", holiday_calls[0]["query"]["CTX_AREA_NK"])
 
     def test_account_wide_other_symbol_or_working_order_blocks(self) -> None:
         other = _fixture()
@@ -513,8 +608,12 @@ class KisDomesticFunctionalTruthTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(KisDomesticFunctionalTruthBlocked, "cursor repeated"):
             self._read(_Client(repeated))
+        limited = _Client(_fixture())
         with self.assertRaisesRegex(KisDomesticFunctionalTruthBlocked, "truncated"):
-            self._read(_Client(_fixture()), max_pages=1)
+            self._read(limited, max_pages=1)
+        self.assertFalse(
+            any(call["tr_id"] == "CTCA0903R" for call in limited.calls)
+        )
 
     def test_unstable_stale_closed_day_and_malformed_envelope_block(self) -> None:
         def close_day(tr_id, result):

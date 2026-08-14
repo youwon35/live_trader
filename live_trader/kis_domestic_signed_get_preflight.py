@@ -10,10 +10,12 @@ import re
 import secrets
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
+
+from trading_runtime.market_calendar import session_bounds_utc
 
 from .env_loader import (
     default_runtime_data_root,
@@ -26,7 +28,10 @@ from .kis_domestic_functional_get_client import (
     KisDomesticFunctionalGetClient,
     kis_domestic_functional_account_fingerprint,
 )
-from .kis_domestic_functional_truth import KisDomesticFunctionalTruthReader
+from .kis_domestic_functional_truth import (
+    HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+    KisDomesticFunctionalTruthReader,
+)
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -37,6 +42,7 @@ EXECUTION_ENV_GATE = "KIS_DOMESTIC_FUNCTIONAL_SIGNED_GET_PREFLIGHT_ENABLED"
 _AUTHORITY_VALUE = re.compile(r"^v1:([0-9a-f]{96})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TERMINAL_CONTINUATIONS = frozenset({"", "D", "E"})
+_ALL_AVAILABLE_PAGES_SCOPE = "ALL_AVAILABLE_PAGES"
 _BASELINE_ROUTES = {
     "balance": (
         "/uapi/domestic-stock/v1/trading/inquire-balance",
@@ -308,6 +314,18 @@ def _verify_baseline_pages(
                 raise KisDomesticSignedGetPreflightBlocked(
                     f"baseline-{name}-pages-missing"
                 )
+            if name == "holiday":
+                if (
+                    len(pages) != 1
+                    or endpoint.get("paginationScope")
+                    != HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE
+                    or endpoint.get("allAvailablePagesClaimed") is not False
+                    or endpoint.get("continuationFollowAllowed") is not False
+                    or endpoint.get("maximumPhysicalPages") != 1
+                ):
+                    raise KisDomesticSignedGetPreflightBlocked(
+                        "baseline-holiday-target-date-scope-invalid"
+                    )
             page_counts[name] += len(pages)
             for index, page_value in enumerate(pages):
                 page = _mapping(page_value, f"baseline-{name}-page")
@@ -321,7 +339,43 @@ def _verify_baseline_pages(
                     raise KisDomesticSignedGetPreflightBlocked(
                         f"baseline-{name}-page-identity-invalid"
                     )
-            if pages[-1].get("continuationReceived") not in _TERMINAL_CONTINUATIONS:
+            if name == "holiday":
+                trading_date = capture.get("tradingDate")
+                page = _mapping(pages[0], "baseline-holiday-page")
+                query = _mapping(page.get("query"), "baseline-holiday-query")
+                page_body = _mapping(
+                    page.get("body"), "baseline-holiday-body"
+                )
+                rows = page_body.get("output")
+                target_rows = (
+                    [
+                        row
+                        for row in rows
+                        if isinstance(row, Mapping)
+                        and row.get("bass_dt") == trading_date.replace("-", "")
+                    ]
+                    if isinstance(rows, list) and type(trading_date) is str
+                    else []
+                )
+                if (
+                    type(trading_date) is not str
+                    or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", trading_date)
+                    or endpoint.get("targetDate") != trading_date.replace("-", "")
+                    or query
+                    != {
+                        "BASS_DT": trading_date.replace("-", ""),
+                        "CTX_AREA_FK": "",
+                        "CTX_AREA_NK": "",
+                    }
+                    or page.get("continuationSent") != ""
+                    or not isinstance(rows, list)
+                    or len(target_rows) != 1
+                    or target_rows[0].get("opnd_yn") != "Y"
+                ):
+                    raise KisDomesticSignedGetPreflightBlocked(
+                        "baseline-holiday-target-date-proof-invalid"
+                    )
+            elif pages[-1].get("continuationReceived") not in _TERMINAL_CONTINUATIONS:
                 raise KisDomesticSignedGetPreflightBlocked(
                     f"baseline-{name}-pagination-incomplete"
                 )
@@ -351,9 +405,17 @@ def _verify_baseline_pages(
                 "endpoint": endpoint,
                 "trId": tr_id,
                 "pageCount": page_counts[name],
+                "paginationScope": (
+                    HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE
+                    if name == "holiday"
+                    else _ALL_AVAILABLE_PAGES_SCOPE
+                ),
+                "allAvailablePagesClaimed": name != "holiday",
             }
             for name, (endpoint, tr_id) in _BASELINE_ROUTES.items()
         ],
+        "holidayProofScope": HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+        "holidayAllAvailablePagesClaimed": False,
         "durableCasPersisted": False,
     }
 
@@ -435,6 +497,7 @@ class KisDomesticSignedGetPreflightRunner:
         client: KisDomesticFunctionalGetClient,
         reader: KisDomesticFunctionalTruthReader,
         authority: KisSignedGetAuthority,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if type(client) is not KisDomesticFunctionalGetClient:
             raise KisDomesticSignedGetPreflightBlocked(
@@ -451,8 +514,48 @@ class KisDomesticSignedGetPreflightRunner:
         self.client = client
         self.reader = reader
         self.authority = authority
+        self._clock = clock or (lambda: datetime.now(KST))
+
+    def _execution_window(self) -> dict[str, Any]:
+        now = self._clock()
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise KisDomesticSignedGetPreflightBlocked(
+                "signed-get-execution-clock-invalid"
+            )
+        local = now.astimezone(KST)
+        try:
+            session_open_utc, session_close_utc = session_bounds_utc(
+                "XKRX", local.date()
+            )
+        except (OSError, TypeError, ValueError):
+            raise KisDomesticSignedGetPreflightBlocked(
+                "signed-get-xkrx-regular-session-unavailable"
+            ) from None
+        session_open = session_open_utc.astimezone(KST)
+        session_close = session_close_utc.astimezone(KST)
+        cutoff = datetime.combine(local.date(), time(13, 15), tzinfo=KST)
+        if (
+            session_open.date() != local.date()
+            or session_open.time().replace(tzinfo=None) != time(9, 0)
+            or session_close.date() != local.date()
+            or session_close.time().replace(tzinfo=None) != time(15, 30)
+            or not session_open <= local <= cutoff
+        ):
+            raise KisDomesticSignedGetPreflightBlocked(
+                "signed-get-outside-approved-xkrx-window"
+            )
+        return {
+            "calendarId": "XKRX",
+            "tradingDate": local.date().isoformat(),
+            "regularOpenKst": "09:00",
+            "diagnosticCutoffKst": "13:15",
+            "regularCloseKst": "15:30",
+            "checkedAt": local.isoformat(),
+            "insideApprovedWindow": True,
+        }
 
     def run(self) -> dict[str, Any]:
+        execution_window = self._execution_window()
         before = self.client.audit_snapshot()
         baseline = self.reader.read_preactivation_baseline()
         quote = self.reader.read_fresh_quote_preflight()
@@ -488,6 +591,10 @@ class KisDomesticSignedGetPreflightRunner:
                 "signed-get-oauth-post-audit-invalid"
             )
         run_oauth_posts = after_oauth_posts - before_oauth_posts
+        if run_oauth_posts > 1:
+            raise KisDomesticSignedGetPreflightBlocked(
+                "signed-get-oauth-post-one-shot-exceeded"
+            )
         baseline_summary = _verify_baseline_pages(baseline, client=self.client)
         quote_summary = _verify_quote(quote, client=self.client)
         expected_gets = baseline_summary["officialGetRequestCount"] + 1
@@ -584,6 +691,7 @@ class KisDomesticSignedGetPreflightRunner:
             "accountFingerprint": self.client.account_fingerprint,
             "credentialConfigurationHash": self.client.credential_configuration_hash,
             "authority": authority_snapshot,
+            "executionWindow": execution_window,
             "baseline": baseline_summary,
             "quote": quote_summary,
             "officialRead": {
@@ -598,6 +706,8 @@ class KisDomesticSignedGetPreflightRunner:
                 - int(before.get("authenticationTokenReadCount") or 0),
                 "oauthTokenIssuanceMayUsePost": True,
                 "authenticationOauthPostDispatchCount": run_oauth_posts,
+                "authenticationOauthPostDispatchLimit": 1,
+                "authenticationOauthPostLimitEnforced": True,
                 "authenticationOauthPostCountComplete": after.get(
                     "authenticationOauthPostCountComplete"
                 ),
@@ -732,6 +842,7 @@ def build_production_signed_get_preflight_runner(
         client=client,
         reader=reader,
         authority=authority,
+        clock=clock,
     )
 
 
@@ -747,12 +858,87 @@ def signed_get_preflight_plan() -> dict[str, Any]:
         ],
         "authenticationTokenIssuanceMayUsePost": True,
         "authenticationOauthPostDispatchCount": 0,
+        "authenticationOauthPostDispatchLimit": 1,
+        "authenticationOauthPostLimitEnforced": True,
         "authenticationOauthPostAuthOnly": True,
         "tradingPostDeleteDispatchCount": 0,
+        "holidayProofScope": HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+        "holidayMaximumPagesPerCapture": 1,
+        "holidayAllAvailablePagesClaimed": False,
         "requiresExplicitExecuteFlag": True,
         "requiresEnvironmentGate": EXECUTION_ENV_GATE,
         "networkExecuted": False,
     }
+
+
+def _verify_executable_signed_get_evidence(evidence: object) -> None:
+    if not isinstance(evidence, Mapping):
+        raise KisDomesticSignedGetPreflightBlocked(
+            "signed-get-executable-evidence-not-object"
+        )
+    authority = evidence.get("authority")
+    baseline = evidence.get("baseline")
+    official = evidence.get("officialRead")
+    execution_window = evidence.get("executionWindow")
+    if (
+        not isinstance(authority, Mapping)
+        or not isinstance(baseline, Mapping)
+        or not isinstance(official, Mapping)
+        or not isinstance(execution_window, Mapping)
+    ):
+        raise KisDomesticSignedGetPreflightBlocked(
+            "signed-get-executable-evidence-shape-invalid"
+        )
+    route_pairs = official.get("routePairs")
+    expected_pairs = [
+        {"endpoint": endpoint, "trId": tr_id}
+        for endpoint, tr_id in [*_BASELINE_ROUTES.values(), _QUOTE_ROUTE]
+    ]
+    logical_gets = official.get("getRequestCount")
+    physical_gets = official.get("physicalGetAttemptCount")
+    oauth_posts = official.get("authenticationOauthPostDispatchCount")
+    valid = (
+        evidence.get("environment") == "KIS_LIVE"
+        and evidence.get("mode") == "SIGNED_GET_ONLY_PREFLIGHT"
+        and evidence.get("origin") == KIS_DOMESTIC_FUNCTIONAL_LIVE_ORIGIN
+        and authority.get("source") == "secret-store"
+        and authority.get("durable") is True
+        and authority.get("restartVerifiable") is True
+        and baseline.get("holidayProofScope")
+        == HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE
+        and baseline.get("holidayAllAvailablePagesClaimed") is False
+        and execution_window.get("calendarId") == "XKRX"
+        and execution_window.get("regularOpenKst") == "09:00"
+        and execution_window.get("diagnosticCutoffKst") == "13:15"
+        and execution_window.get("regularCloseKst") == "15:30"
+        and execution_window.get("insideApprovedWindow") is True
+        and route_pairs == expected_pairs
+        and type(logical_gets) is int
+        and logical_gets > 0
+        and type(physical_gets) is int
+        and physical_gets == logical_gets
+        and official.get("physicalGetAttemptCountComplete") is True
+        and type(oauth_posts) is int
+        and 0 <= oauth_posts <= 1
+        and official.get("authenticationOauthPostDispatchLimit") == 1
+        and official.get("authenticationOauthPostLimitEnforced") is True
+        and official.get("authenticationOauthPostCountComplete") is True
+        and official.get("authenticationOauthPostAuthOnly") is True
+        and official.get("authenticationOauthHiddenRetryCount") == 0
+        and official.get("authenticationOauthRedirectFollowCount") == 0
+        and official.get("hiddenGetRetryCount") == 0
+        and official.get("redirectFollowCount") == 0
+        and official.get("tradingPostDeleteDispatchCount") == 0
+        and official.get("allTradingMutationsForbidden") is True
+        and evidence.get("tradingAuthorityIssued") is False
+        and evidence.get("durableBaselineCasPersisted") is False
+        and evidence.get("networkOrderPostAllowed") is False
+        and evidence.get("releaseEvidenceEligible") is False
+    )
+    if not valid:
+        raise KisDomesticSignedGetPreflightBlocked(
+            "signed-get-executable-evidence-incomplete-or-unsafe"
+        )
 
 
 def _default_output_path() -> Path:
@@ -784,15 +970,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.execute_signed_get:
         print(json.dumps(signed_get_preflight_plan(), ensure_ascii=False, sort_keys=True))
         return 0
+    if args.allow_ephemeral_authority:
+        raise KisDomesticSignedGetPreflightBlocked(
+            "signed-get-ephemeral-authority-execution-forbidden"
+        )
     if os.getenv(EXECUTION_ENV_GATE, "").strip().lower() != "true":
         raise KisDomesticSignedGetPreflightBlocked(
             "signed-get-preflight-environment-gate-disabled"
         )
-    authority = load_kis_signed_get_authority(
-        allow_ephemeral=args.allow_ephemeral_authority
-    )
+    authority = load_kis_signed_get_authority()
+    authority_snapshot = authority.snapshot()
+    if (
+        authority_snapshot.get("source") != "secret-store"
+        or authority_snapshot.get("durable") is not True
+        or authority_snapshot.get("restartVerifiable") is not True
+    ):
+        raise KisDomesticSignedGetPreflightBlocked(
+            "signed-get-durable-authority-required"
+        )
     runner = build_production_signed_get_preflight_runner(authority=authority)
     evidence = runner.run()
+    _verify_executable_signed_get_evidence(evidence)
     target = write_redacted_signed_get_evidence(
         evidence,
         args.output or _default_output_path(),

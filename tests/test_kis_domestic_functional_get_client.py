@@ -756,6 +756,64 @@ class KisDomesticFunctionalGetClientTest(unittest.TestCase):
         self.assertEqual(0, audit["officialGetDispatchCount"])
         self.assertEqual(0, audit["tradingPostDeleteDispatchCount"])
 
+    def test_production_auth_post_budget_blocks_short_ttl_refresh_before_second_socket(self) -> None:
+        environment = {
+            "KIS_BASE_URL": KIS_DOMESTIC_FUNCTIONAL_LIVE_ORIGIN,
+            "KIS_APP_KEY": APP_KEY,
+            "KIS_APP_SECRET": APP_SECRET,
+            "KIS_ACCOUNT_NO": CANO,
+            "KIS_ACCOUNT_PRODUCT_CODE": PRODUCT,
+        }
+        now = [0.0]
+        calls = []
+
+        def fake_http(method, url, *, body, headers, timeout_seconds):
+            calls.append((method, url))
+            if method == "POST":
+                return {
+                    "statusCode": 200,
+                    "json": {"access_token": TOKEN, "expires_in": 61},
+                    "effectiveUrlExact": True,
+                    "redirectFollowed": False,
+                    "physicalAttemptCount": 1,
+                }
+            return {
+                "statusCode": 200,
+                "trCont": "",
+                "json": {"rt_cd": "0", "output": {}},
+                "effectiveUrlExact": True,
+                "redirectFollowed": False,
+                "physicalAttemptCount": 1,
+            }
+
+        with patch.dict(os.environ, environment, clear=False), patch(
+            "live_trader.kis_domestic_functional_get_client.time.monotonic",
+            side_effect=lambda: now[0],
+        ), patch(
+            "live_trader.kis_domestic_functional_get_client._owned_no_redirect_json_request",
+            side_effect=fake_http,
+        ):
+            client = KisDomesticFunctionalGetClient.from_environment(
+                expected_account_fingerprint=FINGERPRINT,
+                server_authority_key=SERVER_KEY,
+                server_authority_key_id="dpapi:test",
+                server_authority_restart_verifiable=True,
+            )
+            self._get(client, QUOTE)
+            now[0] = 2.0
+            with self.assertRaisesRegex(
+                KisDomesticFunctionalGetBlocked,
+                "oauth-post-one-shot-exhausted",
+            ):
+                self._get(client, QUOTE)
+
+        self.assertEqual(1, sum(method == "POST" for method, _url in calls))
+        self.assertEqual(1, sum(method == "GET" for method, _url in calls))
+        audit = client.audit_snapshot()
+        self.assertEqual(1, audit["authenticationOauthPostDispatchCount"])
+        self.assertEqual(1, audit["officialGetDispatchCount"])
+        self.assertEqual(0, audit["tradingPostDeleteDispatchCount"])
+
     def test_owned_transport_forbids_redirects_and_never_hides_get_retries(self) -> None:
         environment = {
             "KIS_BASE_URL": KIS_DOMESTIC_FUNCTIONAL_LIVE_ORIGIN,

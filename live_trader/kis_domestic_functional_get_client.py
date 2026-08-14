@@ -487,6 +487,13 @@ class _ProductionBoundTokenReader:
                         self._credential_configuration_hash
                     ),
                 )
+            # This diagnostic reader owns a strict one-shot authentication
+            # budget.  A short-but-valid token lifetime must fail closed before
+            # a second physical /oauth2/tokenP request can leave the process.
+            if self._oauth_post_dispatches >= 1:
+                raise KisDomesticFunctionalGetBlocked(
+                    "kis-functional-oauth-post-one-shot-exhausted"
+                )
             self._oauth_post_dispatches += 1
             try:
                 response = _owned_no_redirect_json_request(

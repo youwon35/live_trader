@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from live_trader import state
+from live_trader.audit_store import SQLiteAuditEventStore
 
 
 class UpbitSmokeOrderTest(unittest.TestCase):
     def setUp(self) -> None:
         self.original_state = copy.deepcopy(state.STATE)
         self.original_real_orders_process_armed = state._REAL_ORDERS_PROCESS_ARMED
+        self.original_audit_store = state.AUDIT_STORE
+        self.original_audit_path = Path(state.AUDIT_STORE.path)
+        self.original_flight_path = self._flight_recorder_path()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary_root = Path(self.temporary.name)
+        state.AUDIT_STORE = SQLiteAuditEventStore(
+            self.temporary_root / "live_trader_audit.sqlite3"
+        )
         # These smoke-order tests exercise the post-confirmation broker gates.
         # Production starts disarmed; the fixture explicitly models a process
         # that has already completed the REAL_ORDERS_ENABLE confirmation.
@@ -23,9 +35,18 @@ class UpbitSmokeOrderTest(unittest.TestCase):
                 "UPBIT_SECRET_KEY": "test-secret",
                 "UPBIT_BASE_URL": "https://api.upbit.com",
                 "LIVE_TRADER_ENABLE_REAL_ORDERS": "false",
+                "TRADING_FLIGHT_RECORDER_DIR": str(
+                    self.temporary_root / "flight-recorder"
+                ),
             },
         )
         self.env.start()
+        self.telegram_send_patcher = patch.object(
+            state.TELEGRAM_DISPATCHER,
+            "send_async",
+            return_value=False,
+        )
+        self.telegram_send = self.telegram_send_patcher.start()
         self.strategy_rows = patch.object(state, "strategy_rows", return_value=[self.strategy()])
         self.strategy_rows.start()
         self.snapshot = patch.object(state, "snapshot", return_value={})
@@ -34,10 +55,42 @@ class UpbitSmokeOrderTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.snapshot.stop()
         self.strategy_rows.stop()
+        self.telegram_send_patcher.stop()
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
         state._REAL_ORDERS_PROCESS_ARMED = self.original_real_orders_process_armed
+        state.AUDIT_STORE = self.original_audit_store
         self.env.stop()
+        self.temporary.cleanup()
+
+    @staticmethod
+    def _flight_recorder_path() -> Path:
+        configured = str(
+            os.environ.get("TRADING_FLIGHT_RECORDER_DIR") or ""
+        ).strip()
+        if configured:
+            root = Path(configured)
+        else:
+            user_root = str(
+                os.environ.get("APPDATA")
+                or os.environ.get("LOCALAPPDATA")
+                or ""
+            ).strip()
+            root = (
+                Path(user_root) if user_root else Path(tempfile.gettempdir())
+            ) / "trading_programs" / "flight-recorder"
+        return root / "live_trader.jsonl"
+
+    @staticmethod
+    def _file_fingerprint(path: Path) -> tuple[bool, int, int, str]:
+        if not path.is_file():
+            return False, 0, 0, ""
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        stat = path.stat()
+        return True, stat.st_size, stat.st_mtime_ns, digest.hexdigest()
 
     @staticmethod
     def account_snapshot(balance: float = 50_001.0) -> dict[str, object]:
@@ -75,6 +128,34 @@ class UpbitSmokeOrderTest(unittest.TestCase):
             return_value=self.order_chance(),
         ):
             return state.preview_upbit_smoke_order("upbit-btc-qualified", 5000)
+
+    def test_fixture_keeps_original_audit_and_flight_files_unchanged(self) -> None:
+        original_audit = self._file_fingerprint(self.original_audit_path)
+        original_flight = self._file_fingerprint(self.original_flight_path)
+
+        result = self.preview()
+        state.append_audit(
+            "danger",
+            "Upbit fixture isolation",
+            "synthetic test event",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(2, state.AUDIT_STORE.count())
+        temporary_flight = (
+            self.temporary_root / "flight-recorder" / "live_trader.jsonl"
+        )
+        self.assertTrue(temporary_flight.is_file())
+        self.assertEqual(2, len(temporary_flight.read_text(encoding="utf-8").splitlines()))
+        self.telegram_send.assert_called_once()
+        self.assertEqual(
+            original_audit,
+            self._file_fingerprint(self.original_audit_path),
+        )
+        self.assertEqual(
+            original_flight,
+            self._file_fingerprint(self.original_flight_path),
+        )
 
     def test_preview_is_read_only_and_builds_exact_market_buy(self) -> None:
         result = self.preview()

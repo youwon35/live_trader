@@ -11,6 +11,7 @@ from live_trader.kis_domestic_functional_get_client import (
     KisDomesticFunctionalGetClient,
 )
 from live_trader.kis_domestic_functional_truth import (
+    HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
     KisDomesticFunctionalTruthReader,
 )
 from live_trader.kis_domestic_signed_get_preflight import (
@@ -18,6 +19,7 @@ from live_trader.kis_domestic_signed_get_preflight import (
     EXECUTION_ENV_GATE,
     KisDomesticSignedGetPreflightBlocked,
     KisDomesticSignedGetPreflightRunner,
+    _verify_executable_signed_get_evidence,
     load_kis_signed_get_authority,
     main,
     provision_durable_kis_signed_get_authority,
@@ -62,6 +64,19 @@ def _runner():
     store = _Store("v1:" + SERVER_KEY.hex())
     authority = load_kis_signed_get_authority(store=store)
     fixture = _fixture()
+    fixture["CTCA0903R"][0]["trCont"] = "F"
+    fixture["CTCA0903R"][0]["body"]["ctx_area_fk"] = "DO-NOT-FOLLOW"
+    fixture["CTCA0903R"][0]["body"]["ctx_area_nk"] = "DO-NOT-FOLLOW"
+    fixture["CTCA0903R"].append(
+        {
+            "statusCode": 200,
+            "trCont": "D",
+            "body": {
+                "rt_cd": "0",
+                "output": [{"bass_dt": "20260814", "opnd_yn": "Y"}],
+            },
+        }
+    )
     fixture["FHKST01010100"] = [
         {
             "statusCode": 200,
@@ -92,13 +107,14 @@ def _runner():
         cano=CANO,
         account_product_code=PRODUCT,
         trading_date=date(2026, 8, 13),
-        clock=lambda: datetime(2026, 8, 13, 14, 0, tzinfo=KST),
+        clock=lambda: datetime(2026, 8, 13, 10, 0, tzinfo=KST),
         max_stable_read_seconds=120,
     )
     runner = KisDomesticSignedGetPreflightRunner(
         client=client,
         reader=reader,
         authority=authority,
+        clock=lambda: datetime(2026, 8, 13, 10, 0, tzinfo=KST),
     )
     return runner, client, reader, transport, authority
 
@@ -124,7 +140,15 @@ class KisDomesticSignedGetPreflightTest(unittest.TestCase):
         self.assertEqual(0, plan["tradingPostDeleteDispatchCount"])
         self.assertTrue(plan["authenticationTokenIssuanceMayUsePost"])
         self.assertEqual(0, plan["authenticationOauthPostDispatchCount"])
+        self.assertEqual(1, plan["authenticationOauthPostDispatchLimit"])
+        self.assertTrue(plan["authenticationOauthPostLimitEnforced"])
         self.assertTrue(plan["authenticationOauthPostAuthOnly"])
+        self.assertEqual(
+            HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+            plan["holidayProofScope"],
+        )
+        self.assertEqual(1, plan["holidayMaximumPagesPerCapture"])
+        self.assertFalse(plan["holidayAllAvailablePagesClaimed"])
 
     def test_durable_authority_is_explicitly_provisioned_and_stable_without_leak(self) -> None:
         store = _Store()
@@ -167,6 +191,8 @@ class KisDomesticSignedGetPreflightTest(unittest.TestCase):
             evidence = runner.run()
         terminal_read.assert_not_called()
         self.assertEqual("SIGNED_GET_ONLY_PREFLIGHT", evidence["mode"])
+        self.assertEqual("XKRX", evidence["executionWindow"]["calendarId"])
+        self.assertTrue(evidence["executionWindow"]["insideApprovedWindow"])
         self.assertTrue(evidence["authority"]["restartVerifiable"])
         self.assertEqual(authority.key_id_hash, evidence["authority"]["keyIdHash"])
         self.assertEqual(15, evidence["officialRead"]["getRequestCount"])
@@ -174,6 +200,13 @@ class KisDomesticSignedGetPreflightTest(unittest.TestCase):
         self.assertEqual(
             0,
             evidence["officialRead"]["authenticationOauthPostDispatchCount"],
+        )
+        self.assertEqual(
+            1,
+            evidence["officialRead"]["authenticationOauthPostDispatchLimit"],
+        )
+        self.assertTrue(
+            evidence["officialRead"]["authenticationOauthPostLimitEnforced"]
         )
         self.assertFalse(
             evidence["officialRead"]["authenticationOauthPostCountComplete"]
@@ -192,6 +225,27 @@ class KisDomesticSignedGetPreflightTest(unittest.TestCase):
         self.assertFalse(evidence["durableBaselineCasPersisted"])
         self.assertEqual(15, len(transport.calls))
         self.assertEqual(0, transport.post_calls)
+        holiday_calls = [
+            call for call in transport.calls if call["tr_id"] == "CTCA0903R"
+        ]
+        self.assertEqual(2, len(holiday_calls))
+        self.assertTrue(all(call["continuation"] == "" for call in holiday_calls))
+        self.assertEqual(
+            HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+            evidence["baseline"]["holidayProofScope"],
+        )
+        self.assertFalse(evidence["baseline"]["holidayAllAvailablePagesClaimed"])
+        holiday_page_count = next(
+            row
+            for row in evidence["baseline"]["pageCountsAcrossTwoCaptures"]
+            if row["trId"] == "CTCA0903R"
+        )
+        self.assertEqual(2, holiday_page_count["pageCount"])
+        self.assertEqual(
+            HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+            holiday_page_count["paginationScope"],
+        )
+        self.assertFalse(holiday_page_count["allAvailablePagesClaimed"])
         self.assertEqual(
             {
                 "TTTC8434R",
@@ -239,6 +293,68 @@ class KisDomesticSignedGetPreflightTest(unittest.TestCase):
                 "quote-hash-mismatch",
             ):
                 runner.run()
+
+    def test_runner_blocks_before_read_outside_xkrx_diagnostic_window(self) -> None:
+        runner, client, reader, _transport, _authority = _runner()
+        for checked_at, reason in (
+            (datetime(2026, 8, 13, 8, 59, 59, tzinfo=KST), "outside-approved"),
+            (datetime(2026, 8, 13, 13, 15, 1, tzinfo=KST), "outside-approved"),
+            (datetime(2026, 8, 15, 10, 0, tzinfo=KST), "regular-session-unavailable"),
+        ):
+            with self.subTest(checked_at=checked_at):
+                runner._clock = lambda value=checked_at: value
+                with patch.object(
+                    reader, "read_preactivation_baseline"
+                ) as baseline, patch.object(client, "audit_snapshot") as audit:
+                    with self.assertRaisesRegex(
+                        KisDomesticSignedGetPreflightBlocked,
+                        reason,
+                    ):
+                        runner.run()
+                baseline.assert_not_called()
+                audit.assert_not_called()
+
+    def test_xkrx_diagnostic_window_includes_exact_open_and_cutoff(self) -> None:
+        runner, _client, _reader, _transport, _authority = _runner()
+        for checked_at in (
+            datetime(2026, 8, 13, 9, 0, tzinfo=KST),
+            datetime(2026, 8, 13, 13, 15, tzinfo=KST),
+        ):
+            with self.subTest(checked_at=checked_at):
+                runner._clock = lambda value=checked_at: value
+                window = runner._execution_window()
+                self.assertTrue(window["insideApprovedWindow"])
+
+    def test_executable_evidence_requires_complete_counts_and_false_release_flags(self) -> None:
+        runner, _client, _reader, _transport, _authority = _runner()
+        evidence = runner.run()
+        with self.assertRaisesRegex(
+            KisDomesticSignedGetPreflightBlocked,
+            "incomplete-or-unsafe",
+        ):
+            _verify_executable_signed_get_evidence(evidence)
+
+        complete = json.loads(json.dumps(evidence))
+        official = complete["officialRead"]
+        official["authenticationOauthPostCountComplete"] = True
+        official["physicalGetAttemptCountComplete"] = True
+        official["physicalGetAttemptCount"] = official["getRequestCount"]
+        _verify_executable_signed_get_evidence(complete)
+        dishonest_holiday_scope = json.loads(json.dumps(complete))
+        dishonest_holiday_scope["baseline"][
+            "holidayAllAvailablePagesClaimed"
+        ] = True
+        with self.assertRaisesRegex(
+            KisDomesticSignedGetPreflightBlocked,
+            "incomplete-or-unsafe",
+        ):
+            _verify_executable_signed_get_evidence(dishonest_holiday_scope)
+        complete["networkOrderPostAllowed"] = True
+        with self.assertRaisesRegex(
+            KisDomesticSignedGetPreflightBlocked,
+            "incomplete-or-unsafe",
+        ):
+            _verify_executable_signed_get_evidence(complete)
 
     def test_output_writer_contains_only_preverified_evidence(self) -> None:
         runner, client, _reader, _transport, _authority = _runner()
@@ -311,6 +427,17 @@ class KisDomesticSignedGetPreflightTest(unittest.TestCase):
                 "environment-gate-disabled",
             ):
                 main(["--execute-signed-get"])
+        build.assert_not_called()
+
+    def test_cli_rejects_ephemeral_authority_before_factory(self) -> None:
+        with patch.dict(os.environ, {EXECUTION_ENV_GATE: "true"}, clear=False), patch(
+            "live_trader.kis_domestic_signed_get_preflight.build_production_signed_get_preflight_runner"
+        ) as build:
+            with self.assertRaisesRegex(
+                KisDomesticSignedGetPreflightBlocked,
+                "ephemeral-authority-execution-forbidden",
+            ):
+                main(["--execute-signed-get", "--allow-ephemeral-authority"])
         build.assert_not_called()
 
 

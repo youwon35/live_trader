@@ -108,7 +108,7 @@ PINNED_COMPONENT_FILE_HASHES = {
     "capability": "09bbfe9e4842fdedf6eb88cdcb6b2dd6a1af89a1ccd5ca89df6db63da673bb89",
     "quote": "4b518526cf36215b3b63b6df7ad5d682180e88a5b35c799fb2732b815fe0c1b9",
     "graph": "e532eab127d2f62e8751d0abc0b718cb99784221a52b82a4c2aafd0f4c6b3405",
-    "truth": "15c9ba5aec052dd83da22774eb87aec2433aa7d9629d094134e7e3c95c6098d9",
+    "truth": "488068d514f647a9ed9aca74c3deded32f3cdab793d5602487b3b9601b99cd9b",
 }
 
 _COMPONENT_FILES = {

@@ -104,6 +104,7 @@ _SPECS = (
     ),
 )
 _SPEC_BY_NAME = {spec.name: spec for spec in _SPECS}
+HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE = "EXACT_TARGET_DATE_FIRST_PAGE_ONLY"
 _OFFICIAL_ID = re.compile(r"^[0-9]{1,16}$", flags=re.ASCII)
 _ORDER_DATE = re.compile(r"^[0-9]{8}$", flags=re.ASCII)
 
@@ -254,6 +255,22 @@ def _stable_causal_projection(capture: Mapping[str, Any]) -> dict[str, Any]:
                 }
             )
         projected: dict[str, Any] = {"rows": rows, "pagination": topology}
+        if spec.name == "holiday":
+            projected.update(
+                {
+                    "paginationScope": endpoint.get("paginationScope"),
+                    "allAvailablePagesClaimed": endpoint.get(
+                        "allAvailablePagesClaimed"
+                    ),
+                    "continuationFollowAllowed": endpoint.get(
+                        "continuationFollowAllowed"
+                    ),
+                    "maximumPhysicalPages": endpoint.get(
+                        "maximumPhysicalPages"
+                    ),
+                    "targetDate": endpoint.get("targetDate"),
+                }
+            )
         if spec.summary_key is not None:
             projected["summary"] = dict(summary) if isinstance(summary, Mapping) else summary
         projection[spec.name] = projected
@@ -571,7 +588,13 @@ class KisDomesticFunctionalTruthReader:
         nk = ""
         continuation = ""
         seen: set[tuple[str, str]] = set()
-        for page_index in range(self.max_pages):
+        # KIS operating guidance warns against repeatedly walking the holiday
+        # calendar.  BASS_DT asks for the exact trading date needed by this
+        # lane, so CTCA0903R is deliberately a one-page proof and can never
+        # consume a continuation cursor.  Account/order TRs retain all-page
+        # pagination.
+        maximum_physical_pages = 1 if spec.name == "holiday" else self.max_pages
+        for page_index in range(maximum_physical_pages):
             query = self._query(spec.name, fk, nk)
             try:
                 response = self.client.get(
@@ -613,7 +636,9 @@ class KisDomesticFunctionalTruthReader:
                     raise KisDomesticFunctionalTruthBlocked(f"{spec.name} summary shape is unknown")
             next_fk = body.get(spec.cursor_fk, "")
             next_nk = body.get(spec.cursor_nk, "")
-            if not isinstance(next_fk, str) or not isinstance(next_nk, str):
+            if spec.name != "holiday" and (
+                not isinstance(next_fk, str) or not isinstance(next_nk, str)
+            ):
                 raise KisDomesticFunctionalTruthBlocked(f"{spec.name} cursor is malformed")
             redacted_query = _redact_account_fields(query, self.account_fingerprint)
             redacted_body = _redact_account_fields(body, self.account_fingerprint)
@@ -669,6 +694,15 @@ class KisDomesticFunctionalTruthReader:
                     ),
                 }
             )
+            if spec.name == "holiday":
+                ymd = self.trading_date.strftime("%Y%m%d")
+                matches = [row for row in rows if row.get("bass_dt") == ymd]
+                if len(matches) != 1 or matches[0].get("opnd_yn") != "Y":
+                    raise KisDomesticFunctionalTruthBlocked(
+                        "exact trading date is not authoritatively open on the "
+                        "holiday first page"
+                    )
+                break
             if tr_cont in {"", "D", "E"}:
                 break
             pair = (next_fk, next_nk)
@@ -680,12 +714,29 @@ class KisDomesticFunctionalTruthReader:
             fk, nk, continuation = next_fk, next_nk, "N"
         else:
             raise KisDomesticFunctionalTruthBlocked(f"{spec.name} pagination is truncated")
-        if not pages or pages[-1]["continuationReceived"] not in {"", "D", "E"}:
+        if not pages:
+            raise KisDomesticFunctionalTruthBlocked(
+                f"{spec.name} pagination is incomplete"
+            )
+        if (
+            spec.name != "holiday"
+            and pages[-1]["continuationReceived"] not in {"", "D", "E"}
+        ):
             raise KisDomesticFunctionalTruthBlocked(f"{spec.name} pagination is incomplete")
         result: dict[str, Any] = {
             "pages": pages,
             "rows": _redact_account_fields([dict(row) for row in combined_rows], self.account_fingerprint),
         }
+        if spec.name == "holiday":
+            result.update(
+                {
+                    "paginationScope": HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+                    "allAvailablePagesClaimed": False,
+                    "continuationFollowAllowed": False,
+                    "maximumPhysicalPages": 1,
+                    "targetDate": self.trading_date.strftime("%Y%m%d"),
+                }
+            )
         if spec.summary_key is not None:
             result["summary"] = _redact_account_fields(
                 dict(_single_summary(summaries, spec.name)), self.account_fingerprint
@@ -909,6 +960,8 @@ class KisDomesticFunctionalTruthReader:
             "periodProfitSummary": self._serialize_decimal_mapping(costs["dailySummary"]),
             "accountWideWorkingOrdersZero": True,
             "tradingDayOpen": True,
+            "holidayProofScope": HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+            "holidayAllAvailablePagesClaimed": False,
         }
         return {**normalized, "normalizedHash": _hash(normalized)}
 
@@ -1570,7 +1623,10 @@ class KisDomesticFunctionalTruthReader:
             "ownerLossLimitSatisfied": owner_loss < OWNER_LOSS_LIMIT_KRW,
             "grossLimitSatisfied": max(buy_amt, sell_amt) <= MAX_GROSS_KRW,
             "tradingDayOpen": True,
-            "paginationComplete": True,
+            "allPaginatedAccountTruthComplete": True,
+            "holidayTargetDateFirstPageProofComplete": True,
+            "holidayProofScope": HOLIDAY_TARGET_DATE_FIRST_PAGE_SCOPE,
+            "holidayAllAvailablePagesClaimed": False,
             "stableRepeatedReads": True,
             "allTruthMethodsGetOnly": True,
         }
