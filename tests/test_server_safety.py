@@ -19,6 +19,32 @@ from live_trader.functional_http_session import FunctionalHttpSessionAuthority
 
 
 class ServerSafetyTests(unittest.TestCase):
+    def test_public_whole_program_ledger_baseline_is_permanently_closed(self) -> None:
+        handler = object.__new__(LiveTraderHandler)
+        handler.path = "/api/program-ledger-baseline"
+        handler.read_json = Mock(return_value={"confirmed": True})
+        handler.send_json = Mock()
+
+        with (
+            patch(
+                "live_trader.server.state.seed_program_ledger_from_broker_snapshot"
+            ) as seed,
+            patch(
+                "live_trader.server.state.snapshot",
+                return_value={"new_entries_blocked": True},
+            ),
+        ):
+            handler.do_POST()
+
+        seed.assert_not_called()
+        response = handler.send_json.call_args.args[0]
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            "program-ledger-wholesale-baseline-disabled",
+            response["reason"],
+        )
+        self.assertFalse(response["brokerSubmissionPerformed"])
+
     def test_snapshot_reconnect_is_native_kill_recovery_safe_point(self) -> None:
         handler = object.__new__(LiveTraderHandler)
         handler.path = "/api/snapshot"

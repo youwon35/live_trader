@@ -22,6 +22,7 @@ from .upbit_continuous_functional import (
     SYMBOL,
     UpbitFunctionalBlocked,
     _account_exclusivity_evidence_complete,
+    account_exclusivity_verifier_wiring_status,
 )
 from trading_runtime.functional_test import (
     issue_functional_test_permit,
@@ -31,6 +32,10 @@ from trading_runtime.functional_test import (
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,160}$")
+UPBIT_FUNCTIONAL_OWNER_LEASE_SCHEMA_VERSION = (
+    "upbit-functional-owner-lease/v1"
+)
+UPBIT_FUNCTIONAL_OWNER_LEASE_SECONDS = 30
 
 
 def _text(value: object) -> str:
@@ -47,6 +52,10 @@ def _stable_hash(value: object) -> str:
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _secret_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _exact_lower_hash(value: object) -> str | None:
@@ -1544,6 +1553,7 @@ class DurableUpbitFunctionalApprovalStore:
             AccountExclusivityProofVerifier | None
         ) = None,
         account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+        durable_owner_lease_required: bool = False,
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1556,6 +1566,9 @@ class DurableUpbitFunctionalApprovalStore:
             dict(account_exclusivity_verifier_pin)
             if isinstance(account_exclusivity_verifier_pin, Mapping)
             else None
+        )
+        self.durable_owner_lease_required = bool(
+            durable_owner_lease_required
         )
         self._lock = threading.RLock()
         with closing(self._connect()) as connection:
@@ -1591,6 +1604,24 @@ class DurableUpbitFunctionalApprovalStore:
                     validated INTEGER NOT NULL DEFAULT 0,
                     evidence_hash TEXT NOT NULL DEFAULT '',
                     session_id TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS upbit_functional_owner_lease (
+                    lease_id TEXT PRIMARY KEY,
+                    approval_id TEXT NOT NULL UNIQUE,
+                    candidate_hash TEXT NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    owner_id_hash TEXT NOT NULL,
+                    owner_token_hash TEXT NOT NULL,
+                    process_identity_hash TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    cleanup_only INTEGER NOT NULL DEFAULT 0,
+                    acquired_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '',
+                    record_hash TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS upbit_functional_recovery_approvals (
@@ -1659,6 +1690,544 @@ class DurableUpbitFunctionalApprovalStore:
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA journal_mode=WAL")
         return connection
+
+    @staticmethod
+    def _owner_lease_public(row: Mapping[str, Any]) -> dict[str, Any]:
+        """Return restart-verifiable lease identity without bearer material."""
+
+        return {
+            "schemaVersion": UPBIT_FUNCTIONAL_OWNER_LEASE_SCHEMA_VERSION,
+            "leaseId": _text(row.get("lease_id")),
+            "approvalId": _text(row.get("approval_id")),
+            "candidateHash": _text(row.get("candidate_hash")).lower(),
+            "sessionId": _text(row.get("session_id")),
+            "ownerIdHash": _text(row.get("owner_id_hash")).lower(),
+            "processIdentityHash": _text(
+                row.get("process_identity_hash")
+            ).lower(),
+            "state": _text(row.get("state")).upper(),
+            "cleanupOnly": bool(int(row.get("cleanup_only") or 0)),
+            "acquiredAt": _text(row.get("acquired_at")),
+            "heartbeatAt": _text(row.get("heartbeat_at")),
+            "expiresAt": _text(row.get("expires_at")),
+            "revision": int(row.get("revision") or 0),
+            "detail": _text(row.get("detail")),
+            "recordHash": _text(row.get("record_hash")).lower(),
+            "updatedAt": _text(row.get("updated_at")),
+        }
+
+    @classmethod
+    def _owner_lease_row_verified(cls, row: Mapping[str, Any]) -> bool:
+        public = cls._owner_lease_public(row)
+        projection = {
+            key: item for key, item in public.items() if key != "recordHash"
+        }
+        return bool(
+            _HASH_RE.fullmatch(public["recordHash"])
+            and secrets.compare_digest(
+                public["recordHash"], _stable_hash(projection)
+            )
+        )
+
+    def acquire_owner_lease(
+        self,
+        *,
+        approval_id: str,
+        owner_id: str,
+        owner_token: str,
+        process_identity_hash: str,
+        cleanup_only: bool = False,
+    ) -> dict[str, Any]:
+        """Acquire one durable owner before the permit claim can cross.
+
+        Only a hash of the bearer token is persisted.  An ordinary first-live
+        approval gets exactly one owner generation; cleanup recovery may rotate
+        only a lease already durably marked ``LOST``.
+        """
+
+        normalized_approval = _text(approval_id)
+        normalized_owner = _text(owner_id)
+        normalized_token = _text(owner_token)
+        normalized_process = _text(process_identity_hash).lower()
+        if (
+            _SAFE_ID_RE.fullmatch(normalized_approval) is None
+            or _SAFE_ID_RE.fullmatch(normalized_owner) is None
+            or len(normalized_token) < 32
+            or _HASH_RE.fullmatch(normalized_process) is None
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-owner-lease-input-invalid"
+            )
+        now = _utc(self.clock(), "current-time")
+        expires = now + timedelta(
+            seconds=UPBIT_FUNCTIONAL_OWNER_LEASE_SECONDS
+        )
+        lease_id = "upbit-owner-lease-" + secrets.token_hex(16)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            approval = connection.execute(
+                """SELECT approval_id,candidate_hash,state,claimed_session_id
+                FROM upbit_functional_approvals WHERE approval_id=?""",
+                (normalized_approval,),
+            ).fetchone()
+            existing = connection.execute(
+                """SELECT * FROM upbit_functional_owner_lease
+                WHERE approval_id=?""",
+                (normalized_approval,),
+            ).fetchone()
+            if approval is None:
+                connection.rollback()
+                raise UpbitFunctionalBlocked(
+                    "upbit-functional-owner-lease-approval-missing"
+                )
+            candidate_hash = _text(approval["candidate_hash"]).lower()
+            if _HASH_RE.fullmatch(candidate_hash) is None:
+                connection.rollback()
+                raise UpbitFunctionalBlocked(
+                    "upbit-functional-owner-lease-candidate-hash-invalid"
+                )
+            if cleanup_only:
+                if (
+                    approval["state"] != "ACTIVE"
+                    or not _text(approval["claimed_session_id"])
+                    or existing is None
+                    or _text(existing["state"]).upper() != "LOST"
+                    or not self._owner_lease_row_verified(dict(existing))
+                ):
+                    connection.rollback()
+                    raise UpbitFunctionalBlocked(
+                        "upbit-functional-cleanup-owner-rotation-invalid"
+                    )
+                session_id = _text(approval["claimed_session_id"])
+                revision = int(existing["revision"] or 0) + 1
+            else:
+                if approval["state"] != "APPROVED" or existing is not None:
+                    connection.rollback()
+                    raise UpbitFunctionalBlocked(
+                        "upbit-functional-owner-lease-not-acquirable"
+                    )
+                session_id = ""
+                revision = 1
+            record = {
+                "schemaVersion": UPBIT_FUNCTIONAL_OWNER_LEASE_SCHEMA_VERSION,
+                "leaseId": lease_id,
+                "approvalId": normalized_approval,
+                "candidateHash": candidate_hash,
+                "sessionId": session_id,
+                "ownerIdHash": _secret_hash(normalized_owner),
+                "processIdentityHash": normalized_process,
+                "state": "ACTIVE" if cleanup_only else "ACQUIRED",
+                "cleanupOnly": bool(cleanup_only),
+                "acquiredAt": now.isoformat(),
+                "heartbeatAt": now.isoformat(),
+                "expiresAt": expires.isoformat(),
+                "revision": revision,
+                "detail": (
+                    "cleanup owner rotated after proven process loss"
+                    if cleanup_only
+                    else "owner acquired before permit claim"
+                ),
+                "updatedAt": now.isoformat(),
+            }
+            record_hash = _stable_hash(record)
+            values = (
+                lease_id,
+                normalized_approval,
+                candidate_hash,
+                session_id,
+                record["ownerIdHash"],
+                _secret_hash(normalized_token),
+                normalized_process,
+                record["state"],
+                1 if cleanup_only else 0,
+                record["acquiredAt"],
+                record["heartbeatAt"],
+                record["expiresAt"],
+                revision,
+                record["detail"],
+                record_hash,
+                record["updatedAt"],
+            )
+            if cleanup_only:
+                cursor = connection.execute(
+                    """UPDATE upbit_functional_owner_lease SET
+                    lease_id=?,candidate_hash=?,session_id=?,owner_id_hash=?,
+                    owner_token_hash=?,process_identity_hash=?,state=?,
+                    cleanup_only=?,acquired_at=?,heartbeat_at=?,expires_at=?,
+                    revision=?,detail=?,record_hash=?,updated_at=?
+                    WHERE approval_id=? AND state='LOST'""",
+                    (
+                        lease_id,
+                        candidate_hash,
+                        session_id,
+                        record["ownerIdHash"],
+                        _secret_hash(normalized_token),
+                        normalized_process,
+                        record["state"],
+                        1,
+                        record["acquiredAt"],
+                        record["heartbeatAt"],
+                        record["expiresAt"],
+                        revision,
+                        record["detail"],
+                        record_hash,
+                        record["updatedAt"],
+                        normalized_approval,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    raise UpbitFunctionalBlocked(
+                        "upbit-functional-cleanup-owner-rotation-raced"
+                    )
+            else:
+                try:
+                    connection.execute(
+                        """INSERT INTO upbit_functional_owner_lease
+                        (lease_id,approval_id,candidate_hash,session_id,
+                         owner_id_hash,owner_token_hash,process_identity_hash,
+                         state,cleanup_only,acquired_at,heartbeat_at,expires_at,
+                         revision,detail,record_hash,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        values,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    connection.rollback()
+                    raise UpbitFunctionalBlocked(
+                        "upbit-functional-owner-lease-replay"
+                    ) from exc
+            connection.commit()
+        return self.owner_lease_status(approval_id=normalized_approval) or {}
+
+    def owner_lease_status(
+        self, *, approval_id: str = "", session_id: str = ""
+    ) -> dict[str, Any] | None:
+        if bool(_text(approval_id)) == bool(_text(session_id)):
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-owner-lease-lookup-invalid"
+            )
+        field = "approval_id" if _text(approval_id) else "session_id"
+        value = _text(approval_id) or _text(session_id)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                f"SELECT * FROM upbit_functional_owner_lease WHERE {field}=?",
+                (value,),
+            ).fetchone()
+        if row is None:
+            return None
+        public = self._owner_lease_public(dict(row))
+        public["recordHashVerified"] = self._owner_lease_row_verified(
+            dict(row)
+        )
+        return public
+
+    def owner_lease_active(
+        self,
+        *,
+        approval_id: str,
+        owner_id: str,
+        owner_token: str,
+        session_id: str = "",
+    ) -> bool:
+        now = _utc(self.clock(), "current-time")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT * FROM upbit_functional_owner_lease
+                WHERE approval_id=?""",
+                (_text(approval_id),),
+            ).fetchone()
+        if row is None:
+            return False
+        try:
+            expires = _utc(row["expires_at"], "owner-lease-expires-at")
+        except UpbitFunctionalBlocked:
+            return False
+        return bool(
+            row["state"] in {"ACQUIRED", "ACTIVE"}
+            and self._owner_lease_row_verified(dict(row))
+            and now < expires
+            and secrets.compare_digest(
+                _text(row["owner_id_hash"]), _secret_hash(_text(owner_id))
+            )
+            and secrets.compare_digest(
+                _text(row["owner_token_hash"]),
+                _secret_hash(_text(owner_token)),
+            )
+            and (
+                not _text(session_id)
+                or secrets.compare_digest(
+                    _text(row["session_id"]), _text(session_id)
+                )
+            )
+        )
+
+    def heartbeat_owner_lease(
+        self,
+        *,
+        approval_id: str,
+        owner_id: str,
+        owner_token: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        now = _utc(self.clock(), "current-time")
+        expires = now + timedelta(
+            seconds=UPBIT_FUNCTIONAL_OWNER_LEASE_SECONDS
+        )
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM upbit_functional_owner_lease
+                WHERE approval_id=?""",
+                (_text(approval_id),),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "ACTIVE"
+                or not self._owner_lease_row_verified(dict(row))
+                or _utc(row["expires_at"], "owner-lease-expires-at") <= now
+                or not secrets.compare_digest(
+                    _text(row["session_id"]), _text(session_id)
+                )
+                or not secrets.compare_digest(
+                    _text(row["owner_id_hash"]),
+                    _secret_hash(_text(owner_id)),
+                )
+                or not secrets.compare_digest(
+                    _text(row["owner_token_hash"]),
+                    _secret_hash(_text(owner_token)),
+                )
+            ):
+                connection.rollback()
+                raise UpbitFunctionalBlocked(
+                    "upbit-functional-owner-lease-heartbeat-invalid"
+                )
+            revision = int(row["revision"] or 0) + 1
+            public = self._owner_lease_public(dict(row))
+            record = {
+                **{
+                    key: value
+                    for key, value in public.items()
+                    if key not in {"recordHash", "heartbeatAt", "expiresAt", "revision", "detail", "updatedAt"}
+                },
+                "heartbeatAt": now.isoformat(),
+                "expiresAt": expires.isoformat(),
+                "revision": revision,
+                "detail": "owner heartbeat renewed",
+                "updatedAt": now.isoformat(),
+            }
+            cursor = connection.execute(
+                """UPDATE upbit_functional_owner_lease SET
+                heartbeat_at=?,expires_at=?,revision=?,detail=?,record_hash=?,
+                updated_at=? WHERE approval_id=? AND state='ACTIVE'
+                AND revision=?""",
+                (
+                    record["heartbeatAt"],
+                    record["expiresAt"],
+                    revision,
+                    record["detail"],
+                    _stable_hash(record),
+                    record["updatedAt"],
+                    _text(approval_id),
+                    int(row["revision"] or 0),
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise UpbitFunctionalBlocked(
+                    "upbit-functional-owner-lease-heartbeat-raced"
+                )
+            connection.commit()
+        return self.owner_lease_status(approval_id=_text(approval_id)) or {}
+
+    def finish_owner_lease(
+        self,
+        *,
+        approval_id: str,
+        owner_id: str,
+        owner_token: str,
+        state: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        terminal = _text(state).upper()
+        if terminal not in {"RELEASED", "FAILED", "LOST"}:
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-owner-lease-terminal-invalid"
+            )
+        with self._lock, closing(self._connect()) as connection:
+            # A heartbeat may be running in another process/store instance.
+            # Take the SQLite writer lease before reading so the terminal hash
+            # is derived from the exact revision that this transaction owns.
+            connection.execute("BEGIN IMMEDIATE")
+            now = _utc(self.clock(), "current-time")
+            row = connection.execute(
+                """SELECT * FROM upbit_functional_owner_lease
+                WHERE approval_id=?""",
+                (_text(approval_id),),
+            ).fetchone()
+            if row is None or row["state"] not in {"ACQUIRED", "ACTIVE"}:
+                connection.rollback()
+                raise UpbitFunctionalBlocked(
+                    "upbit-functional-owner-lease-terminal-raced"
+                )
+            if not self._owner_lease_row_verified(dict(row)):
+                connection.rollback()
+                raise UpbitFunctionalBlocked(
+                    "upbit-functional-owner-lease-record-hash-invalid"
+                )
+            expected_revision = int(row["revision"] or 0)
+            expected_session = _text(row["session_id"])
+            expected_record_hash = _text(row["record_hash"]).lower()
+            public = self._owner_lease_public(dict(row))
+            terminal_record = {
+                **{
+                    key: value
+                    for key, value in public.items()
+                    if key
+                    not in {
+                        "recordHash",
+                        "state",
+                        "heartbeatAt",
+                        "expiresAt",
+                        "revision",
+                        "detail",
+                        "updatedAt",
+                    }
+                },
+                "state": terminal,
+                "heartbeatAt": now.isoformat(),
+                "expiresAt": now.isoformat(),
+                "revision": expected_revision + 1,
+                "detail": _text(detail)[:500],
+                "updatedAt": now.isoformat(),
+            }
+            cursor = connection.execute(
+                """UPDATE upbit_functional_owner_lease SET state=?,
+                owner_token_hash='',heartbeat_at=?,expires_at=?,revision=?,
+                detail=?,record_hash=?,updated_at=? WHERE approval_id=?
+                AND lease_id=? AND candidate_hash=? AND session_id=?
+                AND state=? AND revision=? AND record_hash=?
+                AND owner_id_hash=? AND owner_token_hash=?""",
+                (
+                    terminal,
+                    now.isoformat(),
+                    now.isoformat(),
+                    terminal_record["revision"],
+                    _text(detail)[:500],
+                    _stable_hash(terminal_record),
+                    now.isoformat(),
+                    _text(approval_id),
+                    _text(row["lease_id"]),
+                    _text(row["candidate_hash"]).lower(),
+                    expected_session,
+                    _text(row["state"]),
+                    expected_revision,
+                    expected_record_hash,
+                    _secret_hash(_text(owner_id)),
+                    _secret_hash(_text(owner_token)),
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise UpbitFunctionalBlocked(
+                    "upbit-functional-owner-lease-terminal-raced"
+                )
+            connection.commit()
+        return self.owner_lease_status(approval_id=_text(approval_id)) or {}
+
+    def attest_owner_process_absent(
+        self, *, process_absence_attested: bool, detail: str
+    ) -> tuple[dict[str, Any], ...]:
+        """Revoke every surviving bearer only after process absence is proven."""
+
+        if process_absence_attested is not True:
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-owner-process-absence-proof-required"
+            )
+        now = _utc(self.clock(), "current-time")
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """SELECT * FROM upbit_functional_owner_lease
+                WHERE state IN ('ACQUIRED','ACTIVE')"""
+            ).fetchall()
+            for row in rows:
+                if not self._owner_lease_row_verified(dict(row)):
+                    connection.rollback()
+                    raise UpbitFunctionalBlocked(
+                        "upbit-functional-owner-lease-record-hash-invalid"
+                    )
+                public = self._owner_lease_public(dict(row))
+                lost_record = {
+                    **{
+                        key: value
+                        for key, value in public.items()
+                        if key
+                        not in {
+                            "recordHash",
+                            "state",
+                            "heartbeatAt",
+                            "expiresAt",
+                            "revision",
+                            "detail",
+                            "updatedAt",
+                        }
+                    },
+                    "state": "LOST",
+                    "heartbeatAt": now.isoformat(),
+                    "expiresAt": now.isoformat(),
+                    "revision": int(row["revision"] or 0) + 1,
+                    "detail": _text(detail)[:500],
+                    "updatedAt": now.isoformat(),
+                }
+                connection.execute(
+                    """UPDATE upbit_functional_owner_lease SET state='LOST',
+                    owner_token_hash='',heartbeat_at=?,expires_at=?,
+                    revision=?,detail=?,record_hash=?,updated_at=?
+                    WHERE approval_id=? AND state IN ('ACQUIRED','ACTIVE')
+                    AND revision=?""",
+                    (
+                        now.isoformat(),
+                        now.isoformat(),
+                        lost_record["revision"],
+                        lost_record["detail"],
+                        _stable_hash(lost_record),
+                        now.isoformat(),
+                        row["approval_id"],
+                        int(row["revision"] or 0),
+                    ),
+                )
+            connection.commit()
+        return tuple(
+            self.owner_lease_status(approval_id=_text(row["approval_id"]))
+            or {}
+            for row in rows
+        )
+
+    def owner_lease_preparation_status(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": UPBIT_FUNCTIONAL_OWNER_LEASE_SCHEMA_VERSION,
+            "required": self.durable_owner_lease_required,
+            "durable": True,
+            "singleOwner": True,
+            "bearerTokenPersisted": False,
+            "heartbeatSeconds": UPBIT_FUNCTIONAL_OWNER_LEASE_SECONDS,
+        }
+
+    def first_live_preparation_status(self) -> dict[str, Any]:
+        verifier = account_exclusivity_verifier_wiring_status(
+            self.account_exclusivity_verifier,
+            self.account_exclusivity_verifier_pin,
+        )
+        owner = self.owner_lease_preparation_status()
+        return {
+            "prepared": bool(
+                verifier.get("ready") is True
+                and owner.get("required") is True
+                and owner.get("durable") is True
+            ),
+            "accountExclusivityVerifier": verifier,
+            "ownerLease": owner,
+        }
 
     def approve_permit(
         self,
@@ -2165,7 +2734,13 @@ class DurableUpbitFunctionalApprovalStore:
         return cursor.rowcount == 1
 
     def claim_permit(
-        self, *, approval_id: str, session_id: str
+        self,
+        *,
+        approval_id: str,
+        session_id: str,
+        owner_lease_id: str = "",
+        owner_id: str = "",
+        owner_token: str = "",
     ) -> dict[str, Any]:
         now = _utc(self.clock(), "current-time")
         if _SAFE_ID_RE.fullmatch(_text(session_id)) is None:
@@ -2185,6 +2760,50 @@ class DurableUpbitFunctionalApprovalStore:
                 raise UpbitFunctionalBlocked(
                     "upbit-functional-permit-approval-not-claimable"
                 )
+            owner_lease = connection.execute(
+                """SELECT * FROM upbit_functional_owner_lease
+                WHERE approval_id=?""",
+                (_text(approval_id),),
+            ).fetchone()
+            owner_inputs_present = bool(
+                _text(owner_lease_id)
+                or _text(owner_id)
+                or _text(owner_token)
+            )
+            if self.durable_owner_lease_required or owner_inputs_present:
+                if (
+                    owner_lease is None
+                    or owner_lease["state"] != "ACQUIRED"
+                    or not self._owner_lease_row_verified(
+                        dict(owner_lease)
+                    )
+                    or not secrets.compare_digest(
+                        _text(owner_lease["lease_id"]),
+                        _text(owner_lease_id),
+                    )
+                    or not secrets.compare_digest(
+                        _text(owner_lease["candidate_hash"]).lower(),
+                        _text(row["candidate_hash"]).lower(),
+                    )
+                    or not secrets.compare_digest(
+                        _text(owner_lease["owner_id_hash"]),
+                        _secret_hash(_text(owner_id)),
+                    )
+                    or not secrets.compare_digest(
+                        _text(owner_lease["owner_token_hash"]),
+                        _secret_hash(_text(owner_token)),
+                    )
+                    or _text(owner_lease["session_id"])
+                    or _utc(
+                        owner_lease["expires_at"],
+                        "owner-lease-expires-at",
+                    )
+                    <= now
+                ):
+                    connection.rollback()
+                    raise UpbitFunctionalBlocked(
+                        "upbit-functional-permit-owner-lease-required"
+                    )
             candidate_permit = parse_functional_test_permit(
                 json.loads(row["permit_json"])
             )
@@ -2317,6 +2936,50 @@ class DurableUpbitFunctionalApprovalStore:
                 raise UpbitFunctionalBlocked(
                     "upbit-functional-permit-approval-not-claimable"
                 )
+            if self.durable_owner_lease_required or owner_inputs_present:
+                lease_revision = int(owner_lease["revision"] or 0) + 1
+                lease_public = self._owner_lease_public(dict(owner_lease))
+                lease_record = {
+                    **{
+                        key: value
+                        for key, value in lease_public.items()
+                        if key
+                        not in {
+                            "recordHash",
+                            "sessionId",
+                            "state",
+                            "revision",
+                            "detail",
+                            "updatedAt",
+                        }
+                    },
+                    "sessionId": _text(session_id),
+                    "state": "ACTIVE",
+                    "revision": lease_revision,
+                    "detail": "owner atomically bound to permit claim",
+                    "updatedAt": now.isoformat(),
+                }
+                lease_cursor = connection.execute(
+                    """UPDATE upbit_functional_owner_lease SET
+                    session_id=?,state='ACTIVE',revision=?,detail=?,
+                    record_hash=?,updated_at=? WHERE lease_id=?
+                    AND approval_id=? AND state='ACQUIRED' AND revision=?""",
+                    (
+                        _text(session_id),
+                        lease_revision,
+                        lease_record["detail"],
+                        _stable_hash(lease_record),
+                        lease_record["updatedAt"],
+                        _text(owner_lease_id),
+                        _text(approval_id),
+                        int(owner_lease["revision"] or 0),
+                    ),
+                )
+                if lease_cursor.rowcount != 1:
+                    connection.rollback()
+                    raise UpbitFunctionalBlocked(
+                        "upbit-functional-owner-lease-claim-bind-raced"
+                    )
             if _text(row["bootstrap_id"]):
                 bootstrap_row = connection.execute(
                     """SELECT * FROM upbit_functional_e2e_bootstrap
@@ -2408,7 +3071,23 @@ class DurableUpbitFunctionalApprovalStore:
             and bootstrap.get("realE2EValidatedBeforeStart") is False
         )
 
-    def bind_permit(self, *, approval_id: str, session_id: str) -> None:
+    def bind_permit(
+        self,
+        *,
+        approval_id: str,
+        session_id: str,
+        owner_id: str = "",
+        owner_token: str = "",
+    ) -> None:
+        if self.durable_owner_lease_required and not self.owner_lease_active(
+            approval_id=_text(approval_id),
+            owner_id=_text(owner_id),
+            owner_token=_text(owner_token),
+            session_id=_text(session_id),
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-bind-owner-lease-required"
+            )
         self._permit_transition(
             approval_id=approval_id,
             session_id=session_id,
@@ -3767,6 +4446,8 @@ class DurableUpbitFunctionalApprovalStore:
 
 __all__ = [
     "DurableUpbitFunctionalApprovalStore",
+    "UPBIT_FUNCTIONAL_OWNER_LEASE_SCHEMA_VERSION",
+    "UPBIT_FUNCTIONAL_OWNER_LEASE_SECONDS",
     "_durable_functional_wiring_complete",
     "_functional_wiring_evidence_complete",
 ]

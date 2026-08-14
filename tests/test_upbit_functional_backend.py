@@ -212,6 +212,29 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
         self.assertFalse(snapshot["newEntriesBlocked"])
         self.assertFalse(snapshot["functionalMutationEnabled"])
 
+    def test_authority_requires_live_durable_owner_lease_on_every_read(self) -> None:
+        owner = {"active": False}
+        authority = backend._ManagedFunctionalAuthority(
+            ordinary_routes_closed_reader=lambda: True,
+            emergency_stop_reader=lambda: {
+                "active": False,
+                "revision": "test-emergency-clear",
+            },
+            durable_owner_lease_reader=lambda: owner["active"],
+            durable_owner_lease_required=True,
+        )
+        authority.bind_scope({"functionalTestSessionId": "session-1"})
+        authority.register("a" * 64)
+        authority.arm("a" * 64)
+        self.assertFalse(authority.orders_enabled())
+        blocked = authority.snapshot()
+        self.assertTrue(blocked["durableOwnerLeaseRequired"])
+        self.assertFalse(blocked["durableOwnerLeaseActive"])
+        self.assertFalse(blocked["functionalMutationEnabled"])
+        owner["active"] = True
+        self.assertTrue(authority.orders_enabled())
+        self.assertTrue(authority.snapshot()["functionalMutationEnabled"])
+
     def test_process_singleton_wrappers_delegate_server_owned_commands(self) -> None:
         original = backend._BACKEND_SINGLETON
         self.addCleanup(
@@ -250,6 +273,95 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
 
     def test_composite_gate_is_false_until_every_production_proof_exists(self) -> None:
         self.assertFalse(upbit_functional_composite_available())
+
+    def test_first_live_status_exposes_prepared_but_keeps_network_gate_closed(
+        self,
+    ) -> None:
+        manager = object.__new__(UpbitFunctionalBackendManager)
+        manager._lock = threading.RLock()
+        manager._account_exclusivity_proof_reader = lambda **_kwargs: {}
+        manager._owner_process_identity_hash = "d" * 64
+        manager._owner_process_identity_durable = True
+        manager._durable_owner_lease_required = True
+        manager._approval_id = ""
+        manager._session_id = ""
+        manager._generation = 0
+        manager._scheduler = None
+        manager._terminal_state = "IDLE"
+        manager._terminal_detail = ""
+        manager._startup_audit = {"graph": {}, "approvals": {}}
+        manager.authority = _Authority()
+
+        verifier_status = {
+            "ready": True,
+            "authorityPinned": True,
+            "runtimeIdentityMatched": True,
+            "reason": "READY",
+            "pinHash": "e" * 64,
+        }
+
+        class Store:
+            @staticmethod
+            def first_live_preparation_status():
+                return {
+                    "prepared": True,
+                    "accountExclusivityVerifier": dict(verifier_status),
+                    "ownerLease": {
+                        "required": True,
+                        "durable": True,
+                        "singleOwner": True,
+                        "bearerTokenPersisted": False,
+                    },
+                }
+
+            @staticmethod
+            def owner_lease_status(**_kwargs):
+                return None
+
+        class Graph:
+            @staticmethod
+            def status():
+                return {
+                    "accountExclusivityVerifier": dict(verifier_status),
+                    "accountExclusivityProofSourceWired": True,
+                    "startupAudit": {},
+                }
+
+        manager.approval_store = Store()
+        manager.graph = Graph()
+        closed_gates = {
+            "explicitLiveEnv": True,
+            "entrypoint": True,
+            "mutation": True,
+            "backend": True,
+            "stateServer": True,
+            "verifierAuthorityPinned": True,
+            "productionVerifierWired": True,
+            "entrypointComposite": True,
+            "bootstrapPreparation": True,
+            "bootstrapNetworkRelease": False,
+        }
+        with (
+            patch.object(
+                backend,
+                "_first_live_static_gate_status",
+                return_value=closed_gates,
+            ),
+            patch.object(
+                backend,
+                "upbit_functional_composite_available",
+                return_value=False,
+            ),
+        ):
+            status = manager.status()
+        self.assertTrue(status["firstLiveBootstrapPrepared"])
+        self.assertFalse(status["firstLiveBootstrapEligible"])
+        self.assertFalse(status["available"])
+        self.assertFalse(status["networkOrderPostAllowed"])
+        self.assertIn(
+            "bootstrapNetworkRelease",
+            status["firstLiveBootstrapBlockedReason"],
+        )
 
     def test_explicit_live_env_gate_is_required_even_when_all_code_gates_are_true(
         self,

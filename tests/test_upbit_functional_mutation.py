@@ -225,6 +225,36 @@ class UpbitFunctionalMutationTest(unittest.TestCase):
             )
         self.assertEqual([], sends)
 
+    def test_required_durable_owner_lease_blocks_before_sender(self) -> None:
+        sends: list[object] = []
+        request_hash = _stable_hash(
+            {
+                key: value
+                for key, value in buy_payload().items()
+                if key != "identifier"
+            }
+        )
+        edge = self.edge(
+            sender=lambda request: sends.append(request) or {},
+            request_hash=request_hash,
+            allow_mock_transport=True,
+            authority_reader=lambda: authority(
+                durableOwnerLeaseRequired=True,
+                durableOwnerLeaseActive=False,
+            ),
+        )
+        with self.ready_env(), self.assertRaisesRegex(
+            UpbitFunctionalMutationNotSent, "durable-owner-lease-inactive"
+        ):
+            edge.post(
+                buy_payload(),
+                functional_capability=RAW_CAPABILITY,
+                functional_action="STRATEGY_BUY",
+                claim_id=CLAIM_ID,
+                request_hash=request_hash,
+            )
+        self.assertEqual([], sends)
+
     def test_mock_edge_sends_once_and_timeout_is_outcome_unknown(self) -> None:
         sends = 0
 

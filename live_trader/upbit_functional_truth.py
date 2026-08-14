@@ -50,6 +50,18 @@ class UpbitPrivateStreamReader(Protocol):
     ) -> Mapping[str, Any]: ...
 
 
+class UpbitAccountExclusivityProofReader(Protocol):
+    def __call__(
+        self,
+        *,
+        session_id: str,
+        account_fingerprint: str,
+        session_started_at: datetime,
+        observation_started_at: datetime,
+        observed_at: datetime,
+    ) -> Mapping[str, Any]: ...
+
+
 def _text(value: object) -> str:
     return str(value or "").strip()
 
@@ -312,6 +324,9 @@ class OfficialUpbitFunctionalTruthReader:
     cleanup_deadline: datetime
     clock: Any
     private_stream_reader: UpbitPrivateStreamReader
+    account_exclusivity_proof_reader: (
+        UpbitAccountExclusivityProofReader | None
+    ) = None
     cleanup_recovery: bool = False
 
     def _open_orders(
@@ -822,7 +837,7 @@ class OfficialUpbitFunctionalTruthReader:
             raise UpbitFunctionalBlocked(
                 "upbit-official-truth-read-duration-exceeded"
             )
-        return {
+        result = {
             "broker": "UPBIT",
             "market": SYMBOL,
             "accountFingerprint": self.account_fingerprint,
@@ -890,12 +905,39 @@ class OfficialUpbitFunctionalTruthReader:
                 ).encode("utf-8")
             ).hexdigest(),
         }
+        if self.account_exclusivity_proof_reader is not None:
+            # Bind the detached proof to the exact timestamps serialized in
+            # this truth record.  Millisecond normalization prevents a proof
+            # from signing sub-millisecond values that the durable truth does
+            # not retain.
+            proof_started_at = datetime.fromisoformat(
+                _utc_text(now).replace("Z", "+00:00")
+            )
+            proof_observed_at = datetime.fromisoformat(
+                _utc_text(observed_at).replace("Z", "+00:00")
+            )
+            proof = self.account_exclusivity_proof_reader(
+                session_id=session_id,
+                account_fingerprint=self.account_fingerprint,
+                session_started_at=_utc(
+                    self.session_started_at, "session-started-at"
+                ),
+                observation_started_at=proof_started_at,
+                observed_at=proof_observed_at,
+            )
+            if not isinstance(proof, Mapping):
+                raise UpbitFunctionalBlocked(
+                    "upbit-official-account-exclusivity-proof-not-object"
+                )
+            result["accountExclusivityProof"] = dict(proof)
+        return result
 
 
 __all__ = [
     "CLOSED_LIMIT",
     "OPEN_PAGE_LIMIT",
     "OfficialUpbitFunctionalTruthReader",
+    "UpbitAccountExclusivityProofReader",
     "QUANTITY_RULE_SOURCE",
     "UPBIT_ACCOUNTS_ENDPOINT",
     "UPBIT_CLOSED_ORDERS_ENDPOINT",

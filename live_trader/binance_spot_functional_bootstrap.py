@@ -1026,6 +1026,7 @@ def default_binance_spot_functional_code_paths() -> tuple[Path, ...]:
         "binance_spot_functional_bootstrap.py",
         "binance_spot_functional_lifecycle.py",
         "binance_spot_functional_mutation.py",
+        "binance_spot_functional_preparation.py",
         "binance_spot_functional_scheduler.py",
         "binance_spot_functional_state.py",
         "binance_spot_functional_strategy.py",

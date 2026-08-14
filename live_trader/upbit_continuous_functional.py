@@ -331,6 +331,64 @@ def _normalized_account_exclusivity_verifier_pin(
     return result
 
 
+def account_exclusivity_verifier_wiring_status(
+    verifier: AccountExclusivityProofVerifier | None,
+    verifier_pin: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Report whether an injected verifier is exactly bound to its durable pin.
+
+    This check is deliberately verification-only: the trading process is not
+    given an account-exclusivity signing primitive.  Production composition
+    must inject an independently owned verifier whose runtime identity exactly
+    matches the persisted code/config/key fingerprints in ``verifier_pin``.
+    """
+
+    normalized_pin = _normalized_account_exclusivity_verifier_pin(verifier_pin)
+    if normalized_pin is None:
+        return {
+            "ready": False,
+            "authorityPinned": False,
+            "runtimeIdentityMatched": False,
+            "reason": "ACCOUNT_EXCLUSIVITY_VERIFIER_PIN_INVALID",
+            "pinHash": "",
+        }
+    if verifier is None:
+        return {
+            "ready": False,
+            "authorityPinned": True,
+            "runtimeIdentityMatched": False,
+            "reason": "ACCOUNT_EXCLUSIVITY_VERIFIER_MISSING",
+            "pinHash": _strict_stable_hash(normalized_pin),
+        }
+    try:
+        runtime_identity = verifier.identity()
+    except Exception:
+        return {
+            "ready": False,
+            "authorityPinned": True,
+            "runtimeIdentityMatched": False,
+            "reason": "ACCOUNT_EXCLUSIVITY_VERIFIER_IDENTITY_UNAVAILABLE",
+            "pinHash": _strict_stable_hash(normalized_pin),
+        }
+    normalized_identity = (
+        _normalized_account_exclusivity_verifier_pin(runtime_identity)
+        if isinstance(runtime_identity, Mapping)
+        else None
+    )
+    matched = normalized_identity == normalized_pin
+    return {
+        "ready": matched,
+        "authorityPinned": True,
+        "runtimeIdentityMatched": matched,
+        "reason": (
+            "READY"
+            if matched
+            else "ACCOUNT_EXCLUSIVITY_VERIFIER_IDENTITY_PIN_MISMATCH"
+        ),
+        "pinHash": _strict_stable_hash(normalized_pin),
+    }
+
+
 def _canonical_exclusivity_component(
     value: object,
     *,
@@ -3539,6 +3597,13 @@ class UpbitContinuousFunctionalService:
             raise UpbitFunctionalBlocked("upbit-runtime-smoke-route-must-be-closed")
         if runtime.get("newEntriesBlocked") is not True:
             raise UpbitFunctionalBlocked("upbit-runtime-new-entries-state-mismatch")
+        if (
+            runtime.get("durableOwnerLeaseRequired") is True
+            and runtime.get("durableOwnerLeaseActive") is not True
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-runtime-durable-owner-lease-required"
+            )
         if activation and runtime.get("realOrdersEnabled") is not False:
             raise UpbitFunctionalBlocked("upbit-runtime-real-orders-must-start-off")
 
@@ -5176,5 +5241,6 @@ __all__ = [
     "UpbitOrderRules",
     "UpbitPermitScope",
     "UpbitTruth",
+    "account_exclusivity_verifier_wiring_status",
     "activate_upbit_continuous_functional",
 ]

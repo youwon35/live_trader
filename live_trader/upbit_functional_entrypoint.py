@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .upbit_continuous_functional import (
+    AccountExclusivityProofVerifier,
     UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
     UPBIT_CONTINUOUS_FUNCTIONAL_AVAILABLE,
     UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED,
@@ -24,6 +25,7 @@ from .upbit_continuous_functional import (
     UpbitFunctionalLedger,
     UpbitPermitScope,
     _stable_hash,
+    account_exclusivity_verifier_wiring_status,
 )
 from .upbit_functional_managed import ManagedUpbitFunctionalController
 from .upbit_functional_mutation import (
@@ -102,6 +104,9 @@ class UpbitFunctionalProductionGraph:
         finalized_bar_window_reader: Callable[[], Mapping[str, Any]],
         arm_functional_orders: Callable[[str], None] | None = None,
         clear_runtime_capability: Callable[[], None] | None = None,
+        account_exclusivity_proof_reader: Callable[..., Mapping[str, Any]] | None = None,
+        account_exclusivity_verifier: AccountExclusivityProofVerifier | None = None,
+        account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
         _capability: object | None = None,
     ) -> None:
         if _capability not in {
@@ -126,6 +131,21 @@ class UpbitFunctionalProductionGraph:
             lambda _capability_hash: None
         )
         self.clear_runtime_capability = clear_runtime_capability or (lambda: None)
+        self.account_exclusivity_proof_reader = (
+            account_exclusivity_proof_reader
+        )
+        self.account_exclusivity_verifier = account_exclusivity_verifier
+        self.account_exclusivity_verifier_pin = (
+            dict(account_exclusivity_verifier_pin)
+            if isinstance(account_exclusivity_verifier_pin, Mapping)
+            else None
+        )
+        self.account_exclusivity_verifier_status = (
+            account_exclusivity_verifier_wiring_status(
+                self.account_exclusivity_verifier,
+                self.account_exclusivity_verifier_pin,
+            )
+        )
         self.lease_reader_factory = lease_reader_factory
         self.sender = sender
         self.approved_permit_reader = approved_permit_reader
@@ -156,6 +176,12 @@ class UpbitFunctionalProductionGraph:
         with self._lock:
             return {
                 **production_entrypoint_status(),
+                "accountExclusivityVerifier": dict(
+                    self.account_exclusivity_verifier_status
+                ),
+                "accountExclusivityProofSourceWired": callable(
+                    self.account_exclusivity_proof_reader
+                ),
                 "controller": self.controller.snapshot(),
                 "startupAudit": dict(self._startup_audit),
             }
@@ -391,6 +417,9 @@ class UpbitFunctionalProductionGraph:
                 cleanup_deadline=starts_at + timedelta(hours=3),
                 clock=self.clock,
                 private_stream_reader=self.journal.snapshot,
+                account_exclusivity_proof_reader=(
+                    self.account_exclusivity_proof_reader
+                ),
             )
             scope = UpbitPermitScope.parse(
                 permit,
@@ -433,6 +462,19 @@ class UpbitFunctionalProductionGraph:
                 ),
                 terminal_stream_barrier=self._terminal_stream_barrier,
                 clock=self.clock,
+                **(
+                    {
+                        "account_exclusivity_verifier": (
+                            self.account_exclusivity_verifier
+                        ),
+                        "account_exclusivity_verifier_pin": (
+                            self.account_exclusivity_verifier_pin
+                        ),
+                    }
+                    if self.account_exclusivity_verifier is not None
+                    or self.account_exclusivity_verifier_pin is not None
+                    else {}
+                ),
             )
             durable = self.ledger.session(session_id)
             capability_hash = str(durable["capability_hash"])
@@ -1002,6 +1044,9 @@ class UpbitFunctionalProductionGraph:
             ),
             clock=self.clock,
             private_stream_reader=self.journal.snapshot,
+            account_exclusivity_proof_reader=(
+                self.account_exclusivity_proof_reader
+            ),
             cleanup_recovery=True,
         )
         edge = UpbitFunctionalMutationEdge(
@@ -1042,6 +1087,19 @@ class UpbitFunctionalProductionGraph:
                 ),
                 terminal_stream_barrier=self._terminal_stream_barrier,
                 clock=self.clock,
+                **(
+                    {
+                        "account_exclusivity_verifier": (
+                            self.account_exclusivity_verifier
+                        ),
+                        "account_exclusivity_verifier_pin": (
+                            self.account_exclusivity_verifier_pin
+                        ),
+                    }
+                    if self.account_exclusivity_verifier is not None
+                    or self.account_exclusivity_verifier_pin is not None
+                    else {}
+                ),
             )
             # Bind the cleanup owner before arming the only mutation lane.
             self.controller.attach_cleanup_recovery(service)

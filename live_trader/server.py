@@ -629,16 +629,19 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/api/program-ledger-baseline":
-            if payload.get("confirmed") is not True:
-                self.send_json(
-                    {
-                        "ok": False,
-                        "reason": "프로그램 원장 기준 저장은 명시 확인이 필요합니다.",
-                        "snapshot": state.snapshot(),
-                    }
-                )
-                return
-            self.send_json(state.seed_program_ledger_from_broker_snapshot())
+            # Whole-ledger replacement can hide an external transfer or
+            # unrelated broker drift and historically committed cash and
+            # positions in separate transactions.  It is not a safe public
+            # recovery primitive.  Reconciliation now stays fail-closed until
+            # an exact scoped, append-only adjustment is reviewed.
+            self.send_json(
+                {
+                    "ok": False,
+                    "reason": "program-ledger-wholesale-baseline-disabled",
+                    "brokerSubmissionPerformed": False,
+                    "snapshot": state.snapshot(),
+                }
+            )
             return
         if parsed.path == "/api/execution-events":
             force_snapshot = payload.get("force_snapshot")

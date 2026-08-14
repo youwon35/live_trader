@@ -3712,7 +3712,6 @@ class KisSharedRouteIntegrationTests(unittest.TestCase):
             "run_recovery_drill",
             "run_shadow_live",
             "save_environment_settings",
-            "seed_program_ledger_from_broker_snapshot",
             "set_automation_profile",
             "set_checklist_item",
             "set_flag",

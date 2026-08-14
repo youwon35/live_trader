@@ -3,12 +3,18 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Callable, Mapping
+
+
+BINANCE_CASH_TRANSFER_ADJUSTMENT_RELEASED = False
+MAX_CASH_TRANSFER_TRUTH_AGE_SECONDS = 30.0
 
 
 def now_text() -> str:
@@ -69,8 +75,18 @@ def normalized_position_side(row: dict[str, Any]) -> str:
 class ProgramLedger:
     """Small local ledger for live account/position/event reconciliation."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        cash_transfer_authority_verifier: (
+            Callable[[Mapping[str, Any]], bool] | None
+        ) = None,
+    ) -> None:
         self.path = Path(path)
+        self.cash_transfer_authority_verifier = (
+            cash_transfer_authority_verifier
+        )
         self.ensure_schema()
 
     def connect(self) -> sqlite3.Connection:
@@ -342,6 +358,55 @@ class ProgramLedger:
                     occurred_at TEXT NOT NULL,
                     reason TEXT NOT NULL
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cash_transfer_adjustments (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    adjustment_id TEXT NOT NULL UNIQUE,
+                    source_broker_id TEXT NOT NULL,
+                    source_account TEXT NOT NULL,
+                    destination_broker_id TEXT NOT NULL,
+                    destination_account TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    amount_text TEXT NOT NULL,
+                    source_cash_before_text TEXT NOT NULL,
+                    source_cash_after_text TEXT NOT NULL,
+                    destination_cash_before_text TEXT NOT NULL,
+                    destination_cash_after_text TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    truth_evidence_json TEXT NOT NULL,
+                    truth_hash TEXT NOT NULL UNIQUE,
+                    previous_hash TEXT NOT NULL,
+                    content_json TEXT NOT NULL,
+                    content_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS cash_transfer_adjustments_created_idx
+                ON cash_transfer_adjustments(created_at, sequence)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS cash_transfer_adjustments_no_update
+                BEFORE UPDATE ON cash_transfer_adjustments
+                BEGIN
+                    SELECT RAISE(ABORT, 'cash-transfer-adjustments-append-only');
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS cash_transfer_adjustments_no_delete
+                BEFORE DELETE ON cash_transfer_adjustments
+                BEGIN
+                    SELECT RAISE(ABORT, 'cash-transfer-adjustments-append-only');
+                END
                 """
             )
             conn.execute(
@@ -658,6 +723,382 @@ class ProgramLedger:
                     """
                 ).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _exact_decimal(value: object, label: str) -> Decimal:
+        text = str(value or "").strip()
+        try:
+            parsed = Decimal(text)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"{label}-invalid") from exc
+        if not parsed.is_finite() or parsed < 0:
+            raise ValueError(f"{label}-invalid")
+        return parsed
+
+    @staticmethod
+    def _decimal_equal(left: object, right: Decimal) -> bool:
+        try:
+            return Decimal(str(left)) == right
+        except (InvalidOperation, ValueError):
+            return False
+
+    def apply_binance_spot_futures_cash_transfer_adjustment(
+        self,
+        *,
+        source_account: str,
+        destination_account: str,
+        amount: object,
+        source_cash_before: object,
+        source_cash_after: object,
+        destination_cash_before: object,
+        destination_cash_after: object,
+        observed_at: str,
+        truth_evidence: dict[str, Any],
+        truth_hash: str,
+    ) -> dict[str, Any]:
+        """Atomically reclassify one proven Spot -> USD-M USDT transfer.
+
+        This intentionally cannot seed a whole broker snapshot.  Both durable
+        cash legs must still equal the caller's exact pre-transfer values, and
+        the supplied fresh official truth must prove the exact post-transfer
+        values.  Any mismatch or one-leg SQLite failure rolls back everything.
+        """
+
+        if not BINANCE_CASH_TRANSFER_ADJUSTMENT_RELEASED:
+            raise ValueError("binance-cash-transfer-adjustment-not-released")
+
+        source_name = str(source_account or "").strip()
+        destination_name = str(destination_account or "").strip()
+        if source_name != "Binance Spot" or destination_name != "Binance USD-M Futures":
+            raise ValueError("binance-cash-transfer-account-scope-invalid")
+        amount_value = self._exact_decimal(amount, "transfer-amount")
+        if amount_value != Decimal("10"):
+            raise ValueError("binance-cash-transfer-amount-must-be-exact-10-usdt")
+        source_before = self._exact_decimal(
+            source_cash_before, "source-cash-before"
+        )
+        source_after = self._exact_decimal(
+            source_cash_after, "source-cash-after"
+        )
+        destination_before = self._exact_decimal(
+            destination_cash_before, "destination-cash-before"
+        )
+        destination_after = self._exact_decimal(
+            destination_cash_after, "destination-cash-after"
+        )
+        if source_before - amount_value != source_after:
+            raise ValueError("binance-cash-transfer-source-arithmetic-mismatch")
+        if destination_before + amount_value != destination_after:
+            raise ValueError(
+                "binance-cash-transfer-destination-arithmetic-mismatch"
+            )
+        observed = _utc_observation_text(observed_at)
+        evidence = dict(truth_evidence)
+        if set(evidence) != {
+            "schemaVersion",
+            "accountFingerprint",
+            "spotCash",
+            "futuresCash",
+            "spotOpenOrderCount",
+            "futuresOpenOrderCount",
+            "futuresPositionCount",
+            "signedGetComplete",
+            "observedAt",
+            "officialTransfer",
+        }:
+            raise ValueError("binance-cash-transfer-truth-fields-not-exact")
+        account_fingerprint = str(
+            evidence.get("accountFingerprint") or ""
+        ).strip()
+        transfer = evidence.get("officialTransfer")
+        if not isinstance(transfer, dict) or set(transfer) != {
+            "tranId",
+            "asset",
+            "amount",
+            "fromAccount",
+            "toAccount",
+            "status",
+            "eventTime",
+        }:
+            raise ValueError("binance-cash-transfer-record-fields-not-exact")
+        transfer_id = str(transfer.get("tranId") or "").strip()
+        transfer_event = _utc_observation_text(transfer.get("eventTime"))
+        observed_datetime = datetime.fromisoformat(observed)
+        transfer_datetime = datetime.fromisoformat(transfer_event)
+        current_datetime = datetime.now(timezone.utc)
+        if (
+            evidence.get("schemaVersion")
+            != "binance-spot-futures-cash-transfer-truth/v1"
+            or evidence.get("signedGetComplete") is not True
+            or evidence.get("spotOpenOrderCount") != 0
+            or evidence.get("futuresOpenOrderCount") != 0
+            or evidence.get("futuresPositionCount") != 0
+            or str(evidence.get("spotCash") or "").strip()
+            != str(source_after)
+            or str(evidence.get("futuresCash") or "").strip()
+            != str(destination_after)
+            or _utc_observation_text(evidence.get("observedAt")) != observed
+            or len(account_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in account_fingerprint
+            )
+            or not transfer_id
+            or len(transfer_id) > 160
+            or any(
+                character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+                for character in transfer_id
+            )
+            or str(transfer.get("asset") or "").strip() != "USDT"
+            or not self._decimal_equal(transfer.get("amount"), amount_value)
+            or str(transfer.get("fromAccount") or "").strip() != "SPOT"
+            or str(transfer.get("toAccount") or "").strip()
+            != "USD_M_FUTURES"
+            or str(transfer.get("status") or "").strip() != "CONFIRMED"
+            or transfer_datetime > observed_datetime
+            or observed_datetime > current_datetime
+            or (
+                current_datetime - observed_datetime
+            ).total_seconds() > MAX_CASH_TRANSFER_TRUTH_AGE_SECONDS
+        ):
+            raise ValueError("binance-cash-transfer-truth-not-exact")
+        truth_evidence_json = json.dumps(
+            evidence,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        normalized_truth_hash = str(truth_hash or "").strip()
+        if (
+            len(normalized_truth_hash) != 64
+            or any(character not in "0123456789abcdef" for character in normalized_truth_hash)
+        ):
+            raise ValueError("binance-cash-transfer-truth-hash-invalid")
+        if not secrets.compare_digest(
+            normalized_truth_hash,
+            hashlib.sha256(truth_evidence_json.encode("utf-8")).hexdigest(),
+        ):
+            raise ValueError("binance-cash-transfer-truth-hash-mismatch")
+
+        authority_request = {
+            "schemaVersion": "binance-cash-transfer-adjustment-authority/v1",
+            "sourceBrokerId": "binance",
+            "destinationBrokerId": "binance-futures",
+            "sourceAccount": source_name,
+            "destinationAccount": destination_name,
+            "accountFingerprint": account_fingerprint,
+            "amount": str(amount_value),
+            "sourceCashBefore": str(source_before),
+            "sourceCashAfter": str(source_after),
+            "destinationCashBefore": str(destination_before),
+            "destinationCashAfter": str(destination_after),
+            "observedAt": observed,
+            "officialTransfer": dict(transfer),
+            "truthHash": normalized_truth_hash,
+        }
+        verifier = self.cash_transfer_authority_verifier
+        if verifier is None or verifier(authority_request) is not True:
+            raise ValueError("binance-cash-transfer-authority-unverified")
+
+        adjustment_id = "cash-transfer-adjustment-" + uuid.uuid4().hex
+        created_at = now_text()
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            source_row = conn.execute(
+                """
+                SELECT cash FROM cash_balances
+                WHERE broker_id='binance' AND account=? AND currency='USDT'
+                """,
+                (source_name,),
+            ).fetchone()
+            destination_row = conn.execute(
+                """
+                SELECT cash FROM cash_balances
+                WHERE broker_id='binance-futures' AND account=? AND currency='USDT'
+                """,
+                (destination_name,),
+            ).fetchone()
+            if source_row is None or destination_row is None:
+                raise ValueError("binance-cash-transfer-durable-legs-missing")
+            prior_transfers = conn.execute(
+                "SELECT truth_evidence_json FROM cash_transfer_adjustments"
+            ).fetchall()
+            for prior in prior_transfers:
+                prior_evidence = json.loads(str(prior[0]))
+                prior_transfer = prior_evidence.get("officialTransfer")
+                if (
+                    isinstance(prior_transfer, dict)
+                    and str(prior_transfer.get("tranId") or "").strip()
+                    == transfer_id
+                ):
+                    raise ValueError(
+                        "binance-cash-transfer-record-already-consumed"
+                    )
+            if not self._decimal_equal(source_row["cash"], source_before):
+                raise ValueError("binance-cash-transfer-source-cas-changed")
+            if not self._decimal_equal(
+                destination_row["cash"], destination_before
+            ):
+                raise ValueError("binance-cash-transfer-destination-cas-changed")
+            previous_row = conn.execute(
+                """
+                SELECT content_hash FROM cash_transfer_adjustments
+                ORDER BY sequence DESC LIMIT 1
+                """
+            ).fetchone()
+            previous_hash = str(previous_row[0]) if previous_row is not None else ""
+            content = {
+                "schemaVersion": "program-ledger-cash-transfer-adjustment/v1",
+                "adjustmentId": adjustment_id,
+                "sourceBrokerId": "binance",
+                "sourceAccount": source_name,
+                "destinationBrokerId": "binance-futures",
+                "destinationAccount": destination_name,
+                "currency": "USDT",
+                "amount": str(amount_value),
+                "sourceCashBefore": str(source_before),
+                "sourceCashAfter": str(source_after),
+                "destinationCashBefore": str(destination_before),
+                "destinationCashAfter": str(destination_after),
+                "observedAt": observed,
+                "truthHash": normalized_truth_hash,
+                "previousHash": previous_hash,
+            }
+            content_json = json.dumps(
+                content,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            content_hash = hashlib.sha256(
+                content_json.encode("utf-8")
+            ).hexdigest()
+            source_updated = conn.execute(
+                """
+                UPDATE cash_balances SET cash=?, updated_at=?, source=?
+                WHERE broker_id='binance' AND account=? AND currency='USDT'
+                  AND cash=?
+                """,
+                (
+                    float(source_after),
+                    created_at,
+                    "cash_transfer_adjustment",
+                    source_name,
+                    float(source_before),
+                ),
+            ).rowcount
+            destination_updated = conn.execute(
+                """
+                UPDATE cash_balances SET cash=?, updated_at=?, source=?
+                WHERE broker_id='binance-futures' AND account=?
+                  AND currency='USDT' AND cash=?
+                """,
+                (
+                    float(destination_after),
+                    created_at,
+                    "cash_transfer_adjustment",
+                    destination_name,
+                    float(destination_before),
+                ),
+            ).rowcount
+            if source_updated != 1 or destination_updated != 1:
+                raise ValueError("binance-cash-transfer-two-leg-cas-changed")
+            conn.execute(
+                """
+                INSERT INTO cash_transfer_adjustments(
+                    adjustment_id, source_broker_id, source_account,
+                    destination_broker_id, destination_account, currency,
+                    amount_text, source_cash_before_text,
+                    source_cash_after_text, destination_cash_before_text,
+                    destination_cash_after_text, observed_at, truth_hash,
+                    truth_evidence_json, previous_hash, content_json,
+                    content_hash, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    adjustment_id,
+                    "binance",
+                    source_name,
+                    "binance-futures",
+                    destination_name,
+                    "USDT",
+                    str(amount_value),
+                    str(source_before),
+                    str(source_after),
+                    str(destination_before),
+                    str(destination_after),
+                    observed,
+                    normalized_truth_hash,
+                    truth_evidence_json,
+                    previous_hash,
+                    content_json,
+                    content_hash,
+                    created_at,
+                ),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        return {
+            "ok": True,
+            "adjustmentId": adjustment_id,
+            "contentHash": content_hash,
+            "sourceCash": str(source_after),
+            "destinationCash": str(destination_after),
+        }
+
+    def cash_transfer_adjustment_rows(self) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT sequence, adjustment_id, source_broker_id, source_account,
+                       destination_broker_id, destination_account, currency,
+                       amount_text, observed_at, truth_hash, previous_hash,
+                       truth_evidence_json, content_json, content_hash, created_at
+                FROM cash_transfer_adjustments
+                ORDER BY sequence
+                """
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        previous_hash = ""
+        previous_sequence = 0
+        for raw in rows:
+            row = dict(raw)
+            sequence = int(row["sequence"])
+            evidence_json = str(row["truth_evidence_json"])
+            content_json = str(row["content_json"])
+            content_hash = hashlib.sha256(content_json.encode("utf-8")).hexdigest()
+            truth_hash = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+            if (
+                sequence <= previous_sequence
+                or str(row["previous_hash"]) != previous_hash
+                or not secrets.compare_digest(
+                    str(row["content_hash"]), content_hash
+                )
+                or not secrets.compare_digest(str(row["truth_hash"]), truth_hash)
+            ):
+                raise ValueError("cash-transfer-adjustment-chain-invalid")
+            content = json.loads(content_json)
+            evidence = json.loads(evidence_json)
+            if (
+                not isinstance(content, dict)
+                or not isinstance(evidence, dict)
+                or content.get("adjustmentId") != row["adjustment_id"]
+                or content.get("previousHash") != previous_hash
+                or content.get("truthHash") != row["truth_hash"]
+            ):
+                raise ValueError("cash-transfer-adjustment-chain-invalid")
+            result.append(row)
+            previous_hash = content_hash
+            previous_sequence = sequence
+        return result
 
     @staticmethod
     def _validate_functional_test_equity_identity(
@@ -1399,10 +1840,80 @@ class ProgramLedger:
         positions: list[dict[str, Any]],
         source: str = "broker_snapshot",
     ) -> dict[str, Any]:
+        updated_at = now_text()
+        prepared_cash: list[tuple[str, str, str, float, str, str]] = []
+        for row in accounts:
+            broker_id = str(row.get("broker_id") or "").strip()
+            if not broker_id:
+                continue
+            prepared_cash.append(
+                (
+                    broker_id,
+                    str(row.get("account") or broker_id).strip(),
+                    str(row.get("currency") or "").strip(),
+                    numeric_value(row.get("broker_cash", row.get("cash", 0.0))),
+                    updated_at,
+                    source,
+                )
+            )
+        prepared_positions: list[
+            tuple[str, str, str, str, str, float, float, str, str]
+        ] = []
+        for row in positions:
+            broker_id = str(row.get("broker_id") or "").strip()
+            symbol = str(row.get("symbol") or "").strip()
+            if not broker_id or not symbol:
+                continue
+            prepared_positions.append(
+                (
+                    broker_id,
+                    symbol,
+                    normalized_position_side(row),
+                    str(row.get("asset") or ""),
+                    str(row.get("currency") or ""),
+                    numeric_value(
+                        row.get("broker_qty", row.get("quantity", 0.0))
+                    ),
+                    numeric_value(
+                        row.get("broker_value", row.get("value", 0.0))
+                    ),
+                    updated_at,
+                    source,
+                )
+            )
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM cash_balances")
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO cash_balances
+                (broker_id, account, currency, cash, updated_at, source)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                prepared_cash,
+            )
+            conn.execute("DELETE FROM positions")
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO positions
+                (broker_id, symbol, position_side, asset, currency, quantity,
+                 value, updated_at, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                prepared_positions,
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
         return {
-            "updated_at": now_text(),
-            "cash_count": self.replace_cash_rows(accounts, source),
-            "position_count": self.replace_position_rows(positions, source),
+            "updated_at": updated_at,
+            "cash_count": len(prepared_cash),
+            "position_count": len(prepared_positions),
             "source": source,
         }
 

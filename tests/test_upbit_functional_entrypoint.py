@@ -111,7 +111,7 @@ class UpbitFunctionalEntrypointTest(unittest.TestCase):
             self.assertEqual([], calls)
 
     @staticmethod
-    def graph(path: Path, *, calls: list[str]):
+    def graph(path: Path, *, calls: list[str], **extra):
         safe_runtime = {
             "newEntriesBlocked": True,
             "realOrdersEnabled": False,
@@ -142,6 +142,27 @@ class UpbitFunctionalEntrypointTest(unittest.TestCase):
                 AssertionError("audit must not use network")
             ),
             clear_runtime_capability=lambda: calls.append("clear"),
+            **extra,
+        )
+
+    def test_graph_reports_exact_exclusivity_verifier_and_proof_source_wiring(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            graph = self.graph(
+                Path(temporary) / "upbit-verifier-wiring.sqlite3",
+                calls=[],
+                account_exclusivity_proof_reader=lambda **_kwargs: {},
+                account_exclusivity_verifier=TEST_EXCLUSIVITY_VERIFIER,
+                account_exclusivity_verifier_pin=(
+                    TEST_EXCLUSIVITY_VERIFIER_PIN
+                ),
+            )
+            status = graph.status()
+        self.assertTrue(status["accountExclusivityProofSourceWired"])
+        self.assertTrue(status["accountExclusivityVerifier"]["ready"])
+        self.assertTrue(
+            status["accountExclusivityVerifier"]["runtimeIdentityMatched"]
         )
 
     def test_graph_constructs_offline_but_start_is_hard_unavailable(self) -> None:

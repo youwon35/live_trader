@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import closing
 from decimal import Decimal
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -240,6 +242,102 @@ class BinanceSpotFunctionalLifecycleTest(unittest.TestCase):
         self.assertFalse(sealed["realOrdersEnabled"])
         self.assertFalse(sealed["functionalOnlyRouting"])
         self.assertTrue(sealed["newEntriesBlocked"])
+
+    def test_cleanup_and_final_reset_cas_exact_owner_session_revision(self) -> None:
+        with self.ready_env():
+            handle = self.manager.start(
+                permit(self.clock),
+                owner_id="owner-process-exact-cas",
+                owner_token=OWNER_TOKEN,
+            )
+            active = self.manager.status()
+            cleanup = self.manager.begin_cleanup(
+                handle, reason="exact CAS regression"
+            )
+            reset = self.manager.control.prepare_final_reset(
+                session_id=handle.session_id,
+                owner_id=handle.owner_id,
+                owner_token=handle.owner_token,
+            )
+
+        self.assertEqual("CLEANUP", cleanup["phase"])
+        self.assertEqual(handle.session_id, cleanup["session_id"])
+        self.assertEqual(handle.owner_id, cleanup["owner_id"])
+        self.assertEqual(int(active["revision"]) + 1, cleanup["revision"])
+        self.assertEqual("FINAL_RESET", reset["phase"])
+        self.assertEqual(handle.session_id, reset["session_id"])
+        self.assertEqual(handle.owner_id, reset["owner_id"])
+        self.assertEqual(int(cleanup["revision"]) + 1, reset["revision"])
+
+    def test_begin_cleanup_stale_precheck_cannot_cross_owner_epoch(self) -> None:
+        with self.ready_env():
+            handle = self.manager.start(
+                permit(self.clock),
+                owner_id="owner-process-stale-cleanup",
+                owner_token=OWNER_TOKEN,
+            )
+        stale = self.manager.control._row()
+        self.assertIsNotNone(stale)
+        replacement_token = "replacement-owner-token-000000000001"
+        with closing(self.manager.control._connect()) as connection:
+            connection.execute(
+                """
+                UPDATE binance_spot_functional_control
+                SET owner_id=?, owner_token_hash=?, revision=revision+1
+                """,
+                (
+                    "replacement-cleanup-owner",
+                    hashlib.sha256(replacement_token.encode("utf-8")).hexdigest(),
+                ),
+            )
+            connection.commit()
+
+        with patch.object(self.manager.control, "_row", return_value=stale):
+            with self.assertRaisesRegex(
+                BinanceSpotLifecycleError, "owner/session epoch changed"
+            ):
+                self.manager.begin_cleanup(handle, reason="must not cross epoch")
+
+        durable = self.manager.status()
+        self.assertEqual("ACTIVE", durable["phase"])
+        self.assertEqual("replacement-cleanup-owner", durable["ownerId"])
+
+    def test_prepare_final_reset_stale_precheck_cannot_cross_owner_epoch(self) -> None:
+        with self.ready_env():
+            handle = self.manager.start(
+                permit(self.clock),
+                owner_id="owner-process-stale-final",
+                owner_token=OWNER_TOKEN,
+            )
+        stale = self.manager.control._row()
+        self.assertIsNotNone(stale)
+        replacement_token = "replacement-final-token-0000000000001"
+        with closing(self.manager.control._connect()) as connection:
+            connection.execute(
+                """
+                UPDATE binance_spot_functional_control
+                SET owner_id=?, owner_token_hash=?, revision=revision+1
+                """,
+                (
+                    "replacement-final-owner",
+                    hashlib.sha256(replacement_token.encode("utf-8")).hexdigest(),
+                ),
+            )
+            connection.commit()
+
+        with patch.object(self.manager.control, "_row", return_value=stale):
+            with self.assertRaisesRegex(
+                BinanceSpotLifecycleError, "owner/session epoch changed"
+            ):
+                self.manager.control.prepare_final_reset(
+                    session_id=handle.session_id,
+                    owner_id=handle.owner_id,
+                    owner_token=handle.owner_token,
+                )
+
+        durable = self.manager.status()
+        self.assertEqual("ACTIVE", durable["phase"])
+        self.assertEqual("replacement-final-owner", durable["ownerId"])
 
     def test_owner_loss_restart_can_only_take_over_cleanup_and_flatten(self) -> None:
         with self.ready_env():

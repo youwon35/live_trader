@@ -49,16 +49,32 @@ class FakeManager:
         self.clock = clock
         self.phase = "IDLE"
         self.session_id = ""
+        self.owner_id = ""
+        self.owner_token = ""
+        self.revision = 0
+        self.cleanup_failures_before_commit = 0
+        self.cleanup_raise_after_commit = False
+        self.cleanup_calls = 0
+        self.terminal_reset_override: bool | None = None
         self.start_pointer: dict[str, str] = {}
         self.recovery: object = {"startupRecovery": "NONE"}
 
     def audit_incomplete_startup(self):
+        if isinstance(self.recovery, LifecycleHandle):
+            self.session_id = self.recovery.session_id
+            self.owner_id = self.recovery.owner_id
+            self.owner_token = self.recovery.owner_token
+            self.phase = "CLEANUP"
+            self.revision = max(1, self.revision)
         return self.recovery
 
     def start(self, pointer, *, owner_id: str, owner_token: str):
         self.start_pointer = dict(pointer)
         self.session_id = "bnsft-backend-0000000000000001"
+        self.owner_id = owner_id
+        self.owner_token = owner_token
         self.phase = "ACTIVE"
+        self.revision += 1
         return LifecycleHandle(
             session_id=self.session_id,
             capability="raw-functional-capability-must-never-escape",
@@ -69,11 +85,41 @@ class FakeManager:
         )
 
     def begin_cleanup(self, _handle, *, reason: str):
+        self.cleanup_calls += 1
+        if self.cleanup_failures_before_commit > 0:
+            self.cleanup_failures_before_commit -= 1
+            raise RuntimeError("durable cleanup write unavailable")
+        self.session_id = _handle.session_id
+        self.owner_id = _handle.owner_id
+        self.owner_token = _handle.owner_token
         self.phase = "CLEANUP"
-        return {"phase": self.phase, "detail": reason}
+        self.revision += 1
+        result = {
+            "phase": self.phase,
+            "sessionId": self.session_id,
+            "ownerId": self.owner_id,
+            "revision": self.revision,
+            "detail": reason,
+        }
+        if self.cleanup_raise_after_commit:
+            self.cleanup_raise_after_commit = False
+            raise RuntimeError("response lost after durable cleanup commit")
+        return result
 
     def status(self):
-        return {"phase": self.phase, "sessionId": self.session_id}
+        terminal = (
+            self.phase in {"FAILED", "FINALIZED"}
+            if self.terminal_reset_override is None
+            else self.terminal_reset_override
+        )
+        return {
+            "phase": self.phase,
+            "sessionId": self.session_id,
+            "ownerId": self.owner_id,
+            "revision": self.revision,
+            "functionalCapabilityReset": terminal,
+            "ownerTokenReset": terminal,
+        }
 
 
 class FakeScheduler:
@@ -119,6 +165,24 @@ class AlwaysEscapingScheduler:
         raise OSError("scheduler storage unavailable")
 
 
+class FalseTerminalScheduler:
+    def __init__(self, *, manager: FakeManager) -> None:
+        self.manager = manager
+
+    def run(self, _handle, *, stop_event: threading.Event):
+        del stop_event
+        return {"ok": True, "status": "FINALIZED"}
+
+
+class RawReconciliationScheduler:
+    def __init__(self, *, manager: FakeManager) -> None:
+        self.manager = manager
+
+    def run(self, _handle, *, stop_event: threading.Event):
+        del stop_event
+        return {"ok": False, "status": "RECONCILIATION_REQUIRED"}
+
+
 class TerminalOnlyBootstrapStore:
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
@@ -128,6 +192,44 @@ class TerminalOnlyBootstrapStore:
         if session_id != self.session_id:
             return None
         return {"bootstrap_id": "binance-first-live-recovered-terminal-only"}
+
+    def fail(self, *, bootstrap_id: str, detail: str):
+        self.failed.append((bootstrap_id, detail))
+        return {"state": "FAILED"}
+
+
+class TerminalEvidenceLedger:
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+
+    def session(self, session_id: str):
+        if session_id != self.session_id:
+            raise AssertionError("unexpected terminal session")
+        return {
+            "permit_id": "binance-terminal-permit-0001",
+            "permit_hash": "a" * 64,
+        }
+
+    def final_evidence(self, session_id: str):
+        if session_id != self.session_id:
+            raise AssertionError("unexpected terminal evidence session")
+        return {
+            "evidence": {
+                "sessionId": session_id,
+                "outcome": "SAFE_INCOMPLETE_EARLY_TERMINATION",
+            },
+            "evidenceHash": "b" * 64,
+        }
+
+
+class FailingConsumeBootstrapStore:
+    def __init__(self) -> None:
+        self.consume_calls: list[dict[str, object]] = []
+        self.failed: list[tuple[str, str]] = []
+
+    def consume_terminal(self, **kwargs):
+        self.consume_calls.append(dict(kwargs))
+        raise RuntimeError("terminal bootstrap store unavailable")
 
     def fail(self, *, bootstrap_id: str, detail: str):
         self.failed.append((bootstrap_id, detail))
@@ -509,6 +611,79 @@ class BinanceSpotFunctionalBackendTest(unittest.TestCase):
             bootstrap_store.failed[0][0],
         )
 
+    def test_finalized_lifecycle_consume_failure_stays_reconciliation(self) -> None:
+        handle = LifecycleHandle(
+            session_id="bnsft-finalized-consume-fault-0001",
+            capability="finalized-consume-capability-private",
+            owner_id="finalized-consume-owner",
+            owner_token="finalized-consume-token-00000000001",
+            expires_epoch=self.clock(),
+            cleanup_deadline_epoch=self.clock() + 3600,
+        )
+        bootstrap_id = "binance-first-live-consume-fault-0001"
+        bootstrap_store = FailingConsumeBootstrapStore()
+        self.manager.phase = "FINALIZED"
+        self.manager.session_id = handle.session_id
+        self.manager.owner_id = handle.owner_id
+        self.manager.owner_token = handle.owner_token
+        self.manager.revision = 19
+        self.manager.ledger = TerminalEvidenceLedger(  # type: ignore[attr-defined]
+            handle.session_id
+        )
+        self.backend.first_live_bootstrap_store = bootstrap_store  # type: ignore[assignment]
+        self.backend.scheduler_factory = FalseTerminalScheduler
+        self.backend._handle = handle
+        self.backend._active_first_live_bootstrap_id = bootstrap_id
+        self.backend._generation = 15
+
+        self.backend._run_scheduler(15)
+
+        status = self.backend.status()
+        self.assertEqual("FINALIZED", self.manager.phase)
+        self.assertEqual("RECONCILIATION_REQUIRED", status["terminalState"])
+        self.assertFalse(self.backend._last_result["ok"])
+        self.assertFalse(
+            self.backend._last_result["firstLiveBootstrapConsumed"]
+        )
+        self.assertEqual(
+            "FINALIZED", self.backend._last_result["durableLifecyclePhase"]
+        )
+        self.assertEqual(1, len(bootstrap_store.consume_calls))
+        self.assertEqual(1, len(bootstrap_store.failed))
+        self.assertEqual(bootstrap_id, bootstrap_store.failed[0][0])
+        self.assertIsNone(self.backend._handle)
+
+    def test_raw_reconciliation_does_not_burn_durable_cleanup_bootstrap(self) -> None:
+        handle = LifecycleHandle(
+            session_id="bnsft-raw-reconcile-cleanup-0001",
+            capability="raw-reconcile-cleanup-capability-private",
+            owner_id="raw-reconcile-cleanup-owner",
+            owner_token="raw-reconcile-cleanup-token-00000001",
+            expires_epoch=self.clock(),
+            cleanup_deadline_epoch=self.clock() + 3600,
+        )
+        bootstrap_store = TerminalOnlyBootstrapStore(handle.session_id)
+        self.manager.phase = "CLEANUP"
+        self.manager.session_id = handle.session_id
+        self.manager.owner_id = handle.owner_id
+        self.manager.owner_token = handle.owner_token
+        self.manager.revision = 23
+        self.backend.first_live_bootstrap_store = bootstrap_store  # type: ignore[assignment]
+        self.backend.scheduler_factory = RawReconciliationScheduler
+        self.backend._handle = handle
+        self.backend._active_first_live_bootstrap_id = (
+            "binance-first-live-raw-reconcile-0001"
+        )
+        self.backend._generation = 16
+
+        self.backend._run_scheduler(16)
+
+        self.assertEqual([], bootstrap_store.failed)
+        self.assertIs(handle, self.backend._handle)
+        self.assertEqual(
+            "CLEANUP_RETRY_REQUIRED", self.backend._terminal_state
+        )
+
     def test_explicit_recovery_spawn_failure_is_retryable_without_secret_loss(
         self,
     ) -> None:
@@ -593,6 +768,209 @@ class BinanceSpotFunctionalBackendTest(unittest.TestCase):
             if self.backend.status()["terminalState"] == "FINALIZED":
                 break
             threading.Event().wait(0.01)
+        self.assertEqual("FINALIZED", self.backend.status()["terminalState"])
+
+    def test_operator_stop_failure_preserves_handle_until_exact_cleanup_retry(
+        self,
+    ) -> None:
+        handle = LifecycleHandle(
+            session_id="bnsft-stop-retry-00000000000001",
+            capability="stop-retry-capability-never-exposed",
+            owner_id="stop-retry-owner",
+            owner_token="stop-retry-owner-token-00000000001",
+            expires_epoch=self.clock() + 7200,
+            cleanup_deadline_epoch=self.clock() + 10800,
+        )
+        self.manager.phase = "ACTIVE"
+        self.manager.session_id = handle.session_id
+        self.manager.owner_id = handle.owner_id
+        self.manager.owner_token = handle.owner_token
+        self.manager.revision = 7
+        self.manager.cleanup_failures_before_commit = 1
+        self.backend._handle = handle
+
+        failed = self.backend.stop(
+            {"operatorConfirmation": self.confirmation}
+        )
+        self.assertFalse(failed["ok"])
+        self.assertTrue(failed["retryable"])
+        self.assertEqual("ACTIVE", self.manager.phase)
+        self.assertIs(handle, self.backend._handle)
+        self.assertEqual(
+            "CLEANUP_RETRY_REQUIRED",
+            failed["status"]["terminalState"],
+        )
+        self.assertFalse(failed["brokerSubmissionPerformed"])
+
+        retried = self.backend.stop(
+            {"operatorConfirmation": self.confirmation}
+        )
+        self.assertTrue(retried["ok"])
+        self.assertEqual("CLEANUP", self.manager.phase)
+        self.assertEqual(8, retried["durableCleanupRevision"])
+        self.assertIs(handle, self.backend._handle)
+
+    def test_operator_stop_accepts_exception_only_after_fresh_durable_commit(
+        self,
+    ) -> None:
+        handle = LifecycleHandle(
+            session_id="bnsft-stop-after-commit-00000001",
+            capability="stop-after-commit-capability-never-exposed",
+            owner_id="stop-after-commit-owner",
+            owner_token="stop-after-commit-token-000000000001",
+            expires_epoch=self.clock() + 7200,
+            cleanup_deadline_epoch=self.clock() + 10800,
+        )
+        self.manager.phase = "ACTIVE"
+        self.manager.session_id = handle.session_id
+        self.manager.owner_id = handle.owner_id
+        self.manager.owner_token = handle.owner_token
+        self.manager.revision = 11
+        self.manager.cleanup_raise_after_commit = True
+        self.backend._handle = handle
+
+        stopped = self.backend.stop(
+            {"operatorConfirmation": self.confirmation}
+        )
+
+        self.assertTrue(stopped["ok"])
+        self.assertEqual(12, stopped["durableCleanupRevision"])
+        self.assertEqual("CLEANUP", self.manager.phase)
+        self.assertIs(handle, self.backend._handle)
+        self.assertFalse(stopped["brokerSubmissionPerformed"])
+
+    def test_scheduler_escape_cleanup_and_revocation_fault_preserves_handle(
+        self,
+    ) -> None:
+        handle = LifecycleHandle(
+            session_id="bnsft-escape-double-fault-000001",
+            capability="escape-double-fault-capability-private",
+            owner_id="escape-double-fault-owner",
+            owner_token="escape-double-fault-token-000000001",
+            expires_epoch=self.clock() + 7200,
+            cleanup_deadline_epoch=self.clock() + 10800,
+        )
+        self.manager.phase = "ACTIVE"
+        self.manager.session_id = handle.session_id
+        self.manager.owner_id = handle.owner_id
+        self.manager.owner_token = handle.owner_token
+        self.manager.revision = 3
+        self.manager.cleanup_failures_before_commit = 1
+        self.backend._handle = handle
+        self.backend._generation = 9
+        self.backend.scheduler_factory = AlwaysEscapingScheduler
+
+        self.backend._run_scheduler(9)
+
+        status = self.backend.status()
+        self.assertEqual("ACTIVE", self.manager.phase)
+        self.assertEqual("CLEANUP_RETRY_REQUIRED", status["terminalState"])
+        self.assertIs(handle, self.backend._handle)
+        self.assertNotIn(
+            "escape-double-fault-capability", json.dumps(status, sort_keys=True)
+        )
+
+    def test_scheduler_terminal_claim_cannot_clear_active_durable_handle(
+        self,
+    ) -> None:
+        handle = LifecycleHandle(
+            session_id="bnsft-false-terminal-0000000001",
+            capability="false-terminal-capability-private",
+            owner_id="false-terminal-owner",
+            owner_token="false-terminal-token-000000000001",
+            expires_epoch=self.clock() + 7200,
+            cleanup_deadline_epoch=self.clock() + 10800,
+        )
+        self.manager.phase = "ACTIVE"
+        self.manager.session_id = handle.session_id
+        self.manager.owner_id = handle.owner_id
+        self.manager.owner_token = handle.owner_token
+        self.manager.revision = 5
+        self.backend._handle = handle
+        self.backend._generation = 12
+        self.backend.scheduler_factory = FalseTerminalScheduler
+
+        self.backend._run_scheduler(12)
+
+        status = self.backend.status()
+        self.assertEqual("ACTIVE", self.manager.phase)
+        self.assertEqual("CLEANUP_RETRY_REQUIRED", status["terminalState"])
+        self.assertIs(handle, self.backend._handle)
+        self.assertFalse(status["schedulerRunning"])
+
+    def test_terminal_phase_without_both_secret_resets_retains_handle(self) -> None:
+        handle = LifecycleHandle(
+            session_id="bnsft-unreset-terminal-000000001",
+            capability="unreset-terminal-capability-private",
+            owner_id="unreset-terminal-owner",
+            owner_token="unreset-terminal-token-00000000001",
+            expires_epoch=self.clock() + 7200,
+            cleanup_deadline_epoch=self.clock() + 10800,
+        )
+        self.manager.phase = "FAILED"
+        self.manager.session_id = handle.session_id
+        self.manager.owner_id = handle.owner_id
+        self.manager.owner_token = handle.owner_token
+        self.manager.revision = 6
+        self.manager.terminal_reset_override = False
+        self.backend._handle = handle
+        self.backend._generation = 13
+        self.backend.scheduler_factory = FalseTerminalScheduler
+
+        self.backend._run_scheduler(13)
+
+        self.assertIs(handle, self.backend._handle)
+        self.assertEqual("CLEANUP_RETRY_REQUIRED", self.backend._terminal_state)
+
+    def test_unreadable_durable_terminal_control_retains_handle(self) -> None:
+        handle = LifecycleHandle(
+            session_id="bnsft-unknown-terminal-000000001",
+            capability="unknown-terminal-capability-private",
+            owner_id="unknown-terminal-owner",
+            owner_token="unknown-terminal-token-00000000001",
+            expires_epoch=self.clock() + 7200,
+            cleanup_deadline_epoch=self.clock() + 10800,
+        )
+        self.backend._handle = handle
+        self.backend._generation = 14
+        self.backend.scheduler_factory = FalseTerminalScheduler
+        self.manager.status = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            RuntimeError("durable control unreadable")
+        )
+
+        self.backend._run_scheduler(14)
+
+        self.assertIs(handle, self.backend._handle)
+        self.assertEqual("CLEANUP_RETRY_REQUIRED", self.backend._terminal_state)
+
+    def test_final_reset_in_process_recover_resumes_without_cleanup_reentry(
+        self,
+    ) -> None:
+        handle = LifecycleHandle(
+            session_id="bnsft-final-reset-recover-000001",
+            capability="final-reset-recover-capability-private",
+            owner_id="final-reset-recover-owner",
+            owner_token="final-reset-recover-token-000000001",
+            expires_epoch=self.clock(),
+            cleanup_deadline_epoch=self.clock() + 3600,
+        )
+        self.manager.phase = "FINAL_RESET"
+        self.manager.session_id = handle.session_id
+        self.manager.owner_id = handle.owner_id
+        self.manager.owner_token = handle.owner_token
+        self.manager.revision = 17
+        self.backend._handle = handle
+        self.backend.scheduler_factory = ImmediateFinalScheduler
+
+        recovered = self.backend.recover(
+            {"operatorConfirmation": self.confirmation}
+        )
+        self.assertTrue(recovered["ok"])
+        for _ in range(100):
+            if self.backend.status()["terminalState"] == "FINALIZED":
+                break
+            threading.Event().wait(0.01)
+        self.assertEqual(0, self.manager.cleanup_calls)
         self.assertEqual("FINALIZED", self.backend.status()["terminalState"])
 
     def test_raw_permit_bar_signal_capability_and_caps_are_rejected(self) -> None:

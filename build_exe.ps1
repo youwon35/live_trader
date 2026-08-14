@@ -1,3 +1,8 @@
+param(
+  [switch]$PendingOnly,
+  [switch]$SkipDependencyInstall
+)
+
 $ErrorActionPreference = "Stop"
 
 function Assert-NativeCommandSucceeded([string]$Step) {
@@ -10,13 +15,22 @@ if (-not (Test-Path ".venv")) {
   py -m venv .venv
 }
 
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-Assert-NativeCommandSucceeded "pip upgrade"
-.\.venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
-Assert-NativeCommandSucceeded "desktop dependency install"
+if (-not $SkipDependencyInstall) {
+  .\.venv\Scripts\python.exe -m pip install --upgrade pip
+  Assert-NativeCommandSucceeded "pip upgrade"
+  .\.venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
+  Assert-NativeCommandSucceeded "desktop dependency install"
 
-npm install
-Assert-NativeCommandSucceeded "npm install"
+  npm install
+  Assert-NativeCommandSucceeded "npm install"
+} else {
+  if (-not (Test-Path ".venv\Scripts\python.exe")) {
+    throw "SkipDependencyInstall requires an existing project virtualenv"
+  }
+  if (-not (Test-Path "node_modules")) {
+    throw "SkipDependencyInstall requires existing node_modules"
+  }
+}
 npm run build
 Assert-NativeCommandSucceeded "frontend build"
 node ..\scripts\desktop_scale_click_contract.mjs --app live_trader --app-root $PWD
@@ -26,8 +40,8 @@ Assert-NativeCommandSucceeded "desktop scale/click contract"
 Assert-NativeCommandSucceeded "desktop icon generation"
 
 $liveTraderRunning = @(Get-Process -Name "LiveTrader" -ErrorAction SilentlyContinue).Count -gt 0
-$distPath = if ($liveTraderRunning) { "release_pending" } else { "release" }
-$workPath = if ($liveTraderRunning) { "build_pending" } else { "build" }
+$distPath = if ($PendingOnly -or $liveTraderRunning) { "release_pending" } else { "release" }
+$workPath = if ($PendingOnly -or $liveTraderRunning) { "build_pending" } else { "build" }
 
 if (Test-Path $workPath) {
   Remove-Item -Recurse -Force $workPath
@@ -35,7 +49,9 @@ if (Test-Path $workPath) {
 if (Test-Path $distPath) {
   Remove-Item -Recurse -Force $distPath
 }
-if ($liveTraderRunning) {
+if ($PendingOnly) {
+  Write-Host "PendingOnly is set; building only in $distPath and leaving the active release untouched."
+} elseif ($liveTraderRunning) {
   Write-Host "LiveTrader is running; building the replacement binary in $distPath without interrupting monitoring."
 }
 

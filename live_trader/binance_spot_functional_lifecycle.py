@@ -190,6 +190,102 @@ class DurableBinanceSpotFunctionalControl:
         assert updated is not None
         return updated
 
+    def _owned_transition(
+        self,
+        *,
+        expected_phases: set[str],
+        expected_session_id: str,
+        owner_id: str,
+        owner_token: str,
+        values: Mapping[str, Any],
+        allow_expired: bool,
+    ) -> dict[str, Any]:
+        """CAS one owner transition from a row read in the same transaction.
+
+        Reading owner/session first and then delegating to ``_update`` leaves
+        a window in which another owner epoch can replace the durable row.
+        This boundary compares the exact phase, revision, session, owner id,
+        and owner-token hash selected under ``BEGIN IMMEDIATE``.
+        """
+
+        normalized_owner = _text(owner_id)
+        normalized_session = _text(expected_session_id)
+        token_hash = _secret_hash(owner_token)
+        now = float(self.clock())
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM binance_spot_functional_control WHERE route_key=?",
+                (ROUTE_KEY,),
+            ).fetchone()
+            phase = _text(row["phase"]).upper() if row is not None else ""
+            if (
+                row is None
+                or phase not in expected_phases
+                or _text(row["session_id"]) != normalized_session
+                or _text(row["owner_id"]) != normalized_owner
+                or not secrets.compare_digest(
+                    _text(row["owner_token_hash"]), token_hash
+                )
+                or (
+                    not allow_expired
+                    and now >= float(row["owner_lease_expires_epoch"])
+                )
+            ):
+                connection.rollback()
+                raise BinanceSpotLifecycleError(
+                    "functional lifecycle owner/session epoch changed"
+                )
+            revision = int(row["revision"])
+            assignments = [f"{field}=?" for field in values]
+            params = list(values.values())
+            assignments.extend(["revision=revision+1", "updated_epoch=?"])
+            params.extend(
+                [
+                    now,
+                    ROUTE_KEY,
+                    phase,
+                    revision,
+                    normalized_session,
+                    normalized_owner,
+                    token_hash,
+                ]
+            )
+            cursor = connection.execute(
+                "UPDATE binance_spot_functional_control SET "
+                + ", ".join(assignments)
+                + " WHERE route_key=? AND phase=? AND revision=? "
+                "AND session_id=? AND owner_id=? AND owner_token_hash=?",
+                params,
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise BinanceSpotLifecycleError(
+                    "functional lifecycle owner transition CAS changed"
+                )
+            updated = connection.execute(
+                "SELECT * FROM binance_spot_functional_control WHERE route_key=?",
+                (ROUTE_KEY,),
+            ).fetchone()
+            if (
+                updated is None
+                or int(updated["revision"]) != revision + 1
+                or _text(updated["phase"]).upper()
+                != _text(values.get("phase", phase)).upper()
+                or _text(updated["session_id"]) != normalized_session
+                or _text(updated["owner_id"]) != normalized_owner
+                or not secrets.compare_digest(
+                    _text(updated["owner_token_hash"]), token_hash
+                )
+            ):
+                connection.rollback()
+                raise BinanceSpotLifecycleError(
+                    "functional lifecycle durable owner transition is unverified"
+                )
+            result = dict(updated)
+            connection.commit()
+        return result
+
     def arm(
         self,
         permit: ExactPermit,
@@ -890,6 +986,35 @@ class DurableBinanceSpotFunctionalControl:
             raise BinanceSpotLifecycleError("lifecycle handle is not active")
         return row
 
+    def verify_final_reset_handle(
+        self, handle: LifecycleHandle
+    ) -> dict[str, Any]:
+        """Verify the retained owner epoch for mutation-free final retry."""
+
+        row = self._row()
+        if row is None:
+            raise BinanceSpotLifecycleError("functional lifecycle is missing")
+        if _text(row["phase"]).upper() != "FINAL_RESET":
+            raise BinanceSpotLifecycleError(
+                "functional lifecycle is not in FINAL_RESET"
+            )
+        self._require_owner(
+            row,
+            owner_id=handle.owner_id,
+            owner_token=handle.owner_token,
+            allow_expired=True,
+        )
+        if (
+            _text(row["session_id"]) != handle.session_id
+            or not secrets.compare_digest(
+                _text(row["capability_hash"]), _secret_hash(handle.capability)
+            )
+        ):
+            raise BinanceSpotLifecycleError(
+                "final-reset handle session/capability changed"
+            )
+        return row
+
     def heartbeat(
         self,
         *,
@@ -922,22 +1047,18 @@ class DurableBinanceSpotFunctionalControl:
     def begin_cleanup(
         self,
         *,
+        session_id: str,
         owner_id: str,
         owner_token: str,
         detail: str,
     ) -> dict[str, Any]:
-        row = self._row()
-        if row is None:
-            raise BinanceSpotLifecycleError("functional lifecycle is missing")
-        self._require_owner(
-            row,
+        return self._owned_transition(
+            expected_phases={"ACTIVE", "CLEANUP"},
+            expected_session_id=session_id,
             owner_id=owner_id,
             owner_token=owner_token,
-            allow_expired=True,
-        )
-        return self._update(
-            expected_phases={"ACTIVE", "CLEANUP"},
             values={"phase": "CLEANUP", "detail": _text(detail)[:500]},
+            allow_expired=True,
         )
 
     def expire_cleanup_to_reconciliation(
@@ -1178,20 +1299,18 @@ class DurableBinanceSpotFunctionalControl:
         return {**updated, "cleanup_capability": cleanup_capability}
 
     def prepare_final_reset(
-        self, *, owner_id: str, owner_token: str
+        self, *, session_id: str, owner_id: str, owner_token: str
     ) -> dict[str, Any]:
-        row = self._row()
-        if row is None:
-            raise BinanceSpotLifecycleError("functional lifecycle is missing")
-        self._require_owner(
-            row,
+        return self._owned_transition(
+            expected_phases={"ACTIVE", "CLEANUP"},
+            expected_session_id=session_id,
             owner_id=owner_id,
             owner_token=owner_token,
+            values={
+                "phase": "FINAL_RESET",
+                "detail": "authority pointers reset before final seal",
+            },
             allow_expired=True,
-        )
-        return self._update(
-            expected_phases={"ACTIVE", "CLEANUP"},
-            values={"phase": "FINAL_RESET", "detail": "authority pointers reset before final seal"},
         )
 
     def restore_cleanup_after_failed_final(self, *, detail: str) -> dict[str, Any]:
@@ -1497,6 +1616,7 @@ class BinanceSpotFunctionalLifecycleManager:
         except Exception as exc:
             try:
                 self.control.begin_cleanup(
+                    session_id=handle.session_id,
                     owner_id=handle.owner_id,
                     owner_token=handle.owner_token,
                     detail=(
@@ -2114,6 +2234,7 @@ class BinanceSpotFunctionalLifecycleManager:
             )
             if risk["cleanupRequired"] is True:
                 self.control.begin_cleanup(
+                    session_id=handle.session_id,
                     owner_id=handle.owner_id,
                     owner_token=handle.owner_token,
                     detail="owner loss limit reached; exact-owned cleanup only",
@@ -2195,6 +2316,7 @@ class BinanceSpotFunctionalLifecycleManager:
             )
             if dispatched.get("ok") is not True:
                 self.control.begin_cleanup(
+                    session_id=handle.session_id,
                     owner_id=handle.owner_id,
                     owner_token=handle.owner_token,
                     detail=f"dispatch ended {dispatched.get('status')}",
@@ -2205,6 +2327,7 @@ class BinanceSpotFunctionalLifecycleManager:
     def begin_cleanup(self, handle: LifecycleHandle, *, reason: str) -> dict[str, Any]:
         self._assert_available()
         return self.control.begin_cleanup(
+            session_id=handle.session_id,
             owner_id=handle.owner_id,
             owner_token=handle.owner_token,
             detail=reason,
@@ -2253,7 +2376,9 @@ class BinanceSpotFunctionalLifecycleManager:
         permit_payload = self._permit(handle, permit_payload)
         self.control.verify_handle(handle)
         reset = self.control.prepare_final_reset(
-            owner_id=handle.owner_id, owner_token=handle.owner_token
+            session_id=handle.session_id,
+            owner_id=handle.owner_id,
+            owner_token=handle.owner_token,
         )
         barrier_crossed = False
         try:

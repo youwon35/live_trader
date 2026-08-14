@@ -167,6 +167,42 @@ class OfficialUpbitFunctionalTruthReaderTest(unittest.TestCase):
             endpoints,
         )
 
+    def test_detached_exclusivity_proof_is_bound_to_exact_truth_interval(
+        self,
+    ) -> None:
+        calls = []
+
+        def proof_reader(**kwargs):
+            calls.append(dict(kwargs))
+            return {
+                "schemaVersion": "upbit-functional-account-exclusivity-proof/v1",
+                "sessionId": kwargs["session_id"],
+                "payloadHash": "a" * 64,
+            }
+
+        self.reader.account_exclusivity_proof_reader = proof_reader
+        result = self.read()
+        self.assertEqual(1, len(calls))
+        call = calls[0]
+        self.assertEqual("upbit-functional-session-0001", call["session_id"])
+        self.assertEqual(ACCOUNT, call["account_fingerprint"])
+        self.assertEqual(NOW - timedelta(hours=1), call["session_started_at"])
+        self.assertEqual(NOW, call["observation_started_at"])
+        self.assertEqual(NOW, call["observed_at"])
+        self.assertEqual(
+            "a" * 64,
+            result["accountExclusivityProof"]["payloadHash"],
+        )
+
+    def test_non_object_exclusivity_proof_fails_closed(self) -> None:
+        self.reader.account_exclusivity_proof_reader = (
+            lambda **_kwargs: "not-a-proof"
+        )
+        with self.assertRaisesRegex(
+            UpbitFunctionalBlocked, "proof-not-object"
+        ):
+            self.read()
+
     def test_open_order_query_is_account_wide_both_states_and_fully_paginated(self) -> None:
         self.client.open_pages[1] = [order(index, state="wait") for index in range(100)]
         for row in self.client.open_pages[1]:

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -124,6 +125,304 @@ class DurableUpbitFunctionalApprovalStoreTest(unittest.TestCase):
         self.store.approve_permit(
             self.functional_permit.to_dict(), self.approval
         )
+
+    def test_durable_owner_lease_fences_claim_and_rotates_only_after_loss(
+        self,
+    ) -> None:
+        path = Path(self.temp.name) / "owner-lease.sqlite3"
+        store = DurableUpbitFunctionalApprovalStore(
+            path,
+            clock=self.fake.clock,
+            operator_verifier=lambda value: value.get("serverSignature")
+            == "verified-by-backend",
+            account_exclusivity_verifier=TEST_EXCLUSIVITY_VERIFIER,
+            account_exclusivity_verifier_pin=(
+                TEST_EXCLUSIVITY_VERIFIER_PIN
+            ),
+            durable_owner_lease_required=True,
+        )
+        store.approve_permit(
+            self.functional_permit.to_dict(), self.approval
+        )
+        preparation = store.first_live_preparation_status()
+        self.assertTrue(preparation["prepared"])
+        self.assertTrue(preparation["ownerLease"]["required"])
+        session_id = "upbit-owner-session-0001"
+        with self.assertRaisesRegex(
+            UpbitFunctionalBlocked, "owner-lease-required"
+        ):
+            store.claim_permit(
+                approval_id=self.approval["approvalId"],
+                session_id=session_id,
+            )
+
+        owner_id = "upbit-owner-process-0001"
+        owner_token = "owner-token-" + "x" * 64
+        lease = store.acquire_owner_lease(
+            approval_id=self.approval["approvalId"],
+            owner_id=owner_id,
+            owner_token=owner_token,
+            process_identity_hash="a" * 64,
+        )
+        self.assertEqual("ACQUIRED", lease["state"])
+        self.assertTrue(lease["recordHashVerified"])
+        self.assertNotIn(owner_token, json.dumps(lease, sort_keys=True))
+        with closing(sqlite3.connect(path)) as connection:
+            stored_token_hash = connection.execute(
+                "SELECT owner_token_hash FROM upbit_functional_owner_lease"
+            ).fetchone()[0]
+        self.assertNotEqual(owner_token, stored_token_hash)
+        self.assertEqual(64, len(stored_token_hash))
+
+        claimed = store.claim_permit(
+            approval_id=self.approval["approvalId"],
+            session_id=session_id,
+            owner_lease_id=lease["leaseId"],
+            owner_id=owner_id,
+            owner_token=owner_token,
+        )
+        self.assertEqual(session_id, claimed["activeSessionId"])
+        active = store.owner_lease_status(
+            approval_id=self.approval["approvalId"]
+        )
+        self.assertEqual("ACTIVE", active["state"])
+        self.assertEqual(session_id, active["sessionId"])
+        self.assertTrue(active["recordHashVerified"])
+        store.bind_permit(
+            approval_id=self.approval["approvalId"],
+            session_id=session_id,
+            owner_id=owner_id,
+            owner_token=owner_token,
+        )
+        heartbeat = store.heartbeat_owner_lease(
+            approval_id=self.approval["approvalId"],
+            session_id=session_id,
+            owner_id=owner_id,
+            owner_token=owner_token,
+        )
+        self.assertTrue(heartbeat["recordHashVerified"])
+        lost = store.finish_owner_lease(
+            approval_id=self.approval["approvalId"],
+            owner_id=owner_id,
+            owner_token=owner_token,
+            state="LOST",
+            detail="test process absence attested",
+        )
+        self.assertEqual("LOST", lost["state"])
+        self.assertTrue(lost["recordHashVerified"])
+        self.assertFalse(
+            store.owner_lease_active(
+                approval_id=self.approval["approvalId"],
+                session_id=session_id,
+                owner_id=owner_id,
+                owner_token=owner_token,
+            )
+        )
+
+        cleanup_token = "cleanup-owner-token-" + "y" * 64
+        cleanup = store.acquire_owner_lease(
+            approval_id=self.approval["approvalId"],
+            owner_id="upbit-cleanup-owner-0001",
+            owner_token=cleanup_token,
+            process_identity_hash="b" * 64,
+            cleanup_only=True,
+        )
+        self.assertEqual("ACTIVE", cleanup["state"])
+        self.assertTrue(cleanup["cleanupOnly"])
+        self.assertTrue(cleanup["recordHashVerified"])
+        with self.assertRaisesRegex(
+            UpbitFunctionalBlocked, "cleanup-owner-rotation-invalid"
+        ):
+            store.acquire_owner_lease(
+                approval_id=self.approval["approvalId"],
+                owner_id="upbit-cleanup-owner-0002",
+                owner_token="z" * 64,
+                process_identity_hash="c" * 64,
+                cleanup_only=True,
+            )
+        with self.assertRaisesRegex(
+            UpbitFunctionalBlocked, "process-absence-proof-required"
+        ):
+            store.attest_owner_process_absent(
+                process_absence_attested=False,
+                detail="untrusted caller assertion",
+            )
+        attested = store.attest_owner_process_absent(
+            process_absence_attested=True,
+            detail="independent application lease proves old process absent",
+        )
+        self.assertEqual(1, len(attested))
+        self.assertEqual("LOST", attested[0]["state"])
+        self.assertTrue(attested[0]["recordHashVerified"])
+        restarted_cleanup = store.acquire_owner_lease(
+            approval_id=self.approval["approvalId"],
+            owner_id="upbit-cleanup-owner-0003",
+            owner_token="restart-token-" + "r" * 64,
+            process_identity_hash="c" * 64,
+            cleanup_only=True,
+        )
+        self.assertEqual("ACTIVE", restarted_cleanup["state"])
+        self.assertTrue(restarted_cleanup["recordHashVerified"])
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute(
+                "UPDATE upbit_functional_owner_lease SET detail='tampered'"
+            )
+            connection.commit()
+        tampered = store.owner_lease_status(
+            approval_id=self.approval["approvalId"]
+        )
+        self.assertFalse(tampered["recordHashVerified"])
+        with self.assertRaisesRegex(
+            UpbitFunctionalBlocked, "record-hash-invalid"
+        ):
+            store.attest_owner_process_absent(
+                process_absence_attested=True,
+                detail="must not bless a corrupted owner record",
+            )
+
+    def test_owner_finish_serializes_exactly_against_concurrent_heartbeat(
+        self,
+    ) -> None:
+        path = Path(self.temp.name) / "owner-finish-race.sqlite3"
+
+        def make_store() -> DurableUpbitFunctionalApprovalStore:
+            return DurableUpbitFunctionalApprovalStore(
+                path,
+                clock=self.fake.clock,
+                operator_verifier=lambda value: value.get(
+                    "serverSignature"
+                )
+                == "verified-by-backend",
+                account_exclusivity_verifier=TEST_EXCLUSIVITY_VERIFIER,
+                account_exclusivity_verifier_pin=(
+                    TEST_EXCLUSIVITY_VERIFIER_PIN
+                ),
+                durable_owner_lease_required=True,
+            )
+
+        finish_store = make_store()
+        finish_store.approve_permit(
+            self.functional_permit.to_dict(), self.approval
+        )
+        owner_id = "upbit-racing-owner-0001"
+        owner_token = "racing-owner-token-" + "x" * 64
+        lease = finish_store.acquire_owner_lease(
+            approval_id=self.approval["approvalId"],
+            owner_id=owner_id,
+            owner_token=owner_token,
+            process_identity_hash="d" * 64,
+        )
+        session_id = "upbit-racing-session-0001"
+        finish_store.claim_permit(
+            approval_id=self.approval["approvalId"],
+            session_id=session_id,
+            owner_lease_id=lease["leaseId"],
+            owner_id=owner_id,
+            owner_token=owner_token,
+        )
+        finish_store.bind_permit(
+            approval_id=self.approval["approvalId"],
+            session_id=session_id,
+            owner_id=owner_id,
+            owner_token=owner_token,
+        )
+        heartbeat_store = make_store()
+
+        selected = threading.Event()
+        allow_finish = threading.Event()
+        heartbeat_started = threading.Event()
+        heartbeat_done = threading.Event()
+        original_connect = finish_store._connect
+
+        class CursorProxy:
+            def __init__(self, cursor):
+                self._cursor = cursor
+
+            def fetchone(self):
+                row = self._cursor.fetchone()
+                selected.set()
+                if not allow_finish.wait(5):
+                    raise AssertionError("finish SELECT test barrier timed out")
+                return row
+
+            def __getattr__(self, name):
+                return getattr(self._cursor, name)
+
+        class ConnectionProxy:
+            def __init__(self, connection):
+                self._connection = connection
+
+            def execute(self, statement, parameters=()):
+                cursor = self._connection.execute(statement, parameters)
+                normalized = " ".join(str(statement).split())
+                if normalized.startswith(
+                    "SELECT * FROM upbit_functional_owner_lease"
+                ):
+                    return CursorProxy(cursor)
+                return cursor
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        finish_store._connect = lambda: ConnectionProxy(original_connect())
+
+        def finish():
+            return finish_store.finish_owner_lease(
+                approval_id=self.approval["approvalId"],
+                owner_id=owner_id,
+                owner_token=owner_token,
+                state="RELEASED",
+                detail="terminal owner release wins exact CAS",
+            )
+
+        def heartbeat():
+            heartbeat_started.set()
+            try:
+                heartbeat_store.heartbeat_owner_lease(
+                    approval_id=self.approval["approvalId"],
+                    session_id=session_id,
+                    owner_id=owner_id,
+                    owner_token=owner_token,
+                )
+                return "COMMITTED"
+            except UpbitFunctionalBlocked:
+                return "BLOCKED_AFTER_TERMINAL"
+            finally:
+                heartbeat_done.set()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            finish_future = executor.submit(finish)
+            self.assertTrue(selected.wait(2))
+            heartbeat_future = executor.submit(heartbeat)
+            self.assertTrue(heartbeat_started.wait(2))
+            try:
+                # BEGIN IMMEDIATE must keep the other store from committing a
+                # newer revision between terminal SELECT and UPDATE.
+                self.assertFalse(heartbeat_done.wait(0.2))
+            finally:
+                allow_finish.set()
+            finished = finish_future.result(timeout=5)
+            heartbeat_outcome = heartbeat_future.result(timeout=5)
+
+        self.assertEqual("RELEASED", finished["state"])
+        self.assertTrue(finished["recordHashVerified"])
+        self.assertEqual("BLOCKED_AFTER_TERMINAL", heartbeat_outcome)
+        final = heartbeat_store.owner_lease_status(
+            approval_id=self.approval["approvalId"]
+        )
+        self.assertEqual("RELEASED", final["state"])
+        self.assertTrue(final["recordHashVerified"])
+        self.assertEqual(3, final["revision"])
+        with closing(sqlite3.connect(path)) as connection:
+            raw = connection.execute(
+                """SELECT session_id,revision,record_hash,owner_token_hash
+                FROM upbit_functional_owner_lease WHERE approval_id=?""",
+                (self.approval["approvalId"],),
+            ).fetchone()
+        self.assertEqual(session_id, raw[0])
+        self.assertEqual(final["revision"], raw[1])
+        self.assertEqual(final["recordHash"], raw[2])
+        self.assertEqual("", raw[3])
 
     def test_wiring_verifier_recomputes_primitives_and_rejects_tamper(self) -> None:
         self.fake.now = self.functional_permit.ends_at

@@ -19,9 +19,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .upbit_continuous_functional import (
+    AccountExclusivityProofVerifier,
     UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
     UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED,
     UpbitFunctionalBlocked,
+    account_exclusivity_verifier_wiring_status,
 )
 from .upbit_functional_approval import (
     DurableUpbitFunctionalApprovalStore,
@@ -46,6 +48,11 @@ from .upbit_functional_truth import OfficialUpbitFunctionalTruthReader
 UPBIT_FUNCTIONAL_BACKEND_AVAILABLE = False
 UPBIT_FUNCTIONAL_STATE_SERVER_WIRING_AVAILABLE = False
 UPBIT_FUNCTIONAL_REAL_E2E_AVAILABLE = False
+# The implementation can report its dynamic prerequisites, but every static
+# production release bit stays false until shared state/server composition and
+# all frozen identities are reviewed together.
+UPBIT_FUNCTIONAL_FIRST_LIVE_BOOTSTRAP_PREPARATION_AVAILABLE = False
+UPBIT_FUNCTIONAL_FIRST_LIVE_NETWORK_AVAILABLE = False
 _POLL_SECONDS = 5.0
 _SCHEDULER_START_ATTEMPTS = 3
 _BACKEND_SINGLETON_LOCK = threading.RLock()
@@ -72,6 +79,60 @@ def upbit_functional_composite_available() -> bool:
     )
 
 
+def _first_live_static_gate_status() -> dict[str, bool]:
+    return {
+        "explicitLiveEnv": (
+            os.environ.get("UPBIT_FUNCTIONAL_LIVE_ENABLED", "")
+            .strip()
+            .lower()
+            == "true"
+        ),
+        "entrypoint": UPBIT_FUNCTIONAL_ENTRYPOINT_AVAILABLE,
+        "mutation": UPBIT_FUNCTIONAL_MUTATION_AVAILABLE,
+        "backend": UPBIT_FUNCTIONAL_BACKEND_AVAILABLE,
+        "stateServer": UPBIT_FUNCTIONAL_STATE_SERVER_WIRING_AVAILABLE,
+        "verifierAuthorityPinned": (
+            UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED
+        ),
+        "productionVerifierWired": (
+            UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED
+        ),
+        "entrypointComposite": bool(
+            production_entrypoint_status().get("available")
+        ),
+        "bootstrapPreparation": (
+            UPBIT_FUNCTIONAL_FIRST_LIVE_BOOTSTRAP_PREPARATION_AVAILABLE
+        ),
+        "bootstrapNetworkRelease": (
+            UPBIT_FUNCTIONAL_FIRST_LIVE_NETWORK_AVAILABLE
+        ),
+    }
+
+
+def upbit_functional_first_live_preissue_available(
+    *, preparation_ready: bool
+) -> bool:
+    """Permit an inert candidate only after every non-E2E gate is exact."""
+
+    return bool(
+        preparation_ready
+        and all(_first_live_static_gate_status().values())
+    )
+
+
+def upbit_functional_first_live_composite_available(
+    *, preparation_ready: bool, bootstrap_claimable: bool
+) -> bool:
+    """Bypass only the circular REAL_E2E bit for one durable bootstrap."""
+
+    return bool(
+        bootstrap_claimable
+        and upbit_functional_first_live_preissue_available(
+            preparation_ready=preparation_ready
+        )
+    )
+
+
 class _ManagedFunctionalAuthority:
     """Process-local runtime pointer; raw capability is never exposed."""
 
@@ -80,10 +141,18 @@ class _ManagedFunctionalAuthority:
         *,
         ordinary_routes_closed_reader: Callable[[], bool],
         emergency_stop_reader: Callable[[], Mapping[str, Any]],
+        durable_owner_lease_reader: Callable[[], bool] | None = None,
+        durable_owner_lease_required: bool = False,
     ) -> None:
         self._lock = threading.RLock()
         self._ordinary_routes_closed_reader = ordinary_routes_closed_reader
         self._emergency_stop_reader = emergency_stop_reader
+        self._durable_owner_lease_reader = (
+            durable_owner_lease_reader or (lambda: True)
+        )
+        self._durable_owner_lease_required = bool(
+            durable_owner_lease_required
+        )
         self._scope: dict[str, Any] = {}
         self._capability_hash = ""
         self._armed = False
@@ -130,11 +199,16 @@ class _ManagedFunctionalAuthority:
     def orders_enabled(self) -> bool:
         with self._lock:
             emergency = dict(self._emergency_stop_reader())
+            owner_active = bool(self._durable_owner_lease_reader())
             return bool(
                 self._armed
                 and self._capability_hash
                 and self._ordinary_routes_closed_reader() is True
                 and emergency.get("active") is not True
+                and (
+                    not self._durable_owner_lease_required
+                    or owner_active
+                )
             )
 
     def snapshot(self) -> dict[str, Any]:
@@ -144,6 +218,16 @@ class _ManagedFunctionalAuthority:
             )
             emergency = dict(self._emergency_stop_reader())
             kill_switch = emergency.get("active") is True
+            owner_active = bool(self._durable_owner_lease_reader())
+            mutation_ready = bool(
+                self._armed
+                and ordinary_routes_closed
+                and not kill_switch
+                and (
+                    not self._durable_owner_lease_required
+                    or owner_active
+                )
+            )
             return {
                 **self._scope,
                 "killSwitch": kill_switch,
@@ -152,16 +236,16 @@ class _ManagedFunctionalAuthority:
                 "dryRun": False,
                 "operatorConfirmed": True,
                 "newEntriesBlocked": ordinary_routes_closed,
-                "realOrdersEnabled": self._armed
-                and ordinary_routes_closed
-                and not kill_switch,
-                "functionalMutationEnabled": self._armed
-                and ordinary_routes_closed
-                and not kill_switch,
+                "realOrdersEnabled": mutation_ready,
+                "functionalMutationEnabled": mutation_ready,
                 "functionalOnlyRouting": True,
                 "ordinaryRoutesClosed": ordinary_routes_closed,
                 "upbitSmokeRouteClosed": ordinary_routes_closed,
                 "functionalCapabilityHash": self._capability_hash,
+                "durableOwnerLeaseRequired": (
+                    self._durable_owner_lease_required
+                ),
+                "durableOwnerLeaseActive": owner_active,
             }
 
 
@@ -181,6 +265,10 @@ class UpbitFunctionalBackendManager:
         approval_record_signer: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         websocket_source: OfficialUpbitFunctionalMyOrderPump | None = None,
         candle_source: OfficialUpbitFinalizedFiveMinuteWindowReader | None = None,
+        account_exclusivity_proof_reader: Callable[..., Mapping[str, Any]] | None = None,
+        account_exclusivity_verifier: AccountExclusivityProofVerifier | None = None,
+        account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+        owner_process_identity: Mapping[str, Any] | None = None,
         allow_mock_graph: bool = False,
         _capability: object | None = None,
     ) -> None:
@@ -200,6 +288,64 @@ class UpbitFunctionalBackendManager:
         self.database_path = Path(database_path)
         self.approval_store = approval_store
         self.operator_confirmation_verifier = operator_confirmation_verifier
+        self._account_exclusivity_proof_reader = (
+            account_exclusivity_proof_reader
+        )
+        self._account_exclusivity_verifier = account_exclusivity_verifier
+        self._account_exclusivity_verifier_pin = (
+            dict(account_exclusivity_verifier_pin)
+            if isinstance(account_exclusivity_verifier_pin, Mapping)
+            else None
+        )
+        process_identity = (
+            dict(owner_process_identity)
+            if isinstance(owner_process_identity, Mapping)
+            else {
+                "kind": "UPBIT_FUNCTIONAL_MOCK_PROCESS",
+                "ownerPid": os.getpid(),
+            }
+        )
+        try:
+            acquired_at = datetime.fromisoformat(
+                str(process_identity.get("acquiredAt") or "").replace(
+                    "Z", "+00:00"
+                )
+            )
+        except (TypeError, ValueError):
+            acquired_at = None
+        try:
+            owner_pid = int(process_identity.get("ownerPid") or 0)
+        except (TypeError, ValueError):
+            owner_pid = 0
+        scope_hash = str(process_identity.get("scopeHash") or "").lower()
+        self._owner_process_identity_durable = bool(
+            process_identity.get("schemaVersion")
+            == "upbit-functional-process-owner/v1"
+            and len(scope_hash) == 64
+            and all(
+                character in "0123456789abcdef"
+                for character in scope_hash
+            )
+            and owner_pid > 0
+            and acquired_at is not None
+            and acquired_at.tzinfo is not None
+        )
+        self._owner_process_identity_hash = hashlib.sha256(
+            json.dumps(
+                process_identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        self._durable_owner_lease_required = bool(
+            getattr(approval_store, "durable_owner_lease_required", False)
+        )
+        self._owner_lease_id = ""
+        self._owner_id = ""
+        self._owner_token = ""
         if approval_record_signer is None:
             if not allow_mock_graph:
                 raise UpbitFunctionalBlocked(
@@ -222,9 +368,25 @@ class UpbitFunctionalBackendManager:
                 "active": False,
                 "revision": "mock-emergency-clear",
             }
+        def owner_lease_active() -> bool:
+            if not self._durable_owner_lease_required:
+                return True
+            if not self._approval_id or not self._owner_id or not self._owner_token:
+                return False
+            return self.approval_store.owner_lease_active(
+                approval_id=self._approval_id,
+                owner_id=self._owner_id,
+                owner_token=self._owner_token,
+                session_id=self._session_id,
+            )
+
         self.authority = _ManagedFunctionalAuthority(
             ordinary_routes_closed_reader=ordinary_routes_closed_reader,
             emergency_stop_reader=emergency_stop_reader,
+            durable_owner_lease_reader=owner_lease_active,
+            durable_owner_lease_required=(
+                self._durable_owner_lease_required
+            ),
         )
         self._lock = threading.RLock()
         self._generation = 0
@@ -286,6 +448,15 @@ class UpbitFunctionalBackendManager:
             finalized_bar_window_reader=self.candle_source,
             arm_functional_orders=self.authority.arm,
             clear_runtime_capability=self.authority.clear,
+            account_exclusivity_proof_reader=(
+                self._account_exclusivity_proof_reader
+            ),
+            account_exclusivity_verifier=(
+                self._account_exclusivity_verifier
+            ),
+            account_exclusivity_verifier_pin=(
+                self._account_exclusivity_verifier_pin
+            ),
             **({"allow_mock_graph": True} if allow_mock_graph else {}),
         )
         # Preserve the full immutable identity for the approval-side startup
@@ -333,6 +504,33 @@ class UpbitFunctionalBackendManager:
                 self._terminal_detail = (
                     "startup-cleanup-recovery-owner-required"
                 )
+            owner = self.approval_store.owner_lease_status(
+                approval_id=self._approval_id
+            )
+            if (
+                self._durable_owner_lease_required
+                and isinstance(owner, Mapping)
+                and owner.get("state") in {"ACQUIRED", "ACTIVE"}
+            ):
+                if owner.get("recordHashVerified") is not True:
+                    raise UpbitFunctionalBlocked(
+                        "upbit-functional-backend-owner-record-corrupt"
+                    )
+                if (
+                    owner.get("processIdentityHash")
+                    == self._owner_process_identity_hash
+                ):
+                    raise UpbitFunctionalBlocked(
+                        "upbit-functional-backend-owner-bearer-unrecoverable"
+                    )
+                # The official application lease was acquired before this
+                # production manager was constructed.  A different persisted
+                # process identity is therefore a restart-verifiable lost
+                # owner, never authority for this process.
+                self.approval_store.attest_owner_process_absent(
+                    process_absence_attested=True,
+                    detail="application lease proves previous process absent",
+                )
         self._startup_audit = {
             "graph": self.graph.status()["startupAudit"],
             "approvals": approval_audit,
@@ -379,19 +577,167 @@ class UpbitFunctionalBackendManager:
             generation = self._generation
             yield generation
 
+    def _first_live_preparation_status(self) -> dict[str, Any]:
+        store = self.approval_store.first_live_preparation_status()
+        graph = self.graph.status()
+        graph_verifier = graph.get("accountExclusivityVerifier")
+        store_verifier = store.get("accountExclusivityVerifier")
+        verifier_agrees = bool(
+            isinstance(graph_verifier, Mapping)
+            and isinstance(store_verifier, Mapping)
+            and graph_verifier.get("ready") is True
+            and store_verifier.get("ready") is True
+            and secrets.compare_digest(
+                str(graph_verifier.get("pinHash") or ""),
+                str(store_verifier.get("pinHash") or ""),
+            )
+        )
+        proof_source_wired = bool(
+            graph.get("accountExclusivityProofSourceWired") is True
+            and callable(self._account_exclusivity_proof_reader)
+        )
+        owner = store.get("ownerLease")
+        owner_ready = bool(
+            isinstance(owner, Mapping)
+            and owner.get("required") is True
+            and owner.get("durable") is True
+            and owner.get("singleOwner") is True
+            and owner.get("bearerTokenPersisted") is False
+            and self._durable_owner_lease_required
+        )
+        process_identity_ready = bool(
+            self._owner_process_identity_durable
+            and len(self._owner_process_identity_hash) == 64
+            and all(
+                character in "0123456789abcdef"
+                for character in self._owner_process_identity_hash
+            )
+        )
+        blockers = []
+        if store.get("prepared") is not True:
+            blockers.append("APPROVAL_STORE_PREREQUISITES_INCOMPLETE")
+        if not verifier_agrees:
+            blockers.append("EXCLUSIVITY_VERIFIER_PIN_MISMATCH")
+        if not proof_source_wired:
+            blockers.append("EXCLUSIVITY_PROOF_SOURCE_MISSING")
+        if not owner_ready:
+            blockers.append("DURABLE_OWNER_LEASE_NOT_REQUIRED")
+        if not process_identity_ready:
+            blockers.append("PROCESS_IDENTITY_NOT_DURABLE")
+        return {
+            "prepared": not blockers,
+            "blockers": blockers,
+            "approvalStore": store,
+            "graphVerifier": (
+                dict(graph_verifier)
+                if isinstance(graph_verifier, Mapping)
+                else {}
+            ),
+            "verifierPinAgrees": verifier_agrees,
+            "proofSourceWired": proof_source_wired,
+            "ownerLease": dict(owner) if isinstance(owner, Mapping) else {},
+            "processIdentityHash": self._owner_process_identity_hash,
+        }
+
+    def _acquire_durable_owner_locked(
+        self, *, approval_id: str, cleanup_only: bool = False
+    ) -> None:
+        if not getattr(self, "_durable_owner_lease_required", False):
+            return
+        if self._owner_id or self._owner_token or self._owner_lease_id:
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-backend-owner-already-acquired"
+            )
+        owner_id = "upbit-owner-" + secrets.token_hex(16)
+        owner_token = secrets.token_urlsafe(48)
+        lease = self.approval_store.acquire_owner_lease(
+            approval_id=approval_id,
+            owner_id=owner_id,
+            owner_token=owner_token,
+            process_identity_hash=self._owner_process_identity_hash,
+            cleanup_only=cleanup_only,
+        )
+        lease_id = str(lease.get("leaseId") or "")
+        if (
+            not lease_id
+            or lease.get("recordHashVerified") is not True
+            or lease.get("processIdentityHash")
+            != self._owner_process_identity_hash
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-backend-owner-acquire-not-verifiable"
+            )
+        self._owner_lease_id = lease_id
+        self._owner_id = owner_id
+        self._owner_token = owner_token
+
+    def _heartbeat_durable_owner_locked(self) -> None:
+        if not getattr(self, "_durable_owner_lease_required", False):
+            return
+        if not self._approval_id or not self._session_id:
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-backend-owner-heartbeat-scope-missing"
+            )
+        lease = self.approval_store.heartbeat_owner_lease(
+            approval_id=self._approval_id,
+            owner_id=self._owner_id,
+            owner_token=self._owner_token,
+            session_id=self._session_id,
+        )
+        if lease.get("recordHashVerified") is not True:
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-backend-owner-heartbeat-not-verifiable"
+            )
+
+    def _finish_durable_owner_locked(
+        self, *, state: str, detail: str, approval_id: str = ""
+    ) -> None:
+        if not getattr(self, "_durable_owner_lease_required", False):
+            return
+        target = str(approval_id or self._approval_id or "")
+        if not target or not self._owner_id or not self._owner_token:
+            return
+        lease = self.approval_store.finish_owner_lease(
+            approval_id=target,
+            owner_id=self._owner_id,
+            owner_token=self._owner_token,
+            state=state,
+            detail=detail,
+        )
+        if lease.get("recordHashVerified") is not True:
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-backend-owner-terminal-not-verifiable"
+            )
+        self._owner_lease_id = ""
+        self._owner_id = ""
+        self._owner_token = ""
+
     def start(self, command: Mapping[str, Any]) -> dict[str, Any]:
         self._assert_command_fields(
             command, {"approvalId", "operatorConfirmation"}
         )
         self._verify_operator(command)
-        if (
-            not self._allow_mock_graph
-            and not upbit_functional_composite_available()
-        ):
-            raise UpbitFunctionalBlocked(
-                "upbit-functional-backend-composite-unavailable"
-            )
         approval_id = str(command["approvalId"])
+        if not self._allow_mock_graph:
+            preparation = self._first_live_preparation_status()
+            full_live_available = bool(
+                upbit_functional_composite_available()
+                and preparation.get("prepared") is True
+            )
+            first_live_available = bool(
+                upbit_functional_first_live_composite_available(
+                    preparation_ready=(preparation.get("prepared") is True),
+                    bootstrap_claimable=(
+                        self.approval_store.first_live_bootstrap_claimable(
+                            approval_id=approval_id
+                        )
+                    ),
+                )
+            )
+            if not (full_live_available or first_live_available):
+                raise UpbitFunctionalBlocked(
+                    "upbit-functional-backend-composite-unavailable"
+                )
         claim_crossed = False
         try:
             with self._owner() as generation:
@@ -399,9 +745,16 @@ class UpbitFunctionalBackendManager:
                     raise UpbitFunctionalBlocked(
                         "upbit-functional-backend-already-running"
                     )
+                self._acquire_durable_owner_locked(
+                    approval_id=approval_id
+                )
                 session_id = "upbit-functional-" + secrets.token_hex(16)
                 record = self.approval_store.claim_permit(
-                    approval_id=approval_id, session_id=session_id
+                    approval_id=approval_id,
+                    session_id=session_id,
+                    owner_lease_id=self._owner_lease_id,
+                    owner_id=self._owner_id,
+                    owner_token=self._owner_token,
                 )
                 claim_crossed = True
                 return self._start_claimed_locked(
@@ -413,6 +766,14 @@ class UpbitFunctionalBackendManager:
         except Exception as exc:
             if not claim_crossed:
                 try:
+                    self._finish_durable_owner_locked(
+                        approval_id=approval_id,
+                        state="FAILED",
+                        detail=(
+                            "start failed before durable permit claim:"
+                            f"{type(exc).__name__}"
+                        ),
+                    )
                     retired = self.approval_store.retire_unclaimed_permit(
                         approval_id=approval_id,
                         detail=(
@@ -483,13 +844,17 @@ class UpbitFunctionalBackendManager:
                         ),
                     }
                 )
+                self._heartbeat_durable_owner_locked()
                 result = self.graph.start(
                     permit_id=scope.permit_id,
                     permit_hash=scope.permit_hash,
                     session_id=session_id,
                 )
                 self.approval_store.bind_permit(
-                    approval_id=approval_id, session_id=session_id
+                    approval_id=approval_id,
+                    session_id=session_id,
+                    owner_id=self._owner_id,
+                    owner_token=self._owner_token,
                 )
             except Exception as exc:
                 durable_nonterminal = False
@@ -511,6 +876,16 @@ class UpbitFunctionalBackendManager:
                         self.approval_store.bind_permit(
                             approval_id=approval_id,
                             session_id=session_id,
+                            owner_id=self._owner_id,
+                            owner_token=self._owner_token,
+                        )
+                        self._finish_durable_owner_locked(
+                            approval_id=approval_id,
+                            state="LOST",
+                            detail=(
+                                "start crossed durable boundary without "
+                                "scheduler ownership"
+                            ),
                         )
                         self._terminal_state = "RECONCILIATION_REQUIRED"
                         self._terminal_detail = (
@@ -521,6 +896,11 @@ class UpbitFunctionalBackendManager:
                         self.approval_store.fail_permit(
                             approval_id=approval_id,
                             session_id=session_id,
+                            detail=f"start-failed:{type(exc).__name__}",
+                        )
+                        self._finish_durable_owner_locked(
+                            approval_id=approval_id,
+                            state="FAILED",
                             detail=f"start-failed:{type(exc).__name__}",
                         )
                 except Exception:
@@ -575,6 +955,18 @@ class UpbitFunctionalBackendManager:
                 + ":compensation-failed:"
                 + type(cleanup_exc).__name__
             )
+        try:
+            self._finish_durable_owner_locked(
+                state="LOST",
+                detail=reason + ":scheduler owner unavailable",
+            )
+        except Exception as owner_exc:
+            self._terminal_state = "RECONCILIATION_REQUIRED"
+            self._terminal_detail = (
+                reason
+                + ":owner-terminal-failed:"
+                + type(owner_exc).__name__
+            )
         raise UpbitFunctionalBlocked(
             "upbit-functional-scheduler-start-failed"
         ) from scheduler_exc
@@ -596,6 +988,7 @@ class UpbitFunctionalBackendManager:
                 if generation != self._generation:
                     return
                 try:
+                    self._heartbeat_durable_owner_locked()
                     result = self.graph.pump()
                     snapshot = result.get("snapshot")
                     if (
@@ -797,6 +1190,19 @@ class UpbitFunctionalBackendManager:
                     f"{type(exc).__name__}"
                 )
                 raise
+        try:
+            self._finish_durable_owner_locked(
+                state="RELEASED",
+                detail=f"durable-final-seal-complete:{outcome}",
+            )
+        except Exception as exc:
+            self.authority.clear()
+            self._scheduler_stop.set()
+            self._terminal_state = "RECONCILIATION_REQUIRED"
+            self._terminal_detail = (
+                "owner-release-failed:" f"{type(exc).__name__}"
+            )
+            raise
         self.authority.clear()
         self._scheduler_stop.set()
         self._terminal_state = (
@@ -875,6 +1281,18 @@ class UpbitFunctionalBackendManager:
                 raise UpbitFunctionalBlocked(
                     "upbit-functional-backend-recovery-identity-changed"
                 )
+            if getattr(self, "_durable_owner_lease_required", False):
+                owner = self.approval_store.owner_lease_status(
+                    approval_id=self._approval_id
+                )
+                if not isinstance(owner, Mapping) or owner.get("state") != "LOST":
+                    raise UpbitFunctionalBlocked(
+                        "upbit-functional-backend-recovery-lost-owner-required"
+                    )
+                self._acquire_durable_owner_locked(
+                    approval_id=self._approval_id,
+                    cleanup_only=True,
+                )
             recovery = self.approval_store.claim_recovery(
                 recovery_id=recovery_id,
                 session_id=self._session_id,
@@ -893,6 +1311,10 @@ class UpbitFunctionalBackendManager:
                     detail="cleanup recovery attached",
                 )
             except Exception as exc:
+                self._finish_durable_owner_locked(
+                    state="LOST",
+                    detail=f"cleanup recovery failed:{type(exc).__name__}",
+                )
                 self.approval_store.finish_recovery(
                     recovery_id=recovery_id,
                     state="FAILED",
@@ -1009,6 +1431,17 @@ class UpbitFunctionalBackendManager:
 
         with self._owner():
             identity = self._recovery_identity_locked()
+            if (
+                getattr(self, "_durable_owner_lease_required", False)
+                and self._owner_id
+                and self._owner_token
+            ):
+                self._finish_durable_owner_locked(
+                    state="LOST",
+                    detail=(
+                        "exact cleanup state sealed before recovery handoff"
+                    ),
+                )
             existing = self.approval_store.recovery_authority_pointer()
             requested = str(requested_recovery_id or "").strip()
             now = self.clock().astimezone(timezone.utc)
@@ -1209,10 +1642,38 @@ class UpbitFunctionalBackendManager:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            composite_available = upbit_functional_composite_available()
+            preparation = self._first_live_preparation_status()
+            full_live_available = bool(
+                upbit_functional_composite_available()
+                and preparation.get("prepared") is True
+            )
+            first_live_eligible = (
+                upbit_functional_first_live_preissue_available(
+                    preparation_ready=(
+                        preparation.get("prepared") is True
+                    )
+                )
+            )
+            available = bool(full_live_available or first_live_eligible)
+            verifier = preparation.get("graphVerifier")
+            owner = (
+                self.approval_store.owner_lease_status(
+                    approval_id=self._approval_id
+                )
+                if self._approval_id
+                else None
+            )
+            static_gates = _first_live_static_gate_status()
+            first_live_blockers = list(preparation.get("blockers") or [])
+            first_live_blockers.extend(
+                name
+                for name, passed in static_gates.items()
+                if passed is not True
+            )
             return {
-                "available": composite_available,
-                "networkOrderPostAllowed": False,
+                "available": available,
+                "networkOrderPostAllowed": available,
+                "fullLiveAvailable": full_live_available,
                 "verifierAuthorityPinned": (
                     UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED
                 ),
@@ -1220,17 +1681,29 @@ class UpbitFunctionalBackendManager:
                     UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED
                 ),
                 "accountExclusivityPreSendReady": bool(
-                    UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED
-                    and UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED
+                    isinstance(verifier, Mapping)
+                    and verifier.get("ready") is True
+                    and preparation.get("proofSourceWired") is True
                 ),
-                # The first credentialed canary bypass is intentionally kept
-                # unreachable until its route-global burn contract is approved
-                # and implemented.  Absence of a field must never be mistaken
-                # for authorization by state/server callers.
-                "firstLiveBootstrapEligible": False,
+                "accountExclusivityVerifier": (
+                    dict(verifier) if isinstance(verifier, Mapping) else {}
+                ),
+                "firstLiveBootstrapPrepared": (
+                    preparation.get("prepared") is True
+                ),
+                "firstLiveBootstrapPreparation": preparation,
+                "firstLiveBootstrapEligible": first_live_eligible,
                 "firstLiveBootstrapBlockedReason": (
-                    "route-global-one-shot-bypass-not-authorized"
+                    "READY"
+                    if first_live_eligible
+                    else ",".join(first_live_blockers)
+                    or "FIRST_LIVE_PREREQUISITES_INCOMPLETE"
                 ),
+                "firstLiveStaticGates": static_gates,
+                "durableOwnerLeaseRequired": (
+                    self._durable_owner_lease_required
+                ),
+                "durableOwnerLease": dict(owner) if owner else None,
                 "liveEnableGate": (
                     os.environ.get("UPBIT_FUNCTIONAL_LIVE_ENABLED", "")
                     .strip()
@@ -1265,6 +1738,10 @@ def prepare_upbit_functional_backend(
     approval_record_signer: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     websocket_source: OfficialUpbitFunctionalMyOrderPump | None = None,
     candle_source: OfficialUpbitFinalizedFiveMinuteWindowReader | None = None,
+    account_exclusivity_proof_reader: Callable[..., Mapping[str, Any]] | None = None,
+    account_exclusivity_verifier: AccountExclusivityProofVerifier | None = None,
+    account_exclusivity_verifier_pin: Mapping[str, Any] | None = None,
+    owner_process_identity: Mapping[str, Any] | None = None,
     allow_mock_graph: bool = False,
 ) -> dict[str, Any]:
     """Construct the process singleton and run startup audit exactly once."""
@@ -1275,10 +1752,24 @@ def prepare_upbit_functional_backend(
             if not allow_mock_graph:
                 from .process_safety import live_trader_instance_lease_status
 
-                if live_trader_instance_lease_status().get("acquired") is not True:
+                application_lease = live_trader_instance_lease_status()
+                if application_lease.get("acquired") is not True:
                     raise UpbitFunctionalBlocked(
                         "upbit-functional-backend-application-lease-required"
                     )
+                if owner_process_identity is None:
+                    owner_process_identity = {
+                        "schemaVersion": "upbit-functional-process-owner/v1",
+                        "scopeHash": str(
+                            application_lease.get("scopeHash") or ""
+                        ),
+                        "ownerPid": int(
+                            application_lease.get("ownerPid") or os.getpid()
+                        ),
+                        "acquiredAt": str(
+                            application_lease.get("acquiredAt") or ""
+                        ),
+                    }
             _BACKEND_SINGLETON = UpbitFunctionalBackendManager(
                 database_path=database_path,
                 publication_proof_path=publication_proof_path,
@@ -1292,6 +1783,16 @@ def prepare_upbit_functional_backend(
                 approval_record_signer=approval_record_signer,
                 websocket_source=websocket_source,
                 candle_source=candle_source,
+                account_exclusivity_proof_reader=(
+                    account_exclusivity_proof_reader
+                ),
+                account_exclusivity_verifier=(
+                    account_exclusivity_verifier
+                ),
+                account_exclusivity_verifier_pin=(
+                    account_exclusivity_verifier_pin
+                ),
+                owner_process_identity=owner_process_identity,
                 allow_mock_graph=allow_mock_graph,
                 _capability=(
                     None
@@ -1320,10 +1821,12 @@ def upbit_functional_backend_status() -> dict[str, Any]:
     with _BACKEND_SINGLETON_LOCK:
         manager = _BACKEND_SINGLETON
     if manager is None:
+        static_gates = _first_live_static_gate_status()
         return {
-            "available": upbit_functional_composite_available(),
+            "available": False,
             "prepared": False,
             "networkOrderPostAllowed": False,
+            "fullLiveAvailable": False,
             "verifierAuthorityPinned": (
                 UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED
             ),
@@ -1331,13 +1834,23 @@ def upbit_functional_backend_status() -> dict[str, Any]:
                 UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED
             ),
             "accountExclusivityPreSendReady": bool(
-                UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED
-                and UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED
+                False
             ),
+            "accountExclusivityVerifier": account_exclusivity_verifier_wiring_status(
+                None, None
+            ),
+            "firstLiveBootstrapPrepared": False,
+            "firstLiveBootstrapPreparation": {
+                "prepared": False,
+                "blockers": ["BACKEND_NOT_PREPARED"],
+            },
             "firstLiveBootstrapEligible": False,
             "firstLiveBootstrapBlockedReason": (
-                "route-global-one-shot-bypass-not-authorized"
+                "BACKEND_NOT_PREPARED"
             ),
+            "firstLiveStaticGates": static_gates,
+            "durableOwnerLeaseRequired": False,
+            "durableOwnerLease": None,
             "liveEnableGate": (
                 os.environ.get("UPBIT_FUNCTIONAL_LIVE_ENABLED", "")
                 .strip()
@@ -1386,6 +1899,8 @@ def approve_upbit_functional_recovery_candidate(
 
 __all__ = [
     "UPBIT_FUNCTIONAL_BACKEND_AVAILABLE",
+    "UPBIT_FUNCTIONAL_FIRST_LIVE_BOOTSTRAP_PREPARATION_AVAILABLE",
+    "UPBIT_FUNCTIONAL_FIRST_LIVE_NETWORK_AVAILABLE",
     "UPBIT_FUNCTIONAL_REAL_E2E_AVAILABLE",
     "UPBIT_FUNCTIONAL_STATE_SERVER_WIRING_AVAILABLE",
     "UpbitFunctionalBackendManager",
@@ -1396,5 +1911,7 @@ __all__ = [
     "start_upbit_functional_backend",
     "stop_upbit_functional_backend",
     "upbit_functional_composite_available",
+    "upbit_functional_first_live_composite_available",
+    "upbit_functional_first_live_preissue_available",
     "upbit_functional_backend_status",
 ]

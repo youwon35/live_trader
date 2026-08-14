@@ -68,6 +68,10 @@ BINANCE_SPOT_FUNCTIONAL_FIRST_LIVE_BOOTSTRAP_AVAILABLE = False
 BINANCE_SPOT_FUNCTIONAL_ORDINARY_FENCE_AVAILABLE = False
 BINANCE_SPOT_FUNCTIONAL_EMERGENCY_FENCE_AVAILABLE = False
 BINANCE_SPOT_FUNCTIONAL_EXCLUSIVE_ACCOUNT_AVAILABLE = False
+# Final shared state/server/live-adapter integration owns this last latch.  It
+# stays false in the Binance-only preparation tranche even if every internal
+# implementation flag is later proven independently.
+BINANCE_SPOT_FUNCTIONAL_ROOT_INTEGRATION_RELEASED = False
 BINANCE_SPOT_FUNCTIONAL_ROUTE_KEY = (
     "BINANCE_SPOT_CONTINUOUS:BTCUSDT:5m"
 )
@@ -147,6 +151,7 @@ def binance_spot_functional_composite_available() -> bool:
             BINANCE_SPOT_FUNCTIONAL_ORDINARY_FENCE_AVAILABLE,
             BINANCE_SPOT_FUNCTIONAL_EMERGENCY_FENCE_AVAILABLE,
             BINANCE_SPOT_FUNCTIONAL_EXCLUSIVE_ACCOUNT_AVAILABLE,
+            BINANCE_SPOT_FUNCTIONAL_ROOT_INTEGRATION_RELEASED,
         )
     )
 
@@ -163,6 +168,7 @@ def binance_spot_first_live_bootstrap_available() -> bool:
             BINANCE_SPOT_FUNCTIONAL_ORDINARY_FENCE_AVAILABLE,
             BINANCE_SPOT_FUNCTIONAL_EMERGENCY_FENCE_AVAILABLE,
             BINANCE_SPOT_FUNCTIONAL_EXCLUSIVE_ACCOUNT_AVAILABLE,
+            BINANCE_SPOT_FUNCTIONAL_ROOT_INTEGRATION_RELEASED,
             not BINANCE_SPOT_FUNCTIONAL_REAL_E2E_AVAILABLE,
         )
     )
@@ -806,6 +812,88 @@ class BinanceSpotFunctionalBackendManager:
             return False
         return True
 
+    def _verified_durable_phase(
+        self,
+        handle: LifecycleHandle,
+        *,
+        expected_phase: str,
+        before_revision: int | None = None,
+        transition: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Re-read one exact durable owner epoch before reporting success."""
+
+        fresh = dict(self.manager.status())
+        phase = str(fresh.get("phase") or "").upper()
+        session_id = str(
+            fresh.get("sessionId") or fresh.get("session_id") or ""
+        )
+        owner_id = str(fresh.get("ownerId") or fresh.get("owner_id") or "")
+        try:
+            revision = int(fresh.get("revision"))
+        except (TypeError, ValueError):
+            revision = -1
+        if (
+            phase != str(expected_phase).upper()
+            or session_id != handle.session_id
+            or owner_id != handle.owner_id
+            or revision < 1
+            or (
+                before_revision is not None
+                and revision <= int(before_revision)
+            )
+        ):
+            raise BinanceSpotFunctionalBackendError(
+                "durable functional owner phase was not freshly verified"
+            )
+        if transition is not None:
+            transition_phase = str(transition.get("phase") or "").upper()
+            transition_session = str(
+                transition.get("sessionId")
+                or transition.get("session_id")
+                or ""
+            )
+            transition_owner = str(
+                transition.get("ownerId")
+                or transition.get("owner_id")
+                or ""
+            )
+            try:
+                transition_revision = int(transition.get("revision"))
+            except (TypeError, ValueError):
+                transition_revision = -1
+            if (
+                transition_phase != phase
+                or transition_session != session_id
+                or transition_owner != owner_id
+                or transition_revision != revision
+            ):
+                raise BinanceSpotFunctionalBackendError(
+                    "cleanup transition and fresh durable owner epoch differ"
+                )
+        control = getattr(self.manager, "control", None)
+        verifier_name = (
+            "verify_final_reset_handle"
+            if str(expected_phase).upper() == "FINAL_RESET"
+            else "verify_handle"
+        )
+        verifier = getattr(control, verifier_name, None)
+        if callable(verifier):
+            verified = dict(verifier(handle))
+            if (
+                str(verified.get("phase") or "").upper() != phase
+                or str(verified.get("session_id") or "") != session_id
+                or str(verified.get("owner_id") or "") != owner_id
+                or int(verified.get("revision") or -1) != revision
+            ):
+                raise BinanceSpotFunctionalBackendError(
+                    "cleanup owner token verification changed durable epoch"
+                )
+        elif not self.allow_mock_backend:
+            raise BinanceSpotFunctionalBackendError(
+                "production cleanup owner-token verifier is unavailable"
+            )
+        return fresh
+
     def _seal_first_live_terminal(
         self, *, bootstrap_id: str, session_id: str
     ) -> dict[str, Any]:
@@ -847,16 +935,44 @@ class BinanceSpotFunctionalBackendManager:
                     self._scheduler_escape_count += 1
                 escape_count = self._scheduler_escape_count
             cleanup_latched = False
+            cleanup_authority_fault = False
+            cleanup_error_name = "unknown cleanup transition fault"
             try:
-                self.manager.begin_cleanup(
+                before = dict(self.manager.status())
+            except Exception:
+                before = {}
+            try:
+                before_revision = int(before.get("revision"))
+            except (TypeError, ValueError):
+                before_revision = None
+            try:
+                transition = self.manager.begin_cleanup(
                     handle,
                     reason=(
                         "backend scheduler escaped unexpectedly:"
                         f"{type(exc).__name__}"
                     ),
                 )
+                self._verified_durable_phase(
+                    handle,
+                    expected_phase="CLEANUP",
+                    before_revision=before_revision,
+                    transition=transition,
+                )
                 cleanup_latched = True
             except Exception as cleanup_exc:
+                cleanup_error_name = type(cleanup_exc).__name__
+                try:
+                    self._verified_durable_phase(
+                        handle,
+                        expected_phase="CLEANUP",
+                        before_revision=before_revision,
+                    )
+                except Exception:
+                    pass
+                else:
+                    cleanup_latched = True
+            if not cleanup_latched:
                 control = getattr(self.manager, "control", None)
                 fail_closed = getattr(
                     control, "fail_closed_owner_health", None
@@ -871,11 +987,13 @@ class BinanceSpotFunctionalBackendManager:
                             detail=(
                                 "scheduler escape cleanup latch failed:"
                                 f"{type(exc).__name__}/"
-                                f"{type(cleanup_exc).__name__}"
+                                f"{cleanup_error_name}"
                             ),
                         )
                     except Exception:
-                        pass
+                        cleanup_authority_fault = True
+                else:
+                    cleanup_authority_fault = True
             if cleanup_latched and escape_count >= 3:
                 control = getattr(self.manager, "control", None)
                 fail_closed = getattr(
@@ -900,7 +1018,13 @@ class BinanceSpotFunctionalBackendManager:
             result = {
                 "ok": False,
                 "status": (
-                    "CLEANUP" if cleanup_latched else "RECONCILIATION_REQUIRED"
+                    "CLEANUP"
+                    if cleanup_latched
+                    else (
+                        "CLEANUP_RETRY_REQUIRED"
+                        if cleanup_authority_fault
+                        else "RECONCILIATION_REQUIRED"
+                    )
                 ),
                 "detail": f"{type(exc).__name__}:{str(exc)[:300]}",
             }
@@ -913,8 +1037,100 @@ class BinanceSpotFunctionalBackendManager:
                 if generation == self._generation
                 else ""
             )
-        result_status = str(result.get("status") or "").upper()
-        if bootstrap_id and result_status == "FINALIZED":
+        raw_result_status = str(result.get("status") or "").upper()
+
+        control_read_error = ""
+        try:
+            durable_control = dict(self.manager.status())
+        except Exception as exc:
+            durable_control = {}
+            control_read_error = type(exc).__name__
+        durable_phase = str(durable_control.get("phase") or "").upper()
+        durable_session = str(
+            durable_control.get("sessionId")
+            or durable_control.get("session_id")
+            or ""
+        )
+        durable_owner = str(
+            durable_control.get("ownerId")
+            or durable_control.get("owner_id")
+            or ""
+        )
+        exact_owner_epoch = bool(
+            durable_session == handle.session_id
+            and durable_owner == handle.owner_id
+        )
+        terminal_capabilities_reset = bool(
+            durable_control.get("functionalCapabilityReset") is True
+            and durable_control.get("ownerTokenReset") is True
+        )
+        durable_terminal_clear = bool(
+            durable_phase in {"FAILED", "FINALIZED"}
+            and exact_owner_epoch
+            and terminal_capabilities_reset
+        )
+        if not durable_terminal_clear:
+            if durable_phase == "CLEANUP" and exact_owner_epoch:
+                cleanup_driver_escaped = raw_result_status == "CLEANUP"
+                result = {
+                    **result,
+                    "ok": False,
+                    "status": (
+                        "CLEANUP"
+                        if cleanup_driver_escaped
+                        else "CLEANUP_RETRY_REQUIRED"
+                    ),
+                    "detail": (
+                        "scheduler stopped before durable cleanup terminal seal"
+                    ),
+                    "retryableInProcess": True,
+                    "entryAuthorityRestored": False,
+                }
+            elif durable_phase == "FINAL_RESET" and exact_owner_epoch:
+                result = {
+                    **result,
+                    "ok": False,
+                    "status": "FINAL_RESET_RETRY_REQUIRED",
+                    "detail": (
+                        "durable FINAL_RESET remains; authenticated resume required"
+                    ),
+                    "retryableInProcess": True,
+                    "entryAuthorityRestored": False,
+                }
+            else:
+                # ACTIVE, an owner/session mismatch, or an unreadable control
+                # row can never justify discarding the only raw handle.
+                result = {
+                    **result,
+                    "ok": False,
+                    "status": "CLEANUP_RETRY_REQUIRED",
+                    "detail": (
+                        "scheduler terminal result lacks exact durable revoked "
+                        "control proof"
+                        + (
+                            f":{control_read_error}"
+                            if control_read_error
+                            else f":{durable_phase or 'UNKNOWN'}"
+                        )
+                    ),
+                    "retryableInProcess": True,
+                    "entryAuthorityRestored": False,
+                }
+        else:
+            result = {
+                **result,
+                "ok": durable_phase == "FINALIZED",
+                "status": durable_phase,
+            }
+
+        # Bootstrap disposition follows the normalized durable lifecycle, not
+        # a scheduler object's raw return.  In particular, an escaped cleanup
+        # driver must not burn a still-retryable first-live record.  Conversely
+        # a consume/evidence failure after durable FINALIZED remains an
+        # explicit reconciliation failure and can never be overwritten by the
+        # already-sealed lifecycle phase.
+        normalized_status = str(result.get("status") or "").upper()
+        if bootstrap_id and normalized_status == "FINALIZED":
             try:
                 bootstrap_terminal = self._seal_first_live_terminal(
                     bootstrap_id=bootstrap_id,
@@ -932,12 +1148,15 @@ class BinanceSpotFunctionalBackendManager:
                 except Exception:
                     pass
                 result = {
+                    **result,
                     "ok": False,
                     "status": "RECONCILIATION_REQUIRED",
                     "detail": (
                         "first-live terminal evidence could not be consumed:"
                         f"{type(exc).__name__}"
                     ),
+                    "durableLifecyclePhase": durable_phase,
+                    "firstLiveBootstrapConsumed": False,
                 }
             else:
                 result = {
@@ -950,11 +1169,17 @@ class BinanceSpotFunctionalBackendManager:
                         bootstrap_terminal.get("e2e_evidence_eligible")
                     ),
                 }
-        elif bootstrap_id and result_status in {"FAILED", "RECONCILIATION_REQUIRED"}:
+        elif bootstrap_id and normalized_status in {
+            "FAILED",
+            "RECONCILIATION_REQUIRED",
+        }:
             try:
                 self.first_live_bootstrap_store.fail(
                     bootstrap_id=bootstrap_id,
-                    detail=f"first-live session terminalized as {result_status}",
+                    detail=(
+                        "first-live session terminalized as "
+                        f"{normalized_status}"
+                    ),
                 )
             except Exception:
                 pass
@@ -969,7 +1194,7 @@ class BinanceSpotFunctionalBackendManager:
             status = str(result.get("status") or "").upper()
             self._terminal_state = status or "RECONCILIATION_REQUIRED"
             self._terminal_detail = str(result.get("detail") or "")[:500]
-            if status != "CLEANUP":
+            if durable_terminal_clear:
                 self._handle = None
                 self._active_first_live_bootstrap_id = ""
                 self._recovered_first_live_terminal_id = ""
@@ -995,6 +1220,17 @@ class BinanceSpotFunctionalBackendManager:
                     source="scheduler escape cleanup reschedule",
                 )
                 return
+            if status == "CLEANUP_RETRY_REQUIRED":
+                # Both durable CLEANUP and fail-closed revocation faulted.
+                # Retain the only raw owner handle for authenticated retry;
+                # never resume tick/dispatch from this scheduler generation.
+                self._scheduler_stop.set()
+                self._scheduler_thread = None
+                return
+            if status == "FINAL_RESET_RETRY_REQUIRED":
+                self._scheduler_stop.set()
+                self._scheduler_thread = None
+                return
         # Never wait for execution-stream or shared state locks while holding
         # the backend vault lock.  This is the second phase of the state CAS.
         if should_stop_stream and self.stream_stop is not None:
@@ -1017,16 +1253,57 @@ class BinanceSpotFunctionalBackendManager:
             if handle is None:
                 return {"ok": True, "pending": False, "status": self.status()}
             self._assert_route_lock()
-            try:
-                self.manager.begin_cleanup(handle, reason="operator stop")
-            except Exception:
-                # The scheduler observes the durable phase and may resume a
-                # pending final reset.  Never mint or expose another handle.
-                pass
             self._scheduler_stop.set()
+            before = dict(self.manager.status())
+            try:
+                before_revision = int(before.get("revision"))
+            except (TypeError, ValueError):
+                before_revision = None
+            transition: Mapping[str, Any] | None = None
+            transition_error = ""
+            try:
+                transition = self.manager.begin_cleanup(
+                    handle, reason="operator stop"
+                )
+            except Exception as exc:
+                transition_error = type(exc).__name__
+            try:
+                durable = self._verified_durable_phase(
+                    handle,
+                    expected_phase="CLEANUP",
+                    before_revision=before_revision,
+                    transition=transition,
+                )
+            except Exception as exc:
+                self._terminal_state = "CLEANUP_RETRY_REQUIRED"
+                self._terminal_detail = (
+                    "operator stop has not durably latched CLEANUP:"
+                    f"{transition_error or type(exc).__name__}"
+                )
+                self._last_result = {
+                    "ok": False,
+                    "status": "CLEANUP_RETRY_REQUIRED",
+                    "detail": self._terminal_detail,
+                    "retryableInProcess": True,
+                    "entryAuthorityRestored": False,
+                    "brokerSubmissionPerformed": False,
+                }
+                return {
+                    "ok": False,
+                    "pending": True,
+                    "retryable": True,
+                    "brokerSubmissionPerformed": False,
+                    "status": self.status(),
+                }
             self._terminal_state = "CLEANUP"
             self._terminal_detail = "operator stop latched; bounded cleanup continues"
-            return {"ok": True, "pending": True, "status": self.status()}
+            return {
+                "ok": True,
+                "pending": True,
+                "durableCleanupRevision": int(durable["revision"]),
+                "brokerSubmissionPerformed": False,
+                "status": self.status(),
+            }
 
     def recover(self, command: Mapping[str, Any]) -> dict[str, Any]:
         self._assert_fields(command, {"operatorConfirmation"})
@@ -1043,17 +1320,106 @@ class BinanceSpotFunctionalBackendManager:
                         "current backend owner is still present"
                     )
                 handle = self._handle
-                try:
-                    self.manager.begin_cleanup(
-                        handle,
-                        reason="authenticated in-process cleanup worker retry",
+                current = dict(self.manager.status())
+                phase = str(current.get("phase") or "").upper()
+                if phase == "ACTIVE":
+                    try:
+                        before_revision = int(current.get("revision"))
+                    except (TypeError, ValueError):
+                        before_revision = None
+                    try:
+                        transition = self.manager.begin_cleanup(
+                            handle,
+                            reason=(
+                                "authenticated in-process cleanup worker retry"
+                            ),
+                        )
+                        self._verified_durable_phase(
+                            handle,
+                            expected_phase="CLEANUP",
+                            before_revision=before_revision,
+                            transition=transition,
+                        )
+                    except Exception as exc:
+                        self._terminal_state = "CLEANUP_RETRY_REQUIRED"
+                        self._terminal_detail = (
+                            "in-process recovery could not latch CLEANUP:"
+                            f"{type(exc).__name__}"
+                        )
+                        self._last_result = {
+                            "ok": False,
+                            "status": "CLEANUP_RETRY_REQUIRED",
+                            "detail": self._terminal_detail,
+                            "retryableInProcess": True,
+                            "entryAuthorityRestored": False,
+                        }
+                        return {
+                            "ok": False,
+                            "sessionId": handle.session_id,
+                            "cleanupOnly": True,
+                            "pending": True,
+                            "retryable": True,
+                            "status": self.status(),
+                        }
+                    phase = "CLEANUP"
+                elif phase == "CLEANUP":
+                    try:
+                        self._verified_durable_phase(
+                            handle, expected_phase="CLEANUP"
+                        )
+                    except Exception as exc:
+                        self._terminal_state = "CLEANUP_RETRY_REQUIRED"
+                        self._terminal_detail = (
+                            "existing cleanup owner epoch is unverified:"
+                            f"{type(exc).__name__}"
+                        )
+                        return {
+                            "ok": False,
+                            "sessionId": handle.session_id,
+                            "cleanupOnly": True,
+                            "pending": True,
+                            "retryable": True,
+                            "status": self.status(),
+                        }
+                elif phase == "FINAL_RESET":
+                    try:
+                        self._verified_durable_phase(
+                            handle, expected_phase="FINAL_RESET"
+                        )
+                    except Exception as exc:
+                        self._terminal_state = "FINAL_RESET_RETRY_REQUIRED"
+                        self._terminal_detail = (
+                            "final-reset owner epoch is unverified:"
+                            f"{type(exc).__name__}"
+                        )
+                        return {
+                            "ok": False,
+                            "sessionId": handle.session_id,
+                            "cleanupOnly": True,
+                            "pending": True,
+                            "retryable": True,
+                            "status": self.status(),
+                        }
+                else:
+                    self._terminal_state = "RECONCILIATION_REQUIRED"
+                    self._terminal_detail = (
+                        "in-process handle durable phase is not recoverable:"
+                        + phase
                     )
-                except Exception:
-                    # Startup-recovered handles are already cleanup-only; a
-                    # repeated idempotent transition may be unavailable in a
-                    # mock or concurrently finalized durable phase.
-                    pass
+                    return {
+                        "ok": False,
+                        "sessionId": handle.session_id,
+                        "cleanupOnly": True,
+                        "pending": True,
+                        "retryable": False,
+                        "status": self.status(),
+                    }
                 self._generation += 1
+                self._terminal_state = (
+                    "FINAL_RESET_RETRY_REQUIRED"
+                    if phase == "FINAL_RESET"
+                    else "CLEANUP"
+                )
                 started = self._try_start_cleanup_scheduler_locked(
                     self._generation,
                     handle,
@@ -1093,6 +1459,9 @@ class BinanceSpotFunctionalBackendManager:
             lifecycle = dict(self.manager.status())
             full_available = binance_spot_functional_composite_available()
             first_live_available = binance_spot_first_live_bootstrap_available()
+            hold_preparation = (
+                binance_spot_functional_hold_preparation_status()
+            )
             return {
                 "available": full_available,
                 "candidateIssuanceAvailable": (
@@ -1139,6 +1508,7 @@ class BinanceSpotFunctionalBackendManager:
                 "rawCapabilityExposed": False,
                 "clientSignalAccepted": False,
                 "clientPermitAccepted": False,
+                "holdPreparation": hold_preparation,
             }
 
 
@@ -1424,8 +1794,25 @@ def binance_spot_functional_backend_status() -> dict[str, Any]:
             "rawCapabilityExposed": False,
             "clientSignalAccepted": False,
             "clientPermitAccepted": False,
+            "holdPreparation": (
+                binance_spot_functional_hold_preparation_status()
+            ),
         }
     return {"prepared": True, **value.status()}
+
+
+def binance_spot_functional_hold_preparation_status() -> dict[str, Any]:
+    """Expose verified Binance-only prerequisites while keeping HOLD."""
+
+    from .binance_spot_functional_preparation import (
+        binance_spot_functional_hold_preparation_status as _status,
+    )
+
+    return _status(
+        root_integration_released=(
+            BINANCE_SPOT_FUNCTIONAL_ROOT_INTEGRATION_RELEASED
+        )
+    )
 
 
 def preissue_binance_spot_functional_candidate(
@@ -1455,11 +1842,13 @@ def recover_binance_spot_functional_backend(
 __all__ = [
     "BINANCE_SPOT_FUNCTIONAL_BACKEND_AVAILABLE",
     "BINANCE_SPOT_FUNCTIONAL_REAL_E2E_AVAILABLE",
+    "BINANCE_SPOT_FUNCTIONAL_ROOT_INTEGRATION_RELEASED",
     "BINANCE_SPOT_FUNCTIONAL_STATE_SERVER_AVAILABLE",
     "BinanceSpotFunctionalBackendError",
     "BinanceSpotFunctionalBackendManager",
     "binance_spot_functional_backend_status",
     "binance_spot_functional_composite_available",
+    "binance_spot_functional_hold_preparation_status",
     "build_binance_spot_functional_production_backend",
     "issue_binance_spot_functional_permit",
     "prepare_binance_spot_functional_backend",

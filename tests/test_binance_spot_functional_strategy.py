@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 from live_trader.binance_spot_continuous_functional import (
@@ -15,7 +16,10 @@ from live_trader.binance_spot_functional_strategy import (
     OfficialBinanceSpotFinalizedKlineReader,
     SealedBinanceSpotMovingAverageEvaluator,
 )
-from live_trader.binance_spot_functional_lifecycle import LifecycleHandle
+from live_trader.binance_spot_functional_lifecycle import (
+    BinanceSpotLifecycleError,
+    LifecycleHandle,
+)
 from live_trader.binance_spot_publication import verify_binance_spot_publication
 from tests.test_binance_spot_publication import PROOF, actual_binding
 
@@ -203,6 +207,8 @@ class BinanceSpotFunctionalStrategyTest(unittest.TestCase):
 
 
 class FakeManagedLifecycle:
+    allow_mock_lifecycle = True
+
     def __init__(
         self,
         clock: FakeClock,
@@ -218,8 +224,14 @@ class FakeManagedLifecycle:
     ) -> None:
         self.clock = clock
         self.phase = "ACTIVE"
+        self.session_id = "bnsft-scheduler-0001"
+        self.owner_id = "scheduler-owner-0001"
+        self.revision = 1
         self.heartbeat_times: list[float] = []
         self.tick_times: list[float] = []
+        self.tick_phases: list[str] = []
+        self.cleanup_calls = 0
+        self.cleanup_failures_before_commit = 0
         self.fail_heartbeat_at = fail_heartbeat_at
         self.fail_tick_once = fail_tick_once
         self.keep_cleanup_pending = keep_cleanup_pending
@@ -235,18 +247,25 @@ class FakeManagedLifecycle:
         self.final_reset_resume_calls = 0
 
     def status(self) -> dict[str, object]:
-        return {"phase": self.phase}
+        return {
+            "phase": self.phase,
+            "sessionId": self.session_id,
+            "ownerId": self.owner_id,
+            "revision": self.revision,
+        }
 
     def heartbeat(self, _handle: LifecycleHandle) -> dict[str, object]:
         self.heartbeat_times.append(self.clock())
         if self.fail_heartbeat_at and len(self.heartbeat_times) == self.fail_heartbeat_at:
             if not self.fail_heartbeat_without_cleanup:
                 self.phase = "CLEANUP"
+                self.revision += 1
             raise RuntimeError("verified private stream lost")
         return {"phase": "ACTIVE"}
 
     def tick(self, handle: LifecycleHandle) -> dict[str, object]:
         self.tick_times.append(self.clock())
+        self.tick_phases.append(self.phase)
         if self.transient_tick_once:
             self.transient_tick_once = False
             error = RuntimeError("5-minute boundary moved")
@@ -296,8 +315,19 @@ class FakeManagedLifecycle:
         return {"status": "FINALIZED", "resumed": True}
 
     def begin_cleanup(self, _handle: LifecycleHandle, *, reason: str):
+        self.cleanup_calls += 1
+        if self.cleanup_failures_before_commit > 0:
+            self.cleanup_failures_before_commit -= 1
+            raise BinanceSpotLifecycleError("cleanup CAS temporarily unavailable")
         self.phase = "CLEANUP"
-        return {"phase": "CLEANUP", "reason": reason}
+        self.revision += 1
+        return {
+            "phase": "CLEANUP",
+            "sessionId": self.session_id,
+            "ownerId": self.owner_id,
+            "revision": self.revision,
+            "reason": reason,
+        }
 
     def fail_cleanup_deadline(self, _handle: LifecycleHandle, *, reason: str):
         self.phase = "FAILED"
@@ -417,6 +447,26 @@ class BinanceSpotFunctionalManagedSchedulerTest(unittest.TestCase):
         self.assertEqual([], manager.tick_times)
         self.assertFalse(result["entryRetryAttempted"])
 
+    def test_operator_stop_retries_durable_cleanup_before_any_tick(self) -> None:
+        clock = FakeClock(0)
+        manager = FakeManagedLifecycle(clock)
+        manager.cleanup_failures_before_commit = 2
+        stop_event = threading.Event()
+        stop_event.set()
+
+        result = BinanceSpotFunctionalManagedScheduler(
+            manager=manager,  # type: ignore[arg-type]
+            clock=clock,
+            wait=clock.wait,
+            market_poll_interval_seconds=5,
+        ).run(self.handle(), stop_event=stop_event)
+
+        self.assertEqual("FINALIZED", result["status"])
+        self.assertEqual(3, manager.cleanup_calls)
+        self.assertEqual([], manager.heartbeat_times)
+        self.assertEqual(["CLEANUP"], manager.tick_phases)
+        self.assertGreaterEqual(manager.tick_times[0], 10)
+
     def test_tick_or_evaluator_exception_latches_cleanup_and_then_finalizes(self) -> None:
         clock = FakeClock(0)
         manager = FakeManagedLifecycle(clock, fail_tick_once=True)
@@ -428,6 +478,26 @@ class BinanceSpotFunctionalManagedSchedulerTest(unittest.TestCase):
         self.assertEqual("FINALIZED", result["status"])
         self.assertEqual(1, len(manager.heartbeat_times))
         self.assertEqual("FINALIZED", manager.phase)
+
+    def test_tick_fault_cleanup_cas_retries_without_active_tick_or_heartbeat(
+        self,
+    ) -> None:
+        clock = FakeClock(0)
+        manager = FakeManagedLifecycle(clock, fail_tick_once=True)
+        manager.cleanup_failures_before_commit = 2
+
+        result = BinanceSpotFunctionalManagedScheduler(
+            manager=manager,  # type: ignore[arg-type]
+            clock=clock,
+            wait=clock.wait,
+            market_poll_interval_seconds=5,
+        ).run(self.handle())
+
+        self.assertEqual("FINALIZED", result["status"])
+        self.assertEqual(3, manager.cleanup_calls)
+        self.assertEqual(["ACTIVE", "CLEANUP"], manager.tick_phases)
+        self.assertEqual([0], manager.heartbeat_times)
+        self.assertGreaterEqual(manager.tick_times[-1], 15)
 
     def test_cleanup_deadline_revokes_capability_to_manual_reconciliation(self) -> None:
         clock = FakeClock(10_799)

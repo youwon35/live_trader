@@ -11,7 +11,7 @@ fresh.  Any heartbeat failure stops entry authority before cleanup is driven.
 
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .binance_spot_functional_lifecycle import (
     BinanceSpotFunctionalLifecycleManager,
@@ -52,6 +52,83 @@ class BinanceSpotFunctionalManagedScheduler:
         self.heartbeat_interval_seconds = heartbeat_interval
         self.market_poll_interval_seconds = market_poll_interval
 
+    def _verified_cleanup_phase(
+        self,
+        handle: LifecycleHandle,
+        *,
+        before_revision: int | None = None,
+        transition: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Verify the exact durable owner epoch before cleanup can advance."""
+
+        fresh = dict(self.manager.status())
+        try:
+            revision = int(fresh.get("revision"))
+        except (TypeError, ValueError):
+            revision = -1
+        phase = str(fresh.get("phase") or "").upper()
+        session_id = str(
+            fresh.get("sessionId") or fresh.get("session_id") or ""
+        )
+        owner_id = str(
+            fresh.get("ownerId") or fresh.get("owner_id") or ""
+        )
+        if (
+            phase != "CLEANUP"
+            or session_id != handle.session_id
+            or owner_id != handle.owner_id
+            or revision < 1
+            or (
+                before_revision is not None
+                and revision <= int(before_revision)
+            )
+        ):
+            raise BinanceSpotLifecycleError(
+                "operator stop CLEANUP owner epoch is not durably verified"
+            )
+        if transition is not None:
+            try:
+                transition_revision = int(transition.get("revision"))
+            except (TypeError, ValueError):
+                transition_revision = -1
+            if (
+                str(transition.get("phase") or "").upper() != phase
+                or str(
+                    transition.get("sessionId")
+                    or transition.get("session_id")
+                    or ""
+                )
+                != session_id
+                or str(
+                    transition.get("ownerId")
+                    or transition.get("owner_id")
+                    or ""
+                )
+                != owner_id
+                or transition_revision != revision
+            ):
+                raise BinanceSpotLifecycleError(
+                    "operator stop transition differs from durable owner epoch"
+                )
+        control = getattr(self.manager, "control", None)
+        verifier = getattr(control, "verify_handle", None)
+        if callable(verifier):
+            verified = dict(verifier(handle))
+            if (
+                str(verified.get("phase") or "").upper() != phase
+                or str(verified.get("session_id") or "") != session_id
+                or str(verified.get("owner_id") or "") != owner_id
+                or int(verified.get("revision") or -1) != revision
+            ):
+                raise BinanceSpotLifecycleError(
+                    "operator stop owner-token verification changed epoch"
+                )
+        elif not bool(getattr(self.manager, "allow_mock_lifecycle", False)):
+            raise BinanceSpotLifecycleError(
+                "production cleanup owner-token verifier is unavailable"
+            )
+        return fresh
+
     def run(
         self,
         handle: LifecycleHandle,
@@ -81,15 +158,35 @@ class BinanceSpotFunctionalManagedScheduler:
         last_tick: dict[str, Any] | None = None
         operator_cleanup_latched = False
         owner_failure_detail = ""
+        cleanup_barrier_reason = ""
         while True:
             iterations += 1
             if max_iterations is not None and iterations > max_iterations:
+                before = dict(self.manager.status())
                 try:
-                    self.manager.begin_cleanup(
+                    before_revision = int(before.get("revision"))
+                except (TypeError, ValueError):
+                    before_revision = None
+                try:
+                    transition = self.manager.begin_cleanup(
                         handle, reason="test iteration bound reached"
                     )
-                except Exception:
-                    pass
+                    self._verified_cleanup_phase(
+                        handle,
+                        before_revision=before_revision,
+                        transition=transition,
+                    )
+                except Exception as exc:
+                    return {
+                        "ok": False,
+                        "status": (
+                            "TEST_ITERATION_BOUND_CLEANUP_RETRY_REQUIRED"
+                        ),
+                        "detail": f"{type(exc).__name__}:{str(exc)[:200]}",
+                        "iterations": iterations - 1,
+                        "lastTick": last_tick,
+                        "brokerSubmissionPerformed": False,
+                    }
                 return {
                     "ok": False,
                     "status": "TEST_ITERATION_BOUND_FORCED_CLEANUP",
@@ -167,20 +264,72 @@ class BinanceSpotFunctionalManagedScheduler:
                     "lastTick": last_tick,
                     "authority": revoked,
                 }
-            if (
-                stop_event is not None
-                and stop_event.is_set()
-                and not operator_cleanup_latched
-            ):
-                try:
-                    self.manager.begin_cleanup(
-                        handle, reason="managed scheduler operator stop"
-                    )
-                except BinanceSpotLifecycleError:
-                    # A concurrently expired owner is handled by tick below.
-                    pass
-                operator_cleanup_latched = True
-                phase = "CLEANUP"
+            operator_stop_requested = bool(
+                stop_event is not None and stop_event.is_set()
+            )
+            if operator_stop_requested or cleanup_barrier_reason:
+                if not operator_cleanup_latched:
+                    cleanup_verified = False
+                    if phase == "CLEANUP":
+                        try:
+                            self._verified_cleanup_phase(handle)
+                        except Exception as exc:
+                            cleanup_error = exc
+                        else:
+                            cleanup_verified = True
+                    else:
+                        try:
+                            before_revision = int(status.get("revision"))
+                        except (TypeError, ValueError):
+                            before_revision = None
+                        transition: Mapping[str, Any] | None = None
+                        try:
+                            transition = self.manager.begin_cleanup(
+                                handle,
+                                reason=(
+                                    "managed scheduler operator stop"
+                                    if operator_stop_requested
+                                    else cleanup_barrier_reason
+                                ),
+                            )
+                        except Exception as exc:
+                            cleanup_error = exc
+                        try:
+                            self._verified_cleanup_phase(
+                                handle,
+                                before_revision=before_revision,
+                                transition=transition,
+                            )
+                        except Exception as exc:
+                            cleanup_error = exc
+                        else:
+                            cleanup_verified = True
+                    if not cleanup_verified:
+                        # STOP is a strict dispatch barrier.  Do not heartbeat,
+                        # tick, evaluate, or dispatch while the durable
+                        # owner/session CLEANUP transition is unverified.
+                        last_tick = {
+                            "ok": False,
+                            "status": (
+                                "STOP_CLEANUP_LATCH_RETRY"
+                                if operator_stop_requested
+                                else "TICK_CLEANUP_LATCH_RETRY"
+                            ),
+                            "detail": (
+                                f"{type(cleanup_error).__name__}:"
+                                f"{str(cleanup_error)[:200]}"
+                            ),
+                            "entryRetryAttempted": False,
+                            "brokerSubmissionPerformed": False,
+                        }
+                        next_heartbeat = float("inf")
+                        self.wait(self.market_poll_interval_seconds)
+                        continue
+                    operator_cleanup_latched = True
+                    cleanup_barrier_reason = ""
+                    phase = "CLEANUP"
+                    next_heartbeat = float("inf")
+                    next_market_poll = min(next_market_poll, now)
             if now >= float(handle.expires_epoch):
                 # Entry expiry is a normal lifecycle transition, not an owner
                 # heartbeat failure.  Let tick's durable authority snapshot
@@ -283,24 +432,25 @@ class BinanceSpotFunctionalManagedScheduler:
                             now + self.market_poll_interval_seconds
                         )
                         continue
-                    try:
-                        self.manager.begin_cleanup(
-                            handle,
-                            reason=(
-                                "managed scheduler tick/evaluator failed:"
-                                f"{type(exc).__name__}"
-                            ),
-                        )
-                    except Exception:
-                        # A concurrently changed/expired owner is handled by
-                        # startup takeover; no new tick or entry is attempted
-                        # before the next durable phase observation.
-                        pass
+                    cleanup_barrier_reason = (
+                        "managed scheduler tick/evaluator failed:"
+                        f"{type(exc).__name__}"
+                    )
+                    # A generic tick/evaluator fault is a strict barrier.
+                    # The next loop must durably prove the same owner/session
+                    # CLEANUP epoch before heartbeat, tick, or dispatch can
+                    # run again.  A failed CAS remains retry-only here.
+                    next_heartbeat = float("inf")
                     last_tick = {
                         "ok": False,
-                        "status": "TICK_FAILED_CLEANUP_ONLY",
+                        "status": "TICK_FAILED_CLEANUP_RETRY_REQUIRED",
                         "detail": f"{type(exc).__name__}:{str(exc)[:200]}",
+                        "entryRetryAttempted": False,
+                        "brokerSubmissionPerformed": False,
                     }
+                    next_market_poll = now + self.market_poll_interval_seconds
+                    self.wait(self.market_poll_interval_seconds)
+                    continue
                 next_market_poll = now + self.market_poll_interval_seconds
                 phase = str(self.manager.status().get("phase") or "").upper()
                 if phase == "CLEANUP" and last_tick.get("claim") is None:

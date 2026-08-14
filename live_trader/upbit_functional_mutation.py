@@ -311,6 +311,13 @@ class UpbitFunctionalMutationEdge:
             raise UpbitFunctionalMutationNotSent(
                 "upbit-mutation-functional-only-authority-incomplete"
             )
+        if (
+            authority.get("durableOwnerLeaseRequired") is True
+            and authority.get("durableOwnerLeaseActive") is not True
+        ):
+            raise UpbitFunctionalMutationNotSent(
+                "upbit-mutation-durable-owner-lease-inactive"
+            )
         if not _global_real_orders_are_off():
             raise UpbitFunctionalMutationNotSent(
                 "upbit-mutation-global-real-orders-must-stay-off"
