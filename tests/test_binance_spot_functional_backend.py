@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from contextlib import closing
 from pathlib import Path
+import hashlib
 import json
 import tempfile
 import threading
@@ -22,7 +23,12 @@ from live_trader.binance_spot_functional_backend import (
 from live_trader.binance_spot_functional_bootstrap import (
     DurableBinanceSpotFirstLiveBootstrapStore,
 )
-from live_trader.binance_spot_functional_lifecycle import LifecycleHandle
+from live_trader.binance_spot_functional_lifecycle import (
+    LifecycleHandle,
+    PREPARED_ACTIVATION_RECEIPT_SCHEMA_VERSION,
+    PreparedLifecycleHandle,
+    verify_prepared_activation_receipt,
+)
 from tests.test_binance_spot_continuous_functional import (
     ACCOUNT_FINGERPRINT,
     binding,
@@ -58,6 +64,8 @@ class FakeManager:
         self.terminal_reset_override: bool | None = None
         self.start_pointer: dict[str, str] = {}
         self.recovery: object = {"startupRecovery": "NONE"}
+        self.prepared: PreparedLifecycleHandle | None = None
+        self.activation_receipt: dict[str, object] = {}
 
     def audit_incomplete_startup(self):
         if isinstance(self.recovery, LifecycleHandle):
@@ -83,6 +91,72 @@ class FakeManager:
             expires_epoch=self.clock() + 7200,
             cleanup_deadline_epoch=self.clock() + 10800,
         )
+
+    def prepare_inert(
+        self,
+        pointer,
+        *,
+        approval_id: str,
+        owner_id: str,
+        owner_token: str,
+    ):
+        self.start_pointer = dict(pointer)
+        self.phase = "ARMED"
+        self.session_id = "bnsft-backend-prepared-000000000001"
+        self.owner_id = owner_id
+        self.owner_token = owner_token
+        self.revision += 1
+        self.prepared = PreparedLifecycleHandle(
+            approval_id=approval_id,
+            session_id=self.session_id,
+            permit_id=str(pointer["permitId"]),
+            permit_hash=str(pointer["permitHash"]),
+            account_fingerprint=ACCOUNT_FINGERPRINT,
+            prepared_epoch=self.clock(),
+            expires_epoch=self.clock() + 7200,
+            cleanup_deadline_epoch=self.clock() + 10800,
+            control_revision=self.revision,
+            permit_payload={},
+            approval_claim_token="prepared-claim-token-private-0001",
+            owner_id=owner_id,
+            owner_token=owner_token,
+        )
+        return self.prepared
+
+    def heartbeat_prepared(self, prepared):
+        if prepared is not self.prepared or self.phase != "ARMED":
+            raise RuntimeError("prepared owner changed")
+        self.revision += 1
+        return {
+            "ok": True,
+            "phase": "PREPARED_INERT",
+            "sessionId": prepared.session_id,
+            "controlRevision": self.revision,
+            "networkCapabilityOpen": False,
+        }
+
+    def activate_prepared(self, prepared, receipt):
+        self.activation_receipt = verify_prepared_activation_receipt(
+            receipt, handle=prepared, now_epoch=self.clock()
+        )
+        self.prepared = None
+        self.phase = "ACTIVE"
+        self.revision += 1
+        return LifecycleHandle(
+            session_id=prepared.session_id,
+            capability="raw-prepared-capability-must-never-escape",
+            owner_id=prepared.owner_id,
+            owner_token=prepared.owner_token,
+            expires_epoch=prepared.expires_epoch,
+            cleanup_deadline_epoch=prepared.cleanup_deadline_epoch,
+        )
+
+    def fail_prepared(self, prepared, *, detail: str):
+        del prepared, detail
+        self.prepared = None
+        self.phase = "FAILED"
+        self.revision += 1
+        return {"ok": True, "phase": "FAILED"}
 
     def begin_cleanup(self, _handle, *, reason: str):
         self.cleanup_calls += 1
@@ -337,6 +411,95 @@ class BinanceSpotFunctionalBackendTest(unittest.TestCase):
             },
         )
         return candidate
+
+    def test_supervised_prepared_backend_uses_only_shared_reader_receipt(self) -> None:
+        requests: list[dict[str, object]] = []
+
+        def activation_reader(request):
+            request = dict(request)
+            requests.append(request)
+            body = {
+                "schemaVersion": PREPARED_ACTIVATION_RECEIPT_SCHEMA_VERSION,
+                "assuranceMode": "SUPERVISED_NON_PROMOTION",
+                "lane": "BINANCE_SPOT",
+                "approvalId": request["approvalId"],
+                "sessionId": request["sessionId"],
+                "permitId": request["permitId"],
+                "permitHash": request["permitHash"],
+                "accountFingerprint": request["accountFingerprint"],
+                "preparedPlanHash": request["preparedPlanHash"],
+                "globalRunId": "crypto-first-live-run-backend-prepared-0001",
+                "globalCoordinatorRevision": 11,
+                "globalPhase": "ACTIVE",
+                "supervisedContractHash": "c" * 64,
+                "approvalReceiptHash": "d" * 64,
+                "observerCoverageStartedEpoch": self.clock(),
+                "observerSnapshotPayloadHash": "e" * 64,
+                "exactUserApprovalConsumed": True,
+                "oneUse": True,
+                "durable": True,
+                "restartVerifiable": True,
+                "networkCapabilityOpen": True,
+                "promotionEligible": False,
+                "realE2EEligible": False,
+                "productionPromotionAllowed": False,
+                "observedEpoch": self.clock(),
+            }
+            encoded = json.dumps(
+                body,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return {
+                **body,
+                "receiptHash": hashlib.sha256(encoded).hexdigest(),
+            }
+
+        self.backend.supervised_non_promotion_mode = True
+        self.backend.prepared_activation_authority_reader = activation_reader
+        candidate = self.approve_candidate()
+        prepared = self.backend.prepare_inert(
+            {
+                "approvalId": candidate["approvalId"],
+                "operatorConfirmation": self.confirmation,
+            }
+        )
+        self.assertEqual("PREPARED_INERT", self.backend.status()["terminalState"])
+        self.assertTrue(self.backend.status()["preparedInert"])
+        self.assertFalse(prepared["networkCapabilityOpen"])
+        self.assertFalse(self.backend.status()["networkOrderPostAllowed"])
+        self.assertNotIn("ownerToken", json.dumps(prepared))
+        self.assertNotIn("claim", json.dumps(prepared).lower())
+
+        heartbeat = self.backend.heartbeat_prepared()
+        self.assertEqual("PREPARED_INERT", heartbeat["phase"])
+        self.assertFalse(heartbeat["networkCapabilityOpen"])
+        activated = self.backend.activate_prepared(
+            {
+                "approvalId": candidate["approvalId"],
+                "operatorConfirmation": self.confirmation,
+            }
+        )
+        self.assertTrue(activated["ok"])
+        self.assertEqual(1, len(requests))
+        self.assertEqual(
+            {
+                "schemaVersion",
+                "assuranceMode",
+                "lane",
+                "approvalId",
+                "sessionId",
+                "permitId",
+                "permitHash",
+                "accountFingerprint",
+                "preparedPlanHash",
+                "requestedEpoch",
+            },
+            set(requests[0]),
+        )
+        self.assertTrue(self.manager.activation_receipt["networkCapabilityOpen"])
+        self.assertFalse(self.manager.activation_receipt["promotionEligible"])
 
     def test_all_binance_functional_production_flags_remain_false(self) -> None:
         self.assertFalse(backend.BINANCE_SPOT_FUNCTIONAL_BACKEND_AVAILABLE)
@@ -1058,6 +1221,39 @@ class BinanceSpotFunctionalBackendTest(unittest.TestCase):
             patch.object(backend, "composite_production_available", return_value=False),
         ):
             self.assertFalse(backend.binance_spot_functional_composite_available())
+
+    def test_supervised_gate_is_explicit_and_never_reuses_real_e2e(self) -> None:
+        with (
+            patch.object(
+                backend,
+                "supervised_non_promotion_composite_available",
+                return_value=True,
+            ),
+            patch.object(backend, "BINANCE_SPOT_FUNCTIONAL_BACKEND_AVAILABLE", True),
+            patch.object(backend, "BINANCE_SPOT_FUNCTIONAL_STATE_SERVER_AVAILABLE", True),
+            patch.object(
+                backend, "BINANCE_SPOT_FUNCTIONAL_FIRST_LIVE_BOOTSTRAP_AVAILABLE", True
+            ),
+            patch.object(
+                backend, "BINANCE_SPOT_FUNCTIONAL_ORDINARY_FENCE_AVAILABLE", True
+            ),
+            patch.object(
+                backend, "BINANCE_SPOT_FUNCTIONAL_EMERGENCY_FENCE_AVAILABLE", True
+            ),
+            patch.object(backend, "BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED", True),
+            patch.object(backend, "BINANCE_SPOT_FUNCTIONAL_ROOT_INTEGRATION_RELEASED", True),
+            patch.object(backend, "BINANCE_SPOT_FUNCTIONAL_REAL_E2E_AVAILABLE", False),
+        ):
+            self.assertTrue(
+                backend.binance_spot_supervised_non_promotion_available()
+            )
+            self.assertFalse(backend.binance_spot_functional_composite_available())
+            with patch.object(
+                backend, "BINANCE_SPOT_FUNCTIONAL_REAL_E2E_AVAILABLE", True
+            ):
+                self.assertFalse(
+                    backend.binance_spot_supervised_non_promotion_available()
+                )
 
     def test_production_builder_rejects_custom_origin_before_credentials_or_network(self) -> None:
         with patch.dict(

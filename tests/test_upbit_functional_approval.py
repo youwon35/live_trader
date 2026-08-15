@@ -970,6 +970,83 @@ class DurableUpbitFunctionalApprovalStoreTest(unittest.TestCase):
                 session_id="upbit-manifest-session-0001",
             )
 
+    def test_global_reservation_material_is_post_claim_and_recomputed(self) -> None:
+        manifest = state._upbit_functional_code_manifest()
+        store = DurableUpbitFunctionalApprovalStore(
+            Path(self.temp.name) / "global-material.sqlite3",
+            clock=self.fake.clock,
+            operator_verifier=lambda value: value.get("serverSignature")
+            == "verified-by-backend",
+            code_manifest_reader=lambda: manifest,
+        )
+        binding = {
+            "schemaVersion": "upbit-functional-server-candidate-binding/v1",
+            "immutablePermit": _permit_immutable_lineage(
+                self.functional_permit
+            ),
+            "codeManifest": manifest,
+        }
+        candidate = {
+            "schemaVersion": "upbit-functional-server-permit-candidate/v2",
+            "approvalId": "upbit-global-material-candidate-0001",
+            "permitId": self.functional_permit.permit_id,
+            "permitHash": self.functional_permit.content_hash,
+            "accountFingerprint": ACCOUNT,
+            "executionRoute": "UPBIT_KRW_SPOT_CONTINUOUS",
+            "symbol": "KRW-BTC",
+            "serverManaged": True,
+            "singleUse": True,
+            "issuer": "LIVE_TRADER_SERVER",
+            "issuedAt": self.fake.now.isoformat().replace("+00:00", "Z"),
+            "nonce": "global-material-candidate-nonce-000000000001",
+            "candidateBinding": binding,
+            "candidateHash": _stable_hash(binding),
+            "serverSignature": "verified-by-backend",
+        }
+        store.issue_permit_candidate(
+            self.functional_permit.to_dict(), candidate
+        )
+        with self.assertRaisesRegex(
+            UpbitFunctionalBlocked, "global-reservation-pointer-missing"
+        ):
+            store.global_reservation_material(
+                candidate["approvalId"],
+                session_id="upbit-global-material-session-0001",
+            )
+        approval = {
+            **self.approval,
+            "approvalId": candidate["approvalId"],
+            "candidateHash": candidate["candidateHash"],
+        }
+        store.approve_issued_permit(
+            approval_id=candidate["approvalId"], approval=approval
+        )
+        claimed = store.claim_permit(
+            approval_id=candidate["approvalId"],
+            session_id="upbit-global-material-session-0001",
+        )
+        material = store.global_reservation_material(
+            candidate["approvalId"],
+            session_id="upbit-global-material-session-0001",
+        )
+        self.assertEqual(
+            "upbit-functional-global-reservation-material/v1",
+            material["schemaVersion"],
+        )
+        self.assertEqual("UPBIT", material["lane"])
+        self.assertEqual(claimed["permitId"], material["permitId"])
+        self.assertEqual(claimed["permitHash"], material["permitHash"])
+        self.assertEqual(manifest["manifestHash"], material["codeHash"])
+        self.assertEqual(7200, material["activeDurationSeconds"])
+        self.assertFalse(material["promotionEligible"])
+        for field in (
+            "candidateHash",
+            "activationLineageHash",
+            "codeHash",
+            "operatorApprovalHash",
+        ):
+            self.assertRegex(material[field], r"^[0-9a-f]{64}$")
+
     def test_startup_binds_exact_claimed_durable_session_cleanup_only(self) -> None:
         self.approve()
         session = "upbit-crash-after-activate-0001"

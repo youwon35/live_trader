@@ -28,6 +28,7 @@ import {
   normalizeFunctionalTestWorkspace,
   preferredFunctionalTestCandidate,
 } from "./functionalTestModel";
+import CryptoFirstLivePanel from "./CryptoFirstLivePanel";
 
 
 const BLOCKER_LABELS = {
@@ -214,6 +215,7 @@ export default function FunctionalTestWorkspace() {
 
   return (
     <section className="functional-test-workspace" aria-labelledby="functional-test-heading">
+      <CryptoFirstLivePanel />
       <header className="functional-test-hero">
         <div>
           <span className="functional-test-eyebrow">KIS LIVE · CONTROLLED FUNCTIONAL EXECUTION</span>

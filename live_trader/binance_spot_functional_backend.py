@@ -38,9 +38,12 @@ from .binance_spot_functional_lifecycle import (
     BinanceSpotFunctionalLifecycleManager,
     BinanceSpotLifecycleError,
     LifecycleHandle,
+    PreparedLifecycleHandle,
     build_binance_spot_production_lifecycle,
     composite_production_available,
     production_entrypoint_status,
+    prepared_lifecycle_plan,
+    supervised_non_promotion_composite_available,
 )
 from .binance_spot_functional_exclusivity import (
     BINANCE_SPOT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
@@ -60,6 +63,10 @@ from .binance_spot_functional_exclusivity_provider import (
     DurableCursorBoundBinanceSpotExclusivityVerifier,
     PinnedEd25519BinanceSpotExclusivityVerifier,
     build_binance_spot_exclusivity_injection,
+)
+from .binance_spot_functional_supervised_exclusivity import (
+    BinanceSpotSupervisedExclusivityGuard,
+    DurableBinanceSpotSupervisedExclusivityStore,
 )
 from .binance_spot_functional_scheduler import (
     BinanceSpotFunctionalManagedScheduler,
@@ -205,10 +212,32 @@ def binance_spot_first_live_bootstrap_available() -> bool:
     )
 
 
+def binance_spot_supervised_non_promotion_available() -> bool:
+    """Explicit one-run gate that can never satisfy REAL_E2E promotion."""
+
+    return all(
+        (
+            supervised_non_promotion_composite_available(),
+            BINANCE_SPOT_FUNCTIONAL_BACKEND_AVAILABLE,
+            BINANCE_SPOT_FUNCTIONAL_STATE_SERVER_AVAILABLE,
+            BINANCE_SPOT_FUNCTIONAL_FIRST_LIVE_BOOTSTRAP_AVAILABLE,
+            BINANCE_SPOT_FUNCTIONAL_ORDINARY_FENCE_AVAILABLE,
+            BINANCE_SPOT_FUNCTIONAL_EMERGENCY_FENCE_AVAILABLE,
+            BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED,
+            BINANCE_SPOT_FUNCTIONAL_ROOT_INTEGRATION_RELEASED,
+            not BINANCE_SPOT_FUNCTIONAL_REAL_E2E_AVAILABLE,
+        )
+    )
+
+
 def _utc(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace(
         "+00:00", "Z"
     )
+
+
+def _text(value: object) -> str:
+    return str(value or "").strip()
 
 
 def _exact_route_lock(value: Mapping[str, Any]) -> bool:
@@ -317,6 +346,10 @@ class BinanceSpotFunctionalBackendManager:
             DurableBinanceSpotFirstLiveBootstrapStore | None
         ) = None,
         first_live_gate_reader: Callable[[], Mapping[str, Any]] | None = None,
+        supervised_non_promotion_mode: bool = False,
+        prepared_activation_authority_reader: (
+            Callable[[Mapping[str, Any]], Mapping[str, Any]] | None
+        ) = None,
         allow_mock_backend: bool = False,
     ) -> None:
         self.manager = manager
@@ -333,10 +366,19 @@ class BinanceSpotFunctionalBackendManager:
         self.terminal_callback = terminal_callback
         self.first_live_bootstrap_store = first_live_bootstrap_store
         self.first_live_gate_reader = first_live_gate_reader
+        self.supervised_non_promotion_mode = bool(
+            supervised_non_promotion_mode
+        )
+        self.prepared_activation_authority_reader = (
+            prepared_activation_authority_reader
+        )
         self.allow_mock_backend = bool(allow_mock_backend)
         self._lock = threading.RLock()
         self._generation = 0
         self._handle: LifecycleHandle | None = None
+        self._prepared_handle: PreparedLifecycleHandle | None = None
+        self._prepared_bootstrap_id = ""
+        self._prepared_bootstrap_claim_token = ""
         self._scheduler_thread: threading.Thread | None = None
         self._scheduler_stop = threading.Event()
         self._terminal_state = "IDLE"
@@ -419,6 +461,8 @@ class BinanceSpotFunctionalBackendManager:
     def _candidate_gate_available(self) -> bool:
         if self.allow_mock_backend:
             return True
+        if self.supervised_non_promotion_mode:
+            return binance_spot_supervised_non_promotion_available()
         return bool(
             binance_spot_functional_composite_available()
             or binance_spot_first_live_bootstrap_available()
@@ -468,6 +512,13 @@ class BinanceSpotFunctionalBackendManager:
                     "permitId": str(existing["permit_id"]),
                     "permitHash": str(existing["permit_hash"]),
                     "serverManaged": True,
+                    "assuranceMode": (
+                        "SUPERVISED_NON_PROMOTION"
+                        if self.supervised_non_promotion_mode
+                        else "STRICT_INDEPENDENT"
+                    ),
+                    "promotionEligible": False,
+                    "realE2EEligible": False,
                 }
                 if self._first_live_required():
                     bootstrap = self.first_live_bootstrap_store.pointer_for_approval(
@@ -566,6 +617,13 @@ class BinanceSpotFunctionalBackendManager:
                 "expiresAt": record["expiresAt"],
                 "permitExpiresAt": record["permitExpiresAt"],
                 "serverManaged": True,
+                "assuranceMode": (
+                    "SUPERVISED_NON_PROMOTION"
+                    if self.supervised_non_promotion_mode
+                    else "STRICT_INDEPENDENT"
+                ),
+                "promotionEligible": False,
+                "realE2EEligible": False,
             }
             if bootstrap is not None:
                 self._first_live_vault[str(stored["approval_id"])] = (
@@ -592,6 +650,262 @@ class BinanceSpotFunctionalBackendManager:
                     }
                 )
             return result
+
+    def prepare_inert(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        """Durably bind the final permit/session while broker I/O stays zero."""
+
+        self._assert_fields(command, {"approvalId", "operatorConfirmation"})
+        self._verify_operator(command)
+        with self._lock:
+            self._assert_route_lock()
+            if not self.supervised_non_promotion_mode:
+                raise BinanceSpotFunctionalBackendError(
+                    "prepared inert backend is supervised non-promotion only"
+                )
+            if not self._candidate_gate_available():
+                raise BinanceSpotFunctionalBackendError(
+                    "Binance supervised prepared-inert gate is unavailable"
+                )
+            if not callable(self.prepared_activation_authority_reader):
+                raise BinanceSpotFunctionalBackendError(
+                    "shared prepared activation authority is not wired"
+                )
+            if self._handle is not None or self._prepared_handle is not None:
+                raise BinanceSpotFunctionalBackendError(
+                    "Binance functional backend already owns a plan/session"
+                )
+            if self._scheduler_thread is not None and self._scheduler_thread.is_alive():
+                raise BinanceSpotFunctionalBackendError(
+                    "Binance functional backend scheduler already owns the route"
+                )
+            approval_id = _text(command.get("approvalId"))
+            record = self.approval_store.candidate_status(approval_id)
+            if _text(record.get("state")).upper() != "APPROVED":
+                raise BinanceSpotFunctionalBackendError(
+                    "exact server-approved permit is absent"
+                )
+            bootstrap_id = ""
+            bootstrap_claim_token = ""
+            if self._first_live_required():
+                vault = self._first_live_vault.pop(approval_id, None)
+                if vault is None:
+                    raise BinanceSpotFunctionalBackendError(
+                        "single-use first-live capability is absent or already claimed"
+                    )
+                bootstrap_id, raw_bootstrap = vault
+                try:
+                    bootstrap_claim_token = self.first_live_bootstrap_store.claim(
+                        bootstrap_id=bootstrap_id,
+                        raw_capability=raw_bootstrap,
+                        approval_id=approval_id,
+                        permit_id=_text(record["permit_id"]),
+                        permit_hash=_text(record["permit_hash"]),
+                    )
+                except Exception:
+                    try:
+                        self.first_live_bootstrap_store.fail(
+                            bootstrap_id=bootstrap_id,
+                            detail="prepared inert first-live claim failed",
+                        )
+                    except Exception:
+                        pass
+                    raise
+                finally:
+                    raw_bootstrap = ""
+            owner_id = "binance-functional-owner-" + secrets.token_hex(16)
+            owner_token = secrets.token_urlsafe(48)
+            try:
+                prepared = self.manager.prepare_inert(
+                    {
+                        "permitId": _text(record["permit_id"]),
+                        "permitHash": _text(record["permit_hash"]),
+                    },
+                    approval_id=approval_id,
+                    owner_id=owner_id,
+                    owner_token=owner_token,
+                )
+            except Exception:
+                if bootstrap_id:
+                    try:
+                        self.first_live_bootstrap_store.fail(
+                            bootstrap_id=bootstrap_id,
+                            detail="prepared inert broker plan failed",
+                        )
+                    except Exception:
+                        pass
+                raise
+            self._prepared_handle = prepared
+            self._prepared_bootstrap_id = bootstrap_id
+            self._prepared_bootstrap_claim_token = bootstrap_claim_token
+            self._terminal_state = "PREPARED_INERT"
+            self._terminal_detail = (
+                "exact permit/session durably armed; network capability closed"
+            )
+            return {"ok": True, **prepared_lifecycle_plan(prepared)}
+
+    def heartbeat_prepared(self) -> dict[str, Any]:
+        """Renew the private inert bearer; never call a broker transport."""
+
+        with self._lock:
+            prepared = self._prepared_handle
+            if prepared is None or self._handle is not None:
+                raise BinanceSpotFunctionalBackendError(
+                    "prepared inert backend owner is absent"
+                )
+            value = dict(self.manager.heartbeat_prepared(prepared))
+            return {**value, "preparedPlan": prepared_lifecycle_plan(prepared)}
+
+    def activate_prepared(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        """Activate only from a server-read shared one-use ACTIVE receipt."""
+
+        self._assert_fields(command, {"approvalId", "operatorConfirmation"})
+        self._verify_operator(command)
+        with self._lock:
+            self._assert_route_lock()
+            prepared = self._prepared_handle
+            if (
+                prepared is None
+                or self._handle is not None
+                or not secrets.compare_digest(
+                    prepared.approval_id, _text(command.get("approvalId"))
+                )
+            ):
+                raise BinanceSpotFunctionalBackendError(
+                    "exact prepared inert approval is absent"
+                )
+            reader = self.prepared_activation_authority_reader
+            if not callable(reader):
+                raise BinanceSpotFunctionalBackendError(
+                    "shared prepared activation authority is not wired"
+                )
+            plan = prepared_lifecycle_plan(prepared)
+            request = {
+                "schemaVersion": (
+                    "binance-spot-supervised-prepared-activation-request/v1"
+                ),
+                "assuranceMode": "SUPERVISED_NON_PROMOTION",
+                "lane": "BINANCE_SPOT",
+                "approvalId": prepared.approval_id,
+                "sessionId": prepared.session_id,
+                "permitId": prepared.permit_id,
+                "permitHash": prepared.permit_hash,
+                "accountFingerprint": prepared.account_fingerprint,
+                "preparedPlanHash": _text(plan["preparedPlanHash"]),
+                "requestedEpoch": float(self.clock()),
+            }
+            try:
+                receipt = dict(reader(request))
+            except Exception:
+                self.manager.fail_prepared(
+                    prepared,
+                    detail="shared activation authority read failed",
+                )
+                self._prepared_handle = None
+                self._terminal_state = "FAILED"
+                self._terminal_detail = "prepared activation authority failed closed"
+                raise
+            if self.stream_start is not None:
+                try:
+                    self.stream_start()
+                except Exception:
+                    self.manager.fail_prepared(
+                        prepared, detail="prepared activation stream start failed"
+                    )
+                    self._prepared_handle = None
+                    self._terminal_state = "FAILED"
+                    self._terminal_detail = (
+                        "prepared activation stream failed before broker truth"
+                    )
+                    raise
+            self._generation += 1
+            generation = self._generation
+            try:
+                self._start_scheduler_locked(generation)
+            except Exception:
+                if self.stream_stop is not None:
+                    try:
+                        self.stream_stop()
+                    except Exception:
+                        pass
+                self.manager.fail_prepared(
+                    prepared, detail="prepared activation scheduler spawn failed"
+                )
+                self._prepared_handle = None
+                self._scheduler_thread = None
+                self._terminal_state = "FAILED"
+                self._terminal_detail = (
+                    "prepared activation scheduler failed before broker truth"
+                )
+                raise
+            handle: LifecycleHandle | None = None
+            try:
+                if self.stream_ready is not None and self.stream_ready() is not True:
+                    raise BinanceSpotFunctionalBackendError(
+                        "authenticated prebaseline Binance stream is not ready"
+                    )
+                handle = self.manager.activate_prepared(prepared, receipt)
+                if self._prepared_bootstrap_id:
+                    active_record = self.approval_store.candidate_status(
+                        prepared.approval_id
+                    )
+                    active_permit = ExactPermit.parse(
+                        self.approval_store.server_permit_for_approval(
+                            prepared.approval_id
+                        ),
+                        now_epoch=float(self.clock()),
+                    )
+                    self.first_live_bootstrap_store.bind_session(
+                        bootstrap_id=self._prepared_bootstrap_id,
+                        claim_token=self._prepared_bootstrap_claim_token,
+                        approval_id=prepared.approval_id,
+                        active_permit_id=_text(active_record["permit_id"]),
+                        active_permit_hash=_text(active_record["permit_hash"]),
+                        session_id=handle.session_id,
+                        binding=self._binding(),
+                        activated_epoch=active_permit.issued_epoch,
+                        active_ends_epoch=active_permit.expires_epoch,
+                    )
+            except Exception:
+                self._generation += 1
+                self._scheduler_stop.set()
+                if handle is not None:
+                    self._handle = handle
+                    try:
+                        self.manager.begin_cleanup(
+                            handle,
+                            reason="prepared post-activation binding failed",
+                        )
+                    finally:
+                        self._terminal_state = "CLEANUP"
+                else:
+                    try:
+                        self.manager.fail_prepared(
+                            prepared, detail="prepared broker activation failed"
+                        )
+                    except Exception:
+                        pass
+                    self._terminal_state = "FAILED"
+                if self.stream_stop is not None:
+                    try:
+                        self.stream_stop()
+                    except Exception:
+                        pass
+                self._prepared_handle = None
+                raise
+            assert handle is not None
+            self._handle = handle
+            self._prepared_handle = None
+            self._active_first_live_bootstrap_id = self._prepared_bootstrap_id
+            self._prepared_bootstrap_id = ""
+            self._prepared_bootstrap_claim_token = ""
+            self._scheduler_escape_count = 0
+            self._terminal_state = "ACTIVE"
+            self._terminal_detail = "prepared shared authority activated"
+            return {
+                "ok": True,
+                "sessionId": handle.session_id,
+                "status": self.status(),
+            }
 
     def start(self, command: Mapping[str, Any]) -> dict[str, Any]:
         self._assert_fields(command, {"approvalId", "operatorConfirmation"})
@@ -1490,20 +1804,57 @@ class BinanceSpotFunctionalBackendManager:
             lifecycle = dict(self.manager.status())
             full_available = binance_spot_functional_composite_available()
             first_live_available = binance_spot_first_live_bootstrap_available()
+            supervised_available = bool(
+                self.supervised_non_promotion_mode
+                and binance_spot_supervised_non_promotion_available()
+            )
+            candidate_available = (
+                supervised_available
+                if self.supervised_non_promotion_mode
+                else full_available or first_live_available
+            )
             hold_preparation = (
                 binance_spot_functional_hold_preparation_status()
             )
+            prepared_plan = (
+                prepared_lifecycle_plan(self._prepared_handle)
+                if self._prepared_handle is not None
+                else None
+            )
+            supervised_network_open = bool(
+                self.supervised_non_promotion_mode
+                and self._handle is not None
+                and self._prepared_handle is None
+                and _text(lifecycle.get("phase")).upper()
+                in {"ACTIVE", "CLEANUP"}
+                and bool(self._active_first_live_bootstrap_id)
+            )
             return {
                 "available": full_available,
-                "candidateIssuanceAvailable": (
-                    full_available or first_live_available
-                ),
+                "candidateIssuanceAvailable": candidate_available,
                 "networkOrderPostAllowed": bool(
-                    full_available
-                    or (
-                        first_live_available
-                        and self._active_first_live_bootstrap_id
+                    candidate_available
+                    and (
+                        supervised_network_open
+                        if self.supervised_non_promotion_mode
+                        else (
+                            full_available
+                            or bool(self._active_first_live_bootstrap_id)
+                        )
                     )
+                ),
+                "assuranceMode": (
+                    "SUPERVISED_NON_PROMOTION"
+                    if self.supervised_non_promotion_mode
+                    else "STRICT_INDEPENDENT"
+                ),
+                "supervisedNonPromotionAvailable": supervised_available,
+                "supervisedPromotionEligible": False,
+                "supervisedRealE2EEligible": False,
+                "preparedInert": self._prepared_handle is not None,
+                "preparedPlan": prepared_plan,
+                "preparedActivationAuthorityWired": callable(
+                    self.prepared_activation_authority_reader
                 ),
                 "firstLiveBootstrapAvailable": first_live_available,
                 "firstLiveBootstrapActive": bool(
@@ -1628,6 +1979,23 @@ def build_binance_spot_functional_production_backend(
     global_first_live_authority_reader: (
         Callable[..., Mapping[str, Any]] | None
     ) = None,
+    global_first_live_dispatch_reservation: (
+        Callable[..., Any] | None
+    ) = None,
+    supervised_non_promotion_mode: bool = False,
+    supervised_contract_reader: (
+        Callable[..., Mapping[str, Any]] | None
+    ) = None,
+    supervised_user_attestation_reader: (
+        Callable[..., Mapping[str, Any]] | None
+    ) = None,
+    supervised_independent_authority_reader: (
+        Callable[..., Mapping[str, Any]] | None
+    ) = None,
+    supervised_independent_authority_verifier: Any | None = None,
+    prepared_activation_authority_reader: (
+        Callable[[Mapping[str, Any]], Mapping[str, Any]] | None
+    ) = None,
     first_live_gate_reader: Callable[[], Mapping[str, Any]] | None = None,
     production_code_hash_reader: Callable[[], str] = (
         default_binance_spot_functional_code_hash
@@ -1666,14 +2034,69 @@ def build_binance_spot_functional_production_backend(
     store = DurableBinanceSpotApprovedPermitStore(
         database_path, approval_verifier=approval_verifier, clock=clock
     )
-    exclusivity_guard = BinanceSpotExclusivityGuard(
-        store=DurableBinanceSpotExclusivityProofStore(database_path),
-        proof_reader=account_exclusivity_proof_reader,
-        verifier=account_exclusivity_verifier,
-        verifier_pin=account_exclusivity_verifier_pin,
-        account_identity_fingerprint=account_identity_fingerprint,
-        clock=clock,
-    )
+    if supervised_non_promotion_mode:
+        if any(
+            value is None
+            for value in (
+                supervised_contract_reader,
+                supervised_user_attestation_reader,
+                supervised_independent_authority_reader,
+                supervised_independent_authority_verifier,
+                prepared_activation_authority_reader,
+            )
+        ):
+            raise BinanceSpotFunctionalBackendError(
+                "supervised mode requires contract, attestation, and independent authority"
+            )
+        if any(
+            value is not None
+            for value in (
+                account_exclusivity_proof_reader,
+                account_exclusivity_verifier,
+                account_exclusivity_verifier_pin,
+            )
+        ):
+            raise BinanceSpotFunctionalBackendError(
+                "supervised and strict exclusivity authorities cannot be mixed"
+            )
+        exclusivity_guard: Any = BinanceSpotSupervisedExclusivityGuard(
+            store=DurableBinanceSpotSupervisedExclusivityStore(database_path),
+            contract_reader=supervised_contract_reader,
+            official_get_reader=None,
+            local_process_bot_audit_reader=None,
+            user_attestation_reader=supervised_user_attestation_reader,
+            stream_reader=None,
+            independent_authority_reader=(
+                supervised_independent_authority_reader
+            ),
+            independent_authority_verifier=(
+                supervised_independent_authority_verifier
+            ),
+            allow_inprocess_test_evidence=False,
+            clock=clock,
+        )
+    else:
+        if any(
+            value is not None
+            for value in (
+                supervised_contract_reader,
+                supervised_user_attestation_reader,
+                supervised_independent_authority_reader,
+                supervised_independent_authority_verifier,
+                prepared_activation_authority_reader,
+            )
+        ):
+            raise BinanceSpotFunctionalBackendError(
+                "supervised callbacks require explicit supervised mode"
+            )
+        exclusivity_guard = BinanceSpotExclusivityGuard(
+            store=DurableBinanceSpotExclusivityProofStore(database_path),
+            proof_reader=account_exclusivity_proof_reader,
+            verifier=account_exclusivity_verifier,
+            verifier_pin=account_exclusivity_verifier_pin,
+            account_identity_fingerprint=account_identity_fingerprint,
+            clock=clock,
+        )
     if (
         BINANCE_SPOT_FUNCTIONAL_FIRST_LIVE_BOOTSTRAP_AVAILABLE
         and first_live_gate_reader is None
@@ -1737,6 +2160,10 @@ def build_binance_spot_functional_production_backend(
         global_first_live_authority_reader=(
             global_first_live_authority_reader
         ),
+        global_first_live_dispatch_reservation=(
+            global_first_live_dispatch_reservation
+        ),
+        supervised_non_promotion_mode=supervised_non_promotion_mode,
         startup_owner_process_absence_attested=startup_owner_absence,
         permit_approval_verifier=approval_verifier,
         activation_permit_issuer=lambda binding, activated_epoch: (
@@ -1810,6 +2237,10 @@ def build_binance_spot_functional_production_backend(
         terminal_callback=terminal_callback,
         first_live_bootstrap_store=bootstrap_store,
         first_live_gate_reader=first_live_gate_reader,
+        supervised_non_promotion_mode=supervised_non_promotion_mode,
+        prepared_activation_authority_reader=(
+            prepared_activation_authority_reader
+        ),
         allow_mock_backend=False,
     )
 
@@ -1851,6 +2282,11 @@ def binance_spot_functional_backend_status() -> dict[str, Any]:
             "rawCapabilityExposed": False,
             "clientSignalAccepted": False,
             "clientPermitAccepted": False,
+            "supervisedNonPromotionAvailable": (
+                binance_spot_supervised_non_promotion_available()
+            ),
+            "supervisedPromotionEligible": False,
+            "supervisedRealE2EEligible": False,
             "holdPreparation": (
                 binance_spot_functional_hold_preparation_status()
             ),
@@ -1882,6 +2318,22 @@ def start_binance_spot_functional_backend(
     command: Mapping[str, Any]
 ) -> dict[str, Any]:
     return _required().start(command)
+
+
+def prepare_inert_binance_spot_functional_backend(
+    command: Mapping[str, Any]
+) -> dict[str, Any]:
+    return _required().prepare_inert(command)
+
+
+def heartbeat_inert_binance_spot_functional_backend() -> dict[str, Any]:
+    return _required().heartbeat_prepared()
+
+
+def activate_prepared_binance_spot_functional_backend(
+    command: Mapping[str, Any]
+) -> dict[str, Any]:
+    return _required().activate_prepared(command)
 
 
 def stop_binance_spot_functional_backend(
@@ -1917,11 +2369,15 @@ __all__ = [
     "binance_spot_functional_backend_status",
     "binance_spot_functional_composite_available",
     "binance_spot_functional_hold_preparation_status",
+    "binance_spot_supervised_non_promotion_available",
+    "activate_prepared_binance_spot_functional_backend",
     "build_binance_spot_functional_production_backend",
     "build_binance_spot_exclusivity_injection",
     "issue_binance_spot_functional_permit",
+    "heartbeat_inert_binance_spot_functional_backend",
     "prepare_binance_spot_functional_backend",
     "preissue_binance_spot_functional_candidate",
+    "prepare_inert_binance_spot_functional_backend",
     "recover_binance_spot_functional_backend",
     "start_binance_spot_functional_backend",
     "stop_binance_spot_functional_backend",

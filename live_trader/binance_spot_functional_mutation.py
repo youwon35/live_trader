@@ -9,7 +9,6 @@ sender explicitly; no test in this module performs network I/O.
 """
 
 from dataclasses import dataclass
-from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
 import hashlib
 import os
@@ -279,7 +278,6 @@ def build_binance_spot_functional_mutation_request(
     action: Mapping[str, Any],
     *,
     expected_account_fingerprint: str = "",
-    allow_mock_origin: bool = False,
 ) -> FunctionalMutationRequest:
     kind, query = _validate_action(action)
     blocked = missing_env("BINANCE_API_KEY", "BINANCE_API_SECRET")
@@ -294,24 +292,18 @@ def build_binance_spot_functional_mutation_request(
         blocked.append("BINANCE_SPOT_FUNCTIONAL_LIVE_ENABLED")
     configured_base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
     origin_valid = True
-    if allow_mock_origin:
-        base_url = configured_base_url.rstrip("/")
-    else:
-        try:
-            base_url = assert_binance_spot_production_origin(
-                configured_base_url
-            )
-        except Exception:
-            base_url = ""
-            origin_valid = False
-            blocked.append("BINANCE_SPOT_PRODUCTION_ORIGIN_CHANGED")
+    try:
+        base_url = assert_binance_spot_production_origin(
+            configured_base_url
+        )
+    except Exception:
+        base_url = ""
+        origin_valid = False
+        blocked.append("BINANCE_SPOT_PRODUCTION_ORIGIN_CHANGED")
     # Never even place credentials/signature in a request object for a wrong
-    # production origin.  Mock-only injected transports may opt into a custom
-    # origin without changing the production contract.
-    api_key = env_value("BINANCE_API_KEY") if origin_valid or allow_mock_origin else ""
-    api_secret = (
-        env_value("BINANCE_API_SECRET") if origin_valid or allow_mock_origin else ""
-    )
+    # production origin.  Injected senders do not weaken this contract.
+    api_key = env_value("BINANCE_API_KEY") if origin_valid else ""
+    api_secret = env_value("BINANCE_API_SECRET") if origin_valid else ""
     if expected_account_fingerprint:
         try:
             current_fingerprint = binance_api_key_fingerprint(api_key)
@@ -358,24 +350,24 @@ class BinanceSpotFunctionalMutationEdge:
         claim_reader: Callable[[str], Mapping[str, Any]],
         claim_marker: Callable[[str], None] | None = None,
         dispatch_lease_factory: Callable[..., Any] | None = None,
-        global_first_live_authority_reader: (
+        global_first_live_dispatch_reservation: (
+            Callable[..., Any] | None
+        ) = None,
+        final_exclusivity_health_reader: (
             Callable[..., Mapping[str, Any]] | None
         ) = None,
         sender: Callable[[PreparedRequest], Mapping[str, Any]] = send_prepared_request,
-        allow_mock_transport: bool = False,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if allow_mock_transport and sender is send_prepared_request:
-            raise ValueError("mock transport requires an explicitly injected sender")
         self.sender = sender
         self.authority_reader = authority_reader
         self.claim_reader = claim_reader
         self.claim_marker = claim_marker
         self.dispatch_lease_factory = dispatch_lease_factory
-        self.global_first_live_authority_reader = (
-            global_first_live_authority_reader
+        self.global_first_live_dispatch_reservation = (
+            global_first_live_dispatch_reservation
         )
-        self.allow_mock_transport = bool(allow_mock_transport)
+        self.final_exclusivity_health_reader = final_exclusivity_health_reader
         self.clock = clock
 
     def _assert_exact_authority(
@@ -484,48 +476,127 @@ class BinanceSpotFunctionalMutationEdge:
         account_fingerprint: str,
         authority_revision: str,
     ) -> Mapping[str, Any]:
-        lease_context = (
-            self.dispatch_lease_factory(
-                session_id=_text(session_id),
-                claim_id=_text(claim_id),
-                cleanup_only=action.get("cleanupOnly") is True,
-                authority_revision=_text(authority_revision),
+        # This compile-time release fence is unconditional.  An injected
+        # sender, wrapper, caller marker, or test double cannot weaken it.
+        if PRODUCTION_MUTATION_AVAILABLE is not True:
+            raise BinanceSpotFunctionalMutationNotSent(
+                "Binance functional mutation production edge is unavailable"
             )
-            if self.dispatch_lease_factory is not None
-            else nullcontext(lambda: {"active": True})
-        )
-        if not self.allow_mock_transport and self.dispatch_lease_factory is None:
+        if not callable(self.dispatch_lease_factory):
             raise BinanceSpotFunctionalMutationNotSent(
                 "production mutation edge lacks a cross-route dispatch lease"
             )
-        with lease_context as lease_reader:
-            if not callable(lease_reader):
-                raise BinanceSpotFunctionalMutationNotSent(
-                    "functional dispatch lease reader is malformed"
-                )
-            lease = dict(lease_reader())
-            if (
-                lease.get("active") is not True
-                or _text(lease.get("sessionId")) not in {"", _text(session_id)}
-                or _text(lease.get("claimId")) not in {"", _text(claim_id)}
-                or lease.get("ordinaryRoutesClosed", True) is not True
-            ):
-                raise BinanceSpotFunctionalMutationNotSent(
-                    "cross-route functional dispatch lease is inactive"
-                )
-            return self._dispatch_under_lease(
-                action,
-                mark_may_have_been_sent,
-                claim_id=claim_id,
-                sealed_action_hash=sealed_action_hash,
-                functional_capability=functional_capability,
-                session_id=session_id,
-                permit_id=permit_id,
-                permit_hash=permit_hash,
-                account_fingerprint=account_fingerprint,
-                authority_revision=authority_revision,
-                lease_reader=lease_reader,
+        global_reserver = self.global_first_live_dispatch_reservation
+        if not callable(global_reserver):
+            raise BinanceSpotFunctionalMutationNotSent(
+                "production mutation edge lacks the global dispatch reservation"
             )
+        if not callable(self.claim_marker):
+            raise BinanceSpotFunctionalMutationNotSent(
+                "production mutation edge has no backend-owned durable marker CAS"
+            )
+        cleanup_only = action.get("cleanupOnly") is True
+        reservation_request = {
+            "purpose": "MUTATION_FINAL_PRE_MARKER",
+            "session_id": _text(session_id),
+            "permit_id": _text(permit_id),
+            "permit_hash": _text(permit_hash).lower(),
+            "account_fingerprint": _text(account_fingerprint).lower(),
+            "cleanup_only": cleanup_only,
+        }
+        try:
+            reservation_context = global_reserver(**reservation_request)
+        except Exception as exc:
+            raise BinanceSpotFunctionalMutationNotSent(
+                "global first-live dispatch reservation failed closed"
+            ) from exc
+
+        # Lock order is global route authority -> canonical Binance route.
+        # STOP/revoke uses that same order, so the broker edge must never take
+        # the local route lock first.  Both locks remain held across the
+        # durable marker and the physical sender return.
+        try:
+            with reservation_context as global_snapshot:
+                if not isinstance(global_snapshot, Mapping):
+                    raise BinanceSpotExclusivityError(
+                        "global first-live dispatch reservation returned no snapshot"
+                    )
+                verify_global_first_live_authority(
+                    global_snapshot,
+                    purpose="MUTATION_FINAL_PRE_MARKER",
+                    session_id=session_id,
+                    permit_id=permit_id,
+                    permit_hash=permit_hash,
+                    account_fingerprint=account_fingerprint,
+                    cleanup_only=cleanup_only,
+                    now_epoch=float(self.clock()),
+                )
+                lease_context = self.dispatch_lease_factory(
+                    session_id=_text(session_id),
+                    claim_id=_text(claim_id),
+                    cleanup_only=cleanup_only,
+                    authority_revision=_text(authority_revision),
+                )
+                with lease_context as lease_reader:
+                    if not callable(lease_reader):
+                        raise BinanceSpotFunctionalMutationNotSent(
+                            "functional dispatch lease reader is malformed"
+                        )
+                    lease = dict(lease_reader())
+                    if (
+                        lease.get("active") is not True
+                        or _text(lease.get("sessionId"))
+                        not in {"", _text(session_id)}
+                        or _text(lease.get("claimId"))
+                        not in {"", _text(claim_id)}
+                        or lease.get("ordinaryRoutesClosed", True) is not True
+                    ):
+                        raise BinanceSpotFunctionalMutationNotSent(
+                            "cross-route functional dispatch lease is inactive"
+                        )
+                    return self._dispatch_under_lease(
+                        action,
+                        mark_may_have_been_sent,
+                        claim_id=claim_id,
+                        sealed_action_hash=sealed_action_hash,
+                        functional_capability=functional_capability,
+                        session_id=session_id,
+                        permit_id=permit_id,
+                        permit_hash=permit_hash,
+                        account_fingerprint=account_fingerprint,
+                        authority_revision=authority_revision,
+                        lease_reader=lease_reader,
+                    )
+        except BinanceSpotFunctionalMutationOutcomeUnknown:
+            raise
+        except BinanceSpotFunctionalMutationNotSent as exc:
+            try:
+                boundary_state = _text(
+                    dict(self.claim_reader(_text(claim_id))).get("state")
+                ).upper()
+            except Exception:
+                boundary_state = "UNREADABLE"
+            if boundary_state == "POST_MAY_HAVE_CROSSED":
+                raise BinanceSpotFunctionalMutationOutcomeUnknown(
+                    "final dispatch failed after durable boundary marker"
+                ) from exc
+            raise
+        except BinanceSpotExclusivityError as exc:
+            raise BinanceSpotFunctionalMutationNotSent(str(exc)) from exc
+        except Exception as exc:
+            try:
+                boundary_state = _text(
+                    dict(self.claim_reader(_text(claim_id))).get("state")
+                ).upper()
+            except Exception:
+                boundary_state = "UNREADABLE"
+            if boundary_state == "POST_MAY_HAVE_CROSSED":
+                raise BinanceSpotFunctionalMutationOutcomeUnknown(
+                    "final dispatch reservation failed after durable marker"
+                ) from exc
+            raise BinanceSpotFunctionalMutationNotSent(
+                "final dispatch reservation failed closed"
+            ) from exc
 
     def _dispatch_under_lease(
         self,
@@ -588,68 +659,72 @@ class BinanceSpotFunctionalMutationEdge:
             account_fingerprint=account_fingerprint,
             authority_revision=authority_revision,
         )
-        global_reader = self.global_first_live_authority_reader
-        if global_reader is None and not self.allow_mock_transport:
-            raise BinanceSpotFunctionalMutationNotSent(
-                "production mutation edge lacks global first-live authority"
-            )
-        if global_reader is not None:
-            cleanup_only = action.get("cleanupOnly") is True
-            try:
-                global_snapshot = global_reader(
-                    purpose="MUTATION_FINAL_PRE_MARKER",
-                    session_id=_text(session_id),
-                    permit_id=_text(permit_id),
-                    permit_hash=_text(permit_hash).lower(),
-                    account_fingerprint=_text(account_fingerprint).lower(),
-                    cleanup_only=cleanup_only,
-                )
-                verify_global_first_live_authority(
-                    global_snapshot,
-                    purpose="MUTATION_FINAL_PRE_MARKER",
-                    session_id=session_id,
-                    permit_id=permit_id,
-                    permit_hash=permit_hash,
-                    account_fingerprint=account_fingerprint,
-                    cleanup_only=cleanup_only,
-                    now_epoch=float(self.clock()),
-                )
-            except BinanceSpotExclusivityError as exc:
-                raise BinanceSpotFunctionalMutationNotSent(str(exc)) from exc
-            except Exception as exc:
-                raise BinanceSpotFunctionalMutationNotSent(
-                    "global first-live authority reader failed closed"
-                ) from exc
         prepared = build_binance_spot_functional_mutation_request(
             action,
             expected_account_fingerprint=account_fingerprint,
-            allow_mock_origin=self.allow_mock_transport,
         )
         if not prepared.can_send:
             raise BinanceSpotFunctionalMutationNotSent(
                 "mutation request is not credential/gate ready: "
                 + ",".join(prepared.blocked_reasons)
             )
-        if not self.allow_mock_transport and not PRODUCTION_MUTATION_AVAILABLE:
-            raise BinanceSpotFunctionalMutationNotSent(
-                "Binance functional mutation production edge is unavailable"
-            )
-        # Contract: every local validation precedes this marker.  The sender is
-        # invoked exactly once after it, and no timestamp retry exists here.
-        if self.claim_marker is not None:
-            self.claim_marker(_text(claim_id))
-        elif self.allow_mock_transport:
-            mark_may_have_been_sent()
-        else:
-            raise BinanceSpotFunctionalMutationNotSent(
-                "production mutation edge has no backend-owned durable marker CAS"
-            )
+        # Supervised non-promotion runs have an independently signed observer
+        # outside the trader process.  Re-read it inside both the global route
+        # reservation and the canonical Binance dispatch lease, immediately
+        # before the durable may-have-crossed marker.  Cleanup orders are
+        # deliberately exempt so an observer revoke/gap/crash cannot strand
+        # exact session-owned BTC.
+        health_reader = self.final_exclusivity_health_reader
+        if health_reader is not None and action.get("cleanupOnly") is not True:
+            try:
+                health = dict(
+                    health_reader(
+                        purpose="MUTATION_FINAL_PRE_MARKER",
+                        session_id=_text(session_id),
+                        permit_id=_text(permit_id),
+                        permit_hash=_text(permit_hash).lower(),
+                        credential_fingerprint=_text(
+                            account_fingerprint
+                        ).lower(),
+                    )
+                )
+            except BinanceSpotExclusivityError:
+                raise
+            except Exception as exc:
+                raise BinanceSpotFunctionalMutationNotSent(
+                    "final independent exclusivity health read failed closed"
+                ) from exc
+            if (
+                health.get("healthy") is not True
+                or _text(health.get("purpose")).upper()
+                != "MUTATION_FINAL_PRE_MARKER"
+                or _text(health.get("sessionId")) != _text(session_id)
+                or _text(health.get("permitId")) != _text(permit_id)
+                or not secrets.compare_digest(
+                    _text(health.get("permitHash")).lower(),
+                    _text(permit_hash).lower(),
+                )
+                or not secrets.compare_digest(
+                    _text(health.get("credentialFingerprint")).lower(),
+                    _text(account_fingerprint).lower(),
+                )
+                or health.get("otherApiKeyInventoryProven") is not False
+                or health.get("accountWideCausalClosureProven") is not False
+                or health.get("promotionEligible") is not False
+                or health.get("realE2EEligible") is not False
+                or health.get("productionPromotionAllowed") is not False
+            ):
+                raise BinanceSpotFunctionalMutationNotSent(
+                    "final independent exclusivity health changed"
+                )
+        # Contract: every local validation precedes this marker.  The sender
+        # is invoked exactly once after it; no retry exists.
+        self.claim_marker(_text(claim_id))
         marked = dict(self.claim_reader(_text(claim_id)))
         if (
             _text(marked.get("claim_id")) != _text(claim_id)
             or _text(marked.get("session_id")) != _text(session_id)
-            or _text(marked.get("state")).upper()
-            != "POST_MAY_HAVE_CROSSED"
+            or _text(marked.get("state")).upper() != "POST_MAY_HAVE_CROSSED"
             or _text(marked.get("sealed_action_json"))
             != _text(claim.get("sealed_action_json"))
         ):
@@ -672,7 +747,7 @@ class BinanceSpotFunctionalMutationEdge:
             response = self.sender(prepared)
         except Exception as exc:
             raise BinanceSpotFunctionalMutationOutcomeUnknown(
-                f"transport raised after boundary marker: {type(exc).__name__}"
+                "transport raised after boundary marker: " + type(exc).__name__
             ) from exc
         if not isinstance(response, Mapping) or response.get("ok") is not True:
             raise BinanceSpotFunctionalMutationOutcomeUnknown(

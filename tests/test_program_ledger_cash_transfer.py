@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import contextmanager
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
@@ -57,6 +59,7 @@ class ProgramLedgerCashTransferTests(unittest.TestCase):
             ),
             clock=lambda: self.now,
         )
+        self.global_idle_held = False
         self.ledger = self.new_ledger()
         self.ledger.replace_cash_rows(
             [
@@ -96,7 +99,48 @@ class ProgramLedgerCashTransferTests(unittest.TestCase):
             cash_transfer_high_water_verifier=(
                 self.evidence_verifier.verify_high_water_request
             ),
+            cash_transfer_global_idle_reserver=(
+                self.global_idle_reservation
+            ),
         )
+
+    @contextmanager
+    def global_idle_reservation(self, request):
+        if self.global_idle_held:
+            raise RuntimeError("test-global-idle-reservation-reentered")
+        self.global_idle_held = True
+        body = {
+            "schemaVersion": "crypto-first-live-global-idle-reservation/v1",
+            "scope": "CRYPTO_FIRST_LIVE_GLOBAL",
+            "purpose": request["purpose"],
+            "phase": "IDLE",
+            "coordinatorStoredPhase": "IDLE",
+            "coordinatorDatabaseId": "crypto-first-live-db-test-0001",
+            "coordinatorRevision": 0,
+            "publicationHash": "",
+            "accountFingerprint": request["accountFingerprint"],
+            "consumptionKey": request["consumptionKey"],
+            "truthHash": request["truthHash"],
+            "reservationId": "crypto-first-live-global-idle-test-0001",
+            "acquiredEpoch": self.now.timestamp(),
+            "held": True,
+            "exclusive": True,
+            "durableAuthority": True,
+            "restartVerifiable": True,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                body,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            yield {**body, "reservationHash": digest}
+        finally:
+            self.global_idle_held = False
 
     def envelope(self) -> dict[str, object]:
         observed = self.now.isoformat()
@@ -284,6 +328,51 @@ class ProgramLedgerCashTransferTests(unittest.TestCase):
                     self.apply(ledger=ledger, certified=proof)
                 self.assert_original_balances()
                 self.assertEqual([], self.ledger.cash_transfer_consumption_rows())
+
+    def test_global_idle_reserver_is_required_before_ledger_commit(self) -> None:
+        ledger = ProgramLedger(
+            self.path,
+            cash_transfer_authority_verifier=(
+                self.evidence_verifier.verify_ledger_authority_request
+            ),
+            cash_transfer_high_water_verifier=(
+                self.evidence_verifier.verify_high_water_request
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "idle-reserver-unavailable"):
+            self.apply(ledger=ledger)
+        self.assert_original_balances()
+        self.assertEqual([], self.ledger.cash_transfer_consumption_rows())
+
+    def test_global_idle_reservation_is_held_during_sqlite_commit(self) -> None:
+        original_connect = self.ledger.connect
+
+        def checked_connect():
+            conn = original_connect()
+            conn.create_function(
+                "global_idle_held",
+                0,
+                lambda: 1 if self.global_idle_held else 0,
+            )
+            return conn
+
+        self.ledger.connect = checked_connect  # type: ignore[method-assign]
+        conn = self.ledger.connect()
+        try:
+            conn.execute(
+                """
+                CREATE TRIGGER require_global_idle_for_transfer_consumption
+                BEFORE INSERT ON binance_cash_transfer_consumptions
+                WHEN global_idle_held() != 1
+                BEGIN SELECT RAISE(ABORT, 'global-idle-not-held'); END
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        result = self.apply()
+        self.assertTrue(result["ok"])
+        self.assertFalse(self.global_idle_held)
 
     def test_replay_is_rejected_by_unique_consumed_high_water(self) -> None:
         proof = self.certified()

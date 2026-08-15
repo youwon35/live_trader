@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from decimal import Decimal
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -18,8 +19,13 @@ from live_trader.binance_spot_functional_lifecycle import (
     BinanceSpotLifecycleError,
     DurableBinanceSpotFunctionalControl,
     PRODUCTION_LIFECYCLE_AVAILABLE,
+    PREPARED_ACTIVATION_RECEIPT_SCHEMA_VERSION,
     build_binance_spot_production_lifecycle,
+    prepared_lifecycle_plan,
     production_entrypoint_status,
+)
+from live_trader.binance_spot_functional_approval import (
+    DurableBinanceSpotApprovedPermitStore,
 )
 from live_trader.binance_spot_functional_mutation import (
     BinanceSpotFunctionalMutationEdge,
@@ -51,12 +57,17 @@ class FakeOfficialTruthAndMutation:
         self.orders: list[dict[str, object]] = []
         self.fills: list[dict[str, object]] = []
         self.send_count = 0
+        self.read_count = 0
 
     def read(self, *, baseline_epoch: float, owner_prefix: str):
+        self.read_count += 1
         _ = baseline_epoch, owner_prefix
         return (
             truth(
                 self.clock,
+                historyBaselineAt=self.clock.iso(
+                    float(baseline_epoch) - self.clock()
+                ),
                 base=format(self.base, "f"),
                 quote=format(self.quote, "f"),
                 mark=format(self.mark, "f"),
@@ -135,6 +146,13 @@ class FakeOfficialTruthAndMutation:
 
 class BinanceSpotFunctionalLifecycleTest(unittest.TestCase):
     def setUp(self) -> None:
+        mutation_release = patch(
+            "live_trader.binance_spot_functional_mutation."
+            "PRODUCTION_MUTATION_AVAILABLE",
+            True,
+        )
+        mutation_release.start()
+        self.addCleanup(mutation_release.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.clock = Clock()
         self.path = Path(self.temporary.name) / "managed-binance.sqlite3"
@@ -169,11 +187,31 @@ class BinanceSpotFunctionalLifecycleTest(unittest.TestCase):
             clock=self.clock,
             monotonic_clock=self.clock,
         )
+        global_reader = global_authority_reader(self.clock)
+
+        @contextmanager
+        def global_reservation(**request: object):
+            yield global_reader(**request)
+
+        @contextmanager
+        def dispatch_lease(**request: object):
+            yield lambda: {
+                "active": True,
+                "sessionId": request["session_id"],
+                "claimId": request["claim_id"],
+                "ordinaryRoutesClosed": True,
+            }
+
         edge = BinanceSpotFunctionalMutationEdge(
             authority_reader=control.authority_snapshot,
             claim_reader=ledger.action,
+            claim_marker=lambda claim_id: ledger.mark_post_may_have_crossed(
+                claim_id, now_epoch=float(self.clock())
+            ),
+            dispatch_lease_factory=dispatch_lease,
+            global_first_live_dispatch_reservation=global_reservation,
             sender=self.broker.send,
-            allow_mock_transport=True,
+            clock=self.clock,
         )
         return BinanceSpotFunctionalLifecycleManager(
             ledger=ledger,
@@ -187,6 +225,85 @@ class BinanceSpotFunctionalLifecycleTest(unittest.TestCase):
             clock=self.clock,
             allow_mock_lifecycle=True,
         )
+
+    def approve_supervised_permit(self) -> tuple[str, dict[str, object]]:
+        approval_id = "binance-prepared-approval-0001"
+        payload = permit(self.clock)
+        store = DurableBinanceSpotApprovedPermitStore(
+            self.path,
+            approval_verifier=lambda _value: True,
+            clock=self.clock,
+        )
+        store.approve(
+            payload,
+            {
+                "approvalId": approval_id,
+                "operatorId": "authenticated-operator",
+                "operatorAuthenticated": True,
+                "operatorApproved": True,
+                "permitId": payload["permitId"],
+                "permitHash": payload["permitHash"],
+                "accountFingerprint": binding()["accountFingerprint"],
+                "executionRoute": "BINANCE_SPOT_CONTINUOUS",
+                "symbol": "BTCUSDT",
+                "approvedAt": self.clock.iso(),
+                "nonce": "prepared-approval-nonce-0000000001",
+                "activationResealAuthorized": True,
+                "activeDurationSeconds": 7200,
+                "accountExclusivityProofRequired": True,
+                "accountWideCausalClosureProofRequired": True,
+                "firstLiveBootstrapAuthorized": True,
+                "firstLiveBootstrapRequired": False,
+                "firstLiveBootstrapId": "",
+                "firstLiveBootstrapHash": "",
+                "firstLiveSessionNonceHash": "",
+                "firstLiveCodeHash": "",
+            },
+        )
+        self.manager.permit_store = store
+        self.manager.assurance_mode = "SUPERVISED_NON_PROMOTION"
+        self.manager.activation_permit_issuer = (
+            lambda _binding, _now: permit(self.clock)
+        )
+        return approval_id, payload
+
+    def activation_receipt(self, prepared: object, **updates: object):
+        plan = prepared_lifecycle_plan(prepared)  # type: ignore[arg-type]
+        body: dict[str, object] = {
+            "schemaVersion": PREPARED_ACTIVATION_RECEIPT_SCHEMA_VERSION,
+            "assuranceMode": "SUPERVISED_NON_PROMOTION",
+            "lane": "BINANCE_SPOT",
+            "approvalId": plan["approvalId"],
+            "sessionId": plan["sessionId"],
+            "permitId": plan["permitId"],
+            "permitHash": plan["permitHash"],
+            "accountFingerprint": plan["accountFingerprint"],
+            "preparedPlanHash": plan["preparedPlanHash"],
+            "globalRunId": "crypto-first-live-run-binance-prepared-0001",
+            "globalCoordinatorRevision": 7,
+            "globalPhase": "ACTIVE",
+            "supervisedContractHash": "c" * 64,
+            "approvalReceiptHash": "d" * 64,
+            "observerCoverageStartedEpoch": plan["preparedEpoch"],
+            "observerSnapshotPayloadHash": "e" * 64,
+            "exactUserApprovalConsumed": True,
+            "oneUse": True,
+            "durable": True,
+            "restartVerifiable": True,
+            "networkCapabilityOpen": True,
+            "promotionEligible": False,
+            "realE2EEligible": False,
+            "productionPromotionAllowed": False,
+            "observedEpoch": self.clock(),
+        }
+        body.update(updates)
+        encoded = json.dumps(
+            body,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return {**body, "receiptHash": hashlib.sha256(encoded).hexdigest()}
 
     def ready_env(self):
         return patch.dict(
@@ -204,6 +321,97 @@ class BinanceSpotFunctionalLifecycleTest(unittest.TestCase):
         for _ in range(6):
             self.clock.value += 50
             self.manager.heartbeat(handle)  # type: ignore[arg-type]
+
+    def test_supervised_prepare_is_durable_inert_then_exact_receipt_activates(
+        self,
+    ) -> None:
+        approval_id, original = self.approve_supervised_permit()
+        prepared = self.manager.prepare_inert(
+            {
+                "permitId": original["permitId"],
+                "permitHash": original["permitHash"],
+            },
+            approval_id=approval_id,
+            owner_id="prepared-owner-process-0001",
+            owner_token=OWNER_TOKEN,
+        )
+        plan = prepared_lifecycle_plan(prepared)
+        durable = self.manager.status()
+        self.assertEqual("ARMED", durable["phase"])
+        self.assertEqual(prepared.session_id, durable["sessionId"])
+        self.assertTrue(durable["functionalCapabilityReset"])
+        self.assertFalse(plan["networkCapabilityOpen"])
+        self.assertFalse(plan["promotionEligible"])
+        self.assertFalse(plan["realE2EEligible"])
+        self.assertEqual(0, self.broker.read_count)
+        self.assertEqual(0, self.broker.send_count)
+
+        self.clock.value += 30
+        heartbeat = self.manager.heartbeat_prepared(prepared)
+        self.assertEqual("PREPARED_INERT", heartbeat["phase"])
+        self.assertFalse(heartbeat["networkCapabilityOpen"])
+        self.assertEqual(0, self.broker.read_count)
+
+        handle = self.manager.activate_prepared(
+            prepared, self.activation_receipt(prepared)
+        )
+        self.assertEqual(prepared.session_id, handle.session_id)
+        self.assertEqual("ACTIVE", self.manager.status()["phase"])
+        self.assertEqual(1, self.broker.read_count)
+        self.assertEqual(0, self.broker.send_count)
+
+    def test_supervised_bad_activation_receipt_fails_before_broker_read(self) -> None:
+        approval_id, original = self.approve_supervised_permit()
+        prepared = self.manager.prepare_inert(
+            {
+                "permitId": original["permitId"],
+                "permitHash": original["permitHash"],
+            },
+            approval_id=approval_id,
+            owner_id="prepared-owner-process-0002",
+            owner_token=OWNER_TOKEN,
+        )
+        bad = self.activation_receipt(
+            prepared,
+            networkCapabilityOpen=False,
+        )
+        with self.assertRaisesRegex(
+            BinanceSpotLifecycleError, "stale, incomplete, or promotive"
+        ):
+            self.manager.activate_prepared(prepared, bad)
+        self.assertEqual("ARMED", self.manager.status()["phase"])
+        self.assertTrue(self.manager.status()["functionalCapabilityReset"])
+        self.assertEqual(0, self.broker.read_count)
+        self.assertEqual(0, self.broker.send_count)
+
+    def test_supervised_activation_receipt_rejects_noncanonical_identity_and_time(
+        self,
+    ) -> None:
+        approval_id, original = self.approve_supervised_permit()
+        prepared = self.manager.prepare_inert(
+            {
+                "permitId": original["permitId"],
+                "permitHash": original["permitHash"],
+            },
+            approval_id=approval_id,
+            owner_id="prepared-owner-process-hostile-0001",
+            owner_token=OWNER_TOKEN,
+        )
+        hostile_updates = (
+            {"globalRunId": "x"},
+            {"observerCoverageStartedEpoch": float("nan")},
+            {"supervisedContractHash": "C" * 64},
+            {"globalCoordinatorRevision": True},
+        )
+        for update in hostile_updates:
+            with self.subTest(update=tuple(update)):
+                with self.assertRaises(BinanceSpotLifecycleError):
+                    self.manager.activate_prepared(
+                        prepared, self.activation_receipt(prepared, **update)
+                    )
+        self.assertEqual("ARMED", self.manager.status()["phase"])
+        self.assertEqual(0, self.broker.read_count)
+        self.assertEqual(0, self.broker.send_count)
 
     def test_mock_managed_buy_sell_round_trip_seals_baseline_flat(self) -> None:
         with self.ready_env():
@@ -567,6 +775,34 @@ class BinanceSpotFunctionalLifecycleTest(unittest.TestCase):
         self.assertFalse(authority["realOrdersEnabled"])
         self.assertTrue(authority["newEntriesBlocked"])
 
+    def test_supervised_observer_stale_heartbeat_latches_cleanup_only(self) -> None:
+        with self.ready_env():
+            handle = self.manager.start(
+                permit(self.clock),
+                owner_id="owner-process-a",
+                owner_token=OWNER_TOKEN,
+            )
+        self.manager.assurance_mode = "SUPERVISED_NON_PROMOTION"
+        calls: list[str] = []
+
+        def stale_observer(**request: object) -> dict[str, object]:
+            calls.append(str(request["purpose"]))
+            raise TimeoutError("observer snapshot older than five seconds")
+
+        self.manager.continuous_exclusivity_health_reader = stale_observer
+        with self.assertRaisesRegex(
+            BinanceSpotLifecycleError,
+            "independent supervised observer health failed closed",
+        ):
+            self.manager.heartbeat(handle)
+        self.assertEqual(["CONTINUOUS_HEALTH"], calls)
+        self.assertEqual("CLEANUP", self.manager.status()["phase"])
+        authority = self.manager.control.authority_snapshot()
+        self.assertTrue(authority["cleanupOnlyAuthority"])
+        self.assertTrue(authority["killSwitch"])
+        self.assertTrue(authority["newEntriesBlocked"])
+        self.assertEqual(0, self.broker.send_count)
+
     def test_expired_active_owner_is_cross_audited_to_new_cleanup_handle(self) -> None:
         with self.ready_env():
             handle = self.manager.start(
@@ -673,6 +909,13 @@ class BinanceSpotFunctionalLifecycleTest(unittest.TestCase):
             ),
             dispatch_lease_factory=lambda **_: (_ for _ in ()).throw(
                 AssertionError("unavailable start must not acquire dispatch lease")
+            ),
+            global_first_live_dispatch_reservation=lambda **_: (
+                _ for _ in ()
+            ).throw(
+                AssertionError(
+                    "unavailable start must not reserve global dispatch"
+                )
             ),
             stream_terminal_retirer=lambda **_: (_ for _ in ()).throw(
                 AssertionError("unavailable start must not retire stream")

@@ -203,6 +203,24 @@ class CryptoFirstLiveRuntimeTests(unittest.TestCase):
             "cleanup_only": cleanup,
         }
 
+    def inert_heartbeat_request(self) -> dict:
+        status = self.coordinator.status()
+        return {
+            "schemaVersion": (
+                "crypto-first-live-runtime-inert-heartbeat/v1"
+            ),
+            "lane": status["lane"],
+            "runId": status["runId"],
+            "sessionId": status["sessionId"],
+            "permitId": status["permitId"],
+            "permitHash": status["permitHash"],
+            "accountFingerprint": status["accountFingerprint"],
+            "baselineHash": status["baselineHash"],
+            "codeHash": status["codeHash"],
+            "ownerIdentityHash": status["ownerIdentityHash"],
+            "expectedRevision": status["revision"],
+        }
+
     def test_two_lane_reservation_race_has_one_durable_winner(self) -> None:
         barrier = threading.Barrier(2)
         wins: list[str] = []
@@ -226,6 +244,47 @@ class CryptoFirstLiveRuntimeTests(unittest.TestCase):
         self.assertEqual((1, 1), (len(wins), len(losses)))
         self.assertEqual(wins[0], self.coordinator.status()["lane"])
         self.assertNotIn("ownerToken", self.runtime.status())
+
+    def test_runtime_inert_heartbeat_is_exact_and_non_enabling(self) -> None:
+        self.reserve("UPBIT")
+        self.clock.advance(20)
+        result = self.runtime.heartbeat_inert(
+            self.inert_heartbeat_request()
+        )
+        self.assertEqual("APPROVED_INERT", result["phase"])
+        self.assertTrue(result["inertHeartbeat"])
+        self.assertFalse(result["entryAuthorityOpen"])
+        self.assertFalse(result["networkCapabilityOpen"])
+        self.assertFalse(result["networkOrderPostAllowed"])
+        self.assertFalse(result["ownerTokenPersisted"])
+        self.assertFalse(result["ownerTokenReturned"])
+
+    def test_runtime_inert_heartbeat_rejects_extra_or_stale_request(
+        self,
+    ) -> None:
+        self.reserve("UPBIT")
+        request = self.inert_heartbeat_request()
+        revision = request["expectedRevision"]
+        with self.assertRaisesRegex(
+            CryptoFirstLiveRuntimeError, "fields-not-exact"
+        ):
+            self.runtime.heartbeat_inert({**request, "receipt": {}})
+        request["expectedRevision"] = revision - 1
+        with self.assertRaisesRegex(
+            CryptoFirstLiveRuntimeError, "owner-changed"
+        ):
+            self.runtime.heartbeat_inert(request)
+        self.assertEqual(revision, self.coordinator.status()["revision"])
+
+    def test_runtime_inert_heartbeat_rechecks_account_os_lease(self) -> None:
+        self.reserve("UPBIT")
+        self.runtime.account_lease_status_reader = lambda _lane, _account: {
+            "acquired": False,
+        }
+        with self.assertRaisesRegex(
+            CryptoFirstLiveRuntimeError, "lease-lost-at-inert-heartbeat"
+        ):
+            self.runtime.heartbeat_inert(self.inert_heartbeat_request())
 
     def test_owner_lease_loss_blocks_final_edge_without_sender(self) -> None:
         self.activate(self.reserve())
@@ -308,6 +367,64 @@ class CryptoFirstLiveRuntimeTests(unittest.TestCase):
             self.runtime.binance_authority(**self.binance_request(cleanup=False))
             sender()
         sender.assert_not_called()
+
+    def test_dispatch_reservation_retains_route_until_sender_returns(self) -> None:
+        self.activate(self.reserve())
+        entered = threading.Event()
+        release_sender = threading.Event()
+        sender_returned = threading.Event()
+        stop_results: list[dict] = []
+
+        def final_sender() -> None:
+            with mock.patch.multiple(
+                "live_trader.crypto_first_live_coordinator",
+                CRYPTO_FIRST_LIVE_ACTIVATION_RELEASED=True,
+                CRYPTO_FIRST_LIVE_WORM_ROLLBACK_RELEASED=True,
+            ):
+                with self.runtime.binance_dispatch_reservation(
+                    **self.binance_request(cleanup=False)
+                ) as authority:
+                    self.assertTrue(authority["entryAuthorityOpen"])
+                    entered.set()
+                    release_sender.wait(5)
+                sender_returned.set()
+
+        sender_thread = threading.Thread(target=final_sender)
+        sender_thread.start()
+        self.assertTrue(entered.wait(5))
+        stop_thread = threading.Thread(
+            target=lambda: stop_results.append(
+                self.runtime.revoke_entry_before_cleanup("operator-stop")
+            )
+        )
+        stop_thread.start()
+        self.assertFalse(sender_returned.is_set())
+        self.assertTrue(stop_thread.is_alive())
+        release_sender.set()
+        sender_thread.join(5)
+        stop_thread.join(5)
+        self.assertTrue(sender_returned.is_set())
+        self.assertEqual(1, len(stop_results))
+        self.assertTrue(stop_results[0]["entryAuthorityRevoked"])
+        self.assertEqual("CLEANUP_ONLY", self.coordinator.status()["phase"])
+
+    def test_dispatch_reservation_rechecks_exact_account_os_lease(self) -> None:
+        self.activate(self.reserve())
+        self.runtime.account_lease_status_reader = lambda _lane, _account: {
+            "acquired": False,
+            "reason": "hostile-lease-loss",
+        }
+        with mock.patch.multiple(
+            "live_trader.crypto_first_live_coordinator",
+            CRYPTO_FIRST_LIVE_ACTIVATION_RELEASED=True,
+            CRYPTO_FIRST_LIVE_WORM_ROLLBACK_RELEASED=True,
+        ), self.assertRaisesRegex(
+            CryptoFirstLiveRuntimeError, "lease-lost-at-dispatch"
+        ):
+            with self.runtime.binance_dispatch_reservation(
+                **self.binance_request(cleanup=False)
+            ):
+                self.fail("lost account lease must not reach sender")
 
     def test_startup_expiry_becomes_cleanup_only_without_disk_token(self) -> None:
         self.reserve()

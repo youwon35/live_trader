@@ -7,6 +7,12 @@ export const SAFETY_CONFIRMATION_ACTIONS = Object.freeze({
   NEW_ENTRIES_BLOCKED_OFF: "NEW_ENTRIES_BLOCKED_OFF",
   REAL_ORDERS_ENABLE: "REAL_ORDERS_ENABLE",
   FUNCTIONAL_TEST_START: "FUNCTIONAL_TEST_START",
+  UPBIT_FUNCTIONAL_START: "UPBIT_FUNCTIONAL_START",
+  UPBIT_FUNCTIONAL_STOP: "UPBIT_FUNCTIONAL_STOP",
+  UPBIT_FUNCTIONAL_RECOVER: "UPBIT_FUNCTIONAL_RECOVER",
+  BINANCE_SPOT_FUNCTIONAL_START: "BINANCE_SPOT_FUNCTIONAL_START",
+  BINANCE_SPOT_FUNCTIONAL_STOP: "BINANCE_SPOT_FUNCTIONAL_STOP",
+  BINANCE_SPOT_FUNCTIONAL_RECOVER: "BINANCE_SPOT_FUNCTIONAL_RECOVER",
   BINANCE_FUTURES_FILL_SOAK_START: "BINANCE_FUTURES_FILL_SOAK_START",
 });
 
@@ -21,6 +27,7 @@ const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/binance-spot-functional/start",
   "/api/binance-spot-functional/stop",
   "/api/binance-spot-functional/recover",
+  "/api/crypto-first-live/reprepare",
 ]);
 const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
   ...FUNCTIONAL_HTTP_MUTATION_PATHS,
@@ -124,6 +131,25 @@ function normalizedSafetyChallenge(response, action) {
       "SAFETY_CONFIRMATION_INVALID",
     );
   }
+  const metadataSource = response && typeof response === "object" ? response : {};
+  const metadata = Object.fromEntries(
+    [
+      "approvalId",
+      "candidateHash",
+      "permitExpiresAt",
+      "recoveryId",
+      "sessionId",
+      "recoveryExpiresAt",
+      "bootstrapId",
+      "bootstrapHash",
+      "sessionNonceHash",
+      "codeHash",
+      "accountFingerprint",
+      "bindingHash",
+    ]
+      .filter((key) => typeof metadataSource[key] === "string" && metadataSource[key])
+      .map((key) => [key, metadataSource[key]]),
+  );
   return {
     action,
     challengeId,
@@ -134,6 +160,7 @@ function normalizedSafetyChallenge(response, action) {
     displayContext: raw?.displayContext && typeof raw.displayContext === "object"
       ? raw.displayContext
       : {},
+    metadata,
   };
 }
 
@@ -204,7 +231,7 @@ async function runWithSafetyConfirmation(action, context, mutation) {
       challengeId: challenge.challengeId,
       token: challenge.token,
       typedPhrase,
-    });
+    }, challenge.metadata);
   })();
 
   activeSafetyConfirmationFlow = flow;
@@ -576,6 +603,132 @@ export async function evaluateValidationSmallLive(validationStrategyInstanceId) 
     },
     timeoutMs: 30000,
   });
+}
+
+function requiredChallengeMetadata(metadata, field, action) {
+  const value = String(metadata?.[field] || "").trim();
+  if (!value) {
+    throw new ApiRequestError(
+      `${action} 사전 승인 응답에 ${field}가 없습니다.`,
+      "FUNCTIONAL_PREISSUE_INVALID",
+    );
+  }
+  return value;
+}
+
+export async function getUpbitFunctionalStatus() {
+  return request("/api/upbit-functional/status");
+}
+
+export async function getBinanceSpotFunctionalStatus() {
+  return request("/api/binance-spot-functional/status");
+}
+
+export async function reprepareCryptoFirstLive() {
+  return request("/api/crypto-first-live/reprepare", {
+    method: "POST",
+    body: {},
+    timeoutMs: 30_000,
+  });
+}
+
+export async function startUpbitFunctional(approvalId = "") {
+  return runWithSafetyConfirmation(
+    SAFETY_CONFIRMATION_ACTIONS.UPBIT_FUNCTIONAL_START,
+    { approvalId: String(approvalId || "") },
+    (operatorConfirmation, metadata) => request("/api/upbit-functional/start", {
+      method: "POST",
+      body: {
+        approvalId: requiredChallengeMetadata(
+          metadata,
+          "approvalId",
+          "Upbit 기능시험 시작",
+        ),
+        operatorConfirmation,
+      },
+      timeoutMs: 30_000,
+    }),
+  );
+}
+
+export async function stopUpbitFunctional(sessionId) {
+  return runWithSafetyConfirmation(
+    SAFETY_CONFIRMATION_ACTIONS.UPBIT_FUNCTIONAL_STOP,
+    { sessionId: String(sessionId || "") },
+    (operatorConfirmation) => request("/api/upbit-functional/stop", {
+      method: "POST",
+      body: { operatorConfirmation },
+      timeoutMs: 30_000,
+    }),
+  );
+}
+
+export async function recoverUpbitFunctional(recoveryId = "", sessionId = "") {
+  return runWithSafetyConfirmation(
+    SAFETY_CONFIRMATION_ACTIONS.UPBIT_FUNCTIONAL_RECOVER,
+    {
+      recoveryId: String(recoveryId || ""),
+      sessionId: String(sessionId || ""),
+    },
+    (operatorConfirmation, metadata) => request("/api/upbit-functional/recover", {
+      method: "POST",
+      body: {
+        recoveryId: requiredChallengeMetadata(
+          metadata,
+          "recoveryId",
+          "Upbit 기능시험 복구",
+        ),
+        operatorConfirmation,
+      },
+      timeoutMs: 30_000,
+    }),
+  );
+}
+
+export async function startBinanceSpotFunctional(approvalId = "") {
+  return runWithSafetyConfirmation(
+    SAFETY_CONFIRMATION_ACTIONS.BINANCE_SPOT_FUNCTIONAL_START,
+    { approvalId: String(approvalId || "") },
+    (operatorConfirmation, metadata) => request(
+      "/api/binance-spot-functional/start",
+      {
+        method: "POST",
+        body: {
+          approvalId: requiredChallengeMetadata(
+            metadata,
+            "approvalId",
+            "Binance Spot 기능시험 시작",
+          ),
+          operatorConfirmation,
+        },
+        timeoutMs: 30_000,
+      },
+    ),
+  );
+}
+
+export async function stopBinanceSpotFunctional(sessionId) {
+  return runWithSafetyConfirmation(
+    SAFETY_CONFIRMATION_ACTIONS.BINANCE_SPOT_FUNCTIONAL_STOP,
+    { sessionId: String(sessionId || "") },
+    (operatorConfirmation) => request("/api/binance-spot-functional/stop", {
+      method: "POST",
+      body: { operatorConfirmation },
+      timeoutMs: 30_000,
+    }),
+  );
+}
+
+export async function recoverBinanceSpotFunctional(sessionId) {
+  return runWithSafetyConfirmation(
+    SAFETY_CONFIRMATION_ACTIONS.BINANCE_SPOT_FUNCTIONAL_RECOVER,
+    { sessionId: String(sessionId || "") },
+    (operatorConfirmation) => request("/api/binance-spot-functional/recover", {
+      method: "POST",
+      body: { operatorConfirmation },
+      timeoutMs: 30_000,
+    }),
+  );
 }
 
 export async function getFunctionalTestWorkspace() {

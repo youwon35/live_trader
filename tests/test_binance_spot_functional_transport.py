@@ -6,6 +6,7 @@ import os
 import urllib.parse
 import unittest
 from unittest.mock import patch
+import live_trader.binance_spot_functional_transport as transport
 
 from live_trader.binance_spot_continuous_functional import AccountTruth, ExactBinding, SymbolRules
 from live_trader.binance_spot_functional_transport import (
@@ -309,19 +310,31 @@ class BinanceSpotFunctionalTransportTest(unittest.TestCase):
 
         with patch.dict(
             os.environ, {"BINANCE_BASE_URL": "http://mock.local"}, clear=False
-        ):
-            mock = build_binance_spot_get_request(
+        ), self.assertRaises(TypeError):
+            build_binance_spot_get_request(
                 BINANCE_SPOT_TICKER_PRICE_ENDPOINT,
                 {"symbol": "BTCUSDT"},
-                allow_mock_origin=True,
+                allow_mock_origin=True,  # type: ignore[call-arg]
             )
-        self.assertTrue(mock.url.startswith("http://mock.local/"))
 
     def test_official_client_has_no_post_or_cancel_surface(self) -> None:
         client = OfficialBinanceSpotGetClient(sender=lambda _: {"ok": True, "json": {}})
         self.assertFalse(hasattr(client, "post"))
         self.assertFalse(hasattr(client, "cancel"))
         self.assertFalse(hasattr(client, "withdraw"))
+
+    def test_public_client_release_false_calls_no_injected_sender(self) -> None:
+        sends: list[str] = []
+        client = OfficialBinanceSpotGetClient(
+            sender=lambda _request: sends.append("sender")
+            or {"ok": True, "json": {}},
+        )
+        with self.assertRaisesRegex(BinanceSpotTruthError, "capability is closed"):
+            client.get(
+                BINANCE_SPOT_TICKER_PRICE_ENDPOINT,
+                {"symbol": "BTCUSDT"},
+            )
+        self.assertEqual([], sends)
 
     def test_exact_signed_order_query_only_accepts_unknown_order_code(self) -> None:
         fingerprint = __import__(
@@ -331,37 +344,55 @@ class BinanceSpotFunctionalTransportTest(unittest.TestCase):
         responses = [
             {"ok": False, "json": {"code": -2013, "msg": "Order does not exist."}}
         ]
-        client = OfficialBinanceSpotGetClient(
-            sender=lambda request: responses.pop(0),
-            expected_account_fingerprint=fingerprint,
-            clock=lambda: NOW,
-        )
-        with patch.dict(
-            os.environ,
-            {"BINANCE_API_KEY": "api-key", "BINANCE_API_SECRET": "secret"},
-            clear=False,
+        with patch.object(
+            transport,
+            "BINANCE_SPOT_FUNCTIONAL_GET_NETWORK_RELEASED",
+            True,
         ):
-            proof = client.query_order_absence(
-                client_order_id=OWNER_PREFIX + "b"
+            capability = (
+                transport._protected_binance_spot_get_network_capability()
             )
+            client = OfficialBinanceSpotGetClient(
+                sender=lambda request: responses.pop(0),
+                expected_account_fingerprint=fingerprint,
+                clock=lambda: NOW,
+                network_capability=capability,
+            )
+            with patch.dict(
+                os.environ,
+                {"BINANCE_API_KEY": "api-key", "BINANCE_API_SECRET": "secret"},
+                clear=False,
+            ):
+                proof = client.query_order_absence(
+                    client_order_id=OWNER_PREFIX + "b"
+                )
         self.assertTrue(proof["notFound"])
         self.assertEqual(-2013, proof["errorCode"])
         self.assertIn(BINANCE_SPOT_QUERY_ORDER_ENDPOINT, ALL_GET_ENDPOINTS)
 
-        client = OfficialBinanceSpotGetClient(
-            sender=lambda request: {
-                "ok": False,
-                "json": {"code": -1000, "msg": "Internal error"},
-            },
-            expected_account_fingerprint=fingerprint,
-            clock=lambda: NOW,
-        )
-        with patch.dict(
-            os.environ,
-            {"BINANCE_API_KEY": "api-key", "BINANCE_API_SECRET": "secret"},
-            clear=False,
-        ), self.assertRaises(BinanceSpotTruthError):
-            client.query_order_absence(client_order_id=OWNER_PREFIX + "b")
+        with patch.object(
+            transport,
+            "BINANCE_SPOT_FUNCTIONAL_GET_NETWORK_RELEASED",
+            True,
+        ):
+            capability = (
+                transport._protected_binance_spot_get_network_capability()
+            )
+            client = OfficialBinanceSpotGetClient(
+                sender=lambda request: {
+                    "ok": False,
+                    "json": {"code": -1000, "msg": "Internal error"},
+                },
+                expected_account_fingerprint=fingerprint,
+                clock=lambda: NOW,
+                network_capability=capability,
+            )
+            with patch.dict(
+                os.environ,
+                {"BINANCE_API_KEY": "api-key", "BINANCE_API_SECRET": "secret"},
+                clear=False,
+            ), self.assertRaises(BinanceSpotTruthError):
+                client.query_order_absence(client_order_id=OWNER_PREFIX + "b")
 
     def test_official_response_set_builds_strict_core_truth_and_rules(self) -> None:
         fake = FakeClient()

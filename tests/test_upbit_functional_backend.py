@@ -384,6 +384,14 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
         manager._owner_process_identity_hash = "d" * 64
         manager._owner_process_identity_durable = True
         manager._global_first_live_authority_reader = lambda _request: {}
+        manager._global_first_live_dispatch_reserver = lambda _request: None
+        manager._global_first_live_heartbeat = lambda: {}
+        manager._global_first_live_entry_revoker = lambda _reason: {}
+        manager._global_first_live_terminal_finalizer = lambda _request: {}
+        manager._global_first_live_reservation_evidence_reader = (
+            lambda _request: {}
+        )
+        manager._global_first_live_reserve_activate = lambda _request: {}
         manager._durable_owner_lease_required = True
         manager._approval_id = ""
         manager._session_id = ""
@@ -428,6 +436,7 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
                     "accountExclusivityProofSourceWired": True,
                     "globalFirstLiveDispatchFence": {
                         "wired": True,
+                        "routeReservationWired": True,
                         "ownerIdentityBound": True,
                         "releaseLatch": False,
                         "networkOrderPostAllowed": False,
@@ -560,6 +569,151 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
                     },
                     {"approvalId", "operatorConfirmation"},
                 )
+
+    @staticmethod
+    def _global_lifecycle_manager() -> UpbitFunctionalBackendManager:
+        manager = object.__new__(UpbitFunctionalBackendManager)
+        manager._global_first_live_lifecycle_required = True
+        manager._session_id = "upbit-functional-global-session-0001"
+        manager._approval_id = "upbit-global-approval-0001"
+        manager._owner_process_identity_hash = "d" * 64
+        manager.authority = _Authority()
+        return manager
+
+    def test_global_lifecycle_heartbeat_is_exactly_session_bound(self) -> None:
+        manager = self._global_lifecycle_manager()
+        manager._global_first_live_heartbeat = lambda: {
+            "phase": "ACTIVE",
+            "lane": "UPBIT",
+            "sessionId": manager._session_id,
+            "ownerLeaseActive": True,
+            "ownerTokenPersisted": False,
+            "ownerTokenReturned": False,
+        }
+        self.assertEqual(
+            "ACTIVE",
+            manager._heartbeat_global_first_live_locked()["phase"],
+        )
+        manager._global_first_live_heartbeat = lambda: {
+            "phase": "ACTIVE",
+            "lane": "BINANCE_SPOT",
+            "sessionId": manager._session_id,
+            "ownerLeaseActive": True,
+            "ownerTokenPersisted": False,
+            "ownerTokenReturned": False,
+        }
+        with self.assertRaisesRegex(
+            UpbitFunctionalBlocked, "heartbeat-binding-invalid"
+        ):
+            manager._heartbeat_global_first_live_locked()
+
+    def test_global_revoke_failure_still_closes_local_cleanup_latch(self) -> None:
+        manager = self._global_lifecycle_manager()
+        manager._global_first_live_entry_revoker = lambda _reason: {
+            "ok": False,
+            "entryAuthorityRevoked": False,
+            "state": "RECONCILIATION_REQUIRED",
+        }
+        with self.assertRaisesRegex(
+            UpbitFunctionalBlocked, "entry-revocation-unproven"
+        ):
+            manager._enter_cleanup_latches()
+        self.assertEqual(1, manager.authority.cleanup_calls)
+
+    def test_global_terminal_finalize_request_is_exact_and_redacted(self) -> None:
+        manager = self._global_lifecycle_manager()
+        evidence = {
+            "schemaVersion": "upbit-functional-terminal-evidence/v1",
+            "sessionId": manager._session_id,
+            "functionalCapabilityCleared": True,
+            "newEntriesBlocked": True,
+            "realOrdersEnabled": False,
+        }
+        evidence_hash = manager._hash_payload(evidence)
+        requests = []
+
+        def finalize(request):
+            requests.append(dict(request))
+            return {
+                "phase": "FINALIZED",
+                "lane": "UPBIT",
+                "sessionId": manager._session_id,
+                "entryAuthorityOpen": False,
+                "networkOrderPostAllowed": False,
+                "ownerTokenPersisted": False,
+                "ownerTokenReturned": False,
+            }
+
+        manager._global_first_live_terminal_finalizer = finalize
+        result = manager._finalize_global_first_live_locked(
+            evidence=evidence, evidence_hash=evidence_hash
+        )
+        self.assertEqual("FINALIZED", result["phase"])
+        self.assertEqual(1, len(requests))
+        self.assertEqual(
+            {
+                "schemaVersion",
+                "lane",
+                "sessionId",
+                "terminalEvidenceHash",
+                "outcome",
+                "terminalEvidence",
+            },
+            set(requests[0]),
+        )
+        self.assertEqual("CLEANUP_COMPLETE", requests[0]["outcome"])
+        self.assertNotIn("ownerToken", json.dumps(requests[0]))
+
+    def test_scheduler_heartbeat_failure_revokes_before_local_cleanup(self) -> None:
+        manager = self._global_lifecycle_manager()
+        manager._lock = threading.RLock()
+        manager._generation = 51
+        manager._scheduler_stop = _WaitSequence([False])
+        manager._terminal_state = "IDLE"
+        manager._terminal_detail = ""
+        manager._durable_owner_lease_required = False
+        calls: list[str] = []
+
+        def heartbeat():
+            calls.append("heartbeat")
+            raise RuntimeError("global-owner-expired")
+
+        def revoke(_reason):
+            calls.append("revoke")
+            return {
+                "ok": True,
+                "entryAuthorityRevoked": True,
+                "state": "CLEANUP_ONLY",
+                "coordinator": {
+                    "lane": "UPBIT",
+                    "sessionId": manager._session_id,
+                    "entryAuthorityOpen": False,
+                },
+            }
+
+        class Graph:
+            @staticmethod
+            def pump():
+                calls.append("pump")
+                return {}
+
+            @staticmethod
+            def stop(*, reason):
+                calls.append("stop:" + reason)
+                return {
+                    "ok": False,
+                    "pending": False,
+                    "snapshot": {"status": "FAILED_CLOSED"},
+                }
+
+        manager._global_first_live_heartbeat = heartbeat
+        manager._global_first_live_entry_revoker = revoke
+        manager.graph = Graph()
+        manager._scheduler_loop(51)
+        self.assertEqual(
+            ["heartbeat", "revoke", "stop:scheduler-failure"], calls
+        )
+        self.assertEqual("RECONCILIATION_REQUIRED", manager._terminal_state)
 
     def test_scheduler_failure_keeps_cleanup_owner_until_finalized(self) -> None:
         manager = object.__new__(UpbitFunctionalBackendManager)
@@ -1171,6 +1325,10 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
                 }
                 return {**body, "authorityHash": core._strict_stable_hash(body)}
 
+            @contextmanager
+            def global_first_live_reservation(request):
+                yield global_first_live_authority(request)
+
             with (
                 patch.dict(os.environ, environment, clear=False),
                 patch.object(core, "UPBIT_CONTINUOUS_FUNCTIONAL_AVAILABLE", True),
@@ -1263,6 +1421,9 @@ class UpbitFunctionalBackendContractTest(unittest.TestCase):
                     candle_source=candles,
                     global_first_live_authority_reader=(
                         global_first_live_authority
+                    ),
+                    global_first_live_dispatch_reserver=(
+                        global_first_live_reservation
                     ),
                     owner_process_identity={
                         "pid": os.getpid(),

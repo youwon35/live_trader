@@ -2253,6 +2253,7 @@ class BinanceSpotFirstLiveBootstrapTest(unittest.TestCase):
         paths = default_binance_spot_functional_code_paths()
         normalized = {path.as_posix() for path in paths}
         required_suffixes = {
+            "/live_trader/binance_cash_transfer_evidence.py",
             "/live_trader/binance_order_authority.py",
             "/live_trader/binance_spot_publication.py",
             "/live_trader/emergency_stop.py",
@@ -2260,10 +2261,16 @@ class BinanceSpotFirstLiveBootstrapTest(unittest.TestCase):
             "/live_trader/binance_spot_functional_transport.py",
             "/live_trader/binance_spot_functional_exclusivity.py",
             "/live_trader/binance_spot_functional_exclusivity_provider.py",
+            "/live_trader/binance_spot_functional_supervised_exclusivity.py",
+            "/live_trader/binance_spot_supervised_authority_protocol.py",
+            "/live_trader/binance_spot_supervised_observer_launch.py",
             "/live_trader/continuous_live.py",
             "/live_trader/crypto_first_live_coordinator.py",
+            "/live_trader/crypto_first_live_external_worm.py",
             "/live_trader/crypto_first_live_high_water.py",
             "/live_trader/crypto_first_live_runtime.py",
+            "/live_trader/crypto_first_live_supervised_anchor.py",
+            "/live_trader/crypto_first_live_supervised_release.py",
             "/live_trader/env_loader.py",
             "/live_trader/env_settings.py",
             "/live_trader/safety_confirmation.py",

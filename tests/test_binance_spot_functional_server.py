@@ -97,6 +97,34 @@ class BinanceSpotFunctionalServerTest(unittest.TestCase):
                     handler.do_POST()
                 command.assert_called_once_with(payload)
 
+    def test_generic_reprepare_is_native_csrf_only_and_forwards_empty_body(self) -> None:
+        handler = self.handler("/api/crypto-first-live/reprepare", {})
+        expected = {
+            "ok": False,
+            "networkRequestCount": 0,
+            "networkOrderPostAllowed": False,
+        }
+        with patch(
+            "live_trader.server.state."
+            "reprepare_crypto_first_live_functional_state",
+            return_value=expected,
+        ) as command:
+            handler.do_POST()
+        command.assert_called_once_with({})
+        handler.send_json.assert_called_once_with(expected)
+
+        hostile = self.handler("/api/crypto-first-live/reprepare", {})
+        del hostile.headers[CSRF_HEADER]
+        hostile._send_functional_http_denial = Mock()
+        with patch(
+            "live_trader.server.state."
+            "reprepare_crypto_first_live_functional_state"
+        ) as blocked:
+            hostile.do_POST()
+        hostile.read_json.assert_not_called()
+        blocked.assert_not_called()
+        hostile._send_functional_http_denial.assert_called_once()
+
     def test_http_start_rejects_raw_permit_bar_signal_and_capability(self) -> None:
         confirmation = {
             "challengeId": "challenge-1",

@@ -95,6 +95,23 @@ _ACTIVATION_CAPABILITY = object()
 _TEST_CAPABILITY = object()
 
 
+def upbit_functional_session_identifier_prefix(session_id: str) -> str:
+    """Derive the only client-order identifier prefix owned by one session.
+
+    The account-wide independent observer can therefore distinguish this
+    session's orders from every manual, stale, or concurrently running client
+    without receiving a mutable allow-list from the trading process.
+    """
+
+    normalized = str(session_id or "").strip()
+    if _SAFE_ID_RE.fullmatch(normalized) is None:
+        raise UpbitFunctionalBlocked(
+            "upbit-functional-session-identifier-prefix-invalid"
+        )
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"uft-{digest[:8]}-"
+
+
 class UpbitFunctionalError(RuntimeError):
     pass
 
@@ -2822,7 +2839,10 @@ class UpbitFunctionalLedger:
                 }
                 claim_digest = _stable_hash(claim_material)
                 claim_id = f"upbit-claim-{claim_digest[:32]}"
-                identifier = f"uft-{claim_digest[:28]}"
+                identifier = (
+                    upbit_functional_session_identifier_prefix(session_id)
+                    + claim_digest[:19]
+                )
                 connection.execute(
                     """INSERT INTO upbit_functional_claims
                     (claim_id,session_id,claim_key,slot,side,identifier,
@@ -5688,6 +5708,7 @@ def _activate_for_test(**kwargs: Any) -> UpbitContinuousFunctionalService:
 
 __all__ = [
     "ACCOUNT_EXCLUSIVITY_PROOF_SCHEMA_VERSION_V2",
+    "upbit_functional_session_identifier_prefix",
     "EVIDENCE_CLASS",
     "EXECUTION_ROUTE",
     "GLOBAL_FIRST_LIVE_AUTHORITY_SCHEMA_VERSION",

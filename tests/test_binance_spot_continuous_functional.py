@@ -1492,6 +1492,56 @@ class BinanceSpotContinuousFunctionalTest(unittest.TestCase):
         self.assertFalse(final["evidence"]["accountWideCausalClosureProven"])
         self.assertFalse(final["evidence"]["functionalWiringPassed"])
 
+    def test_supervised_round_trip_is_separate_safe_incomplete_evidence(self) -> None:
+        self.exclusivity_guard.terminal_causal_closure = False
+        strict_verify = self.exclusivity_guard.verify_and_record
+
+        def supervised_verify(**request: object) -> dict[str, object]:
+            result = strict_verify(**request)
+            result.update(
+                {
+                    "assuranceMode": "SUPERVISED_NON_PROMOTION",
+                    "supervisedControlsVerified": True,
+                    "supervisedNoManualTradingAttested": True,
+                    "supervisedNoOtherBotsAttested": True,
+                    "exclusiveAccountConfirmed": False,
+                    "noManualTradingConfirmed": True,
+                    "noBotsConfirmed": True,
+                    "noOtherApiKeysConfirmed": False,
+                    "accountWideCausalClosureProven": False,
+                    "promotionEligible": False,
+                    "realE2EEligible": False,
+                    "productionPromotionAllowed": False,
+                }
+            )
+            return result
+
+        self.exclusivity_guard.verify_and_record = supervised_verify
+        session_id, capability, final_truth = (
+            self.dispatched_round_trip_ready_for_finalize()
+        )
+        final = self.service.finalize(
+            session_id, capability, permit(self.clock), final_truth, rules()
+        )
+        evidence = final["evidence"]
+        self.assertEqual(
+            "SAFE_INCOMPLETE_SUPERVISED_NON_PROMOTION",
+            evidence["outcome"],
+        )
+        self.assertEqual("SUPERVISED_NON_PROMOTION", evidence["assuranceMode"])
+        self.assertTrue(evidence["supervisedFunctionalWiringPassed"])
+        self.assertTrue(evidence["noManualTradingAttested"])
+        self.assertTrue(evidence["noManualTradingIndependentlyProven"])
+        self.assertTrue(evidence["noExternalBotsAttested"])
+        self.assertTrue(evidence["noExternalBotsIndependentlyProven"])
+        self.assertTrue(evidence["otherApiKeyInventoryResidualUnknown"])
+        self.assertFalse(evidence["noOtherApiKeysIndependentlyProven"])
+        self.assertFalse(evidence["accountWideCausalClosureProven"])
+        self.assertFalse(evidence["functionalWiringPassed"])
+        self.assertFalse(evidence["promotionEligible"])
+        self.assertFalse(evidence["useAsPromotionEvidence"])
+        self.assertFalse(evidence["fullLiveAllowed"])
+
     def test_missing_pre_post_phase_proof_can_finalize_but_can_never_pass(self) -> None:
         session_id, capability, final_truth = (
             self.dispatched_round_trip_ready_for_finalize()

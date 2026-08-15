@@ -108,6 +108,7 @@ class OfficialUpbitFunctionalMyOrderPump:
         socket_factory: Callable[[str], Any] = _default_socket_factory,
         credential_reader: Callable[[], tuple[str, str]] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        all_markets: bool = False,
     ) -> None:
         self.expected_account_fingerprint = _text(
             expected_account_fingerprint
@@ -121,6 +122,7 @@ class OfficialUpbitFunctionalMyOrderPump:
             )
         )
         self.monotonic = monotonic
+        self.all_markets = bool(all_markets)
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -178,7 +180,11 @@ class OfficialUpbitFunctionalMyOrderPump:
         ticket = "upbit-functional-" + secrets.token_hex(16)
         subscription = [
             {"ticket": ticket},
-            {"type": "myOrder", "codes": [SYMBOL]},
+            (
+                {"type": "myOrder", "codes": []}
+                if self.all_markets
+                else {"type": "myOrder", "codes": [SYMBOL]}
+            ),
             {"format": "DEFAULT"},
         ]
         try:
@@ -271,6 +277,7 @@ class OfficialUpbitFunctionalMyOrderPump:
                 "connected": self._connected,
                 "authenticated": self._authenticated,
                 "myOrderSubscribed": self._subscribed,
+                "allMarketsSubscribed": self.all_markets,
                 "lastFrameAt": _utc_text(last) if last is not None else "",
             }
 

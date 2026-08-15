@@ -9,11 +9,13 @@ and can be exercised only with an explicitly injected mock lifecycle while
 """
 
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import math
+import re
 import secrets
 import sqlite3
 import threading
@@ -51,6 +53,14 @@ PRODUCTION_STARTUP_RECOVERY_AVAILABLE = False
 PRODUCTION_STATE_SERVER_WIRING_AVAILABLE = False
 ROUTE_KEY = "BINANCE_SPOT_CONTINUOUS:BTCUSDT:5m"
 MAX_OWNER_LEASE_SECONDS = 60.0
+PREPARED_PLAN_SCHEMA_VERSION = (
+    "binance-spot-supervised-prepared-inert-plan/v1"
+)
+PREPARED_ACTIVATION_RECEIPT_SCHEMA_VERSION = (
+    "binance-spot-supervised-prepared-activation-receipt/v1"
+)
+_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,160}$")
 
 
 class BinanceSpotLifecycleError(RuntimeError):
@@ -81,6 +91,28 @@ def composite_production_available() -> bool:
     )
 
 
+def supervised_non_promotion_composite_available() -> bool:
+    """Release gate for one lower-assurance run, never for promotion."""
+
+    from .binance_spot_functional_mutation import PRODUCTION_MUTATION_AVAILABLE
+    from . import crypto_first_live_supervised_release as supervised_release
+
+    return all(
+        (
+            CORE_PRODUCTION_AVAILABLE,
+            PRODUCTION_MUTATION_AVAILABLE,
+            PRODUCTION_LIFECYCLE_AVAILABLE,
+            PRODUCTION_STREAM_JOURNAL_AVAILABLE,
+            PRODUCTION_SIGNAL_SCHEDULER_AVAILABLE,
+            PRODUCTION_STARTUP_RECOVERY_AVAILABLE,
+            PRODUCTION_STATE_SERVER_WIRING_AVAILABLE,
+            BINANCE_SPOT_GLOBAL_FIRST_LIVE_AUTHORITY_WIRED,
+            supervised_release.SUPERVISED_NON_PROMOTION_RELEASED,
+            supervised_release.SUPERVISED_NON_PROMOTION_NETWORK_CAPABILITY_RELEASED,
+        )
+    )
+
+
 def _text(value: object) -> str:
     return str(value or "").strip()
 
@@ -92,9 +124,162 @@ def _secret_hash(value: str) -> str:
 def _canonical_hash(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
-            dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            dict(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def prepared_lifecycle_plan(
+    handle: "PreparedLifecycleHandle",
+) -> dict[str, Any]:
+    """Return the non-secret exact binding consumed by shared authority."""
+
+    body = {
+        "schemaVersion": PREPARED_PLAN_SCHEMA_VERSION,
+        "assuranceMode": "SUPERVISED_NON_PROMOTION",
+        "lane": "BINANCE_SPOT",
+        "approvalId": handle.approval_id,
+        "sessionId": handle.session_id,
+        "permitId": handle.permit_id,
+        "permitHash": handle.permit_hash,
+        "accountFingerprint": handle.account_fingerprint,
+        "preparedEpoch": float(handle.prepared_epoch),
+        "entryExpiresEpoch": float(handle.expires_epoch),
+        "cleanupDeadlineEpoch": float(handle.cleanup_deadline_epoch),
+        "controlRevision": int(handle.control_revision),
+        "networkCapabilityOpen": False,
+        "promotionEligible": False,
+        "realE2EEligible": False,
+        "productionPromotionAllowed": False,
+    }
+    return {**body, "preparedPlanHash": _canonical_hash(body)}
+
+
+def verify_prepared_activation_receipt(
+    value: Mapping[str, Any],
+    *,
+    handle: "PreparedLifecycleHandle",
+    now_epoch: float,
+) -> dict[str, Any]:
+    """Verify the shared runtime's exact one-use ACTIVE projection."""
+
+    receipt = dict(value)
+    fields = {
+        "schemaVersion",
+        "assuranceMode",
+        "lane",
+        "approvalId",
+        "sessionId",
+        "permitId",
+        "permitHash",
+        "accountFingerprint",
+        "preparedPlanHash",
+        "globalRunId",
+        "globalCoordinatorRevision",
+        "globalPhase",
+        "supervisedContractHash",
+        "approvalReceiptHash",
+        "observerCoverageStartedEpoch",
+        "observerSnapshotPayloadHash",
+        "exactUserApprovalConsumed",
+        "oneUse",
+        "durable",
+        "restartVerifiable",
+        "networkCapabilityOpen",
+        "promotionEligible",
+        "realE2EEligible",
+        "productionPromotionAllowed",
+        "observedEpoch",
+        "receiptHash",
+    }
+    if set(receipt) != fields:
+        raise BinanceSpotLifecycleError(
+            "prepared activation receipt fields are not exact"
+        )
+    plan = prepared_lifecycle_plan(handle)
+    expected = {
+        "schemaVersion": PREPARED_ACTIVATION_RECEIPT_SCHEMA_VERSION,
+        "assuranceMode": "SUPERVISED_NON_PROMOTION",
+        "lane": "BINANCE_SPOT",
+        "approvalId": handle.approval_id,
+        "sessionId": handle.session_id,
+        "permitId": handle.permit_id,
+        "permitHash": handle.permit_hash,
+        "accountFingerprint": handle.account_fingerprint,
+        "preparedPlanHash": plan["preparedPlanHash"],
+        "globalPhase": "ACTIVE",
+    }
+    if any(_text(receipt.get(key)) != _text(item) for key, item in expected.items()):
+        raise BinanceSpotLifecycleError(
+            "prepared activation receipt binding changed"
+        )
+    body = {key: item for key, item in receipt.items() if key != "receiptHash"}
+    if (
+        type(receipt.get("globalCoordinatorRevision")) is not int
+        or type(receipt.get("observedEpoch")) not in {int, float}
+        or type(receipt.get("observerCoverageStartedEpoch")) not in {int, float}
+    ):
+        raise BinanceSpotLifecycleError(
+            "prepared activation receipt time/revision is invalid"
+        )
+    try:
+        observed = float(receipt["observedEpoch"])
+        coverage = float(receipt["observerCoverageStartedEpoch"])
+        revision = int(receipt["globalCoordinatorRevision"])
+    except (TypeError, ValueError) as exc:
+        raise BinanceSpotLifecycleError(
+            "prepared activation receipt time/revision is invalid"
+        ) from exc
+    if (
+        _ID_RE.fullmatch(_text(receipt.get("globalRunId"))) is None
+        or revision <= 0
+        or not math.isfinite(observed)
+        or not math.isfinite(coverage)
+        or observed < handle.prepared_epoch
+        or coverage < handle.prepared_epoch - 1.0
+        or coverage - handle.prepared_epoch > 5.0
+        or coverage > observed
+        or observed > float(now_epoch) + 1.0
+        or float(now_epoch) - observed > 5.0
+        or any(
+            _HASH_RE.fullmatch(_text(receipt.get(field))) is None
+            for field in (
+                "supervisedContractHash",
+                "approvalReceiptHash",
+                "observerSnapshotPayloadHash",
+                "receiptHash",
+            )
+        )
+        or not secrets.compare_digest(
+            _text(receipt["receiptHash"]), _canonical_hash(body)
+        )
+        or any(
+            receipt.get(field) is not True
+            for field in (
+                "exactUserApprovalConsumed",
+                "oneUse",
+                "durable",
+                "restartVerifiable",
+                "networkCapabilityOpen",
+            )
+        )
+        or any(
+            receipt.get(field) is not False
+            for field in (
+                "promotionEligible",
+                "realE2EEligible",
+                "productionPromotionAllowed",
+            )
+        )
+    ):
+        raise BinanceSpotLifecycleError(
+            "prepared activation receipt is stale, incomplete, or promotive"
+        )
+    return receipt
 
 
 def _owner_prefix(session_id: str) -> str:
@@ -109,6 +294,25 @@ class LifecycleHandle:
     owner_token: str
     expires_epoch: float
     cleanup_deadline_epoch: float
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedLifecycleHandle:
+    """Process-private bearer for a durable, network-inert Binance plan."""
+
+    approval_id: str
+    session_id: str
+    permit_id: str
+    permit_hash: str
+    account_fingerprint: str
+    prepared_epoch: float
+    expires_epoch: float
+    cleanup_deadline_epoch: float
+    control_revision: int
+    permit_payload: Mapping[str, Any] = field(repr=False)
+    approval_claim_token: str = field(repr=False)
+    owner_id: str = field(repr=False)
+    owner_token: str = field(repr=False)
 
 
 class DurableBinanceSpotFunctionalControl:
@@ -309,12 +513,27 @@ class DurableBinanceSpotFunctionalControl:
         *,
         owner_id: str,
         owner_token: str,
+        planned_session_id: str = "",
         lease_seconds: float = MAX_OWNER_LEASE_SECONDS,
     ) -> dict[str, Any]:
         now = float(self.clock())
         lease = float(lease_seconds)
+        planned_session = _text(planned_session_id)
         if not _text(owner_id) or len(_text(owner_token)) < 24:
             raise BinanceSpotLifecycleError("owner id/token is invalid")
+        if planned_session and (
+            not planned_session.startswith("bnsft-")
+            or len(planned_session) < 24
+            or len(planned_session) > 96
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._:"
+                for character in planned_session
+            )
+        ):
+            raise BinanceSpotLifecycleError(
+                "prepared lifecycle session id is invalid"
+            )
         if lease <= 0 or lease > MAX_OWNER_LEASE_SECONDS:
             raise BinanceSpotLifecycleError("owner lease must be within 60 seconds")
         with self._lock, closing(self._connect()) as connection:
@@ -337,12 +556,12 @@ class DurableBinanceSpotFunctionalControl:
                     capability_hash, owner_id, owner_token_hash,
                     owner_lease_expires_epoch, entry_expires_epoch,
                     cleanup_deadline_epoch, revision, detail, updated_epoch
-                ) VALUES (?, 'ARMED', ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, 'ARMED', ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(route_key) DO UPDATE SET
                     phase=excluded.phase,
                     permit_id=excluded.permit_id,
                     permit_hash=excluded.permit_hash,
-                    session_id='', capability_hash='',
+                    session_id=excluded.session_id, capability_hash='',
                     owner_id=excluded.owner_id,
                     owner_token_hash=excluded.owner_token_hash,
                     owner_lease_expires_epoch=excluded.owner_lease_expires_epoch,
@@ -356,6 +575,7 @@ class DurableBinanceSpotFunctionalControl:
                     ROUTE_KEY,
                     permit.permit_id,
                     permit.permit_hash,
+                    planned_session,
                     _text(owner_id),
                     _secret_hash(owner_token),
                     min(now + lease, permit.expires_epoch),
@@ -370,6 +590,87 @@ class DurableBinanceSpotFunctionalControl:
         result = self._row()
         assert result is not None
         return result
+
+    def heartbeat_prepared(
+        self,
+        *,
+        session_id: str,
+        permit_id: str,
+        permit_hash: str,
+        owner_id: str,
+        owner_token: str,
+        lease_seconds: float = MAX_OWNER_LEASE_SECONDS,
+    ) -> dict[str, Any]:
+        """Renew only an inert ARMED plan; it cannot create capability."""
+
+        now = float(self.clock())
+        lease = float(lease_seconds)
+        if lease <= 0 or lease > MAX_OWNER_LEASE_SECONDS:
+            raise BinanceSpotLifecycleError(
+                "prepared owner lease must be within 60 seconds"
+            )
+        token_hash = _secret_hash(owner_token)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM binance_spot_functional_control WHERE route_key=?",
+                (ROUTE_KEY,),
+            ).fetchone()
+            if (
+                row is None
+                or _text(row["phase"]).upper() != "ARMED"
+                or _text(row["session_id"]) != _text(session_id)
+                or _text(row["permit_id"]) != _text(permit_id)
+                or not secrets.compare_digest(
+                    _text(row["permit_hash"]), _text(permit_hash).lower()
+                )
+                or _text(row["capability_hash"])
+                or _text(row["owner_id"]) != _text(owner_id)
+                or not secrets.compare_digest(
+                    _text(row["owner_token_hash"]), token_hash
+                )
+                or now >= float(row["entry_expires_epoch"])
+            ):
+                connection.rollback()
+                raise BinanceSpotLifecycleError(
+                    "prepared lifecycle binding changed"
+                )
+            revision = int(row["revision"])
+            updated = connection.execute(
+                """
+                UPDATE binance_spot_functional_control
+                SET owner_lease_expires_epoch=?, revision=revision+1,
+                    detail='prepared inert owner heartbeat; capability absent',
+                    updated_epoch=?
+                WHERE route_key=? AND phase='ARMED' AND revision=?
+                  AND session_id=? AND permit_id=? AND permit_hash=?
+                  AND capability_hash='' AND owner_id=?
+                  AND owner_token_hash=?
+                """,
+                (
+                    min(now + lease, float(row["entry_expires_epoch"])),
+                    now,
+                    ROUTE_KEY,
+                    revision,
+                    _text(session_id),
+                    _text(permit_id),
+                    _text(permit_hash).lower(),
+                    _text(owner_id),
+                    token_hash,
+                ),
+            ).rowcount
+            if updated != 1:
+                connection.rollback()
+                raise BinanceSpotLifecycleError(
+                    "prepared lifecycle heartbeat CAS changed"
+                )
+            current = connection.execute(
+                "SELECT * FROM binance_spot_functional_control WHERE route_key=?",
+                (ROUTE_KEY,),
+            ).fetchone()
+            connection.commit()
+        assert current is not None
+        return dict(current)
 
     def activate(
         self,
@@ -1471,6 +1772,10 @@ class BinanceSpotFunctionalLifecycleManager:
         activation_permit_issuer: Callable[
             [object, float], Mapping[str, Any]
         ] | None = None,
+        assurance_mode: str = "STRICT_INDEPENDENT",
+        continuous_exclusivity_health_reader: (
+            Callable[..., Mapping[str, Any]] | None
+        ) = None,
         clock: Callable[[], float] = time.time,
         allow_mock_lifecycle: bool = False,
     ) -> None:
@@ -1490,14 +1795,387 @@ class BinanceSpotFunctionalLifecycleManager:
             startup_owner_process_absence_attested
         )
         self.activation_permit_issuer = activation_permit_issuer
+        self.assurance_mode = _text(assurance_mode).upper()
+        if self.assurance_mode not in {
+            "STRICT_INDEPENDENT",
+            "SUPERVISED_NON_PROMOTION",
+        }:
+            raise BinanceSpotLifecycleError(
+                "Binance Spot assurance mode is invalid"
+            )
+        self.continuous_exclusivity_health_reader = (
+            continuous_exclusivity_health_reader
+        )
         self.clock = clock
         self.allow_mock_lifecycle = bool(allow_mock_lifecycle)
 
     def _assert_available(self) -> None:
-        if not self.allow_mock_lifecycle and not composite_production_available():
+        available = (
+            supervised_non_promotion_composite_available()
+            if self.assurance_mode == "SUPERVISED_NON_PROMOTION"
+            else composite_production_available()
+        )
+        if not self.allow_mock_lifecycle and not available:
             raise BinanceSpotLifecycleError(
                 "Binance Spot managed functional lifecycle is not production-available"
             )
+        if (
+            not self.allow_mock_lifecycle
+            and self.assurance_mode == "SUPERVISED_NON_PROMOTION"
+            and not callable(self.continuous_exclusivity_health_reader)
+        ):
+            raise BinanceSpotLifecycleError(
+                "supervised lifecycle lacks independent observer health"
+            )
+
+    def _assert_continuous_exclusivity_health(
+        self,
+        handle: LifecycleHandle,
+        *,
+        purpose: str = "CONTINUOUS_HEALTH",
+    ) -> dict[str, Any]:
+        if self.assurance_mode != "SUPERVISED_NON_PROMOTION":
+            return {"healthy": True, "assuranceMode": self.assurance_mode}
+        reader = self.continuous_exclusivity_health_reader
+        if not callable(reader):
+            raise BinanceSpotLifecycleError(
+                "supervised lifecycle lacks independent observer health"
+            )
+        session = self.ledger.session(handle.session_id)
+        try:
+            binding = json.loads(_text(session.get("binding_json")))
+            credential = _text(binding.get("accountFingerprint")).lower()
+            result = dict(
+                reader(
+                    purpose=_text(purpose).upper(),
+                    session_id=handle.session_id,
+                    permit_id=_text(session.get("permit_id")),
+                    permit_hash=_text(session.get("permit_hash")).lower(),
+                    credential_fingerprint=credential,
+                    coverage_started_epoch=float(
+                        session.get("exclusivity_coverage_started_epoch")
+                        or session["started_epoch"]
+                    ),
+                )
+            )
+        except Exception as exc:
+            raise BinanceSpotLifecycleError(
+                "independent supervised observer health failed closed"
+            ) from exc
+        if (
+            result.get("healthy") is not True
+            or result.get("assuranceMode") != "SUPERVISED_NON_PROMOTION"
+            or _text(result.get("purpose")).upper() != _text(purpose).upper()
+            or _text(result.get("sessionId")) != handle.session_id
+            or _text(result.get("permitId")) != _text(session.get("permit_id"))
+            or not secrets.compare_digest(
+                _text(result.get("permitHash")).lower(),
+                _text(session.get("permit_hash")).lower(),
+            )
+            or not secrets.compare_digest(
+                _text(result.get("credentialFingerprint")).lower(), credential
+            )
+            or result.get("otherApiKeyInventoryProven") is not False
+            or result.get("accountWideCausalClosureProven") is not False
+            or result.get("promotionEligible") is not False
+            or result.get("realE2EEligible") is not False
+            or result.get("productionPromotionAllowed") is not False
+        ):
+            raise BinanceSpotLifecycleError(
+                "independent supervised observer health changed"
+            )
+        return result
+
+    def prepare_inert(
+        self,
+        permit_reference: Mapping[str, Any],
+        *,
+        approval_id: str,
+        owner_id: str,
+        owner_token: str,
+    ) -> PreparedLifecycleHandle:
+        """Reseal and durably arm an exact session without any broker read."""
+
+        self._assert_available()
+        if self.assurance_mode != "SUPERVISED_NON_PROMOTION":
+            raise BinanceSpotLifecycleError(
+                "prepared inert lifecycle is supervised non-promotion only"
+            )
+        if self.permit_store is None:
+            raise BinanceSpotLifecycleError(
+                "prepared inert lifecycle requires the durable approval store"
+            )
+        if set(permit_reference) != {"permitId", "permitHash"}:
+            raise BinanceSpotLifecycleError(
+                "prepared inert permit reference fields are not exact"
+            )
+        candidate = self.permit_store.candidate_status(_text(approval_id))
+        if (
+            _text(candidate.get("state")).upper() != "APPROVED"
+            or _text(candidate.get("permit_id"))
+            != _text(permit_reference.get("permitId"))
+            or not secrets.compare_digest(
+                _text(candidate.get("permit_hash")).lower(),
+                _text(permit_reference.get("permitHash")).lower(),
+            )
+        ):
+            raise BinanceSpotLifecycleError(
+                "prepared inert approval/permit binding changed"
+            )
+        now = float(self.clock())
+        active_payload, claim_token = self.permit_store.claim(
+            permit_id=_text(permit_reference.get("permitId")),
+            permit_hash=_text(permit_reference.get("permitHash")),
+            owner_id=owner_id,
+            activation_epoch=now,
+            activation_permit_issuer=self.activation_permit_issuer,
+        )
+        permit = ExactPermit.parse(active_payload, now_epoch=now)
+        session_id = "bnsft-" + secrets.token_hex(16)
+        try:
+            armed = self.control.arm(
+                permit,
+                owner_id=owner_id,
+                owner_token=owner_token,
+                planned_session_id=session_id,
+            )
+        except Exception:
+            self.permit_store.fail_claim(
+                permit_id=permit.permit_id,
+                claim_token=claim_token,
+                detail="prepared inert control arm failed after permit reseal",
+            )
+            raise
+        if (
+            _text(armed.get("phase")).upper() != "ARMED"
+            or _text(armed.get("session_id")) != session_id
+            or _text(armed.get("capability_hash"))
+        ):
+            try:
+                self.control.fail_armed(
+                    owner_id=owner_id,
+                    owner_token=owner_token,
+                    detail="prepared inert durable control projection changed",
+                )
+            finally:
+                self.permit_store.fail_claim(
+                    permit_id=permit.permit_id,
+                    claim_token=claim_token,
+                    detail="prepared inert durable control projection changed",
+                )
+            raise BinanceSpotLifecycleError(
+                "prepared inert durable control projection changed"
+            )
+        return PreparedLifecycleHandle(
+            approval_id=_text(approval_id),
+            session_id=session_id,
+            permit_id=permit.permit_id,
+            permit_hash=permit.permit_hash,
+            account_fingerprint=permit.binding.account_fingerprint,
+            prepared_epoch=permit.issued_epoch,
+            expires_epoch=permit.expires_epoch,
+            cleanup_deadline_epoch=permit.cleanup_deadline_epoch,
+            control_revision=int(armed["revision"]),
+            permit_payload=dict(active_payload),
+            approval_claim_token=claim_token,
+            owner_id=_text(owner_id),
+            owner_token=_text(owner_token),
+        )
+
+    def heartbeat_prepared(
+        self, handle: PreparedLifecycleHandle
+    ) -> dict[str, Any]:
+        """Renew a prepared bearer while capability and broker I/O stay absent."""
+
+        self._assert_available()
+        if not isinstance(handle, PreparedLifecycleHandle):
+            raise BinanceSpotLifecycleError(
+                "prepared lifecycle handle is invalid"
+            )
+        result = self.control.heartbeat_prepared(
+            session_id=handle.session_id,
+            permit_id=handle.permit_id,
+            permit_hash=handle.permit_hash,
+            owner_id=handle.owner_id,
+            owner_token=handle.owner_token,
+        )
+        return {
+            "ok": True,
+            "phase": "PREPARED_INERT",
+            "sessionId": handle.session_id,
+            "permitId": handle.permit_id,
+            "permitHash": handle.permit_hash,
+            "controlRevision": int(result["revision"]),
+            "ownerLeaseExpiresEpoch": float(
+                result["owner_lease_expires_epoch"]
+            ),
+            "networkCapabilityOpen": False,
+            "promotionEligible": False,
+            "realE2EEligible": False,
+        }
+
+    def fail_prepared(
+        self,
+        handle: PreparedLifecycleHandle,
+        *,
+        detail: str,
+    ) -> dict[str, Any]:
+        """One-way consume an inert plan after activation can no longer proceed."""
+
+        if not isinstance(handle, PreparedLifecycleHandle):
+            raise BinanceSpotLifecycleError(
+                "prepared lifecycle handle is invalid"
+            )
+        control_error: Exception | None = None
+        try:
+            control = self.control.fail_armed(
+                owner_id=handle.owner_id,
+                owner_token=handle.owner_token,
+                detail=("prepared inert failed:" + _text(detail))[:500],
+            )
+        except Exception as exc:
+            control_error = exc
+            control = self.control.status()
+        try:
+            self.permit_store.fail_claim(
+                permit_id=handle.permit_id,
+                claim_token=handle.approval_claim_token,
+                detail=("prepared inert failed:" + _text(detail))[:500],
+            )
+        except Exception:
+            if control_error is not None:
+                raise control_error
+            raise
+        if control_error is not None:
+            raise control_error
+        return {
+            "ok": True,
+            "phase": _text(control.get("phase")).upper(),
+            "sessionId": handle.session_id,
+            "networkCapabilityOpen": False,
+            "promotionEligible": False,
+            "realE2EEligible": False,
+        }
+
+    def activate_prepared(
+        self,
+        handle: PreparedLifecycleHandle,
+        activation_receipt: Mapping[str, Any],
+    ) -> LifecycleHandle:
+        """Perform the first broker read only after shared ACTIVE receipt."""
+
+        self._assert_available()
+        if not isinstance(handle, PreparedLifecycleHandle):
+            raise BinanceSpotLifecycleError(
+                "prepared lifecycle handle is invalid"
+            )
+        now = float(self.clock())
+        verified_activation = verify_prepared_activation_receipt(
+            activation_receipt, handle=handle, now_epoch=now
+        )
+        permit = ExactPermit.parse(handle.permit_payload, now_epoch=now)
+        control = self.control._row()
+        if (
+            control is None
+            or _text(control.get("phase")).upper() != "ARMED"
+            or _text(control.get("session_id")) != handle.session_id
+            or _text(control.get("permit_id")) != handle.permit_id
+            or not secrets.compare_digest(
+                _text(control.get("permit_hash")).lower(), handle.permit_hash
+            )
+            or _text(control.get("capability_hash"))
+        ):
+            raise BinanceSpotLifecycleError(
+                "prepared lifecycle durable binding changed before activation"
+            )
+        started: Mapping[str, Any] | None = None
+        try:
+            truth, _ = self.truth_reader.read(
+                baseline_epoch=now, owner_prefix=""
+            )
+            started = self.service.start(
+                handle.permit_payload,
+                truth,
+                activation_fence={
+                    "routeKey": ROUTE_KEY,
+                    "revision": int(control["revision"]),
+                    "ownerId": handle.owner_id,
+                    "ownerTokenHash": _secret_hash(handle.owner_token),
+                    "plannedSessionId": handle.session_id,
+                },
+                planned_session_id=handle.session_id,
+                exclusivity_coverage_started_epoch=float(
+                    verified_activation["observerCoverageStartedEpoch"]
+                ),
+            )
+            if _text(started.get("sessionId")) != handle.session_id:
+                raise BinanceSpotLifecycleError(
+                    "prepared lifecycle session identity changed"
+                )
+            self.service.assert_activation_guards(
+                handle.session_id, handle.permit_payload
+            )
+            if self.stream_owner_binder is not None:
+                self.stream_owner_binder(
+                    _owner_prefix(handle.session_id),
+                    handle.session_id,
+                    permit.permit_id,
+                    permit.permit_hash,
+                )
+            self.permit_store.bind_session(
+                permit_id=permit.permit_id,
+                claim_token=handle.approval_claim_token,
+                session_id=handle.session_id,
+            )
+            self.control.activate(
+                session_id=handle.session_id,
+                capability_hash=_text(started["functionalCapabilityHash"]),
+                owner_id=handle.owner_id,
+                owner_token=handle.owner_token,
+            )
+        except Exception as exc:
+            if started is None:
+                try:
+                    self.control.fail_armed(
+                        owner_id=handle.owner_id,
+                        owner_token=handle.owner_token,
+                        detail=(
+                            "prepared activation prestart failed:"
+                            f"{type(exc).__name__}:{str(exc)[:240]}"
+                        ),
+                    )
+                except BinanceSpotLifecycleError:
+                    current = self.control.status()
+                    if _text(current.get("phase")).upper() != "FAILED":
+                        raise
+            else:
+                self.control.mark_start_abort_pending(
+                    session_id=handle.session_id,
+                    owner_id=handle.owner_id,
+                    owner_token=handle.owner_token,
+                    detail=(
+                        "prepared activation post-create abort pending:"
+                        f"{type(exc).__name__}:{str(exc)[:240]}"
+                    ),
+                )
+            try:
+                self.permit_store.fail_claim(
+                    permit_id=permit.permit_id,
+                    claim_token=handle.approval_claim_token,
+                    detail=f"prepared activation failed:{type(exc).__name__}",
+                )
+            except Exception:
+                pass
+            raise
+        assert started is not None
+        return LifecycleHandle(
+            session_id=handle.session_id,
+            capability=_text(started["functionalCapability"]),
+            owner_id=handle.owner_id,
+            owner_token=handle.owner_token,
+            expires_epoch=float(started["expiresEpoch"]),
+            cleanup_deadline_epoch=float(started["cleanupDeadlineEpoch"]),
+        )
 
     def start(
         self,
@@ -1629,6 +2307,7 @@ class BinanceSpotFunctionalLifecycleManager:
         self._assert_available()
         self.control.verify_handle(handle)
         try:
+            self._assert_continuous_exclusivity_health(handle)
             # A short owner lease is not proof that the authenticated private
             # stream is still lossless.  Renew only after the complete official
             # reader has revalidated its inbound liveness/gap attestation.
@@ -2585,10 +3264,14 @@ def build_binance_spot_production_lifecycle(
     stream_startup_recovery_latcher: Callable[..., Mapping[str, Any]] | None = None,
     stream_terminal_retirer: Callable[..., Mapping[str, Any]] | None = None,
     dispatch_lease_factory: Callable[..., Any] | None = None,
-    account_exclusivity_guard: BinanceSpotExclusivityGuard | None = None,
+    account_exclusivity_guard: Any | None = None,
     global_first_live_authority_reader: (
         Callable[..., Mapping[str, Any]] | None
     ) = None,
+    global_first_live_dispatch_reservation: (
+        Callable[..., Any] | None
+    ) = None,
+    supervised_non_promotion_mode: bool = False,
     permit_approval_verifier: Callable[[Mapping[str, Any]], bool] | None = None,
     signal_reader: Callable[[], Mapping[str, Any] | None] | None = None,
     startup_owner_process_absence_attested: bool = False,
@@ -2642,6 +3325,10 @@ def build_binance_spot_production_lifecycle(
         raise BinanceSpotLifecycleError(
             "production graph requires a cross-route dispatch lease"
         )
+    if not callable(global_first_live_dispatch_reservation):
+        raise BinanceSpotLifecycleError(
+            "production graph requires the global dispatch reservation"
+        )
     if activation_permit_issuer is None:
         raise BinanceSpotLifecycleError(
             "production graph requires a server-owned activation permit resealer"
@@ -2668,6 +3355,29 @@ def build_binance_spot_production_lifecycle(
         ),
         clock=clock,
     )
+    continuous_health_reader = (
+        getattr(account_exclusivity_guard, "assert_continuous_health", None)
+        if supervised_non_promotion_mode
+        else None
+    )
+    if supervised_non_promotion_mode and not callable(continuous_health_reader):
+        raise BinanceSpotLifecycleError(
+            "supervised production graph requires independent observer health"
+        )
+
+    def final_exclusivity_health(**request: Any) -> Mapping[str, Any]:
+        if not callable(continuous_health_reader):
+            raise BinanceSpotLifecycleError(
+                "supervised final observer health is unavailable"
+            )
+        session = ledger.session(_text(request.get("session_id")))
+        return continuous_health_reader(
+            **request,
+            coverage_started_epoch=float(
+                session.get("exclusivity_coverage_started_epoch")
+                or session["started_epoch"]
+            ),
+        )
     client = OfficialBinanceSpotGetClient(
         expected_account_fingerprint=account_fingerprint,
         clock=clock,
@@ -2690,8 +3400,13 @@ def build_binance_spot_production_lifecycle(
                 claim_id, now_epoch=float(clock())
             ),
             dispatch_lease_factory=dispatch_lease_factory,
-            global_first_live_authority_reader=(
-                global_first_live_authority_reader
+            global_first_live_dispatch_reservation=(
+                global_first_live_dispatch_reservation
+            ),
+            final_exclusivity_health_reader=(
+                final_exclusivity_health
+                if supervised_non_promotion_mode
+                else None
             ),
         ),
         permit_store=permit_store,
@@ -2714,6 +3429,12 @@ def build_binance_spot_production_lifecycle(
             startup_owner_process_absence_attested
         ),
         activation_permit_issuer=activation_permit_issuer,
+        assurance_mode=(
+            "SUPERVISED_NON_PROMOTION"
+            if supervised_non_promotion_mode
+            else "STRICT_INDEPENDENT"
+        ),
+        continuous_exclusivity_health_reader=continuous_health_reader,
         clock=clock,
         allow_mock_lifecycle=False,
     )
@@ -2724,10 +3445,16 @@ __all__ = [
     "BinanceSpotLifecycleError",
     "DurableBinanceSpotFunctionalControl",
     "LifecycleHandle",
+    "PreparedLifecycleHandle",
     "MAX_OWNER_LEASE_SECONDS",
+    "PREPARED_ACTIVATION_RECEIPT_SCHEMA_VERSION",
+    "PREPARED_PLAN_SCHEMA_VERSION",
     "PRODUCTION_LIFECYCLE_AVAILABLE",
     "ROUTE_KEY",
     "build_binance_spot_production_lifecycle",
     "composite_production_available",
+    "prepared_lifecycle_plan",
+    "supervised_non_promotion_composite_available",
     "production_entrypoint_status",
+    "verify_prepared_activation_receipt",
 ]

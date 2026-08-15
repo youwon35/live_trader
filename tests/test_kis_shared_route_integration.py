@@ -3761,6 +3761,7 @@ class KisSharedRouteIntegrationTests(unittest.TestCase):
             "preview_binance_smoke_order",
             "preview_upbit_smoke_order",
             "refresh_upbit_smoke_order",
+            "reprepare_crypto_first_live_functional_state",
             "run_broker_check",
             "run_validation_small_live_once",
             "snapshot",

@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import secrets
@@ -1214,6 +1215,7 @@ class DurableFunctionalLedger:
                     baseline_base TEXT NOT NULL,
                     baseline_quote TEXT NOT NULL,
                     baseline_open_ids_json TEXT NOT NULL,
+                    exclusivity_coverage_started_epoch REAL NOT NULL DEFAULT 0,
                     last_bar_close_epoch REAL NOT NULL DEFAULT 0,
                     buy_claimed INTEGER NOT NULL DEFAULT 0,
                     sell_claimed INTEGER NOT NULL DEFAULT 0,
@@ -1290,6 +1292,12 @@ class DurableFunctionalLedger:
                 connection.execute(
                     "ALTER TABLE binance_spot_functional_sessions "
                     "ADD COLUMN cleanup_sell_claimed INTEGER NOT NULL DEFAULT 0"
+                )
+            if "exclusivity_coverage_started_epoch" not in columns:
+                connection.execute(
+                    "ALTER TABLE binance_spot_functional_sessions "
+                    "ADD COLUMN exclusivity_coverage_started_epoch "
+                    "REAL NOT NULL DEFAULT 0"
                 )
             if "cleanup_recovery_used" not in columns:
                 connection.execute(
@@ -1447,6 +1455,7 @@ class DurableFunctionalLedger:
         now_epoch: float,
         activation_fence: Mapping[str, Any] | None = None,
         session_id: str | None = None,
+        exclusivity_coverage_started_epoch: float | None = None,
     ) -> tuple[dict[str, Any], str]:
         session_id = _text(session_id) or f"bnsft-{secrets.token_hex(16)}"
         if not session_id.startswith("bnsft-") or _SAFE_ID_RE.fullmatch(session_id) is None:
@@ -1459,6 +1468,19 @@ class DurableFunctionalLedger:
             _text(row.get("clientOrderId") or row.get("orderId"))
             for row in truth.open_orders
         )
+        coverage_started = (
+            truth.history_baseline_epoch
+            if exclusivity_coverage_started_epoch is None
+            else float(exclusivity_coverage_started_epoch)
+        )
+        if (
+            not math.isfinite(coverage_started)
+            or coverage_started < permit.issued_epoch - 1.0
+            or coverage_started > truth.observed_epoch
+        ):
+            raise BinanceSpotBoundaryBlocked(
+                "session exclusivity coverage epoch is invalid"
+            )
         with self._lock, closing(self._connect()) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -1483,6 +1505,9 @@ class DurableFunctionalLedger:
                     expected_revision = int(
                         activation_fence.get("revision") or -1
                     )
+                    expected_planned_session = _text(
+                        activation_fence.get("plannedSessionId")
+                    )
                     if (
                         control is None
                         or _upper(control["phase"]) != "ARMED"
@@ -1491,6 +1516,7 @@ class DurableFunctionalLedger:
                             _text(control["permit_hash"]), permit.permit_hash
                         )
                         or _text(control["session_id"])
+                        != expected_planned_session
                         or int(control["revision"]) != expected_revision
                         or _text(control["owner_id"])
                         != _text(activation_fence.get("ownerId"))
@@ -1511,9 +1537,11 @@ class DurableFunctionalLedger:
                         session_id, permit_id, permit_hash, binding_json,
                         binding_hash, state, capability_hash,
                         capability_seal_hash, baseline_base, baseline_quote,
-                        baseline_open_ids_json, started_epoch, expires_epoch,
+                        baseline_open_ids_json,
+                        exclusivity_coverage_started_epoch,
+                        started_epoch, expires_epoch,
                         cleanup_deadline_epoch
-                    ) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session_id,
@@ -1526,6 +1554,7 @@ class DurableFunctionalLedger:
                         _decimal_text(truth.base_total),
                         _decimal_text(truth.quote_total),
                         _canonical_json(baseline_ids),
+                        coverage_started,
                         truth.history_baseline_epoch,
                         permit.expires_epoch,
                         permit.cleanup_deadline_epoch,
@@ -2608,7 +2637,10 @@ class BinanceSpotContinuousFunctionalService:
                 permit=permit,
                 boundary_id=f"{session_id}:activation",
                 boundary_hash=_text(session["binding_hash"]).lower(),
-                coverage_started_epoch=float(session["started_epoch"]),
+                coverage_started_epoch=float(
+                    session.get("exclusivity_coverage_started_epoch")
+                    or session["started_epoch"]
+                ),
             )
             authority = self._require_global_first_live_authority(
                 purpose="ACTIVATION",
@@ -2770,6 +2802,8 @@ class BinanceSpotContinuousFunctionalService:
         account_truth: Mapping[str, Any],
         *,
         activation_fence: Mapping[str, Any] | None = None,
+        planned_session_id: str = "",
+        exclusivity_coverage_started_epoch: float | None = None,
     ) -> dict[str, Any]:
         now = float(self.clock())
         permit = ExactPermit.parse(permit_payload, now_epoch=now)
@@ -2803,19 +2837,39 @@ class BinanceSpotContinuousFunctionalService:
             raise BinanceSpotBoundaryBlocked(
                 "account-wide external activity absence is unproven"
             )
-        session_id = f"bnsft-{secrets.token_hex(16)}"
+        session_id = _text(planned_session_id) or f"bnsft-{secrets.token_hex(16)}"
+        if (
+            not session_id.startswith("bnsft-")
+            or _SAFE_ID_RE.fullmatch(session_id) is None
+        ):
+            raise BinanceSpotBoundaryBlocked(
+                "prepared session identity is invalid"
+            )
         baseline_boundary_hash = (
             truth.official_rest_truth_hash
             if _SHA256_RE.fullmatch(truth.official_rest_truth_hash)
             else _stable_hash(dict(account_truth))
         )
+        exclusivity_coverage = (
+            truth.history_baseline_epoch
+            if exclusivity_coverage_started_epoch is None
+            else float(exclusivity_coverage_started_epoch)
+        )
+        if (
+            not math.isfinite(exclusivity_coverage)
+            or exclusivity_coverage < permit.issued_epoch - 1.0
+            or exclusivity_coverage > truth.observed_epoch
+        ):
+            raise BinanceSpotBoundaryBlocked(
+                "prepared exclusivity coverage epoch is invalid"
+            )
         self._require_exclusivity(
             phase="BASELINE",
             session_id=session_id,
             permit=permit,
             boundary_id=f"{session_id}:baseline",
             boundary_hash=baseline_boundary_hash,
-            coverage_started_epoch=truth.history_baseline_epoch,
+            coverage_started_epoch=exclusivity_coverage,
         )
         session, capability = self.ledger.create_session(
             permit,
@@ -2827,6 +2881,7 @@ class BinanceSpotContinuousFunctionalService:
             now_epoch=permit.issued_epoch,
             activation_fence=activation_fence,
             session_id=session_id,
+            exclusivity_coverage_started_epoch=exclusivity_coverage,
         )
         with self._lock:
             self._monotonic_started[_text(session["session_id"])] = float(
@@ -3558,7 +3613,10 @@ class BinanceSpotContinuousFunctionalService:
                         permit=permit,
                         boundary_id=_text(claim_id),
                         boundary_hash=_stable_hash(dict(action)),
-                        coverage_started_epoch=float(session["started_epoch"]),
+                        coverage_started_epoch=float(
+                            session.get("exclusivity_coverage_started_epoch")
+                            or session["started_epoch"]
+                        ),
                     )
                     self._require_global_first_live_authority(
                         purpose="FINAL_PRE_POST",
@@ -4121,7 +4179,10 @@ class BinanceSpotContinuousFunctionalService:
                     if _SHA256_RE.fullmatch(truth.official_rest_truth_hash)
                     else _stable_hash(dict(account_truth))
                 ),
-                coverage_started_epoch=float(session["started_epoch"]),
+                coverage_started_epoch=float(
+                    session.get("exclusivity_coverage_started_epoch")
+                    or session["started_epoch"]
+                ),
                 # A signed SAFE_INCOMPLETE proof may honestly report that a
                 # causal account-wide terminal barrier is unavailable.  It may
                 # finalize cleanup, but can never become PASS/REAL_E2E.
@@ -4130,6 +4191,12 @@ class BinanceSpotContinuousFunctionalService:
             independent_causal_closure_proven = bool(
                 terminal_exclusivity.get("accountWideCausalClosureProven")
                 is True
+            )
+            assurance_mode = _text(
+                terminal_exclusivity.get("assuranceMode")
+            ).upper()
+            supervised_non_promotion = (
+                assurance_mode == "SUPERVISED_NON_PROMOTION"
             )
             exclusivity_phase_chain = self._exclusivity_phase_chain(
                 session_id=session_id,
@@ -4167,6 +4234,11 @@ class BinanceSpotContinuousFunctionalService:
                 outcome = (
                     "SAFE_INCOMPLETE_ACCOUNT_EXCLUSIVITY_PHASE_CHAIN_UNPROVEN"
                 )
+            elif (
+                outcome == "PASS_FULL_ROUND_TRIP"
+                and supervised_non_promotion
+            ):
+                outcome = "SAFE_INCOMPLETE_SUPERVISED_NON_PROMOTION"
             elif (
                 outcome == "PASS_FULL_ROUND_TRIP"
                 and not independent_causal_closure_proven
@@ -4234,6 +4306,36 @@ class BinanceSpotContinuousFunctionalService:
                 is not None
                 and bool(truth.official_rest_snapshot)
             )
+            supervised_functional_wiring_passed = bool(
+                supervised_non_promotion
+                and natural_round_trip_filled
+                and exact_two_hour_runtime_complete
+                and runtime_clock_consistency_proven
+                and order_caps_and_no_reentry_proven
+                and metrics["feesQuoteExact"]
+                and metrics["ownerLoss"] < MAX_OWNER_LOSS
+                and preexisting_baseline_preserved
+                and baseline_restored_within_precision
+                and orderable_residual_zero
+                and not truth.open_orders
+                and truth.external_activity_absent
+                and terminal_exclusivity.get("verified") is True
+                and terminal_exclusivity.get("supervisedControlsVerified")
+                is True
+                and terminal_exclusivity.get("noManualTradingConfirmed") is True
+                and terminal_exclusivity.get("noBotsConfirmed") is True
+                and terminal_exclusivity.get("noOtherApiKeysConfirmed") is False
+                and exclusivity_phase_chain.get("complete") is True
+                and exclusivity_phase_chain.get("restartVerifiable") is True
+                and not independent_causal_closure_proven
+                and not recovered_stream_gap
+                and _SHA256_RE.fullmatch(truth.stream_journal_seal_hash)
+                is not None
+                and truth.stream_journal_event_count >= 0
+                and _SHA256_RE.fullmatch(truth.official_rest_truth_hash)
+                is not None
+                and bool(truth.official_rest_snapshot)
+            )
             # This normalized official snapshot is intentionally not embedded
             # in the producer-authored evidence document.  The ledger stores it
             # in a separate immutable table in the same final transaction, and
@@ -4272,6 +4374,13 @@ class BinanceSpotContinuousFunctionalService:
                 "accountWideCausalClosureProven": (
                     independent_causal_closure_proven
                 ),
+                "assuranceMode": assurance_mode,
+                "supervisedNonPromotion": supervised_non_promotion,
+                "supervisedFunctionalWiringPassed": (
+                    supervised_functional_wiring_passed
+                ),
+                "promotionEligible": False,
+                "realE2EEligible": False,
                 "accountExclusivityProof": dict(
                     terminal_exclusivity.get("proof") or {}
                 ),
@@ -4378,11 +4487,19 @@ class BinanceSpotContinuousFunctionalService:
                     terminal_exclusivity.get("exclusiveAccountConfirmed")
                     is True
                 ),
-                "noManualTradingAttested": False,
+                "noManualTradingAttested": bool(
+                    terminal_exclusivity.get(
+                        "supervisedNoManualTradingAttested"
+                    )
+                    is True
+                ),
                 "noManualTradingIndependentlyProven": (
                     terminal_exclusivity.get("noManualTradingConfirmed") is True
                 ),
-                "noExternalBotsAttested": False,
+                "noExternalBotsAttested": bool(
+                    terminal_exclusivity.get("supervisedNoOtherBotsAttested")
+                    is True
+                ),
                 "noExternalBotsIndependentlyProven": (
                     terminal_exclusivity.get("noBotsConfirmed") is True
                 ),
@@ -4398,6 +4515,15 @@ class BinanceSpotContinuousFunctionalService:
                 ),
                 "otherApiKeysAbsenceAuthoritativelyProven": (
                     terminal_exclusivity.get("noOtherApiKeysConfirmed") is True
+                ),
+                "otherApiKeyInventoryResidualUnknown": (
+                    terminal_exclusivity.get("noOtherApiKeysConfirmed") is False
+                ),
+                "assuranceMode": assurance_mode,
+                "supervisedNonPromotion": supervised_non_promotion,
+                "supervisedControlsVerified": bool(
+                    terminal_exclusivity.get("supervisedControlsVerified")
+                    is True
                 ),
                 "accountExclusivityProof": dict(
                     terminal_exclusivity.get("proof") or {}
@@ -4451,6 +4577,9 @@ class BinanceSpotContinuousFunctionalService:
                 "openOrdersZero": not truth.open_orders,
                 "terminalOfficialTruthHash": terminal_official_truth_hash,
                 "functionalWiringPassed": functional_wiring_passed,
+                "supervisedFunctionalWiringPassed": (
+                    supervised_functional_wiring_passed
+                ),
                 "newEntriesBlocked": True,
                 "functionalCapabilityReset": True,
                 "evidenceClass": EVIDENCE_CLASS,

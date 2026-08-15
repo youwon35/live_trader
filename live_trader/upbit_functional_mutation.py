@@ -7,6 +7,7 @@ off, while an exact functional authority snapshot and the service's raw
 session capability are revalidated immediately before the single HTTP call.
 """
 
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -21,6 +22,8 @@ from .upbit_continuous_functional import (
     EVIDENCE_CLASS,
     EXECUTION_PURPOSE,
     EXECUTION_ROUTE,
+    GLOBAL_FIRST_LIVE_AUTHORITY_REQUEST_SCHEMA_VERSION,
+    GLOBAL_FIRST_LIVE_SCOPE,
     GlobalFirstLiveAuthorityReader,
     SYMBOL,
     UpbitBrokerPostNotSent,
@@ -28,6 +31,7 @@ from .upbit_continuous_functional import (
     UpbitFunctionalError,
     UpbitPermitScope,
     _stable_hash,
+    upbit_functional_session_identifier_prefix,
     verify_upbit_global_first_live_authority,
 )
 from .upbit_functional_transport import (
@@ -39,10 +43,14 @@ from .upbit_functional_transport import (
 UPBIT_FUNCTIONAL_MUTATION_AVAILABLE = False
 UPBIT_ORDER_ENDPOINT = "/v1/orders"
 UPBIT_CANCEL_ENDPOINT = "/v1/order"
-_IDENTIFIER_RE = re.compile(r"^uft-[0-9a-f]{28}$")
+_IDENTIFIER_RE = re.compile(r"^uft-[0-9a-f]{8}-[0-9a-f]{19}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _BUY_FIELDS = frozenset({"market", "side", "ord_type", "price", "identifier"})
 _SELL_FIELDS = frozenset({"market", "side", "ord_type", "volume", "identifier"})
+
+GlobalFirstLiveDispatchReserver = Callable[
+    [Mapping[str, Any]], AbstractContextManager[Mapping[str, Any]]
+]
 
 
 class UpbitFunctionalMutationNotSent(UpbitBrokerPostNotSent):
@@ -57,6 +65,15 @@ class UpbitGlobalFirstLiveFenceNotSent(UpbitFunctionalMutationNotSent):
 
 class UpbitFunctionalMutationOutcomeUnknown(UpbitFunctionalError):
     pass
+
+
+def _assert_compile_release_gate() -> None:
+    """Keep every mutation path closed unless the frozen release latch is open."""
+
+    if UPBIT_FUNCTIONAL_MUTATION_AVAILABLE is not True:
+        raise UpbitFunctionalMutationNotSent(
+            "upbit-functional-mutation-production-unavailable"
+        )
 
 
 def _text(value: object) -> str:
@@ -250,14 +267,31 @@ class UpbitFunctionalMutationEdge:
         global_first_live_authority_reader: (
             GlobalFirstLiveAuthorityReader | None
         ) = None,
+        global_first_live_dispatch_reserver: (
+            GlobalFirstLiveDispatchReserver | None
+        ) = None,
         global_first_live_owner_identity_hash: str = "",
         global_first_live_scope: UpbitPermitScope | None = None,
         clock: Callable[[], Any] | None = None,
         sender: Callable[[PreparedRequest], Mapping[str, Any]] = send_prepared_request,
-        allow_mock_transport: bool = False,
     ) -> None:
-        if allow_mock_transport and sender is send_prepared_request:
-            raise ValueError("mock transport requires an explicitly injected sender")
+        for callback, label in (
+            (authority_reader, "final-authority-reader"),
+            (claim_reader, "durable-claim-reader"),
+            (post_boundary_marker, "durable-post-boundary-marker"),
+            (
+                global_first_live_authority_reader,
+                "global-first-live-authority-reader",
+            ),
+            (
+                global_first_live_dispatch_reserver,
+                "global-first-live-dispatch-reserver",
+            ),
+            (clock, "clock"),
+            (sender, "sender"),
+        ):
+            if not callable(callback):
+                raise ValueError(f"upbit-mutation-{label}-required")
         self.session_id = _text(session_id)
         self.account_fingerprint = _text(account_fingerprint).lower()
         self.permit_id = _text(permit_id)
@@ -279,14 +313,16 @@ class UpbitFunctionalMutationEdge:
         self.global_first_live_authority_reader = (
             global_first_live_authority_reader
         )
+        self.global_first_live_dispatch_reserver = (
+            global_first_live_dispatch_reserver
+        )
         self.global_first_live_owner_identity_hash = _text(
             global_first_live_owner_identity_hash
         ).lower()
         self.global_first_live_scope = global_first_live_scope
         self.clock = clock
-        if global_first_live_authority_reader is not None and (
+        if (
             global_first_live_scope is None
-            or clock is None
             or global_first_live_scope.permit_id != self.permit_id
             or global_first_live_scope.permit_hash != self.permit_hash
             or global_first_live_scope.route_scope_hash
@@ -302,7 +338,66 @@ class UpbitFunctionalMutationEdge:
                 "upbit-mutation-global-first-live-wiring-invalid"
             )
         self.sender = sender
-        self.allow_mock_transport = bool(allow_mock_transport)
+
+    def _global_first_live_request(
+        self,
+        *,
+        action: str,
+        claim_id: str,
+        request_hash: str,
+    ) -> dict[str, Any]:
+        """Build the exact request accepted by the shared route reservation."""
+
+        normalized_action = _text(action).upper()
+        return {
+            "schemaVersion": (
+                GLOBAL_FIRST_LIVE_AUTHORITY_REQUEST_SCHEMA_VERSION
+            ),
+            "scope": GLOBAL_FIRST_LIVE_SCOPE,
+            "lane": "UPBIT",
+            "action": normalized_action,
+            "cleanup": normalized_action
+            in {"CLEANUP_SELL", "CLEANUP_CANCEL"},
+            "runId": self.session_id,
+            "sessionId": self.session_id,
+            "permitId": self.permit_id,
+            "permitHash": self.permit_hash,
+            "accountFingerprint": self.account_fingerprint,
+            "routeScopeHash": self.route_scope_hash,
+            "ownerIdentityHash": self.global_first_live_owner_identity_hash,
+            "claimId": _text(claim_id),
+            "requestHash": _text(request_hash).lower(),
+        }
+
+    def _verify_reserved_global_snapshot(
+        self,
+        *,
+        request: Mapping[str, Any],
+        snapshot: Mapping[str, Any],
+        action: str,
+        claim_id: str,
+        request_hash: str,
+    ) -> None:
+        expected_request = dict(request)
+
+        def reserved_reader(actual: Mapping[str, Any]) -> Mapping[str, Any]:
+            if dict(actual) != expected_request:
+                raise UpbitFunctionalBlocked(
+                    "upbit-global-first-live-reservation-request-changed"
+                )
+            return dict(snapshot)
+
+        verify_upbit_global_first_live_authority(
+            reserved_reader,
+            scope=self.global_first_live_scope,
+            session_id=self.session_id,
+            owner_identity_hash=self.global_first_live_owner_identity_hash,
+            action=action,
+            cleanup=action in {"CLEANUP_SELL", "CLEANUP_CANCEL"},
+            now=self.clock(),
+            claim_id=claim_id,
+            request_hash=request_hash,
+        )
 
     def _assert_authority(
         self,
@@ -448,28 +543,62 @@ class UpbitFunctionalMutationEdge:
             raise UpbitFunctionalMutationNotSent(
                 "upbit-mutation-durable-identifier-mismatch"
             )
-        if self.global_first_live_authority_reader is not None:
-            try:
-                verify_upbit_global_first_live_authority(
-                    self.global_first_live_authority_reader,
-                    scope=self.global_first_live_scope,
-                    session_id=self.session_id,
-                    owner_identity_hash=(
-                        self.global_first_live_owner_identity_hash
-                    ),
-                    action=action,
-                    cleanup=action in {
-                        "CLEANUP_SELL",
-                        "CLEANUP_CANCEL",
-                    },
-                    now=self.clock(),
-                    claim_id=claim_id,
-                    request_hash=request_hash,
+        if not _text(sealed_payload.get("identifier")).startswith(
+            upbit_functional_session_identifier_prefix(self.session_id)
+        ):
+            raise UpbitFunctionalMutationNotSent(
+                "upbit-mutation-identifier-session-prefix-mismatch"
+            )
+        try:
+            verify_upbit_global_first_live_authority(
+                self.global_first_live_authority_reader,
+                scope=self.global_first_live_scope,
+                session_id=self.session_id,
+                owner_identity_hash=(
+                    self.global_first_live_owner_identity_hash
+                ),
+                action=action,
+                cleanup=action in {
+                    "CLEANUP_SELL",
+                    "CLEANUP_CANCEL",
+                },
+                now=self.clock(),
+                claim_id=claim_id,
+                request_hash=request_hash,
+            )
+        except UpbitFunctionalBlocked as exc:
+            raise UpbitGlobalFirstLiveFenceNotSent(
+                "upbit-mutation-global-first-live-dispatch-fence-closed"
+            ) from exc
+
+    def _assert_durable_post_boundary(
+        self,
+        *,
+        claim_id: str,
+        request_hash: str,
+    ) -> None:
+        """Re-read the durable claim after the marker and before transport."""
+
+        try:
+            durable = dict(self.claim_reader(_text(claim_id)))
+        except Exception as exc:
+            raise UpbitFunctionalMutationNotSent(
+                "upbit-mutation-post-boundary-durable-read-failed"
+            ) from exc
+        exact = {
+            "session_id": self.session_id,
+            "permit_id": self.permit_id,
+            "permit_hash": self.permit_hash,
+            "scope_hash": self.session_scope_hash,
+            "claim_id": _text(claim_id),
+            "request_hash": _text(request_hash).lower(),
+            "claim_state": "POST_MAY_HAVE_CROSSED",
+        }
+        for field, expected in exact.items():
+            if not secrets.compare_digest(_text(durable.get(field)), expected):
+                raise UpbitFunctionalMutationNotSent(
+                    f"upbit-mutation-post-boundary-durable-{field}-mismatch"
                 )
-            except UpbitFunctionalBlocked as exc:
-                raise UpbitGlobalFirstLiveFenceNotSent(
-                    "upbit-mutation-global-first-live-dispatch-fence-closed"
-                ) from exc
 
     def _send_once(
         self,
@@ -481,6 +610,10 @@ class UpbitFunctionalMutationEdge:
         request_hash: str,
         sealed_payload: Mapping[str, str],
     ) -> dict[str, Any]:
+        # This check intentionally precedes authority reads, marker writes and
+        # request transport.  Tests must patch the frozen constant explicitly;
+        # no sender wrapper or public mock boolean can open the edge.
+        _assert_compile_release_gate()
         self._assert_authority(
             raw_capability,
             functional_action=functional_action,
@@ -494,29 +627,66 @@ class UpbitFunctionalMutationEdge:
                 "upbit-mutation-request-not-ready:"
                 + ",".join(prepared.blocked_reasons)
             )
-        if not self.allow_mock_transport and not UPBIT_FUNCTIONAL_MUTATION_AVAILABLE:
-            raise UpbitFunctionalMutationNotSent(
-                "upbit-functional-mutation-production-unavailable"
+        def mark_and_send() -> Mapping[str, Any]:
+            try:
+                marker = self.post_boundary_marker(claim_id, request_hash)
+            except Exception as exc:
+                raise UpbitFunctionalMutationNotSent(
+                    "upbit-mutation-post-boundary-marker-failed"
+                ) from exc
+            if (
+                not isinstance(marker, Mapping)
+                or _text(marker.get("claimId")) != _text(claim_id)
+                or _text(marker.get("state")) != "POST_MAY_HAVE_CROSSED"
+            ):
+                raise UpbitFunctionalMutationNotSent(
+                    "upbit-mutation-post-boundary-marker-invalid"
+                )
+            self._assert_durable_post_boundary(
+                claim_id=claim_id,
+                request_hash=request_hash,
             )
+            try:
+                return self.sender(prepared)
+            except Exception as exc:
+                raise UpbitFunctionalMutationOutcomeUnknown(
+                    f"upbit-mutation-transport-raised:{type(exc).__name__}"
+                ) from exc
+
+        reserver = self.global_first_live_dispatch_reserver
+        reservation_request = self._global_first_live_request(
+            action=functional_action,
+            claim_id=claim_id,
+            request_hash=request_hash,
+        )
         try:
-            marker = self.post_boundary_marker(claim_id, request_hash)
-        except Exception as exc:
-            raise UpbitFunctionalMutationNotSent(
-                "upbit-mutation-post-boundary-marker-failed"
+            with reserver(dict(reservation_request)) as snapshot:
+                if not isinstance(snapshot, Mapping):
+                    raise UpbitFunctionalBlocked(
+                        "upbit-global-first-live-reservation-snapshot-invalid"
+                    )
+                self._verify_reserved_global_snapshot(
+                    request=reservation_request,
+                    snapshot=snapshot,
+                    action=functional_action,
+                    claim_id=claim_id,
+                    request_hash=request_hash,
+                )
+                # The shared canonical route lock remains held across the
+                # durable ambiguity marker, its independent durable re-read,
+                # and the only HTTP mutation call. STOP/Kill cannot race it.
+                response = mark_and_send()
+        except UpbitFunctionalMutationOutcomeUnknown:
+            raise
+        except UpbitFunctionalMutationNotSent:
+            raise
+        except UpbitFunctionalBlocked as exc:
+            raise UpbitGlobalFirstLiveFenceNotSent(
+                "upbit-mutation-global-first-live-dispatch-reservation-closed"
             ) from exc
-        if (
-            not isinstance(marker, Mapping)
-            or _text(marker.get("claimId")) != _text(claim_id)
-            or _text(marker.get("state")) != "POST_MAY_HAVE_CROSSED"
-        ):
-            raise UpbitFunctionalMutationNotSent(
-                "upbit-mutation-post-boundary-marker-invalid"
-            )
-        try:
-            response = self.sender(prepared)
         except Exception as exc:
-            raise UpbitFunctionalMutationOutcomeUnknown(
-                f"upbit-mutation-transport-raised:{type(exc).__name__}"
+            raise UpbitGlobalFirstLiveFenceNotSent(
+                "upbit-mutation-global-first-live-dispatch-reservation-unavailable"
             ) from exc
         if not isinstance(response, Mapping) or response.get("ok") is not True:
             raise UpbitFunctionalMutationOutcomeUnknown(
@@ -538,9 +708,9 @@ class UpbitFunctionalMutationEdge:
         claim_id: str,
         request_hash: str,
     ) -> Mapping[str, Any]:
+        _assert_compile_release_gate()
         prepared = build_upbit_functional_order_request(
             payload,
-            allow_mock_origin=self.allow_mock_transport,
         )
         sealed_payload = {
             key: value for key, value in payload.items() if key != "identifier"
@@ -573,9 +743,9 @@ class UpbitFunctionalMutationEdge:
         claim_id: str,
         request_hash: str,
     ) -> Mapping[str, Any]:
+        _assert_compile_release_gate()
         prepared = build_upbit_functional_cancel_request(
             identifier,
-            allow_mock_origin=self.allow_mock_transport,
         )
         result = self._send_once(
             prepared,
@@ -598,6 +768,7 @@ class UpbitFunctionalMutationEdge:
 
 __all__ = [
     "UPBIT_FUNCTIONAL_MUTATION_AVAILABLE",
+    "GlobalFirstLiveDispatchReserver",
     "UpbitFunctionalMutationEdge",
     "UpbitFunctionalMutationNotSent",
     "UpbitGlobalFirstLiveFenceNotSent",

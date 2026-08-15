@@ -17,12 +17,14 @@ class FakeFuturesSettingsRouter:
         self.position_count = 0
         self.open_order_count = 0
         self.configure_calls: list[dict[str, object]] = []
+        self.observation_calls: list[str] = []
         self.fail_configure = False
 
     def get_binance_futures_canary_observation(
         self,
         symbol: str,
     ) -> dict[str, object]:
+        self.observation_calls.append(symbol)
         return {
             "account": {
                 "can_trade": True,
@@ -79,6 +81,18 @@ class FuturesSettingsStateTests(unittest.TestCase):
         )
         self.router = FakeFuturesSettingsRouter()
         state.BINANCE_FUTURES_SETTINGS_ROUTER_FACTORY = lambda: self.router
+        self.real_orders_patcher = patch.object(
+            state, "real_orders_enabled", return_value=True
+        )
+        self.coordinator_status_patcher = patch.object(
+            state,
+            "crypto_first_live_coordinator_state_status",
+            return_value={"phase": "IDLE"},
+        )
+        self.real_orders_mock = self.real_orders_patcher.start()
+        self.coordinator_status_mock = (
+            self.coordinator_status_patcher.start()
+        )
         state.BINANCE_FUTURES_SETTINGS_INTERNAL.update(
             {
                 "status": "IDLE",
@@ -91,6 +105,8 @@ class FuturesSettingsStateTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.coordinator_status_patcher.stop()
+        self.real_orders_patcher.stop()
         state.BINANCE_FUTURES_SETTINGS_ROUTER_FACTORY = (
             self.original_factory
         )
@@ -196,6 +212,73 @@ class FuturesSettingsStateTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(before, state.BINANCE_FUTURES_SETTINGS_INTERNAL)
         self.assertEqual([], self.router.configure_calls)
+
+    def test_real_orders_false_blocks_preview_before_get_and_token(self) -> None:
+        before = copy.deepcopy(state.BINANCE_FUTURES_SETTINGS_INTERNAL)
+        self.real_orders_mock.return_value = False
+
+        result = state.preview_binance_futures_settings(
+            "ETHUSDT", "ISOLATED", 1
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            "binance-futures-settings-real-orders-disabled",
+            result["reason"],
+        )
+        self.assertEqual({}, result["authorization"])
+        self.assertEqual([], self.router.observation_calls)
+        self.assertEqual([], self.router.configure_calls)
+        self.assertEqual(before, state.BINANCE_FUTURES_SETTINGS_INTERNAL)
+
+    def test_real_orders_false_blocks_apply_before_token_consumption(self) -> None:
+        preview = state.preview_binance_futures_settings(
+            "ETHUSDT", "ISOLATED", 1
+        )
+        token = preview["authorization"]["confirmation_token"]
+        self.real_orders_mock.return_value = False
+        observations_before = list(self.router.observation_calls)
+
+        result = state.apply_binance_futures_settings(
+            token, confirmed=True
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            "binance-futures-settings-real-orders-disabled",
+            result["reason"],
+        )
+        self.assertFalse(
+            state.BINANCE_FUTURES_SETTINGS_INTERNAL["confirmation_used"]
+        )
+        self.assertEqual(
+            observations_before, self.router.observation_calls
+        )
+        self.assertEqual([], self.router.configure_calls)
+
+    def test_phase_race_blocks_immediate_pre_mutation_send(self) -> None:
+        preview = state.preview_binance_futures_settings(
+            "ETHUSDT", "ISOLATED", 1
+        )
+        token = preview["authorization"]["confirmation_token"]
+        self.coordinator_status_mock.side_effect = [
+            {"phase": "IDLE"},
+            {"phase": "ACTIVE"},
+        ]
+
+        result = state.apply_binance_futures_settings(
+            token, confirmed=True
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual([], self.router.configure_calls)
+        self.assertTrue(
+            state.BINANCE_FUTURES_SETTINGS_INTERNAL["confirmation_used"]
+        )
+        self.assertIn(
+            "crypto-first-live-coordinator-blocks-futures-settings:ACTIVE",
+            result["reason"],
+        )
 
     def test_functional_start_waits_for_inflight_settings_sender(self) -> None:
         preview = state.preview_binance_futures_settings(

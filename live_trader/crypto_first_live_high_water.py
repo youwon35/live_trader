@@ -23,6 +23,7 @@ from typing import Any, Callable, Mapping
 
 
 HIGH_WATER_SCHEMA_VERSION = "crypto-first-live-high-water-anchor/v1"
+EXTERNAL_WORM_SCHEMA_VERSION = "crypto-first-live-external-worm-anchor/v1"
 GLOBAL_SCOPE = "CRYPTO_FIRST_LIVE_GLOBAL"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,160}$")
@@ -508,10 +509,207 @@ class DurableCryptoFirstLiveHighWaterAnchor:
         finally:
             conn.close()
 
+    def external_checkpoint_descriptor(self) -> dict[str, Any]:
+        """Return the exact local prefix an external WORM CAS must anchor."""
+
+        conn = self._connect()
+        try:
+            self._verify(conn)
+            row = self._control(conn)
+            if row is None:
+                raise CryptoFirstLiveHighWaterError(
+                    "crypto-first-live-high-water-unregistered"
+                )
+            events = conn.execute(
+                """
+                SELECT anchor_revision, content_json, content_hash
+                FROM crypto_first_live_high_water_events
+                ORDER BY anchor_revision DESC LIMIT 2
+                """
+            ).fetchall()
+            if not events:
+                raise CryptoFirstLiveHighWaterError(
+                    "crypto-first-live-high-water-event-missing"
+                )
+            current = self._response(row)
+            current_revision = int(current["revision"])
+            prior_revision = 0
+            prior_hash = ""
+            if current_revision > 0:
+                prior = next(
+                    (
+                        json.loads(_text(item["content_json"]))
+                        for item in events[1:]
+                    ),
+                    None,
+                )
+                if (
+                    not isinstance(prior, dict)
+                    or int(prior.get("coordinatorRevision", -1))
+                    != current_revision - 1
+                ):
+                    raise CryptoFirstLiveHighWaterError(
+                        "crypto-first-live-high-water-prior-prefix-missing"
+                    )
+                prior_revision = int(prior["coordinatorRevision"])
+                prior_hash = _text(prior.get("publicationHash"))
+            return {
+                "databaseId": current["databaseId"],
+                "priorRevision": prior_revision,
+                "priorPublicationHash": prior_hash,
+                "revision": current_revision,
+                "publicationHash": current["publicationHash"],
+                "localAnchorRevision": int(row["anchor_revision"]),
+                "localAnchorHeadHash": _text(events[0]["content_hash"]),
+            }
+        finally:
+            conn.close()
+
+
+class ExternallyAnchoredCryptoFirstLiveHighWaterAuthority:
+    """Compose the local anchor with an independent monotonic/WORM CAS.
+
+    The external authority is expected to retain its checkpoint outside the
+    coordinator/high-water restore domain.  It may advance only from the
+    supplied prior prefix, and must return its authoritative maximum.  A
+    simultaneous rollback of both local SQLite files therefore returns an
+    external revision ahead of the restored prefix and fails closed.
+    """
+
+    def __init__(
+        self,
+        local_anchor: DurableCryptoFirstLiveHighWaterAnchor,
+        *,
+        external_worm_authority: Callable[
+            [Mapping[str, Any]], Mapping[str, Any]
+        ],
+    ) -> None:
+        if not callable(external_worm_authority):
+            raise CryptoFirstLiveHighWaterError(
+                "crypto-first-live-external-worm-authority-missing"
+            )
+        self.local_anchor = local_anchor
+        self.external_worm_authority = external_worm_authority
+
+    @staticmethod
+    def validate_external_receipt(
+        value: Mapping[str, Any], *, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        receipt = dict(value)
+        if set(receipt) != {
+            "schemaVersion",
+            "scope",
+            "authorityId",
+            "databaseId",
+            "revision",
+            "publicationHash",
+            "checkpointId",
+            "checkpointHash",
+            "monotonic",
+            "appendOnly",
+            "worm",
+            "durable",
+            "restartVerifiable",
+            "receiptHash",
+        }:
+            raise CryptoFirstLiveHighWaterError(
+                "crypto-first-live-external-worm-receipt-fields-not-exact"
+            )
+        body = {
+            key: item for key, item in receipt.items() if key != "receiptHash"
+        }
+        try:
+            revision = int(receipt["revision"])
+        except (TypeError, ValueError) as exc:
+            raise CryptoFirstLiveHighWaterError(
+                "crypto-first-live-external-worm-receipt-invalid"
+            ) from exc
+        if (
+            receipt.get("schemaVersion") != EXTERNAL_WORM_SCHEMA_VERSION
+            or receipt.get("scope") != GLOBAL_SCOPE
+            or _ID_RE.fullmatch(_text(receipt.get("authorityId"))) is None
+            or receipt.get("databaseId") != request.get("databaseId")
+            or revision < 0
+            or (revision == 0 and _text(receipt["publicationHash"]) != "")
+            or (
+                revision > 0
+                and _HASH_RE.fullmatch(
+                    _text(receipt["publicationHash"])
+                ) is None
+            )
+            or _ID_RE.fullmatch(_text(receipt.get("checkpointId"))) is None
+            or _HASH_RE.fullmatch(_text(receipt.get("checkpointHash"))) is None
+            or receipt.get("monotonic") is not True
+            or receipt.get("appendOnly") is not True
+            or receipt.get("worm") is not True
+            or receipt.get("durable") is not True
+            or receipt.get("restartVerifiable") is not True
+            or not secrets.compare_digest(
+                _text(receipt.get("receiptHash")), _digest(body)
+            )
+        ):
+            raise CryptoFirstLiveHighWaterError(
+                "crypto-first-live-external-worm-receipt-invalid"
+            )
+        return receipt
+
+    def __call__(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        local = dict(self.local_anchor(request))
+        descriptor = self.local_anchor.external_checkpoint_descriptor()
+        if (
+            descriptor["databaseId"] != local["databaseId"]
+            or descriptor["revision"] != local["revision"]
+            or descriptor["publicationHash"] != local["publicationHash"]
+        ):
+            raise CryptoFirstLiveHighWaterError(
+                "crypto-first-live-external-worm-local-prefix-changed"
+            )
+        external_request = {
+            "schemaVersion": EXTERNAL_WORM_SCHEMA_VERSION,
+            "action": "OBSERVE_OR_ADVANCE",
+            "purpose": _text(dict(request).get("purpose")),
+            "scope": GLOBAL_SCOPE,
+            **descriptor,
+        }
+        response = self.external_worm_authority(external_request)
+        if not isinstance(response, Mapping):
+            raise CryptoFirstLiveHighWaterError(
+                "crypto-first-live-external-worm-receipt-invalid"
+            )
+        receipt = self.validate_external_receipt(
+            response, request=external_request
+        )
+        if (
+            int(receipt["revision"]) != int(descriptor["revision"])
+            or receipt["publicationHash"]
+            != descriptor["publicationHash"]
+        ):
+            raise CryptoFirstLiveHighWaterError(
+                "crypto-first-live-simultaneous-rollback-detected"
+            )
+        return local
+
+    def status(self) -> dict[str, Any]:
+        local = self.local_anchor.status()
+        if local.get("phase") == "UNREGISTERED":
+            return local
+        request = {
+            "schemaVersion": HIGH_WATER_SCHEMA_VERSION,
+            "action": "REGISTER_OR_OBSERVE",
+            "purpose": "EXTERNAL_WORM_STATUS",
+            "scope": GLOBAL_SCOPE,
+            "databaseId": local["databaseId"],
+            "localRevision": local["revision"],
+            "localPublicationHash": local["publicationHash"],
+        }
+        return dict(self(request))
+
 
 __all__ = [
     "CryptoFirstLiveHighWaterError",
     "DurableCryptoFirstLiveHighWaterAnchor",
+    "EXTERNAL_WORM_SCHEMA_VERSION",
+    "ExternallyAnchoredCryptoFirstLiveHighWaterAuthority",
     "GLOBAL_SCOPE",
     "HIGH_WATER_SCHEMA_VERSION",
 ]

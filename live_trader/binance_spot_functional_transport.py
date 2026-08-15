@@ -53,6 +53,17 @@ SIGNED_GET_ENDPOINTS = frozenset(
         BINANCE_SPOT_QUERY_ORDER_ENDPOINT,
     }
 )
+BINANCE_SPOT_FUNCTIONAL_GET_NETWORK_RELEASED = False
+_FUNCTIONAL_GET_NETWORK_CAPABILITY = object()
+
+
+def _protected_binance_spot_get_network_capability() -> object:
+    """Issue the in-process, identity-only capability to protected wiring."""
+    if BINANCE_SPOT_FUNCTIONAL_GET_NETWORK_RELEASED is not True:
+        raise BinanceSpotTruthError(
+            "Binance Spot functional GET network release is held"
+        )
+    return _FUNCTIONAL_GET_NETWORK_CAPABILITY
 PUBLIC_GET_ENDPOINTS = frozenset(
     {
         BINANCE_SPOT_EXCHANGE_INFO_ENDPOINT,
@@ -210,8 +221,6 @@ def _strict_rows(value: object, *, label: str) -> list[dict[str, Any]]:
 def build_binance_spot_get_request(
     endpoint: str,
     query: Mapping[str, object] | None = None,
-    *,
-    allow_mock_origin: bool = False,
 ) -> PreparedRequest:
     """Build one allowlisted official Spot GET request with redacted preview."""
 
@@ -219,11 +228,8 @@ def build_binance_spot_get_request(
     if normalized_endpoint not in ALL_GET_ENDPOINTS:
         raise BinanceSpotTruthError("endpoint is not in the Binance Spot GET allowlist")
     configured_base_url = env_value("BINANCE_BASE_URL") or BINANCE_BASE_URL
-    if allow_mock_origin:
-        base_url = configured_base_url.rstrip("/")
-    else:
-        # Validate before reading the API key/secret or producing a signature.
-        base_url = assert_binance_spot_production_origin(configured_base_url)
+    # Validate before reading the API key/secret or producing a signature.
+    base_url = assert_binance_spot_production_origin(configured_base_url)
     params = {
         str(key): (
             "true" if value is True else "false" if value is False else value
@@ -273,20 +279,30 @@ class OfficialBinanceSpotGetClient:
         sender: Callable[[PreparedRequest], Mapping[str, Any]] = send_prepared_request,
         expected_account_fingerprint: str = "",
         clock: Callable[[], float] = time.time,
-        allow_mock_origin: bool = False,
+        network_capability: object | None = None,
     ) -> None:
         self.sender = sender
         self.expected_account_fingerprint = _text(
             expected_account_fingerprint
         ).lower()
         self.clock = clock
-        self.allow_mock_origin = bool(allow_mock_origin)
+        self._network_capability = network_capability
+
+    def _assert_network_capability(self) -> None:
+        if (
+            BINANCE_SPOT_FUNCTIONAL_GET_NETWORK_RELEASED is not True
+            or self._network_capability is not _FUNCTIONAL_GET_NETWORK_CAPABILITY
+        ):
+            raise BinanceSpotTruthError(
+                "Binance Spot functional GET network capability is closed"
+            )
 
     def _send_once(
         self,
         endpoint: str,
         query: Mapping[str, object] | None,
     ) -> Mapping[str, Any]:
+        self._assert_network_capability()
         if endpoint in SIGNED_GET_ENDPOINTS:
             current_fingerprint = binance_api_key_fingerprint(
                 env_value("BINANCE_API_KEY")
@@ -298,9 +314,7 @@ class OfficialBinanceSpotGetClient:
                 raise BinanceSpotTruthError(
                     "current Binance credential fingerprint changed"
                 )
-        prepared = build_binance_spot_get_request(
-            endpoint, query, allow_mock_origin=self.allow_mock_origin
-        )
+        prepared = build_binance_spot_get_request(endpoint, query)
         if prepared.method != "GET" or not prepared.can_send:
             raise BinanceSpotTruthError(
                 "Binance Spot GET is not credential/config ready: "

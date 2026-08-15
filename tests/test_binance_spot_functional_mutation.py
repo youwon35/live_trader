@@ -4,6 +4,7 @@ import os
 import hashlib
 import json
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 import urllib.parse
 
@@ -181,6 +182,15 @@ def cancel_action(**updates: object) -> dict[str, object]:
 
 
 class BinanceSpotFunctionalMutationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        release = patch(
+            "live_trader.binance_spot_functional_mutation."
+            "PRODUCTION_MUTATION_AVAILABLE",
+            True,
+        )
+        release.start()
+        self.addCleanup(release.stop)
+
     def ready_env(self):
         return patch.dict(
             os.environ,
@@ -191,6 +201,51 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
                 "BINANCE_SPOT_FUNCTIONAL_LIVE_ENABLED": "true",
             },
             clear=False,
+        )
+
+    def released_edge(
+        self,
+        *,
+        claim_reader,
+        sender,
+        authority_reader=exact_authority,
+        claim_marker=None,
+        dispatch_lease_factory=None,
+        global_first_live_dispatch_reservation=None,
+        final_exclusivity_health_reader=None,
+        clock=lambda: 1_800_000_000.0,
+    ) -> BinanceSpotFunctionalMutationEdge:
+        if claim_marker is None:
+            def claim_marker(claim_id: str) -> None:
+                claim = claim_reader(claim_id)
+                claim["state"] = "POST_MAY_HAVE_CROSSED"
+
+        if dispatch_lease_factory is None:
+            @contextmanager
+            def dispatch_lease_factory(**request: object):
+                yield lambda: {
+                    "active": True,
+                    "sessionId": request["session_id"],
+                    "claimId": request["claim_id"],
+                    "ordinaryRoutesClosed": True,
+                }
+
+        if global_first_live_dispatch_reservation is None:
+            @contextmanager
+            def global_first_live_dispatch_reservation(**_request: object):
+                yield exact_global_authority()
+
+        return BinanceSpotFunctionalMutationEdge(
+            authority_reader=authority_reader,
+            claim_reader=claim_reader,
+            claim_marker=claim_marker,
+            dispatch_lease_factory=dispatch_lease_factory,
+            global_first_live_dispatch_reservation=(
+                global_first_live_dispatch_reservation
+            ),
+            final_exclusivity_health_reader=final_exclusivity_health_reader,
+            sender=sender,
+            clock=clock,
         )
 
     def test_exact_buy_uses_quote_cap_and_owned_new_client_order_id(self) -> None:
@@ -275,14 +330,13 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
                     claim["state"] = "POST_MAY_HAVE_CROSSED"
                     events.append("mark")
 
-                edge = BinanceSpotFunctionalMutationEdge(
+                edge = self.released_edge(
                     authority_reader=lambda: cleanup_authority,
                     claim_reader=lambda _: claim,
                     claim_marker=marker,
                     sender=lambda request, response=response: (
                         events.append(request.method) or {"ok": True, "json": response}
                     ),
-                    allow_mock_transport=True,
                 )
                 with self.ready_env():
                     receipt = edge(action, lambda: None, **call_context(action=action))
@@ -304,23 +358,39 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
                 with self.assertRaises(BinanceSpotFunctionalMutationNotSent):
                     build_binance_spot_functional_mutation_request(action)
 
-    def test_production_unavailable_or_missing_gate_never_marks_transport(self) -> None:
+    def test_release_false_blocks_wrapper_lambda_before_marker_and_sender(self) -> None:
         self.assertFalse(PRODUCTION_MUTATION_AVAILABLE)
+        claim = durable_claim()
         markers: list[str] = []
-        edge = BinanceSpotFunctionalMutationEdge(
+        sends: list[str] = []
+        edge = self.released_edge(
             authority_reader=exact_authority,
-            claim_reader=lambda _: durable_claim(),
-            sender=lambda _: {"ok": True, "json": {}},
+            claim_reader=lambda _: claim,
+            claim_marker=lambda _: markers.append("durable-marker"),
+            sender=lambda _: sends.append("sender")
+            or {"ok": True, "json": {}},
         )
-        with patch.dict(os.environ, {}, clear=True), self.assertRaises(
-            BinanceSpotFunctionalMutationNotSent
-        ):
+        with self.ready_env(), patch(
+            "live_trader.binance_spot_functional_mutation."
+            "PRODUCTION_MUTATION_AVAILABLE",
+            False,
+        ), self.assertRaises(BinanceSpotFunctionalMutationNotSent):
             edge(
                 buy_action(),
-                lambda: markers.append("sent"),
+                lambda: markers.append("caller-marker"),
                 **call_context(),
             )
         self.assertEqual([], markers)
+        self.assertEqual([], sends)
+
+    def test_public_mock_transport_boolean_is_absent(self) -> None:
+        with self.assertRaises(TypeError):
+            BinanceSpotFunctionalMutationEdge(
+                authority_reader=exact_authority,
+                claim_reader=lambda _: durable_claim(),
+                sender=lambda _: {"ok": True, "json": {}},
+                allow_mock_transport=True,  # type: ignore[call-arg]
+            )
 
     def test_mock_edge_marks_once_immediately_before_single_send(self) -> None:
         events: list[str] = []
@@ -340,19 +410,18 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
                 },
             }
 
-        edge = BinanceSpotFunctionalMutationEdge(
+        edge = self.released_edge(
             authority_reader=exact_authority,
             claim_reader=lambda _: claim,
+            claim_marker=lambda _: (
+                claim.__setitem__("state", "POST_MAY_HAVE_CROSSED"),
+                events.append("mark"),
+            ),
             sender=sender,
-            allow_mock_transport=True,
         )
         with self.ready_env():
-            def marker() -> None:
-                claim["state"] = "POST_MAY_HAVE_CROSSED"
-                events.append("mark")
-
             receipt = edge(
-                buy_action(), marker, **call_context()
+                buy_action(), lambda: None, **call_context()
             )
         self.assertEqual(["mark", "send"], events)
         self.assertEqual("101", receipt["orderId"])
@@ -367,30 +436,28 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
             calls += 1
             raise TimeoutError("read timeout")
 
-        edge = BinanceSpotFunctionalMutationEdge(
+        edge = self.released_edge(
             authority_reader=exact_authority,
             claim_reader=lambda _: claim,
+            claim_marker=lambda _: (
+                claim.__setitem__("state", "POST_MAY_HAVE_CROSSED"),
+                events.append("mark"),
+            ),
             sender=sender,
-            allow_mock_transport=True,
         )
         with self.ready_env(), self.assertRaises(
             BinanceSpotFunctionalMutationOutcomeUnknown
         ):
-            def marker() -> None:
-                claim["state"] = "POST_MAY_HAVE_CROSSED"
-                events.append("mark")
-
-            edge(buy_action(), marker, **call_context())
+            edge(buy_action(), lambda: None, **call_context())
         self.assertEqual(["mark"], events)
         self.assertEqual(1, calls)
 
     def test_direct_shaped_action_without_exact_context_cannot_send(self) -> None:
         sends: list[str] = []
-        edge = BinanceSpotFunctionalMutationEdge(
+        edge = self.released_edge(
             authority_reader=exact_authority,
             claim_reader=lambda _: durable_claim(),
             sender=lambda _: sends.append("send") or {"ok": True, "json": {}},
-            allow_mock_transport=True,
         )
         with self.ready_env(), self.assertRaises(TypeError):
             edge(buy_action(), lambda: None)  # type: ignore[call-arg]
@@ -399,11 +466,10 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
     def test_api_key_swap_immediately_before_edge_is_not_sent(self) -> None:
         markers: list[str] = []
         sends: list[str] = []
-        edge = BinanceSpotFunctionalMutationEdge(
+        edge = self.released_edge(
             authority_reader=exact_authority,
             claim_reader=lambda _: durable_claim(),
             sender=lambda _: sends.append("send") or {"ok": True, "json": {}},
-            allow_mock_transport=True,
         )
         with self.ready_env(), patch.dict(
             os.environ, {"BINANCE_API_KEY": "rotated-api-key"}, clear=False
@@ -427,12 +493,11 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
             durable_claim(session_id="bnsft-different-session-0001"),
         ):
             with self.subTest(claim=claim):
-                edge = BinanceSpotFunctionalMutationEdge(
+                edge = self.released_edge(
                     authority_reader=exact_authority,
                     claim_reader=lambda _, claim=claim: claim,
                     sender=lambda _: sends.append("send")
                     or {"ok": True, "json": {}},
-                    allow_mock_transport=True,
                 )
                 with self.ready_env(), self.assertRaises(
                     BinanceSpotFunctionalMutationNotSent
@@ -455,7 +520,7 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
             claim["state"] = "POST_MAY_HAVE_CROSSED"
             events.append("durable-cas")
 
-        edge = BinanceSpotFunctionalMutationEdge(
+        edge = self.released_edge(
             authority_reader=exact_authority,
             claim_reader=lambda _: claim,
             claim_marker=backend_marker,
@@ -471,7 +536,6 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
                     "status": "FILLED",
                 },
             },
-            allow_mock_transport=True,
         )
         with self.ready_env():
             edge(
@@ -485,7 +549,8 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
         claim = durable_claim()
         events: list[str] = []
 
-        def global_reader(**request: object) -> dict[str, object]:
+        @contextmanager
+        def global_reservation(**request: object):
             self.assertEqual("MUTATION_FINAL_PRE_MARKER", request["purpose"])
             self.assertEqual(SESSION_ID, request["session_id"])
             self.assertEqual(PERMIT_ID, request["permit_id"])
@@ -493,18 +558,18 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
             self.assertEqual(ACCOUNT_FINGERPRINT, request["account_fingerprint"])
             self.assertFalse(request["cleanup_only"])
             events.append("global-authority")
-            return exact_global_authority()
+            yield exact_global_authority()
 
         def marker(claim_id: str) -> None:
             self.assertEqual("claim-mutation-0001", claim_id)
             claim["state"] = "POST_MAY_HAVE_CROSSED"
             events.append("durable-marker")
 
-        edge = BinanceSpotFunctionalMutationEdge(
+        edge = self.released_edge(
             authority_reader=exact_authority,
             claim_reader=lambda _: claim,
             claim_marker=marker,
-            global_first_live_authority_reader=global_reader,
+            global_first_live_dispatch_reservation=global_reservation,
             sender=lambda _: events.append("send")
             or {
                 "ok": True,
@@ -517,7 +582,6 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
                     "status": "FILLED",
                 },
             },
-            allow_mock_transport=True,
             clock=lambda: 1_800_000_000.0,
         )
         with self.ready_env():
@@ -537,16 +601,20 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
             with self.subTest(snapshot=snapshot):
                 claim = durable_claim()
                 events: list[str] = []
-                edge = BinanceSpotFunctionalMutationEdge(
+
+                @contextmanager
+                def hostile_reservation(**_request: object):
+                    yield snapshot
+
+                edge = self.released_edge(
                     authority_reader=exact_authority,
                     claim_reader=lambda _: claim,
                     claim_marker=lambda _: events.append("durable-marker"),
-                    global_first_live_authority_reader=(
-                        lambda **_request: snapshot
+                    global_first_live_dispatch_reservation=(
+                        hostile_reservation
                     ),
                     sender=lambda _: events.append("send")
                     or {"ok": True, "json": {}},
-                    allow_mock_transport=True,
                     clock=lambda: 1_800_000_000.0,
                 )
                 with self.ready_env(), self.assertRaises(
@@ -555,20 +623,19 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
                     edge(buy_action(), lambda: None, **call_context())
                 self.assertEqual([], events)
 
-    def test_global_authority_reader_failure_never_marks_or_sends(self) -> None:
+    def test_global_reservation_failure_never_marks_or_sends(self) -> None:
         claim = durable_claim()
         events: list[str] = []
 
-        def failed_reader(**_request: object) -> dict[str, object]:
+        def failed_reservation(**_request: object):
             raise TimeoutError("coordinator authority unavailable")
 
-        edge = BinanceSpotFunctionalMutationEdge(
+        edge = self.released_edge(
             authority_reader=exact_authority,
             claim_reader=lambda _: claim,
             claim_marker=lambda _: events.append("durable-marker"),
-            global_first_live_authority_reader=failed_reader,
+            global_first_live_dispatch_reservation=failed_reservation,
             sender=lambda _: events.append("send") or {"ok": True, "json": {}},
-            allow_mock_transport=True,
             clock=lambda: 1_800_000_000.0,
         )
         with self.ready_env(), self.assertRaisesRegex(
@@ -576,6 +643,309 @@ class BinanceSpotFunctionalMutationTest(unittest.TestCase):
         ):
             edge(buy_action(), lambda: None, **call_context())
         self.assertEqual([], events)
+
+    def test_global_dispatch_reservation_is_held_through_marker_and_sender(
+        self,
+    ) -> None:
+        claim = durable_claim()
+        events: list[str] = []
+        reservation_active = False
+
+        @contextmanager
+        def reservation(**request: object):
+            nonlocal reservation_active
+            self.assertEqual("MUTATION_FINAL_PRE_MARKER", request["purpose"])
+            self.assertEqual(SESSION_ID, request["session_id"])
+            self.assertFalse(request["cleanup_only"])
+            reservation_active = True
+            events.append("reservation-enter")
+            try:
+                yield exact_global_authority()
+            finally:
+                reservation_active = False
+                events.append("reservation-exit")
+
+        def marker(_claim_id: str) -> None:
+            self.assertTrue(reservation_active)
+            claim["state"] = "POST_MAY_HAVE_CROSSED"
+            events.append("durable-marker")
+
+        def sender(_request: object) -> dict[str, object]:
+            self.assertTrue(reservation_active)
+            events.append("send")
+            return {
+                "ok": True,
+                "json": {
+                    "orderId": "101",
+                    "clientOrderId": OWNER + "b",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "type": "MARKET",
+                    "status": "FILLED",
+                },
+            }
+
+        edge = self.released_edge(
+            authority_reader=exact_authority,
+            claim_reader=lambda _: claim,
+            claim_marker=marker,
+            global_first_live_dispatch_reservation=reservation,
+            sender=sender,
+            clock=lambda: 1_800_000_000.0,
+        )
+        with self.ready_env():
+            edge(buy_action(), lambda: None, **call_context())
+        self.assertFalse(reservation_active)
+        self.assertEqual(
+            [
+                "reservation-enter",
+                "durable-marker",
+                "send",
+                "reservation-exit",
+            ],
+            events,
+        )
+
+    def test_global_reservation_is_outermost_to_match_stop_lock_order(
+        self,
+    ) -> None:
+        claim = durable_claim()
+        events: list[str] = []
+        global_active = False
+        local_active = False
+
+        @contextmanager
+        def reservation(**_request: object):
+            nonlocal global_active
+            self.assertFalse(local_active)
+            global_active = True
+            events.append("global-enter")
+            try:
+                yield exact_global_authority()
+            finally:
+                self.assertFalse(local_active)
+                events.append("global-exit")
+                global_active = False
+
+        @contextmanager
+        def local_lease(**_request: object):
+            nonlocal local_active
+            self.assertTrue(global_active)
+            local_active = True
+            events.append("local-enter")
+            try:
+                yield lambda: {
+                    "active": True,
+                    "sessionId": SESSION_ID,
+                    "claimId": "claim-mutation-0001",
+                    "ordinaryRoutesClosed": True,
+                }
+            finally:
+                events.append("local-exit")
+                local_active = False
+
+        def marker(_claim_id: str) -> None:
+            self.assertTrue(global_active)
+            self.assertTrue(local_active)
+            claim["state"] = "POST_MAY_HAVE_CROSSED"
+            events.append("durable-marker")
+
+        def sender(_request: object) -> dict[str, object]:
+            self.assertTrue(global_active)
+            self.assertTrue(local_active)
+            events.append("send")
+            return {
+                "ok": True,
+                "json": {"orderId": "101", "clientOrderId": OWNER + "b"},
+            }
+
+        edge = self.released_edge(
+            authority_reader=exact_authority,
+            claim_reader=lambda _: claim,
+            claim_marker=marker,
+            dispatch_lease_factory=local_lease,
+            global_first_live_dispatch_reservation=reservation,
+            sender=sender,
+            clock=lambda: 1_800_000_000.0,
+        )
+        with self.ready_env():
+            edge(buy_action(), lambda: None, **call_context())
+        self.assertEqual(
+            [
+                "global-enter",
+                "local-enter",
+                "durable-marker",
+                "send",
+                "local-exit",
+                "global-exit",
+            ],
+            events,
+        )
+
+    def test_bad_global_dispatch_reservation_never_marks_or_sends(self) -> None:
+        claim = durable_claim()
+        events: list[str] = []
+
+        @contextmanager
+        def reservation(**_request: object):
+            events.append("reservation-enter")
+            try:
+                yield exact_global_authority(ownerLeaseActive=False)
+            finally:
+                events.append("reservation-exit")
+
+        edge = self.released_edge(
+            authority_reader=exact_authority,
+            claim_reader=lambda _: claim,
+            claim_marker=lambda _: events.append("durable-marker"),
+            global_first_live_dispatch_reservation=reservation,
+            sender=lambda _: events.append("send") or {"ok": True, "json": {}},
+            clock=lambda: 1_800_000_000.0,
+        )
+        with self.ready_env(), self.assertRaises(
+            BinanceSpotFunctionalMutationNotSent
+        ):
+            edge(buy_action(), lambda: None, **call_context())
+        self.assertEqual(
+            ["reservation-enter", "reservation-exit"], events
+        )
+
+    def test_observer_failure_inside_both_route_locks_never_marks_or_sends(
+        self,
+    ) -> None:
+        claim = durable_claim()
+        events: list[str] = []
+
+        @contextmanager
+        def reservation(**_request: object):
+            events.append("global-enter")
+            try:
+                yield exact_global_authority()
+            finally:
+                events.append("global-exit")
+
+        @contextmanager
+        def local_lease(**_request: object):
+            events.append("local-enter")
+            try:
+                yield lambda: {
+                    "active": True,
+                    "sessionId": SESSION_ID,
+                    "claimId": "claim-mutation-0001",
+                    "ordinaryRoutesClosed": True,
+                }
+            finally:
+                events.append("local-exit")
+
+        def failed_health(**request: object) -> dict[str, object]:
+            self.assertEqual("MUTATION_FINAL_PRE_MARKER", request["purpose"])
+            events.append("observer-health")
+            raise TimeoutError("signed observer snapshot is stale")
+
+        edge = self.released_edge(
+            authority_reader=exact_authority,
+            claim_reader=lambda _: claim,
+            claim_marker=lambda _: events.append("durable-marker"),
+            dispatch_lease_factory=local_lease,
+            global_first_live_dispatch_reservation=reservation,
+            final_exclusivity_health_reader=failed_health,
+            sender=lambda _: events.append("send") or {"ok": True, "json": {}},
+            clock=lambda: 1_800_000_000.0,
+        )
+        with self.ready_env(), self.assertRaises(
+            BinanceSpotFunctionalMutationNotSent
+        ):
+            edge(buy_action(), lambda: None, **call_context())
+        self.assertEqual(
+            [
+                "global-enter",
+                "local-enter",
+                "observer-health",
+                "local-exit",
+                "global-exit",
+            ],
+            events,
+        )
+        self.assertEqual("SUBMITTING", claim["state"])
+
+    def test_observer_revoke_never_blocks_exact_session_cleanup(self) -> None:
+        action = cleanup_sell_action()
+        claim = durable_claim(action, action_kind="CLEANUP_SELL")
+        events: list[str] = []
+
+        def marker(_claim_id: str) -> None:
+            claim["state"] = "POST_MAY_HAVE_CROSSED"
+            events.append("durable-marker")
+
+        edge = self.released_edge(
+            authority_reader=lambda: exact_authority(
+                killSwitch=True,
+                cleanupOnlyAuthority=True,
+                cleanupSessionId=SESSION_ID,
+                cleanupCapabilityHash=CAPABILITY_HASH,
+            ),
+            claim_reader=lambda _: claim,
+            claim_marker=marker,
+            final_exclusivity_health_reader=lambda **_: (_ for _ in ()).throw(
+                AssertionError("cleanup must not require healthy observer")
+            ),
+            sender=lambda _: events.append("send")
+            or {
+                "ok": True,
+                "json": {
+                    "orderId": "202",
+                    "clientOrderId": OWNER + "f",
+                },
+            },
+            clock=lambda: 1_800_000_000.0,
+        )
+        with self.ready_env():
+            result = edge(
+                action,
+                lambda: None,
+                **call_context(action=action),
+            )
+        self.assertEqual(OWNER + "f", result["clientOrderId"])
+        self.assertEqual(["durable-marker", "send"], events)
+
+    def test_reservation_exit_failure_after_marker_is_outcome_unknown(
+        self,
+    ) -> None:
+        claim = durable_claim()
+        events: list[str] = []
+
+        @contextmanager
+        def reservation(**_request: object):
+            yield exact_global_authority()
+            events.append("reservation-exit-failed")
+            raise RuntimeError("route unlock evidence unavailable")
+
+        def marker(_claim_id: str) -> None:
+            claim["state"] = "POST_MAY_HAVE_CROSSED"
+            events.append("durable-marker")
+
+        edge = self.released_edge(
+            authority_reader=exact_authority,
+            claim_reader=lambda _: claim,
+            claim_marker=marker,
+            global_first_live_dispatch_reservation=reservation,
+            sender=lambda _: events.append("send")
+            or {
+                "ok": True,
+                "json": {
+                    "orderId": "101",
+                    "clientOrderId": OWNER + "b",
+                },
+            },
+            clock=lambda: 1_800_000_000.0,
+        )
+        with self.ready_env(), self.assertRaises(
+            BinanceSpotFunctionalMutationOutcomeUnknown
+        ):
+            edge(buy_action(), lambda: None, **call_context())
+        self.assertEqual(
+            ["durable-marker", "send", "reservation-exit-failed"], events
+        )
 
     def test_global_real_orders_true_closes_functional_edge(self) -> None:
         with self.ready_env(), patch.dict(

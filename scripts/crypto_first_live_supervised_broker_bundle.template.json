@@ -1,0 +1,25 @@
+{
+  "schemaVersion": "crypto-first-live-supervised-broker-bundle/v1",
+  "readyForApply": false,
+  "pythonWheels": [],
+  "modes": [
+    {
+      "mode": "UPBIT_AUTHORITY",
+      "pipeAddress": "\\\\.\\pipe\\crypto-first-live-upbit-authority",
+      "entryPointDestinationRelativePath": "app/broker_authorities/upbit/runtime/ENTRYPOINT.py",
+      "importRootDestinationRelativePath": "app/broker_authorities/upbit/runtime",
+      "arguments": [],
+      "environment": [],
+      "files": []
+    },
+    {
+      "mode": "BINANCE_OBSERVER",
+      "pipeAddress": "\\\\.\\pipe\\crypto-first-live-binance-observer-launch",
+      "entryPointDestinationRelativePath": "app/broker_authorities/binance/runtime/ENTRYPOINT.py",
+      "importRootDestinationRelativePath": "app/broker_authorities/binance/runtime",
+      "arguments": [],
+      "environment": [],
+      "files": []
+    }
+  ]
+}

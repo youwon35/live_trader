@@ -49,6 +49,7 @@ _FUNCTIONAL_MUTATION_PATHS = frozenset(
         "/api/binance-spot-functional/start",
         "/api/binance-spot-functional/stop",
         "/api/binance-spot-functional/recover",
+        "/api/crypto-first-live/reprepare",
     }
 )
 _FUNCTIONAL_BOOTSTRAP_PATH = "/__lt_native_bootstrap"
@@ -664,6 +665,13 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 str(payload.get("deployment_id", "")),
                 str(payload.get("strategy_id", "")),
             ))
+            return
+        if parsed.path == "/api/crypto-first-live/reprepare":
+            self.send_json(
+                state.reprepare_crypto_first_live_functional_state(
+                    dict(payload)
+                )
+            )
             return
         if parsed.path == "/api/upbit-functional/start":
             self.send_json(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import shutil
 import sqlite3
@@ -22,6 +23,92 @@ from live_trader.crypto_first_live_high_water import (
 
 def h(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def canonical_h(value: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def supervised_contract_for(value: dict, now: float) -> dict:
+    approval_body = {
+        "schemaVersion": (
+            "crypto-first-live-supervised-user-approval-receipt/v1"
+        ),
+        "approvalId": value["approvalId"],
+        "approvalBindingHash": h("supervised-binding"),
+        "consumptionId": "supervised-consumption-00000001",
+        "exactUserApproval": True,
+        "consumed": True,
+        "oneUse": True,
+        "durable": True,
+        "restartVerifiable": True,
+        "approvedEpoch": now - 1,
+    }
+    receipt = {
+        **approval_body,
+        "receiptHash": canonical_h(approval_body),
+    }
+    body = {
+        "schemaVersion": "crypto-first-live-supervised-non-promotion/v1",
+        "mode": "SUPERVISED_NON_PROMOTION",
+        "lane": value["lane"],
+        "sessionId": value["sessionId"],
+        "permitId": value["permitId"],
+        "permitHash": value["permitHash"],
+        "operatorApproval": receipt,
+        "riskCaps": (
+            {
+                "currency": "KRW",
+                "maxOrderNotional": "10000",
+                "maxLoss": "1000",
+                "activeSeconds": 7200,
+            }
+            if value["lane"] == "UPBIT"
+            else {
+                "currency": "USDT",
+                "maxOrderNotional": "10",
+                "maxLoss": "1",
+                "activeSeconds": 7200,
+            }
+        ),
+        "executionConstraints": {
+            "singleLane": True,
+            "foregroundMonitoringRequired": True,
+            "dualDurableStoresRequired": True,
+            "independentAccountOsLeaseRequired": True,
+            "oneUseNetworkCapabilityOnly": True,
+            "promotionEligible": False,
+            "realE2EEligible": False,
+            "productionPromotionAllowed": False,
+        },
+        "auditAnchor": {
+            "schemaVersion": "crypto-first-live-supervised-audit-anchor/v1",
+            "kind": "WINDOWS_EVENT_LOG_SIGNED",
+            "authorityId": "windows-event-authority-00000001",
+            "checkpointId": "windows-event-checkpoint-00000001",
+            "receiptHash": h("supervised-audit-anchor"),
+            "signatureVerified": True,
+            "appendOnlyObserved": True,
+            "durable": True,
+            "restartVerifiable": True,
+            "formalWorm": False,
+        },
+        "residualRisk": {
+            "formalWormAbsent": True,
+            "sameHostAdministratorCanClearOrRewriteAudit": True,
+            "acceptedByUser": True,
+            "nonPromotionOnly": True,
+        },
+    }
+    return {**body, "contractHash": canonical_h(body)}
 
 
 class DualClock:
@@ -237,6 +324,263 @@ class CryptoFirstLiveCoordinatorTests(unittest.TestCase):
         self.assertEqual("APPROVED_INERT", sealed["phase"])
         self.assertFalse(sealed["networkOrderPostAllowed"])
         self.assertTrue(sealed["reservationReceiptHash"])
+
+    def test_inert_heartbeat_renews_only_exact_approved_owner(self) -> None:
+        value = self.reserve()
+        before = self.store.status()
+        self.clock.advance(20)
+        renewed = self.store.heartbeat_inert(
+            run_id=value["runId"],
+            owner_token=value["ownerToken"],
+            owner_epoch=value["ownerEpoch"],
+            lane=value["lane"],
+            session_id=value["sessionId"],
+            permit_id=value["permitId"],
+            permit_hash=value["permitHash"],
+            account_fingerprint=value["accountFingerprint"],
+            baseline_hash=value["baselineHash"],
+            code_hash=value["codeHash"],
+            owner_identity_hash=value["ownerIdentityHash"],
+            expected_revision=before["revision"],
+        )
+        self.assertEqual("APPROVED_INERT", renewed["phase"])
+        self.assertEqual(before["revision"] + 1, renewed["revision"])
+        self.assertGreater(
+            renewed["ownerLeaseExpiresEpoch"],
+            before["ownerLeaseExpiresEpoch"],
+        )
+        self.assertEqual(0.0, renewed["hardStopEpoch"])
+        self.assertFalse(renewed["entryAuthorityOpen"])
+        self.assertFalse(renewed["networkCapabilityOpen"])
+        self.assertFalse(renewed["promotionEligible"])
+        self.assertFalse(renewed["realE2EEligible"])
+
+    def test_inert_heartbeat_binding_tamper_is_socket_zero(self) -> None:
+        value = self.reserve()
+        revision = self.store.status()["revision"]
+        with self.assertRaisesRegex(
+            CryptoFirstLiveCoordinatorError,
+            "inert-heartbeat-binding-changed",
+        ):
+            self.store.heartbeat_inert(
+                run_id=value["runId"],
+                owner_token=value["ownerToken"],
+                owner_epoch=value["ownerEpoch"],
+                lane=value["lane"],
+                session_id=value["sessionId"],
+                permit_id=value["permitId"],
+                permit_hash=h("hostile-permit"),
+                account_fingerprint=value["accountFingerprint"],
+                baseline_hash=value["baselineHash"],
+                code_hash=value["codeHash"],
+                owner_identity_hash=value["ownerIdentityHash"],
+                expected_revision=revision,
+            )
+        status = self.store.status()
+        self.assertEqual("APPROVED_INERT", status["phase"])
+        self.assertEqual(revision, status["revision"])
+
+    def test_supervised_activation_validates_then_stays_durable_hold(
+        self,
+    ) -> None:
+        value = self.reserve()
+        before = self.store.status()
+        contract = supervised_contract_for(value, self.clock.wall)
+        with self.assertRaisesRegex(
+            CryptoFirstLiveCoordinatorError,
+            "supervised-non-promotion-release-held",
+        ):
+            self.store.activate_supervised_non_promotion(
+                run_id=value["runId"],
+                owner_token=value["ownerToken"],
+                owner_epoch=value["ownerEpoch"],
+                lane=value["lane"],
+                session_id=value["sessionId"],
+                permit_id=value["permitId"],
+                permit_hash=value["permitHash"],
+                account_fingerprint=value["accountFingerprint"],
+                baseline_hash=value["baselineHash"],
+                code_hash=value["codeHash"],
+                owner_identity_hash=value["ownerIdentityHash"],
+                expected_revision=before["revision"],
+                approval_receipt=contract["operatorApproval"],
+                supervised_contract=contract,
+                supervised_contract_hash=contract["contractHash"],
+            )
+        after = self.store.status()
+        self.assertEqual("APPROVED_INERT", after["phase"])
+        self.assertEqual(before["revision"], after["revision"])
+        self.assertFalse(after["entryAuthorityOpen"])
+        conn = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(
+                0,
+                conn.execute(
+                    "SELECT COUNT(*) FROM "
+                    "crypto_first_live_supervised_consumptions"
+                ).fetchone()[0],
+            )
+        finally:
+            conn.close()
+
+    def test_supervised_flags_alone_still_cannot_create_active(self) -> None:
+        value = self.reserve()
+        before = self.store.status()
+        contract = supervised_contract_for(value, self.clock.wall)
+        with (
+            mock.patch.multiple(
+                "live_trader.crypto_first_live_coordinator",
+                CRYPTO_FIRST_LIVE_SUPERVISED_NON_PROMOTION_RELEASED=True,
+                CRYPTO_FIRST_LIVE_SUPERVISED_NETWORK_CAPABILITY_RELEASED=True,
+            ),
+            self.assertRaisesRegex(
+                CryptoFirstLiveCoordinatorError,
+                "active-transition-not-released",
+            ),
+        ):
+            self.store.activate_supervised_non_promotion(
+                run_id=value["runId"],
+                owner_token=value["ownerToken"],
+                owner_epoch=value["ownerEpoch"],
+                lane=value["lane"],
+                session_id=value["sessionId"],
+                permit_id=value["permitId"],
+                permit_hash=value["permitHash"],
+                account_fingerprint=value["accountFingerprint"],
+                baseline_hash=value["baselineHash"],
+                code_hash=value["codeHash"],
+                owner_identity_hash=value["ownerIdentityHash"],
+                expected_revision=before["revision"],
+                approval_receipt=contract["operatorApproval"],
+                supervised_contract=contract,
+                supervised_contract_hash=contract["contractHash"],
+            )
+        after = self.store.status()
+        self.assertEqual("APPROVED_INERT", after["phase"])
+        self.assertEqual(before["revision"], after["revision"])
+        self.assertFalse(after["entryAuthorityOpen"])
+
+    def test_supervised_activation_rejects_forged_receipt_before_hold(
+        self,
+    ) -> None:
+        value = self.reserve()
+        before = self.store.status()
+        contract = supervised_contract_for(value, self.clock.wall)
+        forged = dict(contract["operatorApproval"])
+        forged["consumptionId"] = "supervised-consumption-hostile"
+        with self.assertRaisesRegex(
+            CryptoFirstLiveCoordinatorError,
+            "contract-binding-changed",
+        ):
+            self.store.activate_supervised_non_promotion(
+                run_id=value["runId"],
+                owner_token=value["ownerToken"],
+                owner_epoch=value["ownerEpoch"],
+                lane=value["lane"],
+                session_id=value["sessionId"],
+                permit_id=value["permitId"],
+                permit_hash=value["permitHash"],
+                account_fingerprint=value["accountFingerprint"],
+                baseline_hash=value["baselineHash"],
+                code_hash=value["codeHash"],
+                owner_identity_hash=value["ownerIdentityHash"],
+                expected_revision=before["revision"],
+                approval_receipt=forged,
+                supervised_contract=contract,
+                supervised_contract_hash=contract["contractHash"],
+            )
+        self.assertEqual(before["revision"], self.store.status()["revision"])
+
+    def test_additive_supervised_schema_migrates_old_v3_store(self) -> None:
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute(
+                "DROP TABLE crypto_first_live_supervised_consumptions"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        reopened = self.make_store()
+        self.assertEqual("IDLE", reopened.status()["phase"])
+        conn = sqlite3.connect(self.path)
+        try:
+            columns = tuple(
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_xinfo("
+                    "crypto_first_live_supervised_consumptions)"
+                )
+            )
+        finally:
+            conn.close()
+        self.assertEqual(
+            (
+                "consumption_id",
+                "approval_id",
+                "run_id",
+                "lane",
+                "session_id",
+                "permit_id",
+                "permit_hash",
+                "owner_identity_hash",
+                "contract_hash",
+                "receipt_hash",
+                "coordinator_revision",
+                "publication_hash",
+                "consumed_epoch",
+            ),
+            columns,
+        )
+
+    def test_global_idle_reservation_blocks_new_lane_until_caller_commit(self) -> None:
+        request = {
+            "schemaVersion": "crypto-first-live-global-idle-reservation/v1",
+            "purpose": "PROGRAM_LEDGER_BINANCE_CASH_TRANSFER_COMMIT",
+            "accountFingerprint": h("idle-account"),
+            "consumptionKey": h("idle-consumption"),
+            "truthHash": h("idle-truth"),
+        }
+        attempting = threading.Event()
+        finished = threading.Event()
+        outcomes: list[object] = []
+
+        def reserve_lane() -> None:
+            attempting.set()
+            try:
+                outcomes.append(self.begin("BINANCE_SPOT"))
+            except BaseException as exc:
+                outcomes.append(exc)
+            finally:
+                finished.set()
+
+        with self.store.global_idle_reservation(request) as receipt:
+            self.assertEqual("IDLE", receipt["phase"])
+            self.assertTrue(receipt["held"])
+            self.assertTrue(receipt["exclusive"])
+            thread = threading.Thread(target=reserve_lane)
+            thread.start()
+            self.assertTrue(attempting.wait(2))
+            self.assertFalse(finished.wait(0.2))
+        self.assertTrue(finished.wait(5))
+        thread.join(5)
+        self.assertEqual(1, len(outcomes))
+        self.assertIsInstance(outcomes[0], dict)
+        self.assertEqual("PREPARING", outcomes[0]["phase"])
+
+    def test_global_idle_reservation_rejects_nonterminal_owner(self) -> None:
+        self.begin("UPBIT")
+        request = {
+            "schemaVersion": "crypto-first-live-global-idle-reservation/v1",
+            "purpose": "PROGRAM_LEDGER_BINANCE_CASH_TRANSFER_COMMIT",
+            "accountFingerprint": h("idle-account"),
+            "consumptionKey": h("idle-consumption"),
+            "truthHash": h("idle-truth"),
+        }
+        with self.assertRaisesRegex(
+            CryptoFirstLiveCoordinatorError, "global-idle-unavailable"
+        ):
+            with self.store.global_idle_reservation(request):
+                self.fail("nonterminal owner must not grant IDLE")
 
     def test_reservation_receipt_publication_tamper_fails_closed(self) -> None:
         claim = self.begin()

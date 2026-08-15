@@ -12,14 +12,21 @@ import {
   isSafetyConfirmationCancelled,
   nativeEmergencyStopAvailable,
   registerSafetyConfirmationPresenter,
+  reprepareCryptoFirstLive,
+  recoverBinanceSpotFunctional,
+  recoverUpbitFunctional,
   request,
   runFinalPreflight,
   safetyConfirmationValuesDigest,
   saveEnvSettings,
   setFlag,
+  startBinanceSpotFunctional,
   startBinanceFuturesFillSoak,
   startContinuousRuntime,
   startFunctionalTest,
+  startUpbitFunctional,
+  stopBinanceSpotFunctional,
+  stopUpbitFunctional,
   transitionIncident,
 } from "../src/api.js";
 
@@ -354,6 +361,88 @@ try {
   );
   assert.deepEqual(safetyRequests[1].body.values, realOrderValues);
   assert.equal(safetyRequests[1].body.safety_confirmation.challengeId, "challenge-real-orders");
+
+  const postSafetyFetch = globalThis.fetch;
+  const cryptoRequests = [];
+  globalThis.fetch = async (path, options) => {
+    const body = options.body ? JSON.parse(options.body) : undefined;
+    cryptoRequests.push({ path, body, headers: options.headers });
+    if (path === "/api/safety-confirmation/challenge") {
+      const action = body.action;
+      return jsonResponse({
+        ok: true,
+        challengeId: `challenge-${action.toLowerCase()}`,
+        token: `token-${action.toLowerCase()}`,
+        expectedPhrase: "LIVE C0DE",
+        expiresAt: challengeExpiry(),
+        displayContext: { sessionId: body.context.sessionId || "" },
+        ...(action === "UPBIT_FUNCTIONAL_START"
+          ? { approvalId: "upbit-preissued-approval", candidateHash: "a".repeat(64) }
+          : {}),
+        ...(action === "UPBIT_FUNCTIONAL_RECOVER"
+          ? { recoveryId: "upbit-preissued-recovery", sessionId: "upbit-session-1" }
+          : {}),
+        ...(action === "BINANCE_SPOT_FUNCTIONAL_START"
+          ? {
+              approvalId: "binance-preissued-approval",
+              bootstrapId: "bootstrap-1",
+              bootstrapHash: "b".repeat(64),
+              sessionNonceHash: "c".repeat(64),
+              codeHash: "d".repeat(64),
+              accountFingerprint: "e".repeat(64),
+              bindingHash: "f".repeat(64),
+            }
+          : {}),
+      });
+    }
+    return jsonResponse({ ok: true });
+  };
+
+  await startUpbitFunctional();
+  await stopUpbitFunctional("upbit-session-1");
+  await recoverUpbitFunctional("", "upbit-session-1");
+  await startBinanceSpotFunctional();
+  await stopBinanceSpotFunctional("binance-session-1");
+  await recoverBinanceSpotFunctional("binance-session-1");
+  const cryptoMutations = cryptoRequests.filter(
+    (item) => item.path !== "/api/safety-confirmation/challenge",
+  );
+  assert.deepEqual(cryptoMutations.map((item) => item.path), [
+    "/api/upbit-functional/start",
+    "/api/upbit-functional/stop",
+    "/api/upbit-functional/recover",
+    "/api/binance-spot-functional/start",
+    "/api/binance-spot-functional/stop",
+    "/api/binance-spot-functional/recover",
+  ]);
+  assert.deepEqual(cryptoMutations[0].body, {
+    approvalId: "upbit-preissued-approval",
+    operatorConfirmation: {
+      challengeId: "challenge-upbit_functional_start",
+      token: "token-upbit_functional_start",
+      typedPhrase: "LIVE C0DE",
+    },
+  });
+  assert.equal(cryptoMutations[2].body.recoveryId, "upbit-preissued-recovery");
+  assert.equal(cryptoMutations[3].body.approvalId, "binance-preissued-approval");
+  for (const item of cryptoMutations) {
+    assert.equal(
+      item.headers["X-LiveTrader-CSRF"],
+      "csrf-token-that-is-long-enough-for-the-native-boundary",
+    );
+  }
+  const presentedText = JSON.stringify(presentedChallenge || {});
+  assert.equal(presentedText.includes("token-upbit"), false, "UI must not receive bearer tokens");
+
+  cryptoRequests.length = 0;
+  await reprepareCryptoFirstLive();
+  assert.equal(cryptoRequests[0].path, "/api/crypto-first-live/reprepare");
+  assert.deepEqual(cryptoRequests[0].body, {});
+  assert.equal(
+    cryptoRequests[0].headers["X-LiveTrader-CSRF"],
+    "csrf-token-that-is-long-enough-for-the-native-boundary",
+  );
+  globalThis.fetch = postSafetyFetch;
 
   safetyRequests = [];
   await startFunctionalTest("kis:portfolio:alpha", true);

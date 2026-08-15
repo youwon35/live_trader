@@ -146,6 +146,9 @@ class BinanceSpotFunctionalStateFacade:
         global_first_live_authority_reader: (
             Callable[..., Mapping[str, Any]] | None
         ) = None,
+        global_first_live_dispatch_reservation: (
+            Callable[..., Any] | None
+        ) = None,
     ) -> None:
         self.database_path = Path(database_path)
         self.publication_proof_path = Path(publication_proof_path)
@@ -166,6 +169,9 @@ class BinanceSpotFunctionalStateFacade:
         ).strip().lower()
         self.global_first_live_authority_reader = (
             global_first_live_authority_reader
+        )
+        self.global_first_live_dispatch_reservation = (
+            global_first_live_dispatch_reservation
         )
         self._lock = threading.RLock()
         self._dispatch_lock = threading.RLock()
@@ -495,6 +501,9 @@ class BinanceSpotFunctionalStateFacade:
                     ),
                     global_first_live_authority_reader=(
                         self.global_first_live_authority_reader
+                    ),
+                    global_first_live_dispatch_reservation=(
+                        self.global_first_live_dispatch_reservation
                     ),
                     first_live_gate_reader=self._first_live_gate_snapshot,
                     terminal_callback=lambda _value: None,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -10,9 +12,68 @@ import unittest
 from live_trader.crypto_first_live_high_water import (
     CryptoFirstLiveHighWaterError,
     DurableCryptoFirstLiveHighWaterAnchor,
+    EXTERNAL_WORM_SCHEMA_VERSION,
+    ExternallyAnchoredCryptoFirstLiveHighWaterAuthority,
     GLOBAL_SCOPE,
     HIGH_WATER_SCHEMA_VERSION,
 )
+
+
+class IndependentWormAuthority:
+    def __init__(self) -> None:
+        self.database_id = ""
+        self.revision = -1
+        self.publication_hash = ""
+
+    def __call__(self, request):
+        if request.get("schemaVersion") != EXTERNAL_WORM_SCHEMA_VERSION:
+            raise ValueError("external-schema-invalid")
+        proposed_revision = int(request["revision"])
+        proposed_hash = str(request["publicationHash"])
+        if self.revision < 0:
+            if proposed_revision != 0 or proposed_hash:
+                raise ValueError("external-registration-invalid")
+            self.database_id = str(request["databaseId"])
+            self.revision = 0
+        elif request["databaseId"] != self.database_id:
+            raise ValueError("external-database-replaced")
+        elif proposed_revision > self.revision:
+            if (
+                proposed_revision != self.revision + 1
+                or int(request["priorRevision"]) != self.revision
+                or str(request["priorPublicationHash"])
+                != self.publication_hash
+            ):
+                raise ValueError("external-cas-changed")
+            self.revision = proposed_revision
+            self.publication_hash = proposed_hash
+        body = {
+            "schemaVersion": EXTERNAL_WORM_SCHEMA_VERSION,
+            "scope": GLOBAL_SCOPE,
+            "authorityId": "independent-worm-authority-0001",
+            "databaseId": self.database_id,
+            "revision": self.revision,
+            "publicationHash": self.publication_hash,
+            "checkpointId": f"worm-checkpoint-{self.revision:08d}",
+            "checkpointHash": hashlib.sha256(
+                f"{self.database_id}:{self.revision}:{self.publication_hash}".encode()
+            ).hexdigest(),
+            "monotonic": True,
+            "appendOnly": True,
+            "worm": True,
+            "durable": True,
+            "restartVerifiable": True,
+        }
+        receipt_hash = hashlib.sha256(
+            json.dumps(
+                body,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        return {**body, "receiptHash": receipt_hash}
 
 
 class DurableHighWaterTests(unittest.TestCase):
@@ -137,6 +198,81 @@ class DurableHighWaterTests(unittest.TestCase):
             CryptoFirstLiveHighWaterError, "request-fields-not-exact"
         ):
             self.anchor(request)
+
+    def test_external_worm_detects_restored_local_prefix(self) -> None:
+        authority = IndependentWormAuthority()
+        wrapped = ExternallyAnchoredCryptoFirstLiveHighWaterAuthority(
+            self.anchor, external_worm_authority=authority
+        )
+        registered = wrapped({
+            "schemaVersion": HIGH_WATER_SCHEMA_VERSION,
+            "action": "REGISTER_OR_OBSERVE",
+            "purpose": "TEST_EXTERNAL_REGISTER",
+            "scope": GLOBAL_SCOPE,
+            "databaseId": self.database_id,
+            "localRevision": 0,
+            "localPublicationHash": "",
+        })
+        self.assertEqual(0, registered["revision"])
+        restored = Path(self.temp.name) / "restored-prefix.sqlite3"
+        shutil.copy2(self.path, restored)
+        publication = hashlib.sha256(b"external-publication-1").hexdigest()
+        advanced = wrapped({
+            "schemaVersion": HIGH_WATER_SCHEMA_VERSION,
+            "action": "ADVANCE",
+            "purpose": "TEST_EXTERNAL_ADVANCE",
+            "scope": GLOBAL_SCOPE,
+            "databaseId": self.database_id,
+            "expectedRevision": 0,
+            "expectedPublicationHash": "",
+            "newRevision": 1,
+            "newPublicationHash": publication,
+        })
+        self.assertEqual(1, advanced["revision"])
+
+        shutil.copy2(restored, self.path)
+        rolled_back = DurableCryptoFirstLiveHighWaterAnchor(
+            self.path, clock=lambda: self.now
+        )
+        wrapped_rollback = ExternallyAnchoredCryptoFirstLiveHighWaterAuthority(
+            rolled_back, external_worm_authority=authority
+        )
+        with self.assertRaisesRegex(
+            CryptoFirstLiveHighWaterError, "simultaneous-rollback-detected"
+        ):
+            wrapped_rollback({
+                "schemaVersion": HIGH_WATER_SCHEMA_VERSION,
+                "action": "REGISTER_OR_OBSERVE",
+                "purpose": "TEST_EXTERNAL_ROLLBACK",
+                "scope": GLOBAL_SCOPE,
+                "databaseId": self.database_id,
+                "localRevision": 0,
+                "localPublicationHash": "",
+            })
+
+    def test_external_receipt_must_be_exact_worm_and_restart_verifiable(self) -> None:
+        def malformed(_request):
+            return {
+                "schemaVersion": EXTERNAL_WORM_SCHEMA_VERSION,
+                "scope": GLOBAL_SCOPE,
+                "durable": True,
+            }
+
+        wrapped = ExternallyAnchoredCryptoFirstLiveHighWaterAuthority(
+            self.anchor, external_worm_authority=malformed
+        )
+        with self.assertRaisesRegex(
+            CryptoFirstLiveHighWaterError, "fields-not-exact"
+        ):
+            wrapped({
+                "schemaVersion": HIGH_WATER_SCHEMA_VERSION,
+                "action": "REGISTER_OR_OBSERVE",
+                "purpose": "TEST_EXTERNAL_MALFORMED",
+                "scope": GLOBAL_SCOPE,
+                "databaseId": self.database_id,
+                "localRevision": 0,
+                "localPublicationHash": "",
+            })
 
 
 if __name__ == "__main__":

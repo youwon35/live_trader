@@ -403,6 +403,12 @@ const SAFETY_CONFIRMATION_ACTION_LABELS = {
   NEW_ENTRIES_BLOCKED_OFF: "신규 진입 차단 해제",
   REAL_ORDERS_ENABLE: "실전 주문 라우트 활성화",
   FUNCTIONAL_TEST_START: "KIS 실전 기능시험 시작",
+  UPBIT_FUNCTIONAL_START: "Upbit 2시간 기능시험 시작",
+  UPBIT_FUNCTIONAL_STOP: "Upbit 기능시험 중지·정리",
+  UPBIT_FUNCTIONAL_RECOVER: "Upbit 기능시험 복구",
+  BINANCE_SPOT_FUNCTIONAL_START: "Binance Spot 2시간 기능시험 시작",
+  BINANCE_SPOT_FUNCTIONAL_STOP: "Binance Spot 기능시험 중지·정리",
+  BINANCE_SPOT_FUNCTIONAL_RECOVER: "Binance Spot 기능시험 복구",
   BINANCE_FUTURES_FILL_SOAK_START: "Binance Futures 실체결 Soak 시작",
 };
 
@@ -424,6 +430,7 @@ const SAFETY_CONFIRMATION_CONTEXT_LABELS = {
   maxOrderNotional: "최대 주문 금액",
   settingKeys: "변경 설정",
   environment: "환경",
+  sessionId: "기능시험 세션",
 };
 
 function safetyConfirmationContextRows(displayContext) {

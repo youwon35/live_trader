@@ -1022,6 +1022,7 @@ def default_binance_spot_functional_code_paths() -> tuple[Path, ...]:
 
     root = Path(__file__).resolve().parent
     names = (
+        "binance_cash_transfer_evidence.py",
         "binance_order_authority.py",
         "binance_spot_continuous_functional.py",
         "binance_spot_functional_approval.py",
@@ -1035,14 +1036,20 @@ def default_binance_spot_functional_code_paths() -> tuple[Path, ...]:
         "binance_spot_functional_scheduler.py",
         "binance_spot_functional_state.py",
         "binance_spot_functional_strategy.py",
+        "binance_spot_functional_supervised_exclusivity.py",
+        "binance_spot_supervised_authority_protocol.py",
+        "binance_spot_supervised_observer_launch.py",
         "binance_spot_functional_transport.py",
         "binance_spot_publication.py",
         "binance_spot_stream_journal.py",
         "brokers.py",
         "continuous_live.py",
         "crypto_first_live_coordinator.py",
+        "crypto_first_live_external_worm.py",
         "crypto_first_live_high_water.py",
         "crypto_first_live_runtime.py",
+        "crypto_first_live_supervised_anchor.py",
+        "crypto_first_live_supervised_release.py",
         "emergency_stop.py",
         "env_loader.py",
         "env_settings.py",

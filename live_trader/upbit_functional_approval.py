@@ -3557,6 +3557,111 @@ class DurableUpbitFunctionalApprovalStore:
             "permit": json.loads(row["permit_json"]),
         }
 
+    def global_reservation_material(
+        self, approval_id: str, *, session_id: str
+    ) -> dict[str, Any]:
+        """Return non-secret post-claim lineage for shared live authority.
+
+        This reader is intentionally unavailable before ``claim_permit`` has
+        resealed the exact activation-relative 7,200 second permit.  It also
+        recomputes both candidate and activation lineage hashes so a caller
+        cannot reserve the process-global lane from mutable status fields.
+        """
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT * FROM upbit_functional_approvals
+                WHERE approval_id=?""",
+                (_text(approval_id),),
+            ).fetchone()
+        if (
+            row is None
+            or row["state"] not in {"CLAIMED", "ACTIVE"}
+            or row["claimed_session_id"] != _text(session_id)
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-global-reservation-pointer-missing"
+            )
+        candidate = json.loads(_text(row["candidate_json"]))
+        permit = parse_functional_test_permit(
+            json.loads(_text(row["permit_json"]))
+        )
+        self._assert_current_code_manifest(candidate)
+        candidate_hash = _stable_hash(candidate)
+        activation_lineage = {
+            "schemaVersion": "upbit-functional-activation-reseal/v1",
+            "approvalId": _text(row["approval_id"]),
+            "candidatePermitId": _text(row["candidate_permit_id"]),
+            "candidatePermitHash": _text(
+                row["candidate_permit_hash"]
+            ).lower(),
+            "candidateHash": candidate_hash,
+            "activatedPermitId": permit.permit_id,
+            "activatedPermitHash": permit.content_hash,
+            "sessionId": _text(row["claimed_session_id"]),
+            "activatedAt": _text(row["activated_at"]),
+            "activeDurationSeconds": 7200,
+        }
+        activation_lineage_hash = _stable_hash(activation_lineage)
+        code_manifest = candidate.get("codeManifest")
+        code_hash = (
+            _text(code_manifest.get("manifestHash")).lower()
+            if isinstance(code_manifest, Mapping)
+            else ""
+        )
+        operator_approval_hash = _text(
+            row["approval_hash"]
+        ).lower()
+        if (
+            _HASH_RE.fullmatch(candidate_hash) is None
+            or not secrets.compare_digest(
+                candidate_hash, _text(row["candidate_hash"]).lower()
+            )
+            or _HASH_RE.fullmatch(activation_lineage_hash) is None
+            or not secrets.compare_digest(
+                activation_lineage_hash,
+                _text(row["activation_lineage_hash"]).lower(),
+            )
+            or _HASH_RE.fullmatch(code_hash) is None
+            or _HASH_RE.fullmatch(operator_approval_hash) is None
+            or not secrets.compare_digest(
+                permit.permit_id, _text(row["permit_id"])
+            )
+            or not secrets.compare_digest(
+                permit.content_hash, _text(row["permit_hash"]).lower()
+            )
+            or int((permit.ends_at - permit.starts_at).total_seconds())
+            != 7200
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-global-reservation-lineage-invalid"
+            )
+        return {
+            "schemaVersion": (
+                "upbit-functional-global-reservation-material/v1"
+            ),
+            "lane": "UPBIT",
+            "approvalId": _text(row["approval_id"]),
+            "sessionId": _text(row["claimed_session_id"]),
+            "permitId": permit.permit_id,
+            "permitHash": permit.content_hash,
+            "accountFingerprint": _text(
+                row["account_fingerprint"]
+            ).lower(),
+            "candidateHash": candidate_hash,
+            "activationLineageHash": activation_lineage_hash,
+            "codeHash": code_hash,
+            "operatorApprovalHash": operator_approval_hash,
+            "permitStartsAt": permit.starts_at.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "permitEndsAt": permit.ends_at.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "activeDurationSeconds": 7200,
+            "promotionEligible": False,
+        }
+
     def permit_status(self, approval_id: str) -> dict[str, Any]:
         with closing(self._connect()) as connection:
             row = connection.execute(

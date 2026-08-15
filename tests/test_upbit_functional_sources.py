@@ -147,6 +147,37 @@ class OfficialUpbitFunctionalSourcesTest(unittest.TestCase):
             handshake["closePump"]()
             self.assertTrue(socket.closed)
 
+    def test_independent_observer_subscribes_to_all_account_markets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = DurableUpbitMyOrderJournal(
+                Path(temporary) / "source-all-markets.sqlite3",
+                clock=lambda: NOW,
+            )
+            fingerprint = upbit_credential_fingerprint("access")
+            writer = journal.begin_authenticated_session(
+                session_id="upbit-source-all-markets-0001",
+                account_fingerprint=fingerprint,
+                started_at=NOW,
+            )
+            socket = FakeSocket([(10, "PROBE")])
+            source = OfficialUpbitFunctionalMyOrderPump(
+                expected_account_fingerprint=fingerprint,
+                clock=lambda: NOW,
+                socket_factory=lambda _authorization: socket,
+                credential_reader=lambda: ("access", "secret"),
+                monotonic=lambda: 1.0,
+                all_markets=True,
+            )
+            handshake = source.handshake(
+                session_id="upbit-source-all-markets-0001",
+                journal=journal,
+                writer_authority=writer,
+            )
+            self.assertTrue(handshake["allMarketsSubscribed"])
+            self.assertEqual([], socket.sent[0][1]["codes"])
+            self.assertEqual("myOrder", socket.sent[0][1]["type"])
+            source.close()
+
     def test_myorder_handshake_rejects_subscription_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             journal = DurableUpbitMyOrderJournal(

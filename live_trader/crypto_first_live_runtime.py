@@ -58,6 +58,27 @@ _BINANCE_REQUEST_FIELDS = {
     "account_fingerprint",
     "cleanup_only",
 }
+_TERMINAL_FINALIZE_FIELDS = {
+    "schemaVersion",
+    "lane",
+    "sessionId",
+    "terminalEvidenceHash",
+    "outcome",
+    "terminalEvidence",
+}
+_INERT_HEARTBEAT_FIELDS = {
+    "schemaVersion",
+    "lane",
+    "runId",
+    "sessionId",
+    "permitId",
+    "permitHash",
+    "accountFingerprint",
+    "baselineHash",
+    "codeHash",
+    "ownerIdentityHash",
+    "expectedRevision",
+}
 
 
 class CryptoFirstLiveRuntimeError(RuntimeError):
@@ -97,6 +118,7 @@ class _MemoryOwner:
     account_fingerprint: str
     baseline_hash: str
     code_hash: str
+    coordinator_owner_identity_hash: str
     owner_token: str = field(repr=False)
     owner_epoch: int
     route_scope_hash: str
@@ -180,6 +202,9 @@ class CryptoFirstLiveRuntime:
         route_lock_authority: InProcessRouteLockAuthority,
         account_lease_holder: Callable[[str, str], Mapping[str, Any]],
         owner_identity_reader: Callable[[str, str], Mapping[str, Any]],
+        account_lease_status_reader: (
+            Callable[[str, str], Mapping[str, Any]] | None
+        ) = None,
         upbit_route_boundary: Callable[[], Any] | None = None,
         binance_route_boundary: Callable[[], Any] | None = None,
         kill_switch_reader: Callable[[], bool] = lambda: False,
@@ -188,6 +213,9 @@ class CryptoFirstLiveRuntime:
         self.coordinator = coordinator
         self.route_lock_authority = route_lock_authority
         self.account_lease_holder = account_lease_holder
+        self.account_lease_status_reader = (
+            account_lease_status_reader or account_lease_holder
+        )
         self.owner_identity_reader = owner_identity_reader
         self.upbit_route_boundary = upbit_route_boundary
         self.binance_route_boundary = binance_route_boundary
@@ -390,6 +418,9 @@ class CryptoFirstLiveRuntime:
             account_fingerprint=_text(claim["accountFingerprint"]),
             baseline_hash=_text(claim["baselineHash"]),
             code_hash=_text(claim["codeHash"]),
+            coordinator_owner_identity_hash=_text(
+                claim["ownerIdentityHash"]
+            ),
             owner_token=_text(claim["ownerToken"]),
             owner_epoch=int(claim["ownerEpoch"]),
             route_scope_hash=_text(route_scope_hash).lower(),
@@ -419,6 +450,94 @@ class CryptoFirstLiveRuntime:
         )
         return _without_token(value)
 
+    def heartbeat_inert(
+        self, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Renew one exact APPROVED_INERT owner without broker capability."""
+
+        value = dict(request)
+        if set(value) != _INERT_HEARTBEAT_FIELDS:
+            raise CryptoFirstLiveRuntimeError(
+                "crypto-first-live-inert-heartbeat-fields-not-exact"
+            )
+        owner = self._memory_owner()
+        if type(value.get("expectedRevision")) is not int:
+            raise CryptoFirstLiveRuntimeError(
+                "crypto-first-live-inert-heartbeat-revision-invalid"
+            )
+        expected_revision = int(value["expectedRevision"])
+        exact = {
+            "schemaVersion": (
+                "crypto-first-live-runtime-inert-heartbeat/v1"
+            ),
+            "lane": owner.lane,
+            "runId": owner.run_id,
+            "sessionId": owner.session_id,
+            "permitId": owner.permit_id,
+            "permitHash": owner.permit_hash,
+            "accountFingerprint": owner.account_fingerprint,
+            "baselineHash": owner.baseline_hash,
+            "codeHash": owner.code_hash,
+            "ownerIdentityHash": owner.coordinator_owner_identity_hash,
+        }
+        if (
+            expected_revision <= 0
+            or any(
+                value.get(key) != expected
+                for key, expected in exact.items()
+            )
+        ):
+            raise CryptoFirstLiveRuntimeError(
+                "crypto-first-live-inert-heartbeat-binding-changed"
+            )
+        boundary = self._boundary(owner.lane)
+        with self.route_lock_authority.held(owner.lane, boundary):
+            durable = dict(self.coordinator.status())
+            if (
+                durable.get("phase") != "APPROVED_INERT"
+                or int(durable.get("revision", 0)) != expected_revision
+                or durable.get("runId") != owner.run_id
+                or durable.get("ownerIdentityHash")
+                != owner.coordinator_owner_identity_hash
+            ):
+                raise CryptoFirstLiveRuntimeError(
+                    "crypto-first-live-inert-heartbeat-owner-changed"
+                )
+            lease = dict(
+                self.account_lease_status_reader(
+                    owner.lane, owner.account_fingerprint
+                )
+            )
+            if (
+                lease.get("acquired") is not True
+                or _text(lease.get("lane")) != owner.lane
+                or _text(lease.get("accountFingerprint")).lower()
+                != owner.account_fingerprint
+            ):
+                raise CryptoFirstLiveRuntimeError(
+                    "crypto-first-live-account-os-lease-lost-at-inert-heartbeat"
+                )
+            result = self.coordinator.heartbeat_inert(
+                run_id=owner.run_id,
+                owner_token=owner.owner_token,
+                owner_epoch=owner.owner_epoch,
+                lane=owner.lane,
+                session_id=owner.session_id,
+                permit_id=owner.permit_id,
+                permit_hash=owner.permit_hash,
+                account_fingerprint=owner.account_fingerprint,
+                baseline_hash=owner.baseline_hash,
+                code_hash=owner.code_hash,
+                owner_identity_hash=owner.coordinator_owner_identity_hash,
+                expected_revision=expected_revision,
+            )
+        return {
+            **_without_token(result),
+            "networkCapabilityOpen": False,
+            "promotionEligible": False,
+            "realE2EEligible": False,
+        }
+
     def heartbeat(self) -> dict[str, Any]:
         owner = self._memory_owner()
         boundary = self._boundary(owner.lane)
@@ -429,6 +548,86 @@ class CryptoFirstLiveRuntime:
                 owner_epoch=owner.owner_epoch,
             )
         return _without_token(value)
+
+    def finalize_terminal(
+        self, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Seal exact broker terminal evidence and release the global owner."""
+
+        value = dict(request)
+        if set(value) != _TERMINAL_FINALIZE_FIELDS:
+            raise CryptoFirstLiveRuntimeError(
+                "crypto-first-live-terminal-finalize-fields-not-exact"
+            )
+        owner = self._memory_owner()
+        evidence = value.get("terminalEvidence")
+        if not isinstance(evidence, Mapping):
+            raise CryptoFirstLiveRuntimeError(
+                "crypto-first-live-terminal-evidence-invalid"
+            )
+        normalized_evidence = dict(evidence)
+        evidence_hash = _canonical_hash(normalized_evidence)
+        if (
+            value.get("schemaVersion")
+            != "crypto-first-live-runtime-terminal-finalize/v1"
+            or _text(value.get("lane")).upper() != owner.lane
+            or _text(value.get("sessionId")) != owner.session_id
+            or _text(value.get("terminalEvidenceHash")).lower()
+            != evidence_hash
+            or _text(value.get("outcome")).upper()
+            != "CLEANUP_COMPLETE"
+        ):
+            raise CryptoFirstLiveRuntimeError(
+                "crypto-first-live-terminal-finalize-binding-changed"
+            )
+        boundary = self._boundary(owner.lane)
+        with self.route_lock_authority.held(owner.lane, boundary):
+            durable = dict(self.coordinator.status())
+            if (
+                durable.get("phase") != "CLEANUP_ONLY"
+                or durable.get("runId") != owner.run_id
+                or durable.get("lane") != owner.lane
+                or durable.get("sessionId") != owner.session_id
+                or durable.get("permitId") != owner.permit_id
+            ):
+                raise CryptoFirstLiveRuntimeError(
+                    "crypto-first-live-terminal-finalize-owner-changed"
+                )
+            lease = dict(
+                self.account_lease_status_reader(
+                    owner.lane, owner.account_fingerprint
+                )
+            )
+            if (
+                lease.get("acquired") is not True
+                or _text(lease.get("lane")) != owner.lane
+                or _text(lease.get("accountFingerprint")).lower()
+                != owner.account_fingerprint
+            ):
+                raise CryptoFirstLiveRuntimeError(
+                    "crypto-first-live-account-os-lease-lost-at-finalize"
+                )
+            result = self.coordinator.finalize(
+                run_id=owner.run_id,
+                owner_token=owner.owner_token,
+                owner_epoch=owner.owner_epoch,
+                expected_revision=int(durable["revision"]),
+                terminal_evidence={
+                    "schemaVersion": (
+                        "crypto-first-live-runtime-terminal-evidence/v1"
+                    ),
+                    "lane": owner.lane,
+                    "sessionId": owner.session_id,
+                    "permitId": owner.permit_id,
+                    "outcome": "CLEANUP_COMPLETE",
+                    "brokerTerminalEvidenceHash": evidence_hash,
+                    "brokerTerminalEvidence": normalized_evidence,
+                },
+            )
+        with self._lock:
+            if self._owner is owner:
+                self._owner = None
+        return _without_token(result)
 
     def revoke_entry_before_cleanup(self, reason: str) -> dict[str, Any]:
         """Durably close entry under the lane route lock before STOP/Kill."""
@@ -483,7 +682,18 @@ class CryptoFirstLiveRuntime:
             "crypto-first-live-entry-revocation-incomplete"
         )
 
-    def upbit_authority(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+    @contextmanager
+    def upbit_dispatch_reservation(
+        self, request: Mapping[str, Any]
+    ) -> Iterator[Mapping[str, Any]]:
+        """Retain the canonical Upbit route fence through the actual sender.
+
+        The caller must keep this context open while it commits its durable
+        may-have-crossed marker and enters the transport callable.  STOP/Kill
+        uses the same route fence, so it is linearized either before this
+        final revalidation (socket-zero) or after the one permitted sender.
+        """
+
         value = dict(request)
         if set(value) != _UPBIT_REQUEST_FIELDS:
             raise CryptoFirstLiveRuntimeError(
@@ -512,40 +722,54 @@ class CryptoFirstLiveRuntime:
             raise CryptoFirstLiveRuntimeError(
                 "crypto-first-live-upbit-request-binding-changed"
             )
-        if (self.kill_switch_reader() or self.stop_requested_reader()) and not cleanup:
-            raise CryptoFirstLiveRuntimeError(
-                "crypto-first-live-upbit-entry-stop-active"
-            )
-        snapshot = self._assert_under_route(owner, cleanup=cleanup)
-        durable = snapshot["durable"]
-        dispatch = snapshot["dispatch"]
-        body = {
-            "schemaVersion": "upbit-global-first-live-dispatch-authority/v1",
-            "scope": "CRYPTO_FIRST_LIVE_GLOBAL",
-            "lane": "UPBIT",
-            "phase": dispatch["phase"],
-            "runId": dispatch["runId"],
-            "sessionId": dispatch["sessionId"],
-            "permitId": dispatch["permitId"],
-            "permitHash": dispatch["permitHash"],
-            "accountFingerprint": dispatch["accountFingerprint"],
-            "routeScopeHash": owner.route_scope_hash,
-            "ownerIdentityHash": owner.broker_owner_identity_hash,
-            "ownerLeaseActive": dispatch["ownerLeaseActive"],
-            "entryAuthorityOpen": bool(
-                dispatch["entryAuthorityOpen"] and not cleanup
-            ),
-            "cleanupAuthorityOpen": cleanup,
-            "hardStopEpoch": dispatch["hardStopEpoch"],
-            "ownerLeaseExpiresEpoch": durable["ownerLeaseExpiresEpoch"],
-            "revision": dispatch["revision"],
-            "observedEpoch": dispatch["observedEpoch"],
-            "killSwitch": bool(self.kill_switch_reader()),
-            "stopRequested": bool(self.stop_requested_reader()),
-        }
-        return {**body, "authorityHash": _canonical_hash(body)}
+        with self._reserve_under_route(owner, cleanup=cleanup) as snapshot:
+            durable = snapshot["durable"]
+            dispatch = snapshot["dispatch"]
+            body = {
+                "schemaVersion": "upbit-global-first-live-dispatch-authority/v1",
+                "scope": "CRYPTO_FIRST_LIVE_GLOBAL",
+                "lane": "UPBIT",
+                "phase": dispatch["phase"],
+                "runId": dispatch["runId"],
+                "sessionId": dispatch["sessionId"],
+                "permitId": dispatch["permitId"],
+                "permitHash": dispatch["permitHash"],
+                "accountFingerprint": dispatch["accountFingerprint"],
+                "routeScopeHash": owner.route_scope_hash,
+                "ownerIdentityHash": owner.broker_owner_identity_hash,
+                "ownerLeaseActive": dispatch["ownerLeaseActive"],
+                "entryAuthorityOpen": bool(
+                    dispatch["entryAuthorityOpen"] and not cleanup
+                ),
+                "cleanupAuthorityOpen": cleanup,
+                "hardStopEpoch": dispatch["hardStopEpoch"],
+                "ownerLeaseExpiresEpoch": durable["ownerLeaseExpiresEpoch"],
+                "revision": dispatch["revision"],
+                "observedEpoch": dispatch["observedEpoch"],
+                "killSwitch": bool(self.kill_switch_reader()),
+                "stopRequested": bool(self.stop_requested_reader()),
+            }
+            if (
+                (body["killSwitch"] or body["stopRequested"])
+                and not cleanup
+            ):
+                raise CryptoFirstLiveRuntimeError(
+                    "crypto-first-live-upbit-entry-stop-active"
+                )
+            yield {**body, "authorityHash": _canonical_hash(body)}
 
-    def binance_authority(self, **request: Any) -> Mapping[str, Any]:
+    def upbit_authority(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Return a point-in-time snapshot for non-sender validation only."""
+
+        with self.upbit_dispatch_reservation(request) as authority:
+            return dict(authority)
+
+    @contextmanager
+    def binance_dispatch_reservation(
+        self, **request: Any
+    ) -> Iterator[Mapping[str, Any]]:
+        """Retain the canonical Binance route fence through the sender."""
+
         if set(request) != _BINANCE_REQUEST_FIELDS:
             raise CryptoFirstLiveRuntimeError(
                 "crypto-first-live-binance-request-fields-not-exact"
@@ -567,39 +791,56 @@ class CryptoFirstLiveRuntime:
             raise CryptoFirstLiveRuntimeError(
                 "crypto-first-live-binance-request-binding-changed"
             )
-        if (self.kill_switch_reader() or self.stop_requested_reader()) and not cleanup:
-            raise CryptoFirstLiveRuntimeError(
-                "crypto-first-live-binance-entry-stop-active"
-            )
-        snapshot = self._assert_under_route(owner, cleanup=cleanup)
-        dispatch = snapshot["dispatch"]
-        body = {
-            "schemaVersion": (
-                "crypto-first-live-binance-authority-snapshot/v1"
-            ),
-            "scope": "CRYPTO_FIRST_LIVE_GLOBAL",
-            "lane": "BINANCE_SPOT",
-            "phase": dispatch["phase"],
-            "runId": dispatch["runId"],
-            "sessionId": dispatch["sessionId"],
-            "permitId": dispatch["permitId"],
-            "permitHash": dispatch["permitHash"],
-            "accountFingerprint": dispatch["accountFingerprint"],
-            "ownerLeaseActive": dispatch["ownerLeaseActive"],
-            "entryAuthorityOpen": dispatch["entryAuthorityOpen"],
-            "hardStopEpoch": dispatch["hardStopEpoch"],
-            "revision": dispatch["revision"],
-            "observedEpoch": dispatch["observedEpoch"],
-        }
-        return {**body, "authorityHash": _canonical_hash(body)}
+        with self._reserve_under_route(owner, cleanup=cleanup) as snapshot:
+            dispatch = snapshot["dispatch"]
+            if (
+                (self.kill_switch_reader() or self.stop_requested_reader())
+                and not cleanup
+            ):
+                raise CryptoFirstLiveRuntimeError(
+                    "crypto-first-live-binance-entry-stop-active"
+                )
+            body = {
+                "schemaVersion": (
+                    "crypto-first-live-binance-authority-snapshot/v1"
+                ),
+                "scope": "CRYPTO_FIRST_LIVE_GLOBAL",
+                "lane": "BINANCE_SPOT",
+                "phase": dispatch["phase"],
+                "runId": dispatch["runId"],
+                "sessionId": dispatch["sessionId"],
+                "permitId": dispatch["permitId"],
+                "permitHash": dispatch["permitHash"],
+                "accountFingerprint": dispatch["accountFingerprint"],
+                "ownerLeaseActive": dispatch["ownerLeaseActive"],
+                "entryAuthorityOpen": dispatch["entryAuthorityOpen"],
+                "hardStopEpoch": dispatch["hardStopEpoch"],
+                "revision": dispatch["revision"],
+                "observedEpoch": dispatch["observedEpoch"],
+            }
+            yield {**body, "authorityHash": _canonical_hash(body)}
 
-    def _assert_under_route(
+    def binance_authority(self, **request: Any) -> Mapping[str, Any]:
+        """Return a point-in-time snapshot for non-sender validation only."""
+
+        with self.binance_dispatch_reservation(**request) as authority:
+            return dict(authority)
+
+    @contextmanager
+    def _reserve_under_route(
         self, owner: _MemoryOwner, *, cleanup: bool
-    ) -> dict[str, Mapping[str, Any]]:
+    ) -> Iterator[dict[str, Mapping[str, Any]]]:
         boundary = self._boundary(owner.lane)
         with self.route_lock_authority.held(
             owner.lane, boundary
         ) as route_evidence:
+            if (
+                (self.kill_switch_reader() or self.stop_requested_reader())
+                and not cleanup
+            ):
+                raise CryptoFirstLiveRuntimeError(
+                    "crypto-first-live-entry-stop-active"
+                )
             durable = dict(self.coordinator.status())
             if (
                 durable.get("runId") != owner.run_id
@@ -624,7 +865,28 @@ class CryptoFirstLiveRuntime:
                 expected_revision=int(durable["revision"]),
                 route_lock_evidence=route_evidence,
             )
-        return {"durable": durable, "dispatch": dict(dispatch)}
+            lease = dict(
+                self.account_lease_status_reader(
+                    owner.lane, owner.account_fingerprint
+                )
+            )
+            if (
+                lease.get("acquired") is not True
+                or _text(lease.get("lane")) != owner.lane
+                or _text(lease.get("accountFingerprint")).lower()
+                != owner.account_fingerprint
+            ):
+                raise CryptoFirstLiveRuntimeError(
+                    "crypto-first-live-account-os-lease-lost-at-dispatch"
+                )
+            if (
+                (self.kill_switch_reader() or self.stop_requested_reader())
+                and not cleanup
+            ):
+                raise CryptoFirstLiveRuntimeError(
+                    "crypto-first-live-entry-stop-active"
+                )
+            yield {"durable": durable, "dispatch": dict(dispatch)}
 
     def _memory_owner(self) -> _MemoryOwner:
         with self._lock:

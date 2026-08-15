@@ -20,6 +20,7 @@ from .upbit_continuous_functional import SYMBOL, UpbitFunctionalBlocked
 
 
 UPBIT_ACCOUNTS_ENDPOINT = "/v1/accounts"
+UPBIT_API_KEYS_ENDPOINT = "/v1/api_keys"
 UPBIT_ORDER_CHANCE_ENDPOINT = "/v1/orders/chance"
 UPBIT_OPEN_ORDERS_ENDPOINT = "/v1/orders/open"
 UPBIT_CLOSED_ORDERS_ENDPOINT = "/v1/orders/closed"

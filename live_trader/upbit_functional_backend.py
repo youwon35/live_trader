@@ -24,6 +24,7 @@ from .upbit_continuous_functional import (
     AccountExclusivityProofVerifier,
     GlobalFirstLiveAuthorityReader,
     UPBIT_ACCOUNT_EXCLUSIVITY_AUTHORITY_PINNED,
+    UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED,
     UPBIT_PRODUCTION_ACCOUNT_EXCLUSIVITY_VERIFIER_WIRED,
     UpbitFunctionalBlocked,
     account_exclusivity_verifier_wiring_status,
@@ -38,7 +39,10 @@ from .upbit_functional_entrypoint import (
     build_upbit_functional_production_graph,
     production_entrypoint_status,
 )
-from .upbit_functional_mutation import UPBIT_FUNCTIONAL_MUTATION_AVAILABLE
+from .upbit_functional_mutation import (
+    GlobalFirstLiveDispatchReserver,
+    UPBIT_FUNCTIONAL_MUTATION_AVAILABLE,
+)
 from .upbit_functional_sources import (
     OfficialUpbitFinalizedFiveMinuteWindowReader,
     OfficialUpbitFunctionalMyOrderPump,
@@ -76,6 +80,18 @@ _LEGACY_OWNER_FIELDS = {
     "ownerPid",
     "acquiredAt",
 }
+
+GlobalFirstLiveHeartbeat = Callable[[], Mapping[str, Any]]
+GlobalFirstLiveEntryRevoker = Callable[[str], Mapping[str, Any]]
+GlobalFirstLiveTerminalFinalizer = Callable[
+    [Mapping[str, Any]], Mapping[str, Any]
+]
+GlobalFirstLiveReservationEvidenceReader = Callable[
+    [Mapping[str, Any]], Mapping[str, Any]
+]
+GlobalFirstLiveReserveActivator = Callable[
+    [Mapping[str, Any]], Mapping[str, Any]
+]
 
 
 def _validated_owner_process_identity(
@@ -410,6 +426,22 @@ class UpbitFunctionalBackendManager:
         global_first_live_authority_reader: (
             GlobalFirstLiveAuthorityReader | None
         ) = None,
+        global_first_live_dispatch_reserver: (
+            GlobalFirstLiveDispatchReserver | None
+        ) = None,
+        global_first_live_heartbeat: GlobalFirstLiveHeartbeat | None = None,
+        global_first_live_entry_revoker: (
+            GlobalFirstLiveEntryRevoker | None
+        ) = None,
+        global_first_live_terminal_finalizer: (
+            GlobalFirstLiveTerminalFinalizer | None
+        ) = None,
+        global_first_live_reservation_evidence_reader: (
+            GlobalFirstLiveReservationEvidenceReader | None
+        ) = None,
+        global_first_live_reserve_activate: (
+            GlobalFirstLiveReserveActivator | None
+        ) = None,
         owner_process_identity: Mapping[str, Any] | None = None,
         allow_mock_graph: bool = False,
         _capability: object | None = None,
@@ -441,6 +473,26 @@ class UpbitFunctionalBackendManager:
         )
         self._global_first_live_authority_reader = (
             global_first_live_authority_reader
+        )
+        self._global_first_live_dispatch_reserver = (
+            global_first_live_dispatch_reserver
+        )
+        self._global_first_live_heartbeat = global_first_live_heartbeat
+        self._global_first_live_entry_revoker = (
+            global_first_live_entry_revoker
+        )
+        self._global_first_live_terminal_finalizer = (
+            global_first_live_terminal_finalizer
+        )
+        self._global_first_live_reservation_evidence_reader = (
+            global_first_live_reservation_evidence_reader
+        )
+        self._global_first_live_reserve_activate = (
+            global_first_live_reserve_activate
+        )
+        self._global_first_live_lifecycle_required = bool(
+            not allow_mock_graph
+            and UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED
         )
         account_fingerprint = upbit_credential_fingerprint()
         if not account_fingerprint:
@@ -563,7 +615,7 @@ class UpbitFunctionalBackendManager:
             clock=clock,
             runtime_reader=self.authority.snapshot,
             runtime_capability_registrar=self.authority.register,
-            enter_cleanup_latch=self.authority.cleanup,
+            enter_cleanup_latch=self._enter_cleanup_latches,
             disarm_functional_orders=self.authority.disarm,
             functional_orders_reader=self.authority.orders_enabled,
             lease_reader_factory=lease_reader_factory,
@@ -586,6 +638,9 @@ class UpbitFunctionalBackendManager:
             ),
             global_first_live_authority_reader=(
                 self._global_first_live_authority_reader
+            ),
+            global_first_live_dispatch_reserver=(
+                self._global_first_live_dispatch_reserver
             ),
             global_first_live_owner_identity_hash=(
                 self._owner_process_identity_hash
@@ -750,8 +805,35 @@ class UpbitFunctionalBackendManager:
         global_fence_wired = bool(
             isinstance(global_fence, Mapping)
             and global_fence.get("wired") is True
+            and global_fence.get("routeReservationWired") is True
             and global_fence.get("ownerIdentityBound") is True
-            and callable(self._global_first_live_authority_reader)
+            and callable(
+                getattr(self, "_global_first_live_authority_reader", None)
+            )
+            and callable(
+                getattr(self, "_global_first_live_dispatch_reserver", None)
+            )
+        )
+        global_lifecycle_wired = bool(
+            callable(getattr(self, "_global_first_live_heartbeat", None))
+            and callable(
+                getattr(self, "_global_first_live_entry_revoker", None)
+            )
+            and callable(
+                getattr(self, "_global_first_live_terminal_finalizer", None)
+            )
+        )
+        global_activation_wired = bool(
+            callable(
+                getattr(
+                    self,
+                    "_global_first_live_reservation_evidence_reader",
+                    None,
+                )
+            )
+            and callable(
+                getattr(self, "_global_first_live_reserve_activate", None)
+            )
         )
         blockers = []
         if store.get("prepared") is not True:
@@ -766,6 +848,10 @@ class UpbitFunctionalBackendManager:
             blockers.append("PROCESS_IDENTITY_NOT_DURABLE")
         if not global_fence_wired:
             blockers.append("GLOBAL_FIRST_LIVE_DISPATCH_FENCE_MISSING")
+        if not global_lifecycle_wired:
+            blockers.append("GLOBAL_FIRST_LIVE_LIFECYCLE_MISSING")
+        if not global_activation_wired:
+            blockers.append("GLOBAL_FIRST_LIVE_RESERVE_ACTIVATE_MISSING")
         return {
             "prepared": not blockers,
             "blockers": blockers,
@@ -784,6 +870,35 @@ class UpbitFunctionalBackendManager:
                 if isinstance(global_fence, Mapping)
                 else {}
             ),
+            "globalFirstLiveLifecycle": {
+                "heartbeatWired": callable(
+                    getattr(self, "_global_first_live_heartbeat", None)
+                ),
+                "entryRevokerWired": callable(
+                    getattr(self, "_global_first_live_entry_revoker", None)
+                ),
+                "terminalFinalizerWired": callable(
+                    getattr(self, "_global_first_live_terminal_finalizer", None)
+                ),
+                "wired": global_lifecycle_wired,
+                "networkOrderPostAllowed": False,
+            },
+            "globalFirstLiveActivation": {
+                "reservationEvidenceReaderWired": callable(
+                    getattr(
+                        self,
+                        "_global_first_live_reservation_evidence_reader",
+                        None,
+                    )
+                ),
+                "reserveActivateWired": callable(
+                    getattr(
+                        self, "_global_first_live_reserve_activate", None
+                    )
+                ),
+                "wired": global_activation_wired,
+                "networkOrderPostAllowed": False,
+            },
         }
 
     def _acquire_durable_owner_locked(
@@ -835,6 +950,342 @@ class UpbitFunctionalBackendManager:
             raise UpbitFunctionalBlocked(
                 "upbit-functional-backend-owner-heartbeat-not-verifiable"
             )
+
+    def _heartbeat_global_first_live_locked(self) -> dict[str, Any]:
+        """Refresh the shared owner before any broker lifecycle work.
+
+        The broker owner lease and the shared crypto-first-live lease are
+        deliberately independent.  Keeping only the former alive must never
+        let an Upbit scheduler continue after the global bearer expired.
+        """
+
+        callback = getattr(self, "_global_first_live_heartbeat", None)
+        required = bool(
+            getattr(self, "_global_first_live_lifecycle_required", False)
+        )
+        if not callable(callback):
+            if required:
+                raise UpbitFunctionalBlocked(
+                    "upbit-global-first-live-heartbeat-required"
+                )
+            return {"skipped": True, "reason": "test-lifecycle-not-required"}
+        value = callback()
+        if not isinstance(value, Mapping):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-heartbeat-invalid"
+            )
+        snapshot = dict(value)
+        if (
+            snapshot.get("lane") != "UPBIT"
+            or str(snapshot.get("sessionId") or "") != self._session_id
+            or str(snapshot.get("phase") or "")
+            not in {"ACTIVE", "CLEANUP_ONLY"}
+            or snapshot.get("ownerLeaseActive") is not True
+            or snapshot.get("ownerTokenPersisted") is not False
+            or snapshot.get("ownerTokenReturned") is not False
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-heartbeat-binding-invalid"
+            )
+        return snapshot
+
+    def _activate_global_first_live_locked(
+        self,
+        *,
+        scope: Any,
+        approval_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """Bind fresh read-only evidence, then activate the shared owner.
+
+        The first callback owns the official GET-only preflight and detached
+        proof verification.  The second callback owns the in-memory bearer
+        and composes ``reserve_inert`` followed by ``activate``.  Neither raw
+        API credentials nor the operator's typed phrase cross this seam.
+        """
+
+        evidence_reader = getattr(
+            self, "_global_first_live_reservation_evidence_reader", None
+        )
+        reserve_activate = getattr(
+            self, "_global_first_live_reserve_activate", None
+        )
+        required = bool(
+            getattr(self, "_global_first_live_lifecycle_required", False)
+        )
+        if not callable(evidence_reader) or not callable(reserve_activate):
+            if required:
+                raise UpbitFunctionalBlocked(
+                    "upbit-global-first-live-reserve-activate-required"
+                )
+            return {"skipped": True, "reason": "test-lifecycle-not-required"}
+        material = self.approval_store.global_reservation_material(
+            approval_id, session_id=session_id
+        )
+        static_request = {
+            **dict(material),
+            "schemaVersion": (
+                "upbit-global-first-live-reservation-evidence-request/v1"
+            ),
+            "routeScopeHash": str(scope.route_scope_hash).lower(),
+            "brokerOwnerIdentityHash": self._owner_process_identity_hash,
+        }
+        expected_static_fields = {
+            "schemaVersion",
+            "lane",
+            "approvalId",
+            "sessionId",
+            "permitId",
+            "permitHash",
+            "accountFingerprint",
+            "candidateHash",
+            "activationLineageHash",
+            "codeHash",
+            "operatorApprovalHash",
+            "permitStartsAt",
+            "permitEndsAt",
+            "activeDurationSeconds",
+            "promotionEligible",
+            "routeScopeHash",
+            "brokerOwnerIdentityHash",
+        }
+        if (
+            set(static_request) != expected_static_fields
+            or static_request.get("lane") != "UPBIT"
+            or static_request.get("sessionId") != session_id
+            or static_request.get("approvalId") != approval_id
+            or static_request.get("permitId") != scope.permit_id
+            or static_request.get("permitHash") != scope.permit_hash
+            or static_request.get("accountFingerprint")
+            != scope.account_fingerprint
+            or static_request.get("routeScopeHash")
+            != scope.route_scope_hash
+            or static_request.get("activeDurationSeconds") != 7200
+            or static_request.get("promotionEligible") is not False
+            or any(
+                _LOWER_HASH_RE.fullmatch(
+                    str(static_request.get(field) or "")
+                )
+                is None
+                for field in (
+                    "permitHash",
+                    "accountFingerprint",
+                    "candidateHash",
+                    "activationLineageHash",
+                    "codeHash",
+                    "operatorApprovalHash",
+                    "routeScopeHash",
+                    "brokerOwnerIdentityHash",
+                )
+            )
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-reservation-material-invalid"
+            )
+        evidence_result = evidence_reader(dict(static_request))
+        if not isinstance(evidence_result, Mapping):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-reservation-evidence-invalid"
+            )
+        evidence_row = dict(evidence_result)
+        exact_evidence_fields = expected_static_fields | {
+            "baselineHash",
+            "reservationEvidence",
+            "reservationEvidenceHash",
+            "finalApproval",
+            "finalApprovalHash",
+        }
+        if (
+            set(evidence_row) != exact_evidence_fields
+            or any(
+                evidence_row.get(field) != expected
+                for field, expected in static_request.items()
+            )
+            or _LOWER_HASH_RE.fullmatch(
+                str(evidence_row.get("baselineHash") or "")
+            )
+            is None
+            or not isinstance(
+                evidence_row.get("reservationEvidence"), Mapping
+            )
+            or not isinstance(evidence_row.get("finalApproval"), Mapping)
+            or not secrets.compare_digest(
+                self._hash_payload(evidence_row["reservationEvidence"]),
+                str(evidence_row.get("reservationEvidenceHash") or "")
+                .strip()
+                .lower(),
+            )
+            or not secrets.compare_digest(
+                self._hash_payload(evidence_row["finalApproval"]),
+                str(evidence_row.get("finalApprovalHash") or "")
+                .strip()
+                .lower(),
+            )
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-reservation-evidence-binding-invalid"
+            )
+        activation_request = {
+            **evidence_row,
+            "schemaVersion": "upbit-global-first-live-reserve-activate/v1",
+        }
+        activated = reserve_activate(activation_request)
+        if not isinstance(activated, Mapping):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-activation-invalid"
+            )
+        snapshot = dict(activated)
+        try:
+            hard_stop = float(snapshot.get("hardStopEpoch") or 0)
+            expected_hard_stop = datetime.fromisoformat(
+                str(static_request["permitEndsAt"]).replace("Z", "+00:00")
+            ).timestamp()
+        except (OSError, OverflowError, TypeError, ValueError) as exc:
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-hard-stop-invalid"
+            ) from exc
+        if (
+            snapshot.get("phase") != "ACTIVE"
+            or snapshot.get("lane") != "UPBIT"
+            or snapshot.get("sessionId") != session_id
+            or snapshot.get("permitId") != scope.permit_id
+            or snapshot.get("permitHash") != scope.permit_hash
+            or snapshot.get("accountFingerprint")
+            != scope.account_fingerprint
+            or snapshot.get("ownerLeaseActive") is not True
+            or snapshot.get("entryAuthorityOpen") is not True
+            or snapshot.get("networkOrderPostAllowed") is not False
+            or snapshot.get("ownerTokenPersisted") is not False
+            or snapshot.get("ownerTokenReturned") is not False
+            or not math.isclose(
+                hard_stop, expected_hard_stop, rel_tol=0.0, abs_tol=1e-6
+            )
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-activation-binding-invalid"
+            )
+        return snapshot
+
+    def _revoke_global_first_live_entry_locked(
+        self, reason: str
+    ) -> dict[str, Any]:
+        """Durably close shared entry before any Upbit cleanup sender."""
+
+        callback = getattr(self, "_global_first_live_entry_revoker", None)
+        required = bool(
+            getattr(self, "_global_first_live_lifecycle_required", False)
+        )
+        if not callable(callback):
+            if required:
+                raise UpbitFunctionalBlocked(
+                    "upbit-global-first-live-entry-revoker-required"
+                )
+            return {"skipped": True, "reason": "test-lifecycle-not-required"}
+        value = callback(str(reason or "upbit-cleanup"))
+        if not isinstance(value, Mapping):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-entry-revocation-invalid"
+            )
+        snapshot = dict(value)
+        coordinator = snapshot.get("coordinator")
+        coordinator_row = (
+            dict(coordinator) if isinstance(coordinator, Mapping) else {}
+        )
+        state = str(snapshot.get("state") or "").upper()
+        if (
+            snapshot.get("ok") is not True
+            or snapshot.get("entryAuthorityRevoked") is not True
+            or state not in {"CLEANUP_ONLY", "FINALIZED", "IDLE"}
+            or (
+                state == "CLEANUP_ONLY"
+                and (
+                    coordinator_row.get("lane") != "UPBIT"
+                    or str(coordinator_row.get("sessionId") or "")
+                    != self._session_id
+                    or coordinator_row.get("entryAuthorityOpen") is not False
+                )
+            )
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-entry-revocation-unproven"
+            )
+        return snapshot
+
+    def _enter_cleanup_latches(self) -> None:
+        """Close the shared entry latch and the broker-local latch together.
+
+        The local latch is still closed when the shared durable authority is
+        unreadable.  The original error is then raised so the caller retries
+        cleanup or records reconciliation; it cannot proceed to a sender in
+        the same call with an unproven shared revocation.
+        """
+
+        failure: Exception | None = None
+        try:
+            self._revoke_global_first_live_entry_locked(
+                "upbit-enter-cleanup"
+            )
+        except Exception as exc:
+            failure = exc
+        self.authority.cleanup()
+        if failure is not None:
+            raise failure
+
+    def _finalize_global_first_live_locked(
+        self,
+        *,
+        evidence: Mapping[str, Any],
+        evidence_hash: str,
+    ) -> dict[str, Any]:
+        """Consume shared authority only after the local terminal seal holds."""
+
+        callback = getattr(self, "_global_first_live_terminal_finalizer", None)
+        required = bool(
+            getattr(self, "_global_first_live_lifecycle_required", False)
+        )
+        if not callable(callback):
+            if required:
+                raise UpbitFunctionalBlocked(
+                    "upbit-global-first-live-terminal-finalizer-required"
+                )
+            return {"skipped": True, "reason": "test-lifecycle-not-required"}
+        normalized_evidence = dict(evidence)
+        if not secrets.compare_digest(
+            self._hash_payload(normalized_evidence),
+            str(evidence_hash or "").lower(),
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-terminal-evidence-hash-invalid"
+            )
+        request = {
+            "schemaVersion": (
+                "crypto-first-live-runtime-terminal-finalize/v1"
+            ),
+            "lane": "UPBIT",
+            "sessionId": self._session_id,
+            "terminalEvidenceHash": str(evidence_hash).lower(),
+            "outcome": "CLEANUP_COMPLETE",
+            "terminalEvidence": normalized_evidence,
+        }
+        value = callback(request)
+        if not isinstance(value, Mapping):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-terminal-finalize-invalid"
+            )
+        snapshot = dict(value)
+        if (
+            snapshot.get("phase") != "FINALIZED"
+            or snapshot.get("lane") != "UPBIT"
+            or str(snapshot.get("sessionId") or "") != self._session_id
+            or snapshot.get("entryAuthorityOpen") is not False
+            or snapshot.get("networkOrderPostAllowed") is not False
+            or snapshot.get("ownerTokenPersisted") is not False
+            or snapshot.get("ownerTokenReturned") is not False
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-global-first-live-terminal-finalize-unproven"
+            )
+        return snapshot
 
     def _finish_durable_owner_locked(
         self, *, state: str, detail: str, approval_id: str = ""
@@ -967,6 +1418,7 @@ class UpbitFunctionalBackendManager:
                     "functionalTestAccountFingerprint": binding["accountId"],
                 }
             )
+            global_activation_crossed = False
             try:
                 # Scope-dependent route/session hashes are derived only from
                 # the sealed publication and permit inside the graph.  Bind
@@ -991,7 +1443,16 @@ class UpbitFunctionalBackendManager:
                         ),
                     }
                 )
+                global_activation = self._activate_global_first_live_locked(
+                    scope=scope,
+                    approval_id=approval_id,
+                    session_id=session_id,
+                )
+                global_activation_crossed = (
+                    global_activation.get("phase") == "ACTIVE"
+                )
                 self._heartbeat_durable_owner_locked()
+                self._heartbeat_global_first_live_locked()
                 result = self.graph.start(
                     permit_id=scope.permit_id,
                     permit_hash=scope.permit_hash,
@@ -1004,6 +1465,14 @@ class UpbitFunctionalBackendManager:
                     owner_token=self._owner_token,
                 )
             except Exception as exc:
+                global_revoke_failure: Exception | None = None
+                if global_activation_crossed:
+                    try:
+                        self._revoke_global_first_live_entry_locked(
+                            "upbit-start-failed"
+                        )
+                    except Exception as revoke_exc:
+                        global_revoke_failure = revoke_exc
                 durable_nonterminal = False
                 try:
                     durable = self.graph.ledger.session(session_id)
@@ -1056,6 +1525,22 @@ class UpbitFunctionalBackendManager:
                         "start-failure-compensation-failed:"
                         f"{type(exc).__name__}"
                     )
+                if global_activation_crossed:
+                    # A shared bearer may have crossed activation even when
+                    # the broker ledger did not.  Never advertise this as an
+                    # ordinary pre-start failure; recovery must prove and
+                    # finalize the shared cleanup-only owner independently.
+                    self._terminal_state = "RECONCILIATION_REQUIRED"
+                    self._terminal_detail = (
+                        "global-first-live-start-failed:"
+                        + type(exc).__name__
+                        + (
+                            ":revocation-failed:"
+                            + type(global_revoke_failure).__name__
+                            if global_revoke_failure is not None
+                            else ":entry-revoked-cleanup-finalize-required"
+                        )
+                    )
                 self.authority.clear()
                 raise
             self._start_scheduler_or_fail_closed_locked(
@@ -1087,6 +1572,11 @@ class UpbitFunctionalBackendManager:
             except Exception as exc:
                 scheduler_exc = exc
                 self._scheduler = None
+        global_revoke_failure: Exception | None = None
+        try:
+            self._revoke_global_first_live_entry_locked(reason)
+        except Exception as exc:
+            global_revoke_failure = exc
         self.authority.cleanup()
         try:
             self.graph.fail_closed_scheduler_start(reason=reason)
@@ -1101,6 +1591,13 @@ class UpbitFunctionalBackendManager:
                 reason
                 + ":compensation-failed:"
                 + type(cleanup_exc).__name__
+            )
+        if global_revoke_failure is not None:
+            self._terminal_state = "RECONCILIATION_REQUIRED"
+            self._terminal_detail = (
+                reason
+                + ":global-entry-revocation-failed:"
+                + type(global_revoke_failure).__name__
             )
         try:
             self._finish_durable_owner_locked(
@@ -1135,6 +1632,7 @@ class UpbitFunctionalBackendManager:
                 if generation != self._generation:
                     return
                 try:
+                    self._heartbeat_global_first_live_locked()
                     self._heartbeat_durable_owner_locked()
                     result = self.graph.pump()
                     snapshot = result.get("snapshot")
@@ -1156,6 +1654,13 @@ class UpbitFunctionalBackendManager:
                 except Exception:
                     if self._terminal_state == "RECONCILIATION_REQUIRED":
                         return
+                    global_revoke_failure: Exception | None = None
+                    try:
+                        self._revoke_global_first_live_entry_locked(
+                            "upbit-scheduler-failure"
+                        )
+                    except Exception as exc:
+                        global_revoke_failure = exc
                     try:
                         cleanup = self.graph.stop(reason="scheduler-failure")
                     except Exception as cleanup_exc:
@@ -1172,7 +1677,11 @@ class UpbitFunctionalBackendManager:
                         # truth path failed once.
                         self.authority.cleanup()
                         self._terminal_state = "CLEANUP_PENDING"
-                        self._terminal_detail = "scheduler-failure-cleanup-owned"
+                        self._terminal_detail = (
+                            "scheduler-failure-cleanup-owned"
+                            if global_revoke_failure is None
+                            else "scheduler-failure-global-revoke-retry"
+                        )
                         continue
                     cleanup_snapshot = cleanup.get("snapshot")
                     if (
@@ -1314,6 +1823,13 @@ class UpbitFunctionalBackendManager:
                 raise UpbitFunctionalBlocked(
                     "upbit-functional-backend-final-authority-not-cleared"
                 )
+            self._revoke_global_first_live_entry_locked(
+                "upbit-terminal-finalize"
+            )
+            self._finalize_global_first_live_locked(
+                evidence=evidence,
+                evidence_hash=evidence_hash,
+            )
         except Exception as exc:
             self._mark_reconciliation_required_locked(
                 f"final-seal-verification-failed:{type(exc).__name__}"
@@ -1366,6 +1882,13 @@ class UpbitFunctionalBackendManager:
         self._verify_operator(command)
         with self._owner() as generation:
             self._scheduler_stop.set()
+            global_revoke_failure: Exception | None = None
+            try:
+                self._revoke_global_first_live_entry_locked(
+                    "upbit-operator-stop"
+                )
+            except Exception as exc:
+                global_revoke_failure = exc
             result = self.graph.stop(reason="operator-stop")
             if result.get("pending") is True:
                 self._start_scheduler_or_fail_closed_locked(
@@ -1380,6 +1903,12 @@ class UpbitFunctionalBackendManager:
             else:
                 self._mark_reconciliation_required_locked(
                     "operator-stop-cleanup-not-finalized"
+                )
+            if global_revoke_failure is not None:
+                self._terminal_state = "RECONCILIATION_REQUIRED"
+                self._terminal_detail = (
+                    "operator-stop-global-entry-revocation-failed:"
+                    + type(global_revoke_failure).__name__
                 )
             return {"ok": True, "result": result, "status": self.status()}
 
@@ -1891,6 +2420,22 @@ def prepare_upbit_functional_backend(
     global_first_live_authority_reader: (
         GlobalFirstLiveAuthorityReader | None
     ) = None,
+    global_first_live_dispatch_reserver: (
+        GlobalFirstLiveDispatchReserver | None
+    ) = None,
+    global_first_live_heartbeat: GlobalFirstLiveHeartbeat | None = None,
+    global_first_live_entry_revoker: (
+        GlobalFirstLiveEntryRevoker | None
+    ) = None,
+    global_first_live_terminal_finalizer: (
+        GlobalFirstLiveTerminalFinalizer | None
+    ) = None,
+    global_first_live_reservation_evidence_reader: (
+        GlobalFirstLiveReservationEvidenceReader | None
+    ) = None,
+    global_first_live_reserve_activate: (
+        GlobalFirstLiveReserveActivator | None
+    ) = None,
     owner_process_identity: Mapping[str, Any] | None = None,
     allow_mock_graph: bool = False,
 ) -> dict[str, Any]:
@@ -1944,6 +2489,22 @@ def prepare_upbit_functional_backend(
                 ),
                 global_first_live_authority_reader=(
                     global_first_live_authority_reader
+                ),
+                global_first_live_dispatch_reserver=(
+                    global_first_live_dispatch_reserver
+                ),
+                global_first_live_heartbeat=global_first_live_heartbeat,
+                global_first_live_entry_revoker=(
+                    global_first_live_entry_revoker
+                ),
+                global_first_live_terminal_finalizer=(
+                    global_first_live_terminal_finalizer
+                ),
+                global_first_live_reservation_evidence_reader=(
+                    global_first_live_reservation_evidence_reader
+                ),
+                global_first_live_reserve_activate=(
+                    global_first_live_reserve_activate
                 ),
                 owner_process_identity=owner_process_identity,
                 allow_mock_graph=allow_mock_graph,

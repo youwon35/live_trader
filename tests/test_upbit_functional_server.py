@@ -1020,6 +1020,22 @@ class UpbitFunctionalServerContractTest(unittest.TestCase):
             return values.get(key, "")
 
         fake_store = object()
+        account_fingerprint = "a" * 64
+        owner_identity = {
+            "pid": 1234,
+            "processStartEpoch": 1.0,
+            "bootId": "test-boot-id",
+            "applicationLeaseEpoch": 2.0,
+            "accountLeaseScope": "crypto-first-live-account:UPBIT:test",
+        }
+        proof_reader = object()
+        verifier = object()
+        verifier_pin = {"schemaVersion": "test-pin/v1"}
+        injection = SimpleNamespace(
+            proof_reader=proof_reader,
+            verifier=verifier,
+            verifier_pin=verifier_pin,
+        )
         with (
             patch.object(state, "env_value", side_effect=configured),
             patch.object(Path, "is_file", return_value=True),
@@ -1033,6 +1049,26 @@ class UpbitFunctionalServerContractTest(unittest.TestCase):
                 "resolve_upbit_functional_base_url",
                 return_value="https://api.upbit.com",
             ) as origin,
+            patch(
+                "live_trader.upbit_functional_transport."
+                "upbit_credential_fingerprint",
+                return_value=account_fingerprint,
+            ) as fingerprint,
+            patch.object(
+                state,
+                "hold_crypto_first_live_account_lease",
+                return_value={"acquired": True},
+            ) as lease,
+            patch.object(
+                state,
+                "crypto_first_live_owner_identity",
+                return_value=owner_identity,
+            ) as owner,
+            patch.object(
+                state,
+                "_prepare_upbit_account_exclusivity_injection",
+                return_value=(injection, {"ready": True}),
+            ) as exclusivity,
             patch(
                 "live_trader.upbit_functional_backend."
                 "prepare_upbit_functional_backend",
@@ -1053,9 +1089,24 @@ class UpbitFunctionalServerContractTest(unittest.TestCase):
         self.assertFalse(ready["networkOrderPostAllowed"])
         store.assert_called_once()
         origin.assert_called_once_with()
+        fingerprint.assert_called_once_with()
+        lease.assert_called_once_with("UPBIT", account_fingerprint)
+        owner.assert_called_once_with("UPBIT", account_fingerprint)
+        exclusivity.assert_called_once_with(
+            account_fingerprint=account_fingerprint,
+            owner_identity=owner_identity,
+        )
         kwargs = prepare.call_args.kwargs
         self.assertIs(fake_store, kwargs["approval_store"])
         self.assertIs(state.send_prepared_request, kwargs["sender"])
+        self.assertIs(
+            proof_reader, kwargs["account_exclusivity_proof_reader"]
+        )
+        self.assertIs(verifier, kwargs["account_exclusivity_verifier"])
+        self.assertIs(
+            verifier_pin, kwargs["account_exclusivity_verifier_pin"]
+        )
+        self.assertEqual(owner_identity, kwargs["owner_process_identity"])
         self.assertNotIn("allow_mock_graph", kwargs)
 
 

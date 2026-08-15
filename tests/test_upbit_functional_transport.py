@@ -12,6 +12,7 @@ from live_trader.upbit_continuous_functional import UpbitFunctionalBlocked
 from live_trader.upbit_functional_transport import (
     DurableUpbitMyOrderJournal,
     OfficialUpbitFunctionalGetClient,
+    _protected_upbit_functional_get_network_capability,
     build_upbit_functional_get_request,
     normalize_upbit_myorder_event,
     upbit_credential_fingerprint,
@@ -129,30 +130,88 @@ class UpbitFunctionalTransportTest(unittest.TestCase):
             sent.append(request)
             return {"ok": True, "statusCode": 200, "json": []}
 
-        client = OfficialUpbitFunctionalGetClient(
-            expected_account_fingerprint=FINGERPRINT,
-            sender=sender,
-        )
-        with self.ready_env():
+        with self.ready_env(), patch(
+            "live_trader.upbit_functional_transport."
+            "UPBIT_FUNCTIONAL_GET_NETWORK_RELEASED",
+            True,
+        ):
+            capability = _protected_upbit_functional_get_network_capability()
+            client = OfficialUpbitFunctionalGetClient(
+                expected_account_fingerprint=FINGERPRINT,
+                sender=sender,
+                network_capability=capability,
+            )
             self.assertEqual([], client.get(UPBIT_OPEN_ORDERS_ENDPOINT, ()))
         self.assertEqual(1, len(sent))
         self.assertFalse(hasattr(client, "post"))
         self.assertFalse(hasattr(client, "cancel"))
         self.assertFalse(hasattr(client, "withdraw"))
 
-        changed = OfficialUpbitFunctionalGetClient(
-            expected_account_fingerprint="c" * 64,
-            sender=lambda _request: (_ for _ in ()).throw(
-                AssertionError("mismatch must block before HTTP")
-            ),
-        )
-        with self.ready_env(), self.assertRaisesRegex(
-            UpbitFunctionalBlocked, "fingerprint-mismatch"
+        with self.ready_env(), patch(
+            "live_trader.upbit_functional_transport."
+            "UPBIT_FUNCTIONAL_GET_NETWORK_RELEASED",
+            True,
         ):
-            changed.get(UPBIT_OPEN_ORDERS_ENDPOINT, ())
+            capability = _protected_upbit_functional_get_network_capability()
+            changed = OfficialUpbitFunctionalGetClient(
+                expected_account_fingerprint="c" * 64,
+                sender=lambda _request: (_ for _ in ()).throw(
+                    AssertionError("mismatch must block before HTTP")
+                ),
+                network_capability=capability,
+            )
+            with self.assertRaisesRegex(
+                UpbitFunctionalBlocked, "fingerprint-mismatch"
+            ):
+                changed.get(UPBIT_OPEN_ORDERS_ENDPOINT, ())
+
+    def test_public_get_client_cannot_reach_sender_or_signer_while_held(self) -> None:
+        sender_calls = 0
+
+        def hostile_sender(_request):
+            nonlocal sender_calls
+            sender_calls += 1
+            raise AssertionError("held client must not reach sender")
+
+        client = OfficialUpbitFunctionalGetClient(
+            expected_account_fingerprint=FINGERPRINT,
+            sender=hostile_sender,
+        )
+        with self.ready_env(), patch(
+            "live_trader.upbit_functional_transport."
+            "build_upbit_functional_authorization",
+            side_effect=AssertionError("held client must not sign"),
+        ), self.assertRaisesRegex(
+            UpbitFunctionalBlocked, "network-capability-closed"
+        ):
+            client.get(UPBIT_OPEN_ORDERS_ENDPOINT, ())
+
+        forged = OfficialUpbitFunctionalGetClient(
+            expected_account_fingerprint=FINGERPRINT,
+            sender=hostile_sender,
+            network_capability=object(),
+        )
+        with self.ready_env(), patch(
+            "live_trader.upbit_functional_transport."
+            "UPBIT_FUNCTIONAL_GET_NETWORK_RELEASED",
+            True,
+        ), patch(
+            "live_trader.upbit_functional_transport."
+            "build_upbit_functional_authorization",
+            side_effect=AssertionError("forged capability must not sign"),
+        ), self.assertRaisesRegex(
+            UpbitFunctionalBlocked, "network-capability-closed"
+        ):
+            forged.get(UPBIT_OPEN_ORDERS_ENDPOINT, ())
+        self.assertEqual(0, sender_calls)
 
     def test_detail_404_is_typed_absence_but_other_errors_fail_closed(self) -> None:
-        with self.ready_env():
+        with self.ready_env(), patch(
+            "live_trader.upbit_functional_transport."
+            "UPBIT_FUNCTIONAL_GET_NETWORK_RELEASED",
+            True,
+        ):
+            capability = _protected_upbit_functional_get_network_capability()
             missing = OfficialUpbitFunctionalGetClient(
                 expected_account_fingerprint=FINGERPRINT,
                 sender=lambda _request: {
@@ -160,6 +219,7 @@ class UpbitFunctionalTransportTest(unittest.TestCase):
                     "statusCode": 404,
                     "json": {"error": {"name": "order_not_found"}},
                 },
+                network_capability=capability,
             )
             self.assertEqual(
                 {"_notFound": True},
@@ -175,6 +235,7 @@ class UpbitFunctionalTransportTest(unittest.TestCase):
                     "statusCode": 404,
                     "json": {},
                 },
+                network_capability=capability,
             )
             with self.assertRaisesRegex(
                 UpbitFunctionalBlocked, "absence-not-proven"
@@ -190,6 +251,7 @@ class UpbitFunctionalTransportTest(unittest.TestCase):
                     "statusCode": 500,
                     "json": {},
                 },
+                network_capability=capability,
             )
             with self.assertRaisesRegex(UpbitFunctionalBlocked, "get-failed"):
                 unavailable.get(UPBIT_OPEN_ORDERS_ENDPOINT, ())

@@ -26,6 +26,9 @@ from typing import Any, Callable, Iterator, Mapping
 
 SCHEMA_VERSION = "crypto-first-live-coordinator/v3"
 HIGH_WATER_SCHEMA_VERSION = "crypto-first-live-high-water-anchor/v1"
+GLOBAL_IDLE_RESERVATION_SCHEMA_VERSION = (
+    "crypto-first-live-global-idle-reservation/v1"
+)
 GLOBAL_SCOPE = "CRYPTO_FIRST_LIVE_GLOBAL"
 LANES = frozenset({"UPBIT", "BINANCE_SPOT"})
 PHASES = frozenset(
@@ -53,6 +56,15 @@ CRYPTO_FIRST_LIVE_ACTIVATION_RELEASED = False
 # valid prefix.  Production activation therefore also remains code-blocked
 # until an independently administered monotonic/WORM checkpoint is wired.
 CRYPTO_FIRST_LIVE_WORM_ROLLBACK_RELEASED = False
+# The supervised first-live lane has a deliberately separate compile-time
+# boundary.  It must never inherit the strict external-WORM activation latch:
+# doing so would silently upgrade lower-assurance evidence into REAL_E2E
+# authority.  Both values remain false in the shipped build.
+CRYPTO_FIRST_LIVE_SUPERVISED_NON_PROMOTION_RELEASED = False
+CRYPTO_FIRST_LIVE_SUPERVISED_NETWORK_CAPABILITY_RELEASED = False
+SUPERVISED_NON_PROMOTION_COORDINATOR_SCHEMA_VERSION = (
+    "crypto-first-live-supervised-coordinator/v1"
+)
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,160}$")
@@ -322,6 +334,30 @@ class DurableCryptoFirstLiveCoordinator:
                 )
                 """
             )
+            # Additive v3 migration.  The main event/control schema and its
+            # external high-water stay byte-for-byte stable; this independent
+            # table is reserved for a future, explicitly released supervised
+            # transition.  In the current build it must remain empty.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS
+                crypto_first_live_supervised_consumptions (
+                    consumption_id TEXT PRIMARY KEY,
+                    approval_id TEXT NOT NULL UNIQUE,
+                    run_id TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    permit_id TEXT NOT NULL,
+                    permit_hash TEXT NOT NULL,
+                    owner_identity_hash TEXT NOT NULL,
+                    contract_hash TEXT NOT NULL UNIQUE,
+                    receipt_hash TEXT NOT NULL UNIQUE,
+                    coordinator_revision INTEGER NOT NULL,
+                    publication_hash TEXT NOT NULL,
+                    consumed_epoch REAL NOT NULL
+                )
+                """
+            )
             self._verify_schema(conn)
             self._verify_integrity(conn)
             conn.execute("COMMIT")
@@ -351,6 +387,9 @@ class DurableCryptoFirstLiveCoordinator:
         events = cls._column_names(conn, "crypto_first_live_events")
         consumptions = cls._column_names(
             conn, "crypto_first_live_approval_consumptions"
+        )
+        supervised_consumptions = cls._column_names(
+            conn, "crypto_first_live_supervised_consumptions"
         )
         if metadata != (
             "scope_key",
@@ -411,6 +450,20 @@ class DurableCryptoFirstLiveCoordinator:
             "publication_hash",
             "receipt_hash",
             "consumed_epoch",
+        ) or supervised_consumptions != (
+            "consumption_id",
+            "approval_id",
+            "run_id",
+            "lane",
+            "session_id",
+            "permit_id",
+            "permit_hash",
+            "owner_identity_hash",
+            "contract_hash",
+            "receipt_hash",
+            "coordinator_revision",
+            "publication_hash",
+            "consumed_epoch",
         ):
             raise CryptoFirstLiveCoordinatorError(
                 "crypto-first-live-schema-mismatch"
@@ -452,6 +505,11 @@ class DurableCryptoFirstLiveCoordinator:
                 "table",
                 "crypto_first_live_approval_consumptions",
                 "crypto_first_live_approval_consumptions",
+            ),
+            (
+                "table",
+                "crypto_first_live_supervised_consumptions",
+                "crypto_first_live_supervised_consumptions",
             ),
             ("index", "crypto_first_live_events_scope_idx", "crypto_first_live_events"),
         }:
@@ -511,6 +569,7 @@ class DurableCryptoFirstLiveCoordinator:
         previous_revision = 0
         latest_payload: dict[str, Any] = {}
         activated_consumptions: list[tuple[Any, ...]] = []
+        supervised_consumptions: list[tuple[Any, ...]] = []
         for event in events:
             content_json = _text(event["content_json"])
             content_hash = hashlib.sha256(
@@ -556,6 +615,27 @@ class DurableCryptoFirstLiveCoordinator:
                         float(payload.get("approvalConsumedEpoch", -1)),
                     )
                 )
+            if (
+                _text(payload.get("eventType"))
+                == "SUPERVISED_NON_PROMOTION_ACTIVATED"
+            ):
+                supervised_consumptions.append(
+                    (
+                        _text(payload.get("approvalConsumptionId")),
+                        _text(payload.get("approvalId")),
+                        _text(payload.get("runId")),
+                        _text(payload.get("lane")),
+                        _text(payload.get("sessionId")),
+                        _text(payload.get("permitId")),
+                        _text(payload.get("permitHash")),
+                        _text(payload.get("ownerIdentityHash")),
+                        _text(payload.get("supervisedContractHash")),
+                        _text(payload.get("approvalReceiptHash")),
+                        int(payload.get("activationClaimRevision", -1)),
+                        _text(payload.get("activationPublicationHash")),
+                        float(payload.get("approvalConsumedEpoch", -1)),
+                    )
+                )
             previous_hash = content_hash
             previous_revision = int(event["revision"])
         if not secrets.compare_digest(
@@ -581,6 +661,24 @@ class DurableCryptoFirstLiveCoordinator:
         if sorted(activated_consumptions) != durable_consumptions:
             raise CryptoFirstLiveCoordinatorError(
                 "crypto-first-live-approval-consumption-integrity-invalid"
+            )
+        supervised_rows = conn.execute(
+            """
+            SELECT consumption_id, approval_id, run_id, lane, session_id,
+                   permit_id, permit_hash, owner_identity_hash,
+                   contract_hash, receipt_hash, coordinator_revision,
+                   publication_hash, consumed_epoch
+            FROM crypto_first_live_supervised_consumptions
+            ORDER BY consumption_id
+            """
+        ).fetchall()
+        durable_supervised = sorted(
+            tuple(row[key] for key in row.keys())
+            for row in supervised_rows
+        )
+        if sorted(supervised_consumptions) != durable_supervised:
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-supervised-consumption-integrity-invalid"
             )
 
     @staticmethod
@@ -808,6 +906,116 @@ class DurableCryptoFirstLiveCoordinator:
             after=local,
         )
         return self.status()
+
+    @contextmanager
+    def global_idle_reservation(
+        self, request: Mapping[str, Any]
+    ) -> Iterator[Mapping[str, Any]]:
+        """Hold the durable global IDLE CAS through a caller's commit.
+
+        This is intentionally a lock-scoped authority rather than a stale
+        point-in-time assertion.  The coordinator SQLite write reservation is
+        retained until the caller exits the context, so neither exchange can
+        begin a first-live reservation between the IDLE check and a dependent
+        ProgramLedger commit.
+        """
+
+        value = dict(request)
+        if set(value) != {
+            "schemaVersion",
+            "purpose",
+            "accountFingerprint",
+            "consumptionKey",
+            "truthHash",
+        }:
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-global-idle-request-fields-not-exact"
+            )
+        purpose = _text(value.get("purpose")).upper()
+        account = _exact_hash(
+            value.get("accountFingerprint"), "account-fingerprint"
+        )
+        consumption = _exact_hash(
+            value.get("consumptionKey"), "consumption-key"
+        )
+        truth = _exact_hash(value.get("truthHash"), "truth-hash")
+        if (
+            value.get("schemaVersion")
+            != GLOBAL_IDLE_RESERVATION_SCHEMA_VERSION
+            or purpose != "PROGRAM_LEDGER_BINANCE_CASH_TRANSFER_COMMIT"
+        ):
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-global-idle-request-invalid"
+            )
+
+        anchored = self._require_anchor_exact(
+            purpose="GLOBAL_IDLE_RESERVATION_PREPARE"
+        )
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._verify_schema(conn)
+            self._verify_integrity(conn)
+            local = self._local_high_water(conn)
+            if local != anchored:
+                raise CryptoFirstLiveCoordinatorError(
+                    "crypto-first-live-global-idle-publication-changed"
+                )
+            row = self._row(conn)
+            stored_phase = "IDLE" if row is None else _text(row["phase"])
+            if stored_phase not in {"IDLE", "FINALIZED"}:
+                raise CryptoFirstLiveCoordinatorError(
+                    "crypto-first-live-global-idle-unavailable"
+                )
+            acquired_epoch = self._now()
+            receipt_body = {
+                "schemaVersion": GLOBAL_IDLE_RESERVATION_SCHEMA_VERSION,
+                "scope": GLOBAL_SCOPE,
+                "purpose": purpose,
+                "phase": "IDLE",
+                "coordinatorStoredPhase": stored_phase,
+                "coordinatorDatabaseId": _text(local["databaseId"]),
+                "coordinatorRevision": int(local["revision"]),
+                "publicationHash": _text(local["publicationHash"]),
+                "accountFingerprint": account,
+                "consumptionKey": consumption,
+                "truthHash": truth,
+                "reservationId": (
+                    "crypto-first-live-global-idle-"
+                    + secrets.token_hex(18)
+                ),
+                "acquiredEpoch": acquired_epoch,
+                "held": True,
+                "exclusive": True,
+                "durableAuthority": True,
+                "restartVerifiable": True,
+            }
+            receipt = {
+                **receipt_body,
+                "reservationHash": _digest(receipt_body),
+            }
+            yield receipt
+            self._verify_schema(conn)
+            self._verify_integrity(conn)
+            if self._local_high_water(conn) != local:
+                raise CryptoFirstLiveCoordinatorError(
+                    "crypto-first-live-global-idle-changed-before-release"
+                )
+            current = self._row(conn)
+            current_phase = (
+                "IDLE" if current is None else _text(current["phase"])
+            )
+            if current_phase != stored_phase:
+                raise CryptoFirstLiveCoordinatorError(
+                    "crypto-first-live-global-idle-changed-before-release"
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
 
     def _verify_empty_store_authority(
         self,
@@ -1037,6 +1245,14 @@ class DurableCryptoFirstLiveCoordinator:
                 "coordinatedRollbackProtectionReleased": (
                     CRYPTO_FIRST_LIVE_WORM_ROLLBACK_RELEASED
                 ),
+                "supervisedNonPromotionActivationReleased": (
+                    CRYPTO_FIRST_LIVE_SUPERVISED_NON_PROMOTION_RELEASED
+                ),
+                "supervisedNetworkCapabilityReleased": (
+                    CRYPTO_FIRST_LIVE_SUPERVISED_NETWORK_CAPABILITY_RELEASED
+                ),
+                "supervisedPromotionEligible": False,
+                "supervisedRealE2EEligible": False,
                 "hardStopEpoch": 0.0,
                 "entryAuthorityOpen": False,
                 "networkOrderPostAllowed": False,
@@ -1108,6 +1324,14 @@ class DurableCryptoFirstLiveCoordinator:
             "coordinatedRollbackProtectionReleased": (
                 CRYPTO_FIRST_LIVE_WORM_ROLLBACK_RELEASED
             ),
+            "supervisedNonPromotionActivationReleased": (
+                CRYPTO_FIRST_LIVE_SUPERVISED_NON_PROMOTION_RELEASED
+            ),
+            "supervisedNetworkCapabilityReleased": (
+                CRYPTO_FIRST_LIVE_SUPERVISED_NETWORK_CAPABILITY_RELEASED
+            ),
+            "supervisedPromotionEligible": False,
+            "supervisedRealE2EEligible": False,
             "entryAuthorityOpen": bool(
                 CRYPTO_FIRST_LIVE_ACTIVATION_RELEASED
                 and CRYPTO_FIRST_LIVE_WORM_ROLLBACK_RELEASED
@@ -1976,6 +2200,333 @@ class DurableCryptoFirstLiveCoordinator:
             )
             result = self._row(conn)
         return self._public(result, now=self._now())
+
+    def heartbeat_inert(
+        self,
+        *,
+        run_id: str,
+        owner_token: str,
+        owner_epoch: int,
+        lane: str,
+        session_id: str,
+        permit_id: str,
+        permit_hash: str,
+        account_fingerprint: str,
+        baseline_hash: str,
+        code_hash: str,
+        owner_identity_hash: str,
+        expected_revision: int,
+        lease_seconds: float = MAX_OWNER_LEASE_SECONDS,
+    ) -> dict[str, Any]:
+        """Renew only an exact ``APPROVED_INERT`` owner.
+
+        This path exists so a durable reservation cannot expire while an
+        operator reads and consumes the supervised one-use challenge.  It is
+        intentionally separate from the ACTIVE/CLEANUP heartbeat and never
+        creates a hard stop, entry authority, or broker capability.
+        """
+
+        run = _exact_id(run_id, "run-id")
+        token = _text(owner_token)
+        normalized_lane = _text(lane).upper()
+        session = _exact_id(session_id, "session-id")
+        permit_identifier = _exact_id(permit_id, "permit-id")
+        permit = _exact_hash(permit_hash, "permit-hash")
+        account = _exact_hash(
+            account_fingerprint, "account-fingerprint"
+        )
+        baseline = _exact_hash(baseline_hash, "baseline-hash")
+        code = _exact_hash(code_hash, "code-hash")
+        identity_hash = _exact_hash(
+            owner_identity_hash, "owner-identity-hash"
+        )
+        if normalized_lane not in LANES or not token:
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-inert-heartbeat-binding-invalid"
+            )
+        if type(expected_revision) is not int or expected_revision <= 0:
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-inert-heartbeat-revision-invalid"
+            )
+        lease = self._lease_seconds(lease_seconds)
+        observed_at = self._now()
+        observed_monotonic = self._monotonic_now()
+        snapshot = self._verified_row_snapshot(
+            purpose="HEARTBEAT_INERT_READ"
+        )
+        expected = {
+            "run_id": run,
+            "lane": normalized_lane,
+            "session_id": session,
+            "permit_id": permit_identifier,
+            "permit_hash": permit,
+            "account_fingerprint": account,
+            "baseline_hash": baseline,
+            "code_hash": code,
+            "owner_identity_hash": identity_hash,
+        }
+        if (
+            snapshot is None
+            or _text(snapshot["phase"]) != "APPROVED_INERT"
+            or int(snapshot["revision"]) != expected_revision
+            or any(
+                _text(snapshot[column]) != exact
+                for column, exact in expected.items()
+            )
+        ):
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-inert-heartbeat-binding-changed"
+            )
+        self._assert_owner(
+            snapshot,
+            run_id=run,
+            owner_token=token,
+            owner_epoch=owner_epoch,
+            now=observed_at,
+            monotonic_now=observed_monotonic,
+        )
+        owner_identity = json.loads(_text(snapshot["owner_identity_json"]))
+        try:
+            self._require_owner_identity_authority(
+                purpose="HEARTBEAT_INERT",
+                lane=normalized_lane,
+                account_fingerprint=account,
+                identity=owner_identity,
+                identity_hash=identity_hash,
+                run_id=run,
+                owner_epoch=int(snapshot["owner_epoch"]),
+                coordinator_revision=int(snapshot["revision"]),
+            )
+        except Exception:
+            self.mark_reconciliation_required(
+                run_id=run,
+                reason="owner identity lost during inert heartbeat",
+            )
+            raise
+        with self._write(purpose="HEARTBEAT_INERT") as conn:
+            row = self._row(conn)
+            commit_now = self._now()
+            commit_monotonic = self._monotonic_now()
+            if (
+                row is None
+                or _text(row["phase"]) != "APPROVED_INERT"
+                or int(row["revision"]) != expected_revision
+                or any(
+                    _text(row[column]) != exact
+                    for column, exact in expected.items()
+                )
+            ):
+                raise CryptoFirstLiveCoordinatorError(
+                    "crypto-first-live-inert-heartbeat-cas-changed"
+                )
+            self._assert_owner(
+                row,
+                run_id=run,
+                owner_token=token,
+                owner_epoch=owner_epoch,
+                now=commit_now,
+                monotonic_now=commit_monotonic,
+            )
+            revision = int(row["revision"]) + 1
+            updated = conn.execute(
+                """
+                UPDATE crypto_first_live_control
+                SET owner_lease_expires_epoch=?, updated_epoch=?,
+                    updated_monotonic=?, revision=?,
+                    detail='approved inert owner heartbeat; network closed'
+                WHERE scope_key=? AND run_id=? AND phase='APPROVED_INERT'
+                  AND owner_epoch=? AND owner_identity_hash=? AND revision=?
+                """,
+                (
+                    commit_now + lease,
+                    commit_now,
+                    commit_monotonic,
+                    revision,
+                    GLOBAL_SCOPE,
+                    run,
+                    int(owner_epoch),
+                    identity_hash,
+                    expected_revision,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise CryptoFirstLiveCoordinatorError(
+                    "crypto-first-live-inert-heartbeat-cas-changed"
+                )
+            self._append_event(
+                conn,
+                run_id=run,
+                event_type="INERT_HEARTBEAT",
+                revision=revision,
+                occurred_epoch=commit_now,
+                payload={
+                    "lane": normalized_lane,
+                    "sessionId": session,
+                    "permitId": permit_identifier,
+                    "permitHash": permit,
+                    "accountFingerprint": account,
+                    "baselineHash": baseline,
+                    "codeHash": code,
+                    "ownerIdentityHash": identity_hash,
+                    "ownerEpoch": int(owner_epoch),
+                    "networkCapabilityOpen": False,
+                    "promotionEligible": False,
+                    "realE2EEligible": False,
+                },
+            )
+            result = self._row(conn)
+        return {
+            **self._public(result, now=self._now()),
+            "inertHeartbeat": True,
+            "networkCapabilityOpen": False,
+            "promotionEligible": False,
+            "realE2EEligible": False,
+        }
+
+    def activate_supervised_non_promotion(
+        self,
+        *,
+        run_id: str,
+        owner_token: str,
+        owner_epoch: int,
+        lane: str,
+        session_id: str,
+        permit_id: str,
+        permit_hash: str,
+        account_fingerprint: str,
+        baseline_hash: str,
+        code_hash: str,
+        owner_identity_hash: str,
+        expected_revision: int,
+        approval_receipt: Mapping[str, Any],
+        supervised_contract: Mapping[str, Any],
+        supervised_contract_hash: str,
+    ) -> dict[str, Any]:
+        """Validate the separate supervised seam, then obey its HOLD latch.
+
+        No strict-WORM approval consumer or ``activate`` implementation is
+        called here.  The current binary deliberately contains no branch that
+        can turn this lower-assurance contract into ACTIVE/network authority.
+        """
+
+        from .crypto_first_live_supervised_release import (
+            CryptoFirstLiveSupervisedReleaseError,
+            validate_supervised_non_promotion_contract,
+        )
+
+        run = _exact_id(run_id, "run-id")
+        token = _text(owner_token)
+        normalized_lane = _text(lane).upper()
+        session = _exact_id(session_id, "session-id")
+        permit_identifier = _exact_id(permit_id, "permit-id")
+        permit = _exact_hash(permit_hash, "permit-hash")
+        account = _exact_hash(
+            account_fingerprint, "account-fingerprint"
+        )
+        baseline = _exact_hash(baseline_hash, "baseline-hash")
+        code = _exact_hash(code_hash, "code-hash")
+        identity_hash = _exact_hash(
+            owner_identity_hash, "owner-identity-hash"
+        )
+        contract_hash = _exact_hash(
+            supervised_contract_hash, "supervised-contract-hash"
+        )
+        if (
+            normalized_lane not in LANES
+            or not token
+            or type(expected_revision) is not int
+            or expected_revision <= 0
+            or not isinstance(approval_receipt, Mapping)
+            or not isinstance(supervised_contract, Mapping)
+        ):
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-supervised-activation-binding-invalid"
+            )
+        try:
+            contract = validate_supervised_non_promotion_contract(
+                dict(supervised_contract), clock=self.clock
+            )
+        except CryptoFirstLiveSupervisedReleaseError as exc:
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-supervised-contract-invalid"
+            ) from exc
+        receipt = dict(approval_receipt)
+        embedded_receipt = contract.get("operatorApproval")
+        if (
+            not isinstance(embedded_receipt, Mapping)
+            or receipt != dict(embedded_receipt)
+            or not secrets.compare_digest(
+                contract_hash, _text(contract.get("contractHash"))
+            )
+            or contract.get("mode") != "SUPERVISED_NON_PROMOTION"
+            or _text(contract.get("lane")).upper() != normalized_lane
+            or _text(contract.get("sessionId")) != session
+            or _text(contract.get("permitId")) != permit_identifier
+            or not secrets.compare_digest(
+                _text(contract.get("permitHash")), permit
+            )
+        ):
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-supervised-contract-binding-changed"
+            )
+        snapshot = self._verified_row_snapshot(
+            purpose="ACTIVATE_SUPERVISED_NON_PROMOTION_READ"
+        )
+        expected = {
+            "run_id": run,
+            "lane": normalized_lane,
+            "session_id": session,
+            "permit_id": permit_identifier,
+            "permit_hash": permit,
+            "account_fingerprint": account,
+            "baseline_hash": baseline,
+            "code_hash": code,
+            "owner_identity_hash": identity_hash,
+            "approval_id": _text(receipt.get("approvalId")),
+        }
+        if (
+            snapshot is None
+            or _text(snapshot["phase"]) != "APPROVED_INERT"
+            or int(snapshot["revision"]) != expected_revision
+            or any(
+                _text(snapshot[column]) != exact
+                for column, exact in expected.items()
+            )
+        ):
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-supervised-activation-owner-changed"
+            )
+        self._assert_owner(
+            snapshot,
+            run_id=run,
+            owner_token=token,
+            owner_epoch=owner_epoch,
+            now=self._now(),
+            monotonic_now=self._monotonic_now(),
+        )
+        owner_identity = json.loads(_text(snapshot["owner_identity_json"]))
+        self._require_owner_identity_authority(
+            purpose="ACTIVATE_SUPERVISED_NON_PROMOTION",
+            lane=normalized_lane,
+            account_fingerprint=account,
+            identity=owner_identity,
+            identity_hash=identity_hash,
+            run_id=run,
+            owner_epoch=int(snapshot["owner_epoch"]),
+            coordinator_revision=int(snapshot["revision"]),
+        )
+        if (
+            not CRYPTO_FIRST_LIVE_SUPERVISED_NON_PROMOTION_RELEASED
+            or not CRYPTO_FIRST_LIVE_SUPERVISED_NETWORK_CAPABILITY_RELEASED
+        ):
+            raise CryptoFirstLiveCoordinatorError(
+                "crypto-first-live-supervised-non-promotion-release-held"
+            )
+        # Intentionally no ACTIVE transition exists until a separately
+        # reviewed, migration-backed supervised state machine is released.
+        raise CryptoFirstLiveCoordinatorError(
+            "crypto-first-live-supervised-active-transition-not-released"
+        )
 
     def heartbeat(
         self,
@@ -3185,6 +3736,8 @@ class DurableCryptoFirstLiveCoordinator:
 
 __all__ = [
     "CRYPTO_FIRST_LIVE_ACTIVATION_RELEASED",
+    "CRYPTO_FIRST_LIVE_SUPERVISED_NETWORK_CAPABILITY_RELEASED",
+    "CRYPTO_FIRST_LIVE_SUPERVISED_NON_PROMOTION_RELEASED",
     "CRYPTO_FIRST_LIVE_WORM_ROLLBACK_RELEASED",
     "CryptoFirstLiveCoordinatorError",
     "DurableCryptoFirstLiveCoordinator",
@@ -3192,4 +3745,5 @@ __all__ = [
     "HIGH_WATER_SCHEMA_VERSION",
     "MAX_OWNER_LEASE_SECONDS",
     "SCHEMA_VERSION",
+    "SUPERVISED_NON_PROMOTION_COORDINATOR_SCHEMA_VERSION",
 ]

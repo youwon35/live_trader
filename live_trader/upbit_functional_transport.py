@@ -3,7 +3,7 @@ from __future__ import annotations
 """GET-only Upbit transport and durable ``myOrder`` evidence journal.
 
 This module is intentionally separate from the ordinary Upbit broker router.
-Its HTTP client exposes only six allow-listed read endpoints, while the
+Its HTTP client exposes only seven allow-listed read endpoints, while the
 SQLite journal records every private order event before it is offered to the
 continuous functional lane.  A disconnect, parse failure, credential change,
 or conflicting replay permanently marks that journal session incomplete.
@@ -26,10 +26,16 @@ from typing import Any, Callable, Mapping, Sequence
 import urllib.parse
 import uuid
 
-from .live_adapters import PreparedRequest, UPBIT_BASE_URL, env_value, send_prepared_request
+from .upbit_read_only_http import (
+    PreparedRequest,
+    UPBIT_BASE_URL,
+    env_value,
+    send_prepared_request,
+)
 from .upbit_continuous_functional import SYMBOL, UpbitFunctionalBlocked
 from .upbit_functional_truth import (
     UPBIT_ACCOUNTS_ENDPOINT,
+    UPBIT_API_KEYS_ENDPOINT,
     UPBIT_CLOSED_ORDERS_ENDPOINT,
     UPBIT_OPEN_ORDERS_ENDPOINT,
     UPBIT_ORDER_CHANCE_ENDPOINT,
@@ -41,6 +47,7 @@ from .upbit_functional_truth import (
 UPBIT_FUNCTIONAL_GET_ENDPOINTS = frozenset(
     {
         UPBIT_ACCOUNTS_ENDPOINT,
+        UPBIT_API_KEYS_ENDPOINT,
         UPBIT_ORDER_CHANCE_ENDPOINT,
         UPBIT_OPEN_ORDERS_ENDPOINT,
         UPBIT_CLOSED_ORDERS_ENDPOINT,
@@ -48,11 +55,23 @@ UPBIT_FUNCTIONAL_GET_ENDPOINTS = frozenset(
         UPBIT_TICKER_ENDPOINT,
     }
 )
+UPBIT_FUNCTIONAL_GET_NETWORK_RELEASED = False
+_FUNCTIONAL_GET_NETWORK_CAPABILITY = object()
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 _EVENT_STATES = frozenset({"wait", "watch", "trade", "done", "cancel", "reject"})
 _WRITER_LEASE_SECONDS = 30
 _OFFICIAL_UPBIT_ORIGIN = "https://api.upbit.com"
+
+
+def _protected_upbit_functional_get_network_capability() -> object:
+    """Issue the identity-only capability to protected observer wiring."""
+
+    if UPBIT_FUNCTIONAL_GET_NETWORK_RELEASED is not True:
+        raise UpbitFunctionalBlocked(
+            "upbit-functional-get-network-release-held"
+        )
+    return _FUNCTIONAL_GET_NETWORK_CAPABILITY
 
 
 def _text(value: object) -> str:
@@ -254,25 +273,35 @@ class OfficialUpbitFunctionalGetClient:
         expected_account_fingerprint: str,
         credential_fingerprint_reader: Callable[[], str] = upbit_credential_fingerprint,
         sender: Callable[[PreparedRequest], Mapping[str, Any]] = send_prepared_request,
-        allow_mock_transport: bool = False,
+        network_capability: object | None = None,
+        raw_http_network_capability: object | None = None,
     ) -> None:
-        if allow_mock_transport and sender is send_prepared_request:
-            raise ValueError(
-                "mock transport requires an explicitly injected sender"
-            )
         expected = _text(expected_account_fingerprint).lower()
         if _HASH_RE.fullmatch(expected) is None:
             raise UpbitFunctionalBlocked("upbit-functional-account-fingerprint-invalid")
         self.expected_account_fingerprint = expected
         self.credential_fingerprint_reader = credential_fingerprint_reader
         self.sender = sender
-        self.allow_mock_transport = allow_mock_transport
+        self._network_capability = network_capability
+        self._raw_http_network_capability = raw_http_network_capability
+
+    def _assert_network_capability(self) -> None:
+        if (
+            UPBIT_FUNCTIONAL_GET_NETWORK_RELEASED is not True
+            or self._network_capability is not _FUNCTIONAL_GET_NETWORK_CAPABILITY
+        ):
+            raise UpbitFunctionalBlocked(
+                "upbit-functional-get-network-capability-closed"
+            )
 
     def get(
         self,
         endpoint: str,
         query: Sequence[tuple[str, str]],
     ) -> object:
+        # Release and protected identity are checked before credential reads,
+        # signing, request construction, or an injected/default sender.
+        self._assert_network_capability()
         actual = _text(self.credential_fingerprint_reader()).lower()
         if not secrets.compare_digest(actual, self.expected_account_fingerprint):
             raise UpbitFunctionalBlocked(
@@ -281,13 +310,18 @@ class OfficialUpbitFunctionalGetClient:
         prepared = build_upbit_functional_get_request(
             endpoint,
             query,
-            allow_mock_origin=self.allow_mock_transport,
         )
         if prepared.method != "GET" or not prepared.can_send:
             raise UpbitFunctionalBlocked(
                 "upbit-functional-get-credential-or-request-not-ready"
             )
-        response = self.sender(prepared)
+        if self.sender is send_prepared_request:
+            response = send_prepared_request(
+                prepared,
+                network_capability=self._raw_http_network_capability,
+            )
+        else:
+            response = self.sender(prepared)
         if not isinstance(response, Mapping):
             raise UpbitFunctionalBlocked("upbit-functional-get-response-invalid")
         payload = response.get("json")

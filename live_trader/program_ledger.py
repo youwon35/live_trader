@@ -29,6 +29,9 @@ from .binance_cash_transfer_evidence import (
 BINANCE_CASH_TRANSFER_ADJUSTMENT_RELEASED = False
 BINANCE_CASH_TRANSFER_CONSUMPTION_RELEASED = False
 MAX_CASH_TRANSFER_TRUTH_AGE_SECONDS = 30.0
+CRYPTO_FIRST_LIVE_GLOBAL_IDLE_RESERVATION_SCHEMA = (
+    "crypto-first-live-global-idle-reservation/v1"
+)
 
 
 def now_text() -> str:
@@ -99,6 +102,9 @@ class ProgramLedger:
         cash_transfer_high_water_verifier: (
             Callable[[Mapping[str, Any]], bool] | None
         ) = None,
+        cash_transfer_global_idle_reserver: (
+            Callable[[Mapping[str, Any]], Any] | None
+        ) = None,
     ) -> None:
         self.path = Path(path)
         self.cash_transfer_authority_verifier = (
@@ -106,6 +112,9 @@ class ProgramLedger:
         )
         self.cash_transfer_high_water_verifier = (
             cash_transfer_high_water_verifier
+        )
+        self.cash_transfer_global_idle_reserver = (
+            cash_transfer_global_idle_reserver
         )
         self.ensure_schema()
 
@@ -1037,9 +1046,95 @@ class ProgramLedger:
         if high_water_verified is not True:
             raise ValueError("binance-cash-transfer-high-water-unverified")
 
+        idle_request = {
+            "schemaVersion": (
+                CRYPTO_FIRST_LIVE_GLOBAL_IDLE_RESERVATION_SCHEMA
+            ),
+            "purpose": "PROGRAM_LEDGER_BINANCE_CASH_TRANSFER_COMMIT",
+            "accountFingerprint": account_fingerprint,
+            "consumptionKey": consumption_key,
+            "truthHash": normalized_truth_hash,
+        }
+        idle_reserver = self.cash_transfer_global_idle_reserver
+        if idle_reserver is None:
+            raise ValueError(
+                "binance-cash-transfer-global-idle-reserver-unavailable"
+            )
+        try:
+            idle_manager = idle_reserver(idle_request)
+            idle_receipt = idle_manager.__enter__()
+        except BaseException as exc:
+            raise ValueError(
+                "binance-cash-transfer-global-idle-reservation-unverified"
+            ) from exc
+        idle_entered = True
+        try:
+            receipt = dict(idle_receipt)
+            receipt_hash = str(receipt.pop("reservationHash", "")).strip()
+            if (
+                set(receipt) != {
+                    "schemaVersion",
+                    "scope",
+                    "purpose",
+                    "phase",
+                    "coordinatorStoredPhase",
+                    "coordinatorDatabaseId",
+                    "coordinatorRevision",
+                    "publicationHash",
+                    "accountFingerprint",
+                    "consumptionKey",
+                    "truthHash",
+                    "reservationId",
+                    "acquiredEpoch",
+                    "held",
+                    "exclusive",
+                    "durableAuthority",
+                    "restartVerifiable",
+                }
+                or receipt.get("schemaVersion")
+                != CRYPTO_FIRST_LIVE_GLOBAL_IDLE_RESERVATION_SCHEMA
+                or receipt.get("scope") != "CRYPTO_FIRST_LIVE_GLOBAL"
+                or receipt.get("purpose") != idle_request["purpose"]
+                or receipt.get("phase") != "IDLE"
+                or receipt.get("coordinatorStoredPhase")
+                not in {"IDLE", "FINALIZED"}
+                or receipt.get("accountFingerprint") != account_fingerprint
+                or receipt.get("consumptionKey") != consumption_key
+                or receipt.get("truthHash") != normalized_truth_hash
+                or receipt.get("held") is not True
+                or receipt.get("exclusive") is not True
+                or receipt.get("durableAuthority") is not True
+                or receipt.get("restartVerifiable") is not True
+                or isinstance(receipt.get("coordinatorRevision"), bool)
+                or not isinstance(receipt.get("coordinatorRevision"), int)
+                or int(receipt["coordinatorRevision"]) < 0
+                or not str(receipt.get("coordinatorDatabaseId") or "").strip()
+                or not str(receipt.get("reservationId") or "").strip()
+                or not math.isfinite(float(receipt.get("acquiredEpoch")))
+                or float(receipt["acquiredEpoch"]) <= 0
+                or receipt_hash != binance_transfer_content_hash(receipt)
+            ):
+                raise ValueError(
+                    "binance-cash-transfer-global-idle-reservation-invalid"
+                )
+        except BaseException as exc:
+            try:
+                idle_manager.__exit__(type(exc), exc, exc.__traceback__)
+            finally:
+                idle_entered = False
+            raise
+
         adjustment_id = "cash-transfer-adjustment-" + uuid.uuid4().hex
         created_at = now_text()
-        conn = self.connect()
+        try:
+            conn = self.connect()
+        except BaseException as exc:
+            if idle_entered:
+                try:
+                    idle_manager.__exit__(type(exc), exc, exc.__traceback__)
+                finally:
+                    idle_entered = False
+            raise
         try:
             conn.execute("BEGIN IMMEDIATE")
             source_row = conn.execute(
@@ -1265,12 +1360,24 @@ class ProgramLedger:
                 ),
             )
             conn.execute("COMMIT")
-        except BaseException:
+        except BaseException as exc:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
+            if idle_entered:
+                try:
+                    idle_manager.__exit__(type(exc), exc, exc.__traceback__)
+                finally:
+                    idle_entered = False
             raise
         finally:
             conn.close()
+        if idle_entered:
+            suppressed = idle_manager.__exit__(None, None, None)
+            idle_entered = False
+            if suppressed is not False and suppressed is not None:
+                raise ValueError(
+                    "binance-cash-transfer-global-idle-release-invalid"
+                )
         return {
             "ok": True,
             "adjustmentId": adjustment_id,

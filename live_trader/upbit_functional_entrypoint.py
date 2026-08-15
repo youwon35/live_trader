@@ -31,6 +31,7 @@ from .upbit_continuous_functional import (
 )
 from .upbit_functional_managed import ManagedUpbitFunctionalController
 from .upbit_functional_mutation import (
+    GlobalFirstLiveDispatchReserver,
     UPBIT_FUNCTIONAL_MUTATION_AVAILABLE,
     UpbitFunctionalMutationEdge,
 )
@@ -116,6 +117,9 @@ class UpbitFunctionalProductionGraph:
         global_first_live_authority_reader: (
             GlobalFirstLiveAuthorityReader | None
         ) = None,
+        global_first_live_dispatch_reserver: (
+            GlobalFirstLiveDispatchReserver | None
+        ) = None,
         global_first_live_owner_identity_hash: str = "",
         _capability: object | None = None,
     ) -> None:
@@ -159,6 +163,9 @@ class UpbitFunctionalProductionGraph:
         self.global_first_live_authority_reader = (
             global_first_live_authority_reader
         )
+        self.global_first_live_dispatch_reserver = (
+            global_first_live_dispatch_reserver
+        )
         self.global_first_live_owner_identity_hash = str(
             global_first_live_owner_identity_hash or ""
         ).strip().lower()
@@ -167,6 +174,7 @@ class UpbitFunctionalProductionGraph:
             and UPBIT_GLOBAL_FIRST_LIVE_DISPATCH_FENCE_RELEASED
             and (
                 not callable(self.global_first_live_authority_reader)
+                or not callable(self.global_first_live_dispatch_reserver)
                 or len(self.global_first_live_owner_identity_hash) != 64
             )
         ):
@@ -212,6 +220,9 @@ class UpbitFunctionalProductionGraph:
                 "globalFirstLiveDispatchFence": {
                     "wired": callable(
                         self.global_first_live_authority_reader
+                    ),
+                    "routeReservationWired": callable(
+                        self.global_first_live_dispatch_reserver
                     ),
                     "ownerIdentityBound": bool(
                         len(self.global_first_live_owner_identity_hash) == 64
@@ -483,6 +494,9 @@ class UpbitFunctionalProductionGraph:
                 post_boundary_marker=self.ledger.mark_post_may_have_crossed,
                 global_first_live_authority_reader=(
                     self.global_first_live_authority_reader
+                ),
+                global_first_live_dispatch_reserver=(
+                    self.global_first_live_dispatch_reserver
                 ),
                 global_first_live_owner_identity_hash=(
                     self.global_first_live_owner_identity_hash
@@ -1118,6 +1132,9 @@ class UpbitFunctionalProductionGraph:
             post_boundary_marker=self.ledger.mark_post_may_have_crossed,
             global_first_live_authority_reader=(
                 self.global_first_live_authority_reader
+            ),
+            global_first_live_dispatch_reserver=(
+                self.global_first_live_dispatch_reserver
             ),
             global_first_live_owner_identity_hash=(
                 self.global_first_live_owner_identity_hash
