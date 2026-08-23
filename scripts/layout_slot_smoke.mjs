@@ -34,6 +34,86 @@ try {
     await layoutEditor.click();
     await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "locked");
   }
+
+  // A previously saved short edit height must not become a clipping mask in
+  // normal operation. Locked panels keep that value only as a minimum and
+  // grow to the complete content height.
+  const lockedPanel = page.locator(".appearance-panel");
+  const lockedPanelKey = await lockedPanel.getAttribute("data-layout-key");
+  const lockedPanelBox = await lockedPanel.boundingBox();
+  if (!lockedPanelKey || !lockedPanelBox) {
+    issues.push("잠금 화면의 콘텐츠 높이 복구 대상을 찾지 못했습니다.");
+  } else {
+    await page.evaluate(({ key, width }) => {
+      localStorage.setItem("live-trader.panelSizes.v1", JSON.stringify({
+        [key]: { width, height: 64 },
+      }));
+      window.dispatchEvent(new Event("live-trader-layout-restore"));
+    }, { key: lockedPanelKey, width: lockedPanelBox.width });
+    await page.waitForTimeout(50);
+    const lockedVisibility = await lockedPanel.evaluate((panel) => ({
+      clientHeight: panel.clientHeight,
+      fixedHeight: panel.style.height,
+      minimumHeight: panel.style.minHeight,
+      scrollHeight: panel.scrollHeight,
+    }));
+    observations.lockedContentVisibility = lockedVisibility;
+    if (lockedVisibility.fixedHeight) {
+      issues.push("잠금 화면에서 저장된 높이가 여전히 고정 높이로 적용됩니다.");
+    }
+    if (lockedVisibility.clientHeight + 1 < lockedVisibility.scrollHeight) {
+      issues.push("잠금 화면 패널이 전체 콘텐츠 높이까지 확장되지 않았습니다.");
+    }
+    await layoutEditor.locator("xpath=..").getByRole("button", { name: "초기화", exact: true }).click();
+  }
+
+  const operationalTabs = [
+    "운영 현황",
+    "배포·승급",
+    "기능시험",
+    "계좌·포지션",
+    "주문·체결",
+    "리스크·안전",
+    "실거래 운영",
+    "감사 기록",
+    "기술 로그",
+    "설정·진단",
+  ];
+  observations.lockedPanelClipping = {};
+  for (const tabLabel of operationalTabs) {
+    await page.getByRole("button", { name: tabLabel, exact: true }).click();
+    await page.waitForTimeout(40);
+    const clippedPanels = await page.locator(".page-view .panel").evaluateAll((panels) => panels.flatMap((panel) => {
+      if (panel.scrollHeight <= panel.clientHeight + 1) return [];
+      const style = window.getComputedStyle(panel);
+      const parent = panel.parentElement;
+      const parentStyle = parent ? window.getComputedStyle(parent) : null;
+      return [{
+        className: panel.className,
+        clientHeight: panel.clientHeight,
+        computedHeight: style.height,
+        computedMinHeight: style.minHeight,
+        inlineHeight: panel.style.height,
+        inlineMinHeight: panel.style.minHeight,
+        overflow: style.overflow,
+        parentClassName: parent?.className || "",
+        parentHeight: parentStyle?.height || "",
+        parentOverflow: parentStyle?.overflow || "",
+        scrollHeight: panel.scrollHeight,
+        title: panel.querySelector(".panel-header h2")?.textContent?.trim() || "제목 없음",
+      }];
+    }));
+    observations.lockedPanelClipping[tabLabel] = clippedPanels;
+    if (clippedPanels.length) {
+      issues.push(`${tabLabel} 탭에서 내용이 잘린 패널이 ${clippedPanels.length}개 있습니다.`);
+    }
+  }
+  if (await page.locator('[data-program-journey="true"]').count()) {
+    issues.push("제거 요청한 전체 프로그램 여정 배너가 남아 있습니다.");
+  }
+  await page.getByRole("button", { name: "설정·진단", exact: true }).click();
+  await layoutEditor.waitFor({ state: "visible" });
+
   await layoutEditor.click();
   await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "edit");
   await page.getByRole("button", { name: /^리스크·안전/ }).click();

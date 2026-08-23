@@ -175,8 +175,6 @@ const PanelHeader = createPanelHeader(React);
 const StatusCard = createStatusCard(React);
 const SharedStatusRow = createStatusRow(React);
 const ToggleSwitch = createToggleSwitch(React);
-const ProgramJourney = React.lazy(() => import("../../../packages/design/program-journey.js").then((module) => ({ default: module.createProgramJourney(React) })));
-
 const navItems = [
   { id: "overview", label: "운영 현황", icon: LayoutDashboard },
   { id: "gate", label: "배포·승급", icon: ListChecks },
@@ -1392,12 +1390,24 @@ function ensurePanelHandles(panel) {
   const size = sizes[key];
   const position = positions[key];
 
+  const isLayoutEditing = document.documentElement.dataset.layoutMode === "edit";
   panel.style.transform = "";
+  panel.style.removeProperty("min-height");
   if (size && Number.isFinite(size.width)) {
     panel.style.width = `${snapStoredSlotDimension(size.width, "width")}px`;
   }
   if (size && Number.isFinite(size.height)) {
-    panel.style.height = `${snapStoredSlotDimension(size.height, "height")}px`;
+    const storedHeight = snapStoredSlotDimension(size.height, "height");
+    if (isLayoutEditing) {
+      panel.style.height = `${storedHeight}px`;
+    } else {
+      // A saved edit height is an operator preference, not a clipping mask.
+      // Locked views must always grow when live data adds rows or controls.
+      panel.style.removeProperty("height");
+      panel.style.minHeight = `${storedHeight}px`;
+    }
+  } else {
+    panel.style.removeProperty("height");
   }
   applyPanelOffset(panel, position);
   window.requestAnimationFrame(() => {
@@ -1465,6 +1475,7 @@ function useEditablePanels(rootRef) {
       root.querySelectorAll(".panel").forEach((panel) => {
         panel.style.width = "";
         panel.style.height = "";
+        panel.style.removeProperty("min-height");
         clearPanelOffset(panel);
       });
       root.querySelectorAll(".command-grid, .content-grid").forEach((grid) => {
@@ -1724,8 +1735,6 @@ applyLayoutMode(readLayoutMode());
 const LIVE_FLOW_STORAGE_KEY = "live_trader.guidedFlow.v1";
 const LIVE_FLOW_IDS = ["overview", "gate", "functional-test", "accounts", "orders", "risk", "automation", "incidents", "audit", "settings"];
 const DEPLOYMENT_CONTEXT_STORAGE_KEY = "live_trader.deploymentContext.v1";
-const LIVE_PROGRAM_JOURNEY_STORAGE_KEY = "live_trader.programJourney.v1";
-
 function strategyDeploymentContext(strategy = null) {
   if (!strategy) {
     return {
@@ -1924,6 +1933,7 @@ function App() {
 
   useEffect(() => {
     applyLayoutMode(layoutMode);
+    window.dispatchEvent(new Event(LAYOUT_RESTORE_EVENT));
   }, [layoutMode]);
 
   useEffect(() => {
@@ -2232,41 +2242,6 @@ function App() {
     || deploymentOptions[0]?.strategy
     || null;
   const deploymentContext = strategyDeploymentContext(selectedStrategy);
-  const journeyGovernance = snapshot.live_governance ?? {};
-  const journeyGovernedDeploymentId = governedDeploymentIdentity(journeyGovernance);
-  const journeyContextMatchesPreflight = deploymentContextMatchesPreflight(
-    deploymentContext.id,
-    journeyGovernance,
-  );
-  const journeyPreflight = journeyGovernance.preflightValidity ?? journeyGovernance.preflight_validity ?? {};
-  const journeyPreflightReasonValue = journeyPreflight.reasons ?? journeyPreflight.reasonCodes;
-  const journeyPreflightReasons = Array.isArray(journeyPreflightReasonValue) ? journeyPreflightReasonValue : [];
-  const journeyArtifact = selectedStrategy
-    ? `Paper Trader 전달 후보 ${deploymentContext.id || deploymentContext.strategyId} · ${deploymentContext.portfolioName} · ${deploymentContext.symbol} ${deploymentContext.timeframe}`
-    : "Paper Trader에서 SHADOW·PAPER Evidence를 통과한 Deployment가 아직 없습니다.";
-  const journeyBlocker = snapshot.api_connected !== true
-    ? "API 연결이 끊겨 LIVE 안전 상태를 확인할 수 없습니다."
-    : !selectedStrategy
-      ? "LIVE 승급을 검토할 Deployment가 없습니다."
-      : selectedStrategy.live_allowed !== true
-        ? selectedStrategy.block_reason || "선택한 Deployment가 LIVE 승급 조건을 충족하지 못했습니다."
-        : snapshot.kill_switch
-          ? "전역 Kill Switch가 활성화되어 있습니다."
-          : !journeyContextMatchesPreflight
-            ? `선택 Deployment(${deploymentContext.id || "미선택"})와 Preflight Deployment(${journeyGovernedDeploymentId || "미확인"})가 일치하지 않습니다.`
-            : journeyPreflight.valid !== true
-            ? `유효한 Preflight가 없습니다${journeyPreflightReasons.length ? ` · ${journeyPreflightReasons.slice(0, 2).join(", ")}` : ""}.`
-            : snapshot.new_entries_blocked
-              ? "신규 진입 차단 상태입니다."
-              : snapshot.dry_run
-                ? "Dry Run 보호가 활성화되어 Broker 주문 전송이 차단됩니다."
-                : "없음 · 선택 Deployment의 LIVE 안전 게이트가 준비되었습니다.";
-  const journeyBlockerTone = snapshot.api_connected !== true || snapshot.kill_switch
-    ? "danger"
-    : selectedStrategy?.live_allowed === true && journeyContextMatchesPreflight && journeyPreflight.valid === true && !snapshot.new_entries_blocked && !snapshot.dry_run
-      ? "success"
-      : "warning";
-  const journeyNextAction = "Preflight → MONITOR 장기 감시 → LIMITED LIVE → FULL LIVE 순서를 지키고 감사 Evidence를 계속 보존합니다.";
   const notifications = buildNotificationItems(snapshot, error);
   const notificationKey = notificationFingerprint(notifications);
   const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
@@ -2398,19 +2373,6 @@ function App() {
             onSelect={selectDeploymentContext}
             snapshot={snapshot}
           />
-        )}
-
-        {selectedNav === "functional-test" ? null : (
-          <React.Suspense fallback={null}>
-            <ProgramJourney
-              activeStepId="live"
-              artifact={journeyArtifact}
-              blocker={journeyBlocker}
-              blockerTone={journeyBlockerTone}
-              nextAction={journeyNextAction}
-              storageKey={LIVE_PROGRAM_JOURNEY_STORAGE_KEY}
-            />
-          </React.Suspense>
         )}
 
         {error && snapshot.api_connected === false && (

@@ -7619,8 +7619,15 @@ body {
 }
 
 :root[data-program="live-trader"] .workspace.layout-locked .panel {
-  min-height: 0;
+  height: max-content !important;
+  min-height: max-content !important;
   padding: 9px !important;
+}
+
+:root[data-program="live-trader"] .workspace.layout-locked .page-view > * {
+  align-self: start;
+  height: max-content;
+  min-height: max-content;
 }
 
 :root[data-program="live-trader"] .workspace.layout-locked .panel-header {
@@ -8530,7 +8537,7 @@ body {
 .automation-page-layout > .panel,
 .risk-page-layout > .panel,
 .settings-summary-grid > .panel {
-  height: 100%;
+  height: auto;
 }
 
 .live-grid-full {
@@ -8546,50 +8553,50 @@ body {
   --ts-scroll-panel-height: min(44vh, 420px);
 }
 
-/* Single-screen operating surfaces ---------------------------------------
- * Keep the deployment identity and safety scope visible while long status
- * collections scroll inside their own region. This avoids a second page-level
- * scrollbar without removing any operator control or diagnostic detail. */
+/* Content-first operating surfaces ---------------------------------------
+ * Live panels must never hide controls or broker state merely to fit one
+ * viewport. Long tables can still own an explicit scroll region, while page
+ * and panel shells grow naturally with their complete content. */
 .overview-view,
 .gate-view {
-  grid-template-rows: minmax(0, 1fr);
-  overflow: hidden;
+  grid-template-rows: auto;
+  overflow: visible;
 }
 
 .operations-overview-layout {
-  grid-template-rows: auto auto minmax(0, 1fr);
-  height: 100%;
-  overflow: hidden;
+  grid-template-rows: auto;
+  height: auto;
+  overflow: visible;
 }
 
 .operations-overview-grid {
   --ts-scroll-panel-height: none;
-  align-items: stretch;
-  min-height: 0;
-  overflow: hidden;
+  align-items: start;
+  overflow: visible;
 }
 
 .operations-overview-grid > .ts-scroll-panel {
   max-height: none;
+  overflow: visible;
   padding-right: 3px;
 }
 
 .deployment-promotion-layout {
-  grid-template-rows: auto auto minmax(0, 1fr);
-  height: 100%;
-  overflow: hidden;
+  grid-template-rows: auto;
+  height: auto;
+  overflow: visible;
 }
 
 .deployment-promotion-layout > .live-prep-shell {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  min-height: 0;
-  overflow: hidden;
+  grid-template-rows: auto;
+  overflow: visible;
 }
 
 .deployment-promotion-layout > .live-prep-shell > .ts-scroll-panel {
   --ts-scroll-panel-height: none;
   max-height: none;
+  overflow: visible;
   padding-right: 3px;
 }
 
