@@ -127,6 +127,7 @@ import {
   layoutAlignedOffset,
   layoutDropTarget,
   layoutElementOverlapsPeers,
+  layoutVisiblePeers,
   LAYOUT_EDIT_EXIT_EVENT,
   repairLayoutPanelOverlaps,
   layoutSwapDimensions,
@@ -1279,6 +1280,39 @@ function panelOverlapsPeers(activePanel) {
   return layoutElementOverlapsPeers(activePanel, ".panel", LAYOUT_COLLISION_GAP);
 }
 
+function panelPeerCollisionMetrics(activePanel) {
+  const activeRect = activePanel.getBoundingClientRect();
+  const metrics = new Map();
+  layoutVisiblePeers(activePanel, ".panel").forEach((peer) => {
+    const peerRect = peer.getBoundingClientRect();
+    const horizontalDepth = Math.min(
+      activeRect.right + LAYOUT_COLLISION_GAP,
+      peerRect.right + LAYOUT_COLLISION_GAP,
+    ) - Math.max(activeRect.left, peerRect.left);
+    const verticalDepth = Math.min(
+      activeRect.bottom + LAYOUT_COLLISION_GAP,
+      peerRect.bottom + LAYOUT_COLLISION_GAP,
+    ) - Math.max(activeRect.top, peerRect.top);
+    if (horizontalDepth > 0 && verticalDepth > 0) {
+      metrics.set(peer, { horizontalDepth, verticalDepth });
+    }
+  });
+  return metrics;
+}
+
+function panelCollisionWorsened(activePanel, baselineMetrics) {
+  const currentMetrics = panelPeerCollisionMetrics(activePanel);
+  for (const [peer, current] of currentMetrics) {
+    const baseline = baselineMetrics.get(peer);
+    if (!baseline) return true;
+    if (
+      current.horizontalDepth > baseline.horizontalDepth + 1
+      || current.verticalDepth > baseline.verticalDepth + 1
+    ) return true;
+  }
+  return false;
+}
+
 function applyPanelOffset(panel, position = {}) {
   return applyLayoutTransformOffset(panel, position.x, position.y, {
     max: LAYOUT_MAX_OFFSET,
@@ -1302,7 +1336,15 @@ function currentPanelOffset(panel, storedPosition = {}) {
 
 function repairLivePanelOverlaps(root) {
   if (!(root instanceof Element)) return [];
-  const repairs = repairLayoutPanelOverlaps(".panel", { root, gap: LAYOUT_COLLISION_GAP });
+  // Pointer resizing already rejects new or worsened collisions. On edit exit
+  // only transforms need emergency repair: some Live views intentionally use
+  // nested/overlapping flow surfaces, so treating every inline baseline size
+  // as corruption makes otherwise valid horizontal and vertical edits vanish.
+  const repairs = repairLayoutPanelOverlaps(".panel", {
+    root,
+    gap: LAYOUT_COLLISION_GAP,
+    resetDimensions: false,
+  });
   if (!repairs.length) return repairs;
 
   const sizeStore = readStoredMap(PANEL_SIZE_STORAGE_KEY);
@@ -1383,6 +1425,10 @@ function isInteractiveLayoutTarget(target) {
 function ensurePanelHandles(panel) {
   panel.classList.add("resizable-panel");
   panelLayoutKey(panel);
+  // Live snapshots can replace rows several times while the pointer is down.
+  // Do not let the mutation observer restore the previous persisted geometry
+  // over an in-progress resize or move before pointerup commits the new value.
+  if (panel.classList.contains("resizing-panel") || panel.classList.contains("dragging-panel")) return;
 
   const sizes = readStoredMap(PANEL_SIZE_STORAGE_KEY);
   const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
@@ -1412,8 +1458,8 @@ function ensurePanelHandles(panel) {
   applyPanelOffset(panel, position);
   window.requestAnimationFrame(() => {
     if (!panel.isConnected || !panelOverlapsPeers(panel)) return;
-    panel.style.removeProperty("width");
-    clearPanelOffset(panel);
+    const offset = currentPanelOffset(panel, position);
+    if (Math.abs(offset.x) > 0 || Math.abs(offset.y) > 0) clearPanelOffset(panel);
   });
 
   const existingDirections = new Set(
@@ -1501,6 +1547,7 @@ function useEditablePanels(rootRef) {
         }),
       );
       const bounds = panel.getBoundingClientRect();
+      const baselineCollisions = panelPeerCollisionMetrics(panel);
       const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
       const startOffset = currentPanelOffset(panel, positions[key]);
       const affectsWidth = direction.includes("e") || direction.includes("w");
@@ -1511,6 +1558,7 @@ function useEditablePanels(rootRef) {
         x: startOffset.x,
         y: startOffset.y,
       };
+      panel.classList.add("resizing-panel");
       document.body.classList.add("is-resizing-layout");
 
       const onMove = (moveEvent) => {
@@ -1534,7 +1582,8 @@ function useEditablePanels(rootRef) {
           }
         }
         applyPanelOffset(panel, nextOffset);
-        if (panelOverlapsPeers(panel)) {
+        const staysInsideOriginalFootprint = nextWidth <= bounds.width && nextHeight <= bounds.height;
+        if (!staysInsideOriginalFootprint && panelCollisionWorsened(panel, baselineCollisions)) {
           panel.style.width = `${lastValidLayout.width}px`;
           panel.style.height = `${lastValidLayout.height}px`;
           applyPanelOffset(panel, { x: lastValidLayout.x, y: lastValidLayout.y });
@@ -1566,6 +1615,7 @@ function useEditablePanels(rootRef) {
           delete positionStore[key];
         }
         writeStoredMap(PANEL_POSITION_STORAGE_KEY, positionStore);
+        panel.classList.remove("resizing-panel");
         document.body.classList.remove("is-resizing-layout");
         document.removeEventListener("pointermove", onMove);
         document.removeEventListener("pointerup", onUp);

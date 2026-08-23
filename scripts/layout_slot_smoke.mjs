@@ -13,6 +13,33 @@ function sameRect(left, right, properties = ["x", "y", "width", "height"]) {
   return Boolean(left && right && properties.every((property) => closeEnough(left[property], right[property])));
 }
 
+async function dragResizeHandle(page, handle, deltaX, deltaY) {
+  await handle.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(30);
+  const handleBox = await handle.boundingBox();
+  if (!handleBox) return false;
+  const startX = handleBox.x + handleBox.width / 2;
+  const startY = handleBox.y + handleBox.height / 2;
+  await page.mouse.move(startX, startY);
+  await page.mouse.down();
+  await page.mouse.move(startX + deltaX, startY + deltaY, { steps: 8 });
+  await page.mouse.up();
+  await page.waitForTimeout(80);
+  return true;
+}
+
+async function documentBox(locator) {
+  return locator.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    return {
+      height: rect.height,
+      width: rect.width,
+      x: rect.left + window.scrollX,
+      y: rect.top + window.scrollY,
+    };
+  });
+}
+
 try {
   const page = await browser.newPage({ viewport: { width: 1707, height: 960 } });
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
@@ -116,6 +143,142 @@ try {
 
   await layoutEditor.click();
   await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "edit");
+
+  // Exercise both resize axes on one real, top-level panel in every Live tab.
+  // The selected height delta always shrinks when possible so the operation
+  // cannot be rejected merely because a following grid row is occupied.
+  const tabResizeResults = [];
+  for (const tabLabel of operationalTabs) {
+    await page.getByRole("button", { name: tabLabel, exact: true }).click();
+    await page.waitForTimeout(80);
+    const candidates = await page.locator(".page-view .panel.resizable-panel").evaluateAll((panels) => panels
+      .map((panel, index) => {
+        const rect = panel.getBoundingClientRect();
+        const parentPanel = panel.parentElement?.closest(".panel");
+        return {
+          height: rect.height,
+          index,
+          key: panel.getAttribute("data-layout-key") || "",
+          topLevel: !parentPanel,
+          width: rect.width,
+        };
+      })
+      .filter((panel) => panel.key && panel.width >= 260 && panel.height >= 112)
+      .sort((left, right) => Number(right.topLevel) - Number(left.topLevel) || right.height - left.height));
+    const selected = candidates[0];
+    if (!selected) {
+      issues.push(`${tabLabel} 탭에서 양축 크기 조절에 적합한 대표 패널을 찾지 못했습니다.`);
+      continue;
+    }
+
+    const panel = page.locator(`.page-view .panel[data-layout-key=${JSON.stringify(selected.key)}]`).first();
+    const eastResizeHandle = panel.locator(":scope > .panel-resize-east");
+    await eastResizeHandle.scrollIntoViewIfNeeded();
+    const before = await documentBox(panel);
+    const horizontalDragged = await dragResizeHandle(
+      page,
+      eastResizeHandle,
+      -48,
+      0,
+    );
+    const afterHorizontal = await documentBox(panel);
+    if (!horizontalDragged || !before || !afterHorizontal || before.width - afterHorizontal.width < 24) {
+      issues.push(`${tabLabel} 탭 대표 패널의 가로 크기가 실제 드래그로 조절되지 않았습니다.`);
+    }
+    if (!sameRect(before, afterHorizontal, ["x", "y", "height"])) {
+      issues.push(`${tabLabel} 탭 가로 조절 중 위치 또는 높이가 함께 바뀌었습니다.`);
+    }
+
+    const availableVerticalShrink = Math.max(0, (afterHorizontal?.height || 0) - 88);
+    const verticalDelta = -Math.min(48, availableVerticalShrink);
+    const southResizeHandle = panel.locator(":scope > .panel-resize-south");
+    await southResizeHandle.scrollIntoViewIfNeeded();
+    const verticalDragged = verticalDelta <= -24 && await dragResizeHandle(
+      page,
+      southResizeHandle,
+      0,
+      verticalDelta,
+    );
+    const afterVertical = await documentBox(panel);
+    if (!verticalDragged || !afterHorizontal || !afterVertical || afterHorizontal.height - afterVertical.height < 16) {
+      issues.push(`${tabLabel} 탭 대표 패널의 세로 크기가 실제 드래그로 조절되지 않았습니다.`);
+    }
+    if (!sameRect(afterHorizontal, afterVertical, ["x", "y", "width"])) {
+      issues.push(`${tabLabel} 탭 세로 조절 중 위치 또는 너비가 함께 바뀌었습니다.`);
+    }
+
+    const storedSize = await page.evaluate((key) => {
+      const sizes = JSON.parse(localStorage.getItem("live-trader.panelSizes.v1") || "{}");
+      return sizes[key] || null;
+    }, selected.key);
+    if (!storedSize || !afterVertical
+      || !closeEnough(storedSize.width, afterVertical.width)
+      || !closeEnough(storedSize.height, afterVertical.height)) {
+      issues.push(`${tabLabel} 탭 대표 패널의 양축 크기 저장값이 실제 크기와 일치하지 않습니다.`);
+    }
+    tabResizeResults.push({
+      afterHorizontal,
+      afterVertical,
+      before,
+      key: selected.key,
+      storedSize,
+      tabLabel,
+    });
+  }
+  observations.tabResize = tabResizeResults;
+
+  // Verify the saved geometry is reapplied to the actual panel after reload.
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "edit");
+  const tabResizeRestores = [];
+  for (const result of tabResizeResults) {
+    await page.getByRole("button", { name: result.tabLabel, exact: true }).click();
+    await page.waitForTimeout(60);
+    const restored = await page.locator(
+      `.page-view .panel[data-layout-key=${JSON.stringify(result.key)}]`,
+    ).first().boundingBox();
+    tabResizeRestores.push({ key: result.key, restored, tabLabel: result.tabLabel });
+    if (!restored || !result.storedSize
+      || !closeEnough(restored.width, result.storedSize.width)
+      || !closeEnough(restored.height, result.storedSize.height)) {
+      issues.push(`${result.tabLabel} 탭 대표 패널의 저장된 양축 크기가 새로고침 후 복원되지 않았습니다.`);
+    }
+  }
+  observations.tabResizeRestores = tabResizeRestores;
+
+  // Once layout editing is locked, saved short heights must become minimums
+  // and every panel must reveal all live content instead of clipping it.
+  if (await page.evaluate(() => document.documentElement.dataset.layoutMode) === "edit") {
+    // The keyboard route remains reachable even when an intentionally short
+    // edit height temporarily places a panel control under its resize edge.
+    await page.keyboard.press("Control+Shift+L");
+    await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "locked");
+  }
+  const lockedAfterResize = [];
+  for (const result of tabResizeResults) {
+    await page.getByRole("button", { name: result.tabLabel, exact: true }).click();
+    await page.waitForTimeout(60);
+    const visibility = await page.locator(
+      `.page-view .panel[data-layout-key=${JSON.stringify(result.key)}]`,
+    ).first().evaluate((panel) => ({
+      clientHeight: panel.clientHeight,
+      fixedHeight: panel.style.height,
+      minimumHeight: panel.style.minHeight,
+      scrollHeight: panel.scrollHeight,
+    }));
+    lockedAfterResize.push({ ...visibility, key: result.key, tabLabel: result.tabLabel });
+    if (visibility.fixedHeight || visibility.clientHeight + 1 < visibility.scrollHeight) {
+      issues.push(`${result.tabLabel} 탭 대표 패널이 잠금 후 전체 콘텐츠 높이로 확장되지 않았습니다.`);
+    }
+  }
+  observations.lockedAfterTabResize = lockedAfterResize;
+
+  await page.getByRole("button", { name: "설정·진단", exact: true }).click();
+  await layoutEditor.locator("xpath=..").getByRole("button", { name: "초기화", exact: true }).click();
+  if (await layoutEditor.getAttribute("aria-pressed") !== "true") {
+    await layoutEditor.click();
+    await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "edit");
+  }
   await page.getByRole("button", { name: /^리스크·안전/ }).click();
   await page.locator(".operational-safeguards-panel").waitFor({ state: "visible" });
   await page.waitForTimeout(100);
