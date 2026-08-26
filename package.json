@@ -10,6 +10,7 @@
     "package:desktop": "powershell -ExecutionPolicy Bypass -File build_exe.ps1",
     "test:accounts": "node scripts/account_refresh.test.mjs",
     "test:account-visualization": "node scripts/account_visualization.test.mjs",
+    "test:layout-contract": "node scripts/layout_slot_smoke.mjs",
     "test:layout-slot": "node scripts/layout_slot_smoke.mjs",
     "test:polling": "node scripts/polling.test.mjs",
     "test:api-resilience": "node scripts/api_resilience.test.mjs",

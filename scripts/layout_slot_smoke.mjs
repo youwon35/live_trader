@@ -1,13 +1,146 @@
+import { spawn } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
 
-const baseUrl = process.env.LIVE_TRADER_LAYOUT_SMOKE_URL || "http://127.0.0.1:4180";
+const configuredBaseUrl = process.env.LIVE_TRADER_LAYOUT_SMOKE_URL;
+const baseUrl = configuredBaseUrl || "http://127.0.0.1:4180";
+const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tolerance = 10;
 const minimumGap = 7;
 const issues = [];
 const observations = {};
-const browser = await chromium.launch({ channel: "msedge", headless: true });
+let browser;
+let devServer;
+let devServerClosed = false;
+let devServerSpawnError;
+const devServerOutput = [];
 
 const closeEnough = (left, right) => Math.abs(Number(left) - Number(right)) <= tolerance;
+const processEnded = (child) => child.exitCode !== null || child.signalCode !== null;
+
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function canReach(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1_000);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function rememberServerOutput(chunk) {
+  devServerOutput.push(String(chunk));
+  if (devServerOutput.length > 40) devServerOutput.shift();
+}
+
+async function ensureApplication() {
+  if (await canReach(baseUrl)) return;
+  if (configuredBaseUrl) {
+    throw new Error(`지정한 Live Trader URL에 연결할 수 없습니다: ${baseUrl}`);
+  }
+
+  const parsedUrl = new URL(baseUrl);
+  const viteEntry = path.join(appRoot, "node_modules", "vite", "bin", "vite.js");
+  devServer = spawn(process.execPath, [
+    viteEntry,
+    "--host",
+    parsedUrl.hostname,
+    "--port",
+    parsedUrl.port || "4180",
+    "--strictPort",
+  ], {
+    cwd: appRoot,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  devServer.on("error", (error) => {
+    devServerSpawnError = error;
+    rememberServerOutput(error.message);
+  });
+  devServer.once("close", () => {
+    devServerClosed = true;
+  });
+  devServer.stdout.on("data", rememberServerOutput);
+  devServer.stderr.on("data", rememberServerOutput);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (devServerSpawnError) {
+      throw new Error(`Live Trader 개발 서버를 시작하지 못했습니다. ${devServerSpawnError.message}`);
+    }
+    if (processEnded(devServer)) {
+      throw new Error(`Live Trader 개발 서버가 조기 종료되었습니다. ${devServerOutput.join("").trim()}`);
+    }
+    if (await canReach(baseUrl)) return;
+    await delay(200);
+  }
+  throw new Error(`Live Trader 개발 서버가 30초 안에 준비되지 않았습니다. ${devServerOutput.join("").trim()}`);
+}
+
+async function waitForApplicationClose(timeoutMilliseconds) {
+  if (!devServer || devServerClosed) return true;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (closed) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      devServer.off("close", handleClose);
+      resolve(closed);
+    };
+    const handleClose = () => finish(true);
+    const timeout = setTimeout(() => finish(devServerClosed), timeoutMilliseconds);
+    devServer.once("close", handleClose);
+  });
+}
+
+async function forceStopWindowsProcessTree() {
+  if (process.platform !== "win32" || !devServer?.pid || processEnded(devServer)) return "";
+  return new Promise((resolve) => {
+    const output = [];
+    const killer = spawn("taskkill", ["/PID", String(devServer.pid), "/T", "/F"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    killer.stdout.on("data", (chunk) => output.push(String(chunk)));
+    killer.stderr.on("data", (chunk) => output.push(String(chunk)));
+    killer.once("error", (error) => resolve(error.message));
+    killer.once("close", () => resolve(output.join("").trim()));
+  });
+}
+
+async function stopApplication() {
+  // Only `ensureApplication` assigns devServer, so an externally supplied URL
+  // can never reach the process termination paths below.
+  if (!devServer) return;
+  if (!processEnded(devServer)) devServer.kill();
+  let closed = await waitForApplicationClose(3_000);
+  let taskkillOutput = "";
+  if ((!closed || !processEnded(devServer)) && process.platform === "win32") {
+    taskkillOutput = await forceStopWindowsProcessTree();
+    closed = await waitForApplicationClose(5_000);
+  }
+  if (!processEnded(devServer)) {
+    devServer.kill("SIGKILL");
+    closed = await waitForApplicationClose(1_000);
+  }
+  if (!closed && processEnded(devServer)) {
+    devServer.stdout?.destroy();
+    devServer.stderr?.destroy();
+    closed = await waitForApplicationClose(1_000);
+  }
+  if (!closed || !processEnded(devServer)) {
+    devServer.unref();
+    const detail = taskkillOutput ? ` taskkill: ${taskkillOutput}` : "";
+    throw new Error(`Live Trader 개발 서버 프로세스를 종료하지 못했습니다.${detail}`);
+  }
+}
 
 function sameRect(left, right, properties = ["x", "y", "width", "height"]) {
   return Boolean(left && right && properties.every((property) => closeEnough(left[property], right[property])));
@@ -41,6 +174,8 @@ async function documentBox(locator) {
 }
 
 try {
+  await ensureApplication();
+  browser = await chromium.launch({ channel: "msedge", headless: true });
   const page = await browser.newPage({ viewport: { width: 1707, height: 960 } });
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.locator(".nav-item").first().waitFor({ state: "visible" });
@@ -450,21 +585,130 @@ try {
     transformed: [...document.querySelectorAll(".page-view .panel")]
       .some((panel) => panel.style.transform || panel.style.width || panel.style.height),
   }));
+  observations.reset = resetState;
   if (resetState.positions || resetState.sizes || resetState.transformed) {
     issues.push("레이아웃 초기화가 저장 위치·크기 또는 인라인 배치를 제거하지 못했습니다.");
   }
 
   await page.close();
+} catch (error) {
+  issues.push(error instanceof Error ? error.message : String(error));
+  observations.fatalError = error instanceof Error
+    ? { message: error.message, name: error.name }
+    : { message: String(error), name: "Error" };
 } finally {
-  await browser.close();
+  try {
+    if (browser) await browser.close();
+  } catch (error) {
+    issues.push(`Playwright 브라우저 종료 실패: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    await stopApplication();
+  } catch (error) {
+    issues.push(`Live Trader 개발 서버 종료 실패: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+const expectedTabCount = 10;
+const tabResize = observations.tabResize || [];
+const tabResizeRestores = observations.tabResizeRestores || [];
+const lockedAfterTabResize = observations.lockedAfterTabResize || [];
+const lockedPanelClipping = observations.lockedPanelClipping || {};
+const horizontalAxisIsolationPassed = tabResize.length === expectedTabCount
+  && tabResize.every(({ afterHorizontal, before }) => (
+    before && afterHorizontal
+    && before.width - afterHorizontal.width >= 24
+    && sameRect(before, afterHorizontal, ["x", "y", "height"])
+  ));
+const verticalAxisIsolationPassed = tabResize.length === expectedTabCount
+  && tabResize.every(({ afterHorizontal, afterVertical }) => (
+    afterHorizontal && afterVertical
+    && afterHorizontal.height - afterVertical.height >= 16
+    && sameRect(afterHorizontal, afterVertical, ["x", "y", "width"])
+  ));
+const persistencePassed = tabResize.length === expectedTabCount
+  && tabResizeRestores.length === expectedTabCount
+  && tabResize.every(({ key, storedSize, tabLabel }) => {
+    const restored = tabResizeRestores.find((candidate) => (
+      candidate.key === key && candidate.tabLabel === tabLabel
+    ))?.restored;
+    return restored && storedSize
+      && closeEnough(restored.width, storedSize.width)
+      && closeEnough(restored.height, storedSize.height);
+  })
+  && observations.persistence?.beforeReload?.positions === observations.persistence?.afterReload?.positions
+  && observations.persistence?.beforeReload?.sizes === observations.persistence?.afterReload?.sizes;
+const initialLockedVisibility = observations.lockedContentVisibility;
+const lockedContentVisibilityPassed = Boolean(
+  initialLockedVisibility
+  && !initialLockedVisibility.fixedHeight
+  && initialLockedVisibility.clientHeight + 1 >= initialLockedVisibility.scrollHeight
+  && Object.keys(lockedPanelClipping).length === expectedTabCount
+  && Object.values(lockedPanelClipping).every((clippedPanels) => clippedPanels.length === 0)
+  && lockedAfterTabResize.length === expectedTabCount
+  && lockedAfterTabResize.every((visibility) => (
+    !visibility.fixedHeight && visibility.clientHeight + 1 >= visibility.scrollHeight
+  )),
+);
+const resetPassed = Boolean(
+  observations.reset
+  && !observations.reset.positions
+  && !observations.reset.sizes
+  && !observations.reset.transformed,
+);
+
+const checkResults = {
+  horizontalAxisIsolation: {
+    status: horizontalAxisIsolationPassed ? "pass" : "fail",
+    details: { passedTabs: tabResize.filter(({ afterHorizontal, before }) => (
+      before && afterHorizontal
+      && before.width - afterHorizontal.width >= 24
+      && sameRect(before, afterHorizontal, ["x", "y", "height"])
+    )).length, totalTabs: expectedTabCount },
+  },
+  verticalAxisIsolation: {
+    status: verticalAxisIsolationPassed ? "pass" : "fail",
+    details: { passedTabs: tabResize.filter(({ afterHorizontal, afterVertical }) => (
+      afterHorizontal && afterVertical
+      && afterHorizontal.height - afterVertical.height >= 16
+      && sameRect(afterHorizontal, afterVertical, ["x", "y", "width"])
+    )).length, totalTabs: expectedTabCount },
+  },
+  persistence: {
+    status: persistencePassed ? "pass" : "fail",
+    details: { restoredTabs: tabResizeRestores.length, totalTabs: expectedTabCount },
+  },
+  lockedContentVisibility: {
+    status: lockedContentVisibilityPassed ? "pass" : "fail",
+    details: {
+      checkedTabs: Object.keys(lockedPanelClipping).length,
+      clippedPanels: Object.values(lockedPanelClipping)
+        .reduce((total, clippedPanels) => total + clippedPanels.length, 0),
+      totalTabs: expectedTabCount,
+    },
+  },
+  reset: {
+    status: resetPassed ? "pass" : "fail",
+    details: observations.reset || null,
+  },
+};
+for (const [checkName, check] of Object.entries(checkResults)) {
+  if (check.status === "fail") issues.push(`layout contract check failed: ${checkName}`);
 }
 
 const report = {
-  baseUrl,
-  checkedAt: new Date().toISOString(),
-  observations,
-  issues,
-  ok: issues.length === 0,
+  schemaVersion: "trading-system.layout-regression.v1",
+  appId: "live_trader",
+  status: issues.length === 0 ? "pass" : "fail",
+  generatedAt: new Date().toISOString(),
+  checks: checkResults,
+  issues: [...new Set(issues)],
+  tabs: tabResize.map(({ afterHorizontal, afterVertical, before, key, tabLabel }) => ({
+    id: key,
+    label: tabLabel,
+    horizontalDelta: before && afterHorizontal ? afterHorizontal.width - before.width : null,
+    verticalDelta: afterHorizontal && afterVertical ? afterVertical.height - afterHorizontal.height : null,
+  })),
 };
-console.log(JSON.stringify(report, null, 2));
-if (issues.length) process.exitCode = 1;
+console.log(`LAYOUT_CONTRACT_RESULT=${JSON.stringify(report)}`);
+if (report.status === "fail") process.exitCode = 1;
