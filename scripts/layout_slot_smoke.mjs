@@ -185,7 +185,8 @@ try {
     localStorage.removeItem("live-trader.layoutMode.v1");
   });
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByRole("button", { name: /^설정·진단/ }).click();
+  await page.getByRole("button", { name: /^연결 설정/ }).click();
+  await page.getByRole("button", { name: /화면·레이아웃·Telegram/ }).click();
   const layoutEditor = page.locator('[data-layout-control="editor"]');
   await layoutEditor.waitFor({ state: "visible" });
   await layoutEditor.locator("xpath=..").getByRole("button", { name: "초기화", exact: true }).click();
@@ -230,16 +231,16 @@ try {
   }
 
   const operationalTabs = [
-    "운영 현황",
-    "배포·승급",
-    "기능시험",
-    "계좌·포지션",
-    "주문·체결",
-    "리스크·안전",
-    "실거래 운영",
-    "감사 기록",
+    "실행 준비",
+    "배포 검증",
+    "주문 기능 검증",
+    "위험 관리",
+    "실거래 실행",
+    "계좌 대조",
+    "주문 추적",
+    "운영 기록",
     "기술 로그",
-    "설정·진단",
+    "연결 설정",
   ];
   observations.lockedPanelClipping = {};
   for (const tabLabel of operationalTabs) {
@@ -273,7 +274,8 @@ try {
   if (await page.locator('[data-program-journey="true"]').count()) {
     issues.push("제거 요청한 전체 프로그램 여정 배너가 남아 있습니다.");
   }
-  await page.getByRole("button", { name: "설정·진단", exact: true }).click();
+  await page.getByRole("button", { name: "연결 설정", exact: true }).click();
+  await page.getByRole("button", { name: /화면·레이아웃·Telegram/ }).click();
   await layoutEditor.waitFor({ state: "visible" });
 
   await layoutEditor.click();
@@ -408,13 +410,15 @@ try {
   }
   observations.lockedAfterTabResize = lockedAfterResize;
 
-  await page.getByRole("button", { name: "설정·진단", exact: true }).click();
+  await page.getByRole("button", { name: "연결 설정", exact: true }).click();
+  await page.getByRole("button", { name: /화면·레이아웃·Telegram/ }).click();
   await layoutEditor.locator("xpath=..").getByRole("button", { name: "초기화", exact: true }).click();
   if (await layoutEditor.getAttribute("aria-pressed") !== "true") {
     await layoutEditor.click();
     await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "edit");
   }
-  await page.getByRole("button", { name: /^리스크·안전/ }).click();
+  await page.getByRole("button", { name: /^위험 관리/ }).click();
+  await page.getByRole("button", { name: /리스크 정책·재시도·선물 계산/ }).click();
   await page.locator(".operational-safeguards-panel").waitFor({ state: "visible" });
   await page.waitForTimeout(100);
 
@@ -562,7 +566,7 @@ try {
     sizes: localStorage.getItem("live-trader.panelSizes.v1"),
   }));
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByRole("button", { name: /^리스크·안전/ }).click();
+  await page.getByRole("button", { name: /^위험 관리/ }).click();
   await page.locator(".operational-safeguards-panel").waitFor({ state: "visible" });
   await page.waitForTimeout(150);
   const afterReload = await page.evaluate(() => ({
@@ -574,9 +578,10 @@ try {
     issues.push("새로고침 후 독립 위치 또는 크기 저장값이 유지되지 않았습니다.");
   }
 
-  await page.getByRole("button", { name: /^설정·진단/ }).click();
+  await page.getByRole("button", { name: /^연결 설정/ }).click();
+  await page.getByRole("button", { name: /화면·레이아웃·Telegram/ }).click();
   await page.getByRole("button", { name: "초기화", exact: true }).click();
-  await page.getByRole("button", { name: /^리스크·안전/ }).click();
+  await page.getByRole("button", { name: /^위험 관리/ }).click();
   await page.locator(".operational-safeguards-panel").waitFor({ state: "visible" });
   await page.waitForTimeout(100);
   const resetState = await page.evaluate(() => ({

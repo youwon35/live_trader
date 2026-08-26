@@ -62,6 +62,7 @@ function LaneCard({ lane, status, controls, busy, onStart, onStop, onRecover }) 
         <div><dt>시험 계약</dt><dd>2시간 · BUY 1회 · SELL 1회 · 재진입 없음</dd></div>
         <div><dt>금액</dt><dd>{amount}</dd></div>
         <div><dt>보증 모드</dt><dd>{assurance}</dd></div>
+        <div><dt>계정 Fingerprint</dt><dd><code>{compact(status.accountFingerprint)}</code></dd></div>
         <div><dt>세션</dt><dd>{compact(controls.sessionId)}</dd></div>
         <div>
           <dt>Owner SHA256</dt>
@@ -108,7 +109,7 @@ function LaneCard({ lane, status, controls, busy, onStart, onStop, onRecover }) 
   );
 }
 
-export default function CryptoFirstLivePanel() {
+export default function CryptoFirstLivePanel({ onSafetyStateChange }) {
   const [upbit, setUpbit] = useState(EMPTY_STATUS);
   const [binance, setBinance] = useState(EMPTY_STATUS);
   const [busy, setBusy] = useState("");
@@ -167,6 +168,34 @@ export default function CryptoFirstLivePanel() {
   }
 
   const anyLaneActive = controls.upbit.active || controls.binance.active;
+  const statusKnown = upbit !== EMPTY_STATUS && binance !== EMPTY_STATUS && !error;
+  const safeTerminalStates = new Set(["IDLE", "FINALIZED"]);
+  const safeToLeave = statusKnown
+    && !anyLaneActive
+    && [controls.upbit, controls.binance].every((lane) => (
+      safeTerminalStates.has(lane.terminalState)
+      && !lane.stopEnabled
+      && !lane.recoverEnabled
+    ));
+  const safetyState = useMemo(() => ({
+    statusKnown,
+    safeToLeave,
+    anyLaneActive,
+    upbit: {
+      accountFingerprint: String(upbit.accountFingerprint || ""),
+      sessionId: controls.upbit.sessionId,
+      terminalState: controls.upbit.terminalState,
+    },
+    binance: {
+      accountFingerprint: String(binance.accountFingerprint || ""),
+      sessionId: controls.binance.sessionId,
+      terminalState: controls.binance.terminalState,
+    },
+  }), [anyLaneActive, binance, controls, safeToLeave, statusKnown, upbit]);
+
+  useEffect(() => {
+    onSafetyStateChange?.(safetyState);
+  }, [onSafetyStateChange, safetyState]);
 
   return (
     <div className="crypto-first-live-panel" aria-labelledby="crypto-first-live-heading">

@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   BadgeCheck,
@@ -72,7 +72,16 @@ function blockerLabel(value) {
   return BLOCKER_LABELS[value] || String(value || "확인 필요");
 }
 
-export default function FunctionalTestWorkspace() {
+export default function FunctionalTestWorkspace({ snapshot = {} }) {
+  const [testRoute, setTestRoute] = useState("kis");
+  const [cryptoSafety, setCryptoSafety] = useState({
+    statusKnown: false,
+    safeToLeave: false,
+    anyLaneActive: false,
+    upbit: {},
+    binance: {},
+  });
+  const [showBinding, setShowBinding] = useState(false);
   const [workspace, setWorkspace] = useState(EMPTY_FUNCTIONAL_TEST_WORKSPACE);
   const [selectedKey, setSelectedKey] = useState("");
   const [durationValue, setDurationValue] = useState(6);
@@ -83,6 +92,7 @@ export default function FunctionalTestWorkspace() {
   const [error, setError] = useState("");
   const [startAcknowledged, setStartAcknowledged] = useState(false);
   const [now, setNow] = useState(() => new Date());
+  const routeTabRefs = useRef({});
 
   async function refresh({ quiet = false } = {}) {
     if (!quiet) setBusyAction("refresh");
@@ -98,6 +108,7 @@ export default function FunctionalTestWorkspace() {
   }
 
   useEffect(() => {
+    if (testRoute !== "kis") return undefined;
     let cancelled = false;
     getFunctionalTestWorkspace()
       .then((result) => {
@@ -116,7 +127,7 @@ export default function FunctionalTestWorkspace() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [testRoute]);
 
   const selectedCandidate = useMemo(
     () => preferredFunctionalTestCandidate(workspace, selectedKey),
@@ -143,6 +154,37 @@ export default function FunctionalTestWorkspace() {
   const statusTone = functionalTestStatusTone(workspace.status);
   const effectiveCaps = workspace.effectiveCaps;
   const appliedCaps = effectiveCaps.available ? effectiveCaps.values : null;
+  const apiFailClosed = snapshot.api_connected !== true;
+  const globalKilled = snapshot.kill_switch === true;
+  const routeTarget = testRoute === "crypto"
+    ? "Upbit KRW-BTC / Binance Spot BTCUSDT"
+    : selectedCandidate?.label || "KIS 대상 미선택";
+  const accountScope = testRoute === "crypto"
+    ? cryptoSafety.statusKnown
+      ? `UPBIT ${compactHash(cryptoSafety.upbit.accountFingerprint)} · BINANCE ${compactHash(cryptoSafety.binance.accountFingerprint)}`
+      : "계정 fingerprint 확인 중 · 전송 차단"
+    : workspace.account.label;
+  const sessionScope = testRoute === "crypto"
+    ? cryptoSafety.statusKnown
+      ? `UPBIT ${compactHash(cryptoSafety.upbit.sessionId)} · BINANCE ${compactHash(cryptoSafety.binance.sessionId)}`
+      : "exact session 확인 중"
+    : permit?.permitId || activation?.activationId || "허가 세션 없음";
+  const authorityContract = testRoute === "crypto"
+    ? "시작마다 네이티브 45초 1회"
+    : "허가 + 당일 승인 + 시작 확인";
+  const routeStatus = apiFailClosed
+    ? "FAIL-CLOSED"
+    : globalKilled
+      ? "KILLED · 전송 차단"
+      : testRoute === "crypto"
+        ? !cryptoSafety.statusKnown
+          ? "FAIL-CLOSED · lane 상태 확인 중"
+          : cryptoSafety.anyLaneActive
+            ? "CRYPTO FUNCTIONAL_TEST 활성"
+            : "LOCKED · 종료 상태"
+        : workspace.runtime.functionalTestRunning
+          ? "KIS FUNCTIONAL_TEST 활성"
+          : "LOCKED";
 
   async function runCommand(actionName, command) {
     setBusyAction(actionName);
@@ -176,6 +218,38 @@ export default function FunctionalTestWorkspace() {
     const bounds = functionalTestDurationBounds(nextUnit, workspace.durationLimits.maxDays);
     setDurationUnit(nextUnit);
     setDurationValue((current) => Math.max(bounds.min, Math.min(bounds.max, Number(current) || bounds.min)));
+  }
+
+  function changeTestRoute(nextRoute) {
+    if (nextRoute === testRoute) return true;
+    if (testRoute === "kis" && workspace.runtime.functionalTestRunning) {
+      setError("실행 중인 KIS 기능시험을 먼저 ‘오늘 실행 정지’로 정리한 뒤 경로를 전환하세요.");
+      return false;
+    }
+    if (testRoute === "crypto" && !cryptoSafety.safeToLeave) {
+      setError("Upbit와 Binance Spot의 exact terminal 상태가 모두 IDLE 또는 FINALIZED로 확인될 때까지 코인 제어 화면을 닫을 수 없습니다.");
+      return false;
+    }
+    setError("");
+    setTestRoute(nextRoute);
+    return true;
+  }
+
+  function handleRouteTabKeyDown(event, currentRoute) {
+    const routes = ["kis", "crypto"];
+    let nextRoute = "";
+    if (["ArrowLeft", "ArrowUp"].includes(event.key)) {
+      nextRoute = routes[(routes.indexOf(currentRoute) - 1 + routes.length) % routes.length];
+    } else if (["ArrowRight", "ArrowDown"].includes(event.key)) {
+      nextRoute = routes[(routes.indexOf(currentRoute) + 1) % routes.length];
+    } else if (event.key === "Home") {
+      nextRoute = routes[0];
+    } else if (event.key === "End") {
+      nextRoute = routes[routes.length - 1];
+    }
+    if (!nextRoute) return;
+    event.preventDefault();
+    if (changeTestRoute(nextRoute)) routeTabRefs.current[nextRoute]?.focus();
   }
 
   function activateToday() {
@@ -215,15 +289,83 @@ export default function FunctionalTestWorkspace() {
 
   return (
     <section className="functional-test-workspace" aria-labelledby="functional-test-heading">
-      <CryptoFirstLivePanel />
+      <header className="functional-test-route-header">
+        <div>
+          <span className="functional-test-eyebrow">CONTROLLED LIVE TEST ROUTES</span>
+          <h2 id="functional-test-heading">주문 기능 검증</h2>
+        </div>
+        <div className="functional-test-route-tabs" role="tablist" aria-label="기능시험 경로">
+          <button
+            id="functional-test-kis-tab"
+            ref={(node) => { routeTabRefs.current.kis = node; }}
+            type="button"
+            role="tab"
+            aria-selected={testRoute === "kis"}
+            aria-controls="functional-test-kis-panel"
+            tabIndex={testRoute === "kis" ? 0 : -1}
+            className={testRoute === "kis" ? "is-active" : ""}
+            onClick={() => changeTestRoute("kis")}
+            onKeyDown={(event) => handleRouteTabKeyDown(event, "kis")}
+          >
+            KIS 기간형
+          </button>
+          <button
+            id="functional-test-crypto-tab"
+            ref={(node) => { routeTabRefs.current.crypto = node; }}
+            type="button"
+            role="tab"
+            aria-selected={testRoute === "crypto"}
+            aria-controls="functional-test-crypto-panel"
+            tabIndex={testRoute === "crypto" ? 0 : -1}
+            className={testRoute === "crypto" ? "is-active" : ""}
+            onClick={() => changeTestRoute("crypto")}
+            onKeyDown={(event) => handleRouteTabKeyDown(event, "crypto")}
+          >
+            코인 2시간
+          </button>
+        </div>
+      </header>
+
+      <div className="functional-test-safety-strip" aria-label="기능시험 고정 안전 상태">
+        <div><span>환경</span><strong>LIVE · 실계좌</strong></div>
+        <div><span>시험 경계</span><strong>비승급 · promotionEligible=false</strong></div>
+        <div><span>대상</span><strong>{routeTarget}</strong></div>
+        <div><span>계정 범위</span><strong>{accountScope}</strong></div>
+        <div><span>세션</span><strong>{sessionScope}</strong></div>
+        <div><span>승인 계약</span><strong>{authorityContract}</strong></div>
+        <div><span>API·전송</span><strong>{routeStatus}</strong></div>
+        <div><span>전역 Kill</span><strong>{snapshot.kill_switch ? "KILLED" : snapshot.api_connected ? "NORMAL" : "확인 불가"}</strong></div>
+      </div>
+
+      <div className="functional-test-route-notice" role="note">
+        <AlertTriangle size={17} aria-hidden="true" />
+        <div>
+          <strong>{testRoute === "kis" ? "허가서 준비 즉시 전체 시험 기간이 시작됩니다." : "활성 코인 lane은 탭 전환만으로 중지되지 않습니다."}</strong>
+          <span>{testRoute === "kis" ? workspace.notice : "다른 경로로 이동하기 전에 중지·정리 또는 복구 완료 상태를 확인하세요."}</span>
+        </div>
+      </div>
+
+      {testRoute === "crypto" ? (
+        <div
+          className="functional-test-route-panel"
+          id="functional-test-crypto-panel"
+          role="tabpanel"
+          aria-labelledby="functional-test-crypto-tab"
+        >
+          <CryptoFirstLivePanel onSafetyStateChange={setCryptoSafety} />
+        </div>
+      ) : (
+        <div
+          className="functional-test-route-panel"
+          id="functional-test-kis-panel"
+          role="tabpanel"
+          aria-labelledby="functional-test-kis-tab"
+        >
       <header className="functional-test-hero">
         <div>
-          <span className="functional-test-eyebrow">KIS LIVE · CONTROLLED FUNCTIONAL EXECUTION</span>
-          <h2 id="functional-test-heading">실전 기능시험</h2>
-          <p>
-            긴 승급 조건과 분리해 선택한 전략 또는 포트폴리오를 실제 KIS 계좌 경로에서 기능시험합니다.
-            허가서 생성 즉시 기간이 시작되며 최대 {workspace.durationLimits.maxDays}일까지 설정할 수 있습니다.
-          </p>
+          <span className="functional-test-eyebrow">KIS LIVE · TIME BOXED</span>
+          <h3>KIS 기간형 기능시험</h3>
+          <p>대상·기간·당일 승인·실제 적용 한도를 한 흐름에서 관리합니다.</p>
         </div>
         <div className="functional-test-hero-status">
           <span className={`functional-test-status functional-test-status--${statusTone}`}>
@@ -254,15 +396,6 @@ export default function FunctionalTestWorkspace() {
           </button>
         </div>
       </header>
-
-      <div className="functional-test-boundary" role="note">
-        <ShieldCheck size={19} aria-hidden="true" />
-        <div>
-          <strong>승급 Evidence로 사용되지 않습니다.</strong>
-          <span>{workspace.notice}</span>
-        </div>
-        <span>promotionEligible=false</span>
-      </div>
 
       {(message || error) ? (
         <div className={`functional-test-feedback ${error ? "is-error" : "is-success"}`} role={error ? "alert" : "status"}>
@@ -438,28 +571,39 @@ export default function FunctionalTestWorkspace() {
           </div>
         </section>
 
-        <section className="panel functional-test-binding">
-          <div className="panel-header">
-            <div>
-              <span>IMMUTABLE BINDING</span>
-              <h3>현재 선택 범위</h3>
+        <section className="functional-test-binding-disclosure">
+          <button
+            type="button"
+            aria-expanded={showBinding}
+            aria-controls="functional-test-binding-details"
+            onClick={() => setShowBinding((current) => !current)}
+          >
+            <span><strong>바인딩 세부정보</strong><small>Artifact·Instance·계좌 hash</small></span>
+            <span>{showBinding ? "접기" : "열기"}</span>
+          </button>
+          <section className="panel functional-test-binding" id="functional-test-binding-details" hidden={!showBinding}>
+            <div className="panel-header">
+              <div>
+                <span>IMMUTABLE BINDING</span>
+                <h3>현재 선택 범위</h3>
+              </div>
+              <BadgeCheck size={19} aria-hidden="true" />
             </div>
-            <BadgeCheck size={19} aria-hidden="true" />
-          </div>
-          <div className="panel-body">
-            {selectedCandidate ? (
-              <dl className="functional-test-details">
-                <div><dt>대상</dt><dd>{selectedCandidate.kind === "PORTFOLIO" ? "포트폴리오" : "전략"} · {selectedCandidate.label}</dd></div>
-                <div><dt>Artifact</dt><dd>{selectedCandidate.artifactId}<small>{compactHash(selectedCandidate.artifactHash)}</small></dd></div>
-                <div><dt>Instance</dt><dd>{selectedCandidate.instanceId}</dd></div>
-                <div><dt>계좌</dt><dd>{workspace.account.label}<small>{compactHash(workspace.account.bindingId)}</small></dd></div>
-                <div><dt>종목</dt><dd>{selectedCandidate.symbols.join(", ")}</dd></div>
-                <div><dt>주기</dt><dd>{selectedCandidate.timeframe || "-"}</dd></div>
-              </dl>
-            ) : (
-              <div className="functional-test-empty">무결성이 확인된 국내주식/ETF 대상이 없습니다.</div>
-            )}
-          </div>
+            <div className="panel-body">
+              {selectedCandidate ? (
+                <dl className="functional-test-details">
+                  <div><dt>대상</dt><dd>{selectedCandidate.kind === "PORTFOLIO" ? "포트폴리오" : "전략"} · {selectedCandidate.label}</dd></div>
+                  <div><dt>Artifact</dt><dd>{selectedCandidate.artifactId}<small>{compactHash(selectedCandidate.artifactHash)}</small></dd></div>
+                  <div><dt>Instance</dt><dd>{selectedCandidate.instanceId}</dd></div>
+                  <div><dt>계좌</dt><dd>{workspace.account.label}<small>{compactHash(workspace.account.bindingId)}</small></dd></div>
+                  <div><dt>종목</dt><dd>{selectedCandidate.symbols.join(", ")}</dd></div>
+                  <div><dt>주기</dt><dd>{selectedCandidate.timeframe || "-"}</dd></div>
+                </dl>
+              ) : (
+                <div className="functional-test-empty">무결성이 확인된 국내주식/ETF 대상이 없습니다.</div>
+              )}
+            </div>
+          </section>
         </section>
       </div>
 
@@ -482,9 +626,7 @@ export default function FunctionalTestWorkspace() {
           <div className="functional-test-progress" aria-label={`기능시험 진행률 ${Math.round(progress.ratio * 100)}%`}>
             <span style={{ width: `${Math.round(progress.ratio * 100)}%` }} />
           </div>
-          <p>
-            일 단위 기간은 달력일 기준입니다. 전체 계획이 며칠이어도 실전 활성화는 KRX 정규장 안에서 매일 갱신합니다. 활성화가 만료되면 주문은 즉시 차단되며 ‘오늘 실행 정지’로 runtime과 KIS 대조를 마쳐야 다음 거래일에 재개할 수 있습니다.
-          </p>
+          <p>당일 활성화가 만료되면 주문은 차단됩니다. ‘오늘 실행 정지’로 Runtime과 KIS 대조를 마친 뒤 다음 거래일에 다시 활성화하세요.</p>
         </div>
       </section>
 
@@ -529,6 +671,8 @@ export default function FunctionalTestWorkspace() {
           </div>
         </section>
       </div>
+        </div>
+      )}
     </section>
   );
 }

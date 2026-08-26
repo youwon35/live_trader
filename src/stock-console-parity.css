@@ -94,8 +94,8 @@
   letter-spacing: 0;
 }
 
-:root[data-program="live-trader"] .topbar-title-block > strong {
-  font-size: 16px;
+:root[data-program="live-trader"] .topbar-title-block > :is(strong, h1) {
+  font-size: 16px !important;
 }
 
 :root[data-program="live-trader"] .topbar-actions > .status-pill {
@@ -165,7 +165,7 @@
 }
 
 :root[data-program="live-trader"] .live-safety-hierarchy {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 
 :root[data-program="live-trader"] .live-safety-hierarchy .status-pill {
@@ -227,15 +227,93 @@
   padding: var(--ts-console-panel-padding, 9px) !important;
 }
 
+:root[data-program="live-trader"] .app-shell.sidebar-collapsed {
+  grid-template-columns: minmax(0, 1fr) !important;
+}
+
 @media (max-width: 1180px) {
   :root[data-program="live-trader"] .live-environment-bar {
     grid-template-columns: minmax(0, 1fr);
   }
 }
 
+@media (max-width: 1279px) {
+  :root[data-program="live-trader"] .live-environment-identity {
+    grid-template-columns: auto minmax(220px, 1fr);
+  }
+
+  :root[data-program="live-trader"] .live-context-meta {
+    grid-column: 1 / -1;
+    grid-template-columns: minmax(160px, auto) minmax(0, 1fr) minmax(170px, auto);
+    padding: 5px 0 0;
+    border-top: 1px solid var(--live-environment-border);
+    border-left: 0;
+  }
+
+  :root[data-program="live-trader"] .live-safety-hierarchy {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  :root[data-program="live-trader"] .app-shell {
+    height: 100dvh;
+    min-height: 0;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  :root[data-program="live-trader"] .sidebar {
+    position: relative !important;
+    display: flex !important;
+    height: auto !important;
+    max-height: min(220px, 38dvh);
+    overflow: auto;
+  }
+
+  :root[data-program="live-trader"] .app-shell.sidebar-collapsed .sidebar {
+    display: none !important;
+  }
+
+  :root[data-program="live-trader"] .workspace {
+    height: auto;
+    min-height: 0;
+  }
+
+  :root[data-program="live-trader"] .topbar {
+    flex: 0 0 auto;
+    min-height: 0;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  :root[data-program="live-trader"] .topbar-actions {
+    width: 100%;
+    max-width: none;
+  }
+}
+
 @media (max-width: 760px) {
   :root[data-program="live-trader"] .live-environment-bar {
     top: auto;
+  }
+
+  :root[data-program="live-trader"] .live-environment-identity,
+  :root[data-program="live-trader"] .live-environment-identity label,
+  :root[data-program="live-trader"] .live-context-meta {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  :root[data-program="live-trader"] .live-context-meta {
+    grid-column: auto;
+  }
+
+  :root[data-program="live-trader"] .live-safety-hierarchy {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  :root[data-program="live-trader"] .functional-test-safety-strip strong {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }
 

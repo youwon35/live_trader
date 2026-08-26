@@ -177,56 +177,56 @@ const StatusCard = createStatusCard(React);
 const SharedStatusRow = createStatusRow(React);
 const ToggleSwitch = createToggleSwitch(React);
 const navItems = [
-  { id: "overview", label: "운영 현황", icon: LayoutDashboard },
-  { id: "gate", label: "배포·승급", icon: ListChecks },
-  { id: "functional-test", label: "기능시험", icon: FlaskConical },
-  { id: "accounts", label: "계좌·포지션", icon: WalletCards },
-  { id: "orders", label: "주문·체결", icon: FileClock },
-  { id: "risk", label: "리스크·안전", icon: ShieldAlert },
-  { id: "automation", label: "실거래 운영", icon: Power },
-  { id: "incidents", label: "감사 기록", icon: Bell },
+  { id: "overview", label: "실행 준비", icon: LayoutDashboard },
+  { id: "gate", label: "배포 검증", icon: ListChecks },
+  { id: "functional-test", label: "주문 기능 검증", icon: FlaskConical },
+  { id: "risk", label: "위험 관리", icon: ShieldAlert },
+  { id: "automation", label: "실거래 실행", icon: Power },
+  { id: "accounts", label: "계좌 대조", icon: WalletCards },
+  { id: "orders", label: "주문 추적", icon: FileClock },
+  { id: "incidents", label: "운영 기록", icon: Bell },
   { id: "audit", label: "기술 로그", icon: TerminalSquare },
-  { id: "settings", label: "설정·진단", icon: Settings },
+  { id: "settings", label: "연결 설정", icon: Settings },
 ];
 
 const pageProfiles = {
   overview: {
-    title: "운영 현황",
-    eyebrow: "LIVE CONTROL PLANE",
-    summary: "현재 Deployment, Session, Preflight, 위험·주문·사고 상태를 한눈에 확인합니다.",
+    title: "실행 준비",
+    eyebrow: "LIVE READINESS",
+    summary: "현재 차단 사유와 다음 조치를 확인하고 전체 안전 점검을 실행합니다.",
   },
   gate: {
-    title: "배포·승급",
-    eyebrow: "DEPLOYMENT & PROMOTION",
-    summary: "검증된 Portfolio Artifact를 배포 단위로 고정하고 계보·Evidence·승급 조건을 확인합니다.",
+    title: "배포 검증",
+    eyebrow: "DEPLOYMENT VALIDATION",
+    summary: "선택한 Deployment의 전략 단계와 실거래 전 차단 조건을 확인합니다.",
   },
   "functional-test": {
-    title: "기능시험",
-    eyebrow: "KIS LIVE FUNCTIONAL TEST",
-    summary: "승급 Evidence와 분리된 기간형 KIS 실전 기능시험 허가와 당일 활성화를 준비합니다.",
+    title: "주문 기능 검증",
+    eyebrow: "CONTROLLED LIVE TEST",
+    summary: "승급과 분리된 제한 기능시험 경로에서 주문·중지·복구 동작을 확인합니다.",
   },
   accounts: {
-    title: "계좌·포지션",
+    title: "계좌 대조",
     eyebrow: "BROKER TRUTH",
     summary: "Broker Snapshot, 실시간 체결 상태, 프로그램 원장을 구분해 계좌와 포지션을 대조합니다.",
   },
   orders: {
-    title: "주문·체결",
+    title: "주문 추적",
     eyebrow: "ORDER & FILL LEDGER",
     summary: "주문 의도부터 ACK·부분체결·완전체결·원장 대조까지 전체 상태와 실행 품질을 추적합니다.",
   },
   risk: {
-    title: "리스크·안전",
+    title: "위험 관리",
     eyebrow: "RISK GATEWAY",
     summary: "현재 사용량, Soft Warning·Hard Block, Reduce-only, 재시도·Kill 정책을 관리합니다.",
   },
   automation: {
-    title: "실거래 운영",
+    title: "실거래 실행",
     eyebrow: "RUNTIME SESSION",
     summary: "Monitor → Canary → Limited Live → Full Live 순서와 구성 요소별 실행 상태를 관리합니다.",
   },
   incidents: {
-    title: "감사 기록",
+    title: "운영 기록",
     eyebrow: "AUDIT RECORDS",
     summary: "잠금·배포·Preflight·모드·Risk·주문·Kill·Secret 변경을 append-only 감사 이벤트로 추적합니다.",
   },
@@ -236,7 +236,7 @@ const pageProfiles = {
     summary: "Scope·Level·Source·Correlation ID로 개발 및 운영 로그를 검색하고 분석합니다.",
   },
   settings: {
-    title: "설정·진단",
+    title: "연결 설정",
     eyebrow: "BROKER & RUNTIME",
     summary: "화면·레이아웃, 브로커 연결, Telegram 알림과 Runtime 자체 검사를 관리합니다.",
   },
@@ -402,9 +402,11 @@ const SAFETY_CONFIRMATION_ACTION_LABELS = {
   NEW_ENTRIES_BLOCKED_OFF: "신규 진입 차단 해제",
   REAL_ORDERS_ENABLE: "실전 주문 라우트 활성화",
   FUNCTIONAL_TEST_START: "KIS 실전 기능시험 시작",
+  UPBIT_SUPERVISED_PREPARE: "Upbit 감독형 사전 준비",
   UPBIT_FUNCTIONAL_START: "Upbit 2시간 기능시험 시작",
   UPBIT_FUNCTIONAL_STOP: "Upbit 기능시험 중지·정리",
   UPBIT_FUNCTIONAL_RECOVER: "Upbit 기능시험 복구",
+  BINANCE_SPOT_SUPERVISED_PREPARE: "Binance Spot 감독형 사전 준비",
   BINANCE_SPOT_FUNCTIONAL_START: "Binance Spot 2시간 기능시험 시작",
   BINANCE_SPOT_FUNCTIONAL_STOP: "Binance Spot 기능시험 중지·정리",
   BINANCE_SPOT_FUNCTIONAL_RECOVER: "Binance Spot 기능시험 복구",
@@ -1783,7 +1785,7 @@ applyAppearance(readAppearance());
 applyLayoutMode(readLayoutMode());
 
 const LIVE_FLOW_STORAGE_KEY = "live_trader.guidedFlow.v1";
-const LIVE_FLOW_IDS = ["overview", "gate", "functional-test", "accounts", "orders", "risk", "automation", "incidents", "audit", "settings"];
+const LIVE_FLOW_IDS = ["overview", "gate", "functional-test", "risk", "automation", "accounts", "orders", "incidents", "audit", "settings"];
 const DEPLOYMENT_CONTEXT_STORAGE_KEY = "live_trader.deploymentContext.v1";
 function strategyDeploymentContext(strategy = null) {
   if (!strategy) {
@@ -2287,7 +2289,7 @@ function App() {
     }
   }
 
-  const title = navItems.find((item) => item.id === selectedNav)?.label ?? "운영 현황";
+  const title = navItems.find((item) => item.id === selectedNav)?.label ?? "실행 준비";
   const selectedStrategy = deploymentOptions.find((option) => option.id === selectedDeploymentId)?.strategy
     || deploymentOptions[0]?.strategy
     || null;
@@ -2310,7 +2312,7 @@ function App() {
         </div>
         <nav className="nav-list" aria-label="주요 메뉴">
           {navGroups.map((group) => (
-            <div className="nav-group" key={group.id}>
+            <div className="nav-group" key={group.id} role="group" aria-label={group.label}>
               <span className="nav-group-label">{group.label}</span>
               {group.itemIds.map((itemId) => {
                 const item = navItems.find((candidate) => candidate.id === itemId);
@@ -2320,6 +2322,7 @@ function App() {
                     className={`nav-item ${selectedNav === item.id ? "active" : ""}`}
                     type="button"
                     key={item.id}
+                    aria-current={selectedNav === item.id ? "page" : undefined}
                     onClick={() => navigateWorkspace(item.id)}
                   >
                     <Icon size={17} />
@@ -2353,7 +2356,7 @@ function App() {
             </IconButton>
             <div className="topbar-title-block">
               <span>{pageProfiles[selectedNav]?.eyebrow || "LIVE"}</span>
-              <strong>{title}</strong>
+              <h1 id="live-page-title">{title}</h1>
             </div>
           </div>
           <div className="topbar-actions">
@@ -2533,12 +2536,18 @@ function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) 
     || snapshot.runtime_session?.sessionId
     || snapshot.continuous_runtime?.sessionId
     || "세션 없음";
+  const killStatus = snapshot.kill_switch
+    ? { value: "KILLED", tone: "danger" }
+    : snapshot.api_connected === true
+      ? { value: "NORMAL", tone: "success" }
+      : { value: "확인 불가", tone: "warning" };
   const safety = [
     { label: "실거래 잠금", value: armed ? "ARMED" : "LOCKED", tone: armed ? "warning" : "neutral" },
+    { label: "Preflight", value: contextMatchesPreflight && preflightValid ? "VALID" : "REQUIRED", tone: contextMatchesPreflight && preflightValid ? "success" : "warning" },
     { label: "신규 진입", value: snapshot.new_entries_blocked ? "BLOCKED" : "ALLOWED", tone: snapshot.new_entries_blocked ? "warning" : "success" },
     { label: "위험 증가 주문", value: snapshot.new_entries_blocked ? "REDUCE-ONLY" : "ALLOWED", tone: snapshot.new_entries_blocked ? "warning" : "success" },
     { label: "Broker 전송", value: orderRouteEnabled ? "ENABLED" : "DISABLED", tone: orderRouteEnabled ? "danger" : "neutral" },
-    { label: "전역 Kill", value: snapshot.kill_switch ? "KILLED" : "NORMAL", tone: snapshot.kill_switch ? "danger" : "success" },
+    { label: "전역 Kill", ...killStatus },
   ];
 
   return (
@@ -2568,6 +2577,31 @@ function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) 
             <StatusPill tone={item.tone}>{item.value}</StatusPill>
           </div>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function CompactDisclosure({ title, description, badge, children, defaultOpen = false, className = "" }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const contentId = React.useId();
+  return (
+    <section className={`live-compact-disclosure ${open ? "is-open" : ""} ${className}`.trim()}>
+      <button
+        className="live-compact-disclosure__trigger"
+        type="button"
+        aria-expanded={open}
+        aria-controls={contentId}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span>
+          <strong>{title}</strong>
+          {description && <small>{description}</small>}
+        </span>
+        <span className="live-compact-disclosure__state">{badge || (open ? "접기" : "열기")}</span>
+      </button>
+      <div className="live-compact-disclosure__content" id={contentId} hidden={!open}>
+        {children}
       </div>
     </section>
   );
@@ -2661,7 +2695,6 @@ function WorkspaceContent({
   if (selectedNav === "automation") {
     return renderPage(
       <section className="ts-panel-grid ts-panel-grid--two automation-page-layout">
-        <DeploymentContextPanel className="live-grid-full" context={deploymentContext} />
         <AutomationLauncherPanel
           className="live-grid-full"
           deploymentContext={deploymentContext}
@@ -2678,26 +2711,32 @@ function WorkspaceContent({
         />
         <RuntimeComponentStatusPanel snapshot={snapshot} />
         <WatchdogPanel watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
-        <FuturesSettingsPanel snapshot={snapshot.binance_futures_settings} selectedSymbol={deploymentContext?.symbol} />
-        <FuturesFillSoakPanel snapshot={snapshot.binance_futures_fill_soak} selectedSymbol={deploymentContext?.symbol} />
-        <CapitalRolloutPanel
+        <CompactDisclosure
           className="live-grid-full"
-          snapshot={snapshot.capital_rollout}
-          selectedStrategyId={selectedStrategy?.strategy_id}
-        />
+          title="Binance 선물·자본 확대 도구"
+          description="선물 설정, 실체결 Soak와 단계별 자본 한도는 해당 경로를 운용할 때만 엽니다."
+        >
+          <section className="ts-panel-grid ts-panel-grid--two live-secondary-panel-grid">
+            <FuturesSettingsPanel snapshot={snapshot.binance_futures_settings} selectedSymbol={deploymentContext?.symbol} />
+            <FuturesFillSoakPanel snapshot={snapshot.binance_futures_fill_soak} selectedSymbol={deploymentContext?.symbol} />
+            <CapitalRolloutPanel
+              className="live-grid-full"
+              snapshot={snapshot.capital_rollout}
+              selectedStrategyId={selectedStrategy?.strategy_id}
+            />
+          </section>
+        </CompactDisclosure>
       </section>,
     );
   }
 
   if (selectedNav === "functional-test") {
-    return renderPage(<FunctionalTestWorkspace />);
+    return renderPage(<FunctionalTestWorkspace snapshot={snapshot} />);
   }
 
   if (selectedNav === "gate") {
     return renderPage(
       <section className="deployment-promotion-layout ts-layout-stack">
-        <DeploymentContextPanel context={deploymentContext} />
-        <DeploymentManifestPanel governance={snapshot.live_governance} />
         <LivePreparationPanel
           snapshot={snapshot}
           deploymentOnly
@@ -2717,6 +2756,12 @@ function WorkspaceContent({
           onPromoteLive={onPromoteLive}
           onStrategyLifecycle={onStrategyLifecycle}
         />
+        <CompactDisclosure
+          title="Deployment 기술 근거"
+          description="Manifest hash와 Runtime 고정값은 장애 분석이나 binding 검증이 필요할 때만 확인합니다."
+        >
+          <DeploymentManifestPanel governance={snapshot.live_governance} />
+        </CompactDisclosure>
       </section>,
     );
   }
@@ -2752,7 +2797,6 @@ function WorkspaceContent({
   if (selectedNav === "risk") {
     return renderPage(
       <section className="ts-panel-grid ts-panel-grid--two risk-page-layout">
-        <DeploymentContextPanel className="live-grid-full" context={deploymentContext} />
         <RiskUsagePanel snapshot={snapshot} context={deploymentContext} />
         <OperationalSafeguardsPanel
           apiConnected={snapshot.api_connected === true}
@@ -2765,11 +2809,18 @@ function WorkspaceContent({
           onEntryBlock={onEntryBlock}
           onTestIntent={onTestIntent}
         />
-        <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
-        <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
-        <FuturesRiskSimulatorPanel strategies={selectedStrategy ? [selectedStrategy] : []} />
-        <RetryDecisionMatrixPanel matrix={snapshot.retry_policy_matrix} />
-        <WatchdogPanel className="live-grid-full" watchdog={snapshot.watchdog} onWatchdog={onWatchdog} />
+        <CompactDisclosure
+          className="live-grid-full"
+          title="리스크 정책·재시도·선물 계산"
+          description="기본 화면은 현재 사용량과 즉시 차단 장치만 보여줍니다. 설정 변경과 요청별 정책은 여기에서 관리합니다."
+        >
+          <section className="ts-panel-grid ts-panel-grid--two live-secondary-panel-grid">
+            <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
+            <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
+            <FuturesRiskSimulatorPanel strategies={selectedStrategy ? [selectedStrategy] : []} />
+            <RetryDecisionMatrixPanel matrix={snapshot.retry_policy_matrix} />
+          </section>
+        </CompactDisclosure>
       </section>,
     );
   }
@@ -2791,25 +2842,29 @@ function WorkspaceContent({
   if (selectedNav === "settings") {
     return renderPage(
       <section className="settings-page-layout ts-layout-stack">
-        <div className="settings-summary-grid ts-panel-grid ts-panel-grid--two">
-          <AppearanceControlPanel
-            appearance={appearance}
-            updateAppearance={updateAppearance}
-            layoutMode={layoutMode}
-            changeLayoutMode={changeLayoutMode}
-            resetWorkspaceLayout={resetWorkspaceLayout}
-          />
-          <TelegramConnectionPanel />
-        </div>
         <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} onSave={onEnvSettings} />
         <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
+        <CompactDisclosure
+          title="화면·레이아웃·Telegram"
+          description="거래 연결과 직접 관계없는 개인화·알림 설정은 필요할 때만 엽니다."
+        >
+          <div className="settings-summary-grid ts-panel-grid ts-panel-grid--two">
+            <AppearanceControlPanel
+              appearance={appearance}
+              updateAppearance={updateAppearance}
+              layoutMode={layoutMode}
+              changeLayoutMode={changeLayoutMode}
+              resetWorkspaceLayout={resetWorkspaceLayout}
+            />
+            <TelegramConnectionPanel />
+          </div>
+        </CompactDisclosure>
       </section>,
     );
   }
 
   return renderPage(
     <OperationsOverviewPage
-      context={deploymentContext}
       snapshot={snapshot}
       onNavigate={onNavigate}
       onReconcile={onReconcile}
@@ -2875,7 +2930,6 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
   const deploymentLabels = new Set(["포지션·계좌 대조", "대조 증거 신선도", "전략 승인", "필수 운영 체크리스트", "운용자 확인", "신규 진입 차단"]);
   const deploymentChecks = checks.filter((check) => deploymentLabels.has(check.label));
   const globalChecks = checks.filter((check) => !deploymentLabels.has(check.label) && check.label !== "전략 승인");
-  const blockedInventory = (snapshot.strategies ?? []).filter((strategy) => strategy.live_allowed !== true).length;
   const governance = snapshot.live_governance ?? {};
   const latest = governance.latestPreflight || governance.latest_preflight || {};
   const validity = governance.preflightValidity || governance.preflight_validity || {};
@@ -2888,8 +2942,8 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
   return (
     <section className="panel preflight-scope-panel">
       <PanelHeader
-        title="Preflight 범위·유효성"
-        subtitle="전역 시스템, 현재 Deployment, 저장 Artifact 재고를 분리합니다. 재고 경고는 현재 배포의 Hard Stop으로 계산하지 않습니다."
+        title="Preflight 상세"
+        subtitle="전역 시스템과 현재 Deployment 검사를 분리해 표시합니다."
         suffix={<StatusPill tone={snapshotTone}>{latest.snapshotId ? (snapshotValid ? `${remainingSeconds}초 남음` : "무효·만료") : "스냅샷 없음"}</StatusPill>}
       />
       <div className="preflight-scope-grid">
@@ -2903,11 +2957,6 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
           {deploymentChecks.slice(0, 5).map((item) => <StatusRow key={item.label} label={item.label} status={item.status} detail={item.detail} />)}
           {!deploymentChecks.length && <EmptyRow text="Deployment 검사 결과가 없습니다." />}
         </article>
-        <article className="inventory-scope-card">
-          <header><strong>재고·관리 경고</strong><StatusPill tone={blockedInventory ? "warning" : "neutral"}>{blockedInventory}건</StatusPill></header>
-          <p>승급 불가 저장 Artifact {blockedInventory}개</p>
-          <span>현재 선택한 Deployment와 무관한 과거 Artifact는 관리 경고로만 표시합니다.</span>
-        </article>
       </div>
       <div className="panel-action-line">
         <span>{latest.snapshotId ? `Snapshot ${latest.snapshotId}` : "실거래 테스트: 운용자 확인 → Dry Run 해제 → 신규 진입 허용 → 새 Preflight → Canary"}</span>
@@ -2917,28 +2966,30 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
   );
 }
 
-function OperationsOverviewPage({ context, snapshot, onNavigate, onReconcile, onPreflight, onWatchdog }) {
+function OperationsOverviewPage({ snapshot, onNavigate, onReconcile, onPreflight, onWatchdog }) {
   return (
     <section className="operations-overview-layout ts-layout-stack">
-      <DeploymentContextPanel context={context} />
-      <PreflightScopePanel snapshot={snapshot} onPreflight={onPreflight} />
-      <section className="content-grid operations-overview-grid ts-panel-grid ts-panel-grid--two">
-        <div className="content-column ts-scroll-panel">
-          <PreTradeDoctorPanel
-            snapshot={snapshot}
-            onNavigate={onNavigate}
-            onReconcile={onReconcile}
-            onPreflight={onPreflight}
-            onWatchdog={onWatchdog}
-          />
-        </div>
-        <div className="content-column ts-scroll-panel">
-          <LaunchReportPanel report={snapshot.launch_report ?? {}} />
-          {snapshot.operation_report?.sections && <OperationsReportPanel report={snapshot.operation_report} />}
+      <section className="operations-overview-primary ts-panel-grid ts-panel-grid--two">
+        <PreTradeDoctorPanel
+          snapshot={snapshot}
+          onNavigate={onNavigate}
+          onReconcile={onReconcile}
+          onPreflight={onPreflight}
+          onWatchdog={onWatchdog}
+        />
+        <LaunchReportPanel report={snapshot.launch_report ?? {}} />
+      </section>
+      <CompactDisclosure
+        title="Preflight·Runtime 기술 근거"
+        description="전체 통과 항목과 Runtime 구성 요소는 장애 분석이나 상세 검증이 필요할 때만 확인합니다."
+      >
+        <section className="ts-panel-grid ts-panel-grid--two live-secondary-panel-grid">
+          <PreflightScopePanel snapshot={snapshot} onPreflight={onPreflight} />
+          {snapshot.operation_report?.sections?.length > 0 && <OperationsReportPanel report={snapshot.operation_report} />}
           <RuntimeComponentStatusPanel snapshot={snapshot} />
           <OrderQueueSummaryPanel summary={snapshot.order_queue ?? {}} />
-        </div>
-      </section>
+        </section>
+      </CompactDisclosure>
     </section>
   );
 }
@@ -3103,8 +3154,6 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
   };
   return (
     <section className="order-execution-layout ts-layout-stack">
-      <DeploymentContextPanel context={context} />
-      <OrderQueueSummaryPanel summary={snapshot.order_queue ?? {}} />
       <section className="panel order-ledger-panel">
         <PanelHeader title="주문 상태 원장" subtitle="불확실한 주문 결과는 실패와 분리하며, 같은 Client Order ID의 존재를 대조하기 전 재전송하지 않습니다." />
         <MasterDetailLog
@@ -3119,27 +3168,25 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
             <span>{selected.order_id || selected.client_order_id || "주문"} · {selected.symbol || "-"}</span>
           ) : "주문 상세"}
           emptyDetail={(
-            <div className="order-empty-detail">
-              <section className="order-detail-section order-timeline-section">
-                <header><h4>주문 타임라인</h4><span>0건</span></header>
-                <EmptyRow text="상세 타임라인을 볼 주문이 없습니다." />
-              </section>
-              <section className="order-detail-section fill-ledger-panel">
-                <header><h4>체결 원장</h4><span>{events.length}건</span></header>
-                <div className="compact-list">
-                  {events.length ? events.slice(0, 30).map((event, index) => (
-                    <div className="compact-row" key={event.event_id || "unmatched-event-" + index}>
-                      <strong>{event.symbol || "-"} · {event.side || "-"}</strong>
-                      <span>{event.quantity ?? "-"} @ {event.price ?? "-"} · {formatAuditTime({ timestamp: event.occurred_at })}</span>
-                      <StatusPill tone={orderStateTone(event.state)}>{orderStateLabel(event.state)}</StatusPill>
-                    </div>
-                  )) : <EmptyRow text="기록된 체결 Event가 없습니다." />}
-                </div>
-              </section>
+            <div className="order-empty-detail order-empty-detail--compact">
+              <EmptyRow text="검색 조건에 맞는 주문이 없습니다. 새 주문이 기록되면 식별자·타임라인·체결을 함께 표시합니다." />
               <section className="order-detail-section execution-quality-panel">
                 <header><h4>실행 품질</h4><span>전체 주문 기준</span></header>
                 <ExecutionQualitySummary quality={quality} />
               </section>
+              {events.length > 0 && (
+                <CompactDisclosure title="주문과 연결되지 않은 체결 Event" badge={`${events.length}건`}>
+                  <div className="compact-list">
+                    {events.slice(0, 30).map((event, index) => (
+                      <div className="compact-row" key={event.event_id || "unmatched-event-" + index}>
+                        <strong>{event.symbol || "-"} · {event.side || "-"}</strong>
+                        <span>{event.quantity ?? "-"} @ {event.price ?? "-"} · {formatAuditTime({ timestamp: event.occurred_at })}</span>
+                        <StatusPill tone={orderStateTone(event.state)}>{orderStateLabel(event.state)}</StatusPill>
+                      </div>
+                    ))}
+                  </div>
+                </CompactDisclosure>
+              )}
             </div>
           )}
           emptyList={(
@@ -3546,42 +3593,6 @@ function LivePreparationPanel({
       />
       <section className="content-grid ts-scroll-panel">
         <div className="content-column">
-          <StrategyDiscoveryToolbar
-            filters={discoveryFilters}
-            onFilterChange={updateDiscoveryFilter}
-            stageOptions={stageOptions}
-            timeframeOptions={timeframeOptions}
-            pluginOptions={pluginOptions}
-            failureOptions={failureOptions}
-            visibleCount={filteredStrategies.length}
-            totalCount={assetStrategies.length}
-            savedSearches={strategySearchPresets}
-            savedSearchId={savedSearchId}
-            savedSearchName={savedSearchName}
-            onSavedSearchNameChange={setSavedSearchName}
-            onSavedSearchApply={applySavedSearch}
-            onSavedSearchSave={saveCurrentSearch}
-            onSavedSearchDelete={deleteCurrentSavedSearch}
-            onReset={() => {
-              setDiscoveryFilters(DEFAULT_STRATEGY_DISCOVERY_FILTERS);
-              setSavedSearchId("");
-            }}
-          />
-          <LivePromotionReadinessQueue
-            onSelect={(strategyId) => {
-              selectStrategyId(strategyId);
-              saveArtifactMetadata(strategyId, "strategy", { markUsed: true }).catch(() => undefined);
-            }}
-            operatorConfirmed={Boolean(snapshot.operator_confirmed)}
-            orders={snapshot.orders ?? []}
-            runtime={snapshot.continuous_runtime}
-            strategies={filteredStrategies}
-            summary={snapshot.summary ?? {}}
-          />
-          <LineageFlowPanel
-            snapshot={snapshot.lineage_flow}
-            selectedStrategyId={selectedStrategy?.strategy_id}
-          />
           <LiveStrategySelectorPanel
             automaticPromotion={snapshot.automatic_promotion}
             strategies={filteredStrategies}
@@ -3598,20 +3609,32 @@ function LivePreparationPanel({
             summary={snapshot.summary ?? {}}
             operatorConfirmed={Boolean(snapshot.operator_confirmed)}
           />
-          {selectedStrategy && (
-            <PortfolioArtifactPanel
-              portfolios={snapshot.portfolios ?? []}
-              selectedStrategy={selectedStrategy}
-              operationalReadiness={snapshot.operational_readiness}
-              runtimeRecovery={snapshot.runtime_recovery}
-              shadowLive={snapshot.shadow_live}
-              multiStrategy={snapshot.multi_strategy}
-              executionCalibration={snapshot.execution_calibration}
-              metadataItems={artifactMetadata}
-              onMetadataSave={saveArtifactMetadata}
-              continuousRuntime={snapshot.continuous_runtime}
+          <CompactDisclosure
+            title="다른 전략 찾기"
+            description="현재 Deployment를 바꾸려는 경우에만 검색·필터·저장 조건을 사용합니다."
+          >
+            <StrategyDiscoveryToolbar
+              filters={discoveryFilters}
+              onFilterChange={updateDiscoveryFilter}
+              stageOptions={stageOptions}
+              timeframeOptions={timeframeOptions}
+              pluginOptions={pluginOptions}
+              failureOptions={failureOptions}
+              visibleCount={filteredStrategies.length}
+              totalCount={assetStrategies.length}
+              savedSearches={strategySearchPresets}
+              savedSearchId={savedSearchId}
+              savedSearchName={savedSearchName}
+              onSavedSearchNameChange={setSavedSearchName}
+              onSavedSearchApply={applySavedSearch}
+              onSavedSearchSave={saveCurrentSearch}
+              onSavedSearchDelete={deleteCurrentSavedSearch}
+              onReset={() => {
+                setDiscoveryFilters(DEFAULT_STRATEGY_DISCOVERY_FILTERS);
+                setSavedSearchId("");
+              }}
             />
-          )}
+          </CompactDisclosure>
           {!deploymentOnly && (
             <OperationalSafeguardsPanel
               apiConnected={snapshot.api_connected === true}
@@ -4513,10 +4536,11 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, o
   const [hasRun, setHasRun] = useState(false);
   const [selectedDoctorId, setSelectedDoctorId] = useState(null);
   const items = buildDoctorItems(snapshot);
-  const selectedItem = items.find((item) => item.id === selectedDoctorId) ?? items[0];
   const problemCount = items.filter((item) => item.tone !== "success").length;
   const failCount = items.filter((item) => item.tone === "danger").length;
   const warnCount = items.filter((item) => item.tone === "warning").length;
+  const visibleItems = items.filter((item) => item.tone !== "success");
+  const selectedItem = visibleItems.find((item) => item.id === selectedDoctorId) ?? visibleItems[0] ?? null;
 
   async function runDoctor() {
     setRunning(true);
@@ -4552,7 +4576,7 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, o
         />
       </div>
       <div className="doctor-grid">
-        {items.map((item) => (
+        {visibleItems.map((item) => (
           <StatusCard
             className={`doctor-card ${item.tone} ${selectedItem?.id === item.id ? "selected" : ""}`}
             key={item.id}
@@ -4565,6 +4589,7 @@ function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, o
             onClick={() => setSelectedDoctorId(item.id)}
           />
         ))}
+        {!visibleItems.length && <EmptyRow text="현재 표시할 Hard Stop 또는 Warning이 없습니다." />}
       </div>
       {selectedItem && (
         <div className="doctor-detail-panel">
@@ -4761,7 +4786,7 @@ function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) 
   const searchResults = buildSearchResults(snapshot, searchQuery);
 
   return (
-    <section className={`page-view ${selectedNav}-view`}>
+    <section className={`page-view ${selectedNav}-view`} aria-labelledby="live-page-title">
       <SearchResultsPanel query={searchQuery} results={searchResults} onNavigate={onNavigate} />
 
       {children}
@@ -4882,9 +4907,9 @@ const STRATEGY_LIFECYCLE_STEPS = [
 ];
 
 const navGroups = [
-  { id: "operate", label: "주 운영 흐름", itemIds: ["overview", "gate", "functional-test", "accounts", "orders", "risk", "automation"] },
-  { id: "records", label: "기록·대응", itemIds: ["incidents", "audit"] },
-  { id: "system", label: "시스템", itemIds: ["settings"] },
+  { id: "prepare", label: "실행 전", itemIds: ["overview", "gate", "functional-test", "risk"] },
+  { id: "operate", label: "실행·대조", itemIds: ["automation", "accounts", "orders"] },
+  { id: "manage", label: "기록·설정", itemIds: ["incidents", "audit", "settings"] },
 ];
 
 function strategyLifecycleRank(stage = "") {
@@ -5164,7 +5189,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
   return (
     <section className="panel live-connection-assistant-panel">
       <PanelHeader
-        title="연결 설정 Assistant"
+        title="브로커 실계좌 연결"
         subtitle=".env에 저장되는 실거래 브로커 설정을 탭별로 점검합니다."
         suffix={<StatusPill tone={checkCount ? "warning" : "success"}>{checkCount ? `${checkCount} CHECK` : "READY"}</StatusPill>}
       />
@@ -6146,7 +6171,6 @@ function UnifiedBrokerAccountPanel({
     });
   return (
     <>
-      <AccountAllocationOverview accounts={accounts} positions={positions} />
       <BrokerAccountWorkspace
         accounts={accountRows}
         autoRefreshLabel="10초 자동 갱신·대조"
@@ -6169,6 +6193,12 @@ function UnifiedBrokerAccountPanel({
           현재 계좌를 기준 원장으로 승인
         </button>
       </div>
+      <CompactDisclosure
+        title="자본 배분·포지션 노출"
+        description="통화별 배분과 계좌별 집중도 시각화는 상세 분석이 필요할 때만 엽니다."
+      >
+        <AccountAllocationOverview accounts={accounts} positions={positions} />
+      </CompactDisclosure>
     </>
   );
 }
@@ -6417,7 +6447,7 @@ function LiveStrategySelectorPanel({
   );
   return (
     <section className="panel live-strategy-selector-panel">
-      <PanelHeader title="활성 전략 선택" subtitle="Backtester/Paper Trader에서 검증된 artifact를 읽기 전용으로 확인합니다." />
+      <PanelHeader title="선택한 배포 전략" subtitle="현재 단계와 실제 운영 행동만 기본 표시합니다." />
       <div className="live-strategy-selector-grid">
         <label>
           <span>전략 artifact</span>
@@ -6436,7 +6466,7 @@ function LiveStrategySelectorPanel({
           <div className="live-strategy-summary-grid">
             <MetricCard className="metric-card" label="전략" value={selectedStrategy.plugin_label || selectedStrategy.plugin} detail={selectedStrategy.strategy_id} />
             <MetricCard className="metric-card" label="대상" value={`${selectedStrategy.symbol} · ${selectedStrategy.timeframe}`} detail={selectedStrategy.asset} />
-            <MetricCard className="metric-card" label="Release" value={selectedStrategy.release?.release_id || selectedStrategy.release_id || "-"} detail={selectedStrategy.release?.parameter_hash || "parameter hash 없음"} />
+            <MetricCard className="metric-card" label="현재 단계" value={promotionLabel(normalizedStage)} detail={`동일 scope 체결 ${execution.successful}건 · 차단 ${execution.blocked}건`} />
           </div>
           <div className="live-strategy-promotion-line">
             {automaticResult && (
@@ -6453,17 +6483,19 @@ function LiveStrategySelectorPanel({
               status={canPromoteLive ? "success" : undefined}
             />
           </div>
-          <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="전략 승급 타임라인">
-            {lifecycleTimeline.map((item) => (
-              <article className={item.state} key={item.id}>
-                <span>{item.index}</span>
-                <div>
-                  <strong>{item.label}</strong>
-                  <em>{item.time || item.statusLabel}</em>
-                </div>
-              </article>
-            ))}
-          </div>
+          <CompactDisclosure title="승급 이력" description="과거 단계와 전환 시각은 필요할 때만 확인합니다.">
+            <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="전략 승급 타임라인">
+              {lifecycleTimeline.map((item) => (
+                <article className={item.state} key={item.id}>
+                  <span>{item.index}</span>
+                  <div>
+                    <strong>{item.label}</strong>
+                    <em>{item.time || item.statusLabel}</em>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </CompactDisclosure>
           <div className="live-strategy-control-line">
             {isPaused ? (
               <ActionButton
@@ -6501,11 +6533,14 @@ function LiveStrategySelectorPanel({
                     : "상태 변경은 공유 전략 artifact lifecycle에 기록됩니다."}
             </span>
           </div>
-          <div className="live-strategy-parameter-panel">
-            <strong>Parameters</strong>
-            <pre>{parametersText || "-"}</pre>
-          </div>
-          <ArtifactMetadataEditor artifactId={selectedStrategy.strategy_id} artifactType="strategy" metadata={metadata} onSave={onMetadataSave} />
+          <CompactDisclosure title="전략 기술 정보" description="Release, parameter hash와 개인 메타데이터를 확인합니다.">
+            <div className="live-strategy-parameter-panel">
+              <strong>Release · Parameters</strong>
+              <span>{selectedStrategy.release?.release_id || selectedStrategy.release_id || "Release 없음"}</span>
+              <pre>{parametersText || "-"}</pre>
+            </div>
+            {onMetadataSave && <ArtifactMetadataEditor artifactId={selectedStrategy.strategy_id} artifactType="strategy" metadata={metadata} onSave={onMetadataSave} />}
+          </CompactDisclosure>
         </>
       ) : (
         <EmptyRow text="이 자산군에 표시할 전략 artifact가 없습니다." />

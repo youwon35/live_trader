@@ -18,6 +18,7 @@
     "test:deployment-selection": "node --test scripts/deployment_selection.test.mjs",
     "test:functional-test-ui": "node scripts/functional_test_model.test.mjs",
     "test:crypto-first-live-ui": "node scripts/crypto_first_live_ui.test.mjs",
+    "test:information-architecture": "node --test scripts/live_information_architecture.test.mjs",
     "ui:smoke": "node scripts/ui_smoke.mjs"
   },
   "dependencies": {
