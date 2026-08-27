@@ -7569,9 +7569,9 @@ body {
   z-index: 42;
   min-height: 48px;
   padding: 3px 2px;
-  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  background: var(--bg);
   border-bottom: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
-  backdrop-filter: blur(12px);
+  backdrop-filter: none;
 }
 
 :root[data-program="live-trader"] .topbar-title-block {

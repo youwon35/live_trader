@@ -28,7 +28,7 @@ import {
   normalizeFunctionalTestWorkspace,
   preferredFunctionalTestCandidate,
 } from "./functionalTestModel";
-import CryptoFirstLivePanel from "./CryptoFirstLivePanel";
+const CryptoFirstLivePanel = React.lazy(() => import("./CryptoFirstLivePanel"));
 
 
 const BLOCKER_LABELS = {
@@ -352,7 +352,11 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
           role="tabpanel"
           aria-labelledby="functional-test-crypto-tab"
         >
-          <CryptoFirstLivePanel onSafetyStateChange={setCryptoSafety} />
+          <React.Suspense
+            fallback={<div className="functional-test-empty" role="status">코인 기능시험 화면을 불러오는 중입니다.</div>}
+          >
+            <CryptoFirstLivePanel onSafetyStateChange={setCryptoSafety} />
+          </React.Suspense>
         </div>
       ) : (
         <div

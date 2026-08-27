@@ -110,7 +110,6 @@ import {
 } from "./deploymentSelection";
 import { buildOrderCsvRows, ORDER_CSV_COLUMNS } from "./orderCsv";
 import { createActionButton } from "../../../packages/design/action-button.js";
-import FunctionalTestWorkspace from "./FunctionalTestWorkspace";
 import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
 import { createAppearanceSettingsPanel } from "../../../packages/design/appearance-settings-panel.js";
 import {
@@ -176,6 +175,7 @@ const PanelHeader = createPanelHeader(React);
 const StatusCard = createStatusCard(React);
 const SharedStatusRow = createStatusRow(React);
 const ToggleSwitch = createToggleSwitch(React);
+const FunctionalTestWorkspace = React.lazy(() => import("./FunctionalTestWorkspace"));
 const navItems = [
   { id: "overview", label: "실행 준비", icon: LayoutDashboard },
   { id: "gate", label: "배포 검증", icon: ListChecks },
@@ -1424,7 +1424,7 @@ function isInteractiveLayoutTarget(target) {
   );
 }
 
-function ensurePanelHandles(panel) {
+function ensurePanelHandles(panel, sizes, positions) {
   panel.classList.add("resizable-panel");
   panelLayoutKey(panel);
   // Live snapshots can replace rows several times while the pointer is down.
@@ -1432,8 +1432,6 @@ function ensurePanelHandles(panel) {
   // over an in-progress resize or move before pointerup commits the new value.
   if (panel.classList.contains("resizing-panel") || panel.classList.contains("dragging-panel")) return;
 
-  const sizes = readStoredMap(PANEL_SIZE_STORAGE_KEY);
-  const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
   const key = panelLayoutKey(panel);
   const size = sizes[key];
   const position = positions[key];
@@ -1458,18 +1456,23 @@ function ensurePanelHandles(panel) {
     panel.style.removeProperty("height");
   }
   applyPanelOffset(panel, position);
-  window.requestAnimationFrame(() => {
-    if (!panel.isConnected || !panelOverlapsPeers(panel)) return;
-    const offset = currentPanelOffset(panel, position);
-    if (Math.abs(offset.x) > 0 || Math.abs(offset.y) > 0) clearPanelOffset(panel);
-  });
+  const restoredOffset = currentPanelOffset(panel, position);
+  if (Math.abs(restoredOffset.x) > 0 || Math.abs(restoredOffset.y) > 0) {
+    window.requestAnimationFrame(() => {
+      if (!panel.isConnected || !panelOverlapsPeers(panel)) return;
+      clearPanelOffset(panel);
+    });
+  }
 
   const existingDirections = new Set(
     Array.from(panel.querySelectorAll(":scope > .panel-resize-edge, :scope > .panel-resize-corner"))
       .map((handle) => handle.dataset.resizeDirection)
       .filter(Boolean),
   );
-  if (LAYOUT_RESIZE_DIRECTIONS.every((direction) => existingDirections.has(direction))) return;
+  if (LAYOUT_RESIZE_DIRECTIONS.every((direction) => existingDirections.has(direction))) {
+    panel.dataset.layoutEnhanced = "true";
+    return;
+  }
   panel.querySelectorAll(":scope > .panel-resize-edge, :scope > .panel-resize-corner").forEach((handle) => handle.remove());
 
   const directionWords = { n: "north", e: "east", s: "south", w: "west" };
@@ -1486,6 +1489,7 @@ function ensurePanelHandles(panel) {
     handle.setAttribute("aria-label", `패널 ${direction} 방향 크기 조절`);
     panel.appendChild(handle);
   });
+  panel.dataset.layoutEnhanced = "true";
 }
 
 function useEditablePanels(rootRef) {
@@ -1494,11 +1498,22 @@ function useEditablePanels(rootRef) {
     if (!root) return undefined;
     let captureNewBaselines = false;
 
-    const enhancePanels = () => {
-      const storedSizes = readStoredMap(PANEL_SIZE_STORAGE_KEY);
+    const enhancePanels = (forceRestore = false) => {
+      const panels = Array.from(root.querySelectorAll(".panel"));
+      const pendingPanels = forceRestore
+        ? panels
+        : panels.filter((panel) => panel.dataset.layoutEnhanced !== "true");
+      if (pendingPanels.length) {
+        const storedSizes = readStoredMap(PANEL_SIZE_STORAGE_KEY);
+        const storedPositions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
+        pendingPanels.forEach((panel) => ensurePanelHandles(panel, storedSizes, storedPositions));
+      }
+
+      const storedSizes = captureNewBaselines
+        ? readStoredMap(PANEL_SIZE_STORAGE_KEY)
+        : null;
       let capturedBaseline = false;
-      root.querySelectorAll(".panel").forEach((panel) => {
-        ensurePanelHandles(panel);
+      panels.forEach((panel) => {
         if (!captureNewBaselines || document.documentElement.dataset.layoutMode !== "edit") return;
         const key = panelLayoutKey(panel);
         if (storedSizes[key]) return;
@@ -1763,19 +1778,20 @@ function useEditablePanels(rootRef) {
       startMove(event, panel);
     };
 
-    const observer = new MutationObserver(enhancePanels);
-    enhancePanels();
+    const restorePanels = () => enhancePanels(true);
+    const observer = new MutationObserver(() => enhancePanels());
+    enhancePanels(true);
     observer.observe(root, { childList: true, subtree: true });
     root.addEventListener("pointerdown", onPointerDown);
     window.addEventListener(LAYOUT_RESET_EVENT, resetLayout);
-    window.addEventListener(LAYOUT_RESTORE_EVENT, enhancePanels);
+    window.addEventListener(LAYOUT_RESTORE_EVENT, restorePanels);
     window.addEventListener(LAYOUT_BASELINE_EVENT, capturePanelBaselines);
 
     return () => {
       observer.disconnect();
       root.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener(LAYOUT_RESET_EVENT, resetLayout);
-      window.removeEventListener(LAYOUT_RESTORE_EVENT, enhancePanels);
+      window.removeEventListener(LAYOUT_RESTORE_EVENT, restorePanels);
       window.removeEventListener(LAYOUT_BASELINE_EVENT, capturePanelBaselines);
     };
   }, [rootRef]);
@@ -2584,7 +2600,13 @@ function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) 
 
 function CompactDisclosure({ title, description, badge, children, defaultOpen = false, className = "" }) {
   const [open, setOpen] = useState(defaultOpen);
+  const [hasOpened, setHasOpened] = useState(defaultOpen);
   const contentId = React.useId();
+  const toggleDisclosure = () => {
+    const nextOpen = !open;
+    setOpen(nextOpen);
+    if (nextOpen) setHasOpened(true);
+  };
   return (
     <section className={`live-compact-disclosure ${open ? "is-open" : ""} ${className}`.trim()}>
       <button
@@ -2592,7 +2614,7 @@ function CompactDisclosure({ title, description, badge, children, defaultOpen = 
         type="button"
         aria-expanded={open}
         aria-controls={contentId}
-        onClick={() => setOpen((current) => !current)}
+        onClick={toggleDisclosure}
       >
         <span>
           <strong>{title}</strong>
@@ -2601,7 +2623,7 @@ function CompactDisclosure({ title, description, badge, children, defaultOpen = 
         <span className="live-compact-disclosure__state">{badge || (open ? "접기" : "열기")}</span>
       </button>
       <div className="live-compact-disclosure__content" id={contentId} hidden={!open}>
-        {children}
+        {hasOpened ? children : null}
       </div>
     </section>
   );
@@ -2731,7 +2753,17 @@ function WorkspaceContent({
   }
 
   if (selectedNav === "functional-test") {
-    return renderPage(<FunctionalTestWorkspace snapshot={snapshot} />);
+    return renderPage(
+      <React.Suspense
+        fallback={(
+          <section className="panel functional-test-loading" role="status">
+            주문 기능 검증 화면을 불러오는 중입니다.
+          </section>
+        )}
+      >
+        <FunctionalTestWorkspace snapshot={snapshot} />
+      </React.Suspense>,
+    );
   }
 
   if (selectedNav === "gate") {

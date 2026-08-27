@@ -85,6 +85,8 @@ test("default pages prioritize decisions and move technical evidence into disclo
 });
 
 test("functional tests expose explicit KIS and crypto routes without passive crypto mounting", () => {
+  assert.match(appSource, /React\.lazy\(\(\) => import\("\.\/FunctionalTestWorkspace"\)\)/);
+  assert.match(functionalSource, /React\.lazy\(\(\) => import\("\.\/CryptoFirstLivePanel"\)\)/);
   assert.match(functionalSource, /useState\("kis"\)/);
   assert.match(functionalSource, /if \(testRoute !== "kis"\) return undefined/);
   assert.match(functionalSource, /role="tablist" aria-label="기능시험 경로"/);
@@ -119,7 +121,17 @@ test("functional tests expose explicit KIS and crypto routes without passive cry
 test("workspace owns scrolling and disclosures remain keyboard-accessible", () => {
   assert.match(appSource, /aria-expanded=\{open\}/);
   assert.match(appSource, /aria-controls=\{contentId\}/);
+  assert.match(appSource, /className="live-compact-disclosure__content"[\s\S]*?\{hasOpened \? children : null\}/);
   assert.match(stylesSource, /Cascade closure for the compact Live workspace/);
   assert.match(stylesSource, /\.page-view,[\s\S]*?overflow: auto !important/);
   assert.match(stylesSource, /\.live-compact-disclosure__trigger:focus-visible/);
+});
+
+test("passive panels avoid repeated layout work", () => {
+  const editablePanels = between(appSource, "function ensurePanelHandles", "applyAppearance(readAppearance())");
+  assert.match(editablePanels, /panel\.dataset\.layoutEnhanced = "true"/);
+  assert.match(editablePanels, /panel\.dataset\.layoutEnhanced !== "true"/);
+  assert.match(editablePanels, /new MutationObserver\(\(\) => enhancePanels\(\)\)/);
+  assert.match(editablePanels, /if \(Math\.abs\(restoredOffset\.x\) > 0 \|\| Math\.abs\(restoredOffset\.y\) > 0\)/);
+  assert.match(stylesSource, /:root\[data-program="live-trader"\] \.topbar \{[\s\S]*?backdrop-filter: none;/);
 });
