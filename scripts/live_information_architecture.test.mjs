@@ -135,3 +135,13 @@ test("passive panels avoid repeated layout work", () => {
   assert.match(editablePanels, /if \(Math\.abs\(restoredOffset\.x\) > 0 \|\| Math\.abs\(restoredOffset\.y\) > 0\)/);
   assert.match(stylesSource, /:root\[data-program="live-trader"\] \.topbar \{[\s\S]*?backdrop-filter: none;/);
 });
+
+test("single-axis resizing freezes its orthogonal axis without persisting peer geometry", () => {
+  const editor = between(appSource, "function useEditablePanels", "function App()");
+  assert.match(editor, /panel\.style\.width = `\$\{bounds\.width\}px`/);
+  assert.match(editor, /panel\.style\.height = `\$\{bounds\.height\}px`/);
+  assert.match(editor, /peerInlineDimensions = new Map/);
+  assert.match(editor, /slot\.element\.style\.width = original\.width/);
+  assert.match(editor, /slot\.element\.style\.height = original\.height/);
+  assert.doesNotMatch(editor, /stored\[panelLayoutKey\(slot\.element\)\]/);
+});

@@ -1555,15 +1555,23 @@ function useEditablePanels(rootRef) {
       const key = panelLayoutKey(panel);
       const startX = event.clientX;
       const startY = event.clientY;
-      const frozenPeerSlots = freezeLayoutPeerDimensions(
-        captureLayoutPeerDimensions(panel, ".panel", {
-          max: LAYOUT_MAX_DIMENSION,
-          minHeight: MIN_PANEL_HEIGHT,
-          minWidth: MIN_PANEL_WIDTH,
-          snap: LAYOUT_SNAP_SIZE,
-        }),
-      );
+      const peerSlots = captureLayoutPeerDimensions(panel, ".panel", {
+        max: LAYOUT_MAX_DIMENSION,
+        minHeight: MIN_PANEL_HEIGHT,
+        minWidth: MIN_PANEL_WIDTH,
+        snap: LAYOUT_SNAP_SIZE,
+      });
+      const peerInlineDimensions = new Map(peerSlots.map((slot) => [
+        slot.element,
+        { height: slot.element.style.height, width: slot.element.style.width },
+      ]));
+      const frozenPeerSlots = freezeLayoutPeerDimensions(peerSlots);
       const bounds = panel.getBoundingClientRect();
+      // Keep the orthogonal axis fixed while dragging one handle. Otherwise
+      // text reflow can silently change height during a width-only resize (or
+      // width during a height-only resize) before the operator releases it.
+      panel.style.width = `${bounds.width}px`;
+      panel.style.height = `${bounds.height}px`;
       const baselineCollisions = panelPeerCollisionMetrics(panel);
       const positions = readStoredMap(PANEL_POSITION_STORAGE_KEY);
       const startOffset = currentPanelOffset(panel, positions[key]);
@@ -1621,7 +1629,10 @@ function useEditablePanels(rootRef) {
           height: Math.round(panel.getBoundingClientRect().height * 100) / 100,
         };
         frozenPeerSlots.forEach((slot) => {
-          stored[panelLayoutKey(slot.element)] = { width: slot.width, height: slot.height };
+          const original = peerInlineDimensions.get(slot.element);
+          if (!original) return;
+          slot.element.style.width = original.width;
+          slot.element.style.height = original.height;
         });
         writeStoredMap(PANEL_SIZE_STORAGE_KEY, stored);
         const nextOffset = currentPanelOffset(panel, positions[key]);

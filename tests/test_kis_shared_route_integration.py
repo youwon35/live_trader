@@ -3754,6 +3754,7 @@ class KisSharedRouteIntegrationTests(unittest.TestCase):
         observation_or_offline_mutations = {
             "export_audit",
             "issue_safety_confirmation",
+            "prepare_crypto_first_live_supervised_state",
             "preview_binance_futures_canary",
             "preview_binance_futures_fill_soak",
             "preview_binance_futures_order_risk",

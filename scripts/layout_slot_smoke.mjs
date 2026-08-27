@@ -164,11 +164,19 @@ async function dragResizeHandle(page, handle, deltaX, deltaY) {
 async function documentBox(locator) {
   return locator.evaluate((element) => {
     const rect = element.getBoundingClientRect();
+    let ancestorScrollLeft = 0;
+    let ancestorScrollTop = 0;
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      ancestorScrollLeft += ancestor.scrollLeft || 0;
+      ancestorScrollTop += ancestor.scrollTop || 0;
+    }
     return {
       height: rect.height,
       width: rect.width,
-      x: rect.left + window.scrollX,
-      y: rect.top + window.scrollY,
+      // Compare layout coordinates, not viewport coordinates. A resize handle
+      // can scroll the workspace into view without moving the panel itself.
+      x: rect.left + window.scrollX + ancestorScrollLeft,
+      y: rect.top + window.scrollY + ancestorScrollTop,
     };
   });
 }
@@ -388,7 +396,12 @@ try {
   if (await page.evaluate(() => document.documentElement.dataset.layoutMode) === "edit") {
     // The keyboard route remains reachable even when an intentionally short
     // edit height temporarily places a panel control under its resize edge.
-    await page.keyboard.press("Control+Shift+L");
+    // Escape is the documented edit-mode exit. A first press may close an
+    // open disclosure, so repeat once only when edit mode is still active.
+    await page.keyboard.press("Escape");
+    if (await page.evaluate(() => document.documentElement.dataset.layoutMode) === "edit") {
+      await page.keyboard.press("Escape");
+    }
     await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "locked");
   }
   const lockedAfterResize = [];
@@ -418,14 +431,16 @@ try {
     await page.waitForFunction(() => document.documentElement.dataset.layoutMode === "edit");
   }
   await page.getByRole("button", { name: /^위험 관리/ }).click();
-  await page.getByRole("button", { name: /리스크 정책·재시도·선물 계산/ }).click();
+  const riskPolicyDisclosure = page.getByRole("button", { name: /리스크 정책·재시도·선물 계산/ });
+  if (await riskPolicyDisclosure.getAttribute("aria-expanded") !== "true") {
+    await riskPolicyDisclosure.click();
+  }
   await page.locator(".operational-safeguards-panel").waitFor({ state: "visible" });
   await page.waitForTimeout(100);
 
   const active = page.locator(".operational-safeguards-panel");
-  const target = page.locator(".panel").filter({
-    has: page.getByRole("heading", { name: "리스크 한도 설정", exact: true }),
-  });
+  const target = page.locator(".risk-settings-panel");
+  await target.waitFor({ state: "visible" });
   const activeKey = await active.getAttribute("data-layout-key");
   const targetKey = await target.getAttribute("data-layout-key");
 
@@ -712,7 +727,17 @@ const report = {
     id: key,
     label: tabLabel,
     horizontalDelta: before && afterHorizontal ? afterHorizontal.width - before.width : null,
+    horizontalOrthogonalDelta: before && afterHorizontal ? {
+      height: afterHorizontal.height - before.height,
+      x: afterHorizontal.x - before.x,
+      y: afterHorizontal.y - before.y,
+    } : null,
     verticalDelta: afterHorizontal && afterVertical ? afterVertical.height - afterHorizontal.height : null,
+    verticalOrthogonalDelta: afterHorizontal && afterVertical ? {
+      width: afterVertical.width - afterHorizontal.width,
+      x: afterVertical.x - afterHorizontal.x,
+      y: afterVertical.y - afterHorizontal.y,
+    } : null,
   })),
 };
 console.log(`LAYOUT_CONTRACT_RESULT=${JSON.stringify(report)}`);
