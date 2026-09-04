@@ -87,6 +87,8 @@ import {
   shouldHydrateRiskStrategy,
 } from "./futuresRiskSimulator";
 import { livePollingIntervals } from "./polling";
+import { executionApprovalLabel, strategyLifecycleLabel } from "../../../packages/design/strategy-progress.js";
+import { buildLiveStrategyProgress, liveStrategyProgressLabel } from "./strategyProgressDisplay.js";
 import {
   buildRetryMatrix,
   projectAccountReconciliation,
@@ -4913,20 +4915,8 @@ function normalizePromotionStage(stage = "") {
 
 function promotionLabel(stage = "") {
   const normalized = normalizePromotionStage(stage);
-  const labels = {
-    draft: "Draft",
-    backtested: "Backtested",
-    "before-shadow": "Before Shadow",
-    shadowed: "Shadowed",
-    papered: "Papered",
-    "before-live-small": "Before Live-Small",
-    live: "Live",
-    paused: "Paused",
-    retired: "Retired",
-    paper: "Paper",
-    approved: "Approved",
-  };
-  return labels[normalized] || (normalized ? normalized.toUpperCase() : "UNKNOWN");
+  if (["shadow", "paper", "approved"].includes(normalized)) return executionApprovalLabel(normalized);
+  return strategyLifecycleLabel(normalized);
 }
 
 function promotionTone(stage = "") {
@@ -4940,13 +4930,13 @@ function promotionTone(stage = "") {
 }
 
 const STRATEGY_LIFECYCLE_STEPS = [
-  { id: "draft", label: "Draft" },
-  { id: "backtested", label: "Backtested" },
-  { id: "before-shadow", label: "Before Shadow" },
-  { id: "shadowed", label: "Shadowed" },
-  { id: "papered", label: "Papered" },
-  { id: "before-live-small", label: "Before Live-Small" },
-  { id: "live", label: "Live" },
+  { id: "draft" },
+  { id: "backtested" },
+  { id: "before-shadow" },
+  { id: "shadowed" },
+  { id: "papered" },
+  { id: "before-live-small" },
+  { id: "live" },
 ];
 
 const navGroups = [
@@ -4961,55 +4951,7 @@ function strategyLifecycleRank(stage = "") {
 }
 
 function buildLiveLifecycleTimeline(strategy) {
-  const rawStage = strategy?.lifecycle?.status || strategy?.promotion?.stage || strategy?.promotion_stage || strategy?.lifecycle_status || "draft";
-  const currentStage = normalizePromotionStage(rawStage);
-  const currentRank = strategyLifecycleRank(currentStage);
-  const pausedFromRank = strategyLifecycleRank(strategy?.lifecycle?.pausedFrom || strategy?.pausedFrom);
-  const effectiveRank = currentStage === "paused" || currentStage === "retired" ? Math.max(pausedFromRank, 0) : currentRank;
-  const history = [
-    ...(Array.isArray(strategy?.lifecycle?.history) ? strategy.lifecycle.history : []),
-    ...(Array.isArray(strategy?.promotion?.history) ? strategy.promotion.history : []),
-  ];
-  const base = STRATEGY_LIFECYCLE_STEPS.map((step, index) => {
-    const stepRank = strategyLifecycleRank(step.id);
-    const matchedEvent = [...history].reverse().find((event) => normalizePromotionStage(event?.to) === step.id);
-    const state = currentStage === "paused" || currentStage === "retired"
-      ? (stepRank <= effectiveRank ? "done" : "pending")
-      : stepRank < currentRank
-        ? "done"
-        : step.id === currentStage
-          ? "current"
-          : "pending";
-    return {
-      id: step.id,
-      index: index + 1,
-      label: step.label,
-      state,
-      statusLabel: state === "done" ? "완료" : state === "current" ? "현재 단계" : "대기",
-      time: formatShortTimelineTime(matchedEvent?.at),
-    };
-  });
-  if (currentStage === "paused" || currentStage === "retired") {
-    base.push({
-      id: currentStage,
-      index: base.length + 1,
-      label: promotionLabel(currentStage),
-      state: currentStage,
-      statusLabel: currentStage === "paused" ? "일시중지" : "폐기/보관",
-      time: formatShortTimelineTime(strategy?.lifecycle?.updatedAt || strategy?.promotion?.promotedAt),
-    });
-  }
-  return base;
-}
-
-function formatShortTimelineTime(value) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  const date = new Date(text);
-  if (!Number.isNaN(date.getTime())) {
-    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-  }
-  return text.replace("T", " ").slice(0, 16);
+  return buildLiveStrategyProgress(strategy);
 }
 
 function liveSmallExecutionSummaryForStrategy(strategyId, orders) {
@@ -6509,7 +6451,7 @@ function LiveStrategySelectorPanel({
           <div className="live-strategy-summary-grid">
             <MetricCard className="metric-card" label="전략" value={selectedStrategy.plugin_label || selectedStrategy.plugin} detail={selectedStrategy.strategy_id} />
             <MetricCard className="metric-card" label="대상" value={`${selectedStrategy.symbol} · ${selectedStrategy.timeframe}`} detail={selectedStrategy.asset} />
-            <MetricCard className="metric-card" label="현재 단계" value={promotionLabel(normalizedStage)} detail={`동일 scope 체결 ${execution.successful}건 · 차단 ${execution.blocked}건`} />
+            <MetricCard className="metric-card" label="검증 진행" value={liveStrategyProgressLabel(selectedStrategy)} detail={`실행 허용 범위: ${executionApprovalLabel(promotionStage)} · 동일 scope 체결 ${execution.successful}건 · 차단 ${execution.blocked}건`} />
           </div>
           <div className="live-strategy-promotion-line">
             {automaticResult && (
@@ -6521,19 +6463,20 @@ function LiveStrategySelectorPanel({
               className="secondary-button"
               disabled={!canPromoteLive}
               icon={<BadgeCheck size={16} />}
-              label="정식 Live 승급"
+              label="실전 운용 단계로 승인"
               onClick={() => onPromoteLive?.(selectedStrategy.strategy_id)}
               status={canPromoteLive ? "success" : undefined}
             />
           </div>
-          <CompactDisclosure title="승급 이력" description="과거 단계와 전환 시각은 필요할 때만 확인합니다.">
-            <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="전략 승급 타임라인">
+          <CompactDisclosure title="전체 검증 단계" description="Backtester → Paper Trader → Live Trader의 검증 진행입니다. 검증 단계와 현재 주문 권한은 서로 다릅니다.">
+            <p className="pipeline-role-hint"><strong>Paper Trader → Live Trader</strong>모의 검증 근거를 심사하고 제한 실거래를 검증합니다. 검증 단계와 주문 승인은 별개입니다.</p>
+            <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="전략 검증 진행 단계">
               {lifecycleTimeline.map((item) => (
                 <article className={item.state} key={item.id}>
                   <span>{item.index}</span>
                   <div>
                     <strong>{item.label}</strong>
-                    <em>{item.time || item.statusLabel}</em>
+                    <em>{item.statusLabel}</em>
                   </div>
                 </article>
               ))}
