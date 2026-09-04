@@ -9,22 +9,22 @@ const viewports = [
   { name: "compact-desktop", width: 1280, height: 800, desktopScale: 1 },
 ];
 const tabs = [
-  { label: "실행 준비", requiredHeadings: ["실거래 Doctor", "실거래 승인 패키지"] },
-  { label: "배포 검증", requiredHeadings: ["선택한 배포 전략"], forbiddenHeadings: ["승급 준비 큐", "데이터·전략 계보", "포트폴리오 Artifact"] },
-  { label: "주문 기능 검증", requiredHeadings: ["KIS 기간형 기능시험", "시험 대상과 기간", "기간과 활성화 상태", "현재 실제 적용 한도", "현재 차단 항목"] },
-  { label: "위험 관리", requiredHeadings: ["현재 리스크 사용량", "운영 차단 설정"] },
-  { label: "실거래 실행", requiredHeadings: ["브로커별 자동화", "Runtime 구성 요소", "Live Watchdog"] },
-  { label: "계좌 대조", requiredHeadings: ["계좌·포지션 3자 대조", "내 계좌·보유 포지션"] },
-  { label: "주문 추적", requiredHeadings: ["주문 상태 원장", "실행 품질"] },
-  { label: "운영 기록", requiredHeadings: ["감사 이벤트"], forbiddenHeadings: ["운영 사고"] },
-  { label: "기술 로그", requiredHeadings: ["기술 로그"] },
+  { label: "시작 점검", requiredHeadings: ["실거래 Doctor", "실거래 승인 패키지"] },
+  { label: "운용 전략", requiredHeadings: ["선택한 배포 전략"], forbiddenHeadings: ["승급 준비 큐", "데이터·전략 계보", "포트폴리오 Artifact"] },
+  { label: "실거래 운용", requiredHeadings: ["브로커별 자동화", "Runtime 구성 요소", "Live Watchdog"] },
+  { label: "한도·안전장치", parent: "실거래 운용", requiredHeadings: ["현재 리스크 사용량", "운영 차단 설정"] },
+  { label: "계좌·잔고", requiredHeadings: ["계좌·포지션 3자 대조", "내 계좌·보유 포지션"] },
+  { label: "주문·체결", requiredHeadings: ["주문 상태 원장", "실행 품질"] },
+  { label: "실행 기록", requiredHeadings: ["감사 이벤트"], forbiddenHeadings: ["운영 사고"] },
+  { label: "상세 로그", parent: "실행 기록", requiredHeadings: ["기술 로그"] },
   {
-    label: "연결 설정",
+    label: "연결·설정",
     requiredHeadings: ["브로커 실계좌 연결", "설정·Runtime 자체 검사"],
     forbiddenHeadings: ["Secret 보호 상태", "브로커 Capability", "어댑터 인터페이스 계약", "브로커 준비 항목"],
   },
+  { label: "주문 연결 시험", requiredHeadings: ["KIS 기간형 기능시험", "시험 대상과 기간", "기간과 활성화 상태", "현재 실제 적용 한도", "현재 차단 항목"] },
 ];
-const expectedNavigationLabels = tabs.map((tab) => tab.label);
+const expectedNavigationLabels = tabs.filter((tab) => !tab.parent).map((tab) => tab.label);
 const issues = [];
 const views = [];
 
@@ -65,7 +65,7 @@ try {
     const navigationLabels = await page.locator(".nav-item").allTextContents();
     const normalizedNavigationLabels = navigationLabels.map((label) => label.trim());
     if (JSON.stringify(normalizedNavigationLabels) !== JSON.stringify(expectedNavigationLabels)) {
-      issues.push(`${viewport.name}: navigation must contain exactly the 10 operational menus (${normalizedNavigationLabels.join(", ")})`);
+      issues.push(`${viewport.name}: navigation must contain exactly the 8 operational menus (${normalizedNavigationLabels.join(", ")})`);
     }
 
     const environmentBar = page.locator('[aria-label="LIVE 환경 및 안전 상태"]');
@@ -96,7 +96,8 @@ try {
     }
 
     for (const tab of tabs) {
-      await page.getByRole("button", { name: tab.label, exact: true }).first().click();
+      await page.locator(".nav-list").getByRole("button", { name: tab.parent || tab.label, exact: true }).click();
+      if (tab.parent) await page.getByRole("tab", { name: tab.label, exact: true }).click();
       await page.waitForTimeout(150);
       const layout = await page.evaluate(() => {
         const root = document.documentElement;
@@ -169,7 +170,7 @@ try {
         }
       }
 
-      if (tab.label === "배포 검증") {
+      if (tab.label === "운용 전략") {
         const deploymentSelect = environmentBar.locator("select");
         const observedDeployments = [];
         for (let index = 0; index < 6; index += 1) {
@@ -187,10 +188,10 @@ try {
         }
       }
 
-      if (tab.label === "실행 준비" && await page.getByText("포지션·계좌 대조 요약", { exact: true }).count()) {
+      if (tab.label === "시작 점검" && await page.getByText("포지션·계좌 대조 요약", { exact: true }).count()) {
         issues.push(`${viewport.name}/${tab.label}: legacy reconciliation summary is still visible`);
       }
-      if (tab.label === "계좌 대조") {
+      if (tab.label === "계좌·잔고") {
         if (!await page.getByRole("button", { name: /자본 배분·포지션 노출/ }).count()) {
           issues.push(`${viewport.name}/${tab.label}: account allocation disclosure is missing`);
         }
@@ -201,7 +202,7 @@ try {
           issues.push(`${viewport.name}/${tab.label}: explicit program-ledger baseline action is missing`);
         }
       }
-      if (tab.label === "주문 추적") {
+      if (tab.label === "주문·체결") {
         if (!await page.getByText("Client Order ID", { exact: true }).count()) {
           issues.push(`${viewport.name}/${tab.label}: idempotent order identifier column is missing`);
         }
@@ -209,7 +210,7 @@ try {
           issues.push(`${viewport.name}/${tab.label}: filtered order CSV export is missing`);
         }
       }
-      if (tab.label === "실거래 실행") {
+      if (tab.label === "실거래 운용") {
         await page.getByRole("tab", { name: "주식/ETF", exact: true }).waitFor({ state: "visible", timeout: 5000 });
         if (!await page.locator(".runtime-deployment-binding").count()) {
           issues.push(`${viewport.name}/${tab.label}: Deployment/runtime binding status is missing`);
@@ -217,11 +218,11 @@ try {
         if (!await page.getByText(/Run을 누르기 전에는 runtime 설정을 변경하지 않습니다/).count()) {
           issues.push(`${viewport.name}/${tab.label}: mode selection safety guidance is missing`);
         }
-        if (!await page.getByRole("button", { name: /MONITOR Run/, exact: true }).count()) {
+        if (!await page.getByRole("button", { name: "관찰 (주문 없음) 시작", exact: true }).count()) {
           issues.push(`${viewport.name}/${tab.label}: Deployment-bound MONITOR Run action is missing`);
         }
       }
-      if (tab.label === "주문 기능 검증") {
+      if (tab.label === "주문 연결 시험") {
         if (!await page.getByText(/promotionEligible=false/).count()) {
           issues.push(`${viewport.name}/${tab.label}: non-promotion boundary is missing`);
         }
@@ -237,10 +238,10 @@ try {
           issues.push(`${viewport.name}/${tab.label}: daily activation action is missing`);
         }
       }
-      if (tab.label === "운영 기록" && !await page.getByText(/append-only 원장/).count()) {
+      if (tab.label === "실행 기록" && !await page.getByText(/append-only 원장/).count()) {
         issues.push(`${viewport.name}/${tab.label}: immutable audit guidance is missing`);
       }
-      if (tab.label === "위험 관리") {
+      if (tab.label === "한도·안전장치") {
         const policyDisclosure = page.getByRole("button", { name: /리스크 정책·재시도·선물 계산/ });
         if (!await policyDisclosure.count()) {
           issues.push(`${viewport.name}/${tab.label}: risk policy disclosure is missing`);

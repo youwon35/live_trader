@@ -19,25 +19,41 @@ test("operator navigation follows the live decision sequence", () => {
   const navigation = between(appSource, "const navItems = [", "const pageProfiles =");
   const labels = [...navigation.matchAll(/\{ id: "[^"]+", label: "([^"]+)"/g)].map((match) => match[1]);
   assert.deepEqual(labels, [
-    "실행 준비",
-    "배포 검증",
-    "주문 기능 검증",
-    "위험 관리",
-    "실거래 실행",
-    "계좌 대조",
-    "주문 추적",
-    "운영 기록",
-    "기술 로그",
-    "연결 설정",
+    "시작 점검",
+    "운용 전략",
+    "실거래 운용",
+    "계좌·잔고",
+    "주문·체결",
+    "실행 기록",
+    "연결·설정",
+    "주문 연결 시험",
   ]);
 
   const groups = between(appSource, "const navGroups = [", "function strategyLifecycleRank");
-  assert.match(groups, /label: "실행 전", itemIds: \["overview", "gate", "functional-test", "risk"\]/);
-  assert.match(groups, /label: "실행·대조", itemIds: \["automation", "accounts", "orders"\]/);
-  assert.match(groups, /label: "기록·설정", itemIds: \["incidents", "audit", "settings"\]/);
-  assert.match(appSource, /aria-current=\{selectedNav === item\.id \? "page" : undefined\}/);
+  assert.match(groups, /label: "실거래", itemIds: \["overview", "gate", "automation"\]/);
+  assert.match(groups, /label: "조회", itemIds: \["accounts", "orders", "incidents"\]/);
+  assert.match(groups, /label: "관리", itemIds: \["settings", "functional-test"\]/);
+  assert.match(appSource, /aria-current=\{selectedNavRoot === item\.id \? "page" : undefined\}/);
   assert.match(appSource, /<h1 id="live-page-title">\{title\}<\/h1>/);
   assert.match(appSource, /aria-labelledby="live-page-title"/);
+});
+
+test("merged sections preserve old routes and keep broker testing separate from promotion", () => {
+  assert.match(appSource, /const LIVE_FLOW_IDS = LIVE_WORKSPACE_ROUTE_IDS/);
+  assert.match(appSource, /const route = liveNavigationRoute\(navId\)/);
+  assert.match(appSource, /liveSectionTabs\(selectedNav\)/);
+  assert.match(appSource, /<NestedTabs ariaLabel=.*? options=\{sectionTabs\} value=\{selectedNav\} onChange=\{onNavigate\}/);
+  assert.match(appSource, /최초 연결 또는 주문 경로 변경 때 점검하며, 실제 자금과 별도 승인이 필요합니다/);
+  assert.match(appSource, /통과해도 전략은 승급하지 않습니다/);
+  assert.match(appSource, /백테스트 → 모의 검증 → 제한 실거래 → 실전 운용/);
+});
+
+test("advanced one-shot diagnostics load only on explicit opening", () => {
+  const automation = between(appSource, "function AutomationLauncherPanel", "function isCryptoStrategy");
+  assert.match(automation, /title="전략 연결 진단 \(주문 없음\)"/);
+  assert.match(automation, /onFirstOpen=\{\(\) => void refreshValidationPlan\(\)\}/);
+  assert.doesNotMatch(automation, /useEffect\(\(\) => \{\s*void refreshValidationPlan/);
+  assert.match(appSource, /if \(nextOpen && !hasOpened\) \{[\s\S]*?onFirstOpen\?\.\(\)/);
 });
 
 test("persistent live hierarchy keeps every execution-critical state visible", () => {

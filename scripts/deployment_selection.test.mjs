@@ -40,6 +40,8 @@ test("현재 Deployment 선택기는 실행 후보만 남기고 중복·종료 �
 
   assert.deepEqual(options.map((option) => option.id), [ready.deployment_id, papered.deployment_id]);
   assert.equal(new Set(options.map((option) => option.label)).size, options.length);
+  assert.match(options[0].label, /제한 실거래 대기/);
+  assert.match(options[1].label, /모의 검증 완료/);
 });
 
 test("현재 실행에 고정된 종료 Deployment는 안전한 Stop을 위해 표시한다", () => {

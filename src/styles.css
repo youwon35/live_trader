@@ -5562,6 +5562,30 @@ body {
   padding-bottom: 10px;
 }
 
+.live-page-purpose {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 4px 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+:root[data-program="live-trader"] .live-prep-shell.is-deployment-only > .content-grid {
+  grid-template-columns: minmax(0, 1fr) !important;
+}
+
+:root[data-program="live-trader"] .live-section-tabs.ts-nested-tabs {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+@media (max-width: 1599px) {
+  :root[data-program="live-trader"] .workspace .live-environment-bar {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+}
+
 .functional-test-route-panel {
   display: grid;
   gap: 8px;

@@ -137,8 +137,8 @@ const UNKNOWN_VALUE_TOKENS = new Set([
 
 const MODE_LABELS = {
   MONITOR: "모니터링",
-  SMALL_LIVE: "소액 실거래",
-  FULL_LIVE: "전체 실거래",
+  SMALL_LIVE: "제한 실거래",
+  FULL_LIVE: "실전 운용",
   LIVE: "실거래",
 };
 
@@ -531,7 +531,7 @@ function safetyModel(snapshot, mode) {
   const entryBlocked = snapshot?.new_entries_blocked !== false && snapshot?.newEntriesBlocked !== false;
   const dryRun = snapshot?.dry_run !== false && snapshot?.dryRun !== false;
   let level = "live";
-  let label = mode.code === "SMALL_LIVE" ? "소액 실거래 제한" : "실거래 허용";
+  let label = mode.code === "SMALL_LIVE" ? "제한 실거래" : "실거래 허용";
   let tone = mode.code === "SMALL_LIVE" ? "warning" : "danger";
   const reasons = [];
   if (apiExplicitlyDisconnected || (!apiConnected && snapshot?.api_connected == null && snapshot?.apiConnected == null)) {

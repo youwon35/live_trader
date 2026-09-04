@@ -1,3 +1,5 @@
+import { liveStrategyProgressLabel } from './strategyProgressDisplay.js';
+
 const TERMINAL_DEPLOYMENT_STAGES = new Set([
   "archived",
   "paused",
@@ -141,8 +143,8 @@ function optionBaseLabel(strategy) {
   const name = strategy.name || strategy.strategy_id || "이름 없음";
   const symbol = strategy.symbol || "-";
   const timeframe = strategy.timeframe || "-";
-  const stage = strategyLifecycleStage(strategy);
-  return `${portfolio} · ${symbol} ${timeframe} · ${name} · ${stage}`;
+  const stageLabel = liveStrategyProgressLabel(strategy);
+  return `${portfolio} · ${symbol} ${timeframe} · ${name} · ${stageLabel}`;
 }
 
 export function buildCurrentDeploymentOptions(strategies = [], { pinnedDeploymentIds = [] } = {}) {

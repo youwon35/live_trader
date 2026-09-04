@@ -88,7 +88,9 @@ import {
 } from "./futuresRiskSimulator";
 import { livePollingIntervals } from "./polling";
 import { executionApprovalLabel, strategyLifecycleLabel } from "../../../packages/design/strategy-progress.js";
-import { buildLiveStrategyProgress, liveStrategyProgressLabel } from "./strategyProgressDisplay.js";
+import { buildLiveStrategyProgress, liveStrategyProgressLabel, liveRuntimeModeLabel } from "./strategyProgressDisplay.js";
+import { LIVE_WORKSPACE_ROUTE_IDS, liveNavigationRoot, liveNavigationRoute, liveSectionTabs } from "./liveNavigation.js";
+import { liveReconciliationDisplay } from "./liveReconciliationDisplay.js";
 import {
   buildRetryMatrix,
   projectAccountReconciliation,
@@ -179,66 +181,64 @@ const SharedStatusRow = createStatusRow(React);
 const ToggleSwitch = createToggleSwitch(React);
 const FunctionalTestWorkspace = React.lazy(() => import("./FunctionalTestWorkspace"));
 const navItems = [
-  { id: "overview", label: "실행 준비", icon: LayoutDashboard },
-  { id: "gate", label: "배포 검증", icon: ListChecks },
-  { id: "functional-test", label: "주문 기능 검증", icon: FlaskConical },
-  { id: "risk", label: "위험 관리", icon: ShieldAlert },
-  { id: "automation", label: "실거래 실행", icon: Power },
-  { id: "accounts", label: "계좌 대조", icon: WalletCards },
-  { id: "orders", label: "주문 추적", icon: FileClock },
-  { id: "incidents", label: "운영 기록", icon: Bell },
-  { id: "audit", label: "기술 로그", icon: TerminalSquare },
-  { id: "settings", label: "연결 설정", icon: Settings },
+  { id: "overview", label: "시작 점검", icon: LayoutDashboard },
+  { id: "gate", label: "운용 전략", icon: ListChecks },
+  { id: "automation", label: "실거래 운용", icon: Power },
+  { id: "accounts", label: "계좌·잔고", icon: WalletCards },
+  { id: "orders", label: "주문·체결", icon: FileClock },
+  { id: "incidents", label: "실행 기록", icon: FileClock },
+  { id: "settings", label: "연결·설정", icon: Settings },
+  { id: "functional-test", label: "주문 연결 시험", icon: FlaskConical },
 ];
 
 const pageProfiles = {
   overview: {
-    title: "실행 준비",
+    title: "시작 점검",
     eyebrow: "LIVE READINESS",
     summary: "현재 차단 사유와 다음 조치를 확인하고 전체 안전 점검을 실행합니다.",
   },
   gate: {
-    title: "배포 검증",
+    title: "운용 전략",
     eyebrow: "DEPLOYMENT VALIDATION",
-    summary: "선택한 Deployment의 전략 단계와 실거래 전 차단 조건을 확인합니다.",
+    summary: "모의 검증을 마친 전략의 제한 실거래 근거를 확인하고 실전 운용 전환을 심사합니다. 단계 통과와 현재 주문 승인은 별개입니다.",
   },
   "functional-test": {
-    title: "주문 기능 검증",
+    title: "주문 연결 시험",
     eyebrow: "CONTROLLED LIVE TEST",
-    summary: "승급과 분리된 제한 기능시험 경로에서 주문·중지·복구 동작을 확인합니다.",
+    summary: "전략 단계와 별개인 증권사·거래소 주문 연결 시험입니다. 최초 연결 또는 주문 경로 변경 때 점검하며, 실제 자금과 별도 승인이 필요합니다. 통과해도 전략은 승급하지 않습니다.",
   },
   accounts: {
-    title: "계좌 대조",
+    title: "계좌·잔고",
     eyebrow: "BROKER TRUTH",
     summary: "Broker Snapshot, 실시간 체결 상태, 프로그램 원장을 구분해 계좌와 포지션을 대조합니다.",
   },
   orders: {
-    title: "주문 추적",
+    title: "주문·체결",
     eyebrow: "ORDER & FILL LEDGER",
     summary: "주문 의도부터 ACK·부분체결·완전체결·원장 대조까지 전체 상태와 실행 품질을 추적합니다.",
   },
   risk: {
-    title: "위험 관리",
+    title: "한도·안전장치",
     eyebrow: "RISK GATEWAY",
     summary: "현재 사용량, Soft Warning·Hard Block, Reduce-only, 재시도·Kill 정책을 관리합니다.",
   },
   automation: {
-    title: "실거래 실행",
+    title: "실거래 운용",
     eyebrow: "RUNTIME SESSION",
-    summary: "Monitor → Canary → Limited Live → Full Live 순서와 구성 요소별 실행 상태를 관리합니다.",
+    summary: "승인된 범위에서 제한 실거래 또는 실전 운용을 실행·중지합니다. 한도·안전장치에서 주문 차단과 위험 한도를 확인하세요.",
   },
   incidents: {
-    title: "운영 기록",
+    title: "실행 기록",
     eyebrow: "AUDIT RECORDS",
     summary: "잠금·배포·Preflight·모드·Risk·주문·Kill·Secret 변경을 append-only 감사 이벤트로 추적합니다.",
   },
   audit: {
-    title: "기술 로그",
+    title: "상세 로그",
     eyebrow: "ENGINEERING LOG",
     summary: "Scope·Level·Source·Correlation ID로 개발 및 운영 로그를 검색하고 분석합니다.",
   },
   settings: {
-    title: "연결 설정",
+    title: "연결·설정",
     eyebrow: "BROKER & RUNTIME",
     summary: "화면·레이아웃, 브로커 연결, Telegram 알림과 Runtime 자체 검사를 관리합니다.",
   },
@@ -1814,7 +1814,7 @@ applyAppearance(readAppearance());
 applyLayoutMode(readLayoutMode());
 
 const LIVE_FLOW_STORAGE_KEY = "live_trader.guidedFlow.v1";
-const LIVE_FLOW_IDS = ["overview", "gate", "functional-test", "risk", "automation", "accounts", "orders", "incidents", "audit", "settings"];
+const LIVE_FLOW_IDS = LIVE_WORKSPACE_ROUTE_IDS;
 const DEPLOYMENT_CONTEXT_STORAGE_KEY = "live_trader.deploymentContext.v1";
 function strategyDeploymentContext(strategy = null) {
   if (!strategy) {
@@ -2131,10 +2131,9 @@ function App() {
   }
 
   function navigateWorkspace(navId) {
-    if (LIVE_FLOW_IDS.includes(navId)) {
-      writeGuidedFlowStep(LIVE_FLOW_STORAGE_KEY, navId);
-    }
-    setSelectedNav(navId);
+    const route = liveNavigationRoute(navId);
+    writeGuidedFlowStep(LIVE_FLOW_STORAGE_KEY, route);
+    setSelectedNav(route);
     setNotificationsOpen(false);
   }
 
@@ -2318,7 +2317,8 @@ function App() {
     }
   }
 
-  const title = navItems.find((item) => item.id === selectedNav)?.label ?? "실행 준비";
+  const selectedNavRoot = liveNavigationRoot(selectedNav);
+  const title = navItems.find((item) => item.id === selectedNavRoot)?.label ?? "시작 점검";
   const selectedStrategy = deploymentOptions.find((option) => option.id === selectedDeploymentId)?.strategy
     || deploymentOptions[0]?.strategy
     || null;
@@ -2348,10 +2348,10 @@ function App() {
                 const Icon = item.icon;
                 return (
                   <button
-                    className={`nav-item ${selectedNav === item.id ? "active" : ""}`}
+                    className={`nav-item ${selectedNavRoot === item.id ? "active" : ""}`}
                     type="button"
                     key={item.id}
-                    aria-current={selectedNav === item.id ? "page" : undefined}
+                    aria-current={selectedNavRoot === item.id ? "page" : undefined}
                     onClick={() => navigateWorkspace(item.id)}
                   >
                     <Icon size={17} />
@@ -2390,7 +2390,7 @@ function App() {
           </div>
           <div className="topbar-actions">
             <StatusPill tone={snapshot.mode === "FULL_LIVE" ? "danger" : snapshot.mode === "SMALL_LIVE" ? "warning" : "info"}>
-              {snapshot.mode === "FULL_LIVE" ? "FULL LIVE" : snapshot.mode === "SMALL_LIVE" ? "LIMITED LIVE" : "MONITOR"}
+              {liveRuntimeModeLabel(snapshot.mode)}
             </StatusPill>
             <StatusPill tone={snapshot.new_entries_blocked ? "warning" : "success"}>
               신규 진입 {snapshot.new_entries_blocked ? "차단" : "허용"}
@@ -2611,14 +2611,17 @@ function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) 
   );
 }
 
-function CompactDisclosure({ title, description, badge, children, defaultOpen = false, className = "" }) {
+function CompactDisclosure({ title, description, badge, children, defaultOpen = false, className = "", onFirstOpen }) {
   const [open, setOpen] = useState(defaultOpen);
   const [hasOpened, setHasOpened] = useState(defaultOpen);
   const contentId = React.useId();
   const toggleDisclosure = () => {
     const nextOpen = !open;
     setOpen(nextOpen);
-    if (nextOpen) setHasOpened(true);
+    if (nextOpen && !hasOpened) {
+      setHasOpened(true);
+      onFirstOpen?.();
+    }
   };
   return (
     <section className={`live-compact-disclosure ${open ? "is-open" : ""} ${className}`.trim()}>
@@ -2770,7 +2773,7 @@ function WorkspaceContent({
       <React.Suspense
         fallback={(
           <section className="panel functional-test-loading" role="status">
-            주문 기능 검증 화면을 불러오는 중입니다.
+            주문 연결 시험 화면을 불러오는 중입니다.
           </section>
         )}
       >
@@ -3073,7 +3076,8 @@ function ThreeWayReconciliationPanel({ snapshot = {} }) {
   const ledger = snapshot.program_ledger ?? {};
   const streams = execution.streams?.brokers ?? snapshot.execution_streams?.brokers ?? {};
   const streamConnected = Object.values(streams).some((item) => item?.connected === true);
-  const brokerKnown = Number(summary.api_required_count || 0) === 0 && Number(summary.error_count || 0) === 0;
+  const reconciliationDisplay = liveReconciliationDisplay(snapshot);
+  const brokerKnown = reconciliationDisplay.brokerKnown;
   const ledgerKnown = Number(ledger.cash_count || ledger.cashCount || (ledger.cash || []).length || 0) > 0
     || Number(ledger.position_count || ledger.positionCount || (ledger.positions || []).length || 0) > 0;
   const projected = projectAccountReconciliation(snapshot);
@@ -3081,7 +3085,7 @@ function ThreeWayReconciliationPanel({ snapshot = {} }) {
     { label: "Broker REST Snapshot", status: brokerKnown ? "pass" : "warn", value: brokerKnown ? "조회됨" : "미확인", detail: `마지막 대조 ${summary.last_run || "미실행"}` },
     { label: "실시간 주문·체결 Event", status: streamConnected ? "pass" : execution.last_poll ? "warn" : "na", value: streamConnected ? "연결" : execution.last_poll ? "폴링 보조" : "해당 없음", detail: `마지막 동기화 ${execution.last_poll || "미실행"}` },
     { label: "Local Event Ledger", status: ledgerKnown ? "pass" : "warn", value: ledgerKnown ? "원장 있음" : "기준 없음", detail: `체결 이벤트 ${(ledger.execution_events || []).length}건 · 기준 ${ledger.state?.last_baseline || "미승인"}` },
-    { label: "3자 최종 대조", status: summary.status || "warn", value: summary.status_label || "미확인", detail: `불일치 ${summary.mismatch_count || 0} · API/원장 필요 ${summary.api_required_count || 0}` },
+    { label: "3자 최종 대조", status: reconciliationDisplay.status, value: reconciliationDisplay.label, detail: `불일치 ${summary.mismatch_count ?? "미확인"} · API/원장 필요 ${summary.api_required_count ?? "미확인"}` },
   ];
   return (
     <section className="panel three-way-reconciliation-panel">
@@ -3627,7 +3631,7 @@ function LivePreparationPanel({
   }
 
   return (
-    <section className="live-prep-shell">
+    <section className={`live-prep-shell${deploymentOnly ? " is-deployment-only" : ""}`}>
       <NestedTabs
         ariaLabel="실거래 준비 자산군"
         className="internal-tabs prep-tabs"
@@ -4829,9 +4833,12 @@ function buildDoctorItems(snapshot) {
 
 function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) {
   const searchResults = buildSearchResults(snapshot, searchQuery);
+  const sectionTabs = liveSectionTabs(selectedNav);
 
   return (
     <section className={`page-view ${selectedNav}-view`} aria-labelledby="live-page-title">
+      {sectionTabs.length > 0 ? <NestedTabs ariaLabel={`${pageProfiles[liveNavigationRoot(selectedNav)].title} 보기`} className="live-section-tabs" variant="compact" options={sectionTabs} value={selectedNav} onChange={onNavigate} /> : null}
+      <p className="live-page-purpose">{pageProfiles[selectedNav]?.summary}</p>
       <SearchResultsPanel query={searchQuery} results={searchResults} onNavigate={onNavigate} />
 
       {children}
@@ -4940,9 +4947,9 @@ const STRATEGY_LIFECYCLE_STEPS = [
 ];
 
 const navGroups = [
-  { id: "prepare", label: "실행 전", itemIds: ["overview", "gate", "functional-test", "risk"] },
-  { id: "operate", label: "실행·대조", itemIds: ["automation", "accounts", "orders"] },
-  { id: "manage", label: "기록·설정", itemIds: ["incidents", "audit", "settings"] },
+  { id: "prepare", label: "실거래", itemIds: ["overview", "gate", "automation"] },
+  { id: "operate", label: "조회", itemIds: ["accounts", "orders", "incidents"] },
+  { id: "manage", label: "관리", itemIds: ["settings", "functional-test"] },
 ];
 
 function strategyLifecycleRank(stage = "") {
@@ -4985,8 +4992,8 @@ function buildLivePromotionChecklist(strategy, normalizedStage, execution, summa
     : [];
   return [
     {
-      label: "승급 단계",
-      detail: normalizedStage === "before-live-small" ? "Paper Trader에서 Live-Small 전 단계까지 승급되었습니다." : `${promotionLabel(normalizedStage)} 단계입니다.`,
+      label: "모의 검증 인계",
+      detail: normalizedStage === "before-live-small" ? "Paper Trader의 모의 검증 인계가 완료되어 제한 실거래를 준비합니다. 실거래 검증 완료나 주문 승인을 뜻하지 않습니다." : `${promotionLabel(normalizedStage)} 상태입니다.`,
       status: normalizedStage === "before-live-small" || normalizedStage === "live" ? "PASS" : "WAIT",
       tone: normalizedStage === "before-live-small" || normalizedStage === "live" ? "success" : "warning",
     },
@@ -4998,7 +5005,7 @@ function buildLivePromotionChecklist(strategy, normalizedStage, execution, summa
     },
     ...evidenceItem,
     {
-      label: "소액 실거래",
+      label: "제한 실거래 체결",
       detail: execution.successful >= MIN_LIVE_CANARY_FILLS
         ? `브로커 체결 원장 ${execution.successful}건을 확인했습니다.`
         : `SMALL_LIVE broker-confirmed FILLED ${execution.successful}/${MIN_LIVE_CANARY_FILLS}건`,
@@ -5007,7 +5014,7 @@ function buildLivePromotionChecklist(strategy, normalizedStage, execution, summa
     },
     {
       label: "차단 주문",
-      detail: execution.blocked === 0 ? "소액 실거래 중 차단/실패 주문이 없습니다." : `차단/실패 주문 ${execution.blocked}건이 있습니다.`,
+      detail: execution.blocked === 0 ? "제한 실거래 기록 중 차단/실패 주문이 없습니다. 체결 표본 충족 여부는 별도입니다." : `차단/실패 주문 ${execution.blocked}건이 있습니다.`,
       status: execution.blocked === 0 ? "PASS" : "BLOCK",
       tone: execution.blocked === 0 ? "success" : "danger",
     },
@@ -5411,9 +5418,9 @@ function AutomationLauncherPanel({
   });
   const activeProfile = rows.find((profile) => profile.id === assetTab) ?? rows[0];
   const modes = [
-    { id: "MONITOR", label: "MONITOR", icon: Power },
-    { id: "SMALL_LIVE", label: "SMALL LIVE", icon: Play },
-    { id: "FULL_LIVE", label: "FULL LIVE", icon: LockKeyhole },
+    { id: "MONITOR", label: "관찰 (주문 없음)", icon: Power },
+    { id: "SMALL_LIVE", label: "제한 실거래", icon: Play },
+    { id: "FULL_LIVE", label: "실전 운용", icon: LockKeyhole },
   ];
   const tabs = rows.map((profile) => ({
     id: profile.id,
@@ -5449,10 +5456,6 @@ function AutomationLauncherPanel({
       setValidationLoading(false);
     }
   }
-
-  useEffect(() => {
-    void refreshValidationPlan();
-  }, []);
 
   useEffect(() => {
     const nextId = validationCandidates[0]?.validationStrategyInstanceId ?? "";
@@ -5620,7 +5623,7 @@ function AutomationLauncherPanel({
             onClick={() => onRuntimeStart(activeProfile.id, requestedMode)}
           >
             <Play size={16} />
-            <span>{requestedMode} Run</span>
+            <span>{liveRuntimeModeLabel(requestedMode)} 시작</span>
           </button>
           <button
             className="ts-action-button"
@@ -5629,7 +5632,7 @@ function AutomationLauncherPanel({
             onClick={() => onRuntimeStop(activeProfile.id)}
           >
             <CircleStop size={16} />
-            <span>Stop</span>
+            <span>실행 중지</span>
           </button>
           <button
             className="ts-action-button"
@@ -5650,6 +5653,11 @@ function AutomationLauncherPanel({
         </div>
       </div>
       <UnattendedSoakReportCard report={soakReport} />
+      <CompactDisclosure
+        title="전략 연결 진단 (주문 없음)"
+        description="전략 연결 문제를 분석할 때만 사용합니다. 모의 검증이나 제한 실거래 완료를 대신하지 않습니다."
+        onFirstOpen={() => void refreshValidationPlan()}
+      >
       <section className="validation-monitor-card">
         <PanelHeader
           title="검증 전용 MONITOR"
@@ -5771,6 +5779,7 @@ function AutomationLauncherPanel({
           </div>
         )}
       </section>
+      </CompactDisclosure>
     </section>
   );
 }
@@ -6208,8 +6217,8 @@ function OperationsReportPanel({ report }) {
 function LaunchReportPanel({ report }) {
   const items = [
     { label: "실주문 잠금", value: report.real_order_lock, tone: statusTone(report.real_order_lock) },
-    { label: "SMALL LIVE", value: report.small_live_status, tone: statusTone(report.small_live_status) },
-    { label: "FULL LIVE", value: report.full_live_status, tone: statusTone(report.full_live_status) },
+    { label: "제한 실거래", value: report.small_live_status, tone: statusTone(report.small_live_status) },
+    { label: "실전 운용", value: report.full_live_status, tone: statusTone(report.full_live_status) },
     { label: "Hard Stop", value: report.hard_stop_count, tone: report.hard_stop_count ? "danger" : "success" },
     { label: "Warning", value: report.warning_count, tone: report.warning_count ? "warning" : "success" },
   ];
@@ -6469,7 +6478,7 @@ function LiveStrategySelectorPanel({
             />
           </div>
           <CompactDisclosure title="전체 검증 단계" description="Backtester → Paper Trader → Live Trader의 검증 진행입니다. 검증 단계와 현재 주문 권한은 서로 다릅니다.">
-            <p className="pipeline-role-hint"><strong>Paper Trader → Live Trader</strong>모의 검증 근거를 심사하고 제한 실거래를 검증합니다. 검증 단계와 주문 승인은 별개입니다.</p>
+            <p className="pipeline-role-hint"><strong>백테스트 → 모의 검증 → 제한 실거래 → 실전 운용</strong>신호 관찰과 가상체결은 하나의 모의 검증에 포함됩니다. 주문 연결 시험은 전략 단계와 별개이며, 제한 실거래에는 별도 승인이 필요합니다.</p>
             <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="전략 검증 진행 단계">
               {lifecycleTimeline.map((item) => (
                 <article className={item.state} key={item.id}>
