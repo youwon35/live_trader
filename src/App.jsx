@@ -1,3 +1,4 @@
+import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
 import * as React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -6442,6 +6443,7 @@ function LiveStrategySelectorPanel({
   return (
     <section className="panel live-strategy-selector-panel">
       <PanelHeader title="선택한 배포 전략" subtitle="현재 단계와 실제 운영 행동만 기본 표시합니다." />
+      <PaperCandidateEvidencePanel />
       <div className="live-strategy-selector-grid">
         <label>
           <span>전략 artifact</span>

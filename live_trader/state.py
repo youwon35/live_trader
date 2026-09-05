@@ -27587,3 +27587,9 @@ def cancel_order(
                 _kill_cleanup=_kill_cleanup,
             )
         )
+
+
+def paper_candidate_evidence_inbox() -> dict[str, Any]:
+    """Read published Evidence without runtime or account observation hooks."""
+    from .paper_candidate_inbox import list_paper_candidates
+    return list_paper_candidates()

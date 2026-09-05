@@ -30,6 +30,7 @@ const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/crypto-first-live/reprepare",
 ]);
 const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
+  "/api/paper-candidates",
   ...FUNCTIONAL_HTTP_MUTATION_PATHS,
   "/api/upbit-functional/status",
   "/api/binance-spot-functional/status",
@@ -873,4 +874,9 @@ export async function request(path, options = {}) {
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+
+export function getPaperCandidateEvidence() {
+  return request("/api/paper-candidates");
 }

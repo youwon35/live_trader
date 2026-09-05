@@ -36,6 +36,7 @@ STRATEGY_SEARCH_PRESET_SCHEMA = "strategy-search-presets-v1"
 STRATEGY_SEARCH_PRESET_LIMIT = 30
 _FUNCTIONAL_STATUS_PATHS = frozenset(
     {
+        "/api/paper-candidates",
         "/api/upbit-functional/status",
         "/api/binance-spot-functional/status",
     }
@@ -411,6 +412,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path in _FUNCTIONAL_STATUS_PATHS and not self._authorize_functional_http(
             require_origin=False
         ):
+            return
+        if parsed.path == "/api/paper-candidates":
+            self.send_json(state.paper_candidate_evidence_inbox())
             return
         if parsed.path == "/api/snapshot":
             from .soak_monitor import latest_live_soak_report
