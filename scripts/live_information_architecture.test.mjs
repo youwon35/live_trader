@@ -65,7 +65,7 @@ test("persistent live hierarchy keeps every execution-critical state visible", (
 });
 
 test("default pages prioritize decisions and move technical evidence into disclosures", () => {
-  const workspace = between(appSource, "function WorkspaceContent", "function DeploymentContextPanel");
+  const workspace = between(appSource, "function WorkspaceContent", "function compactHash");
   const automation = between(workspace, 'if (selectedNav === "automation")', 'if (selectedNav === "functional-test")');
   const gate = between(workspace, 'if (selectedNav === "gate")', 'if (selectedNav === "accounts")');
   const risk = between(workspace, 'if (selectedNav === "risk")', 'if (selectedNav === "incidents")');

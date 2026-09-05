@@ -10,17 +10,20 @@ Real-money trading console for the `trading-system` workspace.
 
 This app intentionally blocks live orders until an immutable Deployment, a fresh Preflight Snapshot, broker/account reconciliation, live strategy permissions, risk checks, and broker order adapters are ready. Enabling the real-order environment flag never submits an order by itself.
 
-The desktop workspace is organized around nine operational views:
+The desktop workspace has eight top-level tabs:
 
-- 운영 현황
-- 배포·승급
-- 계좌·포지션
+- 시작 점검
+- 운용 전략
+- 실거래 운용 (실행·중지 / 한도·안전장치)
+- 계좌·잔고
 - 주문·체결
-- 리스크·안전
-- 실거래 운영
-- 감사 기록
-- 기술 로그
-- 설정·진단
+- 실행 기록 (운영 이력 / 상세 로그)
+- 연결·설정
+- 주문 연결 시험
+
+See [the architecture review](docs/architecture-review-20260906.md) for the current implementation limits and [the manual tab guide](docs/manual-tab-validation.md) for each tab's purpose, internal behavior, steps, and acceptance criteria.
+
+As of 2026-09-06, ordinary continuous execution supports observation but its final live dispatch remains blocked by `CONTINUOUS_FINAL_DISPATCH_LOCK_ORDER_UNAVAILABLE`. The UI reads this capability from the server; missing capability data is unverified. The separate supervised crypto release also remains closed. Paper candidate evidence is verified read-only; first-time Live adoption and initial limited-live approval are not connected yet. Adapter code and completed validation stages do not establish that a production route is available.
 
 ## Run The Desktop App
 
@@ -65,7 +68,7 @@ BINANCE_API_SECRET=
 
 Current implementation includes signed KIS/Binance/Upbit order adapters and private KIS/Upbit execution streams. Real orders still require an eligible immutable portfolio, Paper evidence, account reconciliation, risk checks, explicit mode/route enablement, and a natural confirmed-bar signal.
 
-For an intentional live test, set `LIVE_TRADER_ENABLE_REAL_ORDERS=true`, select exactly one Deployment, confirm the operator, turn Dry Run off, and release new-entry protection with explicit confirmation. Then run a new Preflight for that exact Deployment and start with Canary/Limited Live only after it passes. A Deployment, risk policy, account route, or risk-opening control change invalidates the Preflight and requires it to be run again. Tightening a safety control takes effect immediately; enabling new-entry protection still permits only independently verified position-reducing orders. The global Kill Switch blocks orders and requests cancellation of working orders; it never creates a position-flattening order.
+Route availability must be implemented and verified before a live test can proceed. For a supported route, the backend additionally requires exactly one Deployment, operator confirmation, appropriate mode and safety controls, and a fresh Preflight for that exact Deployment. These conditions alone cannot open the currently blocked ordinary continuous route. A Deployment, risk policy, account route, or risk-opening control change invalidates the Preflight and requires it to be run again. Tightening a safety control takes effect immediately; enabling new-entry protection still permits only independently verified position-reducing orders. The global Kill Switch blocks orders and requests cancellation of working orders; it never creates a position-flattening order.
 
 Operational identity and recovery evidence are persisted as append-only records:
 

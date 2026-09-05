@@ -1,4 +1,6 @@
 import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
+import OperationalChecklistPanel from "./OperationalChecklistPanel";
+import { ordinaryExecutionView, recordedReconciliation, verifiedCanaryExecution } from "./executionAvailability.js";
 import * as React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -57,7 +59,6 @@ import {
   registerSafetyConfirmationPresenter,
   runFinalPreflight,
   runReconciliation,
-  runStrategyCycle,
   startContinuousRuntime,
   startBinanceFuturesFillSoak,
   stopContinuousRuntime,
@@ -66,6 +67,7 @@ import {
   promoteStrategyToLive,
   retryOrder,
   setFlag,
+  setChecklistItem,
   setStrategyLifecycle,
   setAutomationProfile,
   syncExecutionEvents,
@@ -77,9 +79,6 @@ import {
   updateArtifactMetadata,
   saveEnvSettings,
   submitTestIntent,
-  runPolicyReplay,
-  runShadowLive,
-  runRecoveryDrill,
 } from "./api";
 import {
   futuresRiskLeverageOptions,
@@ -140,11 +139,6 @@ import {
 } from "../../../packages/design/layout-editing.js";
 import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
 import { createMasterDetailLog } from "../../../packages/design/master-detail-log.js";
-import {
-  buildPromotionReadinessQueue,
-  normalizePromotionLifecycle,
-  promotionQueueSummary,
-} from "../../../packages/design/promotion-readiness.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
 import { createTelegramConnectionStatus } from "../../../packages/design/telegram-connection-status.js";
 import {
@@ -1950,9 +1944,14 @@ function App() {
         const result = await accountRefreshCoordinatorRef.current.run();
         if (!stopped && safetyEpoch === snapshotSafetyEpochRef.current && result?.snapshot) {
           setSnapshot({ ...result.snapshot, api_connected: true });
+          setError((current) => result.ok === false || result.syncWarning
+            ? `계좌 갱신: ${result.ok === false ? result.reason : result.syncWarning}`
+            : current.startsWith("계좌 갱신: ") ? "" : current);
         }
-      } catch {
-        // Background account refresh stays quiet; the normal snapshot poll keeps connection status visible.
+      } catch (error) {
+        if (!stopped && safetyEpoch === snapshotSafetyEpochRef.current) {
+          setError(`계좌 갱신: ${error instanceof Error ? error.message : "최신 상태를 확인하지 못했습니다."}`);
+        }
       }
     };
     void refreshBrokerAccounts();
@@ -2074,7 +2073,7 @@ function App() {
       const result = await action();
       if (safetyEpoch === snapshotSafetyEpochRef.current) {
         setSnapshot({ ...(result.snapshot ?? result), api_connected: true });
-        setError(result.ok === false ? result.reason : "");
+        setError(result.ok === false ? result.reason : result.syncWarning || "");
       }
       return result;
     } catch (err) {
@@ -2498,7 +2497,7 @@ function App() {
               : runAction(() => setFlag("new_entries_blocked", true))
           }
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
-          onStrategyCycle={(profileId) => runAction(() => runStrategyCycle(profileId))}
+          onChecklistChange={(key, value) => runAction(() => setChecklistItem(key, value))}
           onValidationEvaluate={(candidateId) => runAction(() => evaluateValidationSmallLive(candidateId))}
           onRuntimeStart={(profileId, mode) => runAction(() => startContinuousRuntime(
             profileId,
@@ -2560,6 +2559,7 @@ function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) 
     && snapshot.operator_confirmed
     && !launchLocked;
   const orderRouteEnabled = armed
+    && ordinaryExecutionView(snapshot).liveDispatchAvailable
     && !snapshot.dry_run
     && ["SMALL_LIVE", "FULL_LIVE"].includes(String(snapshot.mode || "").toUpperCase());
   const sessionId = snapshot.live_governance?.activeSession?.sessionId
@@ -2702,7 +2702,7 @@ function WorkspaceContent({
   onDryRun,
   onEntryBlock,
   onAutomation,
-  onStrategyCycle,
+  onChecklistChange,
   onValidationEvaluate,
   onRuntimeStart,
   onRuntimeStop,
@@ -2741,7 +2741,7 @@ function WorkspaceContent({
           strategies={snapshot.strategies}
           runnerState={snapshot.strategy_runner}
           onAutomation={onAutomation}
-          onStrategyCycle={onStrategyCycle}
+          executionAvailability={ordinaryExecutionView(snapshot)}
           onValidationEvaluate={onValidationEvaluate}
           onRuntimeStart={onRuntimeStart}
           onRuntimeStop={onRuntimeStop}
@@ -2786,6 +2786,10 @@ function WorkspaceContent({
   if (selectedNav === "gate") {
     return renderPage(
       <section className="deployment-promotion-layout ts-layout-stack">
+        <section className="panel">
+          <PanelHeader title="Paper에서 받은 검증 근거" subtitle="모의 검증에서 넘어온 전체 후보를 확인한 뒤 아래에서 현재 운용 배포를 선택합니다." />
+          <PaperCandidateEvidencePanel />
+        </section>
         <LivePreparationPanel
           snapshot={snapshot}
           deploymentOnly
@@ -2858,6 +2862,11 @@ function WorkspaceContent({
           onEntryBlock={onEntryBlock}
           onTestIntent={onTestIntent}
         />
+        <OperationalChecklistPanel
+          items={snapshot.checklist}
+          apiConnected={snapshot.api_connected === true}
+          onChange={onChecklistChange}
+        />
         <CompactDisclosure
           className="live-grid-full"
           title="리스크 정책·재시도·선물 계산"
@@ -2915,29 +2924,12 @@ function WorkspaceContent({
   return renderPage(
     <OperationsOverviewPage
       snapshot={snapshot}
+      selectedDeploymentId={deploymentContext?.id || ""}
       onNavigate={onNavigate}
       onReconcile={onReconcile}
       onPreflight={onPreflight}
       onWatchdog={onWatchdog}
     />,
-  );
-}
-
-function DeploymentContextPanel({ context = {}, className = "" }) {
-  return (
-    <section className={`panel deployment-context-panel ${className}`.trim()}>
-      <PanelHeader
-        title="현재 Deployment"
-        subtitle="이 화면의 설정·Preview·Runtime은 상단에서 선택한 동일한 배포 컨텍스트를 사용합니다."
-        suffix={<StatusPill tone={context.portfolioId ? "info" : "warning"}>{context.portfolioId ? "PORTFOLIO" : "STANDALONE"}</StatusPill>}
-      />
-      <div className="deployment-context-grid">
-        <div><span>Portfolio</span><strong>{context.portfolioName || "미확인"}</strong><small>{context.portfolioId || "검증된 Portfolio 연결 필요"}</small></div>
-        <div><span>Strategy</span><strong>{context.name || "미선택"}</strong><small>{context.strategyId || "-"}</small></div>
-        <div><span>Broker · 계정</span><strong>{context.brokerId || "미확인"}</strong><small>{context.accountId || "미확인"}</small></div>
-        <div><span>실행 대상</span><strong>{context.symbol || "-"}</strong><small>{context.timeframe || "-"}</small></div>
-      </div>
-    </section>
   );
 }
 
@@ -3015,12 +3007,20 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
   );
 }
 
-function OperationsOverviewPage({ snapshot, onNavigate, onReconcile, onPreflight, onWatchdog }) {
+function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, onReconcile, onPreflight, onWatchdog }) {
+  const execution = ordinaryExecutionView(snapshot);
   return (
     <section className="operations-overview-layout ts-layout-stack">
+      <section className="panel" aria-label="현재 버전의 실행 범위">
+        <PanelHeader title="현재 버전의 실행 범위" />
+        <p>{execution.detail}</p>
+        {execution.nextAction && <p>{execution.nextAction}</p>}
+        <button className="secondary-button" type="button" onClick={() => onNavigate("automation")}>실행 범위 확인</button>
+      </section>
       <section className="operations-overview-primary ts-panel-grid ts-panel-grid--two">
         <PreTradeDoctorPanel
           snapshot={snapshot}
+          selectedDeploymentId={selectedDeploymentId}
           onNavigate={onNavigate}
           onReconcile={onReconcile}
           onPreflight={onPreflight}
@@ -3051,14 +3051,19 @@ function RuntimeComponentStatusPanel({ snapshot = {} }) {
   const streams = snapshot.execution_streams?.brokers ?? {};
   const streamRows = Object.values(streams);
   const connectedStreams = streamRows.filter((item) => item?.running && item?.connected).length;
-  const orderRoute = activeLive && !snapshot.kill_switch && !snapshot.dry_run;
+  const execution = ordinaryExecutionView(snapshot);
+  const orderRoute = execution.liveDispatchAvailable && activeLive
+    && snapshot.api_connected === true && snapshot.operator_confirmed === true
+    && snapshot.launch_report?.real_order_lock === "ready"
+    && snapshot.live_governance?.preflightValidity?.valid === true
+    && !snapshot.kill_switch && !snapshot.dry_run;
   const rows = [
     { label: "시장 데이터", status: runtimeRunning ? "pass" : activeLive ? "fail" : "na", value: runtimeRunning ? "RUNNING" : activeLive ? "STOPPED" : "해당 없음", detail: runtimeRunning ? "선택 배포의 feed heartbeat를 감시합니다." : "MONITOR 대기 중에는 활성 feed 경로가 없습니다." },
     { label: "Bar Builder", status: runtimeRunning ? "pass" : activeLive ? "fail" : "na", value: runtimeRunning ? "RUNNING" : activeLive ? "STOPPED" : "해당 없음", detail: "완료 봉 경계와 중복 bar 처리를 런타임별로 추적합니다." },
     { label: "전략 평가", status: runtimeRunning ? "pass" : "na", value: runtimeRunning ? "RUNNING" : "대기", detail: `마지막 평가 ${snapshot.strategy_runner?.last_run || "미실행"}` },
     { label: "Portfolio Engine", status: runtimeRunning ? "pass" : "na", value: runtimeRunning ? "RUNNING" : "대기", detail: "전략 Sleeve를 계좌 Net Target으로 합산합니다." },
     { label: "Risk Gateway", status: snapshot.api_connected ? "pass" : "fail", value: snapshot.api_connected ? "ENFORCING" : "확인 불가", detail: "주문 전 최종 위험 증가·Reduce-only 정책을 적용합니다." },
-    { label: "주문 전송", status: orderRoute ? "pass" : "na", value: orderRoute ? "ENABLED" : "BLOCKED", detail: orderRoute ? "LIVE route가 활성화되어 있습니다." : "전송 차단 상태에서도 시세·전략·대조는 독립적으로 동작할 수 있습니다." },
+    { label: "주문 전송", status: orderRoute ? "pass" : "na", value: orderRoute ? "ENABLED" : "BLOCKED", detail: orderRoute ? "주문마다 계좌·배포·승인과 위험 한도를 다시 검사합니다." : execution.detail },
     { label: "Broker Event", status: connectedStreams ? "pass" : activeLive ? "fail" : "na", value: connectedStreams ? `${connectedStreams} CONNECTED` : activeLive ? "DISCONNECTED" : "해당 없음", detail: "사설 주문·체결 이벤트와 REST Snapshot을 함께 대조합니다." },
   ];
   return (
@@ -3773,68 +3778,6 @@ function displayNumber(value, digits = 2) {
   return Number.isFinite(number) ? number.toLocaleString("ko-KR", { maximumFractionDigits: digits }) : "-";
 }
 
-function LineageFlowPanel({ snapshot = {}, selectedStrategyId = "" }) {
-  const flows = Array.isArray(snapshot?.flows) ? snapshot.flows : [];
-  const flow = flows.find((item) => item.strategyId === selectedStrategyId) || flows[0];
-  return (
-    <section className="panel lineage-flow-panel">
-      <PanelHeader
-        title="데이터·전략 계보"
-        subtitle="Scraper 원천부터 Backtest, Paper, Live 증거까지 같은 전략 체인을 읽기 전용으로 추적합니다."
-        suffix={(
-          <StatusPill tone={snapshot?.brokenCount ? "warning" : flows.length ? "success" : "neutral"}>
-            {snapshot?.completeCount || 0} COMPLETE · {snapshot?.brokenCount || 0} BROKEN
-          </StatusPill>
-        )}
-      />
-      {flow ? (
-        <>
-          <div className="lineage-flow-identity">
-            <div>
-              <strong>{flow.name}</strong>
-              <span>{flow.strategyId} · {flow.symbol} · {flow.timeframe}</span>
-            </div>
-            <StatusPill tone={flow.complete ? "success" : "danger"}>
-              {flow.complete ? "CHAIN OK" : "CHAIN BLOCKED"}
-            </StatusPill>
-          </div>
-          <div className="lineage-stage-grid">
-            {(flow.stages || []).map((stage, index) => (
-              <React.Fragment key={stage.id}>
-                <article {...semanticSurfaceProps(stage.status === "PASS" ? "success" : stage.status === "BLOCK" ? "danger" : "neutral", "lineage-stage-card")}>
-                  <span>{stage.label}</span>
-                  <strong>{stage.status}</strong>
-                  <div className="lineage-stage-details">
-                    {stage.id === "dataset" && stage.metadata?.datasetId && <small>dataset · {stage.metadata.datasetId}</small>}
-                    {stage.id === "dataset" && stage.metadata?.lineageRunId && <small>run · {stage.metadata.lineageRunId}</small>}
-                    {stage.id === "dataset" && stage.metadata?.sourceStage && <small>stage · {stage.metadata.sourceStage}</small>}
-                    {stage.id === "dataset" && stage.metadata?.stageRevisionId && <small>revision · {stage.metadata.stageRevisionId}</small>}
-                    {stage.id === "dataset" && stage.metadata?.transformationId && <small>transform · {stage.metadata.transformationId}</small>}
-                    <small>
-                      {stage.contentHash
-                        ? `hash · ${stage.contentHash.slice(0, 12)}…`
-                        : stage.required
-                          ? "증거 없음"
-                          : "아직 미진행"}
-                    </small>
-                  </div>
-                </article>
-                {index < (flow.stages || []).length - 1 && <span className="lineage-stage-arrow">→</span>}
-              </React.Fragment>
-            ))}
-          </div>
-          {!flow.complete && (
-            <div {...semanticSurfaceProps("danger", "lineage-flow-warning")}>
-              <ShieldAlert size={15} />
-              <span>{(flow.brokenLinks || [])[0] || "계보 연결을 확인하세요."}</span>
-            </div>
-          )}
-        </>
-      ) : <EmptyRow text="표시할 전략 계보가 없습니다." />}
-    </section>
-  );
-}
-
 function CapitalRolloutPanel({ snapshot = {}, selectedStrategyId = "", className = "" }) {
   const rows = Array.isArray(snapshot?.strategies) ? snapshot.strategies : [];
   const rollout = rows.find((item) => item.strategyId === selectedStrategyId) || rows[0];
@@ -4352,187 +4295,6 @@ function FuturesFillSoakPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
   );
 }
 
-function PortfolioArtifactPanel({
-  portfolios = [],
-  selectedStrategy,
-  operationalReadiness = {},
-  runtimeRecovery = {},
-  shadowLive = {},
-  multiStrategy = {},
-  executionCalibration = {},
-  metadataItems = {},
-  onMetadataSave,
-  continuousRuntime = {},
-}) {
-  const gate = selectedStrategy?.portfolio_gate ?? {};
-  const [replay, setReplay] = useState(null);
-  const [replayRunning, setReplayRunning] = useState(false);
-  const [operationResult, setOperationResult] = useState(null);
-  const [filters, setFilters] = useState({ query: "", failure: "all", quick: "all" });
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(10);
-  const failureOptions = uniqueStrategyDiscoveryValues(portfolios.flatMap((portfolio) => liveArtifactFailureReasons(portfolio)));
-  const visiblePortfolios = portfolios.filter((portfolio) => {
-    const artifactId = portfolio.id || portfolio.source_path;
-    const metadata = metadataItems[artifactMetadataKey(artifactId, "portfolio")];
-    const query = filters.query.trim().toLocaleLowerCase();
-    const matchesQuery = !query || [
-      portfolio.name,
-      portfolio.id,
-      portfolio.lifecycle_status,
-      JSON.stringify(portfolio.strategy_instances || []),
-      JSON.stringify(metadata?.tags || []),
-      metadata?.note,
-    ].some((value) => String(value || "").toLocaleLowerCase().includes(query));
-    return matchesQuery
-      && (filters.failure === "all" || liveArtifactFailureReasons(portfolio).includes(filters.failure))
-      && artifactMatchesQuickFilter(metadata, filters.quick, liveArtifactRunning(continuousRuntime, artifactId));
-  });
-  const totalPages = Math.max(1, Math.ceil(visiblePortfolios.length / pageSize));
-  const currentPage = Math.min(Math.max(page, 1), totalPages);
-  const pageStart = (currentPage - 1) * pageSize;
-  const pageEnd = Math.min(visiblePortfolios.length, pageStart + pageSize);
-  const pagedPortfolios = visiblePortfolios.slice(pageStart, pageEnd);
-  const pageNumbers = paginationNumbers(currentPage, totalPages);
-
-  useEffect(() => {
-    setPage(1);
-  }, [filters.query, filters.failure, filters.quick, pageSize]);
-
-  useEffect(() => {
-    setPage((current) => Math.min(Math.max(current, 1), totalPages));
-  }, [totalPages]);
-
-  async function replayPolicy() {
-    setReplayRunning(true);
-    try {
-      const response = await runPolicyReplay({
-        side: "BUY",
-        currentWeight: Number(gate.targetWeight || 0) * 0.5,
-        portfolioEquity: 10000000,
-        expectedAlphaBps: 12,
-        expectedCostBps: 6,
-        alternative: { policyVersion: "live-conservative-v1", deadbandWeight: 0.005, costBufferBps: 2, capitalMultiplier: Number(gate.capitalMultiplier ?? 1) },
-      });
-      setReplay(response.bundle ?? null);
-    } finally {
-      setReplayRunning(false);
-    }
-  }
-  async function observeShadow() {
-    const response = await runShadowLive({ side: "BUY", expected_cost_bps: 6, latency_ms: 100 });
-    setOperationResult(response.evidence ? `Shadow evidence ${response.evidence.contentHash.slice(0, 12)}` : "Shadow 실행 완료");
-  }
-  async function verifyRecovery() {
-    const response = await runRecoveryDrill();
-    setOperationResult(response.ok ? `Recovery generation ${response.recovery.generation} 검증 완료` : "Recovery 안전 모드 진입");
-  }
-  return (
-    <section className="panel portfolio-artifact-panel">
-      <PanelHeader title="포트폴리오 Artifact" subtitle="Live 주문은 선택 전략이 포함된 포트폴리오 universe와 target weight를 기준으로 제한됩니다." />
-      {gate.active && (
-        <div className="portfolio-gate-metrics">
-          <MetricCard className="metric-card" label="Portfolio" value={gate.portfolioName || gate.portfolioId || "-"} detail={gate.lifecycleStatus || "-"} />
-          <MetricCard className="metric-card" label="실효 목표 비중" value={`${formatPercentValue(gate.targetWeight)}%`} detail={`설정 ${formatPercentValue(gate.configuredTargetWeight)}% × 전략 ${formatPercentValue(gate.positionSizeFraction)}% · Symbol max ${formatPercentValue((gate.maxSymbolWeightPct || 0) / 100)}%`} />
-          <MetricCard className="metric-card" label="FX 기준시각" value={gate.fxFreshness?.source === "same-currency" ? "동일 통화" : gate.fxFreshness?.asOf || "없음"} detail={`${gate.fxFreshness?.currency || "-"}/${gate.fxFreshness?.baseCurrency || "-"} ×${Number(gate.fxFreshness?.rate ?? 0).toLocaleString("ko-KR")} · ${gate.fxFreshness?.fresh ? `신선 ${gate.fxFreshness?.ageDays ?? 0}일` : `STALE ${gate.fxFreshness?.ageDays ?? "?"}일`}`} />
-          <MetricCard className="metric-card" label="Mandate" value={gate.mandateCompliant === false ? "BLOCK" : "PASS"} detail={(gate.mandateBreaches ?? []).join(" · ") || "위반 없음"} />
-          <MetricCard className="metric-card" label="Auto De-risk" value={`${gate.automaticDeRiskAction || "KEEP"} ×${Number(gate.capitalMultiplier ?? 1).toFixed(2)}`} detail={`Stress ${gate.stressPassed === false ? "BLOCK" : "PASS"}`} />
-        </div>
-      )}
-      {gate.active && (
-        <div className="operator-actions">
-          <ActionButton className="secondary-button" label="정책 Replay" onClick={replayPolicy} status={replayRunning ? "pending" : replay ? "success" : undefined} disabled={replayRunning} />
-          <ActionButton className="secondary-button" label="Shadow 관찰" onClick={observeShadow} />
-          <ActionButton className="secondary-button" label="복구 훈련" onClick={verifyRecovery} />
-          {replay && <span className="inline-state success">{replay.eventCount}건 · 결정 변경 {replay.changedDecisionCount} · 원본 불변 {replay.sourceEventsImmutable ? "PASS" : "FAIL"}</span>}
-          {operationResult && <span className="inline-state success">{operationResult}</span>}
-        </div>
-      )}
-      {gate.active && (
-        <div className="portfolio-gate-metrics">
-          <MetricCard className="metric-card" label="Operational Readiness" value={`${operationalReadiness.score ?? 0}/${operationalReadiness.threshold ?? 85}`} detail={operationalReadiness.liveEligible ? "LIVE ELIGIBLE" : "신규 위험 차단"} />
-          <MetricCard className="metric-card" label="Recovery" value={runtimeRecovery.verified && !runtimeRecovery.safeMode ? "VERIFIED" : "SAFE MODE"} detail={runtimeRecovery.detail || "복구 훈련 대기"} />
-          <MetricCard className="metric-card" label="Shadow Live" value={`${shadowLive.count ?? 0} observations`} detail="브로커 전송은 항상 차단" />
-          <MetricCard className="metric-card" label="Execution Calibration" value={`${executionCalibration.sampleCount ?? 0} samples`} detail={executionCalibration.status === "pass" ? `모델오차 ${Number(executionCalibration.meanAbsoluteModelErrorBps ?? 0).toFixed(1)} bps` : "Paper/Shadow 체결 표본 필요"} />
-          <MetricCard className="metric-card" label="Strategy Sleeves" value={`${multiStrategy.sleeveCount ?? 0} active`} detail="종목별 순주문 1건 · Short는 명시 상품만" />
-        </div>
-      )}
-      <div className="portfolio-artifact-discovery">
-        <label><Search size={14} /><input value={filters.query} onChange={(event) => setFilters((current) => ({ ...current, query: event.target.value }))} placeholder="포트폴리오, 구성 전략, 태그, 메모 검색" /></label>
-        <select value={filters.failure} onChange={(event) => setFilters((current) => ({ ...current, failure: event.target.value }))}>
-          <option value="all">모든 실패 이유</option>
-          {failureOptions.map((value) => <option key={value} value={value}>{value}</option>)}
-        </select>
-        {[
-          ["all", "전체"],
-          ["favorite", "즐겨찾기"],
-          ["recent-used", "최근 사용"],
-          ["recent-promoted", "최근 승급"],
-          ["running", "현재 실행 중"],
-        ].map(([value, label]) => <button className={filters.quick === value ? "active" : ""} key={value} type="button" onClick={() => setFilters((current) => ({ ...current, quick: value }))}>{label}</button>)}
-      </div>
-      <div className="portfolio-artifact-list">
-        {visiblePortfolios.length ? (
-          pagedPortfolios.map((portfolio) => {
-            const permissions = portfolio.permissions ?? {};
-            const targetCount = portfolio.target_portfolio?.length ?? 0;
-            const strategyCount = portfolio.strategy_instances?.length ?? 0;
-            const liveReady = permissions.live_allowed || permissions.live_export_allowed || permissions.live_small_allowed;
-            const artifactId = portfolio.id || portfolio.source_path;
-            const metadata = metadataItems[artifactMetadataKey(artifactId, "portfolio")];
-            return (
-              <article
-                {...semanticSurfaceProps(liveReady ? "success" : "danger", "portfolio-artifact-item")}
-                key={portfolio.id || portfolio.source_path}
-              >
-                <div>
-                  <strong>{metadata?.favorite && <Star size={13} fill="currentColor" />}{portfolio.name || portfolio.id}</strong>
-                  <span>{strategyCount} 전략 · {targetCount} target · {portfolio.lifecycle_status}</span>
-                  {metadata?.tags?.length > 0 && <small>{metadata.tags.map((tag) => `#${tag}`).join(" ")}</small>}
-                </div>
-                <ArtifactMetadataEditor artifactId={artifactId} artifactType="portfolio" metadata={metadata} onSave={onMetadataSave} compact />
-                <StatusPill tone={liveReady ? "success" : "danger"}>{liveReady ? "LIVE READY" : "LIVE BLOCKED"}</StatusPill>
-              </article>
-            );
-          })
-        ) : (
-          <EmptyRow text={portfolios.length ? "검색 조건에 맞는 portfolio artifact가 없습니다." : "저장된 portfolio artifact가 없습니다. 없을 때는 기존 단일 전략 게이트를 사용합니다."} />
-        )}
-      </div>
-      <div className="portfolio-pagination-footer">
-        <span>
-          검색 결과 {visiblePortfolios.length.toLocaleString()}개
-          {visiblePortfolios.length ? ` · ${pageStart + 1}-${pageEnd}` : ""}
-        </span>
-        <div className="portfolio-pagination-controls" aria-label="포트폴리오 Artifact 페이지">
-          <label>
-            <span>페이지당</span>
-            <select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}>
-              {[10, 20, 50].map((size) => <option key={size} value={size}>{size}개</option>)}
-            </select>
-          </label>
-          <button disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)} type="button">이전</button>
-          {pageNumbers.map((pageNumber, index) => (
-            pageNumber === "gap" ? (
-              <span className="portfolio-pagination-gap" key={`gap-${index}`}>...</span>
-            ) : (
-              <button
-                className={pageNumber === currentPage ? "active" : ""}
-                key={pageNumber}
-                onClick={() => setPage(pageNumber)}
-                type="button"
-              >
-                {pageNumber}
-              </button>
-            )
-          ))}
-          <button disabled={currentPage >= totalPages} onClick={() => setPage(currentPage + 1)} type="button">다음</button>
-        </div>
-      </div>
-    </section>
-  );
-}
-
 function OperationalSafeguardsPanel({ apiConnected, dryRun, newEntriesBlocked, killSwitch, operatorConfirmed, onConfirm, onDryRun, onEntryBlock, onTestIntent }) {
   return (
     <section className="panel operational-safeguards-panel">
@@ -4581,11 +4343,11 @@ function OperationalSafeguardsPanel({ apiConnected, dryRun, newEntriesBlocked, k
   );
 }
 
-function PreTradeDoctorPanel({ snapshot, onNavigate, onReconcile, onPreflight, onWatchdog }) {
+function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onReconcile, onPreflight, onWatchdog }) {
   const [running, setRunning] = useState(false);
   const [hasRun, setHasRun] = useState(false);
   const [selectedDoctorId, setSelectedDoctorId] = useState(null);
-  const items = buildDoctorItems(snapshot);
+  const items = buildDoctorItems(snapshot, selectedDeploymentId);
   const problemCount = items.filter((item) => item.tone !== "success").length;
   const failCount = items.filter((item) => item.tone === "danger").length;
   const warnCount = items.filter((item) => item.tone === "warning").length;
@@ -4682,12 +4444,12 @@ function makeDetail(label, value, status = "neutral") {
   };
 }
 
-function buildDoctorItems(snapshot) {
-  if (snapshot.api_connected === false) {
+function buildDoctorItems(snapshot = {}, selectedDeploymentId = "", now = Date.now()) {
+  if (snapshot.api_connected !== true) {
     const disconnectedItems = [
       ["API / 브로커 연결", "Python API 연결이 필요합니다.", "settings"],
-      ["운영 체크리스트", "API 연결 후 현재 체크 상태를 확인합니다.", "gate"],
-      ["리스크 한도", "API 연결 후 현재 리스크 한도를 확인합니다.", "gate"],
+      ["운영 체크리스트", "API 연결 후 현재 체크 상태를 확인합니다.", "risk"],
+      ["리스크 한도", "API 연결 후 현재 리스크 한도를 확인합니다.", "risk"],
       ["전략 lifecycle eligibility", "API 연결 후 전략 승인 상태를 확인합니다.", "gate"],
       ["포지션·계좌 대조", "API 연결 후 브로커 대조 상태를 확인합니다.", "accounts"],
       ["Live Watchdog", "API 연결 후 Watchdog 상태를 확인합니다.", "automation"],
@@ -4711,9 +4473,28 @@ function buildDoctorItems(snapshot) {
   const brokerConnectionErrors = snapshot.reconciliation?.errors ?? [];
   const configuredBrokerCount = (snapshot.brokers ?? []).filter((broker) => !(broker.missing_env?.length)).length;
   const missingChecklist = (snapshot.checklist ?? []).filter((item) => item.required && !item.checked);
+  const riskKnown = (snapshot.risk_checks ?? []).length > 0
+    && snapshot.risk_checks.every((check) => ["pass", "warn", "fail", "na"].includes(check.status));
+  const strategiesKnown = (snapshot.strategies ?? []).length > 0
+    && snapshot.strategies.every((strategy) => typeof strategy.live_allowed === "boolean");
   const riskFailures = (snapshot.risk_checks ?? []).filter((check) => check.status === "fail");
   const riskWarnings = (snapshot.risk_checks ?? []).filter((check) => check.status === "warn");
   const reconciliation = snapshot.reconciliation?.summary ?? {};
+  const reconciliationEvidence = recordedReconciliation(snapshot);
+  const checklistKnown = (snapshot.checklist ?? []).length > 0;
+  const governance = snapshot.live_governance ?? {};
+  const latestPreflight = governance.latestPreflight || governance.latest_preflight || {};
+  const validity = governance.preflightValidity || governance.preflight_validity || {};
+  const selectedId = String(selectedDeploymentId || "").trim();
+  const preflightId = String(latestPreflight.deploymentId || latestPreflight.deployment_id || "").trim();
+  const expiresAt = Date.parse(latestPreflight.expiresAt || latestPreflight.expires_at || "");
+  const preflightVerified = (snapshot.final_preflight ?? []).length > 0
+    && snapshot.final_preflight.every((check) => ["pass", "warn", "fail", "na"].includes(check.status))
+    && validity.valid === true
+    && String(latestPreflight.status || latestPreflight.result || "").toUpperCase() === "PASS"
+    && deploymentContextMatchesPreflight(selectedId, governance)
+    && preflightId === selectedId
+    && Number.isFinite(expiresAt) && expiresAt > now;
   const finalFailures = (snapshot.final_preflight ?? []).filter((check) => check.status === "fail");
   const finalWarnings = (snapshot.final_preflight ?? []).filter((check) => check.status === "warn");
   const strategyBlocked = (snapshot.strategies ?? []).filter((strategy) => !strategy.live_allowed);
@@ -4724,31 +4505,42 @@ function buildDoctorItems(snapshot) {
         broker.missing_env?.length
           ? `환경 변수 ${broker.missing_env.length}개 누락 · ${broker.missing_env.join(", ")}`
           : "API 인증정보가 설정되어 있습니다. 실주문 승격 조건은 최종 Preflight에서 별도로 확인합니다.",
-        broker.missing_env?.length ? "fail" : "pass",
+        broker.missing_env?.length ? "fail" : reconciliationEvidence.observed ? "pass" : "warn",
       ),
     ),
     ...brokerConnectionErrors.map((error) => makeDetail(`${error.broker_id ?? "브로커"} 계좌 조회`, error.detail ?? "계좌 조회 오류가 발생했습니다.", "fail")),
   ];
   const checklistDetails = (snapshot.checklist ?? []).map((item) => makeDetail(item.label, item.detail, item.checked ? "pass" : item.required ? "fail" : "warn"));
-  const riskDetails = (snapshot.risk_checks ?? []).map((check) => makeDetail(check.label, `${check.detail} · ${check.value}`, check.status));
+  const riskDetails = (snapshot.risk_checks ?? []).map((check) => makeDetail(check.label, `${check.detail} · ${check.value}`, riskKnown || check.status === "fail" ? check.status : "warn"));
   const strategyDetails = (snapshot.strategies ?? []).map((strategy) =>
     makeDetail(strategy.name, `${strategy.symbol} · ${strategy.block_reason || strategy.lifecycle_status}`, strategy.live_allowed ? "pass" : "warn"),
   );
   const reconciliationDetails = [
-    makeDetail("대조 상태", `${reconciliation.status_label ?? reconciliation.status ?? "-"} · 마지막 대조 ${reconciliation.last_run ?? "-"}`, reconciliation.status ?? "neutral"),
-    makeDetail("포지션", `${reconciliation.position_count ?? 0}개 · 불일치 ${reconciliation.mismatch_count ?? 0}개`, reconciliation.mismatch_count ? "fail" : "pass"),
-    makeDetail("계좌", `${reconciliation.account_count ?? 0}개 · API 필요 ${reconciliation.api_required_count ?? 0}건`, reconciliation.api_required_count ? "warn" : "pass"),
+    makeDetail("대조 상태", `${reconciliation.status_label ?? reconciliation.status ?? "-"} · 마지막 대조 ${reconciliation.last_run ?? "-"}`, reconciliationEvidence.blocked ? "fail" : reconciliationEvidence.verified ? "pass" : "warn"),
+    makeDetail("포지션", `${reconciliation.position_count ?? "미확인"}개 · 불일치 ${reconciliation.mismatch_count ?? "미확인"}개`, reconciliation.mismatch_count > 0 ? "fail" : reconciliationEvidence.verified ? "pass" : "warn"),
+    makeDetail("계좌", `${reconciliation.account_count ?? "미확인"}개 · API 필요 ${reconciliation.api_required_count ?? "미확인"}건`, reconciliationEvidence.verified ? "pass" : "warn"),
     ...(snapshot.positions ?? []).map((position) => makeDetail(position.symbol, `${position.broker_name} · ${position.status_label} · ${position.detail}`, position.status)),
     ...(snapshot.accounts ?? []).map((account) => makeDetail(account.account, `${account.broker_name} · ${account.currency} · ${account.detail}`, account.status)),
   ];
-  const watchdog = snapshot.watchdog ?? fallbackSnapshot.watchdog;
+  const watchdog = snapshot.watchdog ?? {};
+  const watchdogKnown = Number.isFinite(Date.parse(watchdog.last_run || ""))
+    && (watchdog.checks ?? []).length > 0
+    && ["pass", "warn", "fail", "na"].includes(watchdog.status)
+    && ["critical_count", "warning_count", "trip_count"].every((key) => (
+      Number.isSafeInteger(watchdog[key]) && watchdog[key] >= 0
+    ))
+    && watchdog.checks.every((check) => ["pass", "warn", "fail", "na"].includes(check.status));
+  const watchdogFailed = watchdog.critical_count > 0 || watchdog.status === "fail"
+    || (watchdog.checks ?? []).some((check) => check.status === "fail");
+  const watchdogWarning = watchdog.warning_count > 0 || watchdog.status === "warn"
+    || (watchdog.checks ?? []).some((check) => check.status === "warn");
   const watchdogDetails = [
-    makeDetail("Watchdog 상태", `${watchdog.status_label ?? watchdog.status} · 마지막 점검 ${watchdog.last_run ?? "-"}`, watchdog.status),
-    makeDetail("Fail-closed", `${watchdog.trip_count ?? 0}회 · 마지막 ${watchdog.last_trip ?? "-"}`, watchdog.trip_count ? "warn" : "pass"),
-    ...(watchdog.checks ?? []).map((check) => makeDetail(check.label, `${check.detail} · ${check.value}`, check.status)),
+    makeDetail("Watchdog 상태", `${watchdog.status_label ?? watchdog.status ?? "미확인"} · 마지막 점검 ${watchdog.last_run ?? "-"}`, watchdogFailed ? "fail" : watchdogKnown ? watchdog.status : "warn"),
+    makeDetail("Fail-closed", `${watchdog.trip_count ?? "미확인"}회 · 마지막 ${watchdog.last_trip ?? "-"}`, watchdogKnown && watchdog.trip_count === 0 ? "pass" : "warn"),
+    ...(watchdog.checks ?? []).map((check) => makeDetail(check.label, `${check.detail} · ${check.value}`, watchdogKnown || check.status === "fail" ? check.status : "warn")),
   ];
   const finalDetails = [
-    ...(snapshot.final_preflight ?? []).map((check) => makeDetail(check.label, check.detail, check.status)),
+    ...(snapshot.final_preflight ?? []).map((check) => makeDetail(check.label, check.detail, preflightVerified || check.status === "fail" ? check.status : "warn")),
     ...((snapshot.launch_report?.hard_stops ?? []).map((item) => makeDetail(`Hard stop · ${item.label}`, item.detail, "fail"))),
     ...((snapshot.launch_report?.warnings ?? []).map((item) => makeDetail(`Warning · ${item.label}`, item.detail, "warn"))),
     ...((snapshot.operation_report?.next_actions ?? []).map((action) => makeDetail("다음 조치", action, "warn"))),
@@ -4763,39 +4555,39 @@ function buildDoctorItems(snapshot) {
         ? `API 환경 변수 ${missingBrokerEnvCount}개가 비어 있습니다.`
         : brokerConnectionErrors.length
           ? `브로커 계좌 조회 오류 ${brokerConnectionErrors.length}개를 확인하세요.`
-          : `${configuredBrokerCount}개 브로커의 API 인증정보와 계좌 조회 상태를 확인했습니다.`,
-      tone: missingBrokerEnvCount || brokerConnectionErrors.length ? "danger" : "success",
-      status: missingBrokerEnvCount || brokerConnectionErrors.length ? "조치" : "통과",
+          : reconciliationEvidence.observed ? `${configuredBrokerCount}개 브로커의 인증정보가 설정되어 있고 계좌 조회 이력이 있습니다.` : "인증정보 설정과 실제 연결 성공은 다릅니다. 계좌 조회 결과를 확인하세요.",
+      tone: missingBrokerEnvCount || brokerConnectionErrors.length ? "danger" : reconciliationEvidence.observed ? "success" : "warning",
+      status: missingBrokerEnvCount || brokerConnectionErrors.length ? "조치" : reconciliationEvidence.observed ? "통과" : "미확인",
       targetNav: "settings",
-      details: apiDetails.length ? apiDetails : [makeDetail("API / 브로커", "점검할 API 문제가 없습니다.", "pass")],
+      details: apiDetails.length ? apiDetails : [makeDetail("API / 브로커", "API 연결 검사 결과를 확인하지 못했습니다.", "warn")],
     },
     {
       id: "doctor-checklist",
       index: 2,
       title: "운영 체크리스트",
-      detail: missingChecklist.length ? `필수 확인 ${missingChecklist.length}개가 남아 있습니다.` : "필수 운영 확인이 완료되었습니다.",
-      tone: missingChecklist.length ? "danger" : "success",
-      status: missingChecklist.length ? "조치" : "통과",
-      targetNav: "gate",
-      details: checklistDetails.length ? checklistDetails : [makeDetail("운영 체크리스트", "점검할 체크리스트가 없습니다.", "pass")],
+      detail: !checklistKnown ? "운영 체크리스트를 확인하지 못했습니다." : missingChecklist.length ? `필수 확인 ${missingChecklist.length}개가 남아 있습니다. 한도·안전장치에서 확인하세요.` : "필수 운영 확인이 완료되었습니다.",
+      tone: !checklistKnown ? "warning" : missingChecklist.length ? "danger" : "success",
+      status: !checklistKnown ? "미확인" : missingChecklist.length ? "조치" : "통과",
+      targetNav: "risk",
+      details: checklistDetails.length ? checklistDetails : [makeDetail("운영 체크리스트", "운영 체크리스트를 확인하지 못했습니다.", "warn")],
     },
     {
       id: "doctor-risk",
       index: 3,
       title: "리스크 한도",
-      detail: riskFailures.length ? `리스크 차단 ${riskFailures.length}개가 있습니다.` : riskWarnings.length ? `warning ${riskWarnings.length}개를 검토하세요.` : "손실/노출/슬리피지 규칙이 정상입니다.",
-      tone: riskFailures.length ? "danger" : riskWarnings.length ? "warning" : "success",
-      status: riskFailures.length ? "차단" : riskWarnings.length ? "주의" : "통과",
+      detail: riskFailures.length ? `리스크 차단 ${riskFailures.length}개가 있습니다.` : !riskKnown ? "리스크 점검 결과를 확인하지 못했습니다." : riskWarnings.length ? `warning ${riskWarnings.length}개를 검토하세요.` : "손실/노출/슬리피지 규칙이 정상입니다.",
+      tone: riskFailures.length ? "danger" : !riskKnown || riskWarnings.length ? "warning" : "success",
+      status: riskFailures.length ? "차단" : !riskKnown ? "미확인" : riskWarnings.length ? "주의" : "통과",
       targetNav: "risk",
-      details: riskDetails.length ? riskDetails : [makeDetail("리스크 한도", "점검할 리스크 항목이 없습니다.", "pass")],
+      details: riskDetails.length ? riskDetails : [makeDetail("리스크 한도", "리스크 점검 결과를 확인하지 못했습니다.", "warn")],
     },
     {
       id: "doctor-strategy",
       index: 4,
       title: "전략 lifecycle eligibility",
-      detail: strategyBlocked.length ? `Live-Small/Live 전 전략 ${strategyBlocked.length}개를 검토해야 합니다.` : "Live-Small 이상 전략을 확인했습니다.",
-      tone: strategyBlocked.length ? "warning" : "success",
-      status: strategyBlocked.length ? "검토" : "통과",
+      detail: !strategiesKnown ? "검증할 전략과 실행 권한을 확인하지 못했습니다." : strategyBlocked.length ? `Live-Small/Live 전 전략 ${strategyBlocked.length}개를 검토해야 합니다.` : "Live-Small 이상 전략을 확인했습니다.",
+      tone: !strategiesKnown || strategyBlocked.length ? "warning" : "success",
+      status: !strategiesKnown ? "미확인" : strategyBlocked.length ? "검토" : "통과",
       targetNav: "gate",
       details: strategyDetails.length ? strategyDetails : [makeDetail("전략", "점검할 전략이 없습니다.", "warn")],
     },
@@ -4803,9 +4595,9 @@ function buildDoctorItems(snapshot) {
       id: "doctor-reconciliation",
       index: 5,
       title: "포지션·계좌 대조",
-      detail: reconciliation.mismatch_count ? `불일치 ${reconciliation.mismatch_count}개가 있습니다.` : reconciliation.api_required_count ? `API 조회 필요 ${reconciliation.api_required_count}건이 있습니다.` : "계좌/포지션 대조가 정상입니다.",
-      tone: reconciliation.mismatch_count ? "danger" : reconciliation.api_required_count ? "warning" : "success",
-      status: reconciliation.mismatch_count ? "조치" : reconciliation.api_required_count ? "API" : "통과",
+      detail: reconciliationEvidence.blocked ? "계좌 조회 오류 또는 원장 불일치를 확인하세요." : reconciliationEvidence.verified ? "기록된 계좌/포지션 대조 결과가 일치합니다. 실행 전 신선도를 다시 검사합니다." : "계좌 대조 미실행 또는 미확인입니다. 계좌·잔고에서 새로 조회하세요.",
+      tone: reconciliationEvidence.blocked ? "danger" : reconciliationEvidence.verified ? "success" : "warning",
+      status: reconciliationEvidence.blocked ? "조치" : reconciliationEvidence.verified ? "통과" : "미확인",
       targetNav: "accounts",
       details: reconciliationDetails,
     },
@@ -4813,9 +4605,9 @@ function buildDoctorItems(snapshot) {
       id: "doctor-watchdog",
       index: 6,
       title: "Live Watchdog",
-      detail: watchdog.critical_count ? `critical ${watchdog.critical_count}개로 자동화가 차단됩니다.` : watchdog.warning_count ? `warning ${watchdog.warning_count}개를 확인하세요.` : "Watchdog 감시 상태가 정상입니다.",
-      tone: watchdog.critical_count ? "danger" : watchdog.warning_count ? "warning" : "success",
-      status: watchdog.critical_count ? "차단" : watchdog.warning_count ? "주의" : "통과",
+      detail: watchdogFailed ? "Watchdog 차단 항목을 확인하세요." : !watchdogKnown ? "Watchdog 점검 이력과 결과를 확인하지 못했습니다." : watchdogWarning ? "Watchdog 주의 항목을 확인하세요." : watchdog.status === "na" ? "활성 운용이 없어 Watchdog 감시 항목이 적용되지 않습니다." : "Watchdog 감시 상태가 정상입니다.",
+      tone: watchdogFailed ? "danger" : !watchdogKnown || watchdogWarning || watchdog.status === "na" ? "warning" : "success",
+      status: watchdogFailed ? "차단" : !watchdogKnown ? "미확인" : watchdogWarning ? "주의" : watchdog.status === "na" ? "비활성" : "통과",
       targetNav: "automation",
       details: watchdogDetails,
     },
@@ -4823,11 +4615,11 @@ function buildDoctorItems(snapshot) {
       id: "doctor-final",
       index: 7,
       title: "최종 Preflight",
-      detail: finalFailures.length ? `hard stop ${finalFailures.length}개가 남아 있습니다.` : finalWarnings.length ? `warning ${finalWarnings.length}개를 확인하세요.` : "최종 점검을 통과했습니다.",
-      tone: finalFailures.length ? "danger" : finalWarnings.length ? "warning" : "success",
-      status: finalFailures.length ? "차단" : finalWarnings.length ? "주의" : "통과",
+      detail: finalFailures.length ? `hard stop ${finalFailures.length}개가 남아 있습니다.` : !preflightVerified ? "유효한 Preflight가 없습니다. 현재 배포를 선택한 뒤 새로 점검하세요." : finalWarnings.length ? `warning ${finalWarnings.length}개를 확인하세요.` : "현재 배포의 유효한 최종 점검 결과가 있습니다.",
+      tone: finalFailures.length ? "danger" : !preflightVerified || finalWarnings.length ? "warning" : "success",
+      status: finalFailures.length ? "차단" : !preflightVerified ? "미확인" : finalWarnings.length ? "주의" : "통과",
       targetNav: "overview",
-      details: finalDetails.length ? finalDetails : [makeDetail("최종 Preflight", "점검할 hard stop이 없습니다.", "pass")],
+      details: finalDetails.length ? finalDetails : [makeDetail("최종 Preflight", "현재 배포의 유효한 Preflight를 확인하지 못했습니다.", "warn")],
     },
   ];
 }
@@ -4962,23 +4754,6 @@ function buildLiveLifecycleTimeline(strategy) {
   return buildLiveStrategyProgress(strategy);
 }
 
-function liveSmallExecutionSummaryForStrategy(strategyId, orders) {
-  let successful = 0;
-  let blocked = 0;
-  (orders || []).forEach((order) => {
-    if (!strategyId || String(order.strategy_id) !== String(strategyId)) return;
-    if (order.dry_run) return;
-    if (String(order.mode || "").toUpperCase() !== "SMALL_LIVE") return;
-    if (!order.canary_scope || typeof order.canary_scope !== "object") return;
-    if (!String(order.broker_order_id || "").trim() || String(order.broker_order_id) === "-") return;
-    const state = String(order.state || "").toLowerCase();
-    const queueState = String(order.queue_state || "").toLowerCase();
-    if (state === "filled" || queueState === "filled") successful += 1;
-    if (["risk_blocked", "adapter_blocked", "failed", "rejected"].includes(state) || ["blocked", "risk_blocked", "failed", "rejected"].includes(queueState)) blocked += 1;
-  });
-  return { successful, blocked };
-}
-
 function buildLivePromotionChecklist(strategy, normalizedStage, execution, summary, operatorConfirmed) {
   const blockerCount = Number(summary?.blocker_count || 0);
   const liveSmallEligible = Boolean(strategy?.live_small_eligible);
@@ -5007,7 +4782,8 @@ function buildLivePromotionChecklist(strategy, normalizedStage, execution, summa
     ...evidenceItem,
     {
       label: "제한 실거래 체결",
-      detail: execution.successful >= MIN_LIVE_CANARY_FILLS
+      detail: !execution.verified ? "현재 배포 범위의 체결 근거를 확인하지 못했습니다."
+        : execution.successful >= MIN_LIVE_CANARY_FILLS
         ? `브로커 체결 원장 ${execution.successful}건을 확인했습니다.`
         : `SMALL_LIVE broker-confirmed FILLED ${execution.successful}/${MIN_LIVE_CANARY_FILLS}건`,
       status: execution.successful >= MIN_LIVE_CANARY_FILLS ? "PASS" : "WAIT",
@@ -5015,9 +4791,9 @@ function buildLivePromotionChecklist(strategy, normalizedStage, execution, summa
     },
     {
       label: "차단 주문",
-      detail: execution.blocked === 0 ? "제한 실거래 기록 중 차단/실패 주문이 없습니다. 체결 표본 충족 여부는 별도입니다." : `차단/실패 주문 ${execution.blocked}건이 있습니다.`,
-      status: execution.blocked === 0 ? "PASS" : "BLOCK",
-      tone: execution.blocked === 0 ? "success" : "danger",
+      detail: !execution.verified ? "현재 배포 범위의 차단 주문 근거를 확인하지 못했습니다." : execution.blocked === 0 ? "검증된 범위에 차단/실패 주문이 없습니다. 체결 표본 충족 여부는 별도입니다." : `차단/실패 주문 ${execution.blocked}건이 있습니다.`,
+      status: !execution.verified ? "WAIT" : execution.blocked === 0 ? "PASS" : "BLOCK",
+      tone: !execution.verified ? "warning" : execution.blocked === 0 ? "success" : "danger",
     },
     {
       label: "운용자 확인",
@@ -5114,24 +4890,66 @@ function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, chan
 
 function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
   const [settings, setSettings] = useState(null);
+  const [settingsStatus, setSettingsStatus] = useState("loading");
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [activeGroup, setActiveGroup] = useState("kis");
   const [draft, setDraft] = useState({});
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
+  const saveInFlight = useRef(false);
+
+  function responseSettings(result) {
+    const value = result?.settings;
+    if (result?.ok !== true || !value || typeof value !== "object" || Array.isArray(value)
+      || (value.envPath !== undefined && typeof value.envPath !== "string")
+      || !Array.isArray(value.fields) || !value.fields.length
+      || value.fields.some((field) => !field || typeof field !== "object"
+        || typeof field.key !== "string" || !field.key.trim()
+        || typeof field.group !== "string" || !field.group.trim()
+        || typeof field.label !== "string" || !field.label.trim()
+        || typeof field.detail !== "string"
+        || !["secret", "text", "bool"].includes(field.kind)
+        || ["configured", "required"].some((key) => field[key] !== undefined && typeof field[key] !== "boolean")
+        || ["value", "default"].some((key) => field[key] !== undefined && field[key] !== null
+          && !["string", "number", "boolean"].includes(typeof field[key])))
+      || new Set(value.fields.map((field) => field.key)).size !== value.fields.length
+      || (value.groups !== undefined && (!Array.isArray(value.groups)
+        || value.groups.some((group) => !group || typeof group.id !== "string"
+          || !group.id.trim() || typeof group.label !== "string" || !group.label.trim())
+        || new Set(value.groups.map((group) => group.id)).size !== value.groups.length))) {
+      return null;
+    }
+    return value;
+  }
 
   useEffect(() => {
     let cancelled = false;
+    setSettings(null);
+    setSettingsStatus("loading");
+    setDraft({});
+    setMessage("");
     getEnvSettings()
       .then((result) => {
-        if (!cancelled) setSettings(result.settings ?? null);
+        if (cancelled) return;
+        const loaded = responseSettings(result);
+        if (!loaded) {
+          setSettingsStatus("error");
+          setMessage("설정 응답을 확인하지 못했습니다. 설정을 다시 확인하세요.");
+          return;
+        }
+        setSettings(loaded);
+        setSettingsStatus("ready");
       })
       .catch((error) => {
-        if (!cancelled) setMessage(error instanceof Error ? error.message : "env 설정을 읽지 못했습니다.");
+        if (!cancelled) {
+          setSettingsStatus("error");
+          setMessage(error instanceof Error ? error.message : "env 설정을 읽지 못했습니다.");
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [loadAttempt]);
 
   useEffect(() => {
     if (!settings?.fields) return;
@@ -5156,12 +4974,20 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
   const broker = brokers.find((item) => item.broker_id === activeGroup);
   const diagnostic = diagnostics.find((item) => item.broker_id === activeGroup);
   const checkCount = visibleFields.filter((field) => assistantFieldStatus(field, draft[field.key]) !== "done").length;
+  const settingsReady = settingsStatus === "ready" && visibleFields.length > 0;
+  const settingsLabel = settingsStatus === "loading" ? "읽는 중"
+    : settingsStatus === "error" ? "확인 실패"
+      : !visibleFields.length ? "항목 없음"
+        : checkCount ? `${checkCount} CHECK` : "설정 확인";
+  const settingsTone = settingsStatus === "error" ? "danger"
+    : settingsReady ? checkCount ? "warning" : "success" : "neutral";
 
   function updateDraft(key, value) {
     setDraft((current) => ({ ...current, [key]: value }));
   }
 
   async function handleSave() {
+    if (!settingsReady || saveInFlight.current || typeof onSave !== "function") return;
     const values = {};
     visibleFields.forEach((field) => {
       const value = draft[field.key];
@@ -5170,21 +4996,44 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
     });
     if (!Object.keys(values).length) return;
     const enablingRealOrders = String(values.LIVE_TRADER_ENABLE_REAL_ORDERS || "").toLowerCase() === "true";
+    saveInFlight.current = true;
     setSaving(true);
     setMessage("");
-    const result = await onSave(values, enablingRealOrders);
-    if (result?.settings) setSettings(result.settings);
-    setDraft((current) => clearSecretDrafts(visibleFields, current));
-    setMessage(result?.ok === false ? result.reason || "저장 실패" : `${Object.keys(values).length}개 설정을 저장했습니다.`);
-    setSaving(false);
+    try {
+      const result = await onSave(values, enablingRealOrders);
+      const saved = responseSettings(result);
+      if (!saved || visibleFields.some((field) => !saved.fields.some((next) =>
+        next.key === field.key && next.group === field.group && next.kind === field.kind))) {
+        setSettingsStatus("error");
+        setMessage(typeof result?.reason === "string" && result.reason
+          ? result.reason : "저장 결과를 확인하지 못했습니다. 설정을 다시 확인하세요.");
+        return;
+      }
+      setSettings(saved);
+      setDraft((current) => {
+        const next = { ...current };
+        saved.fields.filter((field) => field.group === activeGroup).forEach((field) => {
+          next[field.key] = field.kind === "secret" ? "" : field.value ?? field.default ?? "";
+        });
+        return next;
+      });
+      setMessage(`${Object.keys(values).length}개 설정을 저장했습니다.`);
+    } catch (error) {
+      setSettingsStatus("error");
+      setMessage(error instanceof Error ? error.message : "설정 저장에 실패했습니다. 설정을 다시 확인하세요.");
+    } finally {
+      setDraft((current) => clearSecretDrafts(visibleFields, current));
+      saveInFlight.current = false;
+      setSaving(false);
+    }
   }
 
   return (
     <section className="panel live-connection-assistant-panel">
       <PanelHeader
         title="브로커 실계좌 연결"
-        subtitle=".env에 저장되는 실거래 브로커 설정을 탭별로 점검합니다."
-        suffix={<StatusPill tone={checkCount ? "warning" : "success"}>{checkCount ? `${checkCount} CHECK` : "READY"}</StatusPill>}
+        subtitle="저장된 브로커 설정을 점검합니다. 실제 연결 성공과 주문 허용은 별도로 확인합니다."
+        suffix={<StatusPill tone={settingsTone}>{settingsLabel}</StatusPill>}
       />
       <NestedTabs
         ariaLabel="실거래 연결 설정"
@@ -5194,7 +5043,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         variant="cards"
         value={activeGroup}
       />
-      {broker && (
+      {settingsReady && broker && (
         <div
           {...semanticSurfaceProps(
             broker.order_ready ? "success" : broker.status === "missing_credentials" ? "danger" : "warning",
@@ -5206,7 +5055,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
           <StatusPill tone={broker.order_ready ? "success" : broker.status === "missing_credentials" ? "danger" : "warning"}>{broker.order_ready ? "READY" : broker.status}</StatusPill>
         </div>
       )}
-      {diagnostic && (
+      {settingsReady && diagnostic && (
         <div className="live-assistant-steps">
           {(diagnostic.steps ?? []).map((step) => (
             <span className={step.status} key={step.key}>{step.label}</span>
@@ -5254,8 +5103,13 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
       </div>
       <div className="live-assistant-save-row">
         <span>{settings?.envPath || ".env"} · secret은 저장 후 화면에 다시 표시하지 않습니다.</span>
-        {message && <em>{message}</em>}
-        <button className="primary-button compact-button" disabled={saving || !visibleFields.length} onClick={handleSave} type="button">
+        {message && <em role="status">{message}</em>}
+        {settingsStatus === "error" && (
+          <button className="secondary-button compact-button" disabled={saving} onClick={() => setLoadAttempt((attempt) => attempt + 1)} type="button">
+            설정 다시 확인
+          </button>
+        )}
+        <button className="primary-button compact-button" disabled={saving || !settingsReady || typeof onSave !== "function"} onClick={handleSave} type="button">
           <Save size={16} />
           연결 설정 저장
         </button>
@@ -5400,7 +5254,7 @@ function AutomationLauncherPanel({
   strategies,
   runnerState,
   onAutomation,
-  onStrategyCycle,
+  executionAvailability,
   onValidationEvaluate,
   onRuntimeStart,
   onRuntimeStop,
@@ -5505,6 +5359,9 @@ function AutomationLauncherPanel({
   const runtimeBindingBlocked = !deploymentContext?.id
     || !expectedRuntimeProfile
     || expectedRuntimeProfile !== activeProfile.id;
+  const modeUnavailable = requestedMode === "MONITOR"
+    ? executionAvailability?.monitorSupported !== true
+    : executionAvailability?.liveDispatchAvailable !== true;
   const runtimeBindingDetail = !deploymentContext?.id
     ? "상단에서 실행할 Deployment를 먼저 선택하세요."
     : !expectedRuntimeProfile
@@ -5540,6 +5397,11 @@ function AutomationLauncherPanel({
           </StatusPill>
         </div>
         <p>{activeProfile.detail}</p>
+        <div className="runtime-deployment-binding" role="status">
+          <StatusPill tone="warning">{!executionAvailability?.known ? "실행 범위 미확인" : executionAvailability.liveDispatchAvailable ? "주문별 승인 필요" : "관찰만 가능 · 실주문 차단"}</StatusPill>
+          <span>{executionAvailability?.detail}</span>
+          <small>{executionAvailability?.nextAction}</small>
+        </div>
         <div className="automation-scope">
           {activeProfile.asset_scope.map((item) => (
             <span key={item}>{item}</span>
@@ -5604,11 +5466,6 @@ function AutomationLauncherPanel({
             <strong>{activeProfile.live_strategy_count}개</strong>
           </div>
         </div>
-        <div className="adapter-preview">
-          <strong>API 요청 미리보기</strong>
-          <span>{activeProfile.sample_request?.method} {activeProfile.sample_request?.endpoint}</span>
-          <code>{activeProfile.sample_request?.provider} · {activeProfile.sample_request?.can_send ? "전송 가능" : "키/게이트 필요"}</code>
-        </div>
         <div className="automation-strategies">
           {routeStrategies.slice(0, 4).map((strategy) => (
             <span key={strategy.strategy_id}>{strategy.name} · {strategy.symbol}</span>
@@ -5620,7 +5477,8 @@ function AutomationLauncherPanel({
           <button
             className="ts-action-button"
             type="button"
-            disabled={profileRuntime?.running || runtimeBindingBlocked}
+            disabled={profileRuntime?.running || runtimeBindingBlocked || modeUnavailable}
+            title={modeUnavailable ? executionAvailability?.detail : undefined}
             onClick={() => onRuntimeStart(activeProfile.id, requestedMode)}
           >
             <Play size={16} />
@@ -5634,14 +5492,6 @@ function AutomationLauncherPanel({
           >
             <CircleStop size={16} />
             <span>실행 중지</span>
-          </button>
-          <button
-            className="ts-action-button"
-            type="button"
-            onClick={() => onStrategyCycle(activeProfile.id)}
-          >
-            <Play size={16} />
-            <span>1회 진단</span>
           </button>
         </div>
         <LiveClosedBarCountdown schedules={routeSchedules} />
@@ -6255,152 +6105,6 @@ function LaunchReportPanel({ report }) {
   );
 }
 
-function LivePromotionReadinessQueue({
-  operatorConfirmed,
-  onSelect,
-  orders = [],
-  runtime = {},
-  strategies = [],
-  summary = {},
-}) {
-  const [filter, setFilter] = useState("all");
-  const rows = useMemo(
-    () => buildPromotionReadinessQueue(strategies.map((strategy) => {
-      const stage = normalizePromotionLifecycle(
-        strategy?.lifecycle?.status
-        || strategy?.promotion?.stage
-        || strategy?.promotion_stage
-        || strategy?.lifecycle_status,
-      );
-      const execution = liveSmallExecutionSummaryForStrategy(strategy.strategy_id, orders);
-      const rawFailureReasons = liveArtifactFailureReasons(strategy);
-      const expectedCanaryReasons = stage === "before-live-small"
-        ? rawFailureReasons.filter((reason) => /live-activation-required|소액 실거래|canary/i.test(reason))
-        : [];
-      const blockers = rawFailureReasons.filter((reason) => !expectedCanaryReasons.includes(reason));
-      const warnings = [];
-      warnings.push(...expectedCanaryReasons);
-      let nextAction = "";
-      if (stage === "before-live-small") {
-        if (strategy.live_small_eligible !== true) {
-          blockers.push("live_small_eligible 권한이 없습니다.");
-        }
-        if (execution.blocked > 0) {
-          blockers.push(`현재 canary scope에서 차단·실패 주문 ${execution.blocked}건을 해소해야 합니다.`);
-        }
-        if (Number(summary?.blocker_count || 0) > 0) {
-          blockers.push(`운영 readiness blocker ${Number(summary.blocker_count)}개가 남아 있습니다.`);
-        }
-        if (execution.successful < MIN_LIVE_CANARY_FILLS) {
-          warnings.push(`현재 hash·deployment scope의 실제 체결 ${execution.successful}/${MIN_LIVE_CANARY_FILLS}건`);
-        }
-        if (!operatorConfirmed) {
-          warnings.push("운용자 확인이 필요합니다.");
-        }
-        nextAction = execution.successful < MIN_LIVE_CANARY_FILLS
-          ? `SMALL LIVE canary 체결을 ${MIN_LIVE_CANARY_FILLS - execution.successful}건 더 확인하세요.`
-          : "운용자 확인과 최종 preflight 후 정식 Live 승급을 검토하세요.";
-      } else if (stage === "papered") {
-        nextAction = "Paper Trader에서 current hash의 Live-Small 전 승급 evidence를 확정하세요.";
-      } else if (stage === "live") {
-        nextAction = "승급 완료 상태입니다. 무인 모니터와 정기 재검증을 계속하세요.";
-      }
-      return {
-        blockers,
-        detail: `${strategy.symbol || "-"} · ${strategy.timeframe || "-"} · ${strategy.plugin_label || strategy.plugin || "전략"}`,
-        id: strategy.strategy_id,
-        name: strategy.name || strategy.strategy_id,
-        nextAction,
-        running: liveArtifactRunning(runtime, strategy.strategy_id),
-        stage,
-        warnings,
-      };
-    })),
-    [operatorConfirmed, orders, runtime, strategies, summary],
-  );
-  const queueSummary = promotionQueueSummary(rows);
-  const visibleRows = rows
-    .filter((row) => {
-      if (filter === "ready") return ["READY", "OBSERVING"].includes(row.status);
-      if (filter === "check") return row.status === "CHECK";
-      if (filter === "block") return row.status === "BLOCK";
-      return true;
-    })
-    .slice(0, 10);
-
-  return (
-    <section className="panel promotion-readiness-queue">
-      <PanelHeader
-        title="승급 준비 큐"
-        subtitle="후보·차단 근거·다음 작업을 모아 봅니다. 표준 lifecycle, preflight와 current-hash evidence를 건너뛰지 않습니다."
-        suffix={(
-          <StatusPill tone={queueSummary.block ? "warning" : queueSummary.total ? "success" : "neutral"}>
-            {queueSummary.ready + queueSummary.observing} READY · {queueSummary.block} BLOCK
-          </StatusPill>
-        )}
-      />
-      <div className="promotion-readiness-toolbar" role="group" aria-label="승급 준비 큐 필터">
-        {[
-          ["all", `전체 ${queueSummary.total}`],
-          ["ready", `준비 ${queueSummary.ready + queueSummary.observing}`],
-          ["check", `확인 ${queueSummary.check}`],
-          ["block", `차단 ${queueSummary.block}`],
-        ].map(([value, label]) => (
-          <button
-            aria-pressed={filter === value}
-            className={filter === value ? "active" : ""}
-            key={value}
-            onClick={() => setFilter(value)}
-            type="button"
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-      <div className="promotion-readiness-list">
-        {visibleRows.map((row) => {
-          const issues = [...row.blockers, ...row.warnings];
-          return (
-            <article
-              {...semanticSurfaceProps(row.tone, `promotion-readiness-row ${row.status.toLowerCase()}`)}
-              key={row.id}
-            >
-              <div className="promotion-readiness-identity">
-                <StatusPill tone={row.tone}>{row.status}</StatusPill>
-                <div>
-                  <strong>{row.name}</strong>
-                  <span>{row.id} · {row.detail}</span>
-                </div>
-              </div>
-              <div className="promotion-readiness-stage">
-                <span>{row.stageLabel}</span>
-                <strong>→ {row.nextStageLabel}</strong>
-              </div>
-              <div className="promotion-readiness-blockers">
-                <span>차단·확인 근거</span>
-                <strong>{issues[0] || "현재 확인된 차단 근거 없음"}</strong>
-                {issues.length > 1 && <em>외 {issues.length - 1}건</em>}
-              </div>
-              <div className="promotion-readiness-action">
-                <span>다음 작업</span>
-                <strong>{row.nextAction}</strong>
-              </div>
-              <button
-                className="secondary-button compact-button"
-                onClick={() => onSelect(row.id)}
-                type="button"
-              >
-                Artifact 보기
-              </button>
-            </article>
-          );
-        })}
-        {!visibleRows.length && <EmptyRow text="이 상태에 해당하는 승급 후보가 없습니다." />}
-      </div>
-    </section>
-  );
-}
-
 function LiveStrategySelectorPanel({
   automaticPromotion,
   strategies,
@@ -6417,7 +6121,7 @@ function LiveStrategySelectorPanel({
   const parametersText = formatKeyValueMap(selectedStrategy?.parameters);
   const promotionStage = selectedStrategy?.promotion?.stage || selectedStrategy?.promotion_stage || selectedStrategy?.lifecycle_status || "unknown";
   const normalizedStage = normalizePromotionStage(promotionStage);
-  const execution = liveSmallExecutionSummaryForStrategy(selectedStrategy?.strategy_id, orders);
+  const execution = verifiedCanaryExecution(selectedStrategy);
   const automaticResult = (automaticPromotion?.results ?? []).find(
     (item) => item.strategyId === selectedStrategy?.strategy_id,
   );
@@ -6426,6 +6130,7 @@ function LiveStrategySelectorPanel({
     selectedStrategy
       && normalizedStage === "before-live-small"
       && selectedStrategy.live_small_eligible
+      && execution.verified
       && execution.successful >= MIN_LIVE_CANARY_FILLS
       && execution.blocked === 0
       && operatorConfirmed
@@ -6443,7 +6148,6 @@ function LiveStrategySelectorPanel({
   return (
     <section className="panel live-strategy-selector-panel">
       <PanelHeader title="선택한 배포 전략" subtitle="현재 단계와 실제 운영 행동만 기본 표시합니다." />
-      <PaperCandidateEvidencePanel />
       <div className="live-strategy-selector-grid">
         <label>
           <span>전략 artifact</span>
@@ -6462,7 +6166,7 @@ function LiveStrategySelectorPanel({
           <div className="live-strategy-summary-grid">
             <MetricCard className="metric-card" label="전략" value={selectedStrategy.plugin_label || selectedStrategy.plugin} detail={selectedStrategy.strategy_id} />
             <MetricCard className="metric-card" label="대상" value={`${selectedStrategy.symbol} · ${selectedStrategy.timeframe}`} detail={selectedStrategy.asset} />
-            <MetricCard className="metric-card" label="검증 진행" value={liveStrategyProgressLabel(selectedStrategy)} detail={`실행 허용 범위: ${executionApprovalLabel(promotionStage)} · 동일 scope 체결 ${execution.successful}건 · 차단 ${execution.blocked}건`} />
+            <MetricCard className="metric-card" label="검증 진행" value={liveStrategyProgressLabel(selectedStrategy)} detail={`실행 허용 범위: ${executionApprovalLabel(promotionStage)} · ${execution.verified ? `현재 배포 체결 ${execution.successful}건 · 차단 ${execution.blocked}건` : "현재 배포의 체결·차단 집계 미확인"}`} />
           </div>
           <div className="live-strategy-promotion-line">
             {automaticResult && (

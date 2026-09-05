@@ -5,6 +5,38 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$liveTraderAppRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
+if (-not [string]::Equals(
+  [System.IO.Path]::GetFullPath((Get-Location).Path),
+  $liveTraderAppRoot,
+  [System.StringComparison]::OrdinalIgnoreCase
+)) {
+  throw "Run build_exe.ps1 from its Live Trader app directory: $liveTraderAppRoot"
+}
+
+function Resolve-LiveTraderBuildOutputPath([string]$Name, [string[]]$AllowedNames) {
+  if ($AllowedNames -cnotcontains $Name) {
+    throw "Unexpected Live Trader build output name: $Name"
+  }
+  $outputPath = [System.IO.Path]::GetFullPath((Join-Path $liveTraderAppRoot $Name))
+  if (-not [string]::Equals(
+    [System.IO.Path]::GetDirectoryName($outputPath),
+    $liveTraderAppRoot,
+    [System.StringComparison]::OrdinalIgnoreCase
+  )) {
+    throw "Build output must be an exact child of the Live Trader app directory: $outputPath"
+  }
+  foreach ($checkedPath in @($liveTraderAppRoot, $outputPath)) {
+    if (Test-Path -LiteralPath $checkedPath) {
+      $item = Get-Item -LiteralPath $checkedPath -Force
+      if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "Build output and app root must be ordinary directories, without links or junctions: $checkedPath"
+      }
+    }
+  }
+  return $outputPath
+}
+
 function Assert-NativeCommandSucceeded([string]$Step) {
   if ($LASTEXITCODE -ne 0) {
     throw "$Step failed with exit code $LASTEXITCODE"
@@ -40,14 +72,17 @@ Assert-NativeCommandSucceeded "desktop scale/click contract"
 Assert-NativeCommandSucceeded "desktop icon generation"
 
 $liveTraderRunning = @(Get-Process -Name "LiveTrader" -ErrorAction SilentlyContinue).Count -gt 0
-$distPath = if ($PendingOnly -or $liveTraderRunning) { "release_pending" } else { "release" }
-$workPath = if ($PendingOnly -or $liveTraderRunning) { "build_pending" } else { "build" }
+$distName = if ($PendingOnly -or $liveTraderRunning) { "release_pending" } else { "release" }
+$workName = if ($PendingOnly -or $liveTraderRunning) { "build_pending" } else { "build" }
+# Validate both absolute destinations before either recursive removal.
+$distPath = Resolve-LiveTraderBuildOutputPath $distName @("release", "release_pending")
+$workPath = Resolve-LiveTraderBuildOutputPath $workName @("build", "build_pending")
 
-if (Test-Path $workPath) {
-  Remove-Item -Recurse -Force $workPath
+if (Test-Path -LiteralPath $workPath) {
+  Remove-Item -LiteralPath $workPath -Recurse -Force
 }
-if (Test-Path $distPath) {
-  Remove-Item -Recurse -Force $distPath
+if (Test-Path -LiteralPath $distPath) {
+  Remove-Item -LiteralPath $distPath -Recurse -Force
 }
 if ($PendingOnly) {
   Write-Host "PendingOnly is set; building only in $distPath and leaving the active release untouched."
@@ -55,7 +90,7 @@ if ($PendingOnly) {
   Write-Host "LiveTrader is running; building the replacement binary in $distPath without interrupting monitoring."
 }
 
-$root = (Get-Location).Path
+$root = $liveTraderAppRoot
 $sharedRuntime = [System.IO.Path]::GetFullPath((Join-Path $root "..\..\packages\trading_runtime"))
 if (-not (Test-Path -LiteralPath $sharedRuntime)) {
   throw "Shared trading_runtime package was not found: $sharedRuntime"
@@ -85,4 +120,4 @@ if (-not (Test-Path -LiteralPath $sharedRuntime)) {
   live_trader\__main__.py
 Assert-NativeCommandSucceeded "PyInstaller package"
 
-Write-Host "Created LiveTrader executable: $(Join-Path $root "$distPath\LiveTrader.exe")"
+Write-Host "Created LiveTrader executable: $(Join-Path $distPath "LiveTrader.exe")"

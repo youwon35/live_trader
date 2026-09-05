@@ -19,6 +19,8 @@
     "test:functional-test-ui": "node scripts/functional_test_model.test.mjs",
     "test:crypto-first-live-ui": "node scripts/crypto_first_live_ui.test.mjs",
     "test:information-architecture": "node --test scripts/live_information_architecture.test.mjs",
+    "test:workflow": "node --test scripts/live_information_architecture.test.mjs scripts/execution_availability.test.mjs scripts/doctor_display.test.mjs scripts/operational_checklist_ui.test.mjs scripts/broker_settings_ui.test.mjs scripts/paper_candidate_evidence_ui.test.mjs scripts/deployment_selection.test.mjs scripts/account_refresh.test.mjs",
+    "ui:offline": "node scripts/simplified_flow_fixture.mjs",
     "ui:smoke": "node scripts/ui_smoke.mjs"
   },
   "dependencies": {

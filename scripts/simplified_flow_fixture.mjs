@@ -17,6 +17,19 @@ const fallbackLiteral = appSource.match(/const fallbackSnapshot = (\{[\s\S]*?\n\
 assert.ok(fallbackLiteral, 'the fail-closed fixture base must be an explicit static literal');
 const snapshot = JSON.parse(JSON.stringify(runInNewContext(`(${fallbackLiteral[1]})`, {}, { timeout: 500 })));
 snapshot.api_connected = true;
+snapshot.execution_availability = {
+  schemaVersion: 'live-execution-availability-v1', authorizationGranted: false,
+  ordinaryContinuous: { monitorSupported: true, liveDispatchAvailable: false,
+    detail: '현재 일반 자동매매의 실주문 전송은 차단되어 있습니다.',
+    nextAction: '관찰 모드에서 시세 수신과 전략 판단을 확인할 수 있습니다.' },
+};
+snapshot.checklist = [
+  { key: 'api_keys_reviewed', label: 'API·계좌 자동 확인', source: 'automatic', checked: false, required: true },
+  { key: 'risk_limits_reviewed', label: '위험 한도 검토', source: 'pending', checked: false, required: true },
+  { key: 'notification_channel_reviewed', label: '알림 채널 확인', source: 'pending', checked: false, required: true },
+  { key: 'operator_takeover_ready', label: '수동 개입 준비', source: 'pending', checked: false, required: true },
+  { key: 'position_reconcile_reviewed', label: '포지션 대조 자동 확인', source: 'automatic', checked: false, required: true },
+];
 snapshot.generated_at = '2026-09-05T00:00:00Z';
 snapshot.live_governance.deploymentId = 'fixture-deployment';
 snapshot.live_governance.activeSession = { lifecycleState: 'DRAINING', healthStatus: 'TAINTED', sessionId: 'fixture-session' };
@@ -73,6 +86,14 @@ try {
       else if (url.pathname === '/api/search-presets') body = { schemaVersion: 1, presets: [] };
       else if (url.pathname === '/api/artifact-metadata') body = { items: {} };
       else if (url.pathname === '/api/env-settings') body = { settings: { fields: [], groups: [] } };
+      else if (url.pathname === '/api/checklist' && request.method() === 'POST') {
+        const input = request.postDataJSON();
+        const item = snapshot.checklist.find((row) => row.key === input.name);
+        assert.ok(item && ['manual', 'pending'].includes(item.source), 'only an explicit operator acknowledgement can change');
+        item.checked = input.value;
+        item.source = 'manual';
+        body = { ok: true, snapshot };
+      }
       else if (url.pathname.includes('reconcil') || url.pathname.includes('execution-events')) body = { ok: true, snapshot };
       else if (url.pathname.includes('validation')) body = { ok: true, validation: { ok: true, candidates: [] } };
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
@@ -89,6 +110,7 @@ try {
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1);
       assert.equal(overflow, false, `${label} horizontal viewport overflow at ${viewport.width}`);
       if (label === '운용 전략') {
+        await page.getByRole('heading', { name: 'Paper에서 받은 검증 근거', exact: true }).waitFor();
         await page.getByRole('button', { name: /전체 검증 단계/ }).click();
         assert.deepEqual(await page.locator('.live-lifecycle-timeline strong').allTextContents(), ['백테스트', '모의 검증', '제한 실거래', '실전 운용']);
         assert.equal(await page.locator('.live-lifecycle-timeline article.current strong').textContent(), '제한 실거래');
@@ -99,9 +121,21 @@ try {
         assert.equal(report.apiRequests.filter(({ path, viewport: width }) => path.includes('validation-small-live') && width === viewport.width).length, 0, 'advanced diagnostics must not load passively');
         const before = report.apiRequests.length;
         await page.getByRole('button', { name: '제한 실거래', exact: true }).click();
+        assert.equal(await page.getByRole('button', { name: '제한 실거래 시작', exact: true }).isDisabled(), true);
+        assert.equal(await page.getByRole('button', { name: '1회 진단', exact: true }).count(), 0);
+        assert.equal(await page.getByText('API 요청 미리보기', { exact: true }).count(), 0);
         assert.ok(report.apiRequests.slice(before).every(({ method }) => method === 'GET'), 'mode selection alone must not mutate runtime');
         await page.getByRole('tab', { name: '한도·안전장치', exact: true }).click();
         await page.getByRole('heading', { name: '현재 리스크 사용량', exact: true }).waitFor();
+        const checklist = page.getByRole('region', { name: '운영 체크리스트', exact: true });
+        assert.equal(await checklist.getByRole('checkbox').count(), 5);
+        assert.equal(await checklist.getByRole('checkbox').first().isDisabled(), true);
+        const manualCheck = checklist.getByRole('checkbox').nth(1);
+        const originalCheck = await manualCheck.isChecked();
+        // This controlled checkbox changes only after the API acknowledges it.
+        await manualCheck.click();
+        await page.getByText(/위험 한도 검토 .*저장했습니다/).waitFor();
+        assert.equal(await manualCheck.isChecked(), !originalCheck);
         assert.equal(await page.getByRole('tab', { name: '한도·안전장치', exact: true }).getAttribute('aria-selected'), 'true');
         await page.locator('.live-section-tabs').evaluate(async (element) => Promise.all(element.getAnimations({ subtree: true }).map((animation) => animation.finished.catch(() => undefined))));
         report.views.push({ viewport: viewport.width, label: '한도·안전장치', tabs: await page.locator('.live-section-tabs [role="tab"]').evaluateAll((nodes) => nodes.map((node) => ({ text: node.textContent, selected: node.getAttribute('aria-selected'), className: node.className, background: getComputedStyle(node).backgroundColor }))) });

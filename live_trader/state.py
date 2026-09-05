@@ -140,6 +140,7 @@ from .kis_order_authority import (
 )
 from .safety_confirmation import SAFETY_CONFIRMATIONS
 from .execution_streams import ExecutionStreamManager
+from .execution_availability import ordinary_execution_availability
 from .live_adapters import (
     BINANCE_BASE_URL,
     BINANCE_FUTURES_BASE_URL,
@@ -10247,10 +10248,88 @@ def transition_operational_incident(
     }
 
 
+def _canary_execution_for_display(
+    strategy: dict[str, Any],
+    *,
+    evidence_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Reuse promotion's exact calculator with one snapshot's durable evidence."""
+    unavailable = {"verified": False, "successful": 0, "blocked": 0, "scope": {}}
+    if (
+        strategy.get("live_small_eligible") is not True
+        or not isinstance(evidence_context, dict)
+    ):
+        return unavailable
+    try:
+        deployment_index = evidence_context.get("deployment_index")
+        events_by_root = evidence_context.get("deployment_events")
+        execution_events = evidence_context.get("execution_events")
+        order_gate_events = evidence_context.get("order_gate_events")
+        if (
+            not isinstance(deployment_index, dict)
+            or not isinstance(events_by_root, dict)
+            or not isinstance(execution_events, list)
+            or not isinstance(order_gate_events, list)
+        ):
+            return unavailable
+        root, _deployment_id = _strategy_rollout_context_key(strategy)
+        strategy_id = str(strategy.get("strategy_id") or "")
+        deployment = deployment_index.get((root, _live_deployment_id(strategy)))
+        deployment_events = events_by_root.get(root)
+        if (
+            not root
+            or not strategy_id
+            or not isinstance(deployment, dict)
+            or not isinstance(deployment_events, list)
+        ):
+            return unavailable
+        evidence = live_small_execution_summary(
+            strategy_id,
+            normalized=strategy,
+            deployment=deployment,
+            deployment_events=deployment_events,
+            execution_events=execution_events,
+            order_gate_events=order_gate_events,
+        )
+        if not isinstance(evidence, dict):
+            return unavailable
+        counts_valid = all(
+            type(evidence.get(key)) is int and evidence[key] >= 0
+            for key in ("successful", "blocked")
+        )
+        scope = evidence.get("scope")
+        if not counts_valid or not isinstance(scope, dict) or scope.get("eligible") is not True:
+            return unavailable
+        return {**evidence, "verified": True}
+    except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError):
+        return unavailable
+
+
+def _attach_canary_execution_for_display(strategies: list[dict[str, Any]]) -> None:
+    """Read shared canary ledgers once; an unavailable read grants no readiness."""
+    eligible = [
+        strategy for strategy in strategies
+        if strategy.get("live_small_eligible") is True
+    ]
+    evidence_context = None
+    if eligible:
+        try:
+            evidence_context = _build_futures_rollout_evidence_context(
+                eligible, soak_report={}
+            )
+        except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError):
+            pass
+    for strategy in strategies:
+        strategy["canary_execution"] = _canary_execution_for_display(
+            strategy, evidence_context=evidence_context
+        )
+
+
 def snapshot() -> dict[str, Any]:
     brokers = [broker.to_dict() for broker in broker_readiness()]
     portfolios = portfolio_rows()
     strategies = strategy_rows(portfolios)
+    _attach_canary_execution_for_display(strategies)
     automations = automation_profiles(strategies, brokers)
     reconciliation = reconciliation_snapshot()
     queue = order_queue_summary()
@@ -10287,6 +10366,7 @@ def snapshot() -> dict[str, Any]:
     effective_kill_switch = bool(STATE["kill_switch"]) or emergency.get("active") is True
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "execution_availability": ordinary_execution_availability(),
         "mode": STATE["mode"],
         "dry_run": STATE["dry_run"],
         "kill_switch": effective_kill_switch,
@@ -13250,6 +13330,12 @@ def set_checklist_item(name: str, value: bool) -> dict[str, Any]:
     item = keys.get(name)
     if not item:
         return {"ok": False, "reason": "unknown checklist item", "snapshot": snapshot()}
+    if name in MACHINE_VERIFIABLE_CHECKLIST_KEYS:
+        return {
+            "ok": False,
+            "reason": "이 항목은 브로커 조회와 계좌 대조 결과로 자동 확인됩니다.",
+            "snapshot": snapshot(),
+        }
     previous = bool(STATE["checklist"].get(name, False))
     STATE["checklist"][name] = bool(value)
     try:

@@ -1,5 +1,17 @@
 # Live Trader Handoff
 
+## Current baseline: 2026-09-06
+
+Use [the architecture review](docs/architecture-review-20260906.md) and [the manual tab guide](docs/manual-tab-validation.md) before the historical notes below. The current navigation has eight top-level tabs: 시작 점검, 운용 전략, 실거래 운용, 계좌·잔고, 주문·체결, 실행 기록, 연결·설정, 주문 연결 시험. Risk and technical logs remain internal routes.
+
+This review makes unavailable execution explicit, exposes the existing manual operational checklist, uses backend-scoped Canary evidence for promotion displays, improves settings/account error handling, and removes UI code already excluded from the production bundle. Ordinary continuous live dispatch and supervised crypto production release remain closed. Paper evidence is read-only; first-time Live adoption and initial approval still need shared-store concurrency protection and a complete approval transaction.
+
+The user will operate the real app one tab at a time. Explain each tab's goal, internal behavior, steps, and acceptance criteria; fix observed defects before moving on. Mock UI tests and package inspection do not count as live broker validation.
+
+The pre-review source baseline was `8afc130`. Existing uncommitted Upbit/Binance supervised changes must remain preserved and separate from this review's commit. Packages are built from the current working tree, including those existing changes. Update EXE, develop, the print log, and the Notion summary after code changes.
+
+## Historical baseline (2026-07-11)
+
 Last updated: 2026-07-11 KST
 Project path: `D:\github\PROGRAM\trading-system\apps\live_trader`
 Repository: `https://github.com/youwon35/live_trader.git`
