@@ -29,7 +29,7 @@ test("operator navigation follows the live decision sequence", () => {
     "주문 연결 시험",
   ]);
 
-  const groups = between(appSource, "const navGroups = [", "function strategyLifecycleRank");
+  const groups = between(appSource, "const navGroups = [", "function formatKeyValueMap");
   assert.match(groups, /label: "실거래", itemIds: \["overview", "gate", "automation"\]/);
   assert.match(groups, /label: "조회", itemIds: \["accounts", "orders", "incidents"\]/);
   assert.match(groups, /label: "관리", itemIds: \["settings", "functional-test"\]/);

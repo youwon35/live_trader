@@ -1,4 +1,4 @@
-import { liveStrategyProgressLabel } from './strategyProgressDisplay.js';
+import { liveStrategyLifecycleStage, liveStrategyProgressLabel } from './strategyProgressDisplay.js';
 
 const TERMINAL_DEPLOYMENT_STAGES = new Set([
   "archived",
@@ -23,20 +23,7 @@ export function strategyDeploymentIdentity(strategy = {}) {
 }
 
 export function strategyLifecycleStage(strategy = {}) {
-  const lifecycle = strategy.lifecycle && typeof strategy.lifecycle === "object"
-    ? strategy.lifecycle
-    : {};
-  const promotion = strategy.promotion && typeof strategy.promotion === "object"
-    ? strategy.promotion
-    : {};
-  return String(
-    lifecycle.status
-      || promotion.stage
-      || strategy.promotion_stage
-      || strategy.lifecycle_status
-      || strategy.status
-      || "unknown",
-  ).trim().toLowerCase();
+  return liveStrategyLifecycleStage(strategy) || "unknown";
 }
 
 export function deploymentRuntimeProfile(context = {}) {
@@ -100,6 +87,7 @@ function isTerminalDeployment(strategy) {
   return strategy.archived === true
     || strategy.is_archived === true
     || strategy.retired === true
+    || TERMINAL_DEPLOYMENT_STAGES.has(String(strategy.status || "").trim().toLowerCase())
     || TERMINAL_DEPLOYMENT_STAGES.has(strategyLifecycleStage(strategy));
 }
 

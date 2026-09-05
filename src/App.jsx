@@ -87,8 +87,8 @@ import {
   shouldHydrateRiskStrategy,
 } from "./futuresRiskSimulator";
 import { livePollingIntervals } from "./polling";
-import { executionApprovalLabel, strategyLifecycleLabel } from "../../../packages/design/strategy-progress.js";
-import { buildLiveStrategyProgress, liveStrategyProgressLabel, liveRuntimeModeLabel } from "./strategyProgressDisplay.js";
+import { executionApprovalLabel, strategyLifecycleRank } from "../../../packages/design/strategy-progress.js";
+import { buildLiveStrategyProgress, liveStrategyLifecycleStage, liveStrategyPhaseFilter, liveStrategyPhaseId, liveStrategyPhaseLabel, liveStrategyPhaseOptions, liveStrategyProgressLabel, liveRuntimeModeLabel } from "./strategyProgressDisplay.js";
 import { LIVE_WORKSPACE_ROUTE_IDS, liveNavigationRoot, liveNavigationRoute, liveSectionTabs } from "./liveNavigation.js";
 import { liveReconciliationDisplay } from "./liveReconciliationDisplay.js";
 import {
@@ -3468,7 +3468,7 @@ function LivePreparationPanel({
     [isStock, snapshot.strategies],
   );
   const stageOptions = useMemo(
-    () => uniqueStrategyDiscoveryValues(assetStrategies.map(liveStrategyStageId)),
+    () => liveStrategyPhaseOptions(assetStrategies),
     [assetStrategies],
   );
   const timeframeOptions = useMemo(
@@ -3617,7 +3617,7 @@ function LivePreparationPanel({
     setDiscoveryFilters({
       ...DEFAULT_STRATEGY_DISCOVERY_FILTERS,
       query: saved.filters?.query ?? "",
-      stage: saved.filters?.lifecycle ?? "all",
+      stage: liveStrategyPhaseFilter(saved.filters?.lifecycle ?? "all"),
       timeframe: saved.filters?.timeframe ?? "all",
       plugin: saved.filters?.strategyType ?? "all",
       failure: saved.filters?.failure ?? "all",
@@ -4700,115 +4700,11 @@ function NotificationPanel({ items, onNavigate }) {
   );
 }
 
-function normalizePromotionStage(stage = "") {
-  const normalized = String(stage || "").toLowerCase().replaceAll("_", "-");
-  const aliases = {
-    "live-small": "before-live-small",
-    "live-canary": "before-live-small",
-    "live-candidate": "before-live-small",
-    "live-active": "live",
-    "paper-candidate": "paper",
-    "final-tested": "backtested",
-  };
-  return aliases[normalized] || normalized;
-}
-
-function promotionLabel(stage = "") {
-  const normalized = normalizePromotionStage(stage);
-  if (["shadow", "paper", "approved"].includes(normalized)) return executionApprovalLabel(normalized);
-  return strategyLifecycleLabel(normalized);
-}
-
-function promotionTone(stage = "") {
-  const normalized = normalizePromotionStage(stage);
-  if (normalized === "live") return "success";
-  if (["before-live-small", "papered", "shadowed", "paper"].includes(normalized)) return "info";
-  if (["backtested", "before-shadow", "approved"].includes(normalized)) return "warning";
-  if (["retired", "rejected"].includes(normalized)) return "danger";
-  if (normalized === "paused") return "warning";
-  return "neutral";
-}
-
-const STRATEGY_LIFECYCLE_STEPS = [
-  { id: "draft" },
-  { id: "backtested" },
-  { id: "before-shadow" },
-  { id: "shadowed" },
-  { id: "papered" },
-  { id: "before-live-small" },
-  { id: "live" },
-];
-
 const navGroups = [
   { id: "prepare", label: "실거래", itemIds: ["overview", "gate", "automation"] },
   { id: "operate", label: "조회", itemIds: ["accounts", "orders", "incidents"] },
   { id: "manage", label: "관리", itemIds: ["settings", "functional-test"] },
 ];
-
-function strategyLifecycleRank(stage = "") {
-  const normalized = normalizePromotionStage(stage);
-  return STRATEGY_LIFECYCLE_STEPS.findIndex((item) => item.id === normalized);
-}
-
-function buildLiveLifecycleTimeline(strategy) {
-  return buildLiveStrategyProgress(strategy);
-}
-
-function buildLivePromotionChecklist(strategy, normalizedStage, execution, summary, operatorConfirmed) {
-  const blockerCount = Number(summary?.blocker_count || 0);
-  const liveSmallEligible = Boolean(strategy?.live_small_eligible);
-  const evidenceGate = strategy?.paper_portfolio_evidence_gate ?? {};
-  const evidenceItem = evidenceGate.required
-    ? [{
-      label: "Portfolio evidence",
-      detail: evidenceGate.detail || "Paper Trader의 portfolio rebalance 실행 evidence가 필요합니다.",
-      status: evidenceGate.ready ? "PASS" : "BLOCK",
-      tone: evidenceGate.ready ? "success" : "danger",
-    }]
-    : [];
-  return [
-    {
-      label: "모의 검증 인계",
-      detail: normalizedStage === "before-live-small" ? "Paper Trader의 모의 검증 인계가 완료되어 제한 실거래를 준비합니다. 실거래 검증 완료나 주문 승인을 뜻하지 않습니다." : `${promotionLabel(normalizedStage)} 상태입니다.`,
-      status: normalizedStage === "before-live-small" || normalizedStage === "live" ? "PASS" : "WAIT",
-      tone: normalizedStage === "before-live-small" || normalizedStage === "live" ? "success" : "warning",
-    },
-    {
-      label: "정적 권한",
-      detail: liveSmallEligible ? "live_small_eligible evidence가 있습니다." : "live_small_eligible evidence가 부족합니다.",
-      status: liveSmallEligible ? "PASS" : "WAIT",
-      tone: liveSmallEligible ? "success" : "warning",
-    },
-    ...evidenceItem,
-    {
-      label: "제한 실거래 체결",
-      detail: !execution.verified ? "현재 배포 범위의 체결 근거를 확인하지 못했습니다."
-        : execution.successful >= MIN_LIVE_CANARY_FILLS
-        ? `브로커 체결 원장 ${execution.successful}건을 확인했습니다.`
-        : `SMALL_LIVE broker-confirmed FILLED ${execution.successful}/${MIN_LIVE_CANARY_FILLS}건`,
-      status: execution.successful >= MIN_LIVE_CANARY_FILLS ? "PASS" : "WAIT",
-      tone: execution.successful >= MIN_LIVE_CANARY_FILLS ? "success" : "warning",
-    },
-    {
-      label: "차단 주문",
-      detail: !execution.verified ? "현재 배포 범위의 차단 주문 근거를 확인하지 못했습니다." : execution.blocked === 0 ? "검증된 범위에 차단/실패 주문이 없습니다. 체결 표본 충족 여부는 별도입니다." : `차단/실패 주문 ${execution.blocked}건이 있습니다.`,
-      status: !execution.verified ? "WAIT" : execution.blocked === 0 ? "PASS" : "BLOCK",
-      tone: !execution.verified ? "warning" : execution.blocked === 0 ? "success" : "danger",
-    },
-    {
-      label: "운용자 확인",
-      detail: operatorConfirmed ? "운용자 확인이 켜져 있습니다." : "실거래 전 운용자 확인이 필요합니다.",
-      status: operatorConfirmed ? "PASS" : "WAIT",
-      tone: operatorConfirmed ? "success" : "warning",
-    },
-    {
-      label: "Readiness blocker",
-      detail: blockerCount === 0 ? "현재 hard blocker가 없습니다." : `hard blocker ${blockerCount}개가 남아 있습니다.`,
-      status: blockerCount === 0 ? "PASS" : "BLOCK",
-      tone: blockerCount === 0 ? "success" : "danger",
-    },
-  ];
-}
 
 function formatKeyValueMap(values = {}) {
   if (!values || !Object.keys(values).length) return "";
@@ -6119,13 +6015,13 @@ function LiveStrategySelectorPanel({
   onMetadataSave,
 }) {
   const parametersText = formatKeyValueMap(selectedStrategy?.parameters);
-  const promotionStage = selectedStrategy?.promotion?.stage || selectedStrategy?.promotion_stage || selectedStrategy?.lifecycle_status || "unknown";
-  const normalizedStage = normalizePromotionStage(promotionStage);
+  const promotionStage = selectedStrategy?.promotion?.stage || selectedStrategy?.promotion_stage || "unknown";
+  const normalizedStage = liveStrategyLifecycleStage(selectedStrategy);
   const execution = verifiedCanaryExecution(selectedStrategy);
   const automaticResult = (automaticPromotion?.results ?? []).find(
     (item) => item.strategyId === selectedStrategy?.strategy_id,
   );
-  const lifecycleTimeline = buildLiveLifecycleTimeline(selectedStrategy);
+  const lifecycleTimeline = buildLiveStrategyProgress(selectedStrategy);
   const canPromoteLive = Boolean(
     selectedStrategy
       && normalizedStage === "before-live-small"
@@ -6231,7 +6127,7 @@ function LiveStrategySelectorPanel({
                     ? "비-Live 단계로 안전 재개하며 실거래 권한은 복구하지 않습니다."
                   : resumeRevalidationRequired
                     ? "이전 Live 권한은 복구되지 않았습니다. Paper Trader에서 연속 관찰 증거로 다시 승급하세요."
-                    : "상태 변경은 공유 전략 artifact lifecycle에 기록됩니다."}
+                    : "상태 변경은 현재 배포의 운용 상태에 기록됩니다."}
             </span>
           </div>
           <CompactDisclosure title="전략 기술 정보" description="Release, parameter hash와 개인 메타데이터를 확인합니다.">
@@ -6270,7 +6166,7 @@ function StrategyDiscoveryToolbar({
 }) {
   const activeLabels = [
     filters.query && `검색: ${filters.query}`,
-    filters.stage !== "all" && `단계: ${promotionLabel(filters.stage)}`,
+    filters.stage !== "all" && `단계: ${liveStrategyPhaseLabel(filters.stage)}`,
     filters.timeframe !== "all" && `주기: ${filters.timeframe}`,
     filters.plugin !== "all" && `전략 유형: ${filters.plugin}`,
     filters.failure !== "all" && `실패 이유: ${filters.failure}`,
@@ -6289,7 +6185,7 @@ function StrategyDiscoveryToolbar({
             placeholder="이름, ID, 종목, 파라미터, 차단 사유 검색"
           />
         </label>
-        <label><span>현재 단계</span><select value={filters.stage} onChange={(event) => onFilterChange("stage", event.target.value)}><option value="all">전체 단계</option>{stageOptions.map((value) => <option key={value} value={value}>{promotionLabel(value)}</option>)}</select></label>
+        <label><span>검증 단계</span><select value={filters.stage} onChange={(event) => onFilterChange("stage", event.target.value)}><option value="all">전체 단계</option>{stageOptions.map((value) => <option key={value} value={value}>{liveStrategyPhaseLabel(value)}</option>)}</select></label>
         <label><span>주기</span><select value={filters.timeframe} onChange={(event) => onFilterChange("timeframe", event.target.value)}><option value="all">전체 주기</option>{timeframeOptions.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
         <label><span>전략 유형</span><select value={filters.plugin} onChange={(event) => onFilterChange("plugin", event.target.value)}><option value="all">전체 유형</option>{pluginOptions.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
         <label><span>정렬</span><select value={filters.sort} onChange={(event) => onFilterChange("sort", event.target.value)}><option value="updated-desc">최근 갱신순</option><option value="name-asc">이름순</option><option value="stage-desc">단계 높은순</option><option value="stage-asc">단계 낮은순</option></select></label>
@@ -6425,12 +6321,6 @@ function ArtifactMetadataEditor({ artifactId, artifactType, metadata, onSave, co
   );
 }
 
-function liveStrategyStageId(strategy) {
-  const raw = strategy?.lifecycle?.status || strategy?.promotion?.stage || strategy?.promotion_stage || strategy?.lifecycle_status || "draft";
-  const normalized = normalizePromotionStage(raw);
-  return STRATEGY_LIFECYCLE_STEPS.some((step) => step.id === normalized) ? normalized : normalized || "draft";
-}
-
 function uniqueStrategyDiscoveryValues(values) {
   return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))]
     .sort((left, right) => left.localeCompare(right, "ko"));
@@ -6438,7 +6328,7 @@ function uniqueStrategyDiscoveryValues(values) {
 
 function liveStrategyMatchesDiscovery(strategy, filters, metadata, running = false) {
   const query = String(filters.query || "").trim().toLocaleLowerCase();
-  const stage = liveStrategyStageId(strategy);
+  const stage = liveStrategyPhaseId(strategy);
   const plugin = strategy.plugin_label || strategy.plugin || "";
   const queryMatches = !query || [
     strategy.name,
@@ -6451,7 +6341,8 @@ function liveStrategyMatchesDiscovery(strategy, filters, metadata, running = fal
     strategy.permission_label,
     metadata?.note,
     ...(metadata?.tags || []),
-    promotionLabel(stage),
+    liveStrategyProgressLabel(strategy),
+    liveStrategyPhaseLabel(stage),
     JSON.stringify(strategy.parameters || {}),
     JSON.stringify(strategy.release || {}),
   ].some((value) => String(value || "").toLocaleLowerCase().includes(query));
@@ -6468,8 +6359,8 @@ function sortLiveStrategies(strategies, sort) {
     const leftName = left.name || left.strategy_id || "";
     const rightName = right.name || right.strategy_id || "";
     if (sort === "name-asc") return leftName.localeCompare(rightName, "ko");
-    if (sort === "stage-desc") return strategyLifecycleRank(liveStrategyStageId(right)) - strategyLifecycleRank(liveStrategyStageId(left)) || leftName.localeCompare(rightName, "ko");
-    if (sort === "stage-asc") return strategyLifecycleRank(liveStrategyStageId(left)) - strategyLifecycleRank(liveStrategyStageId(right)) || leftName.localeCompare(rightName, "ko");
+    if (sort === "stage-desc") return strategyLifecycleRank(liveStrategyLifecycleStage(right)) - strategyLifecycleRank(liveStrategyLifecycleStage(left)) || leftName.localeCompare(rightName, "ko");
+    if (sort === "stage-asc") return strategyLifecycleRank(liveStrategyLifecycleStage(left)) - strategyLifecycleRank(liveStrategyLifecycleStage(right)) || leftName.localeCompare(rightName, "ko");
     const leftDate = left.updated_at || left.updatedAt || left.release?.created_at || "";
     const rightDate = right.updated_at || right.updatedAt || right.release?.created_at || "";
     return String(rightDate).localeCompare(String(leftDate)) || leftName.localeCompare(rightName, "ko");

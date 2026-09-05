@@ -6,6 +6,7 @@ import {
   deploymentContextMatchesPreflight,
   deploymentRuntimeProfile,
   governedDeploymentIdentity,
+  strategyLifecycleStage,
 } from "../src/deploymentSelection.js";
 import { buildOrderCsvRows, ORDER_CSV_COLUMNS } from "../src/orderCsv.js";
 
@@ -52,6 +53,25 @@ test("현재 실행에 고정된 종료 Deployment는 안전한 Stop을 위해 �
 
   assert.equal(option.id, retired.deployment_id);
   assert.match(option.label, /^\[현재 세션\]/);
+});
+
+test("승인 상태는 검증 단계를 대신하지 않으며 오래된 Live 승인보다 중지 상태를 우선한다", () => {
+  for (const terminal of ["paused", "retired"]) {
+    const stopped = strategy(terminal, terminal, {
+      lifecycle: { status: "live" }, promotion: { stage: "LIVE" }, live_allowed: true,
+    });
+    assert.equal(strategyLifecycleStage(stopped), terminal);
+    assert.deepEqual(buildCurrentDeploymentOptions([stopped]), []);
+    const [pinned] = buildCurrentDeploymentOptions([stopped], { pinnedDeploymentIds: [stopped.deployment_id] });
+    assert.equal(pinned.id, stopped.deployment_id);
+    assert.match(pinned.label, terminal === "paused" ? /일시중지/ : /보관·종료/);
+  }
+  const approvalOnly = strategy("approval-only", undefined, { promotion: { stage: "LIVE" } });
+  assert.equal(strategyLifecycleStage(approvalOnly), "unknown");
+  assert.deepEqual(buildCurrentDeploymentOptions([approvalOnly]), []);
+  const qualified = strategy("qualified", "before-live-small", { promotion: { stage: "PAPER" } });
+  assert.equal(strategyLifecycleStage(qualified), "before-live-small");
+  assert.equal(buildCurrentDeploymentOptions([qualified])[0].id, qualified.deployment_id);
 });
 
 test("Deployment broker와 runtime profile을 명확히 매핑한다", () => {
