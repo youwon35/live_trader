@@ -18,6 +18,7 @@ function strategy(id, lifecycle, extra = {}) {
     symbol: "BTCUSDT",
     timeframe: "1h",
     lifecycle_status: lifecycle,
+    artifactLifecycle: { status: lifecycle || "unknown", source: lifecycle ? "lifecycle.status" : "missing", conflicts: [] },
     ...extra,
   };
 }
@@ -72,6 +73,17 @@ test("승인 상태는 검증 단계를 대신하지 않으며 오래된 Live �
   const qualified = strategy("qualified", "before-live-small", { promotion: { stage: "PAPER" } });
   assert.equal(strategyLifecycleStage(qualified), "before-live-small");
   assert.equal(buildCurrentDeploymentOptions([qualified])[0].id, qualified.deployment_id);
+});
+
+test("같은 저장본의 검증 라벨과 배포 선택 기준은 독립적이다", () => {
+  const ready = strategy("ready", "before-live-small", { artifactLifecycle: { status: "backtested", source: "lifecycle.status", conflicts: [] } });
+  const [option] = buildCurrentDeploymentOptions([ready]);
+  assert.equal(option.id, ready.deployment_id);
+  assert.match(option.label, /저장본: 백테스트 완료/);
+  assert.match(option.label, /배포: 제한 실거래 대기/);
+  assert.deepEqual(buildCurrentDeploymentOptions([{ ...ready, lifecycle_status: "paused" }]), []);
+  const [legacy] = buildCurrentDeploymentOptions([{ ...ready, artifactLifecycle: undefined }]);
+  assert.match(legacy.label, /저장본: 검증 상태 미확인/);
 });
 
 test("Deployment broker와 runtime profile을 명확히 매핑한다", () => {

@@ -2,6 +2,7 @@ import {
   PIPELINE_PHASES, canonicalStrategyLifecycleStage, strategyLifecycleLabel,
   strategyLifecyclePhase, strategyLifecycleSteps,
 } from '../../../packages/design/strategy-progress.js';
+import { readArtifactLifecycle } from '../../../packages/design/artifact-lifecycle.js';
 
 export function liveRuntimeModeLabel(mode) {
   const normalized = String(mode ?? '').trim().toUpperCase();
@@ -10,7 +11,8 @@ export function liveRuntimeModeLabel(mode) {
 }
 
 export function liveStrategyLifecycleStage(strategy) {
-  // promotion.stage is execution authorization, not completed validation evidence.
+  // Operational compatibility contract used by deployment selection and controls.
+  // Stored-artifact validation is read separately below.
   const stages = [strategy?.lifecycle?.status, strategy?.lifecycle_status]
     .filter((stage) => String(stage ?? '').trim())
     .map(canonicalStrategyLifecycleStage);
@@ -18,6 +20,18 @@ export function liveStrategyLifecycleStage(strategy) {
   if (stages.includes('retired')) return 'retired';
   if (stages.includes('paused')) return 'paused';
   return stages[0] || '';
+}
+
+export function liveStrategyValidationStage(strategy) {
+  // Normalized Live rows may contain a deployment lifecycle. An older API without
+  // the explicit projection cannot prove the stored artifact's validation stage.
+  return readArtifactLifecycle(strategy, { allowRawFallback: false }).status;
+}
+
+export function liveDeploymentLifecycleLabel(strategy) {
+  if (strategy?.deployment_source === 'legacy-artifact') return '배포 미등록';
+  const stage = strategy?.deploymentLifecycle?.status ?? liveStrategyLifecycleStage(strategy);
+  return canonicalStrategyLifecycleStage(stage) ? strategyLifecycleLabel(stage) : '배포 상태 미확인';
 }
 
 export function liveStrategyPhaseFilter(value) {
@@ -28,7 +42,7 @@ export function liveStrategyPhaseFilter(value) {
 }
 
 export function liveStrategyPhaseId(strategy) {
-  return liveStrategyPhaseFilter(liveStrategyLifecycleStage(strategy));
+  return liveStrategyPhaseFilter(liveStrategyValidationStage(strategy));
 }
 
 export function liveStrategyPhaseOptions(strategies) {
@@ -43,11 +57,12 @@ export function liveStrategyPhaseLabel(value) {
 }
 
 export function liveStrategyProgressLabel(strategy) {
-  return strategyLifecycleLabel(liveStrategyLifecycleStage(strategy));
+  const stage = liveStrategyValidationStage(strategy);
+  return strategyLifecycleLabel(stage === 'unknown' ? '' : stage);
 }
 
 export function buildLiveStrategyProgress(strategy) {
-  return strategyLifecycleSteps(liveStrategyLifecycleStage(strategy)).map((step, index) => ({
+  return strategyLifecycleSteps(liveStrategyValidationStage(strategy)).map((step, index) => ({
     ...step,
     id: step.key,
     index: index + 1,

@@ -88,7 +88,8 @@ import {
 } from "./futuresRiskSimulator";
 import { livePollingIntervals } from "./polling";
 import { executionApprovalLabel, strategyLifecycleRank } from "../../../packages/design/strategy-progress.js";
-import { buildLiveStrategyProgress, liveStrategyLifecycleStage, liveStrategyPhaseFilter, liveStrategyPhaseId, liveStrategyPhaseLabel, liveStrategyPhaseOptions, liveStrategyProgressLabel, liveRuntimeModeLabel } from "./strategyProgressDisplay.js";
+import { readArtifactLifecycle } from "../../../packages/design/artifact-lifecycle.js";
+import { buildLiveStrategyProgress, liveDeploymentLifecycleLabel, liveStrategyLifecycleStage, liveStrategyValidationStage, liveStrategyPhaseFilter, liveStrategyPhaseId, liveStrategyPhaseLabel, liveStrategyPhaseOptions, liveStrategyProgressLabel, liveRuntimeModeLabel } from "./strategyProgressDisplay.js";
 import { LIVE_WORKSPACE_ROUTE_IDS, liveNavigationRoot, liveNavigationRoute, liveSectionTabs } from "./liveNavigation.js";
 import { liveReconciliationDisplay } from "./liveReconciliationDisplay.js";
 import {
@@ -6015,6 +6016,7 @@ function LiveStrategySelectorPanel({
   onMetadataSave,
 }) {
   const parametersText = formatKeyValueMap(selectedStrategy?.parameters);
+  const artifactLifecycle = readArtifactLifecycle(selectedStrategy, { allowRawFallback: false });
   const promotionStage = selectedStrategy?.promotion?.stage || selectedStrategy?.promotion_stage || "unknown";
   const normalizedStage = liveStrategyLifecycleStage(selectedStrategy);
   const execution = verifiedCanaryExecution(selectedStrategy);
@@ -6062,7 +6064,8 @@ function LiveStrategySelectorPanel({
           <div className="live-strategy-summary-grid">
             <MetricCard className="metric-card" label="전략" value={selectedStrategy.plugin_label || selectedStrategy.plugin} detail={selectedStrategy.strategy_id} />
             <MetricCard className="metric-card" label="대상" value={`${selectedStrategy.symbol} · ${selectedStrategy.timeframe}`} detail={selectedStrategy.asset} />
-            <MetricCard className="metric-card" label="검증 진행" value={liveStrategyProgressLabel(selectedStrategy)} detail={`실행 허용 범위: ${executionApprovalLabel(promotionStage)} · ${execution.verified ? `현재 배포 체결 ${execution.successful}건 · 차단 ${execution.blocked}건` : "현재 배포의 체결·차단 집계 미확인"}`} />
+            <MetricCard className="metric-card" label="저장본 검증 단계" value={liveStrategyProgressLabel(selectedStrategy)} detail="원본 메타데이터에 기록된 검증 단계" />
+            <MetricCard className="metric-card" label="배포 운용 상태" value={liveDeploymentLifecycleLabel(selectedStrategy)} detail={`실행 허용 범위: ${executionApprovalLabel(promotionStage)} · ${execution.verified ? `현재 배포 체결 ${execution.successful}건 · 차단 ${execution.blocked}건` : "현재 배포의 체결·차단 집계 미확인"}`} />
           </div>
           <div className="live-strategy-promotion-line">
             {automaticResult && (
@@ -6079,9 +6082,9 @@ function LiveStrategySelectorPanel({
               status={canPromoteLive ? "success" : undefined}
             />
           </div>
-          <CompactDisclosure title="전체 검증 단계" description="Backtester → Paper Trader → Live Trader의 검증 진행입니다. 검증 단계와 현재 주문 권한은 서로 다릅니다.">
+          <CompactDisclosure title="전체 검증 단계" description="같은 원본 저장본의 메타데이터를 Backtester → Paper Trader → Live Trader에서 표시합니다. 배포 운용 상태와 현재 주문 권한은 별도입니다.">
             <p className="pipeline-role-hint"><strong>백테스트 → 모의 검증 → 제한 실거래 → 실전 운용</strong>신호 관찰과 가상체결은 하나의 모의 검증에 포함됩니다. 주문 연결 시험은 전략 단계와 별개이며, 제한 실거래에는 별도 승인이 필요합니다.</p>
-            <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="전략 검증 진행 단계">
+            <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="저장본 검증 단계">
               {lifecycleTimeline.map((item) => (
                 <article className={item.state} key={item.id}>
                   <span>{item.index}</span>
@@ -6131,6 +6134,9 @@ function LiveStrategySelectorPanel({
             </span>
           </div>
           <CompactDisclosure title="전략 기술 정보" description="Release, parameter hash와 개인 메타데이터를 확인합니다.">
+            <p>원본 ID: {selectedStrategy.artifact_reference?.artifactId || "미확인"} · 원본 hash: <code>{selectedStrategy.artifact_reference?.artifactHash || "미확인"}</code></p>
+            <p>저장본 단계 표시 기준: {artifactLifecycle.source}</p>
+            {artifactLifecycle.conflicts.length > 0 && <p role="status">원본 단계 표기가 서로 다릅니다: {artifactLifecycle.conflicts.join(" · ")}</p>}
             <div className="live-strategy-parameter-panel">
               <strong>Release · Parameters</strong>
               <span>{selectedStrategy.release?.release_id || selectedStrategy.release_id || "Release 없음"}</span>
@@ -6185,7 +6191,7 @@ function StrategyDiscoveryToolbar({
             placeholder="이름, ID, 종목, 파라미터, 차단 사유 검색"
           />
         </label>
-        <label><span>검증 단계</span><select value={filters.stage} onChange={(event) => onFilterChange("stage", event.target.value)}><option value="all">전체 단계</option>{stageOptions.map((value) => <option key={value} value={value}>{liveStrategyPhaseLabel(value)}</option>)}</select></label>
+        <label><span>저장본 검증 단계</span><select value={filters.stage} onChange={(event) => onFilterChange("stage", event.target.value)}><option value="all">전체 단계</option>{stageOptions.map((value) => <option key={value} value={value}>{liveStrategyPhaseLabel(value)}</option>)}</select></label>
         <label><span>주기</span><select value={filters.timeframe} onChange={(event) => onFilterChange("timeframe", event.target.value)}><option value="all">전체 주기</option>{timeframeOptions.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
         <label><span>전략 유형</span><select value={filters.plugin} onChange={(event) => onFilterChange("plugin", event.target.value)}><option value="all">전체 유형</option>{pluginOptions.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
         <label><span>정렬</span><select value={filters.sort} onChange={(event) => onFilterChange("sort", event.target.value)}><option value="updated-desc">최근 갱신순</option><option value="name-asc">이름순</option><option value="stage-desc">단계 높은순</option><option value="stage-asc">단계 낮은순</option></select></label>
@@ -6359,8 +6365,8 @@ function sortLiveStrategies(strategies, sort) {
     const leftName = left.name || left.strategy_id || "";
     const rightName = right.name || right.strategy_id || "";
     if (sort === "name-asc") return leftName.localeCompare(rightName, "ko");
-    if (sort === "stage-desc") return strategyLifecycleRank(liveStrategyLifecycleStage(right)) - strategyLifecycleRank(liveStrategyLifecycleStage(left)) || leftName.localeCompare(rightName, "ko");
-    if (sort === "stage-asc") return strategyLifecycleRank(liveStrategyLifecycleStage(left)) - strategyLifecycleRank(liveStrategyLifecycleStage(right)) || leftName.localeCompare(rightName, "ko");
+    if (sort === "stage-desc") return strategyLifecycleRank(liveStrategyValidationStage(right)) - strategyLifecycleRank(liveStrategyValidationStage(left)) || leftName.localeCompare(rightName, "ko");
+    if (sort === "stage-asc") return strategyLifecycleRank(liveStrategyValidationStage(left)) - strategyLifecycleRank(liveStrategyValidationStage(right)) || leftName.localeCompare(rightName, "ko");
     const leftDate = left.updated_at || left.updatedAt || left.release?.created_at || "";
     const rightDate = right.updated_at || right.updatedAt || right.release?.created_at || "";
     return String(rightDate).localeCompare(String(leftDate)) || leftName.localeCompare(rightName, "ko");

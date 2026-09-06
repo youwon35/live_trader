@@ -1,4 +1,4 @@
-import { liveStrategyLifecycleStage, liveStrategyProgressLabel } from './strategyProgressDisplay.js';
+import { liveDeploymentLifecycleLabel, liveStrategyLifecycleStage, liveStrategyProgressLabel } from './strategyProgressDisplay.js';
 
 const TERMINAL_DEPLOYMENT_STAGES = new Set([
   "archived",
@@ -132,7 +132,7 @@ function optionBaseLabel(strategy) {
   const symbol = strategy.symbol || "-";
   const timeframe = strategy.timeframe || "-";
   const stageLabel = liveStrategyProgressLabel(strategy);
-  return `${portfolio} · ${symbol} ${timeframe} · ${name} · ${stageLabel}`;
+  return `${portfolio} · ${symbol} ${timeframe} · ${name} · 저장본: ${stageLabel} · 배포: ${liveDeploymentLifecycleLabel(strategy)}`;
 }
 
 export function buildCurrentDeploymentOptions(strategies = [], { pinnedDeploymentIds = [] } = {}) {

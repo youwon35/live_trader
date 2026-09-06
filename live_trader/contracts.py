@@ -39,6 +39,7 @@ from trading_runtime.lifecycle import (  # noqa: E402
     lifecycle_at_least,
     lifecycle_rank,
     normalize_lifecycle_status,
+    resolve_artifact_lifecycle,
 )
 from trading_runtime.professional_flow import validate_lineage_manifest  # noqa: E402
 from trading_runtime.exposure_contract import exposure_contract_from_artifact  # noqa: E402
@@ -740,6 +741,7 @@ def load_portfolio_artifacts(limit: int | None = None) -> list[dict[str, Any]]:
 
 
 def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    artifact_lifecycle = resolve_artifact_lifecycle(artifact)
     lifecycle = _dict_value(artifact.get("lifecycle"))
     framework = _dict_value(artifact.get("framework"))
     raw_permissions = _dict_value(artifact.get("permissions"))
@@ -873,6 +875,7 @@ def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "name": str(artifact.get("name") or artifact.get("portfolioName") or artifact.get("id") or "Portfolio Artifact"),
         "schema_version": str(artifact.get("schemaVersion") or "portfolio-artifact-v1"),
         "artifact_type": str(artifact.get("artifactType") or "portfolio"),
+        "artifactLifecycle": artifact_lifecycle,
         "lifecycle_status": lifecycle_status,
         "lifecycle": {
             "status": lifecycle_status,
@@ -1172,6 +1175,9 @@ def load_strategy_artifacts(limit: int | None = None) -> list[dict[str, Any]]:
 
 
 def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    # Display projection only: resolve raw metadata before the deployment's
+    # operational lifecycle is selected. Never persist this DTO into an artifact.
+    artifact_lifecycle = resolve_artifact_lifecycle(artifact)
     dataset = _dict_value(artifact.get("dataset"))
     data_artifact = _dict_value(artifact.get("dataArtifact") or artifact.get("data_artifact"))
     parameters = _dict_value(artifact.get("parameters"))
@@ -1194,6 +1200,7 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         if str(item).strip()
     ] if isinstance(raw_allowed_brokers, (list, tuple, set)) else []
     deployment = _dict_value(artifact.get("_deployment"))
+    deployment_lifecycle_status = normalize_lifecycle_status(deployment.get("lifecycle"), default="") or "unknown"
     custom_definition = _custom_definition_from_artifact(artifact, strategy_contract)
     plugin_id = _normalize_plugin_id(
         artifact.get("plugin")
@@ -1522,6 +1529,14 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "deployment_environment": str(deployment.get("environment") or ""),
         "deployment_mode": str(deployment.get("mode") or ""),
         "deployment_source": "deployment-registry" if deployment else "legacy-artifact",
+        "artifactLifecycle": artifact_lifecycle,
+        "deploymentLifecycle": {
+            "status": deployment_lifecycle_status,
+            "source": "deployment-registry" if deployment else "missing",
+            "label": _promotion_stage_label(deployment_lifecycle_status) if deployment else "배포 미등록",
+            "updatedAt": str(deployment.get("updatedAt") or ""),
+            "history": deployment.get("history") if isinstance(deployment.get("history"), list) else [],
+        },
         "deployment_strategy_reference": dict(
             deployment.get("strategyArtifact")
             if isinstance(deployment.get("strategyArtifact"), dict)

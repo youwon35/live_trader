@@ -34,6 +34,9 @@ snapshot.generated_at = '2026-09-05T00:00:00Z';
 snapshot.live_governance.deploymentId = 'fixture-deployment';
 snapshot.live_governance.activeSession = { lifecycleState: 'DRAINING', healthStatus: 'TAINTED', sessionId: 'fixture-session' };
 snapshot.strategies = [{ strategy_id: 'fixture-strategy', deployment_id: 'fixture-deployment', name: '화면 검증용 전략', asset: 'KR_STOCK', broker_id: 'kis', symbol: '005930', timeframe: '1d', plugin: 'moving_average_cross', lifecycle: { status: 'before-live-small' }, lifecycle_status: 'before-live-small', promotion: { stage: 'LIVE_SMALL' }, live_small_eligible: false, parameters: {} }];
+snapshot.strategies[0].artifactLifecycle = { status: 'backtested', source: 'lifecycle.status', conflicts: [] };
+snapshot.strategies[0].artifact_reference = { artifactId: 'fixture-artifact', artifactHash: 'a'.repeat(64) };
+snapshot.strategies[0].deploymentLifecycle = { status: 'before-live-small', source: 'deployment-registry', updatedAt: '', history: [] };
 snapshot.automation_profiles = [{ id: 'stock', title: '화면 검증용 프로필', provider: 'kis', provider_label: 'KIS fixture', asset_scope: ['KR_STOCK'], broker_ids: ['kis'], strategy_count: 1, live_strategy_count: 0, ready: false, mode: 'MONITOR', enabled: false, detail: '브로커 연결 없는 화면 테스트', last_action: '대기' }];
 snapshot.continuous_runtime = { running: false, phase: 'STOPPED', profiles: {} };
 
@@ -113,7 +116,12 @@ try {
         await page.getByRole('heading', { name: 'Paper에서 받은 검증 근거', exact: true }).waitFor();
         await page.getByRole('button', { name: /전체 검증 단계/ }).click();
         assert.deepEqual(await page.locator('.live-lifecycle-timeline strong').allTextContents(), ['백테스트', '모의 검증', '제한 실거래', '실전 운용']);
-        assert.equal(await page.locator('.live-lifecycle-timeline article.current strong').textContent(), '제한 실거래');
+        assert.equal(await page.locator('.live-lifecycle-timeline article.current strong').textContent(), '백테스트');
+        const cards = page.locator('.live-strategy-summary-grid');
+        assert.equal(await cards.getByText('저장본 검증 단계', { exact: true }).count(), 1);
+        assert.equal(await cards.getByText('백테스트 완료', { exact: true }).count(), 1);
+        assert.equal(await cards.getByText('배포 운용 상태', { exact: true }).count(), 1);
+        assert.equal(await cards.getByText('제한 실거래 대기', { exact: true }).count(), 1);
         assert.equal(await page.getByRole('button', { name: '실전 운용 단계로 승인', exact: true }).isDisabled(), true);
         await page.screenshot({ path: resolve(output, `strategy-${viewport.width}.png`) });
       }

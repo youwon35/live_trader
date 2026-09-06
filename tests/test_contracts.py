@@ -3,8 +3,9 @@ import os
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import live_trader.contracts as contracts
 from live_trader.contracts import (
@@ -24,6 +25,7 @@ from live_trader.contracts import (
 from trading_runtime.artifact_governance import (
     DeploymentStore,
     EvidenceStore,
+    artifact_reference,
     build_paper_portfolio_evidence,
     seal_portfolio_artifact,
     seal_strategy_artifact,
@@ -32,6 +34,71 @@ from trading_runtime.professional_flow import build_lineage_manifest
 
 
 class StrategyContractTest(unittest.TestCase):
+    def test_stored_validation_projection_does_not_overwrite_operational_state_or_raw_hash(self) -> None:
+        raw = seal_strategy_artifact({
+            "id": "same-source", "artifactType": "strategy", "symbol": "BTCUSDT",
+            "lifecycle": {"status": "backtested", "label": "원본 백테스트", "updatedAt": "artifact-time", "history": [{"to": "backtested"}]},
+            "lifecycleStatus": "live", "finalTest": {"status": "pass"},
+        })
+        before, reference = deepcopy(raw), artifact_reference(raw)
+        for state in ("before-live-small", "live", "paused", "retired"):
+            deployment = {"deploymentId": "deployment-a", "lifecycle": state, "updatedAt": "deployment-time", "permissions": {"live_allowed": False}}
+            supplied = {**raw, "_deployment": deployment}
+            supplied_before = deepcopy(supplied)
+            with patch.object(contracts, "strategy_plugin_dirs", return_value=[]):
+                result = normalize_strategy_artifact(supplied)
+            self.assertEqual({"status": "backtested", "source": "lifecycle.status", "conflicts": ["lifecycleStatus=live"]}, result["artifactLifecycle"])
+            self.assertEqual(state, result["lifecycle_status"])
+            self.assertEqual(state, result["lifecycle"]["status"])
+            self.assertEqual(state, result["deploymentLifecycle"]["status"])
+            self.assertEqual("deployment-time", result["deploymentLifecycle"]["updatedAt"])
+            self.assertEqual([], result["deploymentLifecycle"]["history"])
+            self.assertNotEqual("원본 백테스트", result["deploymentLifecycle"]["label"])
+            self.assertFalse(result["permissions"]["live_allowed"])
+            self.assertEqual(supplied_before, supplied)
+        self.assertEqual(before, raw)
+        self.assertEqual(reference, artifact_reference(raw))
+        self.assertNotIn("artifactLifecycle", raw)
+        self.assertNotIn("deploymentLifecycle", raw)
+
+    def test_same_artifact_id_and_hash_keep_validation_stage_across_distinct_deployments(self) -> None:
+        raw = seal_strategy_artifact({"id": "same-source", "artifactType": "strategy", "symbol": "BTCUSDT", "lifecycle": {"status": "backtested"}})
+        reference = artifact_reference(raw)
+        deployments = [{"deploymentId": identifier, "strategyArtifact": reference, "environment": "SMALL_LIVE", "lifecycle": state, "permissions": {}}
+                       for identifier, state in (("one", "live"), ("two", "paused"))]
+        store = Mock()
+        projections = []
+        with patch.object(contracts, "DeploymentStore", return_value=store), patch.object(contracts, "load_pinned_paper_live_qualification", return_value={"ready": False, "issues": ["test-no-evidence"]}), patch.object(contracts, "strategy_plugin_dirs", return_value=[]):
+            for rows in (deployments, list(reversed(deployments))):
+                store.list.return_value = rows
+                result = normalize_strategy_artifact(enrich_strategy_artifact_runtime(Path("not-read"), Path("not-read/source.json"), raw))
+                self.assertEqual(rows[0]["deploymentId"], result["deployment_id"])
+                self.assertEqual(rows[0]["lifecycle"], result["lifecycle_status"])
+                self.assertEqual(reference, result["artifact_reference"])
+                projections.append(result["artifactLifecycle"])
+        self.assertEqual(projections[0], projections[1])
+        self.assertEqual("backtested", projections[0]["status"])
+
+    def test_missing_deployment_lifecycle_cannot_inherit_the_artifact_stage_in_display(self) -> None:
+        for missing in (None, "", "unrecognized"):
+            raw = {"id": "source-live", "lifecycle": {"status": "live"}, "_deployment": {"deploymentId": "bound", "lifecycle": missing}}
+            with patch.object(contracts, "strategy_plugin_dirs", return_value=[]):
+                result = normalize_strategy_artifact(raw)
+            self.assertEqual("live", result["artifactLifecycle"]["status"])
+            self.assertEqual("unknown", result["deploymentLifecycle"]["status"])
+            self.assertEqual("deployment-registry", result["deploymentLifecycle"]["source"])
+            # Preserve the pre-existing runtime compatibility path independently.
+            self.assertEqual("draft" if missing else "live", result["lifecycle_status"])
+
+    def test_portfolio_projection_uses_raw_metadata_and_never_trusts_an_embedded_ui_dto(self) -> None:
+        raw = seal_portfolio_artifact({"id": "portfolio-source", "artifactType": "portfolio", "schemaVersion": "portfolio-artifact-v1", "lifecycle": {"status": "papered"}, "artifactLifecycle": {"status": "live", "source": "lifecycle.status", "conflicts": []}})
+        before, reference = deepcopy(raw), artifact_reference(raw)
+        result = normalize_portfolio_artifact(raw)
+        self.assertEqual({"status": "papered", "source": "lifecycle.status", "conflicts": []}, result["artifactLifecycle"])
+        self.assertEqual("papered", result["lifecycle_status"])
+        self.assertEqual(before, raw)
+        self.assertEqual(reference, artifact_reference(raw))
+
     def test_ui_demo_sample_strategies_are_never_live_candidates(self) -> None:
         samples = sample_strategy_artifacts()
 
