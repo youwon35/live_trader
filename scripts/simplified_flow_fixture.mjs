@@ -180,6 +180,21 @@ try {
         await page.screenshot({ path: resolve(output, `allocation-light-${viewport.width}.png`) });
         await page.evaluate(() => { document.documentElement.dataset.uiTheme = 'dark'; });
 
+        const originalAccounts = snapshot.accounts;
+        const originalPositions = snapshot.positions;
+        snapshot.accounts = snapshot.accounts.map(account => account.broker_id === 'kis' ? { ...account, broker_cash_value: 0, broker_equity_value: 0 } : account);
+        snapshot.positions = snapshot.positions.map(position => position.broker_id === 'kis' ? { ...position, current_price: 0, broker_value: 0 } : position);
+        await allocation.getByRole('button', { name: '계좌 다시 읽기', exact: true }).click();
+        await allocation.locator('.ts-allocation-center-value').filter({ hasText: '평가 미확인' }).waitFor();
+        assert.equal(await allocation.getByText('보유 자산이 없습니다.', { exact: true }).count(), 0);
+        assert.equal(await allocation.locator('tbody tr').count(), 2);
+        assert.match(await allocation.locator('tbody tr').first().innerText(), /평가 미확인/);
+        await page.screenshot({ path: resolve(output, `allocation-missing-price-${viewport.width}.png`) });
+        snapshot.accounts = originalAccounts;
+        snapshot.positions = originalPositions;
+        await allocation.getByRole('button', { name: '계좌 다시 읽기', exact: true }).click();
+        await allocation.locator('.ts-allocation-center-value').filter({ hasText: '400,000원' }).waitFor();
+        report.views.push({ viewport: viewport.width, label: '시세·총액 누락 계좌', missingValueHidden: true });
         assert.equal(await page.locator('.three-way-reconciliation-panel').getByText('조회됨', { exact: true }).count(), 0);
         await page.locator('.three-way-reconciliation-panel').getByText('대조 미확인', { exact: true }).waitFor();
       }
