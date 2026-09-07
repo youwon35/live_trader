@@ -87,8 +87,7 @@ test("default pages prioritize decisions and move technical evidence into disclo
 
   assert.ok(settings.indexOf("BrokerConnectionAssistant") < settings.indexOf("CompactDisclosure"));
   assert.ok(settings.indexOf("DoctorHistoryPanel") < settings.indexOf("CompactDisclosure"));
-  assert.ok(settings.indexOf("AppearanceControlPanel") < settings.indexOf("BrokerConnectionAssistant"));
-  assert.match(settings, /title="텔레그램 알림"/);
+  assert.match(settings, /title="화면·레이아웃·Telegram"/);
 
   const overview = between(appSource, "function OperationsOverviewPage", "function RuntimeComponentStatusPanel");
   assert.doesNotMatch(overview, /DeploymentContextPanel/);

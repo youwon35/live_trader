@@ -1,7 +1,8 @@
 // Offline production-bundle regression. Never starts Python or reads account state.
 // All API responses are intercepted in the browser; the static server rejects /api/.
 import assert from 'node:assert/strict';
-import { probeUnifiedControls, inspectVisibleInternalTabs, exerciseAppearance } from './control_style_probe.mjs';
+import { probeRestoredUi, inspectRestoredTabs } from './font_restore_probe.mjs';
+const fontReview=process.env.FONT_RESTORE_REVIEW==='1';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { extname, resolve, sep } from 'node:path';
@@ -18,6 +19,7 @@ const fallbackLiteral = appSource.match(/const fallbackSnapshot = (\{[\s\S]*?\n\
 assert.ok(fallbackLiteral, 'the fail-closed fixture base must be an explicit static literal');
 const snapshot = JSON.parse(JSON.stringify(runInNewContext(`(${fallbackLiteral[1]})`, {}, { timeout: 500 })));
 snapshot.api_connected = true;
+if(fontReview) snapshot.technical_logs=['INFO','WARN','ERROR'].map((level,i)=>({level,event_id:`font-log-${i}`,timestamp:'2026-09-08T01:00:00Z',source:'오프라인 글꼴 검사',message:`${level} 의미색 검증` }));
 snapshot.execution_availability = {
   schemaVersion: 'live-execution-availability-v1', authorizationGranted: false,
   ordinaryContinuous: { monitorSupported: true, liveDispatchAvailable: false,
@@ -75,10 +77,10 @@ await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen
 const origin = `http://127.0.0.1:${server.address().port}`;
 await mkdir(output, { recursive: true });
 const browser = await chromium.launch({ channel: 'msedge', headless: true });
-const unifiedReview = process.env.UNIFIED_CONTROLS_REVIEW === "1";
-const report = { ok: false, brokerIO: 0, externalRequests: [], views: [], apiRequests: [], styles: [], appearance: [] };
+const report = { ok: false, brokerIO: 0, externalRequests: [], views: [], apiRequests: [],styles: [] };
 try {
-  for (const {theme, ...viewport} of (unifiedReview ? [1024,1920].flatMap(width => ["light","dark"].map(theme => ({width,height:1080,theme}))) : [{width:1280,height:800},{width:1920,height:1080}])) {
+  const configurations=fontReview?[1024,1920].flatMap(width=>['light','dark'].map(theme=>({viewport:{width,height:1000},theme}))):[{viewport:{width:1280,height:800},theme:'light'},{viewport:{width:1920,height:1080},theme:'light'}];
+  for (const {viewport,theme} of configurations) {
     const context = await browser.newContext({ viewport, serviceWorkers: 'block' });
     const page = await context.newPage();
     const errors = [];
@@ -116,7 +118,6 @@ try {
     });
     await page.goto(origin);
     await page.getByRole('heading', { name: '시작 점검', exact: true }).waitFor();
-    if(unifiedReview) report.appearance.push(await exerciseAppearance(page,{navLabel:"연결·설정",theme,app:"live",screenshotPath:resolve(output,`unified-settings-${theme}-${viewport.width}.png`)}));
     const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '계좌·잔고', '주문·체결', '실행 기록', '연결·설정', '주문 연결 시험'];
     assert.deepEqual(await page.locator('.nav-list .nav-item').allTextContents().then((items) => items.map((text) => text.trim())), navLabels);
     for (const label of navLabels) {
@@ -211,10 +212,19 @@ try {
         await page.locator('.functional-test-safety-strip').waitFor();
         await page.screenshot({ path: resolve(output, `broker-test-${viewport.width}.png`) });
       }
-      if(unifiedReview){
+      if(fontReview){
         await page.evaluate(theme=>{document.documentElement.dataset.uiTheme=theme;},theme);
-        report.styles.push(await probeUnifiedControls(page,label));
-        await inspectVisibleInternalTabs(page,label,report.styles);
+        report.styles.push(await probeRestoredUi(page,label));
+        if(label==='실행 기록') {
+          assert.ok(new Set(report.styles.at(-1).logs.map(log=>log.background)).size>=3,'info/warning/error retain distinct semantic colors');
+          await page.screenshot({path:resolve(output,`restored-logs-${theme}-${viewport.width}.png`)});
+        }
+        if(label==='연결·설정') {
+          await page.getByRole('button',{name:/화면·레이아웃·Telegram/}).click();
+          report.styles.push(await probeRestoredUi(page,`${label} / 화면 설정`));
+          await page.screenshot({path:resolve(output,`restored-settings-${theme}-${viewport.width}.png`)});
+        }
+        await inspectRestoredTabs(page,label,report.styles,theme);
       }
       report.views.push({ viewport: viewport.width, label, overflow });
     }
@@ -222,11 +232,7 @@ try {
     await context.close();
   }
   assert.deepEqual(report.externalRequests, [], 'all requests stay in the fixture origin');
-  if(unifiedReview && process.env.UNIFIED_CONTROLS_STRICT === "1") {
-    assert.deepEqual(report.styles.flatMap(row=>[...row.failures,...row.fontFailures]),[]);
-    assert.ok(report.appearance.every(row=>row.persisted&&row.resized&&row.resetRemoved&&row.editorActive==="true"&&row.contrast>=4.5));
-  }
-  assert.ok(!unifiedReview || report.styles.every(row=>row.tabs.every(tab=>tab.display==='flex'&&tab.wrap==='nowrap'&&tab.children.every(child=>child.height<=36&&child.whiteSpace==='nowrap'))));
+  assert.deepEqual(report.styles.flatMap(s=>s.fontFailures),[]);
   report.ok = true;
 } finally {
   await browser.close();
