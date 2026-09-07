@@ -15,3 +15,10 @@
   color: inherit !important;
 }
 }
+
+/* A selected diagnostic is a choice; its separate status badge keeps the tone. */
+@layer interface-polish {
+button.doctor-card[data-ts-selected="true"] :is(.ts-status-card__title, .ts-status-card__detail) {
+  color: var(--ts-selection-contrast, #ffffff) !important;
+}
+}

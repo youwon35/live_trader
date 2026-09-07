@@ -1,4 +1,4 @@
-import { verifyAppearancePolish } from './surface_polish_probe.mjs';
+import { verifyAppearancePolish, verifySelectedCards } from './surface_polish_probe.mjs';
 // Offline production-bundle regression. Never starts Python or reads account state.
 // All API responses are intercepted in the browser; the static server rejects /api/.
 import assert from 'node:assert/strict';
@@ -121,7 +121,7 @@ try {
     await page.getByRole('heading', { name: '시작 점검', exact: true }).waitFor();
     const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '계좌·잔고', '주문·체결', '실행 기록', '연결·설정', '주문 연결 시험'];
     assert.deepEqual(await page.locator('.nav-list .nav-item').allTextContents().then((items) => items.map((text) => text.trim())), navLabels);
-    for (const label of navLabels) {
+    for (const label of (process.env.CARD_ACCENT_ONLY==='1'?['시작 점검']:navLabels)) {
       await page.locator('.nav-list').getByRole('button', { name: label, exact: true }).click();
       await page.getByRole('heading', { name: label, exact: true }).waitFor();
       await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
@@ -130,6 +130,11 @@ try {
       if (await page.locator('.live-environment-bar').count()) assert.equal(await page.locator('.live-environment-bar').evaluate(element => getComputedStyle(element).backgroundImage), 'none');
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1);
       assert.equal(overflow, false, `${label} horizontal viewport overflow at ${viewport.width}`);
+      if(process.env.CARD_ACCENT_REVIEW==='1' && label==='시작 점검') {
+    await page.evaluate(theme=>{document.documentElement.dataset.uiTheme=theme;},theme);
+        report.selectedCards??=[];report.selectedCards.push(...await verifySelectedCards(page,'button.doctor-card','Live 점검 선택 카드'));
+        await page.screenshot({path:resolve(output,`selected-doctor-${theme}-${viewport.width}.png`)});
+      }
       if (label === '운용 전략') {
         await page.getByRole('heading', { name: '모의거래에서 받은 검증 근거', exact: true }).waitFor();
         await page.getByRole('button', { name: /전체 검증 단계/ }).click();
@@ -243,6 +248,6 @@ try {
 } finally {
   await browser.close();
   await new Promise((done) => server.close(done));
-  await writeFile(resolve(output, 'report.json'), JSON.stringify(report, null, 2));
+  await writeFile(resolve(output, process.env.CARD_ACCENT_ONLY==='1'?'selected-card-report.json':'report.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 }

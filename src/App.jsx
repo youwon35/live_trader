@@ -2352,6 +2352,7 @@ function App() {
                     type="button"
                     key={item.id}
                     aria-current={selectedNavRoot === item.id ? "page" : undefined}
+                    data-ts-selected={selectedNavRoot === item.id ? "true" : undefined}
                     onClick={() => navigateWorkspace(item.id)}
                   >
                     <Icon size={17} />
@@ -4390,6 +4391,8 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
         {visibleItems.map((item) => (
           <StatusCard
             className={`doctor-card ${item.tone} ${selectedItem?.id === item.id ? "selected" : ""}`}
+            data-ts-selected={selectedItem?.id === item.id ? "true" : undefined}
+            badge={<StatusPill tone={item.tone}>{item.status}</StatusPill>}
             key={item.id}
             type="button"
             as="button"

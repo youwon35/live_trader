@@ -56,3 +56,30 @@ export async function verifyAppearancePolish(page, label, theme, openPanel) {
  checks.push(await probeSurfacePolish(page,`${label} / reload persistence`));
  return checks;
 }
+
+
+// Select real detail cards, comparing each embedded status badge before/after.
+export async function verifySelectedCards(page, selector, label) {
+ const styles = await page.evaluate(() => ['--ts-selection-accent','--ts-selection-contrast'].map(name=>[name,document.documentElement.style.getPropertyValue(name)]));
+ const result=[];
+ try {
+  for(const [background,foreground] of [['#000080','#ffffff'],['#ffdd00','#000000']]) {
+   await page.evaluate(({background,foreground})=>{document.documentElement.style.setProperty('--ts-selection-accent',background);document.documentElement.style.setProperty('--ts-selection-contrast',foreground);},{background,foreground});
+   const cards=page.locator(selector);
+   assert.ok(await cards.count()>=2,`${label}: requires two real selectable cards`);
+   const badges=await cards.evaluateAll(nodes=>nodes.map(e=>[...e.querySelectorAll('.status-pill')].map(b=>({text:b.textContent,color:getComputedStyle(b).color,background:getComputedStyle(b).backgroundColor}))));
+   for(let index=0;index<2;index++) {
+    await cards.nth(index).click();
+    await page.evaluate(async()=>{await new Promise(resolve=>requestAnimationFrame(resolve));await Promise.all(document.getAnimations().filter(a=>a instanceof CSSTransition).map(a=>a.finished.catch(()=>undefined)));});
+    assert.equal(await cards.nth(index).getAttribute('data-ts-selected'),'true');
+    const state=await cards.nth(index).evaluate(e=>({background:getComputedStyle(e).backgroundColor,titleColor:getComputedStyle(e.querySelector('strong')).color,badges:[...e.querySelectorAll('.status-pill')].map(b=>({text:b.textContent,color:getComputedStyle(b).color,background:getComputedStyle(b).backgroundColor}))}));
+    assert.equal(state.background,background==='#000080'?'rgb(0, 0, 128)':'rgb(255, 221, 0)');
+    assert.equal(state.titleColor,foreground==='#ffffff'?'rgb(255, 255, 255)':'rgb(0, 0, 0)');
+    assert.deepEqual(state.badges,badges[index],`${label}: badge semantics survive card selection`);
+    assert.ok(state.badges.length>0,`${label}: a semantic badge must remain visible`);
+    result.push({label,width:await page.evaluate(()=>innerWidth),theme:await page.evaluate(()=>document.documentElement.dataset.uiTheme),index,accent:background,...state});
+   }
+  }
+ } finally {await page.evaluate(styles=>styles.forEach(([name,value])=>document.documentElement.style.setProperty(name,value)),styles);}
+ return result;
+}
