@@ -112,6 +112,7 @@ import {
 import { buildOrderCsvRows, ORDER_CSV_COLUMNS } from "./orderCsv";
 import { createActionButton } from "../../../packages/design/action-button.js";
 import { createAllocationWorkspace } from "../../../packages/design/allocation-workspace.js";
+import { applySelectionAccent } from "../../../packages/design/selection-accent.js";
 import { liveAllocationAccounts } from "./accountAllocation.js";
 import { createAppearanceSettingsPanel } from "../../../packages/design/appearance-settings-panel.js";
 import {
@@ -943,6 +944,7 @@ function applyAppearance(appearance) {
     root.dataset.accent = nextAppearance.accent;
     applyCustomAccent(root, nextAppearance);
     applyAccentContrast(root, nextAppearance);
+    applySelectionAccent(root, accentColorForContrast(nextAppearance.accent, nextAppearance.customAccent));
   } catch {
     // Appearance remains in React state if document access is unavailable.
   }
@@ -5304,6 +5306,7 @@ function AutomationLauncherPanel({
             {["binance", "upbit"].map((provider) => (
               <button
                 className={activeProfile.provider === provider ? "active" : ""}
+                aria-pressed={activeProfile.provider === provider}
                 type="button"
                 key={provider}
                 onClick={() => onAutomation(activeProfile.id, activeProfile.enabled, provider, activeProfile.mode)}
@@ -5490,7 +5493,7 @@ function AutomationLauncherPanel({
         {lastValidationResult?.ok === false && (
           <div {...semanticSurfaceProps("danger", "validation-evaluation-error")}>{lastValidationResult.reason}</div>
         )}
-        <p className="validation-monitor-note">
+        <p className="validation-monitor-note ts-static-description">
           이 검증 plan은 지속 감시 runner와 연결하지 않습니다. 후보 plan을 우회해 장시간 실행 엔진을 시작하지 않으며, 포트폴리오를 합성하지 않고 표준 SMALL/FULL LIVE 권한도 변경하지 않습니다.
         </p>
         {researchShort && (
@@ -5889,7 +5892,7 @@ function LiveStrategySelectorPanel({
             />
           </div>
           <CompactDisclosure title="전체 검증 단계" description="같은 원본 저장본의 메타데이터를 Backtester → 모의거래 Trader → Live Trader에서 표시합니다. 배포 운용 상태와 현재 주문 권한은 별도입니다.">
-            <p className="pipeline-role-hint"><strong>백테스트 → 모의 검증 → 제한 실거래 → 실전 운용</strong>신호 관찰과 가상체결은 하나의 모의 검증에 포함됩니다. 주문 연결 시험은 전략 단계와 별개이며, 제한 실거래에는 별도 승인이 필요합니다.</p>
+            <p className="pipeline-role-hint ts-static-description"><strong>백테스트 → 모의 검증 → 제한 실거래 → 실전 운용</strong>신호 관찰과 가상체결은 하나의 모의 검증에 포함됩니다. 주문 연결 시험은 전략 단계와 별개이며, 제한 실거래에는 별도 승인이 필요합니다.</p>
             <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="저장본 검증 단계">
               {lifecycleTimeline.map((item) => (
                 <article className={item.state} key={item.id}>
@@ -6019,7 +6022,7 @@ function StrategyDiscoveryToolbar({
           ["recent-promoted", "최근 승급"],
           ["running", "현재 실행 중"],
         ].map(([value, label]) => (
-          <button className={filters.quick === value ? "active" : ""} key={value} type="button" onClick={() => onFilterChange("quick", value)}>
+          <button className={filters.quick === value ? "active" : ""} aria-pressed={filters.quick === value} key={value} type="button" onClick={() => onFilterChange("quick", value)}>
             {value === "favorite" && <Star size={13} />}
             {label}
           </button>

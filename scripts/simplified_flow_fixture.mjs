@@ -1,3 +1,4 @@
+import { verifyAppearancePolish } from './surface_polish_probe.mjs';
 // Offline production-bundle regression. Never starts Python or reads account state.
 // All API responses are intercepted in the browser; the static server rejects /api/.
 import assert from 'node:assert/strict';
@@ -223,6 +224,11 @@ try {
           await page.getByRole('button',{name:/화면·레이아웃·Telegram/}).click();
           report.styles.push(await probeRestoredUi(page,`${label} / 화면 설정`));
           await page.screenshot({path:resolve(output,`restored-settings-${theme}-${viewport.width}.png`)});
+          if(process.env.SURFACE_POLISH_REVIEW==='1'){
+            const openPanel=async()=>{await page.locator('.nav-list').getByRole('button',{name:'연결·설정',exact:true}).click();if(!await page.locator('.ts-appearance-settings').count())await page.getByRole('button',{name:/화면·레이아웃·Telegram/}).click();};
+            report.appearance??=[];report.appearance.push(...await verifyAppearancePolish(page,'Live 화면 테마',theme,openPanel));
+            await page.screenshot({path:resolve(output,`polished-settings-${theme}-${viewport.width}.png`)});
+          }
         }
         await inspectRestoredTabs(page,label,report.styles,theme);
       }

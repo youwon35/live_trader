@@ -1,0 +1,17 @@
+/* Keep the evidence disclosure separate from lifecycle actions. */
+.live-compact-disclosure + .live-strategy-control-line { margin-top: 12px; }
+
+/* Give the three theme groups one full row, as in Paper Trader. */
+.settings-summary-grid.ts-panel-grid--two { grid-template-columns: minmax(0, 1fr); }
+.appearance-panel .custom-accent-label { display: grid; }
+
+/* program-console maps these filled actions to the exact --primary color in
+   both themes. Change only their foreground; mixed/secondary surfaces are untouched. */
+@layer interface-polish {
+:root[data-program] :is(.primary-button, .primary-action, .run-button, .doctor-run-button, .ts-ui-button--primary, .ts-action-button--primary, [data-ts-action-component="true"][data-ts-variant="primary"]):not(.danger-button, .danger-action, .ts-danger-button) {
+  color: var(--ts-selection-contrast, #ffffff) !important;
+}
+:root[data-program] :is(.primary-button, .primary-action, .run-button, .doctor-run-button, .ts-ui-button--primary, .ts-action-button--primary, [data-ts-action-component="true"][data-ts-variant="primary"]):not(.danger-button, .danger-action, .ts-danger-button) :is(span, strong, small, svg) {
+  color: inherit !important;
+}
+}
