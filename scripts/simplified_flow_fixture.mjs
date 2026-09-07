@@ -40,6 +40,17 @@ snapshot.strategies[0].deploymentLifecycle = { status: 'before-live-small', sour
 snapshot.automation_profiles = [{ id: 'stock', title: '화면 검증용 프로필', provider: 'kis', provider_label: 'KIS fixture', asset_scope: ['KR_STOCK'], broker_ids: ['kis'], strategy_count: 1, live_strategy_count: 0, ready: false, mode: 'MONITOR', enabled: false, detail: '브로커 연결 없는 화면 테스트', last_action: '대기' }];
 snapshot.continuous_runtime = { running: false, phase: 'STOPPED', profiles: {} };
 
+snapshot.accounts = [
+  { broker_id: 'kis', broker_name: 'KIS 국내', account: '합성 국내계좌', currency: 'KRW', broker_cash_value: 100000, broker_equity_value: 400000, valuation_basis: 'broker_equity' },
+  { broker_id: 'upbit', broker_name: 'Upbit', account: '합성 현물계좌', currency: 'KRW', broker_cash_value: 50000, broker_equity_value: 50000, valuation_basis: 'cash_only' },
+  { broker_id: 'binance-futures', broker_name: 'Binance 선물', account: '합성 선물계좌', currency: 'USDT', broker_cash_value: 80, broker_equity_value: 100, valuation_basis: 'margin_balance' },
+];
+snapshot.positions = [
+  { broker_id: 'kis', broker_name: 'KIS', asset: '한국주식', symbol: '005930', broker_qty_value: 2, broker_qty: '2', program_qty: '2', broker_value: 200000, current_price: 100000, currency: 'KRW', valuation_basis: 'market_value' },
+  { broker_id: 'kis', broker_name: 'KIS', asset: '한국주식', symbol: '035420', broker_qty_value: 1, broker_qty: '1', program_qty: '1', broker_value: 100000, current_price: 100000, currency: 'KRW', valuation_basis: 'market_value' },
+  { broker_id: 'upbit', broker_name: 'Upbit', asset: '코인', symbol: 'KRW-BTC', broker_qty_value: .1, broker_qty: '.1', program_qty: '.1', broker_value: 50000, current_price: 500000, currency: 'KRW', valuation_basis: 'market_value' },
+  { broker_id: 'binance-futures', broker_name: 'Binance 선물', asset: '코인', symbol: 'BTCUSDT', position_side: 'LONG', broker_qty_value: .01, broker_qty: '.01', program_qty: '.01', broker_value: 400, current_price: 40000, currency: 'USDT', valuation_basis: 'market_notional' },
+];
 const server = createServer(async (request, response) => {
   try {
     const pathname = decodeURIComponent(new URL(request.url, 'http://127.0.0.1').pathname);
@@ -110,10 +121,12 @@ try {
       await page.getByRole('heading', { name: label, exact: true }).waitFor();
       await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
       assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), label);
+      assert.equal(await page.locator('.live-page-purpose').count(), 0);
+      if (await page.locator('.live-environment-bar').count()) assert.equal(await page.locator('.live-environment-bar').evaluate(element => getComputedStyle(element).backgroundImage), 'none');
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1);
       assert.equal(overflow, false, `${label} horizontal viewport overflow at ${viewport.width}`);
       if (label === '운용 전략') {
-        await page.getByRole('heading', { name: 'Paper에서 받은 검증 근거', exact: true }).waitFor();
+        await page.getByRole('heading', { name: '모의거래에서 받은 검증 근거', exact: true }).waitFor();
         await page.getByRole('button', { name: /전체 검증 단계/ }).click();
         assert.deepEqual(await page.locator('.live-lifecycle-timeline strong').allTextContents(), ['백테스트', '모의 검증', '제한 실거래', '실전 운용']);
         assert.equal(await page.locator('.live-lifecycle-timeline article.current strong').textContent(), '백테스트');
@@ -154,6 +167,19 @@ try {
         assert.equal(await page.getByRole('tab', { name: '한도·안전장치', exact: true }).getAttribute('aria-selected'), 'true');
       }
       if (label === '계좌·잔고') {
+        const allocation = page.getByRole('region', { name: '내 실계좌 구성', exact: true });
+        await allocation.getByLabel('계좌 범위', { exact: true }).selectOption('kis');
+        assert.equal(await allocation.locator('tbody tr').count(), 2);
+        assert.equal(await allocation.locator('.ts-allocation-center-value').textContent(), '400,000원');
+        assert.match(await allocation.locator('tbody tr').first().innerText(), /50.00%/);
+        await allocation.getByLabel('정렬', { exact: true }).selectOption('value-asc');
+        assert.match(await allocation.locator('tbody tr').first().innerText(), /035420/);
+        await page.screenshot({ path: resolve(output, `allocation-${viewport.width}.png`) });
+        await page.evaluate(() => { document.documentElement.dataset.uiTheme = 'light'; });
+        assert.equal(await allocation.evaluate(element => getComputedStyle(element).backgroundImage), 'none');
+        await page.screenshot({ path: resolve(output, `allocation-light-${viewport.width}.png`) });
+        await page.evaluate(() => { document.documentElement.dataset.uiTheme = 'dark'; });
+
         assert.equal(await page.locator('.three-way-reconciliation-panel').getByText('조회됨', { exact: true }).count(), 0);
         await page.locator('.three-way-reconciliation-panel').getByText('대조 미확인', { exact: true }).waitFor();
       }
@@ -163,7 +189,7 @@ try {
         assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), '실행 기록');
       }
       if (label === '주문 연결 시험') {
-        await page.getByText(/통과해도 전략은 승급하지 않습니다/).waitFor();
+        await page.getByText('비승급 · promotionEligible=false', { exact: true }).waitFor();
         await page.locator('.functional-test-safety-strip').waitFor();
         await page.screenshot({ path: resolve(output, `broker-test-${viewport.width}.png`) });
       }

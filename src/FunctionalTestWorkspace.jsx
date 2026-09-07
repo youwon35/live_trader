@@ -291,7 +291,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
     <section className="functional-test-workspace" aria-labelledby="functional-test-heading">
       <header className="functional-test-route-header">
         <div>
-          <span className="functional-test-eyebrow">CONTROLLED LIVE TEST ROUTES</span>
+          <span className="functional-test-eyebrow">실계좌 주문 연결 시험</span>
           <h2 id="functional-test-heading">주문 기능 검증</h2>
         </div>
         <div className="functional-test-route-tabs" role="tablist" aria-label="기능시험 경로">
@@ -334,7 +334,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
         <div><span>세션</span><strong>{sessionScope}</strong></div>
         <div><span>승인 계약</span><strong>{authorityContract}</strong></div>
         <div><span>API·전송</span><strong>{routeStatus}</strong></div>
-        <div><span>전역 Kill</span><strong>{snapshot.kill_switch ? "KILLED" : snapshot.api_connected ? "NORMAL" : "확인 불가"}</strong></div>
+        <div><span>전체 긴급 정지</span><strong>{snapshot.kill_switch ? "KILLED" : snapshot.api_connected ? "NORMAL" : "확인 불가"}</strong></div>
       </div>
 
       <div className="functional-test-route-notice" role="note">
@@ -367,7 +367,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
         >
       <header className="functional-test-hero">
         <div>
-          <span className="functional-test-eyebrow">KIS LIVE · TIME BOXED</span>
+          <span className="functional-test-eyebrow">KIS 기간 제한 시험</span>
           <h3>KIS 기간형 기능시험</h3>
           <p>대상·기간·당일 승인·실제 적용 한도를 한 흐름에서 관리합니다.</p>
         </div>
@@ -411,7 +411,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
         <section className="panel functional-test-setup">
           <div className="panel-header">
             <div>
-              <span>EXACT TEST SCOPE</span>
+              <span>확인된 시험 범위</span>
               <h3>시험 대상과 기간</h3>
             </div>
             <FileKey2 size={19} aria-hidden="true" />
@@ -582,13 +582,13 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
             aria-controls="functional-test-binding-details"
             onClick={() => setShowBinding((current) => !current)}
           >
-            <span><strong>바인딩 세부정보</strong><small>Artifact·Instance·계좌 hash</small></span>
+            <span><strong>바인딩 세부정보</strong><small>저장본·실행 단위·계좌 hash</small></span>
             <span>{showBinding ? "접기" : "열기"}</span>
           </button>
           <section className="panel functional-test-binding" id="functional-test-binding-details" hidden={!showBinding}>
             <div className="panel-header">
               <div>
-                <span>IMMUTABLE BINDING</span>
+                <span>고정된 연결 정보</span>
                 <h3>현재 선택 범위</h3>
               </div>
               <BadgeCheck size={19} aria-hidden="true" />
@@ -597,8 +597,8 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
               {selectedCandidate ? (
                 <dl className="functional-test-details">
                   <div><dt>대상</dt><dd>{selectedCandidate.kind === "PORTFOLIO" ? "포트폴리오" : "전략"} · {selectedCandidate.label}</dd></div>
-                  <div><dt>Artifact</dt><dd>{selectedCandidate.artifactId}<small>{compactHash(selectedCandidate.artifactHash)}</small></dd></div>
-                  <div><dt>Instance</dt><dd>{selectedCandidate.instanceId}</dd></div>
+                  <div><dt>저장본</dt><dd>{selectedCandidate.artifactId}<small>{compactHash(selectedCandidate.artifactHash)}</small></dd></div>
+                  <div><dt>실행 단위</dt><dd>{selectedCandidate.instanceId}</dd></div>
                   <div><dt>계좌</dt><dd>{workspace.account.label}<small>{compactHash(workspace.account.bindingId)}</small></dd></div>
                   <div><dt>종목</dt><dd>{selectedCandidate.symbols.join(", ")}</dd></div>
                   <div><dt>주기</dt><dd>{selectedCandidate.timeframe || "-"}</dd></div>
@@ -614,7 +614,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
       <section className="panel functional-test-timeline">
         <div className="panel-header">
           <div>
-            <span>TIME BOX & DAILY AUTHORIZATION</span>
+            <span>시험 기간·당일 승인</span>
             <h3>기간과 활성화 상태</h3>
           </div>
           <Clock3 size={19} aria-hidden="true" />
@@ -625,12 +625,12 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
             <div><span>전체 종료</span><strong>{formatDateTime(permit?.endsAt)}</strong></div>
             <div><span>남은 시간</span><strong>{permit ? formatFunctionalTestRemaining(progress.remainingMs) : "허가서 없음"}</strong></div>
             <div><span>오늘 활성화 종료</span><strong>{formatDateTime(activation?.expiresAt)}</strong></div>
-            <div><span>runtime</span><strong>{workspace.runtime.functionalTestRunning ? "FUNCTIONAL_TEST 실행 중" : "중지"}</strong></div>
+            <div><span>실행 엔진</span><strong>{workspace.runtime.functionalTestRunning ? "FUNCTIONAL_TEST 실행 중" : "중지"}</strong></div>
           </div>
           <div className="functional-test-progress" aria-label={`기능시험 진행률 ${Math.round(progress.ratio * 100)}%`}>
             <span style={{ width: `${Math.round(progress.ratio * 100)}%` }} />
           </div>
-          <p>당일 활성화가 만료되면 주문은 차단됩니다. ‘오늘 실행 정지’로 Runtime과 KIS 대조를 마친 뒤 다음 거래일에 다시 활성화하세요.</p>
+          <p>당일 활성화가 만료되면 주문은 차단됩니다. ‘오늘 실행 정지’로 실행 엔진과 KIS 대조를 마친 뒤 다음 거래일에 다시 활성화하세요.</p>
         </div>
       </section>
 
@@ -638,7 +638,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
         <section className="panel">
           <div className="panel-header">
             <div>
-              <span>NON-NEGOTIABLE LIMITS</span>
+              <span>변경할 수 없는 한도</span>
               <h3>현재 실제 적용 한도</h3>
             </div>
             <ShieldCheck size={19} aria-hidden="true" />
@@ -656,7 +656,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
         <section className="panel">
           <div className="panel-header">
             <div>
-              <span>READINESS BLOCKERS</span>
+              <span>시작 차단 사유</span>
               <h3>현재 차단 항목</h3>
             </div>
             <AlertTriangle size={19} aria-hidden="true" />
@@ -669,7 +669,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
             ) : (
               <div className="functional-test-ready">
                 <BadgeCheck size={18} aria-hidden="true" />
-                <span>허가서·당일 활성화·현재 exact binding이 일치합니다. 확인 체크 후 ‘기능시험 시작’을 눌러야 runtime이 시작됩니다.</span>
+                <span>허가서·당일 활성화·현재 exact binding이 일치합니다. 확인 체크 후 ‘기능시험 시작’을 눌러야 실행 엔진이 시작됩니다.</span>
               </div>
             )}
           </div>

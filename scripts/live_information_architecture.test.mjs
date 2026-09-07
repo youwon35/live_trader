@@ -58,7 +58,7 @@ test("advanced one-shot diagnostics load only on explicit opening", () => {
 
 test("persistent live hierarchy keeps every execution-critical state visible", () => {
   const environment = between(appSource, "function LiveEnvironmentBar", "function CompactDisclosure");
-  for (const label of ["실거래 잠금", "Preflight", "신규 진입", "위험 증가 주문", "Broker 전송", "전역 Kill"]) {
+  for (const label of ["실거래 잠금", "시작 점검", "신규 진입", "위험 증가 주문", "주문 전송", "전체 긴급 정지"]) {
     assert.match(environment, new RegExp(`label: "${label}"`));
   }
   assert.match(environment, /snapshot\.kill_switch[\s\S]*?snapshot\.api_connected === true[\s\S]*?value: "확인 불가"/);
@@ -78,7 +78,7 @@ test("default pages prioritize decisions and move technical evidence into disclo
 
   assert.doesNotMatch(gate, /DeploymentContextPanel|LivePromotionReadinessQueue|DataLineagePanel|PortfolioArtifactPanel/);
   assert.match(gate, /LivePreparationPanel/);
-  assert.match(gate, /title="Deployment 기술 근거"/);
+  assert.match(gate, /title="운용 배포 상세 근거"/);
 
   assert.doesNotMatch(risk, /DeploymentContextPanel|WatchdogPanel/);
   assert.match(risk, /RiskUsagePanel/);
@@ -93,11 +93,11 @@ test("default pages prioritize decisions and move technical evidence into disclo
   assert.doesNotMatch(overview, /DeploymentContextPanel/);
   assert.match(overview, /PreTradeDoctorPanel/);
   assert.match(overview, /LaunchReportPanel/);
-  assert.match(overview, /title="Preflight·Runtime 기술 근거"/);
+  assert.match(overview, /title="시작 점검·실행 엔진 기술 근거"/);
 
   const accounts = between(appSource, "function UnifiedBrokerAccountPanel", "function OperationsReportPanel");
   assert.match(accounts, /현재 계좌를 기준 원장으로 승인/);
-  assert.match(accounts, /title="자본 배분·포지션 노출"/);
+  assert.match(accounts, /title="내 실계좌 구성"/);
 });
 
 test("functional tests expose explicit KIS and crypto routes without passive crypto mounting", () => {

@@ -103,10 +103,6 @@ import {
   createAccountRefreshCoordinator,
 } from "./accountRefresh";
 import {
-  buildAccountVisualization,
-  formatAllocationValue,
-} from "./accountVisualization";
-import {
   buildCurrentDeploymentOptions,
   deploymentContextMatchesPreflight,
   deploymentRuntimeProfile,
@@ -115,7 +111,8 @@ import {
 } from "./deploymentSelection";
 import { buildOrderCsvRows, ORDER_CSV_COLUMNS } from "./orderCsv";
 import { createActionButton } from "../../../packages/design/action-button.js";
-import { createBrokerAccountWorkspace } from "../../../packages/design/account-workspace.js";
+import { createAllocationWorkspace } from "../../../packages/design/allocation-workspace.js";
+import { liveAllocationAccounts } from "./accountAllocation.js";
 import { createAppearanceSettingsPanel } from "../../../packages/design/appearance-settings-panel.js";
 import {
   formatBarCountdown,
@@ -162,7 +159,7 @@ import {
 
 const ActionButton = createActionButton(React);
 const AppearanceSettingsPanel = createAppearanceSettingsPanel(React);
-const BrokerAccountWorkspace = createBrokerAccountWorkspace(React);
+const AllocationWorkspace = createAllocationWorkspace(React);
 const MasterDetailLog = createMasterDetailLog(React);
 const StatusPill = createStatusPill(React);
 const TelegramConnectionStatus = createTelegramConnectionStatus(React);
@@ -395,7 +392,7 @@ function disconnectedSnapshot(nativeEmergency = {}, previousSnapshot = {}) {
 }
 
 const SAFETY_CONFIRMATION_ACTION_LABELS = {
-  KILL_SWITCH_OFF: "전역 Kill 해제",
+  KILL_SWITCH_OFF: "전체 긴급 정지 해제",
   DRY_RUN_OFF: "Dry Run 보호 해제",
   NEW_ENTRIES_BLOCKED_OFF: "신규 진입 차단 해제",
   REAL_ORDERS_ENABLE: "실전 주문 라우트 활성화",
@@ -543,7 +540,7 @@ function SafetyConfirmationModal({ challenge, onResolve, onEmergencyKill }) {
         <header>
           <div className="safety-confirmation-icon"><ShieldAlert size={21} /></div>
           <div>
-            <span>IDENTITY-BOUND · ONE TIME</span>
+            <span>지정된 대상에 한 번만 적용</span>
             <h2 id="safety-confirmation-title">
               {SAFETY_CONFIRMATION_ACTION_LABELS[challenge.action] || "위험 설정 변경"}
             </h2>
@@ -585,7 +582,7 @@ function SafetyConfirmationModal({ challenge, onResolve, onEmergencyKill }) {
           </label>
           <div className="safety-confirmation-actions">
             <button className="danger-button" onClick={engageEmergencyKill} type="button">
-              <CircleStop size={16} /> 전역 Kill 즉시 실행
+              <CircleStop size={16} /> 전체 긴급 정지 즉시 실행
             </button>
             <button
               className="secondary-button"
@@ -1833,7 +1830,7 @@ function strategyDeploymentContext(strategy = null) {
     strategyId: String(strategy.strategy_id || ""),
     name: String(strategy.name || strategy.strategy_id || "Deployment"),
     portfolioId: String(gate.portfolioId || gate.portfolio_id || ""),
-    portfolioName: String(gate.portfolioName || gate.portfolio_name || gate.portfolioId || "Standalone (검토 필요)"),
+    portfolioName: String(gate.portfolioName || gate.portfolio_name || gate.portfolioId || "단일 전략 (검토 필요)"),
     brokerId,
     accountId: String(strategy.account_id || strategy.accountId || "미확인"),
     symbol: String(strategy.symbol || "-"),
@@ -2337,7 +2334,7 @@ function App() {
           </div>
           <div>
             <strong>Live Trader</strong>
-            <span className="brand-environment">LIVE</span>
+            <span className="brand-environment">실거래</span>
           </div>
         </div>
         <nav className="nav-list" aria-label="주요 메뉴">
@@ -2364,9 +2361,9 @@ function App() {
           ))}
         </nav>
         <div className="sidebar-footer">
-          <span>전역 Kill</span>
+          <span>전체 긴급 정지</span>
           <StatusPill tone={snapshot.kill_switch ? "danger" : snapshot.api_connected ? "success" : "warning"}>
-            {snapshot.kill_switch ? "KILLED" : snapshot.api_connected ? "NORMAL" : snapshot.emergency_stop?.available ? "Kill 사용 가능" : "API 끊김"}
+            {snapshot.kill_switch ? "KILLED" : snapshot.api_connected ? "NORMAL" : snapshot.emergency_stop?.available ? "긴급 정지 가능" : "API 끊김"}
           </StatusPill>
         </div>
       </aside>
@@ -2385,7 +2382,6 @@ function App() {
               <PanelLeft size={18} />
             </IconButton>
             <div className="topbar-title-block">
-              <span>{pageProfiles[selectedNav]?.eyebrow || "LIVE"}</span>
               <h1 id="live-page-title">{title}</h1>
             </div>
           </div>
@@ -2435,7 +2431,7 @@ function App() {
                     ? "Kill 해제"
                     : snapshot.kill_switch
                       ? "Kill 재고정"
-                      : "전역 Kill"}
+                      : "전체 긴급 정지"}
             </button>
             {emergencyFeedback && (
               <span
@@ -2462,7 +2458,7 @@ function App() {
           <section className="api-connection-banner" role="alert">
             <Network size={18} />
             <div>
-              <strong>HTTP API 상태를 확인할 수 없어 거래 Snapshot을 안전 차단 상태로 전환했습니다.</strong>
+              <strong>HTTP API 상태를 확인할 수 없어 거래 조회 상태을 안전 차단 상태로 전환했습니다.</strong>
               <span>
                 {error} · {snapshot.emergency_stop?.active
                   ? snapshot.emergency_stop?.durable
@@ -2574,31 +2570,31 @@ function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) 
       : { value: "확인 불가", tone: "warning" };
   const safety = [
     { label: "실거래 잠금", value: armed ? "ARMED" : "LOCKED", tone: armed ? "warning" : "neutral" },
-    { label: "Preflight", value: contextMatchesPreflight && preflightValid ? "VALID" : "REQUIRED", tone: contextMatchesPreflight && preflightValid ? "success" : "warning" },
+    { label: "시작 점검", value: contextMatchesPreflight && preflightValid ? "VALID" : "REQUIRED", tone: contextMatchesPreflight && preflightValid ? "success" : "warning" },
     { label: "신규 진입", value: snapshot.new_entries_blocked ? "BLOCKED" : "ALLOWED", tone: snapshot.new_entries_blocked ? "warning" : "success" },
     { label: "위험 증가 주문", value: snapshot.new_entries_blocked ? "REDUCE-ONLY" : "ALLOWED", tone: snapshot.new_entries_blocked ? "warning" : "success" },
-    { label: "Broker 전송", value: orderRouteEnabled ? "ENABLED" : "DISABLED", tone: orderRouteEnabled ? "danger" : "neutral" },
-    { label: "전역 Kill", ...killStatus },
+    { label: "주문 전송", value: orderRouteEnabled ? "ENABLED" : "DISABLED", tone: orderRouteEnabled ? "danger" : "neutral" },
+    { label: "전체 긴급 정지", ...killStatus },
   ];
 
   return (
     <section className="live-environment-bar" aria-label="LIVE 환경 및 안전 상태">
       <div className="live-environment-identity">
-        <span className="live-environment-badge">LIVE · 실계좌</span>
+        <span className="live-environment-badge">실계좌</span>
         <label>
-          <span>현재 Deployment</span>
+          <span>현재 운용 배포</span>
           <select value={context.id} onChange={(event) => onSelect(event.target.value)}>
             {(deploymentOptions || []).map((option) => (
               <option key={option.id} value={option.id}>{option.label}</option>
             ))}
-            {!deploymentOptions?.length && <option value="">실행 가능한 Deployment 없음</option>}
+            {!deploymentOptions?.length && <option value="">실행 가능한 운용 배포 없음</option>}
           </select>
         </label>
         <div className="live-context-meta">
           <strong>{context.portfolioName}</strong>
           <span>{context.brokerId} · 계정 {context.accountId} · {context.symbol} {context.timeframe}</span>
-          <span>Session · {sessionId}</span>
-          {(!contextMatchesPreflight || !preflightValid) && <span>선택 변경 또는 만료 · 이 Deployment의 Preflight를 다시 실행하세요.</span>}
+          <span>실행 회차 · {sessionId}</span>
+          {(!contextMatchesPreflight || !preflightValid) && <span>선택 변경 또는 만료 · 이 운용 배포의 시작 점검을 다시 실행하세요.</span>}
         </div>
       </div>
       <div className="live-safety-hierarchy">
@@ -2754,7 +2750,7 @@ function WorkspaceContent({
         <CompactDisclosure
           className="live-grid-full"
           title="Binance 선물·자본 확대 도구"
-          description="선물 설정, 실체결 Soak와 단계별 자본 한도는 해당 경로를 운용할 때만 엽니다."
+          description="선물 설정, 실체결 장시간 점검와 단계별 자본 한도는 해당 경로를 운용할 때만 엽니다."
         >
           <section className="ts-panel-grid ts-panel-grid--two live-secondary-panel-grid">
             <FuturesSettingsPanel snapshot={snapshot.binance_futures_settings} selectedSymbol={deploymentContext?.symbol} />
@@ -2788,7 +2784,7 @@ function WorkspaceContent({
     return renderPage(
       <section className="deployment-promotion-layout ts-layout-stack">
         <section className="panel">
-          <PanelHeader title="Paper에서 받은 검증 근거" subtitle="모의 검증에서 넘어온 전체 후보를 확인한 뒤 아래에서 현재 운용 배포를 선택합니다." />
+          <PanelHeader title="모의거래에서 받은 검증 근거" subtitle="모의 검증에서 넘어온 전체 후보를 확인한 뒤 아래에서 현재 운용 배포를 선택합니다." />
           <PaperCandidateEvidencePanel />
         </section>
         <LivePreparationPanel
@@ -2811,8 +2807,8 @@ function WorkspaceContent({
           onStrategyLifecycle={onStrategyLifecycle}
         />
         <CompactDisclosure
-          title="Deployment 기술 근거"
-          description="Manifest hash와 Runtime 고정값은 장애 분석이나 binding 검증이 필요할 때만 확인합니다."
+          title="운용 배포 상세 근거"
+          description="고정 구성 hash와 실행 엔진 고정값은 장애 분석이나 binding 검증이 필요할 때만 확인합니다."
         >
           <DeploymentManifestPanel governance={snapshot.live_governance} />
         </CompactDisclosure>
@@ -2949,18 +2945,18 @@ function DeploymentManifestPanel({ governance = {} }) {
   return (
     <section className="panel deployment-manifest-panel">
       <PanelHeader
-        title="Deployment Manifest · Runtime 고정값"
+        title="운용 배포 고정 구성 · 실행 엔진 고정값"
         subtitle="전략·Portfolio·계좌 fingerprint·Risk·Runtime 버전을 한 revision으로 봉인합니다. 변경 시 새 Manifest와 Preflight가 필요합니다."
         suffix={<StatusPill tone={manifest ? (integrityOk ? "success" : "danger") : "neutral"}>{manifest ? (integrityOk ? "무결성 확인" : "무결성 점검") : "Preflight 전"}</StatusPill>}
       />
       {manifest ? (
         <div className="deployment-manifest-grid">
-          <div><span>Manifest</span><strong>rev {manifest.revision} · {compactHash(manifest.manifestHash)}</strong><small>{manifest.deploymentId}</small></div>
-          <div><span>Artifact Hash</span><strong>{compactHash(manifest.portfolioArtifactHash || manifest.strategyArtifactHash)}</strong><small>Portfolio 우선 · Strategy 봉인</small></div>
-          <div><span>Broker · 계좌</span><strong>{manifest.brokerRoute || "미확인"}</strong><small>fingerprint {compactHash(manifest.accountFingerprint)}</small></div>
-          <div><span>Risk · Config</span><strong>R{manifest.riskPolicyRevision} · C{manifest.configRevision}</strong><small>{compactHash(manifest.riskPolicyHash)} · {compactHash(manifest.configHash)}</small></div>
-          <div><span>Preflight Snapshot</span><strong>{preflight?.status || "미생성"}</strong><small>{preflight?.snapshotId || "현재 Deployment 점검 필요"}</small></div>
-          <div><span>Runtime Session</span><strong>{session?.lifecycle || "중지"} · {session?.mode || "MONITOR"}</strong><small>{session?.sessionId || "세션 없음"}</small></div>
+          <div><span>고정 구성</span><strong>rev {manifest.revision} · {compactHash(manifest.manifestHash)}</strong><small>{manifest.deploymentId}</small></div>
+          <div><span>저장본 검증값</span><strong>{compactHash(manifest.portfolioArtifactHash || manifest.strategyArtifactHash)}</strong><small>포트폴리오 우선 · 전략 봉인</small></div>
+          <div><span>거래소 · 계좌</span><strong>{manifest.brokerRoute || "미확인"}</strong><small>fingerprint {compactHash(manifest.accountFingerprint)}</small></div>
+          <div><span>위험 · 설정</span><strong>R{manifest.riskPolicyRevision} · C{manifest.configRevision}</strong><small>{compactHash(manifest.riskPolicyHash)} · {compactHash(manifest.configHash)}</small></div>
+          <div><span>시작 점검 조회 상태</span><strong>{preflight?.status || "미생성"}</strong><small>{preflight?.snapshotId || "현재 Deployment 점검 필요"}</small></div>
+          <div><span>실행 엔진 실행 회차</span><strong>{session?.lifecycle || "중지"} · {session?.mode || "MONITOR"}</strong><small>{session?.sessionId || "세션 없음"}</small></div>
         </div>
       ) : <EmptyRow text="현재 Deployment의 Preflight를 실행하면 immutable Manifest가 생성됩니다." />}
     </section>
@@ -2984,7 +2980,7 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
   return (
     <section className="panel preflight-scope-panel">
       <PanelHeader
-        title="Preflight 상세"
+        title="시작 점검 상세"
         subtitle="전역 시스템과 현재 Deployment 검사를 분리해 표시합니다."
         suffix={<StatusPill tone={snapshotTone}>{latest.snapshotId ? (snapshotValid ? `${remainingSeconds}초 남음` : "무효·만료") : "스냅샷 없음"}</StatusPill>}
       />
@@ -2995,14 +2991,14 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
           {!globalChecks.length && <EmptyRow text="전역 검사 결과가 없습니다." />}
         </article>
         <article>
-          <header><strong>현재 Deployment 검사</strong><StatusPill tone={deploymentChecks.some((item) => item.status === "fail") ? "danger" : "success"}>{deploymentChecks.filter((item) => item.status === "fail").length} HARD</StatusPill></header>
+          <header><strong>현재 운용 배포 검사</strong><StatusPill tone={deploymentChecks.some((item) => item.status === "fail") ? "danger" : "success"}>{deploymentChecks.filter((item) => item.status === "fail").length} HARD</StatusPill></header>
           {deploymentChecks.slice(0, 5).map((item) => <StatusRow key={item.label} label={item.label} status={item.status} detail={item.detail} />)}
           {!deploymentChecks.length && <EmptyRow text="Deployment 검사 결과가 없습니다." />}
         </article>
       </div>
       <div className="panel-action-line">
         <span>{latest.snapshotId ? `Snapshot ${latest.snapshotId}` : "실거래 테스트: 운용자 확인 → Dry Run 해제 → 신규 진입 허용 → 새 Preflight → Canary"}</span>
-        <button className="primary-button" type="button" onClick={onPreflight}><BadgeCheck size={15} />새 Preflight 실행</button>
+        <button className="primary-button" type="button" onClick={onPreflight}><BadgeCheck size={15} />새 시작 점검 실행</button>
       </div>
     </section>
   );
@@ -3030,8 +3026,8 @@ function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, on
         <LaunchReportPanel report={snapshot.launch_report ?? {}} />
       </section>
       <CompactDisclosure
-        title="Preflight·Runtime 기술 근거"
-        description="전체 통과 항목과 Runtime 구성 요소는 장애 분석이나 상세 검증이 필요할 때만 확인합니다."
+        title="시작 점검·실행 엔진 기술 근거"
+        description="전체 통과 항목과 실행 엔진 구성 요소는 장애 분석이나 상세 검증이 필요할 때만 확인합니다."
       >
         <section className="ts-panel-grid ts-panel-grid--two live-secondary-panel-grid">
           <PreflightScopePanel snapshot={snapshot} onPreflight={onPreflight} />
@@ -3059,8 +3055,8 @@ function RuntimeComponentStatusPanel({ snapshot = {} }) {
     && snapshot.live_governance?.preflightValidity?.valid === true
     && !snapshot.kill_switch && !snapshot.dry_run;
   const rows = [
-    { label: "시장 데이터", status: runtimeRunning ? "pass" : activeLive ? "fail" : "na", value: runtimeRunning ? "RUNNING" : activeLive ? "STOPPED" : "해당 없음", detail: runtimeRunning ? "선택 배포의 feed heartbeat를 감시합니다." : "MONITOR 대기 중에는 활성 feed 경로가 없습니다." },
-    { label: "Bar Builder", status: runtimeRunning ? "pass" : activeLive ? "fail" : "na", value: runtimeRunning ? "RUNNING" : activeLive ? "STOPPED" : "해당 없음", detail: "완료 봉 경계와 중복 bar 처리를 런타임별로 추적합니다." },
+    { label: "시장 데이터", status: runtimeRunning ? "pass" : activeLive ? "fail" : "na", value: runtimeRunning ? "실행 중" : activeLive ? "중지됨" : "해당 없음", detail: runtimeRunning ? "선택 배포의 feed heartbeat를 감시합니다." : "MONITOR 대기 중에는 활성 feed 경로가 없습니다." },
+    { label: "시세 봉 생성", status: runtimeRunning ? "pass" : activeLive ? "fail" : "na", value: runtimeRunning ? "실행 중" : activeLive ? "중지됨" : "해당 없음", detail: "완료 봉 경계와 중복 bar 처리를 런타임별로 추적합니다." },
     { label: "전략 평가", status: runtimeRunning ? "pass" : "na", value: runtimeRunning ? "RUNNING" : "대기", detail: `마지막 평가 ${snapshot.strategy_runner?.last_run || "미실행"}` },
     { label: "Portfolio Engine", status: runtimeRunning ? "pass" : "na", value: runtimeRunning ? "RUNNING" : "대기", detail: "전략 Sleeve를 계좌 Net Target으로 합산합니다." },
     { label: "Risk Gateway", status: snapshot.api_connected ? "pass" : "fail", value: snapshot.api_connected ? "ENFORCING" : "확인 불가", detail: "주문 전 최종 위험 증가·Reduce-only 정책을 적용합니다." },
@@ -3069,7 +3065,7 @@ function RuntimeComponentStatusPanel({ snapshot = {} }) {
   ];
   return (
     <section className="panel runtime-component-panel">
-      <PanelHeader title="Runtime 구성 요소" subtitle="단일 STOPPED 대신 데이터·전략·리스크·주문·이벤트 상태를 각각 표시합니다." />
+      <PanelHeader title="실행 구성 요소" subtitle="단일 STOPPED 대신 데이터·전략·리스크·주문·이벤트 상태를 각각 표시합니다." />
       <div className="runtime-component-list">
         {rows.map((row) => <StatusRow key={row.label} label={row.label} status={row.status} value={row.value} detail={row.detail} />)}
       </div>
@@ -3089,9 +3085,9 @@ function ThreeWayReconciliationPanel({ snapshot = {} }) {
     || Number(ledger.position_count || ledger.positionCount || (ledger.positions || []).length || 0) > 0;
   const projected = projectAccountReconciliation(snapshot);
   const rows = [
-    { label: "Broker REST Snapshot", status: brokerKnown ? "pass" : "warn", value: brokerKnown ? "조회됨" : "미확인", detail: `마지막 대조 ${summary.last_run || "미실행"}` },
-    { label: "실시간 주문·체결 Event", status: streamConnected ? "pass" : execution.last_poll ? "warn" : "na", value: streamConnected ? "연결" : execution.last_poll ? "폴링 보조" : "해당 없음", detail: `마지막 동기화 ${execution.last_poll || "미실행"}` },
-    { label: "Local Event Ledger", status: ledgerKnown ? "pass" : "warn", value: ledgerKnown ? "원장 있음" : "기준 없음", detail: `체결 이벤트 ${(ledger.execution_events || []).length}건 · 기준 ${ledger.state?.last_baseline || "미승인"}` },
+    { label: "거래소 잔고 조회", status: brokerKnown ? "pass" : "warn", value: brokerKnown ? "조회됨" : "미확인", detail: `마지막 대조 ${summary.last_run || "미실행"}` },
+    { label: "실시간 주문·체결 기록", status: streamConnected ? "pass" : execution.last_poll ? "warn" : "na", value: streamConnected ? "연결" : execution.last_poll ? "폴링 보조" : "해당 없음", detail: `마지막 동기화 ${execution.last_poll || "미실행"}` },
+    { label: "앱 체결 원장", status: ledgerKnown ? "pass" : "warn", value: ledgerKnown ? "원장 있음" : "기준 없음", detail: `체결 이벤트 ${(ledger.execution_events || []).length}건 · 기준 ${ledger.state?.last_baseline || "미승인"}` },
     { label: "3자 최종 대조", status: reconciliationDisplay.status, value: reconciliationDisplay.label, detail: `불일치 ${summary.mismatch_count ?? "미확인"} · API/원장 필요 ${summary.api_required_count ?? "미확인"}` },
   ];
   return (
@@ -3134,7 +3130,7 @@ function ExecutionQualitySummary({ quality }) {
     <MetricGrid columns={3}>
       <MetricCard label="표본" value={String(quality.sampleCount) + "건"} detail={quality.submitted ? "Broker 제출 " + quality.submitted + "건" : "Paper/Shadow/Live 표본 필요"} />
       <MetricCard label="평균 Slippage" value={quality.averageSlippageBps == null ? "해당 없음" : quality.averageSlippageBps.toFixed(1) + " bps"} detail="기대 가격 대비" />
-      <MetricCard label="평균 Broker 지연" value={quality.averageLatencyMs == null ? "해당 없음" : quality.averageLatencyMs.toFixed(0) + " ms"} detail={"불확실 주문 " + quality.unknownSubmitResult + "건"} />
+      <MetricCard label="평균 거래소 지연" value={quality.averageLatencyMs == null ? "해당 없음" : quality.averageLatencyMs.toFixed(0) + " ms"} detail={"불확실 주문 " + quality.unknownSubmitResult + "건"} />
     </MetricGrid>
   );
 }
@@ -3247,7 +3243,7 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
           )}
           emptyList={(
             <table aria-label="주문 상태 원장 목록" className="data-table order-ledger-table" role="grid">
-              <thead><tr><th>시각</th><th>Broker</th><th>주문 / <span>Client Order ID</span></th><th>Deployment</th><th>심볼</th><th>상태</th></tr></thead>
+              <thead><tr><th>시각</th><th>거래소</th><th>주문 / <span>앱 주문 번호</span></th><th>운용 배포</th><th>심볼</th><th>상태</th></tr></thead>
               <tbody><tr><td colSpan="6"><EmptyRow text="검색 조건에 맞는 주문이 없습니다." /></td></tr></tbody>
             </table>
           )}
@@ -3263,21 +3259,21 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
               <>
                 <section className="order-detail-summary" aria-label="주문 식별 정보">
                   <dl>
-                    <div><dt>Broker</dt><dd>{order.broker_id || "-"}</dd></div>
-                    <div><dt>Order ID</dt><dd>{order.order_id || "-"}</dd></div>
-                    <div><dt>Client Order ID</dt><dd>{order.client_order_id || order.idempotency_key || "-"}</dd></div>
-                    <div><dt>Deployment</dt><dd>{order.deployment_id || context.id || "-"}</dd></div>
+                    <div><dt>거래소</dt><dd>{order.broker_id || "-"}</dd></div>
+                    <div><dt>주문 번호</dt><dd>{order.order_id || "-"}</dd></div>
+                    <div><dt>앱 주문 번호</dt><dd>{order.client_order_id || order.idempotency_key || "-"}</dd></div>
+                    <div><dt>운용 배포</dt><dd>{order.deployment_id || context.id || "-"}</dd></div>
                     <div><dt>주문</dt><dd>{order.symbol || "-"} · {order.side || "-"} · {order.quantity ?? order.qty ?? "-"}</dd></div>
                     <div><dt>체결</dt><dd>{order.executed_quantity ?? order.executed_volume ?? "-"}</dd></div>
                     <div><dt>상태</dt><dd><StatusPill tone={orderStateTone(order.state)}>{orderStateLabel(order.state)}</StatusPill></dd></div>
-                    <div><dt>Risk</dt><dd>{order.risk_report?.can_submit === true ? "승인" : order.risk_report?.can_submit === false ? "차단" : "미확인"}</dd></div>
+                    <div><dt>위험</dt><dd>{order.risk_report?.can_submit === true ? "승인" : order.risk_report?.can_submit === false ? "차단" : "미확인"}</dd></div>
                   </dl>
                 </section>
                 <section className="order-detail-section order-timeline-section">
                   <header><h4>주문 타임라인</h4><span>{timelineProjection.timeline.length}건</span></header>
                   <div className="order-timeline">
                     {timelineProjection.timeline.map((event) => <div key={event.id}><span>{formatAuditTime({ timestamp: event.time })}</span><strong>{event.label}</strong><small>{event.detail || event.source || "상태 기록"}</small></div>)}
-                    {!timelineProjection.timeline.length && <div><span>-</span><strong>Broker Event 대기</strong><small>체결 스트림 또는 REST 대조 결과가 아직 없습니다.</small></div>}
+                    {!timelineProjection.timeline.length && <div><span>-</span><strong>거래소 Event 대기</strong><small>체결 스트림 또는 REST 대조 결과가 아직 없습니다.</small></div>}
                   </div>
                   <div className="operator-actions">
                     <button className="secondary-button" type="button" disabled={!order.order_id || !timelineProjection.directRetryAllowed} onClick={() => onRetryOrder(order.order_id)}>상태 대조 후 재시도</button>
@@ -3305,7 +3301,7 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
           }}
           renderList={({ items, selectedKey, getItemProps }) => (
             <table aria-label="주문 상태 원장 목록" className="data-table order-ledger-table" role="grid">
-              <thead><tr><th>시각</th><th>Broker</th><th>주문 / <span>Client Order ID</span></th><th>Deployment</th><th>심볼</th><th>상태</th></tr></thead>
+              <thead><tr><th>시각</th><th>거래소</th><th>주문 / <span>앱 주문 번호</span></th><th>운용 배포</th><th>심볼</th><th>상태</th></tr></thead>
               <tbody>
                 {items.map((row, index) => (
                   <tr {...getItemProps(row, index, { className: selectedKey === row.key ? "is-selected" : "" })} key={row.key}>
@@ -3377,7 +3373,7 @@ function RiskUsagePanel({ snapshot = {}, context = {} }) {
           const known = row.current !== null && row.current !== undefined && Number.isFinite(Number(row.current));
           const hard = row.hard !== null && row.hard !== undefined ? Number(row.hard) : null;
           const used = known && hard ? Math.min(100, Math.abs(Number(row.current) / hard) * 100) : 0;
-          return <article key={row.label}><header><strong>{row.label}</strong><span>{known ? `${Number(row.current).toFixed(2)}${row.unit}` : "미확인"} / {hard !== null ? `${hard}${row.unit}` : "정책 없음"}</span></header><div className="risk-usage-track"><span style={{ width: `${used}%` }} /></div><small>주의 {row.warning != null ? `${row.warning}${row.unit}` : "미설정"} · Hard Block {hard != null ? `${hard}${row.unit}` : "미설정"}</small></article>;
+          return <article key={row.label}><header><strong>{row.label}</strong><span>{known ? `${Number(row.current).toFixed(2)}${row.unit}` : "미확인"} / {hard !== null ? `${hard}${row.unit}` : "정책 없음"}</span></header><div className="risk-usage-track"><span style={{ width: `${used}%` }} /></div><small>주의 {row.warning != null ? `${row.warning}${row.unit}` : "미설정"} · Hard 차단 {hard != null ? `${hard}${row.unit}` : "미설정"}</small></article>;
         })}
       </div>
     </section>
@@ -3428,7 +3424,7 @@ function DoctorHistoryPanel({ diagnostics = {}, onNavigate }) {
   const issues = latest.issues ?? [];
   return (
     <section className="panel doctor-history-panel">
-      <PanelHeader title="설정·Runtime 자체 검사" subtitle={`최근 진단 ${latest.generated_at || "미실행"}`} suffix={<StatusPill tone={latest.summary?.hard_stop_count ? "danger" : latest.summary?.warning_count ? "warning" : latest.run_id ? "success" : "neutral"}>{latest.summary?.status || "미실행"}</StatusPill>} />
+      <PanelHeader title="설정·실행 자체 검사" subtitle={`최근 진단 ${latest.generated_at || "미실행"}`} suffix={<StatusPill tone={latest.summary?.hard_stop_count ? "danger" : latest.summary?.warning_count ? "warning" : latest.run_id ? "success" : "neutral"}>{latest.summary?.status || "미실행"}</StatusPill>} />
       <div className="compact-list">
         {issues.slice(0, 12).map((issue) => <button className="compact-row doctor-history-row" type="button" key={issue.issue_code} onClick={() => onNavigate(issue.related_tab || "overview")}><strong>{issue.problem}</strong><span>{issue.remediation}</span><StatusPill tone={issue.severity === "hard_stop" ? "danger" : "warning"}>{issue.severity === "hard_stop" ? "차단" : "주의"}</StatusPill></button>)}
         {!issues.length && <EmptyRow text="저장된 진단 이슈가 없습니다." />}
@@ -3667,7 +3663,7 @@ function LivePreparationPanel({
           />
           <CompactDisclosure
             title="다른 전략 찾기"
-            description="현재 Deployment를 바꾸려는 경우에만 검색·필터·저장 조건을 사용합니다."
+            description="현재 운용 배포를 바꾸려는 경우에만 검색·필터·저장 조건을 사용합니다."
           >
             <StrategyDiscoveryToolbar
               filters={discoveryFilters}
@@ -3917,9 +3913,9 @@ function FuturesRiskSimulatorPanel({ strategies = [] }) {
         suffix={<StatusPill tone={tone}>{result?.status || "READ ONLY"}</StatusPill>}
       />
       <div className="futures-risk-controls">
-        <label><span>전략 Artifact</span><select value={strategyId} onChange={(event) => setStrategyId(event.target.value)}><option value="">안전 기본 정책</option>{futuresStrategies.map((item) => <option key={item.strategy_id} value={item.strategy_id}>{item.name} · {item.symbol}</option>)}</select></label>
+        <label><span>전략 저장본</span><select value={strategyId} onChange={(event) => setStrategyId(event.target.value)}><option value="">안전 기본 정책</option>{futuresStrategies.map((item) => <option key={item.strategy_id} value={item.strategy_id}>{item.name} · {item.symbol}</option>)}</select></label>
         <label><span>종목</span><input value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))} /></label>
-        <label><span>방향</span><select value={direction} onChange={(event) => setDirection(event.target.value)}><option value="LONG">LONG</option><option value="SHORT">SHORT</option></select></label>
+        <label><span>방향</span><select value={direction} onChange={(event) => setDirection(event.target.value)}><option value="LONG">매수 포지션</option><option value="SHORT">매도 포지션</option></select></label>
         <label><span>명목금액 (USDT)</span><input type="number" min="0" step="0.1" value={notional} onChange={(event) => setNotional(event.target.value)} /></label>
         <label><span>계산 레버리지 (x)</span><select value={leverage} onChange={(event) => setLeverage(event.target.value)}>{leverageOptions.map((value) => <option key={value} value={value}>{value}x</option>)}</select></label>
         <label><span>보호 손절가</span><input type="number" min="0" step="any" value={stopPrice} onChange={(event) => setStopPrice(event.target.value)} placeholder="필수" /></label>
@@ -3932,7 +3928,7 @@ function FuturesRiskSimulatorPanel({ strategies = [] }) {
       {result && (
         <>
           <div className="futures-risk-metrics">
-            <div><span>Mark price</span><strong>{displayNumber(result.market?.mark_price, 6)}</strong></div>
+            <div><span>기준 가격</span><strong>{displayNumber(result.market?.mark_price, 6)}</strong></div>
             <div><span>초기 증거금</span><strong>{displayNumber(estimate.initial_margin_usdt, 4)} USDT</strong></div>
             <div><span>추정 청산가</span><strong>{estimate.liquidation_price == null ? "CROSS 산출 불가" : displayNumber(estimate.liquidation_price, 6)}</strong></div>
             <div><span>청산 여유</span><strong>{estimate.liquidation_buffer_pct == null ? "-" : `${displayNumber(estimate.liquidation_buffer_pct)}%`}</strong></div>
@@ -4079,7 +4075,7 @@ function FuturesSettingsPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
         <label>
           <span>마진 방식</span>
           <select value="ISOLATED" disabled>
-            <option value="ISOLATED">ISOLATED · 격리</option>
+            <option value="ISOLATED">격리 · 격리</option>
           </select>
         </label>
         <label>
@@ -4233,7 +4229,7 @@ function FuturesFillSoakPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
   return (
     <section className="panel futures-fill-soak-panel">
       <PanelHeader
-        title="Binance USD-M 실체결 Soak"
+        title="Binance USD-M 실체결 장시간 점검"
         subtitle="전략 승급과 분리된 브로커 경로 검증입니다. 결과는 자동 승급 증거로 사용하지 않습니다."
         suffix={<StatusPill tone={statusTone}>{current.status || "IDLE"}</StatusPill>}
       />
@@ -4314,7 +4310,7 @@ function OperationalSafeguardsPanel({ apiConnected, dryRun, newEntriesBlocked, k
           className={`secondary-button ${dryRun ? "safe-active" : "danger-active"}`}
           disabled={!apiConnected}
           icon={<ShieldCheck size={16} />}
-          label="Dry Run"
+          label="주문 전송 없이 점검"
           onClick={onDryRun}
           status={apiConnected ? (dryRun ? "success" : "error") : undefined}
         />
@@ -4369,7 +4365,7 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
 
   return (
     <section className="panel doctor-panel">
-      <PanelHeader title="실거래 Doctor" subtitle="실계좌 주문 전에 꼭 필요한 항목만 압축해서 점검합니다." />
+      <PanelHeader title="실거래 시작 점검" subtitle="실계좌 주문 전에 꼭 필요한 항목만 압축해서 점검합니다." />
       <div className="doctor-hero">
         <div>
           <span>점검 결과</span>
@@ -4632,7 +4628,6 @@ function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) 
   return (
     <section className={`page-view ${selectedNav}-view`} aria-labelledby="live-page-title">
       {sectionTabs.length > 0 ? <NestedTabs ariaLabel={`${pageProfiles[liveNavigationRoot(selectedNav)].title} 보기`} className="live-section-tabs" variant="compact" options={sectionTabs} value={selectedNav} onChange={onNavigate} /> : null}
-      <p className="live-page-purpose">{pageProfiles[selectedNav]?.summary}</p>
       <SearchResultsPanel query={searchQuery} results={searchResults} onNavigate={onNavigate} />
 
       {children}
@@ -5112,7 +5107,7 @@ function UnattendedSoakReportCard({ report }) {
     <section {...semanticSurfaceProps(tone, "unattended-soak-card")}>
       <div className="unattended-soak-heading">
         <div>
-          <strong>무인 모니터 Soak</strong>
+          <strong>무인 모니터 장시간 점검</strong>
           <span>장시간 실행의 heartbeat, 재연결, 오류와 프로세스 자원을 한 리포트로 확인합니다.</span>
         </div>
         <StatusPill tone={tone}>{running ? status : verdict}</StatusPill>
@@ -5122,11 +5117,11 @@ function UnattendedSoakReportCard({ report }) {
       </div>
       <div className="unattended-soak-metrics">
         <div><span>진행</span><strong>{progress.toFixed(0)}%</strong><em>{Math.round(durationSeconds / 60)} / {Math.round(targetDurationSeconds / 60) || "-"}분</em></div>
-        <div><span>Heartbeat gap</span><strong>{Number(heartbeat.maxGapSeconds || 0).toFixed(1)}초</strong><em>{Number(heartbeat.gapCount || 0)}건 · 기준 {Number(heartbeat.limitSeconds || 0)}초</em></div>
+        <div><span>상태 신호 간격</span><strong>{Number(heartbeat.maxGapSeconds || 0).toFixed(1)}초</strong><em>{Number(heartbeat.gapCount || 0)}건 · 기준 {Number(heartbeat.limitSeconds || 0)}초</em></div>
         <div><span>재연결 / 오류</span><strong>{Number(counts.reconnectCount || 0)} / {Number(counts.errorCount || 0)}</strong><em>차단 {Number(counts.blockCount || 0)}건</em></div>
         <div><span>봉 / 판단 / 체결</span><strong>{Number(counts.barCount || 0)} / {Number(counts.decisionCount || 0)} / {Number(counts.fillCount || 0)}</strong><em>실주문 {Number(counts.realOrderCount || 0)}건</em></div>
-        <div><span>Peak CPU</span><strong>{Number(resources.peakProcessCpuPercent || 0).toFixed(1)}%</strong><em>프로세스 기준</em></div>
-        <div><span>Peak 메모리</span><strong>{formatProcessMemory(resources.peakProcessMemoryBytes)}</strong><em>프로세스 RSS</em></div>
+        <div><span>최대 CPU</span><strong>{Number(resources.peakProcessCpuPercent || 0).toFixed(1)}%</strong><em>프로세스 기준</em></div>
+        <div><span>최대 메모리</span><strong>{formatProcessMemory(resources.peakProcessMemoryBytes)}</strong><em>프로세스 RSS</em></div>
       </div>
       <div className="unattended-soak-footer">
         <span>
@@ -5347,7 +5342,7 @@ function AutomationLauncherPanel({
             {runtimeBindingBlocked ? "RUN BLOCK" : "DEPLOYMENT BOUND"}
           </StatusPill>
           <span>{runtimeBindingDetail}</span>
-          <small>모드 버튼은 화면의 실행 요청만 선택하며, Run을 누르기 전에는 runtime 설정을 변경하지 않습니다.</small>
+          <small>모드 버튼은 화면의 실행 요청만 선택하며, Run을 누르기 전에는 실행 엔진 설정을 변경하지 않습니다.</small>
         </div>
         <div className="automation-metrics">
           <div>
@@ -5367,7 +5362,7 @@ function AutomationLauncherPanel({
           {routeStrategies.slice(0, 4).map((strategy) => (
             <span key={strategy.strategy_id}>{strategy.name} · {strategy.symbol}</span>
           ))}
-          {!routeStrategies.length && <span>연결 가능한 전략 artifact가 없습니다.</span>}
+          {!routeStrategies.length && <span>연결 가능한 전략 저장본가 없습니다.</span>}
         </div>
         <div className="automation-actions">
           <span>{runtimeRunning ? `${profileRuntime.mode} · 확정 봉 ${profileRuntime.engine?.barCount ?? 0} · 판단 ${profileRuntime.engine?.decisionCount ?? 0} · ${profileRuntime.engine?.lastCycleAt || "새 봉 대기"}` : runnerText}</span>
@@ -5394,7 +5389,7 @@ function AutomationLauncherPanel({
         <LiveClosedBarCountdown schedules={routeSchedules} />
         <div {...semanticSurfaceProps(runtimeTone, "continuous-runtime-status")}>
           <StatusPill tone={runtimeTone}>
-            {runtimeRunning ? `${profileRuntime.mode} RUNNING` : profileRuntime?.phase || "STOPPED"}
+            {runtimeRunning ? `${liveRuntimeModeLabel(profileRuntime.mode)} 실행 중` : profileRuntime?.phase || "STOPPED"}
           </StatusPill>
           <span>시세는 계속 수신하고 전략은 확정 봉마다 1회만 평가합니다. HOLD 후에도 다음 봉에서 자동으로 다시 판단합니다.</span>
           {profileRuntime?.lastError && <small data-ts-semantic-preserve="true">{profileRuntime.lastError}</small>}
@@ -5418,9 +5413,9 @@ function AutomationLauncherPanel({
           )}
         />
         <div className="validation-monitor-metrics">
-          <MetricCard label="일반·Standalone Smoke" value={`${validation?.generalSmokeCandidateCount ?? 0}개`} tone="info" />
-          <MetricCard label="Futures SHORT 정식 후보" value={`${validation?.futuresShortCandidateCount ?? 0}개`} tone={(validation?.futuresShortCandidateCount ?? 0) > 0 ? "success" : "warning"} />
-          <MetricCard label="승급 차단 SHORT" value={`${validation?.blockedFuturesShortCount ?? 0}개`} tone={(validation?.blockedFuturesShortCount ?? 0) > 0 ? "warning" : "success"} />
+          <MetricCard label="일반·단일 전략 기본 검사" value={`${validation?.generalSmokeCandidateCount ?? 0}개`} tone="info" />
+          <MetricCard label="Futures 매도 포지션 정식 후보" value={`${validation?.futuresShortCandidateCount ?? 0}개`} tone={(validation?.futuresShortCandidateCount ?? 0) > 0 ? "success" : "warning"} />
+          <MetricCard label="승급 차단 매도 포지션" value={`${validation?.blockedFuturesShortCount ?? 0}개`} tone={(validation?.blockedFuturesShortCount ?? 0) > 0 ? "warning" : "success"} />
           <MetricCard label="실제 평가 가능" value={`${validation?.runtimeEvaluationReadyCount ?? 0}개`} tone="success" />
           <MetricCard label="주문 가능" value="0개" tone="success" />
         </div>
@@ -5462,10 +5457,10 @@ function AutomationLauncherPanel({
               <strong>{selectedValidation.strategyName || selectedValidation.strategyId}</strong>
               <span>
                 {selectedValidation.brokerHint} · {selectedValidation.marketType} · {selectedValidation.plugin}
-                {selectedValidation.standaloneStrategy ? " · Standalone Strategy" : ` · ${selectedValidation.portfolioName || selectedValidation.portfolioId}`}
+                {selectedValidation.standaloneStrategy ? " · 단일 전략" : ` · ${selectedValidation.portfolioName || selectedValidation.portfolioId}`}
               </span>
               <small>
-                {selectedValidation.strategyId} · artifact {selectedValidation.strategyArtifactHash?.slice(0, 12) || "N/A"} · file {selectedValidation.strategyFileSha256?.slice(0, 12) || "N/A"}
+                {selectedValidation.strategyId} · 저장본 {selectedValidation.strategyArtifactHash?.slice(0, 12) || "N/A"} · file {selectedValidation.strategyFileSha256?.slice(0, 12) || "N/A"}
               </small>
             </div>
             <StatusPill tone={selectedValidation.runtimeEvaluationReady ? "success" : "warning"}>
@@ -5496,7 +5491,7 @@ function AutomationLauncherPanel({
           <div {...semanticSurfaceProps("danger", "validation-evaluation-error")}>{lastValidationResult.reason}</div>
         )}
         <p className="validation-monitor-note">
-          이 검증 plan은 지속 감시 runner와 연결하지 않습니다. 후보 plan을 우회해 장시간 runtime을 시작하지 않으며, Portfolio를 합성하지 않고 표준 SMALL/FULL LIVE 권한도 변경하지 않습니다.
+          이 검증 plan은 지속 감시 runner와 연결하지 않습니다. 후보 plan을 우회해 장시간 실행 엔진을 시작하지 않으며, 포트폴리오를 합성하지 않고 표준 SMALL/FULL LIVE 권한도 변경하지 않습니다.
         </p>
         {researchShort && (
           <div
@@ -5506,9 +5501,9 @@ function AutomationLauncherPanel({
             )}
           >
             <div>
-              <strong>Binance Futures SHORT 연구 bundle</strong>
+              <strong>Binance Futures 매도 포지션 연구 bundle</strong>
               <span>
-                {researchShort.strategyCount ?? 0}개 전략 · Portfolio 실행 계약 {researchShort.portfolioExecutionPassed ? "PASS" : "CHECK"} · Shadow/Paper {researchShort.paperPassedStrategyCount ?? 0}/{researchShort.strategyCount ?? 0}
+                {researchShort.strategyCount ?? 0}개 전략 · 포트폴리오 실행 계약 {researchShort.portfolioExecutionPassed ? "PASS" : "CHECK"} · 신호 검증/모의거래 {researchShort.paperPassedStrategyCount ?? 0}/{researchShort.strategyCount ?? 0}
               </span>
             </div>
             <StatusPill tone={researchShort.functionalPass ? "success" : "warning"}>
@@ -5593,7 +5588,7 @@ function WatchdogPanel({ watchdog, onWatchdog, className = "" }) {
 
   return (
     <section className={`panel watchdog-panel ${className}`.trim()}>
-      <PanelHeader title="Live Watchdog" subtitle={`마지막 점검 ${data.last_run ?? "미실행"}`} />
+      <PanelHeader title="자동 상태 점검" subtitle={`마지막 점검 ${data.last_run ?? "미실행"}`} />
       <div className="panel-action-line">
         <div>
           <strong>{data.last_action ?? "대기"}</strong>
@@ -5602,7 +5597,7 @@ function WatchdogPanel({ watchdog, onWatchdog, className = "" }) {
         <ActionButton
           className="secondary-button"
           icon={<Radio size={16} />}
-          label="Watchdog 점검"
+          label="자동 상태 점검 점검"
           onClick={onWatchdog}
           status={tone === "danger" ? "error" : tone === "success" ? "success" : undefined}
         />
@@ -5725,148 +5720,6 @@ function compactAllocationValue(value, currency) {
   return numeric.toLocaleString("ko-KR", { maximumFractionDigits: 2 });
 }
 
-function AllocationDonut({ group }) {
-  const visibleItems = group.items.filter((item) => item.ratio > 0);
-  return (
-    <div className="account-allocation-donut">
-      <svg aria-label={`${group.currency} 계좌 자본 배분`} role="img" viewBox="0 0 120 120">
-        <circle className="account-allocation-donut__track" cx="60" cy="60" r="46" pathLength="100" />
-        {visibleItems.map((item) => (
-          <circle
-            className="account-allocation-donut__segment"
-            cx="60"
-            cy="60"
-            key={item.id}
-            pathLength="100"
-            r="46"
-            stroke={item.color}
-            strokeDasharray={`${item.ratio * 100} ${100 - item.ratio * 100}`}
-            strokeDashoffset={-item.offset * 100}
-          />
-        ))}
-      </svg>
-      <div className="account-allocation-donut__center">
-        <strong>{compactAllocationValue(group.total, group.currency)}</strong>
-        <span>{group.currency}</span>
-      </div>
-    </div>
-  );
-}
-
-function AllocationLegend({ currency, items }) {
-  return (
-    <div className="account-allocation-legend">
-      {items.map((item) => (
-        <div key={item.id}>
-          <span className="account-allocation-legend__marker" style={{ backgroundColor: item.color }} />
-          <span className="account-allocation-legend__name">
-            <strong>{item.label}</strong>
-            <small>{item.basis}</small>
-          </span>
-          <span className="account-allocation-legend__value">
-            <strong>{(item.ratio * 100).toFixed(item.ratio >= 0.1 ? 1 : 2)}%</strong>
-            <small>{formatAllocationValue(item.value, currency)}</small>
-          </span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function PositionExposureCard({ group }) {
-  return (
-    <article className="position-exposure-card">
-      <header>
-        <div>
-          <strong>{group.brokerLabel}</strong>
-          <span>{group.currency} 기준</span>
-        </div>
-        <strong>{formatAllocationValue(group.total, group.currency)}</strong>
-      </header>
-      {group.items.length ? (
-        <>
-          <div className="position-exposure-bar" aria-label={`${group.brokerLabel} 포지션 비중`}>
-            {group.items.map((item) => (
-              <span
-                key={item.id}
-                style={{ backgroundColor: item.color, width: `${Math.max(item.ratio * 100, 0.7)}%` }}
-                title={`${item.label} ${(item.ratio * 100).toFixed(1)}%`}
-              />
-            ))}
-          </div>
-          <AllocationLegend currency={group.currency} items={group.items} />
-        </>
-      ) : (
-        <div className="account-visual-empty">평가 가능한 포지션 금액이 없습니다.</div>
-      )}
-      {group.pendingCount ? (
-        <p className="position-exposure-card__pending">현재가가 없어 평가 대기 중인 포지션 {group.pendingCount}개는 비중 계산에서 제외했습니다.</p>
-      ) : null}
-    </article>
-  );
-}
-
-function AccountAllocationOverview({ accounts, positions }) {
-  const model = useMemo(
-    () => buildAccountVisualization(accounts, positions),
-    [accounts, positions],
-  );
-  return (
-    <section className="panel account-visual-overview">
-      <PanelHeader
-        title="계좌 자본·포지션 노출"
-        subtitle="환율을 임의 추정하지 않고 통화별 자본 배분과 계좌별 포지션 집중도를 분리해 표시합니다."
-      />
-      <div className="account-visual-summary">
-        <div><span>연결 계좌</span><strong>{model.accountCount}개</strong></div>
-        <div><span>보유 포지션</span><strong>{model.positionCount}개</strong></div>
-        <div><span>기준 통화</span><strong>{model.capitalGroups.length}개</strong></div>
-        <div className={model.missingValuationCount ? "is-warning" : ""}>
-          <span>평가 대기</span>
-          <strong>{model.missingValuationCount}개</strong>
-        </div>
-      </div>
-      <div className="account-visual-section">
-        <div className="account-visual-section__heading">
-          <div>
-            <h3>계좌 자본 배분</h3>
-            <p>KRW·USD·USDT를 섞지 않고 브로커가 제공한 총 평가 또는 현금성 잔고를 사용합니다.</p>
-          </div>
-        </div>
-        {model.capitalGroups.length ? (
-          <div className="account-allocation-grid">
-            {model.capitalGroups.map((group) => (
-              <article className="account-allocation-card" key={group.currency}>
-                <AllocationDonut group={group} />
-                <AllocationLegend currency={group.currency} items={group.items} />
-              </article>
-            ))}
-          </div>
-        ) : (
-          <div className="account-visual-empty">계좌를 갱신하면 자본 배분을 표시합니다.</div>
-        )}
-      </div>
-      <div className="account-visual-section">
-        <div className="account-visual-section__heading">
-          <div>
-            <h3>계좌별 포지션 집중도</h3>
-            <p>현물은 평가금액, 선물은 지갑 자본과 분리된 명목 노출 기준입니다.</p>
-          </div>
-        </div>
-        {model.exposureGroups.length ? (
-          <div className="position-exposure-grid">
-            {model.exposureGroups.map((group) => (
-              <PositionExposureCard group={group} key={`${group.brokerId}:${group.currency}`} />
-            ))}
-          </div>
-        ) : (
-          <div className="account-visual-empty">평가 가능한 보유 포지션이 없습니다.</div>
-        )}
-      </div>
-    </section>
-  );
-}
-
 function UnifiedBrokerAccountPanel({
   accounts,
   executionEvents,
@@ -5876,55 +5729,13 @@ function UnifiedBrokerAccountPanel({
   reconciledAt,
   refreshDisabled,
 }) {
-  const accountRows = accounts.map((account) => ({
-    id: account.broker_id,
-    provider: account.broker_id,
-    providerLabel: account.broker_name,
-    accountLabel: `${account.account} · ${account.currency}`,
-    balance: account.broker_equity ?? account.broker_cash,
-    available: account.broker_cash,
-    total: account.broker_equity ?? account.broker_cash,
-    detail: account.detail,
-    statusLabel: account.status_label,
-    tone: statusTone(account.status),
-  }));
-  const positionRows = positions
-    .filter((position) => Math.abs(numericDisplayValue(position.broker_qty)) > 0 || Math.abs(numericDisplayValue(position.program_qty)) > 0)
-    .map((position) => {
-      const positionSide = String(position.position_side || position.positionSide || "").toUpperCase();
-      return {
-        id: `${position.broker_id}:${position.symbol}:${positionSide || "NET"}`,
-        provider: position.broker_id,
-        providerLabel: position.broker_name,
-        symbol: position.symbol,
-        name: `${position.asset}${positionSide ? ` · ${positionSide}` : ""}`,
-        quantity: position.broker_qty,
-        averagePrice: position.average_price_display || "조회 정보 없음",
-        currentPrice: position.current_price_display || "조회 정보 없음",
-        evaluation: position.broker_value_display || "평가 대기",
-        profitLoss: position.status === "pass" ? "원장 일치" : `대조 Δ ${position.delta_qty}`,
-        profitLossTone: position.status === "pass" ? "success" : "danger",
-        brokerValue: position.broker_value,
-        brokerQuantity: position.broker_qty_value,
-        currency: position.currency,
-        positionSide,
-        valuationBasis: position.valuation_basis,
-      };
-    });
+  const allocationAccounts = useMemo(() => liveAllocationAccounts(accounts, positions), [accounts, positions]);
   return (
     <>
-      <BrokerAccountWorkspace
-        accounts={accountRows}
-        autoRefreshLabel="10초 자동 갱신·대조"
-        className="live-unified-account-panel"
-        emptyMessage="KIS·Binance Spot/Futures·Upbit에 현재 보유 포지션이 없습니다."
-        onRefresh={onRefresh}
-        positions={positionRows}
-        refreshDisabled={refreshDisabled}
-        subtitle="KIS·Binance Spot/Futures·Upbit의 실제 계좌 잔고와 보유 포지션을 같은 형식으로 표시합니다."
-        title="내 계좌·보유 포지션"
-        updatedAt={reconciledAt ?? executionEvents?.last_poll ?? "미조회"}
-      />
+      <AllocationWorkspace accounts={allocationAccounts} title="내 실계좌 구성"
+        basis="실제 계좌의 최근 평가 기준 · 현금 포함 · 선물은 증거금만 포함"
+        onRefresh={onRefresh} refreshDisabled={refreshDisabled}
+        updatedAt={reconciledAt ?? executionEvents?.last_poll ?? "미조회"} />
       <div className="account-baseline-toolbar">
         <div>
           <strong>프로그램 기준 원장</strong>
@@ -5935,12 +5746,7 @@ function UnifiedBrokerAccountPanel({
           현재 계좌를 기준 원장으로 승인
         </button>
       </div>
-      <CompactDisclosure
-        title="자본 배분·포지션 노출"
-        description="통화별 배분과 계좌별 집중도 시각화는 상세 분석이 필요할 때만 엽니다."
-      >
-        <AccountAllocationOverview accounts={accounts} positions={positions} />
-      </CompactDisclosure>
+
     </>
   );
 }
@@ -6048,7 +5854,7 @@ function LiveStrategySelectorPanel({
       <PanelHeader title="선택한 배포 전략" subtitle="현재 단계와 실제 운영 행동만 기본 표시합니다." />
       <div className="live-strategy-selector-grid">
         <label>
-          <span>전략 artifact</span>
+          <span>전략 저장본</span>
           <select value={selectedStrategy?.strategy_id || ""} onChange={(event) => onSelect(event.target.value)} disabled={!strategies.length}>
             {!strategies.length && <option value="">전략 없음</option>}
             {strategies.map((strategy) => (
@@ -6082,7 +5888,7 @@ function LiveStrategySelectorPanel({
               status={canPromoteLive ? "success" : undefined}
             />
           </div>
-          <CompactDisclosure title="전체 검증 단계" description="같은 원본 저장본의 메타데이터를 Backtester → Paper Trader → Live Trader에서 표시합니다. 배포 운용 상태와 현재 주문 권한은 별도입니다.">
+          <CompactDisclosure title="전체 검증 단계" description="같은 원본 저장본의 메타데이터를 Backtester → 모의거래 Trader → Live Trader에서 표시합니다. 배포 운용 상태와 현재 주문 권한은 별도입니다.">
             <p className="pipeline-role-hint"><strong>백테스트 → 모의 검증 → 제한 실거래 → 실전 운용</strong>신호 관찰과 가상체결은 하나의 모의 검증에 포함됩니다. 주문 연결 시험은 전략 단계와 별개이며, 제한 실거래에는 별도 승인이 필요합니다.</p>
             <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="저장본 검증 단계">
               {lifecycleTimeline.map((item) => (
@@ -6133,12 +5939,12 @@ function LiveStrategySelectorPanel({
                     : "상태 변경은 현재 배포의 운용 상태에 기록됩니다."}
             </span>
           </div>
-          <CompactDisclosure title="전략 기술 정보" description="Release, parameter hash와 개인 메타데이터를 확인합니다.">
+          <CompactDisclosure title="전략 기술 정보" description="배포 버전, parameter hash와 개인 메타데이터를 확인합니다.">
             <p>원본 ID: {selectedStrategy.artifact_reference?.artifactId || "미확인"} · 원본 hash: <code>{selectedStrategy.artifact_reference?.artifactHash || "미확인"}</code></p>
             <p>저장본 단계 표시 기준: {artifactLifecycle.source}</p>
             {artifactLifecycle.conflicts.length > 0 && <p role="status">원본 단계 표기가 서로 다릅니다: {artifactLifecycle.conflicts.join(" · ")}</p>}
             <div className="live-strategy-parameter-panel">
-              <strong>Release · Parameters</strong>
+              <strong>배포 버전 · 전략 변수</strong>
               <span>{selectedStrategy.release?.release_id || selectedStrategy.release_id || "Release 없음"}</span>
               <pre>{parametersText || "-"}</pre>
             </div>
@@ -6440,9 +6246,9 @@ function AuditPanel({
             <thead>
               <tr>
                 <th>시간</th>
-                <th>Scope</th>
-                <th>Level</th>
-                <th>Source</th>
+                <th>범위</th>
+                <th>중요도</th>
+                <th>출처</th>
                 <th>메시지</th>
               </tr>
             </thead>
@@ -6468,17 +6274,17 @@ function AuditPanel({
               <p>{row.message}</p>
               <dl>
                 <div><dt>시각</dt><dd>{row.time}</dd></div>
-                <div><dt>Scope · Level</dt><dd>{row.scope} · {row.level}</dd></div>
-                <div><dt>Source</dt><dd>{row.source}</dd></div>
-                <div><dt>Session</dt><dd>{row.item.session_id || row.item.sessionId || "-"}</dd></div>
-                <div><dt>Deployment</dt><dd>{row.item.deployment_id || row.item.deploymentId || "-"}</dd></div>
-                <div><dt>Strategy · Symbol</dt><dd>{row.item.strategy_id || "-"} · {row.item.symbol || "-"}</dd></div>
-                <div><dt>Order</dt><dd>{row.item.order_id || row.item.orderId || "-"}</dd></div>
-                <div><dt>Correlation</dt><dd>{row.item.correlation_id || row.item.trace_id || "-"}</dd></div>
+                <div><dt>범위 · 중요도</dt><dd>{row.scope} · {row.level}</dd></div>
+                <div><dt>출처</dt><dd>{row.source}</dd></div>
+                <div><dt>실행 회차</dt><dd>{row.item.session_id || row.item.sessionId || "-"}</dd></div>
+                <div><dt>운용 배포</dt><dd>{row.item.deployment_id || row.item.deploymentId || "-"}</dd></div>
+                <div><dt>전략 · Symbol</dt><dd>{row.item.strategy_id || "-"} · {row.item.symbol || "-"}</dd></div>
+                <div><dt>주문</dt><dd>{row.item.order_id || row.item.orderId || "-"}</dd></div>
+                <div><dt>연결 추적</dt><dd>{row.item.correlation_id || row.item.trace_id || "-"}</dd></div>
                 {detailFields.map((field) => <div key={field.label}><dt>{field.label}</dt><dd>{field.value}</dd></div>)}
               </dl>
               {(row.item.stack_trace || row.item.stackTrace) && <pre>{row.item.stack_trace || row.item.stackTrace}</pre>}
-              {payload ? <><h4>Payload</h4><pre>{payload}</pre></> : null}
+              {payload ? <><h4>원본 자료</h4><pre>{payload}</pre></> : null}
             </>
           );
         }}
@@ -6487,9 +6293,9 @@ function AuditPanel({
             <thead>
               <tr>
                 <th>시간</th>
-                <th>Scope</th>
-                <th>Level</th>
-                <th>Source</th>
+                <th>범위</th>
+                <th>중요도</th>
+                <th>출처</th>
                 <th>메시지</th>
               </tr>
             </thead>
@@ -6525,9 +6331,9 @@ function AuditPanel({
             </select>
             <select aria-label={`${title} 레벨 필터`} value={level} onChange={(event) => setLevel(event.currentTarget.value)}>
               <option value="all">전체</option>
-              <option value="INFO">INFO</option>
-              <option value="WARN">WARN</option>
-              <option value="ERROR">ERROR</option>
+              <option value="INFO">안내</option>
+              <option value="WARN">주의</option>
+              <option value="ERROR">오류</option>
             </select>
             <select aria-label={`${title} 정렬`} value={sort} onChange={(event) => setSort(event.currentTarget.value)}>
               <option value="latest">최신순</option>

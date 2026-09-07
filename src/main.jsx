@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App.jsx";
 import "./styles.css";
+import "../../../packages/design/allocation-workspace.css";
 import "../../../packages/design/action-feedback.css";
 import "../../../packages/design/ui-patterns.css";
 import "../../../packages/design/program-console.css";

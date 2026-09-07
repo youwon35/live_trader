@@ -55,14 +55,14 @@ export default function PaperCandidateEvidencePanel({ strategyId = "" }) {
   );
   return (
     <details className="compact-disclosure">
-      <summary>Paper 검증 근거 확인</summary>
-      <p>Paper에서 발행한 검증 근거와 현재 전략·Instance 저장본을 대조합니다. 확인 전용이며 배포 생성, 승인, 주문 설정을 변경하지 않습니다.</p>
+      <summary>모의거래 검증 근거 확인</summary>
+      <p>모의거래에서 발행한 검증 근거와 현재 전략·실행 단위 저장본을 대조합니다. 확인 전용이며 배포 생성, 승인, 주문 설정을 변경하지 않습니다.</p>
       <p>{inbox?.requiredNextStep || "현재는 검증 근거 확인만 가능합니다. Live 후보 등록과 최초 제한 실거래 승인 기능은 준비 중입니다."}</p>
       <button className="secondary-button" disabled={busy} onClick={refresh} type="button">
         {busy ? "확인 중…" : "Paper 검증 근거 새로고침"}
       </button>
       {message && <p role="status">{message}</p>}
-      {inbox?.ok && rows.length === 0 && <p>확인할 근거가 없습니다. Paper에서 검증 근거를 발행한 뒤 다시 확인하세요.</p>}
+      {inbox?.ok && rows.length === 0 && <p>확인할 근거가 없습니다. 모의거래에서 검증 근거를 발행한 뒤 다시 확인하세요.</p>}
       {rows.length > 0 && (
         <div className="table-scroll">
           <table>
@@ -76,7 +76,7 @@ export default function PaperCandidateEvidencePanel({ strategyId = "" }) {
                     <p>현재 배포: {candidate.deployment?.deploymentId || "미등록"} · 상태: {candidate.deployment?.mode || "미확인"} · revision: {candidate.deployment?.revision ?? "-"}</p>
                     <dl>{Object.entries(SCOPE_LABELS).map(([key, label]) => candidate.identity[key] && (
                       <div key={key}><dt>{label}</dt><dd><code>{candidate.identity[key]}</code></dd></div>
-                    ))}<div><dt>현재 Instance hash</dt><dd><code>{candidate.instanceHash}</code></dd></div></dl>
+                    ))}<div><dt>현재 실행 단위 hash</dt><dd><code>{candidate.instanceHash}</code></dd></div></dl>
                   </details>}
                 </td>
               </tr>

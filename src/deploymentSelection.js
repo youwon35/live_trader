@@ -127,7 +127,7 @@ function optionBaseLabel(strategy) {
   const gate = strategy.portfolio_gate && typeof strategy.portfolio_gate === "object"
     ? strategy.portfolio_gate
     : {};
-  const portfolio = gate.portfolioName || gate.portfolioId || "Standalone";
+  const portfolio = gate.portfolioName || gate.portfolioId || "단일 전략";
   const name = strategy.name || strategy.strategy_id || "이름 없음";
   const symbol = strategy.symbol || "-";
   const timeframe = strategy.timeframe || "-";
