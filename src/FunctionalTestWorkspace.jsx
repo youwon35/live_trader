@@ -294,7 +294,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
           <span className="functional-test-eyebrow">실계좌 주문 연결 시험</span>
           <h2 id="functional-test-heading">주문 기능 검증</h2>
         </div>
-        <div className="functional-test-route-tabs" role="tablist" aria-label="기능시험 경로">
+        <div className="functional-test-route-tabs ts-nested-tabs ts-nested-tabs--compact" role="tablist" aria-label="기능시험 경로">
           <button
             id="functional-test-kis-tab"
             ref={(node) => { routeTabRefs.current.kis = node; }}
@@ -303,7 +303,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
             aria-selected={testRoute === "kis"}
             aria-controls="functional-test-kis-panel"
             tabIndex={testRoute === "kis" ? 0 : -1}
-            className={testRoute === "kis" ? "is-active" : ""}
+            className={`ts-nested-tabs__tab${testRoute === "kis" ? " is-active" : ""}`}
             onClick={() => changeTestRoute("kis")}
             onKeyDown={(event) => handleRouteTabKeyDown(event, "kis")}
           >
@@ -317,7 +317,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
             aria-selected={testRoute === "crypto"}
             aria-controls="functional-test-crypto-panel"
             tabIndex={testRoute === "crypto" ? 0 : -1}
-            className={testRoute === "crypto" ? "is-active" : ""}
+            className={`ts-nested-tabs__tab${testRoute === "crypto" ? " is-active" : ""}`}
             onClick={() => changeTestRoute("crypto")}
             onKeyDown={(event) => handleRouteTabKeyDown(event, "crypto")}
           >

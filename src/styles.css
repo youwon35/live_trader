@@ -32,7 +32,7 @@ body {
   margin: 0;
   color: var(--text);
   background: var(--bg);
-  font-family: var(--font-family);
+  font-family: var(--ts-console-font);
   font-size: var(--font-size-body);
   line-height: var(--line-height);
 }
@@ -2096,7 +2096,7 @@ button {
   max-height: 170px;
   margin: 0;
   color: var(--text-soft);
-  font-family: var(--font-family);
+  font-family: var(--ts-console-font);
   font-size: var(--font-size-small);
   font-weight: 500;
   letter-spacing: 0;
@@ -2592,7 +2592,7 @@ button {
   background: #d7ebff;
   border: 1px solid transparent;
   border-radius: 6px;
-  font-family: Consolas, "SFMono-Regular", monospace;
+  font-family: var(--ts-console-font);
   font-size: 12px;
   font-weight: var(--font-weight-bold);
 }
@@ -2715,7 +2715,7 @@ button {
   gap: 8px;
   min-height: 26px;
   padding: 0 10px;
-  font-family: Consolas, "SFMono-Regular", monospace;
+  font-family: var(--ts-console-font);
   font-size: 12px;
   font-weight: var(--font-weight-bold);
 }
@@ -7754,7 +7754,7 @@ body {
   display: block;
   padding: 10px 12px;
   color: var(--danger-soft-text);
-  font-family: var(--font-family);
+  font-family: var(--ts-console-font);
   font-size: 14px;
   font-weight: 850;
   overflow-wrap: anywhere;
@@ -7893,7 +7893,7 @@ body {
 
 :root[data-program="live-trader"] .live-context-meta span {
   color: var(--text-muted);
-  font-family: var(--ts-console-mono);
+  font-family: var(--ts-console-font);
   font-size: 11px;
 }
 
@@ -8225,7 +8225,7 @@ body {
 .order-ledger-table td > small {
   margin-top: 2px;
   color: var(--text-muted);
-  font-family: var(--ts-console-mono);
+  font-family: var(--ts-console-font);
   font-size: 11px;
 }
 
@@ -8353,7 +8353,7 @@ body {
 
 .order-timeline > div > span {
   color: var(--text-muted);
-  font-family: var(--ts-console-mono);
+  font-family: var(--ts-console-font);
   font-size: 12px;
 }
 
@@ -8520,7 +8520,7 @@ body {
 .audit-event-grid article > span,
 .audit-event-grid article > small {
   color: var(--text-muted);
-  font-family: var(--ts-console-mono);
+  font-family: var(--ts-console-font);
   font-size: 11px;
 }
 

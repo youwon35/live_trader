@@ -9,6 +9,8 @@ import "../../../packages/design/program-console.css";
 import "../../../packages/design/layout-editing.css";
 import "./stock-console-parity.css";
 import "../../../packages/design/readable-notices.css";
+import "./control-parity.css";
+import "../../../packages/design/unified-controls.css";
 import { installLayoutEditingSupport } from "../../../packages/design/layout-editing.js";
 
 installLayoutEditingSupport({ program: "live-trader" });

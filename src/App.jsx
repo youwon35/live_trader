@@ -136,6 +136,7 @@ import {
   readLayoutTransformOffset,
 } from "../../../packages/design/layout-editing.js";
 import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
+import { applyUnifiedControlAccent } from "../../../packages/design/unified-controls.js";
 import { createMasterDetailLog } from "../../../packages/design/master-detail-log.js";
 import { createStatusPill } from "../../../packages/design/status-pill.js";
 import { createTelegramConnectionStatus } from "../../../packages/design/telegram-connection-status.js";
@@ -943,6 +944,7 @@ function applyAppearance(appearance) {
     root.dataset.accent = nextAppearance.accent;
     applyCustomAccent(root, nextAppearance);
     applyAccentContrast(root, nextAppearance);
+    applyUnifiedControlAccent(root, accentColorForContrast(nextAppearance.accent, nextAppearance.customAccent));
   } catch {
     // Appearance remains in React state if document access is unavailable.
   }
@@ -2897,22 +2899,18 @@ function WorkspaceContent({
   if (selectedNav === "settings") {
     return renderPage(
       <section className="settings-page-layout ts-layout-stack">
+        <AppearanceControlPanel
+          appearance={appearance}
+          updateAppearance={updateAppearance}
+          layoutMode={layoutMode}
+          changeLayoutMode={changeLayoutMode}
+          resetWorkspaceLayout={resetWorkspaceLayout}
+        />
         <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} onSave={onEnvSettings} />
         <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
-        <CompactDisclosure
-          title="화면·레이아웃·Telegram"
-          description="거래 연결과 직접 관계없는 개인화·알림 설정은 필요할 때만 엽니다."
-        >
-          <div className="settings-summary-grid ts-panel-grid ts-panel-grid--two">
-            <AppearanceControlPanel
-              appearance={appearance}
-              updateAppearance={updateAppearance}
-              layoutMode={layoutMode}
-              changeLayoutMode={changeLayoutMode}
-              resetWorkspaceLayout={resetWorkspaceLayout}
-            />
-            <TelegramConnectionPanel />
-          </div>
+
+        <CompactDisclosure title="텔레그램 알림" description="알림 연결과 보고 설정을 확인합니다.">
+          <TelegramConnectionPanel />
         </CompactDisclosure>
       </section>,
     );
@@ -3639,8 +3637,8 @@ function LivePreparationPanel({
         ariaLabel="실거래 준비 자산군"
         className="internal-tabs prep-tabs"
         onChange={changeAssetTab}
-        options={tabItems.map((item) => ({ id: item.id, label: item.label, detail: `전략 ${item.count}개`, title: item.detail }))}
-        variant="cards"
+        options={tabItems.map((item) => ({ id: item.id, label: item.label, title: `${item.detail} · 전략 ${item.count}개` }))}
+        variant="compact"
         value={assetTab}
       />
       <section className="content-grid ts-scroll-panel">
@@ -4932,7 +4930,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         className="internal-tabs live-assistant-tabs"
         onChange={setActiveGroup}
         options={groups.map((group) => ({ id: group.id, label: group.label, title: group.detail }))}
-        variant="cards"
+        variant="compact"
         value={activeGroup}
       />
       {settingsReady && broker && (
@@ -5270,7 +5268,7 @@ function AutomationLauncherPanel({
         className="internal-tabs automation-profile-tabs"
         onChange={setAssetTab}
         options={tabs.map((tab) => ({ id: tab.id, label: tab.label, title: tab.detail }))}
-        variant="cards"
+        variant="compact"
         value={assetTab}
       />
       <div

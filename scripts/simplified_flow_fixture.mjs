@@ -1,6 +1,7 @@
 // Offline production-bundle regression. Never starts Python or reads account state.
 // All API responses are intercepted in the browser; the static server rejects /api/.
 import assert from 'node:assert/strict';
+import { probeUnifiedControls, inspectVisibleInternalTabs, exerciseAppearance } from './control_style_probe.mjs';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { extname, resolve, sep } from 'node:path';
@@ -74,9 +75,10 @@ await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen
 const origin = `http://127.0.0.1:${server.address().port}`;
 await mkdir(output, { recursive: true });
 const browser = await chromium.launch({ channel: 'msedge', headless: true });
-const report = { ok: false, brokerIO: 0, externalRequests: [], views: [], apiRequests: [] };
+const unifiedReview = process.env.UNIFIED_CONTROLS_REVIEW === "1";
+const report = { ok: false, brokerIO: 0, externalRequests: [], views: [], apiRequests: [], styles: [], appearance: [] };
 try {
-  for (const viewport of [{ width: 1280, height: 800 }, { width: 1920, height: 1080 }]) {
+  for (const {theme, ...viewport} of (unifiedReview ? [1024,1920].flatMap(width => ["light","dark"].map(theme => ({width,height:1080,theme}))) : [{width:1280,height:800},{width:1920,height:1080}])) {
     const context = await browser.newContext({ viewport, serviceWorkers: 'block' });
     const page = await context.newPage();
     const errors = [];
@@ -114,6 +116,7 @@ try {
     });
     await page.goto(origin);
     await page.getByRole('heading', { name: '시작 점검', exact: true }).waitFor();
+    if(unifiedReview) report.appearance.push(await exerciseAppearance(page,{navLabel:"연결·설정",theme,app:"live",screenshotPath:resolve(output,`unified-settings-${theme}-${viewport.width}.png`)}));
     const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '계좌·잔고', '주문·체결', '실행 기록', '연결·설정', '주문 연결 시험'];
     assert.deepEqual(await page.locator('.nav-list .nav-item').allTextContents().then((items) => items.map((text) => text.trim())), navLabels);
     for (const label of navLabels) {
@@ -208,12 +211,22 @@ try {
         await page.locator('.functional-test-safety-strip').waitFor();
         await page.screenshot({ path: resolve(output, `broker-test-${viewport.width}.png`) });
       }
+      if(unifiedReview){
+        await page.evaluate(theme=>{document.documentElement.dataset.uiTheme=theme;},theme);
+        report.styles.push(await probeUnifiedControls(page,label));
+        await inspectVisibleInternalTabs(page,label,report.styles);
+      }
       report.views.push({ viewport: viewport.width, label, overflow });
     }
     assert.deepEqual(errors, [], 'no runtime errors');
     await context.close();
   }
   assert.deepEqual(report.externalRequests, [], 'all requests stay in the fixture origin');
+  if(unifiedReview && process.env.UNIFIED_CONTROLS_STRICT === "1") {
+    assert.deepEqual(report.styles.flatMap(row=>[...row.failures,...row.fontFailures]),[]);
+    assert.ok(report.appearance.every(row=>row.persisted&&row.resized&&row.resetRemoved&&row.editorActive==="true"&&row.contrast>=4.5));
+  }
+  assert.ok(!unifiedReview || report.styles.every(row=>row.tabs.every(tab=>tab.display==='flex'&&tab.wrap==='nowrap'&&tab.children.every(child=>child.height<=36&&child.whiteSpace==='nowrap'))));
   report.ok = true;
 } finally {
   await browser.close();
