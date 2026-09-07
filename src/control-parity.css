@@ -27,4 +27,7 @@
   width: 100% !important;
   max-width: none !important;
 }
+:root[data-program="live-trader"] body .secondary-button.danger-active:not(:disabled):not([aria-disabled="true"]) {
+  background: var(--ts-control-danger-bg) !important;
+}
 }
