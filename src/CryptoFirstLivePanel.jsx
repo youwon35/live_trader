@@ -223,7 +223,7 @@ export default function CryptoFirstLivePanel({ onSafetyStateChange }) {
         </div>
       </header>
 
-      <div className="crypto-first-live-warning" role="note">
+      <div className="crypto-first-live-warning ts-text-region" role="note">
         <AlertTriangle size={18} aria-hidden="true" />
         <span>출금·이체·마진·선물 금지 · 다른 봇/수동거래 금지 · release HOLD에서는 시작 버튼이 잠깁니다.</span>
       </div>
@@ -249,9 +249,9 @@ export default function CryptoFirstLivePanel({ onSafetyStateChange }) {
         />
       </div>
 
-      {busy && <p className="crypto-first-live-feedback">처리 중: {busy}</p>}
-      {message && <p className="crypto-first-live-feedback crypto-first-live-feedback--ok">{message}</p>}
-      {error && <p className="crypto-first-live-feedback crypto-first-live-feedback--error">{error}</p>}
+      {busy && <p className="crypto-first-live-feedback ts-text-region">처리 중: {busy}</p>}
+      {message && <p className="crypto-first-live-feedback crypto-first-live-feedback--ok ts-text-region">{message}</p>}
+      {error && <p className="crypto-first-live-feedback crypto-first-live-feedback--error ts-text-region">{error}</p>}
     </div>
   );
 }

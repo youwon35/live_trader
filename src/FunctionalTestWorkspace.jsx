@@ -337,7 +337,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
         <div><span>전체 긴급 정지</span><strong>{snapshot.kill_switch ? "KILLED" : snapshot.api_connected ? "NORMAL" : "확인 불가"}</strong></div>
       </div>
 
-      <div className="functional-test-route-notice" role="note">
+      <div className="functional-test-route-notice ts-text-region" role="note">
         <AlertTriangle size={17} aria-hidden="true" />
         <div>
           <strong>{testRoute === "kis" ? "허가서 준비 즉시 전체 시험 기간이 시작됩니다." : "활성 코인 lane은 탭 전환만으로 중지되지 않습니다."}</strong>
@@ -353,7 +353,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
           aria-labelledby="functional-test-crypto-tab"
         >
           <React.Suspense
-            fallback={<div className="functional-test-empty" role="status">코인 기능시험 화면을 불러오는 중입니다.</div>}
+            fallback={<div className="functional-test-empty ts-text-region" role="status">코인 기능시험 화면을 불러오는 중입니다.</div>}
           >
             <CryptoFirstLivePanel onSafetyStateChange={setCryptoSafety} />
           </React.Suspense>
@@ -402,7 +402,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
       </header>
 
       {(message || error) ? (
-        <div className={`functional-test-feedback ${error ? "is-error" : "is-success"}`} role={error ? "alert" : "status"}>
+        <div className={`functional-test-feedback ts-text-region ${error ? "is-error" : "is-success"}`} role={error ? "alert" : "status"}>
           {error || message}
         </div>
       ) : null}
@@ -485,7 +485,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
 
             <div className="functional-test-actions functional-test-field--wide">
               {authorityMutation.blockers.length > 0 ? (
-                <div className="functional-test-feedback is-error" role="status">
+                <div className="functional-test-feedback is-error ts-text-region" role="status">
                   권한 변경 잠금: {authorityMutation.blockers.map(blockerLabel).join(" · ")}
                 </div>
               ) : null}
@@ -604,7 +604,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
                   <div><dt>주기</dt><dd>{selectedCandidate.timeframe || "-"}</dd></div>
                 </dl>
               ) : (
-                <div className="functional-test-empty">무결성이 확인된 국내주식/ETF 대상이 없습니다.</div>
+                <div className="functional-test-empty ts-text-region">무결성이 확인된 국내주식/ETF 대상이 없습니다.</div>
               )}
             </div>
           </section>

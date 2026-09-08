@@ -2438,7 +2438,7 @@ function App() {
             </button>
             {emergencyFeedback && (
               <span
-                className={`emergency-stop-feedback ${snapshot.kill_switch ? "active" : ""}`}
+                className={`emergency-stop-feedback ts-text-region ${snapshot.kill_switch ? "active" : ""}`}
                 role="status"
                 title={emergencyFeedback}
               >
@@ -2458,7 +2458,7 @@ function App() {
         )}
 
         {error && snapshot.api_connected === false && (
-          <section className="api-connection-banner" role="alert">
+          <section className="api-connection-banner ts-text-region" role="alert">
             <Network size={18} />
             <div>
               <strong>HTTP API 상태를 확인할 수 없어 거래 조회 상태을 안전 차단 상태로 전환했습니다.</strong>
@@ -5483,7 +5483,7 @@ function AutomationLauncherPanel({
           </div>
         )}
         {lastValidationResult?.ok === false && (
-          <div {...semanticSurfaceProps("danger", "validation-evaluation-error")}>{lastValidationResult.reason}</div>
+          <div {...semanticSurfaceProps("danger", "validation-evaluation-error ts-text-region")}>{lastValidationResult.reason}</div>
         )}
         <p className="validation-monitor-note ts-static-description">
           이 검증 plan은 지속 감시 runner와 연결하지 않습니다. 후보 plan을 우회해 장시간 실행 엔진을 시작하지 않으며, 포트폴리오를 합성하지 않고 표준 SMALL/FULL LIVE 권한도 변경하지 않습니다.

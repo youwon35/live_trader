@@ -112,7 +112,7 @@ export default function OperationalChecklistPanel({
       {rows.some((item) => AUTOMATIC_CHECKLIST_KEYS.has(item.key)) && (
         <p className="panel-action-line">자동 확인 대기 항목은 계좌·잔고에서 계좌를 갱신하고 시작 점검을 다시 실행하세요.</p>
       )}
-      {feedback && <p className={`inline-state ${feedback.error ? "danger" : "success"}`} role={feedback.error ? "alert" : "status"}>{feedback.text}</p>}
+      {feedback && <p className={`inline-state ts-text-region ${feedback.error ? "danger" : "success"}`} role={feedback.error ? "alert" : "status"}>{feedback.text}</p>}
     </section>
   );
 }

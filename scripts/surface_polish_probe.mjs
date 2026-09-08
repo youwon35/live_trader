@@ -1,24 +1,50 @@
 import assert from 'node:assert/strict';
 
+const textRegionCases = ["api-connection-banner", "emergency-stop-feedback active", "functional-test-route-notice", "functional-test-feedback is-error", "functional-test-feedback is-success", "crypto-first-live-warning", "crypto-first-live-feedback crypto-first-live-feedback--error", "crypto-first-live-feedback crypto-first-live-feedback--ok", "inline-state danger", "validation-evaluation-error ts-semantic-surface"];
+const checkedTextRegions = new WeakMap();
+async function verifyTextRegionVariants(page, label) {
+ const key = await page.evaluate(() => `${innerWidth}:${document.documentElement.dataset.uiTheme}`);
+ const seen = checkedTextRegions.get(page) || new Set();
+ if (seen.has(key)) return [];
+ const variants = await page.evaluate(cases => {
+  const host=document.createElement('section');host.setAttribute('aria-label','오프라인 오류 문장 스타일 검사');document.body.append(host);
+  try { return cases.map(name => {
+   const node=document.createElement('div');node.className=name+' ts-text-region';node.textContent='연결 또는 검증 결과를 확인하세요.';host.append(node);
+   const style=getComputedStyle(node);
+   return {className:node.className,background:style.backgroundColor,borderWidth:style.borderTopWidth,shadow:style.boxShadow,color:style.color};
+  }); } finally {host.remove();}
+ },textRegionCases);
+ for(const item of variants) {
+  assert.equal(item.background,'rgba(0, 0, 0, 0)',`${label}: rare message background ${item.className}`);
+  assert.equal(item.borderWidth,'0px',`${label}: rare message border ${item.className}`);
+  assert.equal(item.shadow,'none',`${label}: rare message shadow ${item.className}`);
+ }
+ seen.add(key);checkedTextRegions.set(page,seen);return variants;
+}
+
+
 // Read computed presentation only. No broker action, rejection or retirement is clicked.
 export async function probeSurfacePolish(page, label) {
  await page.evaluate(async () => { await new Promise(resolve => requestAnimationFrame(resolve)); await Promise.all(document.getAnimations().filter(animation => animation instanceof CSSTransition).map(animation => animation.finished.catch(() => undefined))); });
  const result = await page.evaluate(label => {
   const visible = e => !e.closest('[hidden],[aria-hidden="true"]') && e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0 && getComputedStyle(e).visibility !== 'hidden';
-  const style = e => { const s = getComputedStyle(e); return {text:e.textContent.trim().slice(0,100),className:e.className,background:s.backgroundColor,border:s.borderTopColor,color:s.color}; };
+  const style = e => { const s = getComputedStyle(e); return {text:e.textContent.trim().slice(0,100),className:e.className,background:s.backgroundColor,border:s.borderTopColor,borderWidth:s.borderTopWidth,shadow:s.boxShadow,color:s.color}; };
   const rgb = value => { const node=document.createElement('i');node.style.color=value;document.body.append(node);const result=getComputedStyle(node).color;node.remove();return result; };
   const root = getComputedStyle(document.documentElement);
   const expectedAccent = rgb(root.getPropertyValue('--ts-selection-accent').trim() || '#2f80ed');
   const selected = [...document.querySelectorAll('button[aria-pressed="true"],button[role="tab"][aria-selected="true"],button[data-ts-selected="true"]')].filter(visible).filter(e=>!e.matches('.danger-button,.danger-action,.ts-danger-button,.trash-icon-button')).map(style);
   const expectedForeground = rgb(root.getPropertyValue('--ts-selection-contrast').trim() || '#ffffff');
   const primary = [...document.querySelectorAll('.primary-button,.primary-action,.run-button,.doctor-run-button,.ts-ui-button--primary,.ts-action-button--primary,[data-ts-action-component="true"][data-ts-variant="primary"]')].filter(visible).filter(e=>!e.matches('.danger-button,.danger-action,.ts-danger-button')).map(style);
+  const textRegions = [...document.querySelectorAll('.ts-text-region')].filter(visible).map(style);
   const descriptions = [...document.querySelectorAll('.ts-static-description')].filter(visible).map(style);
   const danger = [...document.querySelectorAll('button.danger-button,button.ts-danger-button,button.danger-action,button.trash-icon-button')].filter(visible).map(style);
   const gaps = [...document.querySelectorAll('.artifact-detail-disclosure + .shared-strategy-actions,.live-compact-disclosure + .live-strategy-control-line')].filter(visible).filter(e=>getComputedStyle(e.previousElementSibling).position!=="fixed").map(e=>({gap:e.getBoundingClientRect().top-e.previousElementSibling.getBoundingClientRect().bottom,text:e.textContent.trim().slice(0,70)}));
   const grids = [...document.querySelectorAll('.ts-appearance-settings__grid')].filter(visible).map(e=>({columns:getComputedStyle(e).gridTemplateColumns.split(' ').length,groups:e.children.length,minGroupWidth:Math.min(...[...e.children].map(child=>child.getBoundingClientRect().width))}));
-  return {label,width:innerWidth,theme:document.documentElement.dataset.uiTheme,expectedAccent,expectedForeground,primary,selected,descriptions,danger,gaps,grids};
+  return {label,width:innerWidth,theme:document.documentElement.dataset.uiTheme,expectedAccent,expectedForeground,primary,selected,descriptions,textRegions,danger,gaps,grids};
  }, label);
- for (const item of result.descriptions) {
+ for (const item of [...result.descriptions,...result.textRegions]) {
+  assert.equal(item.borderWidth,"0px",`${label}: text region border width ${item.className}`);
+  assert.equal(item.shadow,"none",`${label}: text region shadow ${item.className}`);
   assert.equal(item.background,'rgba(0, 0, 0, 0)',`${label}: static description background ${item.className}`);
   assert.equal(item.border,'rgba(0, 0, 0, 0)',`${label}: static description border ${item.className}`);
  }
@@ -30,6 +56,7 @@ export async function probeSurfacePolish(page, label) {
  for (const item of result.selected) assert.equal(item.background,result.expectedAccent,`${label}: exact selected accent ${item.text}`);
  for (const item of result.gaps) assert.ok(item.gap >= 11,`${label}: evidence and actions gap ${item.gap}`);
  for (const item of result.grids) { assert.equal(item.groups,3);assert.equal(item.columns,result.width>=840?3:1);assert.ok(item.minGroupWidth>=180,`${label}: theme group too narrow: ${item.minGroupWidth}`); }
+ result.textRegionVariants=await verifyTextRegionVariants(page,label);
  return result;
 }
 
