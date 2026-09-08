@@ -11,7 +11,7 @@ export async function probeSurfacePolish(page, label) {
   const expectedAccent = rgb(root.getPropertyValue('--ts-selection-accent').trim() || '#2f80ed');
   const selected = [...document.querySelectorAll('button[aria-pressed="true"],button[role="tab"][aria-selected="true"],button[data-ts-selected="true"]')].filter(visible).filter(e=>!e.matches('.danger-button,.danger-action,.ts-danger-button,.trash-icon-button')).map(style);
   const expectedForeground = rgb(root.getPropertyValue('--ts-selection-contrast').trim() || '#ffffff');
-  const primary = [...document.querySelectorAll('.primary-button,.primary-action,.run-button,.doctor-run-button,.ts-ui-button--primary,.ts-action-button--primary,[data-ts-action-component="true"][data-ts-variant="primary"]')].filter(visible).map(style).filter(item=>item.background===expectedAccent);
+  const primary = [...document.querySelectorAll('.primary-button,.primary-action,.run-button,.doctor-run-button,.ts-ui-button--primary,.ts-action-button--primary,[data-ts-action-component="true"][data-ts-variant="primary"]')].filter(visible).filter(e=>!e.matches('.danger-button,.danger-action,.ts-danger-button')).map(style);
   const descriptions = [...document.querySelectorAll('.ts-static-description')].filter(visible).map(style);
   const danger = [...document.querySelectorAll('button.danger-button,button.ts-danger-button,button.danger-action,button.trash-icon-button')].filter(visible).map(style);
   const gaps = [...document.querySelectorAll('.artifact-detail-disclosure + .shared-strategy-actions,.live-compact-disclosure + .live-strategy-control-line')].filter(visible).filter(e=>getComputedStyle(e.previousElementSibling).position!=="fixed").map(e=>({gap:e.getBoundingClientRect().top-e.previousElementSibling.getBoundingClientRect().bottom,text:e.textContent.trim().slice(0,70)}));
@@ -26,7 +26,7 @@ export async function probeSurfacePolish(page, label) {
   assert.equal(item.background,'rgb(239, 68, 68)',`${label}: danger background ${item.text}`);
   assert.equal(item.border,'rgb(156, 163, 175)',`${label}: danger border ${item.text}`);
  }
- for (const item of result.primary) assert.equal(item.color,result.expectedForeground,`${label}: exact accent action contrast ${item.text}`);
+ for (const item of result.primary) { assert.equal(item.background,result.expectedAccent,`${label}: exact primary action accent ${item.text}`); assert.equal(item.color,result.expectedForeground,`${label}: exact accent action contrast ${item.text}`); }
  for (const item of result.selected) assert.equal(item.background,result.expectedAccent,`${label}: exact selected accent ${item.text}`);
  for (const item of result.gaps) assert.ok(item.gap >= 11,`${label}: evidence and actions gap ${item.gap}`);
  for (const item of result.grids) { assert.equal(item.groups,3);assert.equal(item.columns,result.width>=840?3:1);assert.ok(item.minGroupWidth>=180,`${label}: theme group too narrow: ${item.minGroupWidth}`); }
@@ -82,4 +82,20 @@ export async function verifySelectedCards(page, selector, label) {
   }
  } finally {await page.evaluate(styles=>styles.forEach(([name,value])=>document.documentElement.style.setProperty(name,value)),styles);}
  return result;
+}
+
+export async function verifyPrimaryAccents(page, label) {
+ const saved=await page.evaluate(()=>['--ts-selection-accent','--ts-selection-contrast'].map(key=>[key,document.documentElement.style.getPropertyValue(key)]));
+ const checks=[];
+ try {
+  for(const [accent,contrast] of [['#000080','#ffffff'],['#ffdd00','#000000']]) {
+   await page.evaluate(({accent,contrast})=>{document.documentElement.style.setProperty('--ts-selection-accent',accent);document.documentElement.style.setProperty('--ts-selection-contrast',contrast);},{accent,contrast});
+   const result=await probeSurfacePolish(page,`${label} / primary ${accent}`);
+   checks.push({accent,expectedForeground:result.expectedForeground,primary:result.primary});
+  }
+ } finally {
+  await page.evaluate(values=>values.forEach(([key,value])=>document.documentElement.style.setProperty(key,value)),saved);
+  await page.evaluate(async()=>{await new Promise(resolve=>requestAnimationFrame(resolve));await Promise.all(document.getAnimations().filter(a=>a instanceof CSSTransition).map(a=>a.finished.catch(()=>undefined)));});
+ }
+ return checks;
 }

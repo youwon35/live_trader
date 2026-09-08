@@ -5,17 +5,6 @@
 .settings-summary-grid.ts-panel-grid--two { grid-template-columns: minmax(0, 1fr); }
 .appearance-panel .custom-accent-label { display: grid; }
 
-/* program-console maps these filled actions to the exact --primary color in
-   both themes. Change only their foreground; mixed/secondary surfaces are untouched. */
-@layer interface-polish {
-:root[data-program] :is(.primary-button, .primary-action, .run-button, .doctor-run-button, .ts-ui-button--primary, .ts-action-button--primary, [data-ts-action-component="true"][data-ts-variant="primary"]):not(.danger-button, .danger-action, .ts-danger-button) {
-  color: var(--ts-selection-contrast, #ffffff) !important;
-}
-:root[data-program] :is(.primary-button, .primary-action, .run-button, .doctor-run-button, .ts-ui-button--primary, .ts-action-button--primary, [data-ts-action-component="true"][data-ts-variant="primary"]):not(.danger-button, .danger-action, .ts-danger-button) :is(span, strong, small, svg) {
-  color: inherit !important;
-}
-}
-
 /* A selected diagnostic is a choice; its separate status badge keeps the tone. */
 @layer interface-polish {
 button.doctor-card[data-ts-selected="true"] :is(.ts-status-card__title, .ts-status-card__detail) {

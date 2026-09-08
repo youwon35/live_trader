@@ -2630,12 +2630,12 @@ function CompactDisclosure({ title, description, badge, children, defaultOpen = 
         className="live-compact-disclosure__trigger"
         type="button"
         aria-expanded={open}
+        title={description || undefined}
         aria-controls={contentId}
         onClick={toggleDisclosure}
       >
         <span>
           <strong>{title}</strong>
-          {description && <small>{description}</small>}
         </span>
         <span className="live-compact-disclosure__state">{badge || (open ? "접기" : "열기")}</span>
       </button>
@@ -2787,7 +2787,7 @@ function WorkspaceContent({
     return renderPage(
       <section className="deployment-promotion-layout ts-layout-stack">
         <section className="panel">
-          <PanelHeader title="모의거래에서 받은 검증 근거" subtitle="모의 검증에서 넘어온 전체 후보를 확인한 뒤 아래에서 현재 운용 배포를 선택합니다." />
+          <PanelHeader title="모의거래에서 받은 검증 근거" />
           <PaperCandidateEvidencePanel />
         </section>
         <LivePreparationPanel
@@ -2949,7 +2949,6 @@ function DeploymentManifestPanel({ governance = {} }) {
     <section className="panel deployment-manifest-panel">
       <PanelHeader
         title="운용 배포 고정 구성 · 실행 엔진 고정값"
-        subtitle="전략·Portfolio·계좌 fingerprint·Risk·Runtime 버전을 한 revision으로 봉인합니다. 변경 시 새 Manifest와 Preflight가 필요합니다."
         suffix={<StatusPill tone={manifest ? (integrityOk ? "success" : "danger") : "neutral"}>{manifest ? (integrityOk ? "무결성 확인" : "무결성 점검") : "Preflight 전"}</StatusPill>}
       />
       {manifest ? (
@@ -2984,7 +2983,6 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
     <section className="panel preflight-scope-panel">
       <PanelHeader
         title="시작 점검 상세"
-        subtitle="전역 시스템과 현재 Deployment 검사를 분리해 표시합니다."
         suffix={<StatusPill tone={snapshotTone}>{latest.snapshotId ? (snapshotValid ? `${remainingSeconds}초 남음` : "무효·만료") : "스냅샷 없음"}</StatusPill>}
       />
       <div className="preflight-scope-grid">
@@ -3068,7 +3066,7 @@ function RuntimeComponentStatusPanel({ snapshot = {} }) {
   ];
   return (
     <section className="panel runtime-component-panel">
-      <PanelHeader title="실행 구성 요소" subtitle="단일 STOPPED 대신 데이터·전략·리스크·주문·이벤트 상태를 각각 표시합니다." />
+      <PanelHeader title="실행 구성 요소" />
       <div className="runtime-component-list">
         {rows.map((row) => <StatusRow key={row.label} label={row.label} status={row.status} value={row.value} detail={row.detail} />)}
       </div>
@@ -3210,7 +3208,7 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
   return (
     <section className="order-execution-layout ts-layout-stack">
       <section className="panel order-ledger-panel">
-        <PanelHeader title="주문 상태 원장" subtitle="불확실한 주문 결과는 실패와 분리하며, 같은 Client Order ID의 존재를 대조하기 전 재전송하지 않습니다." />
+        <PanelHeader title="주문 상태 원장" />
         <MasterDetailLog
           className="order-ledger-workspace"
           classes={{
@@ -3370,7 +3368,7 @@ function RiskUsagePanel({ snapshot = {}, context = {} }) {
   ];
   return (
     <section className="panel risk-usage-panel">
-      <PanelHeader title="현재 리스크 사용량" subtitle="설정값만 보여주지 않고 현재·주의·Hard Block을 함께 표시합니다. 관측값이 없으면 0이 아닌 미확인입니다." />
+      <PanelHeader title="현재 리스크 사용량" />
       <div className="risk-usage-list">
         {rows.map((row) => {
           const known = row.current !== null && row.current !== undefined && Number.isFinite(Number(row.current));
@@ -3401,7 +3399,7 @@ function RetryDecisionMatrixPanel({ matrix }) {
   ];
   return (
     <section className="panel retry-matrix-panel">
-      <PanelHeader title="요청별 재시도 원칙" subtitle="조회 재시도와 주문 POST 재전송을 분리합니다." />
+      <PanelHeader title="요청별 재시도 원칙" />
       <div className="table-scroll ts-scroll-panel"><table className="data-table"><thead><tr><th>요청</th><th>결과</th><th>동작</th><th>자동</th></tr></thead><tbody>{displayRows.map((row, index) => <tr key={`${row.request || row.request_type}-${index}`}><td>{row.request || row.request_type}</td><td>{row.result || row.outcome}</td><td>{row.action || row.policy}</td><td><StatusPill tone={row.automatic ? "warning" : "neutral"}>{row.automatic ? "허용" : "금지"}</StatusPill></td></tr>)}</tbody></table></div>
     </section>
   );
@@ -3415,7 +3413,6 @@ function IncidentAuditWorkspace({ snapshot = {} }) {
         audit={audit}
         detailLabel="감사 기록 상세"
         emptyText="표시할 감사 이벤트가 없습니다."
-        subtitle="잠금·배포·Preflight·모드·Risk·주문·Kill·Secret 변경을 append-only 원장에서 검색합니다."
         title="감사 이벤트"
       />
     </section>
@@ -3785,7 +3782,6 @@ function CapitalRolloutPanel({ snapshot = {}, selectedStrategyId = "", className
     <section className={`panel capital-rollout-panel ${className}`.trim()}>
       <PanelHeader
         title="단계별 자본 확대"
-        subtitle="최소 Canary → Small Live → Full Live 순서로만 상한이 커집니다. 실제 주문 게이트에도 같은 한도를 적용합니다."
         suffix={(
           <StatusPill tone={snapshot?.accountFresh && snapshot?.reconciliationFresh ? "success" : "warning"}>
             {snapshot?.accountFresh && snapshot?.reconciliationFresh ? "ACCOUNT FRESH" : "REFRESH NEEDED"}
@@ -3912,7 +3908,6 @@ function FuturesRiskSimulatorPanel({ strategies = [] }) {
     <section className="panel futures-risk-panel">
       <PanelHeader
         title="주문 직전 위험 시뮬레이터"
-        subtitle="현재 Binance mark·funding·maintenance bracket·수수료와 Artifact 정책으로 계산합니다. 주문이나 계정 설정은 변경하지 않습니다."
         suffix={<StatusPill tone={tone}>{result?.status || "READ ONLY"}</StatusPill>}
       />
       <div className="futures-risk-controls">
@@ -4060,7 +4055,6 @@ function FuturesSettingsPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
     <section className="panel futures-settings-panel">
       <PanelHeader
         title="Binance USD-M 종목별 증거금 설정"
-        subtitle="배율(x)과 위험률(%)을 분리하고, 포지션·미체결 주문이 없을 때만 명시 확인 후 적용합니다."
         suffix={<StatusPill tone={statusTone}>{current.status || "IDLE"}</StatusPill>}
       />
       <div className="futures-settings-controls">
@@ -4233,7 +4227,6 @@ function FuturesFillSoakPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
     <section className="panel futures-fill-soak-panel">
       <PanelHeader
         title="Binance USD-M 실체결 장시간 점검"
-        subtitle="전략 승급과 분리된 브로커 경로 검증입니다. 결과는 자동 승급 증거로 사용하지 않습니다."
         suffix={<StatusPill tone={statusTone}>{current.status || "IDLE"}</StatusPill>}
       />
       <MetricGrid columns={4}>
@@ -4298,7 +4291,7 @@ function FuturesFillSoakPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
 function OperationalSafeguardsPanel({ apiConnected, dryRun, newEntriesBlocked, killSwitch, operatorConfirmed, onConfirm, onDryRun, onEntryBlock, onTestIntent }) {
   return (
     <section className="panel operational-safeguards-panel">
-      <PanelHeader title="운영 차단 설정" subtitle="자동화 모드 전환 전에 공통 보호 장치를 확인합니다." />
+      <PanelHeader title="운영 차단 설정" />
       <div className="operator-actions">
         <ActionButton
           active={operatorConfirmed}
@@ -4368,7 +4361,7 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
 
   return (
     <section className="panel doctor-panel">
-      <PanelHeader title="실거래 시작 점검" subtitle="실계좌 주문 전에 꼭 필요한 항목만 압축해서 점검합니다." />
+      <PanelHeader title="실거래 시작 점검" />
       <div className="doctor-hero">
         <div>
           <span>점검 결과</span>
@@ -4929,7 +4922,6 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
     <section className="panel live-connection-assistant-panel">
       <PanelHeader
         title="브로커 실계좌 연결"
-        subtitle="저장된 브로커 설정을 점검합니다. 실제 연결 성공과 주문 허용은 별도로 확인합니다."
         suffix={<StatusPill tone={settingsTone}>{settingsLabel}</StatusPill>}
       />
       <NestedTabs
@@ -5057,7 +5049,6 @@ function TelegramConnectionPanel() {
     <section className="panel telegram-settings-panel">
       <PanelHeader
         title="Telegram 공통 알림"
-        subtitle="메시지를 보내지 않고 Bot API와 채팅 접근 권한을 확인합니다."
         suffix={(
           <StatusPill tone={statusTone}>
             {statusLabel}
@@ -5113,7 +5104,6 @@ function UnattendedSoakReportCard({ report }) {
       <div className="unattended-soak-heading">
         <div>
           <strong>무인 모니터 장시간 점검</strong>
-          <span>장시간 실행의 heartbeat, 재연결, 오류와 프로세스 자원을 한 리포트로 확인합니다.</span>
         </div>
         <StatusPill tone={tone}>{running ? status : verdict}</StatusPill>
       </div>
@@ -5232,7 +5222,7 @@ function AutomationLauncherPanel({
   if (!activeProfile) {
     return (
       <section className={`panel automation-panel ${className}`.trim()}>
-        <PanelHeader title="브로커별 자동화" subtitle="실거래 자동화는 자산군과 브로커별로 분리해서 시작합니다." />
+        <PanelHeader title="브로커별 자동화" />
         <EmptyRow text="사용 가능한 자동화 프로필이 없습니다." />
       </section>
     );
@@ -5269,7 +5259,7 @@ function AutomationLauncherPanel({
 
   return (
     <section className={`panel automation-panel ${className}`.trim()}>
-      <PanelHeader title="브로커별 자동화" subtitle="실거래 자동화는 자산군과 브로커별로 분리해서 시작합니다." />
+      <PanelHeader title="브로커별 자동화" />
       <NestedTabs
         ariaLabel="자동화 자산군"
         className="internal-tabs automation-profile-tabs"
@@ -5410,7 +5400,6 @@ function AutomationLauncherPanel({
       <section className="validation-monitor-card">
         <PanelHeader
           title="검증 전용 MONITOR"
-          subtitle="Backtest 후보를 Portfolio 또는 명시적 standalone Strategy로 정확히 바인딩해, lifecycle 승급 없이 실제 지표 코드로 1회 평가합니다. 이 경로에는 OrderIntent 생성과 브로커 주문 전송이 없습니다."
           suffix={(
             <button className="mini-button" type="button" disabled={validationLoading} onClick={refreshValidationPlan}>
               <RefreshCcw size={14} />
@@ -5549,7 +5538,7 @@ function RiskSettingsPanel({ settings, onRiskSetting }) {
 
   return (
     <section className="panel risk-settings-panel">
-      <PanelHeader title="리스크 한도 설정" subtitle="주문 전 게이트에서 사용하는 기본 안전 한도입니다." />
+      <PanelHeader title="리스크 한도 설정" />
       <div className="settings-list">
         {settings.map((setting) => (
           <div className="setting-row" key={setting.key}>
@@ -5644,7 +5633,7 @@ function OrderQueueSummaryPanel({ summary }) {
   ];
   return (
     <section className="panel order-queue-panel">
-      <PanelHeader title="주문 큐 요약" subtitle="주문 의도의 현재 생명주기 상태입니다." />
+      <PanelHeader title="주문 큐 요약" />
       <div className="queue-grid">
         {items.map((item) => (
           <div {...semanticSurfaceProps(item.tone, "queue-card")} key={item.label}>
@@ -5668,7 +5657,7 @@ function RetryPolicyPanel({ policy, onRetryPolicy }) {
 
   return (
     <section className="panel retry-policy-panel">
-      <PanelHeader title="재시도 정책" subtitle="브로커 전송 전 단계에서 사용할 재시도 기준입니다." />
+      <PanelHeader title="재시도 정책" />
       <div className="settings-list">
         {policy.map((setting) => (
           <div className={`setting-row ${setting.type === "boolean" && settingsBooleanValue(setting.value) ? "active" : ""}`} key={setting.key}>
@@ -5857,7 +5846,7 @@ function LiveStrategySelectorPanel({
   );
   return (
     <section className="panel live-strategy-selector-panel">
-      <PanelHeader title="선택한 배포 전략" subtitle="현재 단계와 실제 운영 행동만 기본 표시합니다." />
+      <PanelHeader title="선택한 배포 전략" />
       <div className="live-strategy-selector-grid">
         <label>
           <span>전략 저장본</span>
@@ -5992,7 +5981,7 @@ function StrategyDiscoveryToolbar({
   ].filter(Boolean);
   return (
     <section className="panel strategy-discovery-panel">
-      <PanelHeader title="전략 찾기" subtitle="이름·ID·종목·파라미터를 검색하고, 자주 쓰는 조건은 저장해서 다시 불러옵니다." />
+      <PanelHeader title="전략 찾기" />
       <div className="strategy-discovery-primary">
         <label className="strategy-discovery-search">
           <Search size={16} />
@@ -6189,7 +6178,7 @@ function AuditPanel({
   audit = [],
   detailLabel = "기술 로그 상세",
   emptyText = "검색 조건에 맞는 로그가 없습니다.",
-  subtitle = "사용자용 감사 기록과 분리된 개발·운영 진단 로그입니다.",
+  subtitle,
   title = "기술 로그",
 }) {
   const [query, setQuery] = useState("");

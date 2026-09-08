@@ -1,4 +1,4 @@
-import { probeSurfacePolish } from './surface_polish_probe.mjs';
+import { probeSurfacePolish, verifyPrimaryAccents } from './surface_polish_probe.mjs';
 // Presentation-only probe for restoring the pre-unification UI while retaining one font.
 export async function probeRestoredUi(page,label) {
  const presentation = await page.evaluate(label=>{
@@ -10,6 +10,7 @@ export async function probeRestoredUi(page,label) {
   return {label,width:innerWidth,theme:document.documentElement.dataset.uiTheme,textNodes:text.length,fontFailures,logs,tabs};
  },label);
  if(process.env.SURFACE_POLISH_REVIEW==='1') presentation.surface = await probeSurfacePolish(page,label);
+ if(process.env.ACTION_ACCENT_REVIEW==='1') presentation.actions = await verifyPrimaryAccents(page,label);
  return presentation;
 }
 export async function inspectRestoredTabs(page,label,results,theme,seen=new Set()) {
