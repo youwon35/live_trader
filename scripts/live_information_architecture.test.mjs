@@ -45,7 +45,8 @@ test("merged sections preserve old routes and keep broker testing separate from 
   assert.match(appSource, /<NestedTabs ariaLabel=.*? options=\{sectionTabs\} value=\{selectedNav\} onChange=\{onNavigate\}/);
   assert.match(appSource, /최초 연결 또는 주문 경로 변경 때 점검하며, 실제 자금과 별도 승인이 필요합니다/);
   assert.match(appSource, /통과해도 전략은 승급하지 않습니다/);
-  assert.match(appSource, /백테스트 → 모의 검증 → 제한 실거래 → 실전 운용/);
+  assert.match(appSource, /aria-label="저장본 검증 단계"/);
+  assert.match(appSource, /lifecycleTimeline\.map/);
 });
 
 test("advanced one-shot diagnostics load only on explicit opening", () => {

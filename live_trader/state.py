@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .operator_review import OperatorReviewStore, record_key
+
 import os
 import csv
 import html
@@ -896,6 +898,7 @@ BROKER_SNAPSHOT_MAX_BACKOFF_SECONDS = 1800.0
 REDUCE_ONLY_POSITION_MAX_AGE_SECONDS = 60.0
 EXECUTION_SUMMARY_AUDIT_INTERVAL_SECONDS = 900.0
 APP_DATA_ROOT = default_runtime_data_root()
+OPERATOR_REVIEW_STORE = OperatorReviewStore(APP_DATA_ROOT / "logs" / "operator-review.sqlite3")
 DOCTOR_DIAGNOSTICS_PATH = Path(
     os.environ.get("LIVE_TRADER_DOCTOR_DIAGNOSTICS")
     or APP_DATA_ROOT / "logs" / "doctor-diagnostics.json"
@@ -10459,6 +10462,11 @@ def snapshot() -> dict[str, Any]:
         "doctor_diagnostics": doctor_diagnostics_document(include_history=False),
         "audit": list(reversed(STATE["audit"][-30:])),
     }
+    for collection in ("durable_audit", "technical_logs", "audit"):
+        payload[collection] = [{**row, "operatorRecordKey": record_key(row)} for row in payload.get(collection, [])]
+    payload["operator_runtime_bindings"] = operator_runtime_bindings(continuous_runtime)
+    payload["operator_review_error"] = STATE.get("operator_review_error", "")
+    payload["operator_review_revision"] = STATE.get("operator_review_revision", "")
     return redact_sensitive_payload(payload)  # type: ignore[return-value]
 
 
@@ -18120,6 +18128,7 @@ def run_final_preflight(
             "launch_report": scoped_launch,
         }
         doctor_diagnostics = persist_doctor_diagnostic_snapshot(doctor_data)
+        capture_operator_preflight(requested_deployment or requested_strategy or "global", scoped_checks)
         append_audit(
             "danger",
             "최종 Preflight",
@@ -18226,6 +18235,10 @@ def run_final_preflight(
         "launch_report": scoped_launch,
     }
     doctor_diagnostics = persist_doctor_diagnostic_snapshot(doctor_data)
+    capture_operator_preflight(
+        str((selected or {}).get("deployment_id") or requested_deployment or requested_strategy or "global"),
+        scoped_checks, str((governance_preflight or {}).get("deploymentManifestHash") or ""),
+    )
     append_audit(
         "danger" if hard_stop_count else "warn" if warning_count else "info",
         "최종 Preflight",
@@ -27689,3 +27702,88 @@ def paper_candidate_evidence_inbox() -> dict[str, Any]:
     """Read published Evidence without runtime or account observation hooks."""
     from .paper_candidate_inbox import list_paper_candidates
     return list_paper_candidates()
+
+
+# Operator-only review data. These functions never refresh broker state or alter authority.
+def capture_operator_preflight(scope, checks, manifest_hash=""):
+    try:
+        OPERATOR_REVIEW_STORE.capture_preflight(scope, checks, manifest_hash, STATE.get("risk_settings", {}))
+        STATE["operator_review_error"] = ""
+        STATE["operator_review_revision"] = datetime.now().isoformat()
+    except (OSError, sqlite3.Error, ValueError, TypeError):
+        STATE["operator_review_error"] = "점검 비교 이력을 저장하지 못했습니다. 현재 안전 검사 결과는 별도로 유지됩니다."
+
+
+def operator_runtime_bindings(runtime):
+    result = []
+    profiles = runtime.get("profiles") or {str(runtime.get("profileId") or ""): runtime}
+    for profile, value in profiles.items():
+        if not isinstance(value, dict) or value.get("running") is not True:
+            continue
+        item = {"profile": profile, "running": True, "deploymentId": value.get("deploymentId", ""), "manifest": None}
+        try:
+            session_id = str((STATE.get("active_runtime_session_ids") or {}).get(profile) or "")
+            session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id) if session_id else None
+            if session and session.lifecycle in {"STARTING", "RUNNING", "DEGRADED", "DRAINING", "STOPPING"}:
+                manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(session.deployment_manifest_hash)
+                if manifest and (not item["deploymentId"] or item["deploymentId"] == session.deployment_id):
+                    item.update({"deploymentId": session.deployment_id, "sessionId": session.session_id, "mode": session.mode, "lifecycle": session.lifecycle, "manifest": manifest.to_dict()})
+        except (OSError, sqlite3.Error, ValueError):
+            item["error"] = "실행 고정 구성 조회 실패"
+        result.append(item)
+    return result
+
+
+def operator_manifest_view(manifest):
+    if not manifest:
+        return None
+    document = manifest.to_dict() if hasattr(manifest, "to_dict") else dict(manifest)
+    expected_hash = document.get("portfolioArtifactHash")
+    portfolio = None
+    if expected_hash:
+        portfolio = next((row for row in portfolio_rows() if (verified_portfolio_artifact_reference(row) or {}).get("artifactHash") == expected_hash), None)
+    from .operator_review import manifest_weights
+    return {**document, "reviewWeights": manifest_weights(document, portfolio), "reviewRiskLabels": {row["key"]: row["label"] for row in risk_setting_rows()}, "reviewRisk": OPERATOR_REVIEW_STORE.risk_at_manifest(document.get("manifestHash"))}
+
+
+def operator_review_document(deployment_id):
+    scope = str(deployment_id or "global")
+    history = OPERATOR_REVIEW_STORE.preflights(scope)
+    current = OPERATIONAL_GOVERNANCE.get_deployment_manifest(scope) if scope != "global" else None
+    previous = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(current.previous_manifest_hash) if current and current.previous_manifest_hash else None
+    # Prefer the immutable version actually running, including when viewing a different deployment.
+    bindings = operator_runtime_bindings(LIVE_CONTINUOUS_CONTROLLER.snapshot())
+    running = next((row for row in bindings if row.get("manifest") and row.get("deploymentId") == scope), None)
+    if running is None and len(bindings) == 1 and bindings[0].get("manifest"):
+        running = bindings[0]
+    if running:
+        previous = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(running["manifest"]["manifestHash"])
+    proposed = None
+    error = ""
+    strategy = _operational_strategy(strategy_rows(portfolio_rows()), deployment_id=scope)
+    if strategy and str(strategy.get("deployment_id") or "") == scope:
+        try:
+            inputs = _operational_manifest_inputs(strategy)
+            proposed = {"deploymentId": scope, "portfolioArtifactHash": inputs["portfolio_artifact_hash"], "strategyArtifactHash": inputs["strategy_artifact_hash"], "riskPolicyHash": inputs["risk_policy_hash"], "brokerRoute": inputs["broker_route"], "accountFingerprint": inputs["account_fingerprint"], "metadata": inputs["metadata"]}
+            proposed = operator_manifest_view(proposed)
+            proposed["reviewRisk"] = dict(STATE.get("risk_settings", {}))
+        except (OSError, sqlite3.Error, ValueError, KeyError):
+            error = "선택 배포의 현재 고정 구성을 검증하지 못했습니다. 저장된 버전만 비교합니다."
+    baseline = previous or current
+    return {"ok": True, "scope": scope, "history": history, "before": operator_manifest_view(baseline), "after": proposed or operator_manifest_view(current), "comparisonBasis": "실행 중 고정 버전" if running else "직전 저장 버전" if previous else "현재 저장 버전", "comparisonError": error}
+
+
+def operator_note_document(key, payload=None):
+    if payload is None:
+        return {"ok": True, "note": OPERATOR_REVIEW_STORE.note(key)}
+    rows = [*durable_audit_rows(), *STATE.get("audit", [])]
+    if not any(record_key(row) == key for row in rows):
+        return {"ok": False, "reason": "현재 조회 가능한 실행 기록을 다시 선택한 뒤 메모를 저장하세요."}
+    note = OPERATOR_REVIEW_STORE.save_note(key, payload.get("text"), payload.get("revision"))
+    return {"ok": True, "note": note}
+
+
+def operator_order_history(order_id, offset=0):
+    from .operator_review import read_order_audit
+    result = read_order_audit(AUDIT_STORE.path, order_id, offset)
+    return {"ok": True, **redact_sensitive_payload(result)}

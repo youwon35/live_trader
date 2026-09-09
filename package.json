@@ -21,7 +21,9 @@
     "test:information-architecture": "node --test scripts/live_information_architecture.test.mjs",
     "test:workflow": "node --test scripts/live_information_architecture.test.mjs scripts/execution_availability.test.mjs scripts/doctor_display.test.mjs scripts/operational_checklist_ui.test.mjs scripts/broker_settings_ui.test.mjs scripts/paper_candidate_evidence_ui.test.mjs scripts/deployment_selection.test.mjs scripts/account_refresh.test.mjs",
     "ui:offline": "node scripts/simplified_flow_fixture.mjs",
-    "ui:smoke": "node scripts/ui_smoke.mjs"
+    "ui:smoke": "node scripts/ui_smoke.mjs",
+    "test:operator-insights": "node --test scripts/operator_insights.test.mjs",
+    "ui:operator-insights": "node scripts/operator_insights_fixture.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

@@ -1,3 +1,4 @@
+import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, ReconciliationEvidence, CapitalAllowance, DeploymentChanges, OrderInvestigation, OperatorNoteEditor } from "./OperatorInsights.jsx";
 import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
 import OperationalChecklistPanel from "./OperationalChecklistPanel";
 import { ordinaryExecutionView, recordedReconciliation, verifiedCanaryExecution } from "./executionAvailability.js";
@@ -2585,7 +2586,7 @@ function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) 
       <div className="live-environment-identity">
         <span className="live-environment-badge">실계좌</span>
         <label>
-          <span>현재 운용 배포</span>
+          <span>조회 중인 배포</span>
           <select value={context.id} onChange={(event) => onSelect(event.target.value)}>
             {(deploymentOptions || []).map((option) => (
               <option key={option.id} value={option.id}>{option.label}</option>
@@ -2596,10 +2597,11 @@ function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) 
         <div className="live-context-meta">
           <strong>{context.portfolioName}</strong>
           <span>{context.brokerId} · 계정 {context.accountId} · {context.symbol} {context.timeframe}</span>
-          <span>실행 회차 · {sessionId}</span>
+          <span>조회 배포의 최근 회차 · {snapshot.live_governance?.activeSession?.deploymentId === context.id ? sessionId : "미확인"}</span>
           {(!contextMatchesPreflight || !preflightValid) && <span>선택 변경 또는 만료 · 이 운용 배포의 시작 점검을 다시 실행하세요.</span>}
         </div>
       </div>
+      <RunningSelection snapshot={snapshot} context={context} />
       <div className="live-safety-hierarchy">
         {safety.map((item) => (
           <div key={item.label}>
@@ -2736,6 +2738,7 @@ function WorkspaceContent({
       <section className="ts-panel-grid ts-panel-grid--two automation-page-layout">
         <AutomationLauncherPanel
           className="live-grid-full"
+          reviewSnapshot={snapshot}
           deploymentContext={deploymentContext}
           profiles={snapshot.automation_profiles}
           strategies={snapshot.strategies}
@@ -2790,6 +2793,7 @@ function WorkspaceContent({
           <PanelHeader title="모의거래에서 받은 검증 근거" />
           <PaperCandidateEvidencePanel />
         </section>
+        <DeploymentChanges snapshot={snapshot} scope={deploymentContext.id} />
         <LivePreparationPanel
           snapshot={snapshot}
           deploymentOnly
@@ -2873,7 +2877,7 @@ function WorkspaceContent({
           description="기본 화면은 현재 사용량과 즉시 차단 장치만 보여줍니다. 설정 변경과 요청별 정책은 여기에서 관리합니다."
         >
           <section className="ts-panel-grid ts-panel-grid--two live-secondary-panel-grid">
-            <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
+            <RiskSettingsPanel settings={snapshot.risk_settings} snapshot={snapshot} context={deploymentContext} onRiskSetting={onRiskSetting} />
             <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
             <FuturesRiskSimulatorPanel strategies={selectedStrategy ? [selectedStrategy] : []} />
             <RetryDecisionMatrixPanel matrix={snapshot.retry_policy_matrix} />
@@ -3015,6 +3019,7 @@ function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, on
         {execution.nextAction && <p>{execution.nextAction}</p>}
         <button className="secondary-button" type="button" onClick={() => onNavigate("automation")}>실행 범위 확인</button>
       </section>
+      <PreflightChanges snapshot={snapshot} scope={selectedDeploymentId} />
       <section className="operations-overview-primary ts-panel-grid ts-panel-grid--two">
         <PreTradeDoctorPanel
           snapshot={snapshot}
@@ -3102,6 +3107,7 @@ function ThreeWayReconciliationPanel({ snapshot = {} }) {
           </React.Fragment>
         ))}
       </div>
+      <ReconciliationEvidence snapshot={snapshot} />
     </section>
   );
 }
@@ -3270,6 +3276,7 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
                     <div><dt>위험</dt><dd>{order.risk_report?.can_submit === true ? "승인" : order.risk_report?.can_submit === false ? "차단" : "미확인"}</dd></div>
                   </dl>
                 </section>
+                <OrderInvestigation key={`${order.broker_id}:${order.order_id}:${order.updated_at || ""}`} snapshot={snapshot} order={order} />
                 <section className="order-detail-section order-timeline-section">
                   <header><h4>주문 타임라인</h4><span>{timelineProjection.timeline.length}건</span></header>
                   <div className="order-timeline">
@@ -3707,7 +3714,7 @@ function LivePreparationPanel({
             <FuturesRiskSimulatorPanel strategies={selectedStrategy ? [selectedStrategy] : []} />
             <CapitalRolloutPanel snapshot={snapshot.capital_rollout} selectedStrategyId={selectedStrategy?.strategy_id} />
             <FuturesFillSoakPanel snapshot={snapshot.binance_futures_fill_soak} selectedSymbol={selectedStrategy?.symbol} />
-            <RiskSettingsPanel settings={snapshot.risk_settings} onRiskSetting={onRiskSetting} />
+            <RiskSettingsPanel settings={snapshot.risk_settings} snapshot={snapshot} context={strategyDeploymentContext(selectedStrategy)} onRiskSetting={onRiskSetting} />
             <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
           </div>
         )}
@@ -5132,6 +5139,7 @@ function UnattendedSoakReportCard({ report }) {
 }
 
 function AutomationLauncherPanel({
+  reviewSnapshot = {},
   className = "",
   deploymentContext,
   profiles,
@@ -5257,6 +5265,8 @@ function AutomationLauncherPanel({
   return (
     <section className={`panel automation-panel ${className}`.trim()}>
       <PanelHeader title="브로커별 자동화" />
+      <NoOrderExplanation snapshot={reviewSnapshot} context={deploymentContext || {}} />
+      <StopEffects />
       <NestedTabs
         ariaLabel="자동화 자산군"
         className="internal-tabs automation-profile-tabs"
@@ -5521,7 +5531,10 @@ function isCryptoStrategy(strategy) {
 }
 
 
-function RiskSettingsPanel({ settings, onRiskSetting }) {
+function RiskSettingsPanel({ settings, snapshot = {}, context = {}, onRiskSetting }) {
+  const [capitalDraft, setCapitalDraft] = useState(null);
+  const capitalSetting = settings.find(setting => setting.key === "strategy_capital_limit_krw");
+  useEffect(() => { setCapitalDraft(null); }, [capitalSetting?.value, context.id]);
   function commitChange(event, setting) {
     const nextValue = event.currentTarget.value;
     if (Number(nextValue) !== Number(setting.value)) {
@@ -5548,6 +5561,7 @@ function RiskSettingsPanel({ settings, onRiskSetting }) {
                 min={setting.min}
                 max={setting.max}
                 step={setting.step}
+                onChange={event => { if (setting.key === "strategy_capital_limit_krw") setCapitalDraft(event.target.value); }}
                 onBlur={(event) => commitChange(event, setting)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter") event.currentTarget.blur();
@@ -5558,6 +5572,7 @@ function RiskSettingsPanel({ settings, onRiskSetting }) {
           </div>
         ))}
       </div>
+      {capitalSetting && <CapitalAllowance snapshot={snapshot} context={context} limit={capitalDraft ?? capitalSetting.value} />}
     </section>
   );
 }
@@ -6260,6 +6275,7 @@ function AuditPanel({
           return (
             <>
               <p>{row.message}</p>
+              <OperatorNoteEditor key={row.item.operatorRecordKey || row.id} recordKey={row.item.operatorRecordKey} />
               <dl>
                 <div><dt>시각</dt><dd>{row.time}</dd></div>
                 <div><dt>범위 · 중요도</dt><dd>{row.scope} · {row.level}</dd></div>

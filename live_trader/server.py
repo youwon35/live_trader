@@ -7,11 +7,12 @@ import math
 import mimetypes
 import os
 import socket
+import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import env_settings, state
 from .functional_test_workspace import FUNCTIONAL_TEST_WORKSPACE
@@ -413,6 +414,22 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             require_origin=False
         ):
             return
+        if parsed.path == "/api/operator-order-history":
+            query = parse_qs(parsed.query)
+            try:
+                result = state.operator_order_history(query.get("order_id", [""])[0], int(query.get("offset", ["0"])[0]))
+            except (OSError, sqlite3.Error, ValueError, RuntimeError):
+                result = {"ok": False, "reason": "저장된 주문 조사 기록을 읽지 못했습니다."}
+            self.send_json(result)
+            return
+        if parsed.path in {"/api/operator-review", "/api/operator-note"}:
+            query = parse_qs(parsed.query)
+            try:
+                result = state.operator_review_document(query.get("deployment_id", [""])[0]) if parsed.path == "/api/operator-review" else state.operator_note_document(query.get("record_key", [""])[0])
+            except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+                result = {"ok": False, "reason": "로컬 검토 기록을 읽지 못했습니다: " + type(exc).__name__}
+            self.send_json(result)
+            return
         if parsed.path == "/api/paper-candidates":
             self.send_json(state.paper_candidate_evidence_inbox())
             return
@@ -560,7 +577,22 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             require_origin=True
         ):
             return
+        if parsed.path == "/api/operator-note":
+            origin = self.headers.get("Origin", "")
+            expected = "http://" + self.headers.get("Host", "")
+            if origin != expected or not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+                self.send_json({"ok": False, "reason": "현재 앱 화면에서만 메모를 저장할 수 있습니다."})
+                return
         payload = self.read_json()
+        if parsed.path == "/api/operator-note":
+            if not isinstance(payload, dict):
+                self.send_json({"ok": False, "reason": "메모 입력 형식이 올바르지 않습니다."})
+                return
+            try:
+                self.send_json(state.operator_note_document(str(payload.get("record_key") or ""), payload))
+            except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+                self.send_json({"ok": False, "reason": str(exc) if isinstance(exc, ValueError) else "로컬 메모 저장 실패"})
+            return
         if parsed.path == "/api/safety-confirmation/challenge":
             self.send_json(
                 state.issue_safety_confirmation(

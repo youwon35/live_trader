@@ -1,0 +1,26 @@
+.operator-insights { margin: 12px 0; min-width: 0; color: var(--text-primary, var(--text, inherit)); font-size: 13px; }
+.operator-inline-toggle { cursor: pointer; padding: 8px 0; font-weight: 700; }
+.operator-insights p { margin: 7px 0; line-height: 1.55; overflow-wrap: anywhere; }
+.operator-insights small { display: block; line-height: 1.55; }
+.operator-insights ul { margin: 6px 0; padding-left: 20px; }
+.operator-insights li { margin: 8px 0; line-height: 1.55; }
+.operator-insights .operator-inline { margin: 8px 0; }
+.operator-insights dl { display: grid; gap: 8px; margin: 10px 0; }
+.operator-insights dl > div { display: grid; grid-template-columns: minmax(105px, 160px) minmax(0, 1fr); gap: 12px; }
+.operator-insights dd { margin: 0; overflow-wrap: anywhere; }
+.operator-insights dt { opacity: .8; }
+.operator-summary-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 18px; }
+.operator-table-scroll { overflow-x: auto; max-width: 100%; }
+.operator-insights table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.operator-insights th, .operator-insights td { padding: 10px 9px; border-bottom: 1px solid var(--border, #cbd5e1); text-align: left; overflow-wrap: anywhere; vertical-align: top; min-width: 90px; }
+.operator-insights h4 { margin: 16px 0 8px; }
+.operator-insights textarea { box-sizing: border-box; display: block; width: 100%; resize: vertical; }
+.operator-note-actions { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-top: 8px; }
+.operator-running { flex-basis: 100%; margin: 0; display: flex; flex-wrap: wrap; align-items: start; gap: 8px 20px; }
+.operator-running .operator-inline { margin: 0; min-width: 0; }
+@media(max-width: 1050px) { .operator-summary-grid { grid-template-columns: 1fr; } .operator-insights dl > div { grid-template-columns: minmax(90px,125px) minmax(0,1fr); } }
+
+.operator-inline-toggle { background: transparent; border: 0; color: inherit; text-align: left; width: 100%; min-width: 0; font-weight: 700; padding: 8px 0; }
+.operator-inline-toggle::before { content: "▸ "; }
+.operator-inline-toggle[aria-expanded="true"]::before { content: "▾ "; }
+.operator-inline > [hidden] { display: none !important; }
