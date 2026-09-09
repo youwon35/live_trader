@@ -69,7 +69,7 @@ export default function OperationalChecklistPanel({
       <div className="panel-header">
         <div>
           <h2>운영 체크리스트</h2>
-          <p>운용자가 실제 절차를 확인한 항목만 개별 저장합니다. 계좌·대조 항목은 서버 검사 결과로 표시합니다.</p>
+
         </div>
       </div>
       <p className="panel-action-line">

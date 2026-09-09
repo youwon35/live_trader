@@ -369,7 +369,7 @@ export default function FunctionalTestWorkspace({ snapshot = {} }) {
         <div>
           <span className="functional-test-eyebrow">KIS 기간 제한 시험</span>
           <h3>KIS 기간형 기능시험</h3>
-          <p>대상·기간·당일 승인·실제 적용 한도를 한 흐름에서 관리합니다.</p>
+
         </div>
         <div className="functional-test-hero-status">
           <span className={`functional-test-status functional-test-status--${statusTone}`}>

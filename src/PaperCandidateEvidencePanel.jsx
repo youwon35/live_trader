@@ -56,7 +56,7 @@ export default function PaperCandidateEvidencePanel({ strategyId = "" }) {
   return (
     <details className="compact-disclosure">
       <summary>모의거래 검증 근거 확인</summary>
-      <p>모의거래에서 발행한 검증 근거와 현재 전략·실행 단위 저장본을 대조합니다. 확인 전용이며 배포 생성, 승인, 주문 설정을 변경하지 않습니다.</p>
+
       <p>{inbox?.requiredNextStep || "현재는 검증 근거 확인만 가능합니다. Live 후보 등록과 최초 제한 실거래 승인 기능은 준비 중입니다."}</p>
       <button className="secondary-button" disabled={busy} onClick={refresh} type="button">
         {busy ? "확인 중…" : "Paper 검증 근거 새로고침"}

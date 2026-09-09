@@ -2954,7 +2954,7 @@ function DeploymentManifestPanel({ governance = {} }) {
       {manifest ? (
         <div className="deployment-manifest-grid">
           <div><span>고정 구성</span><strong>rev {manifest.revision} · {compactHash(manifest.manifestHash)}</strong><small>{manifest.deploymentId}</small></div>
-          <div><span>저장본 검증값</span><strong>{compactHash(manifest.portfolioArtifactHash || manifest.strategyArtifactHash)}</strong><small>포트폴리오 우선 · 전략 봉인</small></div>
+          <div><span>저장본 검증값</span><strong>{compactHash(manifest.portfolioArtifactHash || manifest.strategyArtifactHash)}</strong></div>
           <div><span>거래소 · 계좌</span><strong>{manifest.brokerRoute || "미확인"}</strong><small>fingerprint {compactHash(manifest.accountFingerprint)}</small></div>
           <div><span>위험 · 설정</span><strong>R{manifest.riskPolicyRevision} · C{manifest.configRevision}</strong><small>{compactHash(manifest.riskPolicyHash)} · {compactHash(manifest.configHash)}</small></div>
           <div><span>시작 점검 조회 상태</span><strong>{preflight?.status || "미생성"}</strong><small>{preflight?.snapshotId || "현재 Deployment 점검 필요"}</small></div>
@@ -4967,8 +4967,6 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
             >
               <div>
                 <strong>{field.label}</strong>
-                <span>{field.detail}</span>
-                <em>{field.key}</em>
               </div>
               {field.kind === "bool" ? (
                 <ToggleSwitch
@@ -4991,7 +4989,6 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         })}
       </div>
       <div className="live-assistant-save-row">
-        <span>{settings?.envPath || ".env"} · secret은 저장 후 화면에 다시 표시하지 않습니다.</span>
         {message && <em role="status">{message}</em>}
         {settingsStatus === "error" && (
           <button className="secondary-button compact-button" disabled={saving} onClick={() => setLoadAttempt((attempt) => attempt + 1)} type="button">
@@ -5338,7 +5335,7 @@ function AutomationLauncherPanel({
             {runtimeBindingBlocked ? "RUN BLOCK" : "DEPLOYMENT BOUND"}
           </StatusPill>
           <span>{runtimeBindingDetail}</span>
-          <small>모드 버튼은 화면의 실행 요청만 선택하며, Run을 누르기 전에는 실행 엔진 설정을 변경하지 않습니다.</small>
+
         </div>
         <div className="automation-metrics">
           <div>
@@ -5387,7 +5384,7 @@ function AutomationLauncherPanel({
           <StatusPill tone={runtimeTone}>
             {runtimeRunning ? `${liveRuntimeModeLabel(profileRuntime.mode)} 실행 중` : profileRuntime?.phase || "STOPPED"}
           </StatusPill>
-          <span>시세는 계속 수신하고 전략은 확정 봉마다 1회만 평가합니다. HOLD 후에도 다음 봉에서 자동으로 다시 판단합니다.</span>
+
           {profileRuntime?.lastError && <small data-ts-semantic-preserve="true">{profileRuntime.lastError}</small>}
         </div>
       </div>
@@ -5485,9 +5482,7 @@ function AutomationLauncherPanel({
         {lastValidationResult?.ok === false && (
           <div {...semanticSurfaceProps("danger", "validation-evaluation-error ts-text-region")}>{lastValidationResult.reason}</div>
         )}
-        <p className="validation-monitor-note ts-static-description">
-          이 검증 plan은 지속 감시 runner와 연결하지 않습니다. 후보 plan을 우회해 장시간 실행 엔진을 시작하지 않으며, 포트폴리오를 합성하지 않고 표준 SMALL/FULL LIVE 권한도 변경하지 않습니다.
-        </p>
+
         {researchShort && (
           <div
             {...semanticSurfaceProps(
@@ -5511,9 +5506,7 @@ function AutomationLauncherPanel({
                 </span>
               ))}
             </div>
-            <small>
-              researchOnly · 실제 주문 0 · 기존 holdout 재사용으로 production 승급과 Live 권한 부여는 차단됩니다.
-            </small>
+
           </div>
         )}
       </section>
@@ -5884,7 +5877,7 @@ function LiveStrategySelectorPanel({
             />
           </div>
           <CompactDisclosure title="전체 검증 단계" description="같은 원본 저장본의 메타데이터를 Backtester → 모의거래 Trader → Live Trader에서 표시합니다. 배포 운용 상태와 현재 주문 권한은 별도입니다.">
-            <p className="pipeline-role-hint ts-static-description"><strong>백테스트 → 모의 검증 → 제한 실거래 → 실전 운용</strong>신호 관찰과 가상체결은 하나의 모의 검증에 포함됩니다. 주문 연결 시험은 전략 단계와 별개이며, 제한 실거래에는 별도 승인이 필요합니다.</p>
+
             <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="저장본 검증 단계">
               {lifecycleTimeline.map((item) => (
                 <article className={item.state} key={item.id}>

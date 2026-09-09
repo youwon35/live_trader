@@ -203,7 +203,7 @@ export default function CryptoFirstLivePanel({ onSafetyStateChange }) {
         <div>
           <span className="functional-test-eyebrow">CRYPTO FIRST LIVE · NATIVE TRUSTED CONTROL</span>
           <h2 id="crypto-first-live-heading">코인 2시간 실거래 기능시험</h2>
-          <p>감독형 1회 기능시험이며 승급 근거가 아닙니다. 두 거래소를 동시에 활성화하지 않습니다.</p>
+
         </div>
         <div className="crypto-first-live-toolbar">
           <button
@@ -223,10 +223,6 @@ export default function CryptoFirstLivePanel({ onSafetyStateChange }) {
         </div>
       </header>
 
-      <div className="crypto-first-live-warning ts-text-region" role="note">
-        <AlertTriangle size={18} aria-hidden="true" />
-        <span>출금·이체·마진·선물 금지 · 다른 봇/수동거래 금지 · release HOLD에서는 시작 버튼이 잠깁니다.</span>
-      </div>
 
       <div className="crypto-first-live-grid">
         <LaneCard
