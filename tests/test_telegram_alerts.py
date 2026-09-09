@@ -30,7 +30,7 @@ class LiveTelegramAuditAlertTests(unittest.TestCase):
         send.assert_called_once()
         self.assertIn("모드 전환 차단", send.call_args.args[0])
         self.assertEqual("critical", send.call_args.kwargs["severity"])
-        self.assertEqual(600, send.call_args.kwargs["dedupe_seconds"])
+        self.assertEqual(3600, send.call_args.kwargs["dedupe_seconds"])
 
     def test_recovery_event_queues_warning_but_normal_watchdog_stays_quiet(self) -> None:
         with mock.patch.object(state, "persist_audit_event"), mock.patch.object(
@@ -41,9 +41,11 @@ class LiveTelegramAuditAlertTests(unittest.TestCase):
             state.append_audit("info", "Recovery Drill", "복구 훈련 통과")
             state.append_audit("info", "Watchdog", "정상: critical 0 / warning 0")
 
-        send.assert_called_once()
-        self.assertEqual("warning", send.call_args.kwargs["severity"])
-        self.assertEqual("safety", send.call_args.kwargs["event_type"])
+        self.assertEqual(2, send.call_count)
+        recovery = send.call_args_list[1].kwargs
+        self.assertEqual("recovery", recovery["event_type"])
+        self.assertEqual("healthy", recovery["state_value"])
+        self.assertFalse(recovery["notify_initial"])
 
     def test_watchdog_warning_is_still_actionable(self) -> None:
         with mock.patch.object(state, "persist_audit_event"), mock.patch.object(
@@ -165,7 +167,7 @@ class LiveTelegramAuditAlertTests(unittest.TestCase):
         self.assertEqual("warn", state.STATE["audit"][-1]["level"])
         send.assert_called_once()
         self.assertEqual("warning", send.call_args.kwargs["severity"])
-        self.assertEqual(600, send.call_args.kwargs["dedupe_seconds"])
+        self.assertEqual(21600, send.call_args.kwargs["dedupe_seconds"])
 
     def test_invalid_checkpoint_fails_closed_and_queues_startup_warning_once(self) -> None:
         state.STATE.update({"mode": "SMALL_LIVE", "dry_run": False, "new_entries_blocked": False})

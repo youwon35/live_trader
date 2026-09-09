@@ -10549,6 +10549,7 @@ def append_audit(level: str, event: str, detail: str, *, audit_record: AuditEven
 
 def queue_live_audit_telegram(level: str, event: str, detail: str) -> bool:
     """Queue only actionable Live safety alerts; fills use notify_new_live_fills."""
+    from trading_runtime.telegram_alert_policy import alert_broker_scope, stable_alert_reason
 
     normalized_level = str(level or "").strip().lower()
     normalized_event = str(event or "").strip()
@@ -10568,14 +10569,20 @@ def queue_live_audit_telegram(level: str, event: str, detail: str) -> bool:
         normalized_event in TELEGRAM_CONNECTIVITY_AUDIT_EVENTS
         and "연결 복구" in str(detail or "")
     )
-    if not (is_critical or is_safety_event or is_connectivity_failure or is_connectivity_recovery):
+    is_health_recovery = normalized_event in TELEGRAM_HEALTH_AUDIT_EVENTS and normalized_level in {"info", "success"}
+    if not (is_critical or is_safety_event or is_connectivity_failure or is_connectivity_recovery or is_health_recovery):
         return False
+    recovered = is_connectivity_recovery or is_health_recovery
+    stable_state = "healthy" if recovered else (
+        f"{normalized_level}:{bool(STATE.get('kill_switch'))}:{bool(STATE.get('new_entries_blocked'))}:"
+        + stable_alert_reason(detail)
+    )
 
     try:
         return TELEGRAM_DISPATCHER.send_async(
             "\n".join(
                 [
-                    "⚠️ <b>[실전 트레이더] 확인 필요</b>",
+                    "✅ <b>[실전 트레이더] 복구 확인</b>" if recovered else "⚠️ <b>[실전 트레이더] 확인 필요</b>",
                     f"이벤트: {html.escape(normalized_event)}",
                     f"운용 상태: {html.escape(str(STATE.get('mode') or 'MONITOR'))}",
                     f"거래 영향: Kill Switch {'ON' if STATE.get('kill_switch') else 'OFF'} · 신규 진입 {'차단' if STATE.get('new_entries_blocked') else '허용'}",
@@ -10583,12 +10590,15 @@ def queue_live_audit_telegram(level: str, event: str, detail: str) -> bool:
                     f"내용: {html.escape(str(detail or '')[:1200])}",
                 ]
             ),
-            dedupe_key=f"live-alert:{normalized_event}:{str(detail or '')[:120]}",
-            dedupe_seconds=600,
+            dedupe_key=f"live-alert:{normalized_event}:{stable_state}",
+            dedupe_seconds=3600 if is_critical else 21600,
+            state_key=f"live-health:{normalized_event}:{alert_broker_scope(detail)}",
+            state_value=stable_state,
+            notify_initial=not recovered,
             severity="critical" if is_critical else "warning",
             event_type=(
                 "recovery"
-                if is_connectivity_recovery
+                if recovered
                 else "failure"
                 if is_critical or is_connectivity_failure
                 else "safety"
