@@ -20,6 +20,8 @@ let safetyConfirmationPresenter = null;
 let activeSafetyConfirmationFlow = null;
 let functionalHttpSessionPromise = null;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
+  "/api/paper-candidates/import",
+  "/api/monitor-trial/run",
   "/api/safety-confirmation/challenge",
   "/api/upbit-functional/start",
   "/api/upbit-functional/stop",
@@ -877,6 +879,14 @@ export async function request(path, options = {}) {
 }
 
 
+export function importPaperCandidate(requestBody) {
+  return request("/api/paper-candidates/import", { method: "POST", body: requestBody });
+}
+
 export function getPaperCandidateEvidence() {
   return request("/api/paper-candidates");
+}
+
+export function runLocalMonitorTrial(requestBody) {
+  return request("/api/monitor-trial/run", { method: "POST", body: requestBody, timeoutMs: 60_000 });
 }

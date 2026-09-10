@@ -158,3 +158,13 @@ test("주문 CSV는 현재 필터 결과와 Deployment 식별자를 보존한다
     reason: "",
   }]);
 });
+
+
+test("봉인된 Paper 근거를 가져온 검토 대기 배포는 선택만 가능하며 주문 권한은 생기지 않는다", () => {
+  const candidate = strategy("imported", "draft", { deployment_source: "deployment-registry", paper_live_qualification: { ready: true }, permissions: { live_allowed: false, live_small_eligible: false, live_eligible: false } });
+  const options = buildCurrentDeploymentOptions([candidate, strategy("unverified", "draft")]);
+  assert.equal(options.length, 1);
+  assert.equal(options[0].id, candidate.deployment_id);
+  assert.equal(options[0].strategy.permissions.live_allowed, false);
+  assert.equal(options[0].strategy.permissions.live_small_eligible, false);
+});

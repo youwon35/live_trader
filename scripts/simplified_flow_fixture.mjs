@@ -15,6 +15,7 @@ import { EMPTY_FUNCTIONAL_TEST_WORKSPACE } from '../src/functionalTestModel.js';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const dist = resolve(root, 'dist');
 const output = resolve(root, 'output/playwright/simplified-flow');
+const candidateReview = process.env.CANDIDATE_REVIEW === '1' ? JSON.parse(await readFile(resolve(root,'output/sep11-functional-audit/candidate-ui/responses.json'),'utf8')) : null;
 const appSource = await readFile(resolve(root, 'src/App.jsx'), 'utf8');
 const fallbackLiteral = appSource.match(/const fallbackSnapshot = (\{[\s\S]*?\n\});\s*const PANEL_SIZE_STORAGE_KEY/);
 assert.ok(fallbackLiteral, 'the fail-closed fixture base must be an explicit static literal');
@@ -83,6 +84,7 @@ try {
   const configurations=fontReview?[1024,1920].flatMap(width=>['light','dark'].map(theme=>({viewport:{width,height:1000},theme}))):[{viewport:{width:1280,height:800},theme:'light'},{viewport:{width:1920,height:1080},theme:'light'}];
   for (const {viewport,theme} of configurations) {
     const context = await browser.newContext({ viewport, serviceWorkers: 'block' });
+    if(candidateReview) await context.addInitScript(()=>{window.pywebview={api:{functional_http_session:async()=>({ok:true,available:true,csrfHeader:'X-LiveTrader-CSRF',csrfToken:'fixture-csrf-'.repeat(4)})}};});
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -100,7 +102,9 @@ try {
       }
       report.apiRequests.push({ path: url.pathname, method: request.method(), viewport: viewport.width });
       let body = { ok: true };
-      if (url.pathname === '/api/snapshot') body = snapshot;
+      if (url.pathname === '/api/paper-candidates' && candidateReview) body = candidateReview.before;
+      else if(url.pathname === '/api/monitor-trial/run' && candidateReview){assert.equal(request.method(),'POST');assert.deepEqual(request.postDataJSON(),candidateReview.trialRequest);body=candidateReview.trialResult;}
+      else if (url.pathname === '/api/snapshot') body = snapshot;
       else if (url.pathname === '/api/functional-test') body = EMPTY_FUNCTIONAL_TEST_WORKSPACE;
       else if (url.pathname === '/api/search-presets') body = { schemaVersion: 1, presets: [] };
       else if (url.pathname === '/api/artifact-metadata') body = { items: {} };
@@ -147,6 +151,21 @@ try {
         assert.equal(await cards.getByText('제한 실거래 대기', { exact: true }).count(), 1);
         assert.equal(await page.getByRole('button', { name: '실전 운용 단계로 승인', exact: true }).isDisabled(), true);
         await page.screenshot({ path: resolve(output, `strategy-${viewport.width}.png`) });
+        if(candidateReview){
+          await page.getByText('모의거래 검증 근거 확인',{exact:true}).click();
+          await page.getByRole('button',{name:'Paper 검증 근거 새로고침',exact:true}).click();
+          await page.getByRole('button',{name:'검토 대기 후보 등록',exact:true}).waitFor();
+          const beforeSelection=await page.evaluate(()=>localStorage.getItem('live_trader.deploymentContext.v1'));
+          await page.getByLabel('시험용 구성 선택').selectOption(`${candidateReview.trialRequest.rootKey}:${candidateReview.trialRequest.portfolioId}`);
+          await page.getByRole('button',{name:'주문 없이 연결 시험',exact:true}).click();
+          await page.getByText('입력 근거와 한계 보기',{exact:true}).waitFor();
+          assert.equal(await page.evaluate(()=>localStorage.getItem('live_trader.deploymentContext.v1')),beforeSelection);
+          await page.evaluate(()=>{document.documentElement.dataset.uiTheme='light';});
+          await page.screenshot({path:resolve(output,`candidate-trial-full-app-${viewport.width}.png`),fullPage:true});
+          report.views.push({viewport:viewport.width,label:'후보 및 연결 시험 실제 앱',currentSelectionPreserved:true});
+          await page.keyboard.press('Escape');
+        }
+
       }
       if (label === '실거래 운용') {
         assert.equal(report.apiRequests.filter(({ path, viewport: width }) => path.includes('validation-small-live') && width === viewport.width).length, 0, 'advanced diagnostics must not load passively');

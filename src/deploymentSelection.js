@@ -95,7 +95,8 @@ function isLiveWorkspaceCandidate(strategy) {
   const permissions = strategy.permissions && typeof strategy.permissions === "object"
     ? strategy.permissions
     : {};
-  return strategy.live_allowed === true
+  return (strategy.deployment_source === "deployment-registry" && strategy.paper_live_qualification?.ready === true)
+    || strategy.live_allowed === true
     || strategy.live_small_eligible === true
     || strategy.live_eligible === true
     || permissions.live_allowed === true

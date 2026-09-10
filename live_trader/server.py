@@ -44,6 +44,8 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
 )
 _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
+        "/api/paper-candidates/import",
+        "/api/monitor-trial/run",
         "/api/safety-confirmation/challenge",
         "/api/upbit-functional/start",
         "/api/upbit-functional/stop",
@@ -584,6 +586,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "reason": "현재 앱 화면에서만 메모를 저장할 수 있습니다."})
                 return
         payload = self.read_json()
+        if parsed.path == "/api/paper-candidates/import":
+            self.send_json(state.import_paper_candidate_metadata(payload))
+            return
+        if parsed.path == "/api/monitor-trial/run":
+            self.send_json(state.run_local_monitor_trial(payload))
+            return
         if parsed.path == "/api/operator-note":
             if not isinstance(payload, dict):
                 self.send_json({"ok": False, "reason": "메모 입력 형식이 올바르지 않습니다."})

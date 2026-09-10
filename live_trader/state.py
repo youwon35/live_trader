@@ -27747,6 +27747,24 @@ def paper_candidate_evidence_inbox() -> dict[str, Any]:
     return list_paper_candidates()
 
 
+def import_paper_candidate_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    """Register exact metadata only; no runtime, account or authority mutation."""
+    from .paper_candidate_import import import_paper_candidate
+    try:
+        return import_paper_candidate(payload)
+    except (ValueError, OSError, RuntimeError) as exc:
+        return {"ok": False, "authorizationGranted": False, "reason": str(exc)}
+
+
+def run_local_monitor_trial(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run an isolated local observer; no current runtime/deployment mutation."""
+    from .monitor_trial import run_monitor_trial
+    try:
+        return run_monitor_trial(payload, report_root=APP_DATA_ROOT / "logs" / "monitor-trials")
+    except (ValueError, OSError, RuntimeError, TypeError, KeyError) as exc:
+        return {"ok": False, "authorizationGranted": False, "reason": str(exc)}
+
+
 # Operator-only review data. These functions never refresh broker state or alter authority.
 def capture_operator_preflight(scope, checks, manifest_hash=""):
     try:

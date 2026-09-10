@@ -1905,6 +1905,7 @@ function App() {
       if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
       setSnapshot({ ...next, api_connected: true });
       setError("");
+      return next;
     } catch (err) {
       if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
       const nativeEmergency = await getNativeEmergencyStopStatus();
@@ -2309,6 +2310,21 @@ function App() {
     void engageGlobalKill();
   }
 
+  async function selectImportedCandidate(deploymentId) {
+    const deadline = Date.now() + 15_000;
+    while (snapshotRequestInFlightRef.current && Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    }
+    if (snapshotRequestInFlightRef.current || emergencyActionInFlightRef.current) {
+      throw new Error("등록은 완료됐습니다. 현재 작업이 끝난 뒤 등록한 배포 보기를 눌러주세요.");
+    }
+    const updated = await refresh();
+    if (!updated || !buildCurrentDeploymentOptions(updated.strategies || []).some((item) => item.id === deploymentId)) {
+      throw new Error("등록은 완료됐지만 배포 목록을 확인하지 못했습니다. 새로고침 후 등록한 배포 보기를 눌러주세요.");
+    }
+    selectDeploymentContext(deploymentId);
+  }
+
   function selectDeploymentContext(deploymentId) {
     setSelectedDeploymentId(deploymentId);
     try {
@@ -2489,6 +2505,7 @@ function App() {
           deploymentContext={deploymentContext}
           selectedStrategy={selectedStrategy}
           onDeploymentSelect={selectDeploymentContext}
+          onPaperCandidateRegistered={selectImportedCandidate}
           searchQuery={searchQuery}
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
           onDryRun={() => runAction(() => setFlag("dry_run", !snapshot.dry_run, snapshot.dry_run))}
@@ -2699,6 +2716,7 @@ function WorkspaceContent({
   deploymentContext,
   selectedStrategy,
   onDeploymentSelect,
+  onPaperCandidateRegistered,
   searchQuery,
   onConfirm,
   onDryRun,
@@ -2791,7 +2809,7 @@ function WorkspaceContent({
       <section className="deployment-promotion-layout ts-layout-stack">
         <section className="panel">
           <PanelHeader title="모의거래에서 받은 검증 근거" />
-          <PaperCandidateEvidencePanel />
+          <PaperCandidateEvidencePanel onRegistered={onPaperCandidateRegistered} />
         </section>
         <DeploymentChanges snapshot={snapshot} scope={deploymentContext.id} />
         <LivePreparationPanel

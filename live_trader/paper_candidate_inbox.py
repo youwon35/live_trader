@@ -26,7 +26,7 @@ from trading_runtime.portfolio_runtime import infer_market_route, _assert_instan
 SCHEMA = "live-paper-evidence-inbox-v1"
 MAX_BYTES = 8 * 1024 * 1024
 MAX_FILES = 1000
-READ_ONLY_REASON = "현재는 검증 근거 확인만 가능합니다. Live 후보 등록과 최초 제한 실거래 승인 기능은 준비 중입니다."
+READ_ONLY_REASON = "검증된 정확한 저장본을 검토 대기 후보로 등록할 수 있습니다. 등록은 계좌 연결·승급·주문 실행을 승인하지 않습니다."
 
 
 class CandidateBlocked(ValueError):
@@ -80,6 +80,8 @@ def _files(folder: Path) -> list[Path]:
 
 def _registry(root: Path) -> dict[str, Any]:
     path = root / "deployments" / "deployment-registry.json"
+    if (path.parent / ".deployment-transaction.json").exists():
+        raise CandidateBlocked("Deployment 저장 복구가 끝난 뒤 새로고침하세요.")
     if not path.exists():
         return {"schemaVersion": DEPLOYMENT_REGISTRY_SCHEMA_VERSION, "entries": {}}
     result = _read(path, root)
@@ -236,7 +238,7 @@ def _candidate(root, evidence, registry, catalogs):
     identity = qualification.snapshot()
     identity.pop("ready", None)
     identity.pop("schemaVersion", None)
-    return {
+    row = {
         "evidenceId": identity["evidenceId"], "strategyId": scope.strategy_artifact_id,
         "strategyName": str(strategy.get("name") or scope.strategy_artifact_id),
         "portfolioId": scope.portfolio_artifact_id, "instanceHash": instance_hash,
@@ -245,10 +247,39 @@ def _candidate(root, evidence, registry, catalogs):
         "status": "VERIFIED_READ_ONLY", "canImport": False,
         "authorizationGranted": False, "detail": "현재 저장본과 봉인 검증 근거가 일치합니다. 확인 전용입니다.",
     }
+    entry = registry["entries"].get(row["deployment"]["deploymentId"], {})
+    pins = candidate_pins(identity)
+    permissions = entry.get("permissions") or {}
+    registered = bool(entry) and all(permissions.get(key) == value for key, value in pins.items())
+    importable = not entry or (
+        entry.get("lifecycle") == "draft" and entry.get("mode") in ("MONITOR", "OFF")
+        and entry.get("accountId") == "live-account-unresolved"
+        and not any(permissions.get(key) is True for key in ("live_allowed", "live_eligible", "live_small_eligible"))
+    )
+    row["registered"] = registered
+    row["canImport"] = importable and not registered
+    row["registryHash"] = stable_sha256(registry)
+    if row["canImport"]:
+        row["importRequest"] = {"rootKey": row["rootKey"], "evidenceId": row["evidenceId"],
+            "identityHash": stable_sha256({"identity": identity, "instanceHash": instance_hash}),
+            "expectedRevision": row["deployment"]["revision"], "registryHash": row["registryHash"]}
+        row["detail"] = "봉인 근거 확인 완료 · 검토 대기 후보로 등록 가능"
+    elif registered:
+        row["detail"] = "같은 봉인 근거로 등록됨 · 현재 배포 상태와 주문 권한은 별도 확인"
+    return row
+
+
+def candidate_pins(identity):
+    return {"paperEvidenceId": identity["evidenceId"], "paperEvidenceHash": identity["evidenceHash"],
+        "paperEvidenceBundleHash": identity["evidenceBundleHash"], "paperFinalBindingHash": identity["bindingHash"],
+        "paperGovernanceDeploymentId": identity["paperGovernanceDeploymentId"],
+        "paperStrategyInstanceId": identity["strategyInstanceId"],
+        "paperPortfolioInstanceId": identity.get("portfolioInstanceId", "")}
 
 
 def list_paper_candidates(*, roots: Sequence[Path] | None = None) -> dict[str, Any]:
     rows, errors = [], []
+    trials, trial_error = [], ""
     try:
         folders = list(roots) if roots is not None else configured_artifact_roots()
         for root in dict.fromkeys(Path(path).resolve() for path in folders):
@@ -275,6 +306,12 @@ def list_paper_candidates(*, roots: Sequence[Path] | None = None) -> dict[str, A
             rows = []
     except (OSError, ValueError, RuntimeError, TypeError) as exc:
         rows, errors = [], [str(exc)]
+    if not errors:
+        try:
+            from .monitor_trial import list_monitor_trials
+            trials = list_monitor_trials(folders)
+        except (OSError, ValueError, RuntimeError, TypeError, KeyError) as exc:
+            trial_error = str(exc)
     return {"ok": not errors, "schemaVersion": SCHEMA, "candidates": rows, "errors": errors,
-            "readOnly": True, "canImport": False, "authorizationGranted": False,
-            "requiredNextStep": READ_ONLY_REASON}
+            "readOnly": True, "canImport": any(row.get("canImport") is True for row in rows), "authorizationGranted": False,
+            "requiredNextStep": READ_ONLY_REASON, "monitorTrials": trials, "monitorTrialError": trial_error}

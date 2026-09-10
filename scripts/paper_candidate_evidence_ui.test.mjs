@@ -20,14 +20,21 @@ const oldFetch = globalThis.fetch;
 let calls = [];
 let responseForFetch;
 let nativeBridgeReads = 0;
+let allowImport = false;
 globalThis.window = {
   setTimeout, clearTimeout,
   get pywebview() { nativeBridgeReads += 1; throw new Error("Native bridge forbidden in read-only UI test"); },
 };
 globalThis.fetch = async (url, options) => {
-  assert.equal(url, "/api/paper-candidates");
-  assert.equal(options.method, "GET");
-  assert.equal(options.body, undefined);
+  if (options.method === "POST") {
+    assert.equal(allowImport, true);
+    assert.equal(url, "/api/paper-candidates/import");
+    assert.equal(options.headers["X-LiveTrader-CSRF"], "fixture-csrf-".repeat(4));
+  } else {
+    assert.equal(url, "/api/paper-candidates");
+    assert.equal(options.method, "GET");
+    assert.equal(options.body, undefined);
+  }
   calls.push({ url, method: options.method, credentials: options.credentials });
   return responseForFetch(url, options);
 };
@@ -230,6 +237,53 @@ test("HTTP refresh failure makes one GET and preserves manual retry only", async
 test("App integration displays the complete inbox without an automatic strategy filter or execution callbacks", () => {
   const appSource = readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
   assert.equal((appSource.match(/<PaperCandidateEvidencePanel\b/g) || []).length, 1);
-  assert.match(appSource, /<PaperCandidateEvidencePanel\s*\/>/);
+  assert.match(appSource, /<PaperCandidateEvidencePanel onRegistered=\{onPaperCandidateRegistered\}\s*\/>/);
+  assert.match(appSource, /onPaperCandidateRegistered=\{selectImportedCandidate\}/);
   assert.doesNotMatch(source, /useEffect|setInterval|onImport|onApprove|onStart/);
+});
+
+
+test("explicit candidate registration uses the exact preview and native CSRF; never submits on refresh", async () => {
+  const priorWindow = globalThis.window;
+  const proposal = { rootKey: "a".repeat(64), evidenceId: "paper-evidence-a", identityHash: "b".repeat(64), registryHash: "c".repeat(64), expectedRevision: 0 };
+  const ready = row({ canImport: true, importRequest: proposal, deployment: { deploymentId: "", mode: "UNREGISTERED", lifecycle: "", definitionHash: "", revision: 0 } });
+  const selected = [];
+  let posted = null;
+  try {
+    globalThis.window = { setTimeout, clearTimeout, pywebview: { api: { functional_http_session: async () => ({ ok: true, available: true, csrfHeader: "X-LiveTrader-CSRF", csrfToken: "fixture-csrf-".repeat(4) }) } } };
+    allowImport = true;
+    useResponse(result([ready], { canImport: true }));
+    const view = harness({ onRegistered: async (id) => selected.push(id) });
+    await view.refresh(); view.render();
+    assert.deepEqual(calls.map(c => c.method), ["GET"]);
+    responseForFetch = async (_url, options) => {
+      if (options.method === "POST") {
+        posted = JSON.parse(options.body);
+        return response({ ok: true, deploymentId: "new-draft", authorizationGranted: false, detail: "검토 대기 후보로 등록했습니다." });
+      }
+      return response(result([row({ registered: true, deployment: { deploymentId: "new-draft", mode: "MONITOR", lifecycle: "draft", definitionHash: "d".repeat(64), revision: 1 } })]));
+    };
+    await view.buttons().find(button => button.props.children === "검토 대기 후보 등록").props.onClick();
+    assert.deepEqual(posted, proposal);
+    assert.deepEqual(calls.map(c => c.method), ["GET", "POST", "GET"]);
+    assert.deepEqual(selected, ["new-draft"]);
+    assert.match(view.render(), /등록한 배포 보기/);
+    assert.doesNotMatch(view.render(), /실거래 시작|주문 제출/);
+  } finally { allowImport = false; globalThis.window = priorWindow; }
+});
+
+test("stale import rejection clears the preview and does not automatically retry", async () => {
+  const priorWindow = globalThis.window;
+  const proposal = { rootKey: "a", evidenceId: "paper-evidence-a", identityHash: "b", registryHash: "c", expectedRevision: 0 };
+  try {
+    globalThis.window = { setTimeout, clearTimeout, pywebview: { api: { functional_http_session: async () => ({ ok: true, available: true, csrfHeader: "X-LiveTrader-CSRF", csrfToken: "fixture-csrf-".repeat(4) }) } } };
+    allowImport = true;
+    useResponse(result([row({ canImport: true, importRequest: proposal })], { canImport: true }));
+    const view = harness(); await view.refresh(); view.render();
+    responseForFetch = async () => response({ ok: false, reason: "Deployment가 바뀌었습니다. 새로고침하세요.", authorizationGranted: false });
+    await view.buttons().find(button => button.props.children === "검토 대기 후보 등록").props.onClick();
+    assert.match(view.render(), /Deployment가 바뀌었습니다/);
+    assert.equal(view.buttons().length, 1);
+    assert.deepEqual(calls.map(c => c.method), ["GET", "POST"]);
+  } finally { allowImport = false; globalThis.window = priorWindow; }
 });

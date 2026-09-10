@@ -123,11 +123,13 @@ class PaperCandidateInboxTests(unittest.TestCase):
         self.assertEqual(row["instanceHash"], assert_verified_strategy_instance(self.instance))
         self.assertEqual(row["deployment"]["mode"], "UNREGISTERED")
         self.assertIs(result["readOnly"], True)
-        self.assertIs(result["canImport"], False)
+        self.assertIs(result["canImport"], True)
         self.assertIs(result["authorizationGranted"], False)
-        self.assertIs(row["canImport"], False)
+        self.assertIs(row["canImport"], True)
         self.assertNotIn("request", row)
-        self.assertIn("Live 후보 등록", result["requiredNextStep"])
+        self.assertIn("주문 실행을 승인하지 않습니다", result["requiredNextStep"])
+        self.assertEqual(row["importRequest"]["expectedRevision"], 0)
+        self.assertEqual(row["importRequest"]["registryHash"], stable_sha256(service._registry(self.root)))
         self.assertEqual(file_bytes(self.root), before)
 
     def test_standalone_wire_hash_matches_paper_producer_without_runtime_dependency(self):
@@ -214,7 +216,7 @@ class PaperCandidateInboxTests(unittest.TestCase):
         with patch.object(service, "configured_artifact_roots", side_effect=RuntimeError("root unavailable")):
             self.assertFalse(service.list_paper_candidates()["ok"])
 
-    def test_get_route_authenticates_and_post_import_does_not_exist(self):
+    def test_get_route_authenticates_and_import_has_separate_authenticated_route(self):
         source = (APP_ROOT / "live_trader" / "server.py").read_text(encoding="utf-8-sig")
         tree = ast.parse(source)
         method = next(node for cls in tree.body if isinstance(cls, ast.ClassDef) for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "do_GET")
@@ -229,10 +231,41 @@ class PaperCandidateInboxTests(unittest.TestCase):
         handler.do_GET()
         handler._authorize_functional_http.assert_called_with(require_origin=False)
         namespace["state"].snapshot.assert_not_called()
-        self.assertNotIn('/api/paper-candidates/import', source)
-        self.assertNotIn('import_paper_candidate_metadata', (APP_ROOT / "live_trader" / "state.py").read_text(encoding="utf-8-sig"))
+        self.assertIn('/api/paper-candidates/import', source)
+        self.assertIn('import_paper_candidate_metadata', (APP_ROOT / "live_trader" / "state.py").read_text(encoding="utf-8-sig"))
         self.assertFalse(hasattr(service, "import_paper_candidate"))
 
+
+    def test_import_post_denies_before_reading_body_and_only_routes_authorized_metadata(self):
+        source = (APP_ROOT / "live_trader" / "server.py").read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        method = next(node for cls in tree.body if isinstance(cls, ast.ClassDef) for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "do_POST")
+        mutation_paths = next(node.value for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "_FUNCTIONAL_MUTATION_PATHS" for target in node.targets))
+        paths = eval(compile(ast.Expression(mutation_paths), "<paths>", "eval"), {"frozenset": frozenset})
+        metadata = Mock(return_value={"ok": True, "authorizationGranted": False})
+        namespace = {"urlparse": urlparse, "_FUNCTIONAL_STATUS_PATHS": set(), "_FUNCTIONAL_MUTATION_PATHS": paths, "state": types.SimpleNamespace(import_paper_candidate_metadata=metadata)}
+        cls = ast.ClassDef(name="Harness", bases=[], keywords=[], body=[method], decorator_list=[])
+        ast.fix_missing_locations(cls)
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), "<isolated-import-http>", "exec"), namespace)
+        handler = namespace["Harness"]()
+        handler.path = "/api/paper-candidates/import"
+        handler._authorize_functional_http = Mock(return_value=False)
+        handler.read_json = Mock(return_value={"evidenceId": "fixture"})
+        handler.send_json = Mock()
+        handler._send_functional_http_denial = Mock()
+        handler.do_POST()
+        handler._authorize_functional_http.assert_called_once_with(require_origin=True)
+        handler.read_json.assert_not_called()
+        metadata.assert_not_called()
+        handler._authorize_functional_http.return_value = True
+        handler.do_POST()
+        metadata.assert_called_once_with({"evidenceId": "fixture"})
+        handler.send_json.assert_called_once_with({"ok": True, "authorizationGranted": False})
+        handler.path = "http://127.0.0.1/api/paper-candidates/import"
+        handler.read_json.reset_mock()
+        handler.do_POST()
+        handler._send_functional_http_denial.assert_called_once()
+        handler.read_json.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
