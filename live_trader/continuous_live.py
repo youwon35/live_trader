@@ -25,6 +25,7 @@ from trading_runtime import (
 )
 
 from .order_management import OrderIntent
+from .continuous_dispatch import ContinuousDispatcher
 from .portfolio_execution import (
     LIVE_PORTFOLIO_PLAN_SCHEMA,
     ExecutionSyncReport,
@@ -59,6 +60,8 @@ class LiveContinuousController:
         self.portfolio_execution_symbols: tuple[str, ...] = ()
         self._portfolio_sync_lock = threading.RLock()
         self._portfolio_last_sync_monotonic = 0.0
+        self._deferred_dispatcher: ContinuousDispatcher | None = None
+        self._dispatcher_setup_lock = threading.Lock()
 
     def start(
         self,
@@ -85,6 +88,15 @@ class LiveContinuousController:
         )
         if normalized_mode not in {"MONITOR", "SMALL_LIVE", "FULL_LIVE"}:
             return {"ok": False, "reason": f"지원하지 않는 runtime mode입니다: {normalized_mode}", "snapshot": state.snapshot()}
+        dispatch_status = self._dispatch_status(normalized_profile)
+        if normalized_mode != "MONITOR" and dispatch_status.get("reconciliationRequired"):
+            state.STATE["new_entries_blocked"] = True
+            return {
+                "ok": False,
+                "reason": "continuous-dispatch-reconciliation-required: 이전 주문 전송 결과를 대조한 뒤 다시 시작하세요.",
+                "dispatch": dispatch_status,
+                "snapshot": state.snapshot(),
+            }
         if normalized_purpose not in {"", state.FUNCTIONAL_TEST_EXECUTION_PURPOSE}:
             return {
                 "ok": False,
@@ -528,7 +540,7 @@ class LiveContinuousController:
                 status_store=DurableRuntimeState(self.root / "logs" / f"continuous_{normalized_profile}_status.json"),
                 poll_seconds=2.0,
                 heartbeat_seconds=5.0,
-                operation_lock=state.RUNTIME_MODE_LOCK,
+                operation_lock=self._dispatcher(),
             )
             self.supervisor.start()
             source_kind = "Portfolio" if loaded is not None else "Standalone Strategy"
@@ -594,6 +606,7 @@ class LiveContinuousController:
             **base,
             "profileId": self.profile_id,
             "mode": self.mode,
+            "dispatch": self._dispatch_status(),
             "portfolioPath": self.portfolio_path,
             "deploymentId": self.deployment_id,
             "portfolioId": self.portfolio_id,
@@ -1560,15 +1573,136 @@ class LiveContinuousController:
             evaluator_state=evaluator_state,
         )
 
-    def _handle_cycle(self, cycle: Any) -> dict[str, Any]:
-        # The supervisor acquires this lock before engine evaluation and keeps
-        # it through this handler.  Re-entering it here also protects direct
-        # unit/integration calls without introducing an inverse controller
-        # lock order.
+    def _dispatcher(self, profile_id: str = "") -> ContinuousDispatcher:
         from . import state
 
-        with state.RUNTIME_MODE_LOCK:
-            return self._handle_cycle_locked(cycle)
+        with self._dispatcher_setup_lock:
+            if self._deferred_dispatcher is None:
+                profile = "stock" if (profile_id or self.profile_id) == "stock" else "crypto"
+                self._deferred_dispatcher = ContinuousDispatcher(
+                    self.root / "logs" / f"continuous_{profile}_intents.sqlite3",
+                    state.RUNTIME_MODE_LOCK,
+                    self._submit_deferred_intent,
+                    self._deferred_dispatch_failed,
+                )
+            return self._deferred_dispatcher
+
+    def _dispatch_status(self, profile_id: str = "") -> dict[str, Any]:
+        try:
+            journal = self._dispatcher(profile_id).journal
+            return {
+                "reconciliationRequired": journal.reconciliation_required(),
+                "recent": journal.rows(),
+                "restartReplayEnabled": False,
+            }
+        except (OSError, sqlite3.Error, ValueError) as error:
+            return {
+                "reconciliationRequired": True,
+                "reason": "continuous-intent-journal-unavailable:" + type(error).__name__,
+                "recent": [], "restartReplayEnabled": False,
+            }
+
+    def reconcile_deferred_dispatches(self, dispatch_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        rows = []
+        scoped_rows = []
+        for row in dispatch_rows:
+            payload = row.get("portfolio_execution")
+            if not isinstance(payload, dict):
+                rows.append(row)
+                continue
+            plan = validate_symbol_net_plan_metadata(payload)
+            if (
+                row.get("state") in {"risk_blocked", "adapter_blocked", "rejected"}
+                and str(row.get("broker_order_id") or "").strip() in {"", "-"}
+            ):
+                # A proven no-order outcome needs no sleeve ACK mapping. The
+                # journal still verifies the exact immutable intent/seal below.
+                rows.append(row)
+                continue
+            if self.portfolio_ledger is None:
+                continue
+            exact_scope = f"live:{plan.portfolio_id}:{plan.portfolio_hash}"
+            if (
+                plan.scope_id == self.portfolio_execution_scope_id == exact_scope
+                and plan.portfolio_id == self.portfolio_id
+                and str(row.get("broker_order_id") or "").strip() not in {"", "-"}
+            ):
+                scoped_rows.append(row)
+        if scoped_rows and self.portfolio_ledger is not None:
+            # Recover only the exact current portfolio/hash. An unrelated
+            # loaded ledger cannot discharge a previous portfolio's uncertainty.
+            self.portfolio_ledger.recover_accepted_orders(
+                self.portfolio_execution_scope_id, scoped_rows,
+            )
+            self.portfolio_ledger.verify_hash_chain(self.portfolio_execution_scope_id)
+            rows.extend(scoped_rows)
+        count = self._dispatcher().journal.reconcile(rows)
+        return {"resolved": count, **self._dispatch_status()}
+
+    @staticmethod
+    def _deferred_dispatch_failed(error: Exception) -> None:
+        from . import state
+
+        state.STATE["new_entries_blocked"] = True
+        state.append_audit(
+            "danger", "Continuous Runtime",
+            "주문 대기열 또는 완료 기록을 확인하지 못해 신규 주문을 차단했습니다: "
+            + type(error).__name__,
+        )
+
+    @staticmethod
+    def _submit_deferred_intent(intent: OrderIntent) -> dict[str, Any]:
+        from . import state
+
+        return state.submit_order_intent(
+            state.snapshot(), intent, dry_run=False,
+            audit_event="Continuous Runtime Deferred",
+        )
+
+    def _submit_cycle_intent(
+        self, intent: OrderIntent, *, audit_event: str,
+        portfolio_ledger: LivePortfolioLedger | None = None,
+    ) -> dict[str, Any]:
+        from . import state
+
+        if bool(state.STATE["dry_run"]):
+            return state.submit_order_intent(
+                state.snapshot(), intent, dry_run=True, audit_event=audit_event,
+            )
+
+        def record_portfolio_ack(sealed: OrderIntent, result: dict[str, Any]) -> None:
+            order = result.get("order") if isinstance(result.get("order"), dict) else {}
+            broker_order_id = str(order.get("broker_order_id") or "").strip()
+            if portfolio_ledger is None or result.get("ok") is not True or broker_order_id in {"", "-"}:
+                return
+            plan = validate_symbol_net_plan_metadata(sealed.metadata["portfolio_execution"])
+            # Use the exact ledger captured with the immutable plan, even when
+            # STOP or a new controller generation has since replaced the UI context.
+            portfolio_ledger.record_accepted_order(
+                plan, broker_order_id=broker_order_id,
+                local_order_id=str(order.get("order_id") or ""), occurred_at="",
+            )
+
+        return self._dispatcher().defer(
+            intent, record_portfolio_ack if portfolio_ledger is not None else None,
+        )
+
+    def _handle_cycle(self, cycle: Any) -> dict[str, Any]:
+        # Nested entry under the supervisor does not dispatch: the outer
+        # boundary waits for the engine checkpoint, then releases RUNTIME.
+        # Direct dry-run/unit calls retain the same protection.
+        with self._dispatcher() as dispatcher:
+            result = self._handle_cycle_locked(cycle)
+            def reflect_outcomes(outcomes: dict[str, Any]) -> None:
+                for row in result.get("results", []):
+                    outcome = outcomes.get(row.get("commandId"))
+                    if not isinstance(outcome, dict):
+                        continue
+                    row.update({"ok": outcome.get("ok") is True, "action": outcome.get("reason"), "reason": outcome.get("reason")})
+                    if "brokerOrderId" in row:
+                        row["brokerOrderId"] = str((outcome.get("order") or {}).get("broker_order_id") or "")
+            dispatcher.observe(reflect_outcomes)
+        return result
 
     def _handle_cycle_locked(self, cycle: Any) -> dict[str, Any]:
         from . import state
@@ -1784,14 +1918,10 @@ class LiveContinuousController:
                     "decision_price_role": "reference-and-sizing-only",
                 },
             )
-            checks = state.snapshot()
-            result = state.submit_order_intent(
-                checks,
-                intent,
-                dry_run=bool(state.STATE["dry_run"]),
-                audit_event="Continuous Runtime",
+            result = self._submit_cycle_intent(
+                intent, audit_event="Continuous Runtime",
             )
-            results.append({"strategyId": decision.strategy_id, "signal": decision.signal, "action": result.get("reason"), "ok": result.get("ok")})
+            results.append({"strategyId": decision.strategy_id, "signal": decision.signal, "action": result.get("reason"), "ok": result.get("ok"), "commandId": result.get("commandId")})
         return {"mode": self.mode, "profileId": self.profile_id, "results": results}
 
     def _portfolio_functional_metadata(self, spec: Any) -> dict[str, Any]:
@@ -2326,12 +2456,9 @@ class LiveContinuousController:
                 contributing_specs,
                 sum(current_positions.values(), Decimal("0")),
             )
-            checks = state.snapshot()
-            result = state.submit_order_intent(
-                checks,
-                intent,
-                dry_run=bool(state.STATE["dry_run"]),
-                audit_event="Continuous Runtime Portfolio Net",
+            result = self._submit_cycle_intent(
+                intent, audit_event="Continuous Runtime Portfolio Net",
+                portfolio_ledger=ledger,
             )
             order = result.get("order") if isinstance(result.get("order"), dict) else {}
             broker_order_id = str(order.get("broker_order_id") or "").strip()
@@ -2378,6 +2505,7 @@ class LiveContinuousController:
                         broker_order_id=broker_order_id,
                     )
                 )
+                results[-1]["commandId"] = result.get("commandId")
         state.STATE["strategy_runner"].update({
             "last_strategy": f"{len(specs)} sleeves",
             "last_signal": "NET",
@@ -2587,6 +2715,20 @@ class LiveContinuousRuntimeManager:
         self.controllers = {
             "stock": LiveContinuousController(root),
             "crypto": LiveContinuousController(root),
+        }
+        for profile, controller in self.controllers.items():
+            controller.profile_id = profile
+
+    def reconcile_deferred_dispatches(self, dispatch_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        results = {}
+        for profile, controller in self.controllers.items():
+            try:
+                results[profile] = controller.reconcile_deferred_dispatches(dispatch_rows)
+            except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
+                results[profile] = {"reconciliationRequired": True, "reason": type(error).__name__}
+        return {
+            "reconciliationRequired": any(item.get("reconciliationRequired") for item in results.values()),
+            "profiles": results,
         }
 
     def start(

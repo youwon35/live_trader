@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from .operator_review import OperatorReviewStore, record_key
+from .continuous_dispatch import (
+    begin_control as begin_continuous_control,
+    end_control as end_continuous_control,
+    continuous_control_boundary,
+    continuous_dispatch_allowed,
+)
 
 import os
 import csv
@@ -90,6 +96,7 @@ from trading_runtime.functional_test import (
     parse_live_activation_token,
     read_functional_test_document,
 )
+from trading_runtime.artifact_governance import stable_sha256 as runtime_stable_sha256
 from trading_runtime.operations import ENVIRONMENT_PROFILES
 from .brokers import BrokerNotReadyError, LiveBrokerRouter, broker_adapter_contract, broker_diagnostics, broker_readiness, build_kis_mutation_authority_intent, real_orders_enabled as broker_environment_real_orders_enabled
 from .program_ledger import ProgramLedger
@@ -338,7 +345,8 @@ def _serialized_safety_mutation(function: Any) -> Any:
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         with SAFETY_CONFIRMATION_MUTATION_LOCK:
-            result = function(*args, **kwargs)
+            with continuous_control_boundary(function.__name__):
+                result = function(*args, **kwargs)
         # Kill is a two-phase protocol.  Phase one durably latches ON while
         # the shared route/safety fences are held.  Only after both locks are
         # released may the backend manager/graph become the cleanup owner;
@@ -6862,13 +6870,11 @@ RESTORE_CONTEXT_LOCK = threading.RLock()
 
 
 def _restore_context_hash(payload: Any) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    # The engine validates and refreshes these same seals with the shared
+    # canonical hash (integral floats normalize to integers). Reject invalid
+    # numeric data before canonicalization can turn non-finite values into null.
+    json.dumps(payload, allow_nan=False)
+    return runtime_stable_sha256(payload)
 
 
 def _restore_account_scope(broker_id: str) -> str:
@@ -10369,7 +10375,7 @@ def snapshot() -> dict[str, Any]:
     effective_kill_switch = bool(STATE["kill_switch"]) or emergency.get("active") is True
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "execution_availability": ordinary_execution_availability(),
+        "execution_availability": ordinary_execution_availability(continuous_runtime),
         "mode": STATE["mode"],
         "dry_run": STATE["dry_run"],
         "kill_switch": effective_kill_switch,
@@ -17867,9 +17873,23 @@ def _run_reconciliation_without_public_fence(
             else "대조 기반 차단 원인 해소"
         ),
     )
+    continuous_dispatch_reconciliation: dict[str, Any] = {}
+    if refresh_brokers and not reconciliation_blocked:
+        try:
+            result = LIVE_CONTINUOUS_CONTROLLER.reconcile_deferred_dispatches(
+                PROGRAM_LEDGER.order_dispatch_rows(1_000_000)
+            )
+            if isinstance(result, dict):
+                continuous_dispatch_reconciliation = result
+            if continuous_dispatch_reconciliation.get("reconciliationRequired"):
+                STATE["new_entries_blocked"] = True
+        except (OSError, sqlite3.Error, ValueError, RuntimeError):
+            STATE["new_entries_blocked"] = True
+            continuous_dispatch_reconciliation = {"reconciliationRequired": True}
     automatic_results = automatic_live_promotion_sweep()
     return {
         "ok": True,
+        "continuous_dispatch_reconciliation": continuous_dispatch_reconciliation,
         "reason": f"대조 완료: {summary['status_label']} 상태",
         "reconciliation": reconciliation,
         "broker_position_truth": broker_truth,
@@ -21429,6 +21449,9 @@ def live_broker_dispatch_allowed(
     *,
     dry_run: bool,
 ) -> tuple[bool, str]:
+    continuous_allowed, continuous_reason = continuous_dispatch_allowed(intent)
+    if not continuous_allowed:
+        return False, continuous_reason
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     broker_id = str(
         metadata.get("broker_id")
@@ -22297,11 +22320,10 @@ def dispatch_live_order_with_checkpoint(
         or broker_id_from_symbol(intent.symbol, intent.asset)
     ).strip().lower()
     if not bool(order.get("dry_run")) and _runtime_mode_lock_owned():
-        # ContinuousRuntimeSupervisor retains RUNTIME_MODE_LOCK for the whole
-        # evaluated cycle.  Until controls are migrated to a durable A/B/C
-        # protocol, entering SAFETY here would invert against mode/STOP/Kill.
-        # Block before a functional slot, ProgramLedger checkpoint, broker
-        # read, token request, or trading socket is possible.
+        # Direct callers may not enter SAFETY while retaining the cycle lock.
+        # The Live continuous dispatcher checkpoints its immutable command and
+        # releases RUNTIME before calling this same guarded submission path.
+        # Block before any slot, checkpoint, broker read, token or socket.
         return _block_managed_order_before_dispatch(
             order,
             managed_order,
@@ -23194,6 +23216,9 @@ def submit_order_intent(
             "order": {},
             "runtimeDispatchDisabled": True,
         }
+    continuous_allowed, continuous_reason = continuous_dispatch_allowed(intent)
+    if not continuous_allowed:
+        return {"ok": False, "reason": continuous_reason, "order": {}, "runtimeDispatchDisabled": True}
     metadata = dict(intent.metadata) if isinstance(intent.metadata, dict) else {}
     bar_time = str(metadata.get("confirmed_bar_end") or datetime.now(timezone.utc).isoformat())
     try:
@@ -23552,6 +23577,8 @@ def submit_order_intent(
             else {}
         ),
     }
+    if isinstance(metadata.get("continuous_dispatch"), dict):
+        order["continuous_dispatch"] = dict(metadata["continuous_dispatch"])
     if isinstance(metadata.get("portfolio_execution"), dict):
         # Preserve the non-secret sleeve allocation plan in both the durable
         # dispatch journal and recovery journal.  This allows an ACK received
@@ -26328,6 +26355,22 @@ def run_validation_small_live_once(
     }
 
 
+def _continuous_stop_control(function: Any) -> Any:
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        # Revoke queued generations before waiting on any controller. Never
+        # retain SAFETY across worker join: the worker drains outside RUNTIME.
+        with SAFETY_CONFIRMATION_MUTATION_LOCK:
+            token = begin_continuous_control()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            with SAFETY_CONFIRMATION_MUTATION_LOCK:
+                end_continuous_control(token)
+    return wrapped
+
+
+@_continuous_stop_control
 @_two_phase_kis_route_control("STOP")
 def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
     normalized_profile = (

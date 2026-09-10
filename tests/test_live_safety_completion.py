@@ -11,13 +11,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from live_trader import env_settings, state
-from live_trader.emergency_stop import engage_emergency_stop
+from live_trader.emergency_stop import engage_emergency_stop, _reset_emergency_stop_sticky_for_tests
 from live_trader.operational_governance import OperationalGovernanceStore
 from live_trader.order_management import OrderIntent
 
 
 class LiveSafetyCompletionTests(unittest.TestCase):
     def setUp(self) -> None:
+        _reset_emergency_stop_sticky_for_tests()
         self.original_state = copy.deepcopy(state.STATE)
         self.original_emergency_recovery = (
             state.DURABLE_EMERGENCY_RECOVERY_REVISION,
@@ -40,6 +41,7 @@ class LiveSafetyCompletionTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        _reset_emergency_stop_sticky_for_tests()
         state.STATE.clear()
         state.STATE.update(copy.deepcopy(self.original_state))
         (

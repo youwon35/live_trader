@@ -60,7 +60,7 @@ class ExecutionAvailabilityTests(unittest.TestCase):
         self.assertFalse(second["ordinaryContinuous"]["liveDispatchAvailable"])
 
     def test_reported_hold_matches_both_actual_final_dispatch_guards(self):
-        reason = availability.ordinary_execution_availability()["ordinaryContinuous"]["reasonCode"]
+        reason = availability.CONTINUOUS_DISPATCH_HOLD_REASON
         for lock_held in (True, False):
             submit = isolated_dispatch_guard("submit_order_intent", lock_held=lock_held)
             dispatch = isolated_dispatch_guard("dispatch_live_order_with_checkpoint", lock_held=lock_held)
@@ -79,32 +79,47 @@ class ExecutionAvailabilityTests(unittest.TestCase):
                                 self.assertIsNone(first)
                                 self.assertIsNone(second)
 
-    def test_controller_still_holds_the_lock_at_both_order_paths(self):
+    def test_controller_uses_checkpoint_then_unlock_boundary_at_both_order_paths(self):
         tree = ast.parse((APP_ROOT / "live_trader" / "continuous_live.py").read_text(encoding="utf-8-sig"))
         controller = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LiveContinuousController")
         methods = {node.name: node for node in controller.body if isinstance(node, ast.FunctionDef)}
         self.assertTrue(any(
             isinstance(node, ast.keyword) and node.arg == "operation_lock"
-            and ast.unparse(node.value) == "state.RUNTIME_MODE_LOCK"
+            and ast.unparse(node.value) == "self._dispatcher()"
             for node in ast.walk(methods["start"])
         ))
         cycle = methods["_handle_cycle"]
         self.assertTrue(any(
             isinstance(node, ast.With)
-            and any(ast.unparse(item.context_expr) == "state.RUNTIME_MODE_LOCK" for item in node.items)
+            and any(ast.unparse(item.context_expr) == "self._dispatcher()" for item in node.items)
             and any(isinstance(child, ast.Call) and ast.unparse(child.func) == "self._handle_cycle_locked" for child in ast.walk(node))
             for node in ast.walk(cycle)
         ))
         for name in ("_handle_cycle_locked", "_handle_portfolio_cycle_locked"):
             self.assertTrue(any(
-                isinstance(node, ast.Call) and ast.unparse(node.func) == "state.submit_order_intent"
+                isinstance(node, ast.Call) and ast.unparse(node.func) == "self._submit_cycle_intent"
                 for node in ast.walk(methods[name])
             ), name)
 
     def test_projection_has_no_app_or_environment_dependencies(self):
         tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8-sig"))
         self.assertFalse(any(isinstance(node, (ast.Import, ast.ImportFrom)) for node in ast.walk(tree)))
-        self.assertFalse(any(isinstance(node, ast.Call) for node in ast.walk(tree)))
+        runtime = {"profiles": {key: {"dispatch": {"reconciliationRequired": False}} for key in ("stock", "crypto")}}
+        original = deepcopy(runtime)
+        self.assertTrue(availability.ordinary_execution_availability(runtime)["ordinaryContinuous"]["liveDispatchAvailable"])
+        self.assertEqual(original, runtime)
+
+    def test_queue_health_controls_product_support_without_granting_authority(self):
+        for profile in ("stock", "crypto"):
+            for held in (False, True):
+                runtime = {"profiles": {key: {"dispatch": {"reconciliationRequired": False}} for key in ("stock", "crypto")}}
+                runtime["profiles"][profile]["dispatch"]["reconciliationRequired"] = held
+                result = availability.ordinary_execution_availability(runtime)
+                self.assertFalse(result["authorizationGranted"])
+                self.assertEqual(not held, result["ordinaryContinuous"]["liveDispatchAvailable"])
+                self.assertEqual(["SMALL_LIVE", "FULL_LIVE"] if held else [], result["ordinaryContinuous"]["blockedModes"])
+        for malformed in (None, {}, {"profiles": {"stock": {}}}, {"profiles": {"stock": {"dispatch": {"reconciliationRequired": 0}}, "crypto": {}}}):
+            self.assertFalse(availability.ordinary_execution_availability(malformed)["ordinaryContinuous"]["liveDispatchAvailable"])
 
 
 if __name__ == "__main__":
