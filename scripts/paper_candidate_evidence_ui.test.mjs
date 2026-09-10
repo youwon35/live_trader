@@ -167,6 +167,35 @@ test("strategy changes filter verified rows without fetching and retain unscoped
   assert.equal(calls.length, 1);
 });
 
+test("registration blockers distinguish sealed evidence from registration and never expose an action", async () => {
+  useResponse(result([row({ blockedReasons: [
+    { code: "DEPLOYMENT_ACCOUNT_ALREADY_BOUND", detail: "기존 배포에 계좌 연결이 설정되어 있어 후보 등록으로 변경할 수 없습니다." },
+    { code: "DEPLOYMENT_NOT_DRAFT", detail: "기존 배포가 검토 대기 초안이 아닙니다." },
+  ] })]));
+  const view = harness();
+  await view.refresh();
+  const html = view.render();
+  assert.match(html, /Backtester 저장본 · 현재 전략과 실행 단위 일치/);
+  assert.match(html, /Paper 검증 근거 · 봉인 연결 확인/);
+  assert.match(html, /Live 후보 등록 · 기존 배포 조건으로 차단/);
+  assert.match(html, /계좌 연결이 설정되어/);
+  assert.match(html, /검토 대기 초안이 아닙니다/);
+  assert.match(html, /실거래 승인과 현재 계좌 상태는 이 조회에서 확인하지 않습니다/);
+  assert.equal(view.buttons().length, 1);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "GET");
+});
+
+test("legacy candidate response remains readable without inventing a registration cause", async () => {
+  useResponse(result([row()]));
+  const view = harness();
+  await view.refresh();
+  const html = view.render();
+  assert.match(html, /Live 후보 등록 · 상태 추가 확인 필요/);
+  assert.doesNotMatch(html, /기존 배포 조건으로 차단|후보 등록 차단 사유/);
+  assert.equal(view.buttons().length, 1);
+});
+
 const malformed = [
   ["null response", null],
   ["object candidates", result({})],
@@ -175,6 +204,9 @@ const malformed = [
   ["object errors", result([], { errors: {} })],
   ["object error item", result([], { errors: [{}] })],
   ["object detail", result([row({ detail: {} })])],
+  ["object blocked reasons", result([row({ blockedReasons: {} })])],
+  ["object blocked reason detail", result([row({ blockedReasons: [{ code: "CODE", detail: {} }] })])],
+  ["registered candidate with blockers", result([row({ registered: true, blockedReasons: [{ code: "CODE", detail: "blocked" }] })])],
   ["object identity value", result([row({ identity: { evidenceHash: {} } })])],
   ["object deployment value", result([row({ deployment: { deploymentId: {}, mode: "SMALL_LIVE", lifecycle: "before-live-small", definitionHash: "hash", revision: 1 } })])],
   ["object next step", result([], { requiredNextStep: {} })],

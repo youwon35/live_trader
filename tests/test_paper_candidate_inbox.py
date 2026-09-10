@@ -210,6 +210,61 @@ class PaperCandidateInboxTests(unittest.TestCase):
         self.assertEqual(row["deployment"]["mode"], "MONITOR")
         self.assertEqual(file_bytes(self.root), before)
 
+    def test_bound_account_blocks_import_with_reason_without_exposing_account_or_mutating(self):
+        private_account = "fixture-private-account-do-not-expose"
+        DeploymentStore(self.root).create_definition(deployment_id="bound", strategy_artifact=self.strategy,
+            portfolio_artifact=None, environment="SMALL_LIVE", account_id=private_account, symbol="BTCUSDT")
+        before = file_bytes(self.root)
+        result = self.inbox()
+        row = result["candidates"][0]
+        self.assertEqual(row["status"], "VERIFIED_READ_ONLY")
+        self.assertFalse(row["canImport"])
+        self.assertFalse(row["registered"])
+        self.assertEqual([reason["code"] for reason in row["blockedReasons"]], ["DEPLOYMENT_ACCOUNT_ALREADY_BOUND"])
+        self.assertNotIn(private_account, json.dumps(result))
+        self.assertNotIn("importRequest", row)
+        self.assertIs(result["authorizationGranted"], False)
+        self.assertEqual(file_bytes(self.root), before)
+
+    def test_registration_reasons_preserve_existing_verdict_and_registered_precedence(self):
+        DeploymentStore(self.root).create_definition(deployment_id="draft", strategy_artifact=self.strategy,
+            portfolio_artifact=None, environment="SMALL_LIVE", account_id="live-account-unresolved", symbol="BTCUSDT")
+        registry_path = self.root / "deployments" / "deployment-registry.json"
+        base = service._registry(self.root)
+        cases = [
+            ({}, []),
+            ({"lifecycle": "before-live-small"}, ["DEPLOYMENT_NOT_DRAFT"]),
+            ({"mode": "SMALL_LIVE"}, ["DEPLOYMENT_MODE_NOT_REVIEWABLE"]),
+            ({"permissions": {"live_allowed": True}}, ["DEPLOYMENT_LIVE_PERMISSION_PRESENT"]),
+            ({"permissions": {"live_allowed": "true"}}, []),
+            ({"lifecycle": "before-live-small", "mode": "SMALL_LIVE", "permissions": {"live_small_eligible": True}},
+             ["DEPLOYMENT_NOT_DRAFT", "DEPLOYMENT_MODE_NOT_REVIEWABLE", "DEPLOYMENT_LIVE_PERMISSION_PRESENT"]),
+        ]
+        for changes, expected in cases:
+            with self.subTest(changes=changes):
+                registry = deepcopy(base)
+                registry["entries"]["draft"].update(changes)
+                write(registry_path, registry)
+                before = file_bytes(self.root)
+                row = self.row()
+                self.assertEqual([reason["code"] for reason in row["blockedReasons"]], expected)
+                self.assertEqual(row["canImport"], not expected)
+                self.assertEqual("importRequest" in row, not expected)
+                self.assertFalse(row["registered"])
+                self.assertEqual(file_bytes(self.root), before)
+        write(registry_path, base)
+        pins = service.candidate_pins(self.row()["identity"])
+        registered = deepcopy(base)
+        registered["entries"]["draft"].update({"lifecycle": "before-live-small", "mode": "SMALL_LIVE", "permissions": {**pins, "live_allowed": True}})
+        write(registry_path, registered)
+        before = file_bytes(self.root)
+        row = self.row()
+        self.assertTrue(row["registered"])
+        self.assertFalse(row["canImport"])
+        self.assertEqual(row["blockedReasons"], [])
+        self.assertNotIn("importRequest", row)
+        self.assertEqual(file_bytes(self.root), before)
+
     def test_root_resolution_respects_appdata_and_returns_structured_failure(self):
         with patch.dict(service.os.environ, {"APPDATA": str(self.root)}, clear=True), patch.object(service, "artifact_read_roots", return_value=[]), patch.object(Path, "home", side_effect=RuntimeError("home unavailable")):
             self.assertEqual(service.configured_artifact_roots(), [(self.root / "trading_programs" / "strategies").resolve()])

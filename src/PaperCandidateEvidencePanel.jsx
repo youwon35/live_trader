@@ -42,6 +42,9 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
             || ["rootKey", "evidenceId", "identityHash", "registryHash"].some((key) => typeof candidate.importRequest[key] !== "string" || !candidate.importRequest[key])))
           || !["VERIFIED_READ_ONLY", "BLOCKED"].includes(candidate.status)
           || ["evidenceId", "detail"].some((key) => typeof candidate[key] !== "string")
+          || (candidate.blockedReasons !== undefined && (!Array.isArray(candidate.blockedReasons)
+            || candidate.blockedReasons.some((reason) => !record(reason) || typeof reason.code !== "string" || typeof reason.detail !== "string")
+            || (candidate.blockedReasons.length > 0 && (candidate.canImport || candidate.registered === true))))
           || ["strategyId", "strategyName", "portfolioId", "instanceHash", "rootKey"].some((key) => candidate[key] !== undefined && typeof candidate[key] !== "string")
           || (candidate.identity !== undefined && (!record(candidate.identity)
             || Object.keys(SCOPE_LABELS).some((key) => candidate.identity[key] !== undefined && typeof candidate.identity[key] !== "string")))
@@ -167,6 +170,15 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
               <tr key={`${candidate.rootKey || "blocked"}:${candidate.evidenceId}:${index}`}>
                 <td style={{ verticalAlign: "top" }}>{candidate.strategyName || candidate.strategyId || candidate.evidenceId}<br /><small>{candidate.evidenceId}</small></td>
                 <td style={{ verticalAlign: "top" }}>{candidate.detail}
+                  {candidate.status === "VERIFIED_READ_ONLY" && <div aria-label="후보 준비 단계">
+                    <p>Backtester 저장본 · 현재 전략과 실행 단위 일치</p>
+                    <p>Paper 검증 근거 · 봉인 연결 확인</p>
+                    <p>Live 후보 등록 · {candidate.canImport ? "검토 대기 등록 가능" : candidate.registered ? "등록됨" : candidate.blockedReasons?.length ? "기존 배포 조건으로 차단" : "상태 추가 확인 필요"}</p>
+                    {candidate.blockedReasons?.length > 0 && <ul aria-label="후보 등록 차단 사유">
+                      {candidate.blockedReasons.map((reason, reasonIndex) => <li key={`${reason.code}:${reasonIndex}`}>{reason.detail}</li>)}
+                    </ul>}
+                    <small>실거래 승인과 현재 계좌 상태는 이 조회에서 확인하지 않습니다.</small>
+                  </div>}
                   <div style={{ display: "flex", gap: 8, margin: "8px 0", flexWrap: "wrap" }}>
                   {candidate.canImport && <button type="button" className="primary-button" disabled={busy} onClick={() => register(candidate)}>검토 대기 후보 등록</button>}
                   {candidate.registered && onRegistered && <button type="button" className="secondary-button" disabled={busy} onClick={() => openRegistered(candidate.deployment.deploymentId)}>등록한 배포 보기</button>}

@@ -258,6 +258,22 @@ def _candidate(root, evidence, registry, catalogs):
     )
     row["registered"] = registered
     row["canImport"] = importable and not registered
+    # Explain the existing verdict only; no account values or authority changes.
+    row["blockedReasons"] = []
+    if not importable and not registered:
+        for blocked, code, detail in (
+            (entry.get("lifecycle") != "draft", "DEPLOYMENT_NOT_DRAFT",
+             "기존 배포가 검토 대기 초안이 아니므로 이 화면에서 덮어 등록할 수 없습니다."),
+            (entry.get("mode") not in ("MONITOR", "OFF"), "DEPLOYMENT_MODE_NOT_REVIEWABLE",
+             "기존 배포가 관찰 또는 중지 모드가 아니므로 후보로 덮어 등록할 수 없습니다."),
+            (entry.get("accountId") != "live-account-unresolved", "DEPLOYMENT_ACCOUNT_ALREADY_BOUND",
+             "기존 배포에 계좌 연결이 설정되어 있어 후보 등록으로 변경할 수 없습니다."),
+            (any(permissions.get(key) is True for key in ("live_allowed", "live_eligible", "live_small_eligible")),
+             "DEPLOYMENT_LIVE_PERMISSION_PRESENT",
+             "기존 배포에 실거래 관련 권한이 있어 검토 대기 후보로 덮어 등록할 수 없습니다."),
+        ):
+            if blocked:
+                row["blockedReasons"].append({"code": code, "detail": detail})
     row["registryHash"] = stable_sha256(registry)
     if row["canImport"]:
         row["importRequest"] = {"rootKey": row["rootKey"], "evidenceId": row["evidenceId"],
@@ -266,6 +282,8 @@ def _candidate(root, evidence, registry, catalogs):
         row["detail"] = "봉인 근거 확인 완료 · 검토 대기 후보로 등록 가능"
     elif registered:
         row["detail"] = "같은 봉인 근거로 등록됨 · 현재 배포 상태와 주문 권한은 별도 확인"
+    elif row["blockedReasons"]:
+        row["detail"] = "봉인 근거 확인 완료 · 기존 배포 조건으로 후보 등록 차단"
     return row
 
 
