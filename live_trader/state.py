@@ -27765,6 +27765,17 @@ def run_local_monitor_trial(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "authorizationGranted": False, "reason": str(exc)}
 
 
+def read_only_preparation_sources() -> dict[str, Any]:
+    from .read_only_preparation import preparation_sources_response
+    return preparation_sources_response()
+
+
+def read_only_order_preparation(payload: dict[str, Any]) -> dict[str, Any]:
+    """Independent reads only: no preflight, reconciliation, token/permit or runtime writes."""
+    from .read_only_preparation import preparation_response
+    return preparation_response(payload)
+
+
 # Operator-only review data. These functions never refresh broker state or alter authority.
 def capture_operator_preflight(scope, checks, manifest_hash=""):
     try:

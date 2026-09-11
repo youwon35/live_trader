@@ -38,6 +38,7 @@ STRATEGY_SEARCH_PRESET_LIMIT = 30
 _FUNCTIONAL_STATUS_PATHS = frozenset(
     {
         "/api/paper-candidates",
+        "/api/preparation/sources",
         "/api/upbit-functional/status",
         "/api/binance-spot-functional/status",
     }
@@ -46,6 +47,7 @@ _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
         "/api/paper-candidates/import",
         "/api/monitor-trial/run",
+        "/api/preparation/preview",
         "/api/safety-confirmation/challenge",
         "/api/upbit-functional/start",
         "/api/upbit-functional/stop",
@@ -432,6 +434,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 result = {"ok": False, "reason": "로컬 검토 기록을 읽지 못했습니다: " + type(exc).__name__}
             self.send_json(result)
             return
+        if parsed.path == "/api/preparation/sources":
+            self.send_json(state.read_only_preparation_sources())
+            return
         if parsed.path == "/api/paper-candidates":
             self.send_json(state.paper_candidate_evidence_inbox())
             return
@@ -588,6 +593,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         payload = self.read_json()
         if parsed.path == "/api/paper-candidates/import":
             self.send_json(state.import_paper_candidate_metadata(payload))
+            return
+        if parsed.path == "/api/preparation/preview":
+            self.send_json(state.read_only_order_preparation(payload))
             return
         if parsed.path == "/api/monitor-trial/run":
             self.send_json(state.run_local_monitor_trial(payload))

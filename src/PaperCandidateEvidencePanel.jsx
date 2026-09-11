@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { getPaperCandidateEvidence, importPaperCandidate, runLocalMonitorTrial } from "./api";
+import { getPaperCandidateEvidence, importPaperCandidate, runLocalMonitorTrial, previewReadOnlyPreparation, getReadOnlyPreparationSources } from "./api";
 
 const SCOPE_LABELS = {
   evidenceId: "Evidence ID", evidenceHash: "봉인 Evidence hash",
@@ -10,6 +10,8 @@ const SCOPE_LABELS = {
   deploymentManifestHash: "Manifest hash", sessionId: "검증 세션",
 };
 
+const PREPARATION_INPUT_STYLE = { minHeight: 32, padding: "0 8px", color: "var(--text)", background: "var(--input)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", font: "inherit", width: 160 };
+
 export default function PaperCandidateEvidencePanel({ strategyId = "", onRegistered }) {
   const [inbox, setInbox] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -17,6 +19,114 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
   const pending = useRef(false);
   const [trialSelection, setTrialSelection] = useState("");
   const [trialResult, setTrialResult] = useState(null);
+
+  const [preparationSources, setPreparationSources] = useState([]);
+  const [preparationBusy, setPreparationBusy] = useState(false);
+  const [preparationMessage, setPreparationMessage] = useState("");
+  const preparationPending = useRef(false);
+  const [preparationSelection, setPreparationSelection] = useState("");
+  const [preparationSource, setPreparationSource] = useState(null);
+  const [preparationResult, setPreparationResult] = useState(null);
+  const [preparationExpired, setPreparationExpired] = useState(false);
+  const [orderDraft, setOrderDraft] = useState({ instanceId: "", side: "", quantity: "", limitPrice: "" });
+  const preparationGeneration = useRef(0);
+  const preparationStrategy = useRef(strategyId);
+  if (preparationStrategy.current !== strategyId) {
+    preparationStrategy.current = strategyId;
+    clearPreparation(true);
+    setPreparationSelection("");
+  }
+
+  function clearPreparation(clearSource = false) {
+    preparationGeneration.current += 1;
+    setPreparationResult(null);
+    setPreparationExpired(false);
+    if (clearSource) {
+      setPreparationSource(null);
+      setOrderDraft({ instanceId: "", side: "", quantity: "", limitPrice: "" });
+    }
+  }
+
+  const preparationChoices = [
+    ...preparationSources.map((item) => ({
+      key: "trial:" + item.request.rootKey + ":" + item.request.portfolioId,
+      label: item.name + " · 기능시험 자료",
+      request: item.request,
+    })),
+    ...(inbox?.candidates || []).filter((item) => item.status === "VERIFIED_READ_ONLY" && item.rootKey && item.identity?.evidenceHash && item.instanceHash && (!strategyId || item.strategyId === strategyId)).map((item) => ({
+      key: "paper:" + item.rootKey + ":" + item.evidenceId,
+      label: (item.strategyName || item.strategyId) + " · 봉인 Paper 근거",
+      request: { kind: "PAPER", rootKey: item.rootKey, evidenceId: item.evidenceId,
+        evidenceHash: item.identity?.evidenceHash, instanceHash: item.instanceHash },
+    })),
+  ];
+
+  async function refreshPreparation() {
+    if (preparationPending.current) return;
+    preparationPending.current = true;
+    setPreparationBusy(true);
+    clearPreparation(true);
+    setPreparationSelection("");
+    try {
+      const result = await getReadOnlyPreparationSources();
+      if (result?.ok !== true || result.schemaVersion !== "live-readonly-preparation-sources-v1"
+        || result.readOnly !== true || result.executable !== false || result.authorityGranted !== false
+        || !Array.isArray(result.sources) || result.sources.some((item) => !item || typeof item.name !== "string"
+          || item.source?.evidenceClass !== "FUNCTIONAL_TEST_NON_PROMOTION" || item.request?.kind !== "NON_PROMOTION"
+          || ["rootKey", "portfolioId", "portfolioHash", "identityHash"].some((key) => typeof item.request[key] !== "string" || !item.request[key]))) {
+        throw new Error(result?.reason || "준비 자료 목록을 확인하지 못했습니다.");
+      }
+      setPreparationSources(result.sources);
+      setPreparationMessage(result.sources.length ? "" : "준비 전용 폴더에 저장된 자료가 없습니다.");
+    } catch (error) {
+      setPreparationSources([]);
+      setPreparationMessage(error?.message || "준비 자료를 읽지 못했습니다.");
+    } finally {
+      preparationPending.current = false;
+      setPreparationBusy(false);
+    }
+  }
+
+  async function prepare(readAccount) {
+    const selected = preparationChoices.find((item) => item.key === preparationSelection);
+    if (preparationPending.current || !selected) return;
+    clearPreparation();
+    const generation = preparationGeneration.current;
+    preparationPending.current = true;
+    setPreparationBusy(true);
+    try {
+      const result = await previewReadOnlyPreparation({ source: selected.request, draft: orderDraft, readAccount });
+      if (result?.ok !== true || result.schemaVersion !== "live-read-only-preparation-v1"
+        || result.reportPurpose !== "READ_ONLY_PREPARATION" || result.readOnly !== true
+        || ["authorityGranted", "authorizationGranted", "executable", "promotionEligible", "useAsPromotionEvidence", "tradingEnabled", "currentDeploymentChanged"].some((key) => result[key] !== false)
+        || ["ordersSubmitted", "confirmationTokensCreated", "permitsCreated", "runtimeSessionsCreated"].some((key) => result[key] !== 0)
+        || result.source?.kind !== selected.request.kind
+        || (selected.request.kind === "NON_PROMOTION" && (result.source?.portfolioHash !== selected.request.portfolioHash || result.source?.evidenceClass !== "FUNCTIONAL_TEST_NON_PROMOTION"))
+        || (selected.request.kind === "PAPER" && result.source?.evidenceHash !== selected.request.evidenceHash)
+        || !Array.isArray(result.source?.instruments) || result.source.instruments.length === 0
+        || result.source.instruments.some((item) => !item || ["instanceId", "symbol", "broker"].some((key) => typeof item[key] !== "string"))
+        || !Array.isArray(result.checks) || result.checks.some((item) => !item || !["PASS", "BLOCKED", "UNKNOWN"].includes(item.status) || typeof item.detail !== "string")
+        || !Array.isArray(result.draft?.missingInputs) || !Array.isArray(result.limitations)
+        || !Number.isFinite(Date.parse(result.asOf)) || !Number.isFinite(Date.parse(result.expiresAt))
+        || Date.parse(result.expiresAt) <= Date.now() || Date.parse(result.expiresAt) - Date.parse(result.asOf) > 60000) {
+        throw new Error(result?.reason || "읽기 전용 준비 결과의 범위와 유효시간을 확인하지 못했습니다.");
+      }
+      if (preparationGeneration.current !== generation) return;
+      setPreparationSource(result.source);
+      setPreparationResult(result);
+      setPreparationExpired(false);
+      window.setTimeout(() => {
+        if (preparationGeneration.current === generation) setPreparationExpired(true);
+      }, Math.max(0, Date.parse(result.expiresAt) - Date.now()));
+      setPreparationMessage(readAccount ? "계좌 읽기 결과를 확인했습니다. 주문 권한과 실행 상태는 변경되지 않았습니다." : "원본을 확인했습니다. 종목과 주문 초안은 직접 입력하세요.");
+    } catch (error) {
+      clearPreparation();
+      setPreparationMessage(error?.message || "읽기 전용 준비 조회에 실패했습니다.");
+    } finally {
+      preparationPending.current = false;
+      setPreparationBusy(false);
+    }
+  }
 
   async function refresh() {
     if (pending.current) return;
@@ -27,6 +137,7 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
       const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
       const invalid = !record(result) || result.schemaVersion !== "live-paper-evidence-inbox-v1"
         || result.readOnly !== true || typeof result.canImport !== "boolean" || typeof result.ok !== "boolean"
+
         || !Array.isArray(result.candidates) || !Array.isArray(result.errors)
         || (result.monitorTrials !== undefined && (!Array.isArray(result.monitorTrials) || result.monitorTrials.some((trial) => !record(trial)
           || typeof trial.name !== "string" || typeof trial.detail !== "string" || typeof trial.portfolioId !== "string" || typeof trial.canRun !== "boolean"
@@ -125,6 +236,8 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
     finally { pending.current = false; setBusy(false); }
   }
 
+  const visibleMonitorTrials = (inbox?.monitorTrials || []).filter((item) => item.canRun
+    || !preparationSources.some((source) => source.request.portfolioId === item.portfolioId));
   const rows = (inbox?.candidates || []).filter(
     (candidate) => !strategyId || !candidate.strategyId || candidate.strategyId === strategyId,
   );
@@ -137,19 +250,19 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
         {busy ? "확인 중…" : "Paper 검증 근거 새로고침"}
       </button>
       {message && <p role="status">{message}</p>}
-      {inbox?.ok && rows.length === 0 && <p>확인할 근거가 없습니다. 모의거래에서 검증 근거를 발행한 뒤 다시 확인하세요.</p>}
+      {inbox?.ok && rows.length === 0 && <p>{preparationChoices.length ? "정규 Paper 승급 근거는 없습니다. 아래 기능시험 자료로 읽기 전용 준비를 확인할 수 있습니다." : "확인할 근거가 없습니다. 모의거래에서 검증 근거를 발행한 뒤 다시 확인하세요."}</p>}
       {inbox?.monitorTrialError && <p role="status">연결 시험 목록: {inbox.monitorTrialError}</p>}
-      {(inbox?.monitorTrials || []).length > 0 && <section aria-label="연결 시험 · 주문 없음" style={{ margin: "16px 0" }}>
+      {visibleMonitorTrials.length > 0 && <section aria-label="연결 시험 · 주문 없음" style={{ margin: "16px 0" }}>
         <h3>연결 시험 · 주문 없음</h3>
         <p>비승급 연구용 저장본의 과거 종가를 재생합니다. 현재 운영 배포·계좌·실거래 자격은 바뀌지 않습니다.</p>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
           <label>시험용 구성 선택 <select value={trialSelection} disabled={busy} onChange={(event) => { setTrialSelection(event.target.value); setTrialResult(null); }}>
             <option value="">구성을 선택하세요</option>
-            {inbox.monitorTrials.filter((item) => item.canRun).map((item) => <option key={`${item.request.rootKey}:${item.portfolioId}`} value={`${item.request.rootKey}:${item.portfolioId}`}>{item.name} · {item.detail}</option>)}
+            {visibleMonitorTrials.filter((item) => item.canRun).map((item) => <option key={`${item.request.rootKey}:${item.portfolioId}`} value={`${item.request.rootKey}:${item.portfolioId}`}>{item.name} · {item.detail}</option>)}
           </select></label>
           <button type="button" className="secondary-button" disabled={busy || !trialSelection} onClick={runTrial}>주문 없이 연결 시험</button>
         </div>
-        {inbox.monitorTrials.filter((item) => !item.canRun).map((item, index) => <p key={index}>{item.name}: {item.detail}</p>)}
+        {visibleMonitorTrials.filter((item) => !item.canRun).map((item, index) => <p key={index}>{item.name}: {item.detail}</p>)}
         {trialResult && <div role="status">
           <p>{trialResult.summary.symbols}종목 · 종가 {trialResult.summary.sampleCount.toLocaleString()}개 · 판단 {trialResult.summary.decisionCount.toLocaleString()}회 · 주문 0건</p>
           <p>매수 판단 {trialResult.summary.signals.BUY}회 · 매도 판단 {trialResult.summary.signals.SELL}회 · 관망 {trialResult.summary.signals.HOLD}회</p>
@@ -159,6 +272,49 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
             <p>실제 전체 기간: 표본 시각이 없어 미확인</p>
             {trialResult.source.bindings.map((item) => <p key={item.instanceId}>{item.symbol} · 원본 기준 마지막 시각 {item.sourceFinalBarEnd} · 종가 {item.sampleCount}개 · 입력 hash <code>{item.sampleHash}</code></p>)}
             <p>보고서 hash <code>{trialResult.reportHash}</code></p><p>저장 위치 {trialResult.reportPath}</p>
+          </details>
+        </div>}
+      </section>}
+      {<section aria-label="주문 준비 자료 확인" style={{ margin: "16px 0" }}>
+        <h3>주문 준비 자료 확인 · 읽기 전용</h3>
+        <p>Live 설정 계좌와 선택 종목을 조회합니다. 조회만 진행하며 주문은 전송하지 않습니다.</p>
+        <button type="button" className="secondary-button" disabled={preparationBusy} onClick={refreshPreparation}>{preparationBusy ? "준비 자료 확인 중…" : "준비 자료 새로고침"}</button>
+        {preparationMessage && <p role="status">{preparationMessage}</p>}
+        <label>준비할 원본 <select aria-label="준비할 원본" value={preparationSelection} disabled={preparationBusy} onChange={(event) => {
+          setPreparationSelection(event.target.value); clearPreparation(true);
+        }}><option value="">원본을 선택하세요</option>
+          {preparationChoices.map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}
+        </select></label>{" "}
+        <button type="button" className="secondary-button" disabled={preparationBusy || !preparationSelection} onClick={() => prepare(false)}>원본 확인 · 계좌 조회 없음</button>
+        {preparationSource && <>
+          <p>{preparationSource.kind === "NON_PROMOTION" ? "기능시험 자료 · 정규 실거래 승급 전" : "봉인 Paper 자료 · 현재 실거래 자격은 별도 확인"}</p>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", margin: "12px 0" }}>
+            <label>종목 <select aria-label="종목" value={orderDraft.instanceId} disabled={preparationBusy} onChange={(event) => { setOrderDraft({ ...orderDraft, instanceId: event.target.value }); clearPreparation(); }}>
+              <option value="">직접 선택하세요</option>
+              {preparationSource.instruments.map((item) => <option key={item.instanceId} value={item.instanceId}>{item.symbol} · {item.broker}</option>)}
+            </select></label>
+            <label>매수/매도 <select aria-label="매수/매도" value={orderDraft.side} disabled={preparationBusy} onChange={(event) => { setOrderDraft({ ...orderDraft, side: event.target.value }); clearPreparation(); }}>
+              <option value="">직접 선택하세요</option><option value="BUY">매수</option><option value="SELL">매도</option>
+            </select></label>
+            <label>수량 <input style={PREPARATION_INPUT_STYLE} aria-label="수량" inputMode="decimal" placeholder="직접 입력" value={orderDraft.quantity} disabled={preparationBusy} onChange={(event) => { setOrderDraft({ ...orderDraft, quantity: event.target.value }); clearPreparation(); }} /></label>
+            <label>지정가 <input style={PREPARATION_INPUT_STYLE} aria-label="지정가" inputMode="decimal" placeholder="직접 입력" value={orderDraft.limitPrice} disabled={preparationBusy} onChange={(event) => { setOrderDraft({ ...orderDraft, limitPrice: event.target.value }); clearPreparation(); }} /></label>
+          </div>
+          <button type="button" className="secondary-button" disabled={preparationBusy || !orderDraft.instanceId} onClick={() => prepare(true)}>계좌·미체결 읽기 및 입력 금액 계산</button>
+          <small>수량을 잔액에서 자동 선택하지 않습니다. 빈 입력은 미입력입니다.</small>
+        </>}
+        {preparationResult && <div role="status">
+          <p>조회 시각 {preparationResult.asOf} · 만료 {preparationResult.expiresAt}</p>
+          {preparationExpired ? <p>조회가 만료됐습니다. 현재 상태를 다시 조회하세요.</p> : <>
+            <p>입력 금액: {preparationResult.draft.notional ?? "미입력"} {preparationResult.observation?.currency || ""} · 미입력 항목 {preparationResult.draft.missingInputs.length}개</p>
+            <p>계좌 조회 {preparationResult.observation?.status === "NOT_REQUESTED" ? "전" : preparationResult.observation?.account === "AVAILABLE" ? "완료" : "미확인"} · 실거래 승급 및 계좌 연결은 별도 확인</p>
+          </>}
+          <details><summary>검사 세부정보</summary>
+            <ul>{preparationResult.checks.map((item) => <li key={item.code}>{({ PASS: "확인", BLOCKED: "차단", UNKNOWN: "미확인" })[item.status]} · {item.detail}</li>)}</ul>
+          {preparationResult.limitations.map((item, index) => <p key={index}>{item}</p>)}
+
+            <p>권한 없음 · 실행 불가 · 확인 토큰 0 · 주문 허가 0 · 실행 세션 0</p>
+            <p>목적 READ_ONLY_PREPARATION · 원본 {preparationResult.source.evidenceClass || "미기재"} · {preparationResult.source.qualification}</p>
+            <p>계좌 상태 {preparationResult.observation?.status} · hash <code>{preparationResult.reportHash}</code></p>
           </details>
         </div>}
       </section>}

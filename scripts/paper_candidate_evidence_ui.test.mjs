@@ -21,17 +21,18 @@ let calls = [];
 let responseForFetch;
 let nativeBridgeReads = 0;
 let allowImport = false;
+let allowPreparation = false;
 globalThis.window = {
   setTimeout, clearTimeout,
   get pywebview() { nativeBridgeReads += 1; throw new Error("Native bridge forbidden in read-only UI test"); },
 };
 globalThis.fetch = async (url, options) => {
   if (options.method === "POST") {
-    assert.equal(allowImport, true);
-    assert.equal(url, "/api/paper-candidates/import");
+    assert.equal(allowImport || allowPreparation, true);
+    assert.equal(url, allowPreparation ? "/api/preparation/preview" : "/api/paper-candidates/import");
     assert.equal(options.headers["X-LiveTrader-CSRF"], "fixture-csrf-".repeat(4));
   } else {
-    assert.equal(url, "/api/paper-candidates");
+    assert.ok(["/api/paper-candidates", "/api/preparation/sources"].includes(url));
     assert.equal(options.method, "GET");
     assert.equal(options.body, undefined);
   }
@@ -93,6 +94,8 @@ function harness(props = {}) {
     },
     refresh() { return elements(tree, "button")[0].props.onClick(); },
     buttons() { return elements(tree, "button"); },
+    elements(type) { return elements(tree, type); },
+    legacyButtons() { return elements(tree, "button").filter(button => !["준비 자료 새로고침", "원본 확인 · 계좌 조회 없음", "계좌·미체결 읽기 및 입력 금액 계산"].includes(button.props.children)); },
   };
   view.render();
   return view;
@@ -103,9 +106,9 @@ test("mount, disclosure render, and strategy changes never fetch and expose only
   const view = harness({ strategyId: "strategy-a" });
   const html = view.render({ strategyId: "strategy-b" });
   assert.equal(calls.length, 0);
-  assert.equal(view.buttons().length, 1);
+  assert.equal(view.legacyButtons().length, 1);
   assert.equal(view.buttons()[0].props.children, "Paper 검증 근거 새로고침");
-  assert.doesNotMatch(html, /<(?:input|select|form)\b/);
+  assert.doesNotMatch(html, /<(?:input|form)\b/);
   assert.equal(nativeBridgeReads, 0);
 });
 
@@ -151,7 +154,7 @@ test("verified and blocked candidates display evidence without adoption or execu
   assert.match(html, /deployment-a/);
   assert.match(html, /instance-a/);
   assert.match(html, /bbbbbbbbbbbbbbbb/);
-  assert.equal(view.buttons().length, 1);
+  assert.equal(view.legacyButtons().length, 1);
   assert.equal(calls.length, 1);
 });
 
@@ -181,7 +184,7 @@ test("registration blockers distinguish sealed evidence from registration and ne
   assert.match(html, /계좌 연결이 설정되어/);
   assert.match(html, /검토 대기 초안이 아닙니다/);
   assert.match(html, /실거래 승인과 현재 계좌 상태는 이 조회에서 확인하지 않습니다/);
-  assert.equal(view.buttons().length, 1);
+  assert.equal(view.legacyButtons().length, 1);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, "GET");
 });
@@ -193,7 +196,7 @@ test("legacy candidate response remains readable without inventing a registratio
   const html = view.render();
   assert.match(html, /Live 후보 등록 · 상태 추가 확인 필요/);
   assert.doesNotMatch(html, /기존 배포 조건으로 차단|후보 등록 차단 사유/);
-  assert.equal(view.buttons().length, 1);
+  assert.equal(view.legacyButtons().length, 1);
 });
 
 const malformed = [
@@ -225,7 +228,7 @@ for (const [name, payload] of malformed) {
     const html = view.render();
     assert.match(html, /role="status"/);
     assert.doesNotMatch(html, /검증된 전략 A|확인할 근거가 없습니다/);
-    assert.equal(view.buttons().length, 1);
+    assert.equal(view.legacyButtons().length, 1);
     assert.equal(view.buttons()[0].props.disabled, false);
     assert.equal(calls.length, 2);
   });
@@ -315,7 +318,110 @@ test("stale import rejection clears the preview and does not automatically retry
     responseForFetch = async () => response({ ok: false, reason: "Deployment가 바뀌었습니다. 새로고침하세요.", authorizationGranted: false });
     await view.buttons().find(button => button.props.children === "검토 대기 후보 등록").props.onClick();
     assert.match(view.render(), /Deployment가 바뀌었습니다/);
-    assert.equal(view.buttons().length, 1);
+    assert.equal(view.legacyButtons().length, 1);
     assert.deepEqual(calls.map(c => c.method), ["GET", "POST"]);
   } finally { allowImport = false; globalThis.window = priorWindow; }
+});
+
+const preparationTrial = { name: "5종목 기능시험", detail: "비승급", portfolioId: "trial", canRun: true,
+  request: { rootKey: "root-hash", portfolioId: "trial", portfolioHash: "portfolio-hash", identityHash: "identity-hash" } };
+function preparationReply(draft = {}, overrides = {}) {
+  const now = Date.now();
+  return { ok: true, schemaVersion: "live-read-only-preparation-v1", readOnly: true, reportPurpose: "READ_ONLY_PREPARATION",
+    authorityGranted: false, authorizationGranted: false, executable: false, promotionEligible: false,
+    useAsPromotionEvidence: false, tradingEnabled: false, currentDeploymentChanged: false, ordersSubmitted: 0,
+    confirmationTokensCreated: 0, permitsCreated: 0, runtimeSessionsCreated: 0,
+    asOf: new Date(now).toISOString(), expiresAt: new Date(now + 60000).toISOString(),
+    source: { kind: "NON_PROMOTION", portfolioHash: "portfolio-hash", evidenceClass: "FUNCTIONAL_TEST_NON_PROMOTION",
+      qualification: "NON_PROMOTION", instruments: [{ instanceId: "instance-a", symbol: "BTCUSDT", broker: "binance" }] },
+    draft: { missingInputs: ["instanceId", "side", "quantity", "limitPrice"], notional: null, ...draft },
+    observation: { status: "NOT_REQUESTED" },
+    checks: [{ code: "LIVE_AUTHORITY", status: "BLOCKED", detail: "권한 없음" }], limitations: ["주문을 실행하지 않습니다."], ...overrides };
+}
+function preparationSourcesReply() {
+  return {ok:true,schemaVersion:"live-readonly-preparation-sources-v1",readOnly:true,executable:false,authorityGranted:false,sources:[{ name: preparationTrial.name, source: { evidenceClass: "FUNCTIONAL_TEST_NON_PROMOTION" }, request: { kind: "NON_PROMOTION", ...preparationTrial.request } }]};
+}
+async function preparationView() {
+  useResponse(preparationSourcesReply());
+  const view = harness();
+  await view.buttons().find(button => button.props.children === "준비 자료 새로고침").props.onClick();view.render();
+  const selector = view.elements("select").find(node => node.props.children?.flat?.().some?.(child => child?.props?.value === "trial:root-hash:trial"));
+  selector.props.onChange({ target: { value: "trial:root-hash:trial" } }); view.render();
+  return view;
+}
+function preparationWindow(timers) {
+  return { setTimeout: (callback, ms) => {
+    if (ms <= 60000) { timers.push(callback); return 0; }
+    const timer = setTimeout(callback, ms); timer.unref?.(); return timer;
+  }, clearTimeout, pywebview: { api: { functional_http_session: async () => ({
+    ok: true, available: true, csrfHeader: "X-LiveTrader-CSRF", csrfToken: "fixture-csrf-".repeat(4),
+  }) } } };
+}
+test("preparation explicit source/read actions keep missing quantity and exact input; changes clear old results", async () => {
+  const previous = globalThis.window, timers = []; let posted;
+  try {
+    globalThis.window = preparationWindow(timers); allowPreparation = true;
+    const view = await preparationView();
+    responseForFetch = async (_url, options) => { posted = JSON.parse(options.body); return response(preparationReply()); };
+    await view.buttons().find(button => button.props.children === "원본 확인 · 계좌 조회 없음").props.onClick();
+    assert.equal(posted.readAccount, false); assert.equal(posted.draft.quantity, "");
+    assert.match(view.render(), /입력 금액: 미입력/);
+    assert.equal(calls.filter(call => call.method === "POST").length, 1);
+    view.elements("select").find(node => node.props.value === "" && node.props.children?.flat?.().some?.(child => child?.props?.value === "instance-a")).props.onChange({ target: { value: "instance-a" } });
+    assert.doesNotMatch(view.render(), /조회 시각/);
+    view.elements("select").find(node => node.props.children?.flat?.().some?.(child => child?.props?.value === "BUY")).props.onChange({ target: { value: "BUY" } }); view.render();
+    view.elements("input")[0].props.onChange({ target: { value: "0.1" } }); view.render();
+    view.elements("input")[1].props.onChange({ target: { value: "0.2" } }); view.render();
+    responseForFetch = async (_url, options) => { posted = JSON.parse(options.body); return response(preparationReply({ missingInputs: [], notional: "0.02" })); };
+    await view.buttons().find(button => button.props.children === "계좌·미체결 읽기 및 입력 금액 계산").props.onClick();
+    assert.deepEqual(posted.draft, { instanceId: "instance-a", side: "BUY", quantity: "0.1", limitPrice: "0.2" });
+    assert.equal(posted.readAccount, true); assert.match(view.render(), /0.02/);
+    assert.match(view.render(), /권한 없음 · 실행 불가/);
+    timers.at(-1)(); assert.match(view.render(), /조회가 만료됐습니다/);
+    assert.doesNotMatch(view.render(), /입력 금액: 0.02/);
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+test("preparation rejects authority-bearing or wrong-source responses", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    for (const overrides of [{ executable: true }, { permitsCreated: 1 }, { source: { ...preparationReply().source, portfolioHash: "changed" } }]) {
+      const view = await preparationView();
+      responseForFetch = async () => response(preparationReply({}, overrides));
+      await view.buttons().find(button => button.props.children === "원본 확인 · 계좌 조회 없음").props.onClick();
+      assert.match(view.render(), /범위와 유효시간을 확인하지 못했습니다/);
+      assert.doesNotMatch(view.render(), /조회 시각/);
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+test("changing preparation source or external strategy clears the previous snapshot", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    const view = await preparationView(); responseForFetch = async () => response(preparationReply());
+    await view.buttons().find(button => button.props.children === "원본 확인 · 계좌 조회 없음").props.onClick();
+    assert.match(view.render(), /조회 시각/);
+    view.render({ strategyId: "changed-strategy" });
+    assert.doesNotMatch(view.render(), /조회 시각/);
+    assert.equal(view.elements("input").length, 0);
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+
+test("legacy candidate delay and failure cannot block or clear independent preparation sources", async () => {
+  const previous=globalThis.window;
+  try {
+    globalThis.window=preparationWindow([]);allowPreparation=true;
+    calls=[];const view=harness();let releaseLegacy;
+    responseForFetch=async url=>{
+      if(url==="/api/paper-candidates") return new Promise(resolve=>{releaseLegacy=resolve;});
+      return response(preparationSourcesReply());
+    };
+    const legacy=view.refresh();view.render();
+    await view.buttons().find(button=>button.props.children==="준비 자료 새로고침").props.onClick();
+    view.render();
+    assert.equal(view.elements("select").some(node=>node.props["aria-label"]==="준비할 원본"),true);
+    releaseLegacy(response(result([], {ok:false,errors:["legacy unavailable"]})));await legacy;
+    const html=view.render();assert.match(html,/5종목 기능시험/);assert.match(html,/legacy unavailable/);
+    assert.equal(calls.filter(call=>call.url==="/api/preparation/sources").length,1);
+  } finally {allowPreparation=false;globalThis.window=previous;}
 });

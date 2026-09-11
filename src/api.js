@@ -22,6 +22,7 @@ let functionalHttpSessionPromise = null;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/paper-candidates/import",
   "/api/monitor-trial/run",
+  "/api/preparation/preview",
   "/api/safety-confirmation/challenge",
   "/api/upbit-functional/start",
   "/api/upbit-functional/stop",
@@ -33,6 +34,7 @@ const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
 ]);
 const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
   "/api/paper-candidates",
+  "/api/preparation/sources",
   ...FUNCTIONAL_HTTP_MUTATION_PATHS,
   "/api/upbit-functional/status",
   "/api/binance-spot-functional/status",
@@ -889,4 +891,12 @@ export function getPaperCandidateEvidence() {
 
 export function runLocalMonitorTrial(requestBody) {
   return request("/api/monitor-trial/run", { method: "POST", body: requestBody, timeoutMs: 60_000 });
+}
+
+export function previewReadOnlyPreparation(requestBody) {
+  return request("/api/preparation/preview", { method: "POST", body: requestBody, timeoutMs: 120000 });
+}
+
+export function getReadOnlyPreparationSources() {
+  return request("/api/preparation/sources");
 }
