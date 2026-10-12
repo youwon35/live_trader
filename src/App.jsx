@@ -394,6 +394,7 @@ function disconnectedSnapshot(nativeEmergency = {}, previousSnapshot = {}) {
 }
 
 const SAFETY_CONFIRMATION_ACTION_LABELS = {
+  PAPER_CANDIDATE_REVIEW: "Paper 후보 계좌 연결 심사",
   KILL_SWITCH_OFF: "전체 긴급 정지 해제",
   DRY_RUN_OFF: "Dry Run 보호 해제",
   NEW_ENTRIES_BLOCKED_OFF: "신규 진입 차단 해제",
@@ -411,6 +412,11 @@ const SAFETY_CONFIRMATION_ACTION_LABELS = {
 };
 
 const SAFETY_CONFIRMATION_CONTEXT_LABELS = {
+  validationProfile: "검증 기준",
+  actualObservationSeconds: "실제 관찰 초",
+  totalCapital: "총사용한도",
+  orderSizing: "주문 수량·위험 설정",
+  execution: "이번 승인 범위",
   action: "작업",
   account: "계좌",
   accountHint: "계좌 식별",
