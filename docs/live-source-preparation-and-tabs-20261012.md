@@ -40,3 +40,10 @@ Python 80개 독립 fixture 회귀는 exact Source/evidence import, account revi
 실제 빌드 frontend의 8개 상위 탭을 1280/1920 두 크기에서 열고, 중첩 한도/로그/계좌 누락 상태 및 20개 정확한 원본 선택을 모두 확인했다. 22개 view 기록, Source 선택 preview 40회, renderer 오류·가로 넘침·외부 요청·broker I/O 0이다. 실제 계좌 read-only 결과와 합성 화면/행동 검증을 별도로 기록한다. 실제 Live evidence 발행/승급/주문 성공을 이 결과로 주장하지 않는다.
 
 기존 70개 dirty 작업을 보존하고 이번 소유 파일만 선택 commit한다. 최종 실행 파일은 공동 warmup freeze `cf7fbb492f817bb1588afd47dc8cfc6c979ae830`를 포함해 다시 빌드하고, 실행 중인 사용자 프로세스는 종료하지 않는다.
+
+
+## 최종 실행 파일 반영
+
+2026-10-12 15:30:56 KST에 사용자 Live 프로세스가 0개임을 읽기 전용으로 확인하고 기존 exe를 백업한 뒤 `release/LiveTrader.exe`를 교체했다. 코드 commit `9296bb89de80bebbf5a7ee7d023855cc13b76b72`, 공유 runtime `cf7fbb492f817bb1588afd47dc8cfc6c979ae830`, exe 크기 50,009,823 byte, SHA256 `5c282dbe9303600668e35b2a3dbc5daeddfdd33b307a1557a463a8993c3f6015`다.
+
+패키지 archive에서 sealed_source_preparation/cash_preparation_preview/read_only_account, 새 provider_backfill/historical_warmup/portfolio_reference/continuous_runtime, KIS 46·47 field guard, PyArrow Parquet native DLL을 실제 확인했다. 앱 실행·사용자 프로세스 종료·arming·실주문·취소는 0이다. Hub manifest와 비밀/운영 state는 수정하지 않았다. 기록은 `output/live-tabs-20261012/live-release-manifest.json`과 `archive-check.json`이다. 현재 등록된 20개 Source는 계속 실제 Paper 승급 근거 대기 상태다.
