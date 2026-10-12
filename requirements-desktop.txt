@@ -3,3 +3,4 @@ pyinstaller>=6.0
 websocket-client>=1.8
 pycryptodome>=3.20
 tzdata>=2026.1
+pyarrow>=26.0
