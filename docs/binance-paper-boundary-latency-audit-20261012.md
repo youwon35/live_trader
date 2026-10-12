@@ -124,3 +124,5 @@ Upbit는 기존 자료를 유지한 native 종료 재시도에서 CLEAN / STOPPE
 독립 신호 재생의 결과는 구분한다. Binance의 실제 forward input 6개는 모두 PASS다. Upbit의 실제 input 3개는 warmup-incomplete로 BLOCKED다. Upbit의 HOLD 신호가 재생의 기본 HOLD와 같더라도 신호 parity PASS로 표시하지 않는다. Upbit는 봉·경계 처리·무결성·flat 종료 경로를 확인했으며 로컬 체결은 0건이다. 두 사례 모두 실제 broker 주문과 Live publication은 0건이다.
 
 멤버별 원본 시각·hash·claim·로컬 계좌·독립 재생·최종 seal 결과는 Live 앱의 `output/promotion-20261012/paper-v5-read-only-audit.json`에 저장했다. 기능 동작, 자료 무결성, 장기 검증과 실제 승급은 이 보고서에서도 별도로 표시한다.
+
+Upbit warmup 부족의 숫자도 확인했다. RSI14의 requiredHistoryBars는 16이며 baseline에는 모든 멤버가 16봉씩 있어 최초 요구를 충족했다. 마지막 seed는 03:35~03:40이었다. 03:41:48 중간 bucket에서 소켓을 연결하여 불완전한 03:40~03:45 봉이 제외됐고, 최초 완전한 03:45~03:50 봉이 들어올 때 missingBars=1 / gapStateReset=true가 각 멤버에 적용됐다. 이후 실제 history는 각 1봉, runtime gapCount는 3이다. 이번 BLOCKED는 REST의 200개 제한이나 300봉 기본 요청 부족 때문이 아니며, native 첫 봉 완전성 및 gap reset 가드의 결과다. 이 근거를 JSON의 warmupContext에도 추가했다.
