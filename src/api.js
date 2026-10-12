@@ -2,6 +2,7 @@ export const API_DEFAULT_TIMEOUT_MS = 15_000;
 export const BROKER_REFRESH_TIMEOUT_MS = 45_000;
 
 export const SAFETY_CONFIRMATION_ACTIONS = Object.freeze({
+  PAPER_CANDIDATE_REVIEW: "PAPER_CANDIDATE_REVIEW",
   KILL_SWITCH_OFF: "KILL_SWITCH_OFF",
   DRY_RUN_OFF: "DRY_RUN_OFF",
   NEW_ENTRIES_BLOCKED_OFF: "NEW_ENTRIES_BLOCKED_OFF",
@@ -21,6 +22,7 @@ let activeSafetyConfirmationFlow = null;
 let functionalHttpSessionPromise = null;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/paper-candidates/import",
+  "/api/paper-candidates/review",
   "/api/monitor-trial/run",
   "/api/preparation/preview",
   "/api/safety-confirmation/challenge",
@@ -34,6 +36,7 @@ const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
 ]);
 const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
   "/api/paper-candidates",
+  "/api/paper-candidates/accounts",
   "/api/preparation/sources",
   ...FUNCTIONAL_HTTP_MUTATION_PATHS,
   "/api/upbit-functional/status",
@@ -899,4 +902,16 @@ export function previewReadOnlyPreparation(requestBody) {
 
 export function getReadOnlyPreparationSources() {
   return request("/api/preparation/sources");
+}
+
+
+export async function getPaperCandidateAccounts() {
+  return request("/api/paper-candidates/accounts");
+}
+
+export async function reviewPaperCandidate(reviewRequest) {
+  return runWithSafetyConfirmation(SAFETY_CONFIRMATION_ACTIONS.PAPER_CANDIDATE_REVIEW, reviewRequest,
+    (confirmation) => request("/api/paper-candidates/review", {
+      method: "POST", body: { ...reviewRequest, ...safetyConfirmationPayload(confirmation) },
+    }));
 }

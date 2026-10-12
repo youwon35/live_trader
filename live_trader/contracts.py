@@ -932,6 +932,7 @@ def enrich_strategy_artifact_runtime(folder: Path, path: Path, artifact: dict[st
         and _dict_value(item.get("strategyArtifact")).get("artifactHash") == reference.get("artifactHash")
         and str(item.get("environment") or "").strip().upper()
         in {"LIVE", "SMALL_LIVE", "FULL_LIVE"}
+        and not (item.get("lifecycle") == "retired" and _dict_value(item.get("permissions")).get("supersededByDeploymentId"))
     ]
     deployment = deployments[0] if deployments else {}
     if deployment:
@@ -1131,9 +1132,20 @@ def load_pinned_paper_live_qualification(
         expected_portfolio_artifact_id=portfolio_id,
         expected_portfolio_artifact_hash=portfolio_hash,
         expected_portfolio_instance_id=portfolio_instance_id,
+        expected_promotion_policy_hash=str(permission_source.get("paperPromotionPolicyHash") or ""),
         expected_portfolio_required=portfolio_required,
     )
     snapshot = validation.snapshot()
+    reviewed_profile_id = str(permission_source.get("liveAccountProfileId") or "")
+    if reviewed_profile_id:
+        from .account_profiles import saved_account_profiles
+        matched = [item for item in saved_account_profiles() if item["profileId"] == reviewed_profile_id
+            and item["accountFingerprint"] == permission_source.get("liveAccountFingerprint")
+            and item["credentialConfigurationHash"] == permission_source.get("liveAccountCredentialConfigurationHash")
+            and item["accountBindingId"] == deployment.get("accountId")]
+        if len(matched) != 1:
+            snapshot["ready"] = False
+            snapshot["issues"] = [*snapshot.get("issues", []), "paper-live-reviewed-account-binding-changed"]
     snapshot.update(
         {
             "required": True,
@@ -1528,6 +1540,8 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "deployment_revision": _safe_int(deployment.get("revision")),
         "deployment_environment": str(deployment.get("environment") or ""),
         "deployment_mode": str(deployment.get("mode") or ""),
+        "account_id": str(_dict_value(deployment.get("permissions")).get("liveAccountAlias") or "계좌 연결 전"),
+        "live_capital_policy": _dict_value(_dict_value(deployment.get("permissions")).get("liveCapitalPolicy")),
         "deployment_source": "deployment-registry" if deployment else "legacy-artifact",
         "artifactLifecycle": artifact_lifecycle,
         "deploymentLifecycle": {

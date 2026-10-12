@@ -11052,6 +11052,7 @@ def stop_operational_runtime_sessions_for_kill(
 
 
 SAFETY_CONFIRMATION_ACTIONS = {
+    "PAPER_CANDIDATE_REVIEW",
     "KILL_SWITCH_OFF",
     "DRY_RUN_OFF",
     "NEW_ENTRIES_BLOCKED_OFF",
@@ -11587,6 +11588,8 @@ def issue_safety_confirmation(
         dict(request_context) if isinstance(request_context, dict) else {}
     )
     preissued: dict[str, Any] = {}
+    if normalized_action == "PAPER_CANDIDATE_REVIEW":
+        return issue_paper_candidate_review_confirmation(effective_request)
     if normalized_action == "UPBIT_FUNCTIONAL_START":
         try:
             preissued = _preissue_upbit_functional_permit_candidate(
@@ -26367,6 +26370,7 @@ def _continuous_stop_control(function: Any) -> Any:
         finally:
             with SAFETY_CONFIRMATION_MUTATION_LOCK:
                 end_continuous_control(token)
+    wrapped._authority_fence = "CONTINUOUS_CONTROL"
     return wrapped
 
 
@@ -27754,6 +27758,46 @@ def import_paper_candidate_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         return import_paper_candidate(payload)
     except (ValueError, OSError, RuntimeError) as exc:
         return {"ok": False, "authorizationGranted": False, "reason": str(exc)}
+
+
+def saved_paper_candidate_accounts() -> dict[str, Any]:
+    from .account_profiles import public_saved_accounts
+    return public_saved_accounts()
+
+
+def paper_candidate_review_controls() -> dict[str, Any]:
+    return {"configRevision": int(STATE.get("config_revision") or 0),
+        "riskPolicyRevision": int(STATE.get("risk_policy_revision") or 0),
+        "mode": str(STATE.get("mode") or "MONITOR"),
+        "killSwitch": bool(STATE.get("kill_switch")), "dryRun": bool(STATE.get("dry_run")),
+        "newEntriesBlocked": bool(STATE.get("new_entries_blocked"))}
+
+
+def issue_paper_candidate_review_confirmation(payload: dict[str, Any]) -> dict[str, Any]:
+    from .paper_candidate_review import issue_review_confirmation
+    try:
+        return issue_review_confirmation(payload, safety_store=SAFETY_CONFIRMATIONS,
+            controls=paper_candidate_review_controls())
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+        return {"ok": False, "reason": "정확한 후보·저장 계좌·승급 근거를 다시 확인하세요."}
+
+
+@_serialized_safety_mutation
+@_two_phase_kis_route_control("SETTINGS")
+def review_paper_candidate_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    from .paper_candidate_review import approve_paper_candidate, FIELDS
+    if not isinstance(payload, dict) or set(payload) != set(FIELDS) | {"safety_confirmation"}:
+        return {"ok": False, "reason": "후보 심사 입력 형식이 올바르지 않습니다."}
+    request = {key: value for key, value in payload.items() if key != "safety_confirmation"}
+    try:
+        result = approve_paper_candidate(request, payload.get("safety_confirmation"),
+            safety_store=SAFETY_CONFIRMATIONS, controls=paper_candidate_review_controls())
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+        return {"ok": False, "reason": "후보·계좌·승급 기준이 변경됐거나 저장을 완료하지 못했습니다. 새로고침하세요."}
+    if result.get("ok") is True:
+        STATE["latest_preflight_snapshot_id"] = ""
+        append_audit("info", "Live 후보 계좌 심사", "정확한 Paper 근거와 저장 계좌를 제한 실거래 준비로 연결했습니다. 주문 실행과 실제 잔액 조회는 수행하지 않았습니다.")
+    return result
 
 
 def run_local_monitor_trial(payload: dict[str, Any]) -> dict[str, Any]:

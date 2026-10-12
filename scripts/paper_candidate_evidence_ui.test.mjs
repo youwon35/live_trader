@@ -22,17 +22,19 @@ let responseForFetch;
 let nativeBridgeReads = 0;
 let allowImport = false;
 let allowPreparation = false;
+let allowReview = false;
 globalThis.window = {
   setTimeout, clearTimeout,
   get pywebview() { nativeBridgeReads += 1; throw new Error("Native bridge forbidden in read-only UI test"); },
 };
 globalThis.fetch = async (url, options) => {
   if (options.method === "POST") {
-    assert.equal(allowImport || allowPreparation, true);
-    assert.equal(url, allowPreparation ? "/api/preparation/preview" : "/api/paper-candidates/import");
+    assert.equal(allowImport || allowPreparation || allowReview, true);
+    if (allowReview) assert.ok(["/api/safety-confirmation/challenge", "/api/paper-candidates/review"].includes(url));
+    else assert.equal(url, allowPreparation ? "/api/preparation/preview" : "/api/paper-candidates/import");
     assert.equal(options.headers["X-LiveTrader-CSRF"], "fixture-csrf-".repeat(4));
   } else {
-    assert.ok(["/api/paper-candidates", "/api/preparation/sources"].includes(url));
+    assert.ok(["/api/paper-candidates", "/api/paper-candidates/accounts", "/api/preparation/sources"].includes(url));
     assert.equal(options.method, "GET");
     assert.equal(options.body, undefined);
   }
@@ -424,4 +426,78 @@ test("legacy candidate delay and failure cannot block or clear independent prepa
     const html=view.render();assert.match(html,/5종목 기능시험/);assert.match(html,/legacy unavailable/);
     assert.equal(calls.filter(call=>call.url==="/api/preparation/sources").length,1);
   } finally {allowPreparation=false;globalThis.window=previous;}
+});
+
+
+test("custom criteria and actual short observation are shown without claiming default long-term qualification", async () => {
+  useResponse(result([row({
+    validationSummary: { validationProfile: "CUSTOM_THRESHOLD", defaultForwardCriteriaMet: false,
+      actualObservationSeconds: 3600, actualObservationDays: 0, actualOrderCount: 2, actualRegimeCount: 1 },
+    promotionPolicy: { schemaVersion: "paper-promotion-policy-v1", promotionEligible: true,
+      validationProfile: "CUSTOM_THRESHOLD", policyHash: "d".repeat(64),
+      thresholds: { minimumObservationSeconds: 3600, minimumOrders: 2, minimumRegimes: 1 }, baselineDifferences: [] },
+  })]));
+  const view = harness();
+  await view.refresh();
+  const html = view.render();
+  assert.match(html, /사용자 설정 기준 통과 · CUSTOM_THRESHOLD/);
+  assert.match(html, /3,600초/);
+  assert.match(html, /기본 forward 기준[^<]*: 미충족/);
+  assert.match(html, /이 후보의 봉인 승급 기준/);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "GET");
+});
+
+test("malformed or non-promotional policy projection clears candidate actions", async () => {
+  useResponse(result([row({ promotionPolicy: { schemaVersion: "paper-promotion-policy-v1", promotionEligible: false } })]));
+  const view = harness();
+  await view.refresh();
+  assert.match(view.render(), /応答|응답 형식/);
+  assert.doesNotMatch(view.render(), /검증된 전략 A/);
+  assert.equal(calls.length, 1);
+});
+
+
+test("account review requires explicit saved-account choice, existing one-use native confirmation and stays monitor", async () => {
+  const previous = globalThis.window; let selection; let reviewed; let challengeRequest; let reviewPost;
+  const candidate = row({ canReview: true, registered: true, brokerId: "binance", rootKey: "root-a",
+    reviewRequest: { rootKey: "root-a", evidenceId: "paper-evidence-a", deploymentId: "draft-a", identityHash: "e".repeat(64), expectedRevision: 1, registryHash: "f".repeat(64) } });
+  const cleanup = api.registerSafetyConfirmationPresenter(async (challenge) => ({ confirmed: true, typedPhrase: challenge.expectedPhrase }));
+  try {
+    globalThis.window = preparationWindow([]); allowReview = true;
+    responseForFetch = async (url, options) => {
+      if (url === "/api/paper-candidates") return response(result([candidate]));
+      if (url === "/api/paper-candidates/accounts") return response({ ok: true, schemaVersion: "live-saved-account-profiles-v1", readOnly: true, brokerCalls: 0, ordersSubmitted: 0,
+        accounts: [{ profileId: "account-a", brokerId: "binance", alias: "Binance Spot", maskedAccount: "••••ABCD", balanceQueried: false }] });
+      if (url === "/api/safety-confirmation/challenge") {
+        challengeRequest = JSON.parse(options.body);
+        return response({ ok: true, challengeId: "challenge-a", token: "opaque-token-a", expectedPhrase: "LIVE ABCD", expiresAt: new Date(Date.now() + 90000).toISOString(), displayContext: { totalCapital: "주문가능액 100%" } });
+      }
+      if (url === "/api/paper-candidates/review") {
+        reviewPost = JSON.parse(options.body);
+        return response({ ok: true, schemaVersion: "live-paper-candidate-review-v1", lifecycle: "before-live-small", mode: "MONITOR", authorizationGranted: false, realOrdersArmed: false,
+          brokerCalls: 0, ordersSubmitted: 0, deploymentId: "account-bound-a", detail: "제한 실거래 준비 완료" });
+      }
+      throw new Error("unexpected request");
+    };
+    calls = [];
+    const view = harness({ onRegistered: async (id) => { reviewed = id; } });
+    await view.refresh(); view.render();
+    const button = () => view.buttons().find(item => item.props.children === "계좌 연결·제한 실거래 준비 확인");
+    assert.equal(button().props.disabled, true);
+    await view.buttons().find(item => item.props.children === "저장 계좌 새로고침").props.onClick(); view.render();
+    selection = view.elements("select").find(item => item.props["aria-label"] === "계좌 선택 paper-evidence-a");
+    assert.equal(selection.props.value, "");
+    selection.props.onChange({ target: { value: "account-a" } }); view.render();
+    assert.equal(button().props.disabled, false);
+    await button().props.onClick();
+    assert.equal(reviewed, "account-bound-a");
+    assert.equal(challengeRequest.action, "PAPER_CANDIDATE_REVIEW");
+    assert.equal(reviewPost.accountProfileId, "account-a");
+    assert.equal(reviewPost.capitalPercent, 100);
+    assert.equal(reviewPost.capitalBasis, "ACCOUNT_AVAILABLE_CASH");
+    assert.equal(reviewPost.safety_confirmation.typedPhrase, "LIVE ABCD");
+    assert.equal(calls.filter(item => item.method === "POST").length, 2);
+    assert.match(view.render(), /제한 실거래 준비 완료/);
+  } finally { cleanup(); allowReview = false; globalThis.window = previous; }
 });

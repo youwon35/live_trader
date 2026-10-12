@@ -207,7 +207,8 @@ def _deployment(root: Path, registry: dict, strategy: dict, portfolio: dict | No
     matches = [entry for entry in registry["entries"].values()
                if entry.get("strategyArtifact") == artifact_reference(strategy)
                and entry.get("portfolioArtifact") == (artifact_reference(portfolio) if portfolio else None)
-               and entry.get("environment") in ("LIVE", "SMALL_LIVE", "FULL_LIVE")]
+               and entry.get("environment") in ("LIVE", "SMALL_LIVE", "FULL_LIVE")
+               and not (entry.get("lifecycle") == "retired" and (entry.get("permissions") or {}).get("supersededByDeploymentId"))]
     if len(matches) > 1:
         raise CandidateBlocked("같은 저장본의 Live Deployment가 여러 개여서 대상을 확정할 수 없습니다.")
     if not matches:
@@ -243,6 +244,8 @@ def _candidate(root, evidence, registry, catalogs):
         "strategyName": str(strategy.get("name") or scope.strategy_artifact_id),
         "portfolioId": scope.portfolio_artifact_id, "instanceHash": instance_hash,
         "rootKey": stable_sha256(str(root.resolve())), "identity": identity,
+        "validationSummary": dict(qualification.validation_summary or {}),
+        "promotionPolicy": dict(scope.promotion_policy) if scope.promotion_policy is not None else None,
         "deployment": _deployment(root, registry, strategy, portfolio),
         "status": "VERIFIED_READ_ONLY", "canImport": False,
         "authorizationGranted": False, "detail": "현재 저장본과 봉인 검증 근거가 일치합니다. 확인 전용입니다.",
@@ -257,6 +260,22 @@ def _candidate(root, evidence, registry, catalogs):
         and not any(permissions.get(key) is True for key in ("live_allowed", "live_eligible", "live_small_eligible"))
     )
     row["registered"] = registered
+    row["canReview"] = bool(registered and importable and entry.get("lifecycle") == "draft")
+    _, inferred_broker, _ = infer_market_route(str(strategy.get("symbol") or ""))
+    trader = strategy.get("traderContract") or strategy.get("trader_contract") or {}
+    if portfolio is None:
+        selected_instance, _ = _exact_instance(catalogs["instance"], scope.strategy_instance_id, strategy)
+    else:
+        selected_child = next(item for item in portfolio["strategyInstances"] if str(item.get("instanceId") or item.get("strategyInstanceId") or "") == scope.strategy_instance_id)
+        selected_instance, _ = _exact_instance(catalogs["instance"], str(selected_child.get("templateInstanceId") or selected_child.get("instanceId") or ""), strategy)
+    row["brokerId"] = str(selected_instance.get("brokerId") or strategy.get("brokerId") or strategy.get("broker_id") or trader.get("brokerId") or inferred_broker).strip().lower()
+    if row["canReview"]:
+        row["reviewRequest"] = {
+            "rootKey": row["rootKey"], "evidenceId": row["evidenceId"],
+            "deploymentId": row["deployment"]["deploymentId"],
+            "identityHash": stable_sha256({"identity": identity, "instanceHash": instance_hash}),
+            "expectedRevision": row["deployment"]["revision"], "registryHash": stable_sha256(registry),
+        }
     row["canImport"] = importable and not registered
     # Explain the existing verdict only; no account values or authority changes.
     row["blockedReasons"] = []
@@ -288,11 +307,15 @@ def _candidate(root, evidence, registry, catalogs):
 
 
 def candidate_pins(identity):
-    return {"paperEvidenceId": identity["evidenceId"], "paperEvidenceHash": identity["evidenceHash"],
+    pins = {"paperEvidenceId": identity["evidenceId"], "paperEvidenceHash": identity["evidenceHash"],
         "paperEvidenceBundleHash": identity["evidenceBundleHash"], "paperFinalBindingHash": identity["bindingHash"],
         "paperGovernanceDeploymentId": identity["paperGovernanceDeploymentId"],
         "paperStrategyInstanceId": identity["strategyInstanceId"],
         "paperPortfolioInstanceId": identity.get("portfolioInstanceId", "")}
+    if identity.get("promotionPolicyHash"):
+        pins["paperPromotionPolicyHash"] = identity["promotionPolicyHash"]
+        pins["paperValidationProfile"] = identity["validationProfile"]
+    return pins
 
 
 def list_paper_candidates(*, roots: Sequence[Path] | None = None) -> dict[str, Any]:

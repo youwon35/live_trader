@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { getPaperCandidateEvidence, importPaperCandidate, runLocalMonitorTrial, previewReadOnlyPreparation, getReadOnlyPreparationSources } from "./api";
+import { getPaperCandidateEvidence, importPaperCandidate, runLocalMonitorTrial, previewReadOnlyPreparation, getReadOnlyPreparationSources, getPaperCandidateAccounts, reviewPaperCandidate } from "./api";
 
 const SCOPE_LABELS = {
   evidenceId: "Evidence ID", evidenceHash: "봉인 Evidence hash",
@@ -8,6 +8,17 @@ const SCOPE_LABELS = {
   strategyArtifactHash: "전략 hash", strategyInstanceId: "전략 Instance",
   portfolioArtifactHash: "Portfolio hash", portfolioInstanceId: "Portfolio Instance",
   deploymentManifestHash: "Manifest hash", sessionId: "검증 세션",
+  promotionPolicyHash: "승급 기준 정책 hash", validationProfile: "검증 기준 분류",
+};
+
+const POLICY_CRITERION_LABELS = {
+  minimumShadowDecisions: "신호 관찰 판단 횟수", minimumShadowIntents: "신호 관찰 주문 의도",
+  minimumOrders: "최소 모의 주문", minimumObservationSeconds: "최소 실제 관찰 시간(초)",
+  minimumRegimes: "최소 시장국면", minimumCompletedTrades: "최소 완료 거래",
+  returnTolerancePct: "수익률 허용차(%)", mddMultiplier: "낙폭 허용 배수",
+  minimumDataAvailabilityPct: "최소 데이터 수신율(%)", minimumSignalMatchPct: "최소 신호 일치율(%)",
+  continuousMinimumCoverage: "코인 봉 수신 비율", sessionMinimumCoverage: "주식 장중 봉 수신 비율",
+  maximumConsecutiveMissedBoundaries: "최대 연속 누락 봉",
 };
 
 const PREPARATION_INPUT_STYLE = { minHeight: 32, padding: "0 8px", color: "var(--text)", background: "var(--input)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", font: "inherit", width: 160 };
@@ -19,6 +30,9 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
   const pending = useRef(false);
   const [trialSelection, setTrialSelection] = useState("");
   const [trialResult, setTrialResult] = useState(null);
+  const [accountProfiles, setAccountProfiles] = useState([]);
+  const [reviewSelection, setReviewSelection] = useState({});
+  const [capitalPercent, setCapitalPercent] = useState("100");
 
   const [preparationSources, setPreparationSources] = useState([]);
   const [preparationBusy, setPreparationBusy] = useState(false);
@@ -147,6 +161,11 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
         || (result.requiredNextStep !== undefined && typeof result.requiredNextStep !== "string")
         || result.candidates.some((candidate) => !record(candidate)
           || typeof candidate.canImport !== "boolean"
+          || (candidate.canReview !== undefined && typeof candidate.canReview !== "boolean")
+          || (candidate.canReview === true && (!record(candidate.reviewRequest)
+            || !Number.isInteger(candidate.reviewRequest.expectedRevision) || candidate.reviewRequest.expectedRevision < 1
+            || ["rootKey", "evidenceId", "deploymentId", "identityHash", "registryHash"].some((key) => typeof candidate.reviewRequest[key] !== "string" || !candidate.reviewRequest[key])
+            || typeof candidate.brokerId !== "string" || candidate.registered !== true))
           || (candidate.canImport === true && (!record(candidate.importRequest)
             || !Number.isInteger(candidate.importRequest.expectedRevision)
             || candidate.importRequest.expectedRevision < 0
@@ -157,6 +176,17 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
             || candidate.blockedReasons.some((reason) => !record(reason) || typeof reason.code !== "string" || typeof reason.detail !== "string")
             || (candidate.blockedReasons.length > 0 && (candidate.canImport || candidate.registered === true))))
           || ["strategyId", "strategyName", "portfolioId", "instanceHash", "rootKey"].some((key) => candidate[key] !== undefined && typeof candidate[key] !== "string")
+          || (candidate.validationSummary !== undefined && (!record(candidate.validationSummary)
+            || !["STANDARD", "CUSTOM_THRESHOLD"].includes(candidate.validationSummary.validationProfile)
+            || typeof candidate.validationSummary.defaultForwardCriteriaMet !== "boolean"
+            || ["actualObservationSeconds", "actualObservationDays", "actualOrderCount", "actualRegimeCount"].some((key) => !Number.isFinite(candidate.validationSummary[key]) || candidate.validationSummary[key] < 0)))
+          || (candidate.promotionPolicy !== undefined && candidate.promotionPolicy !== null && (!record(candidate.promotionPolicy)
+            || candidate.promotionPolicy.schemaVersion !== "paper-promotion-policy-v1"
+            || candidate.promotionPolicy.promotionEligible !== true
+            || !["STANDARD", "CUSTOM_THRESHOLD"].includes(candidate.promotionPolicy.validationProfile)
+            || typeof candidate.promotionPolicy.policyHash !== "string"
+            || !record(candidate.promotionPolicy.thresholds)
+            || !Array.isArray(candidate.promotionPolicy.baselineDifferences)))
           || (candidate.identity !== undefined && (!record(candidate.identity)
             || Object.keys(SCOPE_LABELS).some((key) => candidate.identity[key] !== undefined && typeof candidate.identity[key] !== "string")))
           || (candidate.deployment !== undefined && (!record(candidate.deployment)
@@ -198,6 +228,46 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
       pending.current = false;
       setBusy(false);
     }
+  }
+
+  async function refreshAccounts() {
+    if (pending.current) return;
+    pending.current = true; setBusy(true); setReviewSelection({});
+    try {
+      const result = await getPaperCandidateAccounts();
+      if (result?.ok !== true || result.schemaVersion !== "live-saved-account-profiles-v1"
+        || result.readOnly !== true || result.brokerCalls !== 0 || result.ordersSubmitted !== 0
+        || !Array.isArray(result.accounts) || result.accounts.some((item) => !item
+          || !["kis", "binance", "upbit"].includes(item.brokerId)
+          || ["profileId", "alias", "maskedAccount"].some((key) => typeof item[key] !== "string" || !item[key])
+          || item.balanceQueried !== false)) throw new Error("저장 계좌 목록의 범위를 확인하지 못했습니다.");
+      setAccountProfiles(result.accounts);
+      setMessage("저장된 계좌 설정만 읽었습니다. 잔액·주문가능액은 시작 점검에서 확인합니다.");
+    } catch (error) { setAccountProfiles([]); setMessage(error?.message || "저장 계좌를 확인하지 못했습니다."); }
+    finally { pending.current = false; setBusy(false); }
+  }
+
+  async function review(candidate) {
+    const key = `${candidate.rootKey}:${candidate.evidenceId}`;
+    const accountProfileId = reviewSelection[key];
+    const percent = Number(capitalPercent);
+    if (pending.current || !candidate.canReview || !candidate.reviewRequest || !accountProfileId
+      || !Number.isFinite(percent) || percent <= 0 || percent > 100) return;
+    pending.current = true; setBusy(true);
+    try {
+      const result = await reviewPaperCandidate({ ...candidate.reviewRequest, accountProfileId,
+        capitalBasis: "ACCOUNT_AVAILABLE_CASH", capitalPercent: percent });
+      if (result?.ok !== true || result.schemaVersion !== "live-paper-candidate-review-v1"
+        || result.lifecycle !== "before-live-small" || result.mode !== "MONITOR"
+        || result.authorizationGranted !== false || result.realOrdersArmed !== false
+        || result.brokerCalls !== 0 || result.ordersSubmitted !== 0
+        || typeof result.deploymentId !== "string" || !result.deploymentId)
+        throw new Error(result?.reason || "계좌 연결·제한 실거래 준비 결과를 확인하지 못했습니다.");
+      pending.current = false; await refresh(); pending.current = true;
+      setMessage(result.detail);
+      if (onRegistered) await onRegistered(result.deploymentId);
+    } catch (error) { setMessage(error?.message || "후보 심사가 완료되지 않았습니다. 새로고침하세요."); }
+    finally { pending.current = false; setBusy(false); }
   }
 
   async function openRegistered(deploymentId) {
@@ -249,6 +319,11 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
       <button className="secondary-button" disabled={busy} onClick={refresh} type="button">
         {busy ? "확인 중…" : "Paper 검증 근거 새로고침"}
       </button>
+      {rows.some((candidate) => candidate.canReview) && <section aria-label="저장 계좌와 총사용한도">
+        <button type="button" className="secondary-button" disabled={busy} onClick={refreshAccounts}>저장 계좌 새로고침</button>
+        <label>총사용한도 · 현재 계좌 주문가능액의 <input aria-label="계좌 주문가능액 사용 비율" type="number" min="0.01" max="100" step="0.01" value={capitalPercent} disabled={busy} onChange={(event) => setCapitalPercent(event.target.value)} style={{ ...PREPARATION_INPUT_STYLE, width: 90 }} />%</label>
+        <p>100%는 계좌의 주문가능액 전체를 총사용한도로 준비합니다. 실제 금액과 주문당 수량·위험 한도는 선택 배포의 시작 점검에서 확인합니다.</p>
+      </section>}
       {message && <p role="status">{message}</p>}
       {inbox?.ok && rows.length === 0 && <p>{preparationChoices.length ? "정규 Paper 승급 근거는 없습니다. 아래 기능시험 자료로 읽기 전용 준비를 확인할 수 있습니다." : "확인할 근거가 없습니다. 모의거래에서 검증 근거를 발행한 뒤 다시 확인하세요."}</p>}
       {inbox?.monitorTrialError && <p role="status">연결 시험 목록: {inbox.monitorTrialError}</p>}
@@ -329,6 +404,16 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
                   {candidate.status === "VERIFIED_READ_ONLY" && <div aria-label="후보 준비 단계">
                     <p>Backtester 저장본 · 현재 전략과 실행 단위 일치</p>
                     <p>Paper 검증 근거 · 봉인 연결 확인</p>
+                    {candidate.validationSummary && <div aria-label="Paper 검증 기준과 관찰 범위">
+                      <p>{candidate.validationSummary.validationProfile === "CUSTOM_THRESHOLD" ? "사용자 설정 기준 통과 · CUSTOM_THRESHOLD" : "기본 기준 통과 · STANDARD"}</p>
+                      <p>실제 관찰 {candidate.validationSummary.actualObservationSeconds.toLocaleString("ko-KR")}초 · {candidate.validationSummary.actualObservationDays}일 · 주문 {candidate.validationSummary.actualOrderCount}건 · 시장국면 {candidate.validationSummary.actualRegimeCount}개</p>
+                      <p>기본 forward 기준(30일·5주문·2국면·봉 수신): {candidate.validationSummary.defaultForwardCriteriaMet ? "충족" : "미충족"}</p>
+                      {candidate.promotionPolicy && <details><summary>이 후보의 봉인 승급 기준</summary>
+                        <p>정책 hash <code>{candidate.promotionPolicy.policyHash}</code></p>
+                        <p>설정 기준은 이 검증 세션에 고정되어 있습니다. 기능시험 근거와 별도로 검증했습니다.</p>
+                        <dl>{Object.entries(candidate.promotionPolicy.thresholds).map(([key, value]) => <div key={key}><dt>{POLICY_CRITERION_LABELS[key] || key}</dt><dd>{String(value)}</dd></div>)}</dl>
+                      </details>}
+                    </div>}
                     <p>Live 후보 등록 · {candidate.canImport ? "검토 대기 등록 가능" : candidate.registered ? "등록됨" : candidate.blockedReasons?.length ? "기존 배포 조건으로 차단" : "상태 추가 확인 필요"}</p>
                     {candidate.blockedReasons?.length > 0 && <ul aria-label="후보 등록 차단 사유">
                       {candidate.blockedReasons.map((reason, reasonIndex) => <li key={`${reason.code}:${reasonIndex}`}>{reason.detail}</li>)}
@@ -337,6 +422,13 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
                   </div>}
                   <div style={{ display: "flex", gap: 8, margin: "8px 0", flexWrap: "wrap" }}>
                   {candidate.canImport && <button type="button" className="primary-button" disabled={busy} onClick={() => register(candidate)}>검토 대기 후보 등록</button>}
+                  {candidate.canReview && <>
+                    <label>저장 계좌 선택 <select aria-label={`계좌 선택 ${candidate.evidenceId}`} disabled={busy} value={reviewSelection[`${candidate.rootKey}:${candidate.evidenceId}`] || ""} onChange={(event) => setReviewSelection({ ...reviewSelection, [`${candidate.rootKey}:${candidate.evidenceId}`]: event.target.value })}>
+                      <option value="">직접 선택하세요</option>
+                      {accountProfiles.filter((account) => account.brokerId === candidate.brokerId).map((account) => <option key={account.profileId} value={account.profileId}>{account.alias} · {account.maskedAccount}</option>)}
+                    </select></label>
+                    <button type="button" className="primary-button" disabled={busy || !reviewSelection[`${candidate.rootKey}:${candidate.evidenceId}`] || !(Number(capitalPercent) > 0 && Number(capitalPercent) <= 100)} onClick={() => review(candidate)}>계좌 연결·제한 실거래 준비 확인</button>
+                  </>}
                   {candidate.registered && onRegistered && <button type="button" className="secondary-button" disabled={busy} onClick={() => openRegistered(candidate.deployment.deploymentId)}>등록한 배포 보기</button>}
                   </div>
                   {candidate.identity && <details>

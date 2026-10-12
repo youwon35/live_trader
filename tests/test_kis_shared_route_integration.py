@@ -3714,6 +3714,7 @@ class KisSharedRouteIntegrationTests(unittest.TestCase):
             and node.func.value.id == "state"
         }
         kis_authority_controls = {
+            "review_paper_candidate_metadata",
             "promote_strategy_to_live",
             "poll_execution_events",
             "run_final_preflight",
@@ -3752,6 +3753,8 @@ class KisSharedRouteIntegrationTests(unittest.TestCase):
             "test_binance_futures_canary_order",
         }
         observation_or_offline_mutations = {
+            "import_paper_candidate_metadata", "operator_note_document",
+            "run_local_monitor_trial", "read_only_order_preparation",
             "export_audit",
             "issue_safety_confirmation",
             "prepare_crypto_first_live_supervised_state",
@@ -3868,7 +3871,8 @@ class KisSharedRouteIntegrationTests(unittest.TestCase):
                 "UPBIT",
                 "KIS_TWO_PHASE_START",
             ],
-            state.stop_continuous_runtime: ["KIS_TWO_PHASE_STOP"],
+            state.stop_continuous_runtime: ["CONTINUOUS_CONTROL", "KIS_TWO_PHASE_STOP"],
+            state.review_paper_candidate_metadata: ["SAFETY", "KIS_TWO_PHASE_SETTINGS"],
         }
         for function, exact_order in expected.items():
             with self.subTest(function=function.__name__):

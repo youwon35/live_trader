@@ -38,6 +38,7 @@ STRATEGY_SEARCH_PRESET_LIMIT = 30
 _FUNCTIONAL_STATUS_PATHS = frozenset(
     {
         "/api/paper-candidates",
+        "/api/paper-candidates/accounts",
         "/api/preparation/sources",
         "/api/upbit-functional/status",
         "/api/binance-spot-functional/status",
@@ -46,6 +47,7 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
 _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
         "/api/paper-candidates/import",
+        "/api/paper-candidates/review",
         "/api/monitor-trial/run",
         "/api/preparation/preview",
         "/api/safety-confirmation/challenge",
@@ -437,6 +439,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/preparation/sources":
             self.send_json(state.read_only_preparation_sources())
             return
+        if parsed.path == "/api/paper-candidates/accounts":
+            self.send_json(state.saved_paper_candidate_accounts())
+            return
         if parsed.path == "/api/paper-candidates":
             self.send_json(state.paper_candidate_evidence_inbox())
             return
@@ -591,6 +596,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "reason": "현재 앱 화면에서만 메모를 저장할 수 있습니다."})
                 return
         payload = self.read_json()
+        if parsed.path == "/api/paper-candidates/review":
+            self.send_json(state.review_paper_candidate_metadata(payload))
+            return
         if parsed.path == "/api/paper-candidates/import":
             self.send_json(state.import_paper_candidate_metadata(payload))
             return

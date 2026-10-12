@@ -23,6 +23,14 @@ from live_trader.risk_engine import PreTradeRiskReport, RiskCheck
 
 class OrderDispatchSafetyTest(unittest.TestCase):
     def setUp(self) -> None:
+        # Contract tests must not depend on (or read) the operator's real keys.
+        self.fixture_credentials = patch.dict(os.environ, {
+            "KIS_APP_KEY": "dispatch-fixture-key", "KIS_APP_SECRET": "dispatch-fixture-secret",
+            "KIS_ACCOUNT_NO": "12345678", "KIS_ACCOUNT_PRODUCT_CODE": "01",
+            "KIS_BASE_URL": "https://openapi.koreainvestment.com:9443",
+        })
+        self.fixture_credentials.start()
+        self.addCleanup(self.fixture_credentials.stop)
         _reset_emergency_stop_sticky_for_tests()
         self.original_state = copy.deepcopy(state.STATE)
         self.original_ledger = state.PROGRAM_LEDGER
@@ -81,6 +89,7 @@ class OrderDispatchSafetyTest(unittest.TestCase):
                 self.previous_process_lock_dir
             )
         self.temporary.cleanup()
+        self.fixture_credentials.stop()
 
     @staticmethod
     def passing_report() -> PreTradeRiskReport:
