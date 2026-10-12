@@ -114,3 +114,13 @@ v5 Upbit의 종료 점검은 trace와 PendingIntent의 closedBarHash가 다르�
 `continuous_portfolio_runtime.py`의 봉 해시 재료에는 sourceProvider가 포함되지만, `signal_parity.py`가 저장한 trace의 봉 재료에는 그 필드가 없다. 종료 consumer가 trace의 마지막 봉 자체를 해시하면서 차이가 발생했다. 각 trace 봉에 sourceProvider=검증된 동일 provider를 넣어 읽기 전용으로 계산한 결과 9개 모두 기존 intent.closed_bar_hash와 정확히 같았다. OHLCV·시간 경계의 차이나 rolling history 변조가 원인은 아니다.
 
 Binance에서는 열린 포지션 검사가 먼저 차단하므로 이 추가 오류가 아직 표면화되지 않았다. Paper 담당자가 producer·consumer의 canonical hash 재료를 통일하는 호환 수정과 회귀 검증을 진행하고 있다. 기존 trace·intent·원장·Final을 다시 봉인하거나 소급 수정하지 않는다. 수정 후 종료 consumer 검증 결과는 별도 확인해야 한다.
+
+## canonical consumer 교정 후 최종 확인
+
+Paper 담당자가 `pending_intent_closed_bar_payload` 공통 helper로 기존 producer의 봉 해시 재료를 통일했다. 기존 v5 Binance 6개·Upbit 3개 intent의 해시는 이 helper 결과와 모두 일치했다. 감사 전후 각 사례의 runtime·engine·trace·forward DB·Paper ledger DB·governance DB 바이트 해시가 같아, 감사가 원본 자료를 변경하지 않았음을 확인했다.
+
+Upbit는 기존 자료를 유지한 native 종료 재시도에서 CLEAN / STOPPED로 종결됐다(세션 ended_at=04:06:22.282727 UTC). 최종 reconciliation seal을 순수 파서로 검증했고 현재 STOPPED runtime hash와 일치했다. positionFlat=true, nonTerminalIntents=0, ambiguousIntents=0이다. Binance는 열린 ETH·SOL 때문에 CLEAN / DRAINING을 유지하며 최종 seal은 없다.
+
+독립 신호 재생의 결과는 구분한다. Binance의 실제 forward input 6개는 모두 PASS다. Upbit의 실제 input 3개는 warmup-incomplete로 BLOCKED다. Upbit의 HOLD 신호가 재생의 기본 HOLD와 같더라도 신호 parity PASS로 표시하지 않는다. Upbit는 봉·경계 처리·무결성·flat 종료 경로를 확인했으며 로컬 체결은 0건이다. 두 사례 모두 실제 broker 주문과 Live publication은 0건이다.
+
+멤버별 원본 시각·hash·claim·로컬 계좌·독립 재생·최종 seal 결과는 Live 앱의 `output/promotion-20261012/paper-v5-read-only-audit.json`에 저장했다. 기능 동작, 자료 무결성, 장기 검증과 실제 승급은 이 보고서에서도 별도로 표시한다.
