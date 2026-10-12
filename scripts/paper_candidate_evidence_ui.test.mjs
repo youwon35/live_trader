@@ -501,3 +501,36 @@ test("account review requires explicit saved-account choice, existing one-use na
     assert.match(view.render(), /제한 실거래 준비 완료/);
   } finally { cleanup(); allowReview = false; globalThis.window = previous; }
 });
+
+function sealedPreparationSources() {
+  const source = { kind: "SEALED_SOURCE", evidenceClass: "PAPER_APPROVED_EVIDENCE_PENDING", proofPending: true,
+    qualification: "PAPER_EVIDENCE_PENDING", approvalBindingStatus: "HISTORICAL_APPROVAL_SOURCE_HASH_NOT_RECORDED",
+    liveAuthorized: false, authorizationGranted: false, promotionEligible: false, useAsPromotionEvidence: false, orderSubmissionEnabled: false, armingEnabled: false };
+  return { ...preparationSourcesReply(), sources: Array.from({length:20},(_,i)=>({name:`원본 ${i}`,
+    source:{...source,targetType:i<12?"INSTANCE":"PORTFOLIO",targetId:`target-${i}`,targetHash:`hash-${i}`,identityHash:`identity-${i}`},
+    request:{kind:"SEALED_SOURCE",rootKey:"sealed-root",targetType:i<12?"INSTANCE":"PORTFOLIO",targetId:`target-${i}`,targetHash:`hash-${i}`,identityHash:`identity-${i}`}})) };
+}
+test("20 sealed research targets remain unique pending choices with explicit historical approval hash gap",async()=>{
+ const previous=globalThis.window;
+ try {globalThis.window=preparationWindow([]);allowPreparation=true;useResponse(sealedPreparationSources());const view=harness();
+  await view.buttons().find(b=>b.props.children==="준비 자료 새로고침").props.onClick();view.render();
+  const selector=view.elements("select").find(n=>n.props["aria-label"]==="준비할 원본");
+  const options=elements(selector,"option").filter(n=>n.props.value);assert.equal(options.length,20);assert.equal(new Set(options.map(n=>n.props.value)).size,20);
+  selector.props.onChange({target:{value:options[0].props.value}});view.render();
+  const data=sealedPreparationSources().sources[0];responseForFetch=async()=>response(preparationReply({}, {source:{...data.source,instruments:[{instanceId:"instance-a",symbol:"BTCUSDT",broker:"binance"}]}}));
+  await view.buttons().find(b=>b.props.children==="원본 확인 · 계좌 조회 없음").props.onClick();const html=view.render();
+  assert.match(html,/실제 Paper 승급 근거 대기/);assert.match(html,/Source hash 결합이 기록되지 않았습니다/);assert.match(html,/권한 없음 · 실행 불가/);
+  assert.equal(calls.filter(c=>c.method==="POST").length,1);assert.ok(calls.every(c=>!c.url.endsWith("/import")&&!c.url.endsWith("/review")));
+ } finally {allowPreparation=false;globalThis.window=previous;}
+});
+test("sealed source changes and authority-bearing source responses clear local preparation",async()=>{
+ const previous=globalThis.window;
+ try {globalThis.window=preparationWindow([]);allowPreparation=true;
+  for(const mutation of [{targetHash:"changed"},{liveAuthorized:true},{proofPending:false}]){
+   useResponse(sealedPreparationSources());const view=harness();await view.buttons().find(b=>b.props.children==="준비 자료 새로고침").props.onClick();view.render();
+   view.elements("select").find(n=>n.props["aria-label"]==="준비할 원본").props.onChange({target:{value:"sealed:sealed-root:INSTANCE:target-0"}});view.render();
+   responseForFetch=async()=>response(preparationReply({}, {source:{...sealedPreparationSources().sources[0].source,...mutation,instruments:[{instanceId:"instance-a",symbol:"BTCUSDT",broker:"binance"}]}}));
+   await view.buttons().find(b=>b.props.children==="원본 확인 · 계좌 조회 없음").props.onClick();assert.match(view.render(),/범위와 유효시간을 확인하지 못했습니다/);assert.doesNotMatch(view.render(),/조회 시각/);
+  }
+ } finally {allowPreparation=false;globalThis.window=previous;}
+});

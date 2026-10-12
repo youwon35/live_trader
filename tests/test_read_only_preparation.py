@@ -203,6 +203,33 @@ class TransportTests(unittest.TestCase):
         self.assertEqual("REGULAR_SYMBOL_NONE_ALGO_UNKNOWN",result["openOrders"])
         self.assertEqual("UNKNOWN",result["orderability"]);self.assertEqual("UNKNOWN",result["fundsCheck"])
 
+    def test_local_cash_observation_bindings_and_sanitized_constraints(self):
+        transport=Mock()
+        def request(provider,method,path,**kwargs):
+            self.assertEqual("GET",method)
+            if path.endswith("/time"):return ({"serverTime":123},{})
+            if path.endswith("/account"):return ({"balances":[{"asset":"USDT","free":"100"},{"asset":"BTC","free":".01"}],"canTrade":True,"commissionRates":{"taker":".001"}},{})
+            if path.endswith("/openOrders"):return ([],{})
+            return ({"symbols":[{"symbol":"BTCUSDT","status":"TRADING","quoteAsset":"USDT","baseAsset":"BTC","filters":[{"filterType":"LOT_SIZE","minQty":".001","maxQty":"100","stepSize":".001"},{"filterType":"PRICE_FILTER","minPrice":".01","maxPrice":"1000000","tickSize":".01"},{"filterType":"MIN_NOTIONAL","minNotional":"10"}]}]}, {})
+        transport.request.side_effect=request
+        reader=account.ReadOnlyBrokerReader({"BINANCE_API_KEY":"fixture-private-key","BINANCE_API_SECRET":"fixture-private-secret"},transport=transport)
+        result=reader.observe_preparation("binance","BTCUSDT",side="BUY",quantity=account.Decimal(".001"),limit_price=account.Decimal("100"))
+        self.assertEqual("100",result["availableCash"]);self.assertEqual("SAVED_CREDENTIAL_CONFIGURATION_OBSERVED",result["accountBinding"])
+        self.assertEqual("WITHIN_OBSERVED_BALANCE",result["fundsCheck"]);self.assertEqual(account.Decimal(".001"),account.Decimal(result["feeRate"]))
+        for secret in ("fixture-private-key","fixture-private-secret","balances","apiKey"):self.assertNotIn(secret,json.dumps(result))
+
+    def test_kis_cash_uses_no_margin_cash_minimum_and_exact_read_trid(self):
+        settings={"KIS_APP_KEY":"fixture-app","KIS_APP_SECRET":"fixture-secret","KIS_ACCOUNT_NO":"12345678","KIS_ACCOUNT_PRODUCT_CODE":"01"}
+        transport=Mock();transport.request.return_value=({"rt_cd":"0","output":{"ord_psbl_cash":"100","nrcvb_buy_amt":"80","nrcvb_buy_qty":"2"}}, {})
+        reader=account.ReadOnlyBrokerReader(settings,transport=transport)
+        with patch.object(reader,"_kis_token",return_value="fixture-only-token"),patch.object(reader,"_pace_kis"):
+            facts=reader._kis_cash("kis-kr","005930",account.Decimal("30"))
+        self.assertEqual(account.Decimal("80"),facts["_quote"])
+        call=transport.request.call_args;self.assertEqual(("kis","GET","/uapi/domestic-stock/v1/trading/inquire-psbl-order"),call.args)
+        self.assertEqual("TTTC8908R",call.kwargs["headers"]["tr_id"]);self.assertEqual("N",call.kwargs["query"]["CMA_EVLU_AMT_ICLD_YN"])
+        transport.request.return_value=({"rt_cd":"0","output":{"tr_crcy_cd":"KRW","ord_psbl_frcr_amt":"100","ovrs_ord_psbl_amt":"100","ord_psbl_qty":"2"}}, {})
+        with patch.object(reader,"_kis_token",return_value="fixture-only-token"),patch.object(reader,"_pace_kis"),self.assertRaises(account.ReadFailure):reader._kis_cash("kis-us","AAPL",account.Decimal("30"))
+
     def test_kis_authentication_cache_is_memory_only_and_reused(self):
         transport=Mock();transport.request.return_value=({"access_token":"fixture-bearer","expires_in":3600},{})
         reader=account.ReadOnlyBrokerReader({"KIS_APP_KEY":"test-distinct-app","KIS_APP_SECRET":"b"},transport=transport)

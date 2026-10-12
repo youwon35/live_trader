@@ -15,6 +15,7 @@ import { EMPTY_FUNCTIONAL_TEST_WORKSPACE } from '../src/functionalTestModel.js';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const dist = resolve(root, 'dist');
 const output = resolve(root, 'output/playwright/simplified-flow');
+const sealedPreparation = process.env.SEALED_PREPARATION === '1' ? JSON.parse(await readFile(resolve(root,'output/live-tabs-20261012/preparation-ui-fixture.json'),'utf8')) : null;
 const candidateReview = process.env.CANDIDATE_REVIEW === '1' ? JSON.parse(await readFile(resolve(root,'output/sep11-functional-audit/candidate-ui/responses.json'),'utf8')) : null;
 const appSource = await readFile(resolve(root, 'src/App.jsx'), 'utf8');
 const fallbackLiteral = appSource.match(/const fallbackSnapshot = (\{[\s\S]*?\n\});\s*const PANEL_SIZE_STORAGE_KEY/);
@@ -84,7 +85,7 @@ try {
   const configurations=fontReview?[1024,1920].flatMap(width=>['light','dark'].map(theme=>({viewport:{width,height:1000},theme}))):[{viewport:{width:1280,height:800},theme:'light'},{viewport:{width:1920,height:1080},theme:'light'}];
   for (const {viewport,theme} of configurations) {
     const context = await browser.newContext({ viewport, serviceWorkers: 'block' });
-    if(candidateReview) await context.addInitScript(()=>{window.pywebview={api:{functional_http_session:async()=>({ok:true,available:true,csrfHeader:'X-LiveTrader-CSRF',csrfToken:'fixture-csrf-'.repeat(4)})}};});
+    if(candidateReview || sealedPreparation) await context.addInitScript(()=>{window.pywebview={api:{functional_http_session:async()=>({ok:true,available:true,csrfHeader:'X-LiveTrader-CSRF',csrfToken:'fixture-csrf-'.repeat(4)})}};});
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -102,7 +103,13 @@ try {
       }
       report.apiRequests.push({ path: url.pathname, method: request.method(), viewport: viewport.width });
       let body = { ok: true };
-      if (url.pathname === '/api/paper-candidates' && candidateReview) body = candidateReview.before;
+      if(url.pathname === '/api/preparation/sources' && sealedPreparation) body = sealedPreparation.sources;
+      else if(url.pathname === '/api/preparation/preview' && sealedPreparation) {
+        assert.equal(request.method(),'POST');const input=request.postDataJSON();assert.equal(input.readAccount,false);
+        const key=JSON.stringify(input.source);const value=sealedPreparation.previews[key];assert.ok(value,'exact20 sealed source preview only');
+        body={...value,asOf:new Date().toISOString(),expiresAt:new Date(Date.now()+60000).toISOString()};
+      }
+      else if (url.pathname === '/api/paper-candidates' && candidateReview) body = candidateReview.before;
       else if(url.pathname === '/api/monitor-trial/run' && candidateReview){assert.equal(request.method(),'POST');assert.deepEqual(request.postDataJSON(),candidateReview.trialRequest);body=candidateReview.trialResult;}
       else if (url.pathname === '/api/snapshot') body = snapshot;
       else if (url.pathname === '/api/functional-test') body = EMPTY_FUNCTIONAL_TEST_WORKSPACE;
@@ -151,6 +158,21 @@ try {
         assert.equal(await cards.getByText('제한 실거래 대기', { exact: true }).count(), 1);
         assert.equal(await page.getByRole('button', { name: '실전 운용 단계로 승인', exact: true }).isDisabled(), true);
         await page.screenshot({ path: resolve(output, `strategy-${viewport.width}.png`) });
+        if(sealedPreparation) {
+          await page.getByText('모의거래 검증 근거 확인',{exact:true}).click();
+          await page.getByRole('button',{name:'준비 자료 새로고침',exact:true}).click();
+          const choices=page.getByLabel('준비할 원본');await choices.locator('option').nth(20).waitFor({state:'attached'});
+          const values=await choices.locator('option').evaluateAll(nodes=>nodes.map(n=>n.value).filter(Boolean));
+          assert.equal(values.length,20);assert.equal(new Set(values).size,20);
+          for(const value of values){await choices.selectOption(value);await page.getByRole('button',{name:'원본 확인 · 계좌 조회 없음',exact:true}).click();
+            await page.getByText('Paper 승인 Source · 실제 Paper 승급 근거 대기',{exact:true}).waitFor();
+            assert.equal(await page.getByRole('button',{name:'검토 대기 후보 등록',exact:true}).count(),0);
+            assert.equal(await page.getByText(/역사 승인 기록에 Source hash 결합이 기록되지 않았습니다/).count(),1);
+          }
+          await page.screenshot({path:resolve(output,`sealed-preparation-${viewport.width}.png`),fullPage:true});
+          report.views.push({viewport:viewport.width,label:'12 실행단위·8 Portfolio Source 준비',exactSourcePreviewCount:20,liveEvidencePending:true,authorityGranted:false});
+          await page.keyboard.press('Escape');
+        }
         if(candidateReview){
           await page.getByText('모의거래 검증 근거 확인',{exact:true}).click();
           await page.getByRole('button',{name:'Paper 검증 근거 새로고침',exact:true}).click();

@@ -54,7 +54,7 @@ assert.equal(formatFunctionalTestRemaining(2 * 24 * 60 * 60 * 1000), "2일 0시�
 const workspaceSource = readFileSync(
   new URL("../src/FunctionalTestWorkspace.jsx", import.meta.url),
   "utf8",
-);
+).replace(/\r\n/g, "\n");
 assert.match(
   workspaceSource,
   /const authorityConfigurationLocked = Boolean\(permit\)\s*\|\| workspace\.current\.authorityReferencePresent === true;/,

@@ -63,8 +63,8 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
 
   const preparationChoices = [
     ...preparationSources.map((item) => ({
-      key: "trial:" + item.request.rootKey + ":" + item.request.portfolioId,
-      label: item.name + " · 기능시험 자료",
+      key: item.request.kind === "SEALED_SOURCE" ? "sealed:" + item.request.rootKey + ":" + item.request.targetType + ":" + item.request.targetId : "trial:" + item.request.rootKey + ":" + item.request.portfolioId,
+      label: item.name + (item.request.kind === "SEALED_SOURCE" ? " · 실제 Paper 근거 대기" : " · 기능시험 자료"),
       request: item.request,
     })),
     ...(inbox?.candidates || []).filter((item) => item.status === "VERIFIED_READ_ONLY" && item.rootKey && item.identity?.evidenceHash && item.instanceHash && (!strategyId || item.strategyId === strategyId)).map((item) => ({
@@ -86,12 +86,17 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
       if (result?.ok !== true || result.schemaVersion !== "live-readonly-preparation-sources-v1"
         || result.readOnly !== true || result.executable !== false || result.authorityGranted !== false
         || !Array.isArray(result.sources) || result.sources.some((item) => !item || typeof item.name !== "string"
-          || item.source?.evidenceClass !== "FUNCTIONAL_TEST_NON_PROMOTION" || item.request?.kind !== "NON_PROMOTION"
-          || ["rootKey", "portfolioId", "portfolioHash", "identityHash"].some((key) => typeof item.request[key] !== "string" || !item.request[key]))) {
+          || (item.request?.kind === "SEALED_SOURCE" ? (item.source?.evidenceClass !== "PAPER_APPROVED_EVIDENCE_PENDING"
+            || item.source?.proofPending !== true || item.source?.qualification !== "PAPER_EVIDENCE_PENDING"
+            || !["INSTANCE", "PORTFOLIO"].includes(item.request.targetType)
+            || ["liveAuthorized", "authorizationGranted", "promotionEligible", "useAsPromotionEvidence", "orderSubmissionEnabled", "armingEnabled"].some((key) => item.source[key] !== false)
+            || ["rootKey", "targetId", "targetHash", "identityHash"].some((key) => typeof item.request[key] !== "string" || !item.request[key]))
+            : (item.source?.evidenceClass !== "FUNCTIONAL_TEST_NON_PROMOTION" || item.request?.kind !== "NON_PROMOTION"
+              || ["rootKey", "portfolioId", "portfolioHash", "identityHash"].some((key) => typeof item.request?.[key] !== "string" || !item.request[key]))))) {
         throw new Error(result?.reason || "준비 자료 목록을 확인하지 못했습니다.");
       }
       setPreparationSources(result.sources);
-      setPreparationMessage(result.sources.length ? "" : "준비 전용 폴더에 저장된 자료가 없습니다.");
+      setPreparationMessage(result.sources.length ? "" : "현재 원본·승인과 일치하는 준비 자료가 없습니다. 변경된 봉인본은 다시 등록한 뒤 새로고침하세요.");
     } catch (error) {
       setPreparationSources([]);
       setPreparationMessage(error?.message || "준비 자료를 읽지 못했습니다.");
@@ -117,9 +122,18 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
         || result.source?.kind !== selected.request.kind
         || (selected.request.kind === "NON_PROMOTION" && (result.source?.portfolioHash !== selected.request.portfolioHash || result.source?.evidenceClass !== "FUNCTIONAL_TEST_NON_PROMOTION"))
         || (selected.request.kind === "PAPER" && result.source?.evidenceHash !== selected.request.evidenceHash)
+        || (selected.request.kind === "SEALED_SOURCE" && (result.source?.targetHash !== selected.request.targetHash || result.source?.identityHash !== selected.request.identityHash
+          || result.source?.proofPending !== true || result.source?.qualification !== "PAPER_EVIDENCE_PENDING"
+          || ["liveAuthorized", "authorizationGranted", "promotionEligible", "useAsPromotionEvidence", "orderSubmissionEnabled", "armingEnabled"].some((key) => result.source[key] !== false)))
         || !Array.isArray(result.source?.instruments) || result.source.instruments.length === 0
         || result.source.instruments.some((item) => !item || ["instanceId", "symbol", "broker"].some((key) => typeof item[key] !== "string"))
         || !Array.isArray(result.checks) || result.checks.some((item) => !item || !["PASS", "BLOCKED", "UNKNOWN"].includes(item.status) || typeof item.detail !== "string")
+        || (result.observation?.cashPreview !== undefined && (!result.observation.cashPreview || result.observation.cashPreview.executable !== false
+          || result.observation.cashPreview.orderSubmissionEnabled !== false || result.observation.cashPreview.armingEnabled !== false
+          || result.observation.cashPreview.capitalBasis !== "ACCOUNT_AVAILABLE_CASH" || result.observation.cashPreview.capitalPercent !== 100
+          || !Number.isFinite(result.observation.cashPreview.sourceMaxOrderPercent) || result.observation.cashPreview.sourceMaxOrderPercent <= 0
+          || !Number.isFinite(result.observation.cashPreview.allocationWeight) || result.observation.cashPreview.allocationWeight < 0 || result.observation.cashPreview.allocationWeight > 1
+          || !Array.isArray(result.observation.cashPreview.reasons) || result.observation.cashPreview.reasons.some((item) => typeof item !== "string")))
         || !Array.isArray(result.draft?.missingInputs) || !Array.isArray(result.limitations)
         || !Number.isFinite(Date.parse(result.asOf)) || !Number.isFinite(Date.parse(result.expiresAt))
         || Date.parse(result.expiresAt) <= Date.now() || Date.parse(result.expiresAt) - Date.parse(result.asOf) > 60000) {
@@ -362,9 +376,10 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
         </select></label>{" "}
         <button type="button" className="secondary-button" disabled={preparationBusy || !preparationSelection} onClick={() => prepare(false)}>원본 확인 · 계좌 조회 없음</button>
         {preparationSource && <>
-          <p>{preparationSource.kind === "NON_PROMOTION" ? "기능시험 자료 · 정규 실거래 승급 전" : "봉인 Paper 자료 · 현재 실거래 자격은 별도 확인"}</p>
+          <p>{preparationSource.kind === "SEALED_SOURCE" ? "Paper 승인 Source · 실제 Paper 승급 근거 대기" : preparationSource.kind === "NON_PROMOTION" ? "기능시험 자료 · 정규 실거래 승급 전" : "봉인 Paper 자료 · 현재 실거래 자격은 별도 확인"}</p>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap", margin: "12px 0" }}>
-            <label>종목 <select aria-label="종목" value={orderDraft.instanceId} disabled={preparationBusy} onChange={(event) => { setOrderDraft({ ...orderDraft, instanceId: event.target.value }); clearPreparation(); }}>
+            {preparationSource.kind === "SEALED_SOURCE" && <p>현재 원본과 현재 PAPER 승인 기록을 대조했습니다. 실제 Paper 관찰·종결·독립 검증 근거가 생기기 전에는 Live 후보 등록·주문·arming이 불가합니다. {preparationSource.approvalBindingStatus === "HISTORICAL_APPROVAL_SOURCE_HASH_NOT_RECORDED" ? "역사 승인 기록에 Source hash 결합이 기록되지 않았습니다." : "승인 기록의 Source hash가 일치합니다."}</p>}
+          <label>종목 <select aria-label="종목" value={orderDraft.instanceId} disabled={preparationBusy} onChange={(event) => { setOrderDraft({ ...orderDraft, instanceId: event.target.value }); clearPreparation(); }}>
               <option value="">직접 선택하세요</option>
               {preparationSource.instruments.map((item) => <option key={item.instanceId} value={item.instanceId}>{item.symbol} · {item.broker}</option>)}
             </select></label>
@@ -381,6 +396,17 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
           <p>조회 시각 {preparationResult.asOf} · 만료 {preparationResult.expiresAt}</p>
           {preparationExpired ? <p>조회가 만료됐습니다. 현재 상태를 다시 조회하세요.</p> : <>
             <p>입력 금액: {preparationResult.draft.notional ?? "미입력"} {preparationResult.observation?.currency || ""} · 미입력 항목 {preparationResult.draft.missingInputs.length}개</p>
+            {preparationResult.observation?.marketSession && <p>시장 시간: {preparationResult.observation.marketSession.detail} · {preparationResult.observation.marketSession.localTime || "연속 시장"} · 거래 허가 없음</p>}
+            {preparationResult.observation?.cashPreview && <div aria-label="주문가능현금 기준 준비">
+              <p>{preparationResult.observation.accountAlias} {preparationResult.observation.maskedAccount} · 저장 credential 설정 관측 · Native 계좌 심사 전</p>
+              <p>총 사용 기준: 주문가능현금 100% · Source 주문 비율 {preparationResult.observation.cashPreview.sourceMaxOrderPercent}% · Portfolio 배분 {(100 * preparationResult.observation.cashPreview.allocationWeight).toFixed(4)}%</p>
+              <p>현재 주문가능현금 {preparationResult.observation.cashPreview.availableCash ?? "미확인"} · 배분 후 Source 한도 {preparationResult.observation.cashPreview.sourceOrderBudget ?? "미확인"} {preparationResult.observation.currency}</p>
+              <p>수수료/슬리피지 여유 후 {preparationResult.observation.cashPreview.notionalAfterCostAllowance ?? "미확인"} · 정적 단위 검사 수량 {preparationResult.observation.cashPreview.maximumQuantity ?? "차단·미확정"}</p>
+              <p>수량 단위 {preparationResult.observation.constraints?.LOT_SIZE?.stepSize ?? preparationResult.observation.constraints?.quantityStep ?? "미확인"} · 최소 주문 금액 {preparationResult.observation.constraints?.NOTIONAL?.minNotional ?? preparationResult.observation.constraints?.MIN_NOTIONAL?.minNotional ?? preparationResult.observation.constraints?.minNotional ?? "미확인"} · 호가 단위 {preparationResult.observation.constraints?.PRICE_FILTER?.tickSize ?? preparationResult.observation.constraints?.priceTick ?? "미확인"}</p>
+              <p>실제 적용 수수료 {preparationResult.observation.cashPreview.actualBrokerFeeObserved ? "관측됨" : "미확인 · 원본 가정만 참고"} · 조회 범위 {preparationResult.observation.cashScope || preparationResult.observation.openOrdersScope || "미확인"}</p>
+              <p>호가·최소 단위·거래소 바인딩·실제 수수료가 미확인되면 수량을 확정하지 않습니다. 직접 시작 전 재조회가 필요합니다.</p>
+              {(preparationResult.observation.cashPreview.reasons || []).map((reason, index) => <p key={index}>{reason}</p>)}
+            </div>}
             <p>계좌 조회 {preparationResult.observation?.status === "NOT_REQUESTED" ? "전" : preparationResult.observation?.account === "AVAILABLE" ? "완료" : "미확인"} · 실거래 승급 및 계좌 연결은 별도 확인</p>
           </>}
           <details><summary>검사 세부정보</summary>

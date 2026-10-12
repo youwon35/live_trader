@@ -26,9 +26,17 @@ READ_PATHS = {
  "kis": {"/uapi/domestic-stock/v1/trading/inquire-balance",
          "/uapi/overseas-stock/v1/trading/inquire-balance",
          "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl",
+         "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+         "/uapi/overseas-stock/v1/trading/inquire-psamount",
+         "/uapi/domestic-stock/v1/quotations/inquire-price",
+         "/uapi/overseas-price/v1/quotations/price",
          "/uapi/overseas-stock/v1/trading/inquire-nccs"},
 }
 KIS_TR_IDS = {
+ "/uapi/domestic-stock/v1/quotations/inquire-price": "FHKST01010100",
+ "/uapi/overseas-price/v1/quotations/price": "HHDFS00000300",
+ "/uapi/domestic-stock/v1/trading/inquire-psbl-order": "TTTC8908R",
+ "/uapi/overseas-stock/v1/trading/inquire-psamount": "TTTS3007R",
  "/uapi/domestic-stock/v1/trading/inquire-balance": "TTTC8434R",
  "/uapi/overseas-stock/v1/trading/inquire-balance": "TTTS3012R",
  "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl": "TTTC0084R",
@@ -175,6 +183,122 @@ class ReadOnlyBrokerReader:
         # No account balances, IDs, keys, raw broker responses, or tokens cross this boundary.
         return result
 
+    def observe_preparation(self, lane, symbol, *, side="", quantity=None, limit_price=None):
+        """Local explicit preview only. Private balances are never persisted by this reader."""
+        from .account_profiles import saved_account_profiles
+        provider = "kis" if lane in {"kis-kr", "kis-us"} else lane
+        result = {"status": "UNKNOWN", "account": "UNKNOWN", "openOrders": "UNKNOWN",
+                  "orderability": "UNKNOWN", "fundsCheck": "UNKNOWN", "accountBinding": "NOT_VERIFIED",
+                  "availableCash": None, "availableAssetQuantity": None, "feeRate": None,
+                  "constraints": {}, "capitalBasis": "ACCOUNT_AVAILABLE_CASH", "capitalPercent": 100,
+                  "currency": "", "privateValuesLocalOnly": True}
+        try:
+            if provider not in {"binance", "upbit", "kis"}:
+                raise ReadFailure("CASH_SPOT_SCOPE_REQUIRED")
+            self._credentials(provider)
+            profiles = [p for p in saved_account_profiles(self.settings) if p["brokerId"] == provider]
+            if len(profiles) != 1:
+                raise ReadFailure("SAVED_ACCOUNT_BINDING_UNAVAILABLE")
+            facts = self._binance(provider, symbol) if provider == "binance" else self._upbit(symbol) if provider == "upbit" else self._kis(lane, symbol)
+            if provider == "kis" and limit_price is not None:
+                facts.update(self._kis_cash(lane, symbol, limit_price))
+            result.update({key: value for key, value in facts.items() if not key.startswith("_")})
+            result.update({"accountAlias": profiles[0]["alias"], "maskedAccount": profiles[0]["maskedAccount"],
+                           "profileId": profiles[0]["profileId"], "accountBinding": "SAVED_CREDENTIAL_CONFIGURATION_OBSERVED"})
+            for field, key in (("availableCash", "_quote"), ("availableAssetQuantity", "_base")):
+                if facts.get(key) is not None:
+                    result[field] = format(facts[key], "f")
+            if provider == "binance":
+                fee = decimal(facts.get("_commission"))
+                filters = facts.get("_filters")
+                if not isinstance(filters, list):
+                    raise ReadFailure("INVALID_MARKET_CONSTRAINTS")
+                allowed = {"LOT_SIZE": ("minQty", "maxQty", "stepSize"), "PRICE_FILTER": ("minPrice", "maxPrice", "tickSize"),
+                           "MIN_NOTIONAL": ("minNotional",), "NOTIONAL": ("minNotional", "maxNotional")}
+                for row in filters:
+                    if isinstance(row, dict) and row.get("filterType") in allowed:
+                        kind = row["filterType"]
+                        if kind in result["constraints"]:
+                            raise ReadFailure("AMBIGUOUS_MARKET_CONSTRAINTS")
+                        result["constraints"][kind] = {k: format(_complete_number(row.get(k)), "f") for k in allowed[kind]}
+            elif provider == "upbit":
+                fee = decimal(facts.get("_fee"))
+                market = facts.get("_chance", {})
+                bid = market.get("bid", {})
+                result["constraints"] = {"minNotional": format(_complete_number(bid.get("min_total")), "f"),
+                    "maxNotional": format(_complete_number(market.get("max_total")), "f"),
+                    "limitBuySupported": "limit" in market.get("bid_types", []),
+                    "quantityStep": None, "priceTick": None}
+                # Current chance API provides notional bounds, not an authoritative quantity/price grid.
+            else:
+                fee = None  # Contract fee assumptions remain distinct from actual broker commissions.
+                result["constraints"] = {"quantityStep": "1", "minQuantity": "1", "priceTick": None,
+                                          "maximumBuyQuantity": str(facts.get("_maximumQty")) if facts.get("_maximumQty") is not None else None}
+            result["feeRate"] = format(fee, "f") if fee is not None else None
+            available = facts.get("_quote") if side == "BUY" else facts.get("_base") if side == "SELL" else None
+            needed = quantity * limit_price if side == "BUY" and quantity is not None and limit_price is not None else quantity if side == "SELL" else None
+            if available is not None and needed is not None:
+                result["fundsCheck"] = "WITHIN_OBSERVED_BALANCE" if needed <= available else "INSUFFICIENT_OBSERVED_BALANCE"
+            result["status"] = "OBSERVED" if result["account"] == "AVAILABLE" else "PARTIAL"
+        except ReadFailure as exc:
+            result["status"] = str(exc)
+        except (ValueError, TypeError, KeyError, ArithmeticError):
+            result["status"] = "INVALID_ACCOUNT_RESPONSE"
+        result["asOf"] = datetime.now(timezone.utc).isoformat()
+        return result
+
+    def kis_reference_price(self, lane, symbol):
+        """Official GET quote, no draft selection. NASD scope stays explicit/unverified."""
+        self._credentials("kis")
+        if self.settings.get("KIS_ENV", "").lower() not in ("", "real", "live"):
+            raise ReadFailure("LIVE_ACCOUNT_ENVIRONMENT_REQUIRED")
+        token = self._kis_token()
+        path = "/uapi/domestic-stock/v1/quotations/inquire-price" if lane == "kis-kr" else "/uapi/overseas-price/v1/quotations/price"
+        query = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol} if lane == "kis-kr" else {"AUTH": "", "EXCD": "NAS", "SYMB": symbol}
+        self._pace_kis()
+        payload, headers = self._get("kis", path, query=query, headers={"authorization": "Bearer " + token,
+            "appkey": self.settings["KIS_APP_KEY"], "appsecret": self.settings["KIS_APP_SECRET"], "tr_id": KIS_TR_IDS[path], "custtype": "P"})
+        if not isinstance(payload, dict) or str(payload.get("rt_cd")) != "0" or headers.get("tr_cont", "").upper() in {"F", "M"}:
+            raise ReadFailure("QUOTE_UNAVAILABLE")
+        output = payload.get("output")
+        if not isinstance(output, dict):
+            raise ReadFailure("QUOTE_UNAVAILABLE")
+        value = _complete_number(output.get("stck_prpr" if lane == "kis-kr" else "last"))
+        if value <= 0:
+            raise ReadFailure("QUOTE_UNAVAILABLE")
+        return value
+
+    def _kis_cash(self, lane, symbol, price):
+        if price <= 0:
+            raise ReadFailure("REFERENCE_PRICE_REQUIRED")
+        token = self._kis_token()
+        cano, product = split_kis_account(self.settings["KIS_ACCOUNT_NO"], self.settings["KIS_ACCOUNT_PRODUCT_CODE"])
+        overseas = lane == "kis-us"
+        path = "/uapi/overseas-stock/v1/trading/inquire-psamount" if overseas else "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+        query = {"CANO": cano, "ACNT_PRDT_CD": product}
+        query.update({"OVRS_EXCG_CD": "NASD", "OVRS_ORD_UNPR": format(price, "f"), "ITEM_CD": symbol} if overseas else {
+            "PDNO": symbol, "ORD_UNPR": format(price, "f"), "ORD_DVSN": "00", "CMA_EVLU_AMT_ICLD_YN": "N", "OVRS_ICLD_YN": "N"})
+        self._pace_kis()
+        payload, response_headers = self._get("kis", path, query=query, headers={"authorization": "Bearer " + token,
+            "appkey": self.settings["KIS_APP_KEY"], "appsecret": self.settings["KIS_APP_SECRET"], "tr_id": KIS_TR_IDS[path], "custtype": "P"})
+        if not isinstance(payload, dict) or str(payload.get("rt_cd")) != "0" or response_headers.get("tr_cont", "").upper() in {"F", "M"}:
+            raise ReadFailure("INCOMPLETE_ACCOUNT_RESPONSE")
+        output = payload.get("output")
+        if isinstance(output, list) and len(output) == 1:
+            output = output[0]
+        if not isinstance(output, dict):
+            raise ReadFailure("INVALID_ACCOUNT_RESPONSE")
+        if overseas:
+            if output.get("tr_crcy_cd") != "USD":
+                raise ReadFailure("ACCOUNT_CURRENCY_MISMATCH")
+            cash = min(_complete_number(output.get("ord_psbl_frcr_amt")), _complete_number(output.get("ovrs_ord_psbl_amt")))
+            max_qty = _complete_number(output.get("ord_psbl_qty"))
+        else:
+            cash = min(_complete_number(output.get("ord_psbl_cash")), _complete_number(output.get("nrcvb_buy_amt")))
+            max_qty = _complete_number(output.get("nrcvb_buy_qty"))
+        return {"_quote": cash, "_maximumQty": max_qty, "cashScope": "KIS_NASD_USD_NO_AUTO_FX" if overseas else "KIS_NO_MARGIN_NO_CMA_NO_OVERSEAS",
+                "cashReferencePrice": format(price, "f"), "cashReferencePriceSource": "USER_LIMIT_PRICE"}
+
     def _binance(self, provider, symbol):
         prefix = "/api/v3" if provider == "binance" else "/fapi/v1"
         clock, _ = self._get(provider, prefix + "/time")
@@ -198,6 +322,8 @@ class ReadOnlyBrokerReader:
             if len(matches) != 1:
                 return facts
             market = matches[0]
+            facts["_filters"] = market.get("filters", [])
+            facts["_commission"] = account.get("commissionRates", {}).get("taker") if isinstance(account.get("commissionRates"), dict) else None
             facts["currency"] = str(market.get("quoteAsset") or "")
             facts["orderability"] = ("MARKET_AND_ACCOUNT_ENABLED" if market.get("status") == "TRADING" and account.get("canTrade") is True
                 else "BLOCKED" if market.get("status") not in (None, "TRADING") or account.get("canTrade") is False else "UNKNOWN")
@@ -234,6 +360,8 @@ class ReadOnlyBrokerReader:
                 facts["orderability"] = "MARKET_AND_ACCOUNT_ENABLED" if chance["market"].get("state") == "active" else "BLOCKED"
                 facts["_quote"] = _complete_number((chance.get("bid_account") or {}).get("balance"))
                 facts["_base"] = _complete_number((chance.get("ask_account") or {}).get("balance"))
+                facts["_chance"] = chance["market"]
+                facts["_fee"] = chance.get("bid_fee")
         except ReadFailure:
             pass
         return facts

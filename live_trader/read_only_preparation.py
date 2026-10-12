@@ -100,6 +100,13 @@ def list_preparation_sources(*, roots=None):
     rows = []
     for root in dedicated_preparation_roots() if roots is None else roots:
         root = Path(root).resolve()
+        from . import sealed_source_preparation as sealed
+        if (root / sealed.FILE).exists():
+            try:
+                rows.extend(sealed.list_sources(root))
+            except (ValueError, OSError, KeyError, TypeError, RuntimeError):
+                pass  # Stale registrations never appear ready; exact old requests still reject.
+            continue
         if not root.exists():
             continue
         for portfolio_id, values in inbox._catalog(root, "portfolio").items():
@@ -120,6 +127,9 @@ def source_snapshot(request, roots):
     if not isinstance(request, dict):
         raise ValueError("원본을 선택하세요.")
     kind = request.get("kind")
+    if kind == "SEALED_SOURCE":
+        from . import sealed_source_preparation as sealed
+        return sealed.source_snapshot(request, _root(request, roots))
     fields = {"kind", "rootKey", "portfolioId", "portfolioHash", "identityHash"} if kind == "NON_PROMOTION" else {
         "kind", "rootKey", "evidenceId", "evidenceHash", "instanceHash"}
     if kind not in {"NON_PROMOTION", "PAPER"} or set(request) != fields or any(
@@ -203,13 +213,36 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
         if len(matches) != 1:
             raise ValueError("계좌 조회 전에 원본의 종목을 선택하세요.")
         selected = matches[0]
+        uses_runtime_settings = reader is None
         reader = reader or ReadOnlyBrokerReader(runtime_settings())
-        observation = reader.read(selected["broker"], selected["symbol"], side=draft["side"],
-                                  quantity=numbers["quantity"], limit_price=numbers["limitPrice"])
+        settings_hash = stable_sha256(reader.settings) if isinstance(getattr(reader, "settings", None), dict) else None
+        read = reader.observe_preparation if before["kind"] == "SEALED_SOURCE" else reader.read
+        observation = read(selected["broker"], selected["symbol"], side=draft["side"],
+                           quantity=numbers["quantity"], limit_price=numbers["limitPrice"])
+        if settings_hash is not None and (stable_sha256(reader.settings) != settings_hash or (uses_runtime_settings and stable_sha256(runtime_settings()) != settings_hash)):
+            raise ValueError("조회 중 저장 계좌 설정이 바뀌어 결과를 폐기했습니다.")
+        if before["kind"] == "SEALED_SOURCE":
+            from .cash_preparation_preview import cash_preview
+            observation["cashPreview"] = cash_preview(selected, observation, draft)
     after = source_snapshot(request["source"], folders)
     if before != after:
         raise ValueError("조회 중 원본이 변경되어 결과를 폐기했습니다. 새로고침하세요.")
     now = clock() if clock else datetime.now(timezone.utc)
+    if before["kind"] == "SEALED_SOURCE" and len(matches) == 1:
+        lane = matches[0]["broker"]
+        if lane in {"kis-kr", "kis-us"}:
+            from trading_runtime.market_calendar import market_session_state
+            try:
+                session = market_session_state("XKRX" if lane == "kis-kr" else "XNYS", now,
+                    regular_open="09:00" if lane == "kis-kr" else "09:30",
+                    regular_close="15:30" if lane == "kis-kr" else "16:00")
+                observation["marketSession"] = {"state": session["state"], "detail": session["detail"],
+                    "localTime": session["local"].isoformat(), "calendarVersion": session.get("version", ""),
+                    "basis": "SHARED_REGULAR_SESSION_CALENDAR", "brokerOrderAuthority": False}
+            except (ValueError, OSError, KeyError):
+                observation["marketSession"] = {"state": "unknown", "detail": "정규장 달력을 확인하지 못했습니다.", "brokerOrderAuthority": False}
+        else:
+            observation["marketSession"] = {"state": "continuous", "detail": "24시간 현물 시장 · 거래소 상태/점검은 별도 확인", "brokerOrderAuthority": False}
     labels = {"AVAILABLE": "조회 완료", "UNKNOWN": "미확인", "PRESENT": "미체결 있음",
               "NONE_OBSERVED": "조회 범위에서 없음", "SYMBOL_NONE_OBSERVED": "선택 종목에서 없음",
               "REGULAR_SYMBOL_NONE_ALGO_UNKNOWN": "선택 종목 일반 주문 없음 · 조건부 주문 미확인",
@@ -220,8 +253,8 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
     label = lambda value: labels.get(value, "미확인")
     checks = [
         {"code": "SOURCE_IDENTITY", "status": "PASS", "detail": "현재 원본 hash와 실행 단위가 선택 내용과 일치합니다."},
-        {"code": "PROMOTION", "status": "BLOCKED" if before["kind"] == "NON_PROMOTION" else "UNKNOWN",
-         "detail": "기능시험 원본은 정규 Paper 승급 및 실거래 자격이 아닙니다." if before["kind"] == "NON_PROMOTION" else "봉인 근거만 확인했습니다. 현재 승급 유효기간·권한은 기존 Live 검사에서 별도 확인해야 합니다."},
+        {"code": "PROMOTION", "status": "BLOCKED" if before["kind"] in {"NON_PROMOTION", "SEALED_SOURCE"} else "UNKNOWN",
+         "detail": "현재 Source는 Paper 승인이 관측됐으나 실제 Paper 승급 근거가 아직 없습니다. 역사 승인 기록의 Source hash 결합 여부도 별도로 표시합니다." if before["kind"] == "SEALED_SOURCE" else "기능시험 원본은 정규 Paper 승급 및 실거래 자격이 아닙니다." if before["kind"] == "NON_PROMOTION" else "봉인 근거만 확인했습니다. 현재 승급 유효기간·권한은 기존 Live 검사에서 별도 확인해야 합니다."},
         {"code": "USER_DRAFT", "status": "BLOCKED" if draft["missingInputs"] else "PASS",
          "detail": "종목·매수/매도·수량·지정가를 직접 입력하세요." if draft["missingInputs"] else "사용자가 입력한 지정가 초안의 금액만 계산했습니다."},
         {"code": "ACCOUNT_READ", "status": "PASS" if observation["account"] == "AVAILABLE" else "UNKNOWN", "detail": "Live 설정 계좌 읽기: " + label(observation["account"])},
@@ -229,7 +262,7 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
         {"code": "ORDERABILITY", "status": "BLOCKED" if observation["orderability"] == "BLOCKED" else "UNKNOWN",
          "detail": "거래소 관측: " + label(observation["orderability"]) + " · 주문별 필터·수수료·리스크 검사는 미완료"},
         {"code": "OBSERVED_FUNDS", "status": "BLOCKED" if observation["fundsCheck"] == "INSUFFICIENT_OBSERVED_BALANCE" else "UNKNOWN", "detail": "입력 금액과 관측 잔액 비교: " + label(observation["fundsCheck"]) + " · 수수료/마진/잠금 변동은 별도 검사"},
-        {"code": "ORDER_SPECIFIC_RISK", "status": "UNKNOWN", "detail": "API 키 주문 권한·LOT_SIZE/MIN_NOTIONAL·수수료·노출 한도·선물 마진 및 조건부 주문은 이 조회로 검증되지 않습니다."},
+        {"code": "ORDER_SPECIFIC_RISK", "status": "UNKNOWN", "detail": "정적 LOT_SIZE·PRICE_FILTER·최소금액 관측은 로컬 현금 준비 결과에 표시됩니다. API 키 주문 권한·동적 가격 필터·노출 한도·조건부 주문 및 실행 허가는 미완료입니다." if before["kind"] == "SEALED_SOURCE" else "API 키 주문 권한·LOT_SIZE/MIN_NOTIONAL·수수료·노출 한도·선물 마진 및 조건부 주문은 이 조회로 검증되지 않습니다."},
         {"code": "LIVE_AUTHORITY", "status": "BLOCKED", "detail": "계좌 바인딩·정규 승급·현재 위험 한도·Kill/모드·수동 확인은 기존 Live 절차에서 직접 확인해야 합니다. 이 보고서는 주문 권한을 만들지 않습니다."},
     ]
     body = {"ok": True, "schemaVersion": SCHEMA, **FLAGS, "asOf": now.isoformat(),
@@ -237,7 +270,9 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
             "source": before, "draft": draft, "observation": observation, "checks": checks,
             "limitations": ["조회 시점의 정보이며 실행 직전에 다시 확인해야 합니다.",
                 "총 보유액을 주문 수량으로 자동 선택하지 않습니다. 미입력은 미입력으로 남습니다.",
-                "별도 감독 기능시험의 미출시 HOLD는 이 화면으로 해제되지 않습니다."]}
+                "별도 감독 기능시험의 미출시 HOLD는 이 화면으로 해제되지 않습니다.",
+                "계좌 금액은 현재 로컬 준비 화면에서만 사용하며 보고서·외부 요약에 기록하지 않습니다.",
+                "저장 credential 설정 관측은 Native 계좌 심사/거래 허가와 다르며 직접 시작 직전에 재조회해야 합니다."]}
     body["reportHash"] = stable_sha256(body)
     return body
 
