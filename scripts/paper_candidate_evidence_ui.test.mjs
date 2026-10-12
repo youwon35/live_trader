@@ -534,3 +534,19 @@ test("sealed source changes and authority-bearing source responses clear local p
   }
  } finally {allowPreparation=false;globalThis.window=previous;}
 });
+
+
+test("native source preview separates initial cash budget from current owned equity and never displays unknown quantity as executable", async () => {
+  const previous=globalThis.window;
+  try {
+    globalThis.window=preparationWindow([]);allowPreparation=true;
+    for(const mutatedMaximum of [null,"0.1"]) {
+      useResponse(sealedPreparationSources());const view=harness();await view.buttons().find(b=>b.props.children==="준비 자료 새로고침").props.onClick();view.render();
+      view.elements("select").find(n=>n.props["aria-label"]==="준비할 원본").props.onChange({target:{value:"sealed:sealed-root:INSTANCE:target-0"}});view.render();
+      responseForFetch=async()=>response(preparationReply({}, {source:{...sealedPreparationSources().sources[0].source,instruments:[{instanceId:"instance-a",symbol:"BTCUSDT",broker:"binance"}]},observation:{status:"OBSERVED",cashPreview:{capitalBasis:"PORTFOLIO_EQUITY_WITH_CASH_CAP",initialBudgetBasis:"ACCOUNT_AVAILABLE_CASH",capitalPercent:100,sourceMaxOrderPercent:5,allocationWeight:0.25,status:"BLOCKED",nativeEligibility:"UNKNOWN",maximumQuantity:mutatedMaximum,executable:false,orderSubmissionEnabled:false,armingEnabled:false,reasons:["owned deployment equity pending"]}}}));
+      await view.buttons().find(b=>b.props.children==="원본 확인 · 계좌 조회 없음").props.onClick();const html=view.render();
+      if(mutatedMaximum===null) {assert.match(html,/배포에 배정된 현재 자본/);assert.match(html,/초기 총 사용 한도/);assert.match(html,/UNKNOWN/);assert.match(html,/차단·미확정/);}
+      else {assert.match(html,/범위와 유효시간을 확인하지 못했습니다/);assert.doesNotMatch(html,/조회 시각/);}
+    }
+  } finally {allowPreparation=false;globalThis.window=previous;}
+});

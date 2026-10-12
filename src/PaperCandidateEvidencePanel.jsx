@@ -130,7 +130,10 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
         || !Array.isArray(result.checks) || result.checks.some((item) => !item || !["PASS", "BLOCKED", "UNKNOWN"].includes(item.status) || typeof item.detail !== "string")
         || (result.observation?.cashPreview !== undefined && (!result.observation.cashPreview || result.observation.cashPreview.executable !== false
           || result.observation.cashPreview.orderSubmissionEnabled !== false || result.observation.cashPreview.armingEnabled !== false
-          || result.observation.cashPreview.capitalBasis !== "ACCOUNT_AVAILABLE_CASH" || result.observation.cashPreview.capitalPercent !== 100
+          || !["ACCOUNT_AVAILABLE_CASH", "PORTFOLIO_EQUITY_WITH_CASH_CAP"].includes(result.observation.cashPreview.capitalBasis) || result.observation.cashPreview.capitalPercent !== 100
+          || (result.observation.cashPreview.capitalBasis === "PORTFOLIO_EQUITY_WITH_CASH_CAP" && (result.observation.cashPreview.initialBudgetBasis !== "ACCOUNT_AVAILABLE_CASH"
+            || !["VERIFIED", "UNKNOWN"].includes(result.observation.cashPreview.nativeEligibility)
+            || (result.observation.cashPreview.nativeEligibility === "UNKNOWN" && result.observation.cashPreview.maximumQuantity !== null)))
           || !Number.isFinite(result.observation.cashPreview.sourceMaxOrderPercent) || result.observation.cashPreview.sourceMaxOrderPercent <= 0
           || !Number.isFinite(result.observation.cashPreview.allocationWeight) || result.observation.cashPreview.allocationWeight < 0 || result.observation.cashPreview.allocationWeight > 1
           || !Array.isArray(result.observation.cashPreview.reasons) || result.observation.cashPreview.reasons.some((item) => typeof item !== "string")))
@@ -400,9 +403,11 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
             {preparationResult.observation?.cashPreview && <div aria-label="주문가능현금 기준 준비">
               <p>{preparationResult.observation.accountAlias} {preparationResult.observation.maskedAccount} · 저장 credential 설정 관측 · Native 계좌 심사 전</p>
               <p>계산 범위: 매수 현금 한도 전용 · 매도/방향 미선택 수량은 확정하지 않습니다.</p>
-              <p>총 사용 기준: 주문가능현금 100% · Source 주문 비율 {preparationResult.observation.cashPreview.sourceMaxOrderPercent}% · Portfolio 배분 {(100 * preparationResult.observation.cashPreview.allocationWeight).toFixed(4)}%</p>
+              <p>초기 총 사용 한도: 주문가능현금 100% · Source 주문 비율 {preparationResult.observation.cashPreview.sourceMaxOrderPercent}% · Portfolio 배분 {(100 * preparationResult.observation.cashPreview.allocationWeight).toFixed(4)}%</p>
+              {preparationResult.observation.cashPreview.capitalBasis === "PORTFOLIO_EQUITY_WITH_CASH_CAP" && <p>수량 계산 기준: 배포에 배정된 현재 자본 × Portfolio 비중 × Source 비율 · 현재 주문가능현금은 별도 상한입니다. 배포 자본 미확인 시 수량 차단 · 다른 보유자산 자동 편입 없음</p>}
               <p>현재 주문가능현금 {preparationResult.observation.cashPreview.availableCash ?? "미확인"} · 배분 후 Source 한도 {preparationResult.observation.cashPreview.sourceOrderBudget ?? "미확인"} {preparationResult.observation.currency}</p>
-              <p>수수료/슬리피지 여유 후 {preparationResult.observation.cashPreview.notionalAfterCostAllowance ?? "미확인"} · 정적 단위 검사 수량 {preparationResult.observation.cashPreview.maximumQuantity ?? "차단·미확정"}</p>
+              <p>수수료/슬리피지 여유 후 {preparationResult.observation.cashPreview.modelResult?.notional ?? preparationResult.observation.cashPreview.notionalAfterCostAllowance ?? "미확인"} · 정적 단위 검사 수량 {preparationResult.observation.cashPreview.maximumQuantity ?? "차단·미확정"}</p>
+              {preparationResult.observation.cashPreview.capitalBasis === "PORTFOLIO_EQUITY_WITH_CASH_CAP" && <p>공유 수량 모델 {preparationResult.observation.cashPreview.modelQuantity ?? "미계산"} · 실제 시장 규칙/평균가격 결합 {preparationResult.observation.cashPreview.nativeEligibility} · {preparationResult.observation.cashPreview.feeAssumptionAdjusted ? "실제 수수료가 높아 보수적으로 재계산" : "원본 수수료와 실제 계좌 수수료를 별도 비교"}</p>}
               <p>수량 단위 {preparationResult.observation.constraints?.LOT_SIZE?.stepSize ?? preparationResult.observation.constraints?.quantityStep ?? "미확인"} · 최소 주문 금액 {preparationResult.observation.constraints?.NOTIONAL?.minNotional ?? preparationResult.observation.constraints?.MIN_NOTIONAL?.minNotional ?? preparationResult.observation.constraints?.minNotional ?? "미확인"} · 호가 단위 {preparationResult.observation.constraints?.PRICE_FILTER?.tickSize ?? preparationResult.observation.constraints?.priceTick ?? "미확인"}</p>
               <p>실제 적용 수수료 {preparationResult.observation.cashPreview.actualBrokerFeeObserved ? "관측됨" : "미확인 · 원본 가정만 참고"} · 조회 범위 {preparationResult.observation.cashScope || preparationResult.observation.openOrdersScope || "미확인"}</p>
               <p>호가·최소 단위·거래소 바인딩·실제 수수료가 미확인되면 수량을 확정하지 않습니다. 직접 시작 전 재조회가 필요합니다.</p>

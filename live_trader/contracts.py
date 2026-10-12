@@ -1620,6 +1620,8 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         },
         "promotion_stage": promotion["stage"],
         "release_id": release["release_id"],
+        "executionSizing": _dict_value(artifact.get("executionSizing") or artifact.get("execution_sizing") or trader_contract.get("executionSizing")),
+        "executionPolicy": _dict_value(artifact.get("executionPolicy")),
         "order_quantity": artifact.get("order_quantity") or artifact.get("orderQuantity") or parameters.get("positionSize") or settings.get("positionSize") or 1,
         "reference_price": artifact.get("reference_price") or artifact.get("referencePrice") or artifact.get("last_price") or artifact.get("price") or artifact.get("close_price"),
         "last_price": artifact.get("last_price") or artifact.get("reference_price") or artifact.get("price") or artifact.get("close_price"),

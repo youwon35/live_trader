@@ -75,7 +75,10 @@ def target_snapshot(manifest:dict,target:dict):
         source=_exact(root,"strategy",binding["strategyId"],binding["strategyHash"])[1]
         if spec.parameters!=source.get("parameters") or spec.timeframe!=source.get("timeframe"):
             raise ValueError("Instance scientific parameters/timeframe differ from approved Source")
-        instruments.append(_instrument(spec,binding,target["targetHash"],execution_policy=source.get("executionPolicy") or {"feePercent":spec.parameters.get("fee"),"slippagePercent":spec.parameters.get("slippage"),"executionTiming":spec.parameters.get("executionTiming")}))
+        instrument = _instrument(spec,binding,target["targetHash"],execution_policy=source.get("executionPolicy") or {"feePercent":spec.parameters.get("fee"),"slippagePercent":spec.parameters.get("slippage"),"executionTiming":spec.parameters.get("executionTiming")})
+        if (source.get("executionSizing") or {}).get("quantityContract") is not None:
+            instrument["executionSizing"] = source["executionSizing"]
+        instruments.append(instrument)
     elif target["targetType"]=="PORTFOLIO":
         _,portfolio=_exact(root,"portfolio",target["targetId"],target["targetHash"]);loaded=load_portfolio_runtime(root,target["targetId"])
         if loaded.portfolio_hash!=target["targetHash"]:raise ValueError("Portfolio runtime identity differs")
@@ -88,7 +91,11 @@ def target_snapshot(manifest:dict,target:dict):
             matching=[row["newInstance"] for row in templates if row.get("newInstance",{}).get("instanceLock",{}).get("artifactHash")==digest]
             if len(matching)!=1 or assert_verified_strategy_instance(matching[0])!=digest:raise ValueError("Portfolio member instance seal differs")
             binding=_source_binding(root,data_root,approval_path,spec.strategy_id,spec.artifact_hash)
-            instruments.append(_instrument(spec,binding,digest,allocation_weight=spec.target_weight/total_weight,execution_policy=portfolio.get("executionPolicy") or {}))
+            instrument = _instrument(spec,binding,digest,allocation_weight=spec.target_weight/total_weight,execution_policy=portfolio.get("executionPolicy") or {})
+            source = _exact(root,"strategy",binding["strategyId"],binding["strategyHash"])[1]
+            if (source.get("executionSizing") or {}).get("quantityContract") is not None:
+                instrument["executionSizing"] = source["executionSizing"]
+            instruments.append(instrument)
     else:raise ValueError("Unsupported preparation target")
     body={"targetType":target["targetType"],"targetId":target["targetId"],"targetHash":target["targetHash"],"instruments":instruments}
     return {**body,"identityHash":stable_sha256(body),"paperStage":"PAPER_APPROVED","proofPending":True,"qualification":"PAPER_EVIDENCE_PENDING","approvalBindingStatus":"SOURCE_HASH_RECORDED" if all(row["approvalSourceHashRecorded"] for row in instruments) else "HISTORICAL_APPROVAL_SOURCE_HASH_NOT_RECORDED",**_FALSE_FLAGS}

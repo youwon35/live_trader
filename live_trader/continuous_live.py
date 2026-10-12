@@ -1769,11 +1769,26 @@ class LiveContinuousController:
                 and decision.signal == "SELL"
                 and current_position_quantity > 0
             )
-            quantity = (
-                abs(current_position_quantity)
-                if is_short_cover or is_long_exit
-                else self._order_quantity(spec, decision.bar.close)
-            )
+            from .native_spot_quantity import sizing_from_artifact
+            native_quantity = None
+            try:
+                native_sizing = sizing_from_artifact(spec.artifact) if position_direction == "long" and self._market_type(spec) == "spot" else None
+            except (ValueError, TypeError, KeyError) as error:
+                native_sizing = {"invalid": str(error)}
+            if native_sizing is not None:
+                native_quantity = self._native_quantity_result(spec, decision.signal, decision.bar.close, current_position_quantity, specs)
+                if native_quantity.get("status") != "READY":
+                    reason = "; ".join(native_quantity.get("reasons") or ["native quantity is not verified"])
+                    state.append_audit("warn", "Continuous Runtime", reason)
+                    results.append({"strategyId": decision.strategy_id, "signal": decision.signal, "action": "BLOCKED", "ok": False, "reason": reason, "nativeQuantityStatus": "BLOCKED"})
+                    continue
+                quantity = native_quantity["quantityForSubmission"]
+            else:
+                quantity = (
+                    abs(current_position_quantity)
+                    if is_short_cover or is_long_exit
+                    else self._order_quantity(spec, decision.bar.close)
+                )
             market_type = self._market_type(spec)
             futures_policy = self._futures_execution_policy(spec)
             functional_test = (
@@ -1860,6 +1875,7 @@ class LiveContinuousController:
                 reason=decision.reason,
                 metadata={
                     **functional_metadata,
+                    **({"native_quantity_model": native_quantity["modelResult"], "native_quantity_status": native_quantity["status"]} if native_quantity is not None else {}),
                     "broker_id": spec.broker_id,
                     "portfolio_id": "" if spec.artifact.get("standalone") else spec.portfolio_id,
                     "portfolio_hash": spec.portfolio_hash,
@@ -2624,8 +2640,32 @@ class LiveContinuousController:
             "canonical": policy,
         }
 
+    def _native_quantity_result(self, spec: Any, side: str, price: float, current_position_quantity: float, specs: tuple[Any, ...]) -> dict[str, Any]:
+        from . import state
+        from .native_spot_quantity import decimal_value, live_quantity
+        contexts = state.STATE.get("native_spot_quantity_contexts") or {}
+        context = contexts.get(spec.strategy_instance_id) if isinstance(contexts, dict) else None
+        if isinstance(context, dict):
+            context = dict(context)
+            probe = OrderIntent(strategy_id=spec.strategy_id, asset=state.asset_from_symbol(spec.symbol), symbol=spec.symbol, side=side, quantity=1, reference_price=float(price), mode=self.mode, reason="native quantity preflight scope only", metadata={"broker_id": spec.broker_id, "quote_currency": context.get("quoteCurrency")})
+            account = state.account_risk_for_intent(probe)
+            context.update(accountKnown=account.get("known") is True, accountFresh=account.get("fresh") is True, availableCash=account.get("available_cash"))
+        try:
+            if spec.artifact.get("standalone") is True:
+                allocation = 1
+            else:
+                weights = [decimal_value(item.target_weight, "canonical target weight", positive=True) for item in specs]
+                allocation = decimal_value(spec.target_weight, "canonical target weight", positive=True) / sum(weights)
+            result = live_quantity(spec, side=side, price=price, allocation_weight=allocation, identity={"deploymentId": self.deployment_id}, context=context, position_quantity=current_position_quantity)
+            return result or {"status": "BLOCKED", "quantityForSubmission": None, "reasons": ["native quantity contract missing"]}
+        except (ValueError, TypeError, KeyError, ArithmeticError) as error:
+            return {"status": "BLOCKED", "quantityForSubmission": None, "reasons": [str(error)]}
+
     @staticmethod
     def _order_quantity(spec: Any, price: float) -> float:
+        from .native_spot_quantity import sizing_from_artifact
+        if LiveContinuousController._position_direction(spec) == "long" and LiveContinuousController._market_type(spec) == "spot" and sizing_from_artifact(spec.artifact) is not None:
+            raise ValueError("native spot quantity requires exact owned deployment equity, current cash/rules and canonical allocation")
         override = spec.parameters.get("liveOrderQuantity")
         if override not in (None, ""):
             try:
