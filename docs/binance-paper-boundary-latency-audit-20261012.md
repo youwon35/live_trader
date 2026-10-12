@@ -18,7 +18,7 @@ Paper 앱 아래 다음 사례 폴더의 logs와 soak 보고서를 조사했다.
 - `logs/forward_evidence.sqlite3`
 - `logs/paper_governance.sqlite3`
 - `logs/paper_trading.sqlite3`
-- `reports/soak/20261012T030938Z-46fd38b7f6.json`
+- `logs/reports/soak/20261012T030938Z-46fd38b7f6.json`
 
 SQLite는 읽기 전용 연결로 확인했으며 서비스나 관찰 루프를 실행하지 않았다. 이 문서 작성은 사례 폴더 밖의 별도 기록이다.
 
@@ -71,3 +71,46 @@ CLEAN은 원장 및 admission 상태를 설명한다. 자연 관찰이 성공했
 ## 유지한 검증 경계
 
 30초 지연 한도를 늘리지 않았고 과거 시가를 소급 체결하지 않았다. 관찰을 짧게 재실행하더라도 실제 자연 경계, 주문·체결, 독립 신호 검증, 원장 및 최종 seal이 필요한 승급 항목은 그대로 충족해야 한다. 승급 기준 설정과 기능 검증, 역사 실제 자료의 신호 비교, 실제 forward 관찰은 각각 근거 범위가 다르다.
+
+
+## 후속 실제 관찰 v5 — 두 자연 경계와 종료 점검
+
+성능 수정 후 별도의 `native-execution-v5` 사례를 읽기 전용으로 다시 조사했다. 사례 이름은 동일한 `integration-5m-20261012-binance-portfolio-equal-execution-v3`이고 로그·원장은 새 v5 폴더에 있다. 이전 v3의 trace SHA는 앞서 기록한 값과 동일하여 그대로 보존됐다.
+
+v5 관찰은 03:41:50.420 UTC에 시작해 03:51:50.678에 런타임을 멈췄다. 03:45와 03:50의 두 실제 자연 경계에서 BTC·ETH·SOL 각 1개씩, 총 6개 봉·결정·시가 경계가 처리됐다. 종료 시 runtime은 STOPPED / running=false이고 pending bar/open/event는 모두 0, handlerErrorCount와 consecutive errors도 0이다. 6개 의도와 실행 청구는 모두 TERMINAL이며 미해결 의도는 0이다.
+
+| UTC 목표 경계 | 종목 | 입력 신호 | 의도 생성 | 시가 청구 | 의도 해소 | 실제 해소 결과 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 03:45:00 | BTCUSDT | BUY | 03:45:01.031268 | 03:45:01.083473 | 03:45:01.663082 | OBSERVED, 주문 없음 |
+| 03:45:00 | ETHUSDT | BUY | 03:45:01.051631 | 03:45:02.164103 | 03:45:02.695366 | 로컬 Paper FILLED |
+| 03:45:00 | SOLUSDT | HOLD | 03:45:01.072694 | 03:45:01.670862 | 03:45:02.146411 | HOLD |
+| 03:50:00 | BTCUSDT | BUY | 03:50:00.038031 | 03:50:02.594742 | 03:50:02.992722 | OBSERVED, 주문 없음 |
+| 03:50:00 | ETHUSDT | HOLD | 03:50:00.060470 | 03:50:03.001015 | 03:50:03.420821 | HOLD |
+| 03:50:00 | SOLUSDT | BUY | 03:50:00.082341 | 03:50:00.092314 | 03:50:00.560180 | 로컬 Paper FILLED |
+
+처리 시각과 공급자 E 시각은 서로 다른 시계다. 실제 processReceiptLagSeconds 범위는 -0.941560~0.970189초다. 음수 원본값을 지우거나 0으로 바꾸지 않았으며, 이를 물리적 소켓 지연으로 해석하지 않는다. 기존 30초 안전 한도는 유지됐다.
+
+로컬 가상 계좌의 실제 Paper 체결은 `LOCAL_IMMEDIATE_V1` 2건이다. ETH는 19개를 2545.643464에, SOL은 447개를 111.713504에 매수했다. 최종 원장에는 ETH 19개와 SOL 447개가 열려 있고 cash는 901598.534733896 USDT, 마지막 기록 equity는 999883.961021896 USDT다. 실제 Binance 계좌의 주문·체결은 아니다. 보고서의 executionRoute는 local virtual account, realOrderSubmissionEnabled는 false, realOrderCount는 0이다.
+
+native 종료 요청은 열린 가상 포지션 때문에 세션 최종 종료를 차단했다. 런타임은 STOPPED지만 거버넌스는 CLEAN / DRAINING이고 세션 ended_at은 비어 있다. flat 상태나 최종 봉인이 완료됐다고 표시하지 않는다. 최종 reconciliation seal, Paper→Live Evidence bundle, Live publication은 모두 0건이다.
+
+실제 soak는 600.289초·119개 표본이며 targetDurationSeconds=18000을 충족하지 못해 verdict=FAIL이다. 오류·재연결·실주문은 0이지만 이것으로 장기 검증 통과나 승급 통과를 주장하지 않는다.
+
+검증 결과는 다음과 같다.
+
+- runtime status와 engine의 contentHash 검증 모두 통과.
+- 독립 Backtester reader로 baseline 1개와 실제 input 6개, 총 7개 trace 이벤트의 체인·입력·rolling history 검증 통과. trace SHA-256은 `c0bd4df3365e173c70844cea55de289bda6e43a750defc9a6c9ccc05a97d6a55`이다.
+- 6개 PendingIntent의 state·command·content·sourceSelection hash 및 trace event/input/source/session/manifest 결합 검증 통과.
+- 실제 실행 청구 6개의 transition chain과 현재 상태 검증 통과.
+- 원본 Strategy 3개, Portfolio, execution edition의 새 Instance 3개의 seal 검증 통과.
+- 봉인된 실제 Strategy를 사용한 독립 Backtester 재생에서 실제 forward input 6개 모두 모델·실행 신호와 일치. 새 참조 발행이나 Live 승급 Evidence 작성 없이 순수 함수로 비교했다.
+
+이 결과는 자연 시세→결정→로컬 Paper 체결과 안전한 런타임 중지를 확인한다. 열린 포지션의 완결 처리와 최종 승급 봉인은 아직 완료되지 않았다.
+
+## Upbit 종료 오류에서 확인한 canonical 봉 표현 차이
+
+v5 Upbit의 종료 점검은 trace와 PendingIntent의 closedBarHash가 다르다고 차단했다. 같은 검사를 추가해 보니 Binance 6개와 Upbit 3개, 총 9개의 실제 입력에 같은 원인이 있었다.
+
+`continuous_portfolio_runtime.py`의 봉 해시 재료에는 sourceProvider가 포함되지만, `signal_parity.py`가 저장한 trace의 봉 재료에는 그 필드가 없다. 종료 consumer가 trace의 마지막 봉 자체를 해시하면서 차이가 발생했다. 각 trace 봉에 sourceProvider=검증된 동일 provider를 넣어 읽기 전용으로 계산한 결과 9개 모두 기존 intent.closed_bar_hash와 정확히 같았다. OHLCV·시간 경계의 차이나 rolling history 변조가 원인은 아니다.
+
+Binance에서는 열린 포지션 검사가 먼저 차단하므로 이 추가 오류가 아직 표면화되지 않았다. Paper 담당자가 producer·consumer의 canonical hash 재료를 통일하는 호환 수정과 회귀 검증을 진행하고 있다. 기존 trace·intent·원장·Final을 다시 봉인하거나 소급 수정하지 않는다. 수정 후 종료 consumer 검증 결과는 별도 확인해야 한다.
