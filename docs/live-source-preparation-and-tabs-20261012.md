@@ -47,3 +47,8 @@ Python 80개 독립 fixture 회귀는 exact Source/evidence import, account revi
 2026-10-12 15:30:56 KST에 사용자 Live 프로세스가 0개임을 읽기 전용으로 확인하고 기존 exe를 백업한 뒤 `release/LiveTrader.exe`를 교체했다. 코드 commit `9296bb89de80bebbf5a7ee7d023855cc13b76b72`, 공유 runtime `cf7fbb492f817bb1588afd47dc8cfc6c979ae830`, exe 크기 50,009,823 byte, SHA256 `5c282dbe9303600668e35b2a3dbc5daeddfdd33b307a1557a463a8993c3f6015`다.
 
 패키지 archive에서 sealed_source_preparation/cash_preparation_preview/read_only_account, 새 provider_backfill/historical_warmup/portfolio_reference/continuous_runtime, KIS 46·47 field guard, PyArrow Parquet native DLL을 실제 확인했다. 앱 실행·사용자 프로세스 종료·arming·실주문·취소는 0이다. Hub manifest와 비밀/운영 state는 수정하지 않았다. 기록은 `output/live-tabs-20261012/live-release-manifest.json`과 `archive-check.json`이다. 현재 등록된 20개 Source는 계속 실제 Paper 승급 근거 대기 상태다.
+
+
+## 매수·매도 계산 범위 교정
+
+독립 최종 검토에서 매도 초안에 현금 기반 매수 최대수량이 표시될 수 있음을 찾아 교정했다. 현금 sizing은 사용자가 매수 방향을 직접 선택했을 때만 계산한다. 매도는 `NOT_APPLICABLE`, 방향 미선택은 `BLOCKED`이며 모두 maximumQuantity는 비어 있다. 매도에는 실제 보유·주문가능 수량과 reduce-only/노출 검사가 별도로 필요하다. SELL/미선택 회귀를 추가했고 기존 매수 배분/fee/lot 검사는 유지한다. 최종 패키지 Source SHA와 exe hash는 최신 `output/live-tabs-20261012/live-release-manifest.json`으로 확인한다.

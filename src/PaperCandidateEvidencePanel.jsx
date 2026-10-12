@@ -399,6 +399,7 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
             {preparationResult.observation?.marketSession && <p>시장 시간: {preparationResult.observation.marketSession.detail} · {preparationResult.observation.marketSession.localTime || "연속 시장"} · 거래 허가 없음</p>}
             {preparationResult.observation?.cashPreview && <div aria-label="주문가능현금 기준 준비">
               <p>{preparationResult.observation.accountAlias} {preparationResult.observation.maskedAccount} · 저장 credential 설정 관측 · Native 계좌 심사 전</p>
+              <p>계산 범위: 매수 현금 한도 전용 · 매도/방향 미선택 수량은 확정하지 않습니다.</p>
               <p>총 사용 기준: 주문가능현금 100% · Source 주문 비율 {preparationResult.observation.cashPreview.sourceMaxOrderPercent}% · Portfolio 배분 {(100 * preparationResult.observation.cashPreview.allocationWeight).toFixed(4)}%</p>
               <p>현재 주문가능현금 {preparationResult.observation.cashPreview.availableCash ?? "미확인"} · 배분 후 Source 한도 {preparationResult.observation.cashPreview.sourceOrderBudget ?? "미확인"} {preparationResult.observation.currency}</p>
               <p>수수료/슬리피지 여유 후 {preparationResult.observation.cashPreview.notionalAfterCostAllowance ?? "미확인"} · 정적 단위 검사 수량 {preparationResult.observation.cashPreview.maximumQuantity ?? "차단·미확정"}</p>

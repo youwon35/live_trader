@@ -15,7 +15,11 @@ def cash_preview(instrument, observation, draft):
               "sourceMaxOrderPercent": instrument.get("sourceMaxOrderPercent"),
               "allocationWeight": instrument.get("allocationWeight"), "status": "BLOCKED",
               "executable": False, "orderSubmissionEnabled": False, "armingEnabled": False,
-              "quantityStatus": "BLOCKED", "maximumQuantity": None, "reasons": []}
+              "quantityStatus": "BLOCKED", "maximumQuantity": None, "calculationScope": "BUY_CASH_CAP_ONLY", "reasons": []}
+    if draft.get("side") != "BUY":
+        result["status"] = "NOT_APPLICABLE" if draft.get("side") == "SELL" else "BLOCKED"
+        result["reasons"].append("매수 방향을 직접 선택한 경우에만 현금 기반 매수 수량을 계산합니다." if draft.get("side") != "SELL" else "매도 수량은 현금 기반 매수 한도로 계산하지 않습니다. 실제 보유·주문가능 수량과 reduce-only/노출 검사를 별도로 확인해야 합니다.")
+        return result
     cash = number(observation.get("availableCash"))
     weight = number(instrument.get("allocationWeight"))
     percent = number(instrument.get("sourceMaxOrderPercent"))

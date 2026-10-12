@@ -70,11 +70,22 @@ class CashSizingTests(unittest.TestCase):
     def fixture(self):
         instrument={"sourceMaxOrderPercent":5,"allocationWeight":.2,"executionPolicy":{"feePercent":.05,"slippagePercent":.03}}
         observation={"availableCash":"100000","feeRate":"0.001","accountBinding":"SAVED_CREDENTIAL_CONFIGURATION_OBSERVED","orderability":"MARKET_AND_ACCOUNT_ENABLED","constraints":{"LOT_SIZE":{"minQty":"1","maxQty":"10000","stepSize":"1"},"PRICE_FILTER":{"minPrice":".01","maxPrice":"100000","tickSize":".01"},"NOTIONAL":{"minNotional":"10","maxNotional":"1000000"}}}
-        return instrument,observation,{"limitPrice":"100"}
+        return instrument,observation,{"side":"BUY","limitPrice":"100"}
     def test_portfolio_weight_and_cap_costs_lot_are_exact_and_never_authorize(self):
         i,o,d=self.fixture();r=preview.cash_preview(i,o,d)
         self.assertEqual(preview.Decimal("1000"),preview.Decimal(r["sourceOrderBudget"]));self.assertEqual("9",r["maximumQuantity"])
         self.assertFalse(r["executable"]);self.assertFalse(r["orderSubmissionEnabled"])
+    def test_sell_does_not_derive_quantity_from_cash_even_without_holdings(self):
+        i,o,d=self.fixture();d["side"]="SELL";o["availableAssetQuantity"]="0"
+        r=preview.cash_preview(i,o,d)
+        self.assertEqual("NOT_APPLICABLE",r["status"]);self.assertEqual("BLOCKED",r["quantityStatus"])
+        self.assertIsNone(r["maximumQuantity"]);self.assertNotIn("sourceOrderBudget",r)
+        self.assertIn("reduce-only",r["reasons"][0]);self.assertFalse(r["executable"])
+    def test_unselected_direction_cannot_confirm_buy_quantity(self):
+        for side in (None,"","HOLD"):
+            i,o,d=self.fixture();d["side"]=side;r=preview.cash_preview(i,o,d)
+            self.assertEqual("BLOCKED",r["status"]);self.assertIsNone(r["maximumQuantity"])
+            self.assertNotIn("notionalAfterCostAllowance",r);self.assertFalse(r["orderSubmissionEnabled"])
     def test_unknown_grid_fee_or_cash_does_not_guess_quantity(self):
         for field in ("availableCash","feeRate","constraints"):
             i,o,d=self.fixture();o[field]=None;r=preview.cash_preview(i,o,d)
