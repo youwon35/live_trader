@@ -108,6 +108,7 @@ if (-not (Test-Path -LiteralPath $sharedRuntime)) {
   --add-data "$sharedRuntime\trading_runtime\data\market_calendars;trading_runtime\data\market_calendars" `
   --paths "$sharedRuntime" `
   --hidden-import live_trader.native_equity_observation `
+  --hidden-import live_trader.kis_reference_conversion `
   --hidden-import trading_runtime.order_management `
   --hidden-import trading_runtime.audit_events `
   --hidden-import trading_runtime.artifact_governance `
