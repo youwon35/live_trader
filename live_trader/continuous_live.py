@@ -39,8 +39,9 @@ from .portfolio_execution import (
 
 
 class LiveContinuousController:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, latency_diagnostics_enabled: bool | None = None) -> None:
         self.root = root
+        self._latency_diagnostics_enabled = latency_diagnostics_enabled
         self._lock = threading.RLock()
         self.supervisor: ContinuousRuntimeSupervisor | None = None
         self.profile_id = ""
@@ -421,6 +422,15 @@ class LiveContinuousController:
                     self._ensure_native_runtime(specs, requested_deployment)
                 except (ValueError, TypeError, KeyError, OSError, ArithmeticError, RuntimeError) as error:
                     return {"ok": False, "reason": str(error), "snapshot": state.snapshot()}
+            from .runtime_latency_optin import runtime_latency_options
+            latency_observer, latency_path = runtime_latency_options(
+                self.root, normalized_profile, runtime_hash,
+                enabled=self._latency_diagnostics_enabled,
+            )
+            latency_kwargs = (
+                {"latency_diagnostics": latency_observer}
+                if latency_observer is not None else {}
+            )
             engine = PortfolioRuntimeEngine(
                 specs,
                 mode="MONITOR",
@@ -430,6 +440,7 @@ class LiveContinuousController:
                 cycle_handler=self._handle_cycle,
                 open_boundary_handler=self._handle_native_open_boundary,
                 state_store=DurableRuntimeState(self.root / "logs" / f"continuous_{normalized_profile}_{runtime_hash[:16]}_engine.json"),
+                **latency_kwargs,
             )
             with state.RUNTIME_MODE_LOCK:
                 restore_context = (
@@ -534,6 +545,7 @@ class LiveContinuousController:
                     == state.FUNCTIONAL_TEST_EXECUTION_PURPOSE
                     else None
                 ),
+                **latency_kwargs,
             )
             for feed in feeds:
                 feed.connect()
@@ -551,6 +563,8 @@ class LiveContinuousController:
                 poll_seconds=2.0,
                 heartbeat_seconds=5.0,
                 operation_lock=self._dispatcher(),
+                **latency_kwargs,
+                **({"latency_diagnostics_path": latency_path} if latency_observer is not None else {}),
             )
             self.supervisor.start()
             source_kind = "Portfolio" if loaded is not None else "Standalone Strategy"
