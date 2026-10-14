@@ -21665,7 +21665,11 @@ def live_broker_payload(
     broker_price = intent.reference_price
     if broker_id == "upbit":
         if order_type.lower() == "price":
-            broker_price = intent.notional
+            if "native_open_boundary" in metadata:
+                from .native_order_ticket import native_upbit_quote_amount
+                broker_price = native_upbit_quote_amount(intent)
+            else:
+                broker_price = intent.notional
         elif order_type.lower() == "market":
             broker_price = 0.0
     elif broker_id == "kis":

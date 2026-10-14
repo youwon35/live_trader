@@ -20,9 +20,9 @@ from .live_adapters import build_upbit_authorization, sign_binance_query, split_
 ORIGINS = {"binance": "https://api.binance.com", "binance-futures": "https://fapi.binance.com",
            "upbit": "https://api.upbit.com", "kis": "https://openapi.koreainvestment.com:9443"}
 READ_PATHS = {
- "binance": {"/api/v3/time", "/api/v3/account", "/api/v3/openOrders", "/api/v3/exchangeInfo"},
+ "binance": {"/api/v3/time", "/api/v3/account", "/api/v3/openOrders", "/api/v3/exchangeInfo", "/api/v3/account/commission", "/api/v3/avgPrice", "/api/v3/ticker/price", "/api/v3/myTrades", "/api/v3/order"},
  "binance-futures": {"/fapi/v1/time", "/fapi/v3/account", "/fapi/v1/openOrders", "/fapi/v1/exchangeInfo"},
- "upbit": {"/v1/accounts", "/v1/orders/chance", "/v1/orders/open"},
+ "upbit": {"/v1/accounts", "/v1/orders/chance", "/v1/orders/open", "/v1/ticker", "/v1/order"},
  "kis": {"/uapi/domestic-stock/v1/trading/inquire-balance",
          "/uapi/overseas-stock/v1/trading/inquire-balance",
          "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl",

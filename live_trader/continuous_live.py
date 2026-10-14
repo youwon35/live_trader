@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 import os
 import sqlite3
@@ -62,6 +62,10 @@ class LiveContinuousController:
         self._portfolio_last_sync_monotonic = 0.0
         self._deferred_dispatcher: ContinuousDispatcher | None = None
         self._dispatcher_setup_lock = threading.Lock()
+        self._native_boundary_queue = None
+        self.native_context_provider = None
+        self._native_boundary_receipt = None
+        self._native_runtime = None
 
     def start(
         self,
@@ -412,6 +416,11 @@ class LiveContinuousController:
                     "reason": portfolio_execution_blocker,
                     "snapshot": state.snapshot(),
                 }
+            if normalized_mode != "MONITOR" and self._native_spot_specs(specs):
+                try:
+                    self._ensure_native_runtime(specs, requested_deployment)
+                except (ValueError, TypeError, KeyError, OSError, ArithmeticError, RuntimeError) as error:
+                    return {"ok": False, "reason": str(error), "snapshot": state.snapshot()}
             engine = PortfolioRuntimeEngine(
                 specs,
                 mode="MONITOR",
@@ -419,6 +428,7 @@ class LiveContinuousController:
                     self._runtime_position_quantity
                 ),
                 cycle_handler=self._handle_cycle,
+                open_boundary_handler=self._handle_native_open_boundary,
                 state_store=DurableRuntimeState(self.root / "logs" / f"continuous_{normalized_profile}_{runtime_hash[:16]}_engine.json"),
             )
             with state.RUNTIME_MODE_LOCK:
@@ -882,6 +892,12 @@ class LiveContinuousController:
     ) -> str:
         from . import state
 
+        if self._native_spot_specs(specs):
+            self.portfolio_ledger = None
+            self.portfolio_execution_scope_id = ""
+            self.portfolio_execution_account_id = ""
+            self.portfolio_execution_symbols = ()
+            return ""
         if len(specs) <= 1:
             self.portfolio_ledger = None
             self.portfolio_execution_scope_id = ""
@@ -1030,6 +1046,8 @@ class LiveContinuousController:
     def _runtime_position_quantity(self, spec: Any) -> float:
         from . import state
 
+        if self._native_runtime is not None:
+            return self._native_owned_position(spec)
         if self.portfolio_ledger is not None and self.portfolio_execution_scope_id:
             self._sync_portfolio_execution()
             return float(
@@ -1050,6 +1068,12 @@ class LiveContinuousController:
     ) -> str:
         """Fail closed before live whenever sleeve ownership is not exact."""
 
+        if self._native_spot_specs(specs):
+            try:
+                self._ensure_native_runtime(specs, self.deployment_id)
+                return ""
+            except (ValueError, TypeError, KeyError, OSError) as error:
+                return str(error)
         if len(specs) <= 1:
             return ""
         blocker = self._portfolio_execution_spec_blocker(specs)
@@ -1654,6 +1678,12 @@ class LiveContinuousController:
     def _submit_deferred_intent(intent: OrderIntent) -> dict[str, Any]:
         from . import state
 
+        if "native_open_boundary" in intent.metadata:
+            from .native_order_ticket import validate_native_ticket
+            try:
+                validate_native_ticket(intent)
+            except (ValueError, TypeError, KeyError, ArithmeticError) as error:
+                return {"ok": False, "reason": str(error), "orderSubmitted": False}
         return state.submit_order_intent(
             state.snapshot(), intent, dry_run=False,
             audit_event="Continuous Runtime Deferred",
@@ -1708,7 +1738,10 @@ class LiveContinuousController:
         from . import state
 
         specs = tuple(self.supervisor.engine.specs) if self.supervisor else ()
-        if len(specs) > 1:
+        if self._native_specs(specs) and self.mode != "MONITOR":
+            if self._native_boundary_receipt is None:
+                return self._stage_native_cycle(cycle, specs)
+        elif len(specs) > 1:
             return self._handle_portfolio_cycle_locked(cycle, specs)
         results: list[dict[str, Any]] = []
         for decision in cycle.decisions:
@@ -1749,11 +1782,9 @@ class LiveContinuousController:
                 )
                 continue
             position_direction = self._position_direction(spec)
-            current_position_quantity = state.broker_position_quantity(
-                spec.symbol,
-                spec.broker_id,
-                "SHORT" if position_direction == "short" else "LONG",
-            )
+            current_position_quantity = (self._native_owned_position(spec) if self._native_boundary_receipt is not None else state.broker_position_quantity(
+                spec.symbol, spec.broker_id, "SHORT" if position_direction == "short" else "LONG"
+            ))
             is_short_entry = (
                 position_direction == "short"
                 and decision.signal == "SELL"
@@ -1870,12 +1901,12 @@ class LiveContinuousController:
                 symbol=spec.symbol,
                 side=decision.signal,
                 quantity=quantity,
-                reference_price=decision.bar.close,
+                reference_price=float(native_quantity["modelResult"]["fillPrice"]) if native_quantity is not None else decision.bar.close,
                 mode=self.mode,  # type: ignore[arg-type]
                 reason=decision.reason,
                 metadata={
                     **functional_metadata,
-                    **({"native_quantity_model": native_quantity["modelResult"], "native_quantity_status": native_quantity["status"]} if native_quantity is not None else {}),
+                    **({"native_quantity_model": native_quantity["modelResult"], "native_quantity_status": native_quantity["status"], "native_preflight": native_quantity.get("preflightBinding"), "native_account_fingerprint": (native_quantity.get("preflightBinding") or {}).get("accountFingerprint")} if native_quantity is not None else {}),
                     "broker_id": spec.broker_id,
                     "portfolio_id": "" if spec.artifact.get("standalone") else spec.portfolio_id,
                     "portfolio_hash": spec.portfolio_hash,
@@ -1891,7 +1922,7 @@ class LiveContinuousController:
                         if abs(current_position_quantity) > 1e-12
                         else 0.0
                     ),
-                    "portfolio_equity": max(1.0, float(state.STATE["risk_settings"]["strategy_capital_limit_krw"])),
+                    "portfolio_equity": float(native_quantity["modelResult"]["deploymentEquity"]) if native_quantity is not None else max(1.0, float(state.STATE["risk_settings"]["strategy_capital_limit_krw"])),
                     "expected_alpha_bps": self._numeric_parameter(spec, "expectedAlphaBps", 0.0),
                     "expected_cost_bps": self._numeric_parameter(spec, "expectedCostBps", 5.0),
                     "position_direction": position_direction,
@@ -1931,7 +1962,8 @@ class LiveContinuousController:
                         functional_test=functional_test,
                     ),
                     "execution_timing": "next-open-boundary",
-                    "decision_price_role": "reference-and-sizing-only",
+                    "decision_price_role": "SOURCE_SLIPPAGE_ADJUSTED_EXACT_OPEN" if self._native_boundary_receipt is not None else "reference-and-sizing-only",
+                    **({"native_open_boundary": self._native_boundary_receipt, "source_artifact_hash": spec.artifact_hash} if self._native_boundary_receipt is not None else {}),
                 },
             )
             result = self._submit_cycle_intent(
@@ -2640,12 +2672,100 @@ class LiveContinuousController:
             "canonical": policy,
         }
 
+    @staticmethod
+    def _native_spot_specs(specs):
+        from .native_spot_quantity import sizing_from_artifact
+        return LiveContinuousController._native_specs(specs) and all(sizing_from_artifact(spec.artifact)["quantityContract"]["schemaVersion"] == "native-spot-quantity-v1" for spec in specs)
+
+    def _ensure_native_runtime(self, specs, deployment_id):
+        from .native_spot_runtime import NativeSpotRuntime
+        if self._native_runtime is None:
+            runtime = NativeSpotRuntime(self.root, deployment_id, specs)
+            runtime.initialize_at_reviewed_manual_start()
+            self._native_runtime = runtime
+            self.native_context_provider = runtime.context
+        else:
+            if self._native_runtime.deployment_id != deployment_id:
+                raise ValueError("NATIVE_CAPITAL_ACTIVE_DEPLOYMENT_CHANGED")
+            self._native_runtime.scope()
+        return self._native_runtime
+
+    @staticmethod
+    def _native_specs(specs):
+        from .native_spot_quantity import sizing_from_artifact
+        try:
+            return bool(specs) and all(sizing_from_artifact(spec.artifact) is not None and LiveContinuousController._position_direction(spec) == "long" for spec in specs)
+        except (ValueError, TypeError, KeyError):
+            return False
+
+    def _boundary_queue(self):
+        from .native_open_boundary import NativeBoundaryQueue
+        if self._native_boundary_queue is None:
+            self._native_boundary_queue = NativeBoundaryQueue(self.root / "logs" / "native_next_open_intents.sqlite3")
+        return self._native_boundary_queue
+
+    def _stage_native_cycle(self, cycle, specs):
+        from . import state
+        results = []
+        counts = [str(d.strategy_instance_id) for d in cycle.decisions]
+        for decision in cycle.decisions:
+            spec = next((s for s in specs if s.strategy_instance_id == decision.strategy_instance_id), None)
+            blocker = self._decision_context_blocker(decision, spec)
+            if counts.count(str(decision.strategy_instance_id)) != 1:
+                blocker = "NATIVE_CYCLE_DUPLICATE_INSTANCE"
+            if blocker:
+                results.append({"strategyId": decision.strategy_id, "action": "BLOCKED", "ok": False, "reason": blocker})
+            elif decision.signal == "HOLD":
+                results.append({"strategyId": decision.strategy_id, "action": "MONITOR", "ok": True})
+            else:
+                try:
+                    row = self._boundary_queue().stage(decision, spec, self.deployment_id)
+                except (ValueError, OSError, sqlite3.Error) as error:
+                    row = {"action": "BLOCKED", "ok": False, "reason": str(error)}
+                results.append({"strategyId": decision.strategy_id, **row})
+        return {"mode": self.mode, "profileId": self.profile_id, "results": results}
+
+    def _native_owned_position(self, spec):
+        from . import state
+        contexts = state.STATE.get("native_spot_quantity_contexts") or {}
+        context = contexts.get(spec.strategy_instance_id) or {}
+        if callable(self.native_context_provider):
+            context = self.native_context_provider(spec, "POSITION", None, tuple(self.supervisor.engine.specs), self._native_boundary_receipt)
+        if context.get("equityScope") != "OWNED_DEPLOYMENT_ONLY":
+            return 0.0  # live_quantity will block the missing exact owned scope
+        return float(Decimal(str((context.get("ownedPositions") or {}).get(spec.strategy_instance_id, 0))))
+
+    def _handle_native_open_boundary(self, boundary):
+        from types import SimpleNamespace
+        from . import state
+        if self.mode == "MONITOR" or self.supervisor is None:
+            return {"ok": True, "action": "MONITOR", "orderAuthorityGranted": False}
+        specs = tuple(self.supervisor.engine.specs)
+        if not self._native_specs(specs):
+            return {"ok": True, "action": "LEGACY_BOUNDARY_NOT_CONSUMED"}
+        def prepare(payload, spec, exact):
+            # Preserve the closed signal identity/end. Only the sizing reference
+            # becomes the separately attested opening price.
+            self._native_boundary_receipt = {**exact.to_dict(), "closedBarHash": stable_sha256(payload["closedBar"]), "evaluationKey": payload["evaluationKey"], "sourceArtifactHash": spec.artifact_hash}
+            decision = SimpleNamespace(strategy_id=spec.strategy_id, strategy_instance_id=spec.strategy_instance_id, signal=payload["signal"], reason=payload["reason"], evaluation_key=payload["evaluationKey"], bar=SimpleNamespace(end_time=payload["closedBarEnd"], close=exact.open))
+            try:
+                result = self._handle_cycle_locked(SimpleNamespace(decisions=(decision,)))
+                rows = result.get("results") or []
+                return rows[0] if len(rows) == 1 else {"ok": False, "reason": "NATIVE_BOUNDARY_PREPARE_NO_RESULT"}
+            finally:
+                self._native_boundary_receipt = None
+        from trading_runtime.artifact_governance import stable_sha256
+        with self._dispatcher():
+            return self._boundary_queue().release(boundary, specs, self.deployment_id, prepare)
+
     def _native_quantity_result(self, spec: Any, side: str, price: float, current_position_quantity: float, specs: tuple[Any, ...]) -> dict[str, Any]:
         from . import state
         from .native_spot_quantity import decimal_value, live_quantity
         contexts = state.STATE.get("native_spot_quantity_contexts") or {}
         context = contexts.get(spec.strategy_instance_id) if isinstance(contexts, dict) else None
-        if isinstance(context, dict):
+        if callable(self.native_context_provider):
+            context = self.native_context_provider(spec, side, price, specs, self._native_boundary_receipt)
+        if isinstance(context, dict) and "nativeMarketObservation" not in context:
             context = dict(context)
             probe = OrderIntent(strategy_id=spec.strategy_id, asset=state.asset_from_symbol(spec.symbol), symbol=spec.symbol, side=side, quantity=1, reference_price=float(price), mode=self.mode, reason="native quantity preflight scope only", metadata={"broker_id": spec.broker_id, "quote_currency": context.get("quoteCurrency")})
             account = state.account_risk_for_intent(probe)
@@ -2654,8 +2774,10 @@ class LiveContinuousController:
             if spec.artifact.get("standalone") is True:
                 allocation = 1
             else:
-                weights = [decimal_value(item.target_weight, "canonical target weight", positive=True) for item in specs]
-                allocation = decimal_value(spec.target_weight, "canonical target weight", positive=True) / sum(weights)
+                with localcontext() as precision:
+                    precision.prec = 2048
+                    weights = [decimal_value(item.target_weight, "canonical target weight", positive=True) for item in specs]
+                    allocation = decimal_value(spec.target_weight, "canonical target weight", positive=True) / sum(weights)
             result = live_quantity(spec, side=side, price=price, allocation_weight=allocation, identity={"deploymentId": self.deployment_id}, context=context, position_quantity=current_position_quantity)
             return result or {"status": "BLOCKED", "quantityForSubmission": None, "reasons": ["native quantity contract missing"]}
         except (ValueError, TypeError, KeyError, ArithmeticError) as error:

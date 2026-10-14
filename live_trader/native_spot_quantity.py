@@ -41,6 +41,12 @@ def sizing_from_artifact(artifact):
 
 
 def source_cost_rates(artifact, parameters):
+    with localcontext() as precision:
+        precision.prec = 2048
+        return _source_cost_rates(artifact, parameters)
+
+
+def _source_cost_rates(artifact, parameters):
     policy = artifact.get("portfolioExecutionPolicy") or artifact.get("executionPolicy") or {}
     def rate(policy_key, parameter_key, direct_key, divisor):
         values = []
@@ -56,7 +62,7 @@ def source_cost_rates(artifact, parameters):
     return rate("feePercent", "fee", "fee_rate", 1), rate("slippagePercent", "slippage", "slippage_bps", 10000)
 
 
-def calculate_model_quantity(sizing, *, side, price, deployment_equity, available_cash, allocation_weight, position_percent, source_fee_rate, source_slippage_rate, actual_fee_rate=None, position_quantity=0, notional_reference_price=None):
+def calculate_model_quantity(sizing, *, side, price, deployment_equity, available_cash, allocation_weight, position_percent, source_fee_rate, source_slippage_rate, actual_fee_rate=None, position_quantity=0, notional_reference_price=None, current_maximum_quote=None):
     """Same numeric inputs as Backtester/Paper; funds are a separate cash cap."""
     sizing = execution_sizing_from_settings({"executionSizing": sizing})
     if sizing.get("capitalBasis") != CAPITAL_BASIS:
@@ -76,12 +82,14 @@ def calculate_model_quantity(sizing, *, side, price, deployment_equity, availabl
             equity = decimal_value(deployment_equity, "deployment_equity", positive=True)
             cash = decimal_value(available_cash, "available_cash")
             capital = min(equity * weight * percent / 100, cash)
+            if current_maximum_quote is not None:
+                capital = min(capital, decimal_value(current_maximum_quote, "current max quote", positive=True))
             result = size_spot_buy(contract, price=price, spend_capital=capital, fee_rate=conservative_fee, slippage_rate=slippage, notional_reference_price=notional_reference_price)
         elif side == "SELL":
             result = size_spot_sell(contract, price=price, position_quantity=position_quantity, fee_rate=conservative_fee, slippage_rate=slippage, notional_reference_price=notional_reference_price)
         else:
             raise ValueError("native spot quantity requires exact BUY/SELL side")
-    return {**result, "capitalBasis": CAPITAL_BASIS, "allocationWeight": str(weight), "sourcePositionPercent": str(percent), "sourceFeeRate": str(fee), "feeRateUsed": str(conservative_fee), "feeAssumptionAdjusted": actual_fee is not None and actual_fee > fee, "actualFeeObserved": actual_fee is not None}
+    return {**result, "capitalBasis": CAPITAL_BASIS, "deploymentEquity":str(decimal_value(deployment_equity,"deployment equity",positive=True)), "availableCashCap":str(decimal_value(available_cash,"cash cap")), "allocationWeight": str(weight), "sourcePositionPercent": str(percent), "sourceFeeRate": str(fee), "feeRateUsed": str(conservative_fee), "feeAssumptionAdjusted": actual_fee is not None and actual_fee > fee, "actualFeeObserved": actual_fee is not None}
 
 
 def live_quantity(spec, *, side, price, allocation_weight, identity, context=None, position_quantity=0, now=None):
@@ -115,24 +123,34 @@ def live_quantity(spec, *, side, price, allocation_weight, identity, context=Non
         if not 0 <= age <= 120:
             raise ValueError("NATIVE_QUANTITY_PREFLIGHT_STALE")
         current = validate_quantity_contract(context.get("currentQuantityContract"))
-        if any(current.get(key) != contract.get(key) for key in RULE_FIELDS):
+        market_observation = context.get("nativeMarketObservation")
+        market_verified = False
+        if market_observation is not None:
+            from .native_spot_preflight import verify_calculation_inputs
+            verify_calculation_inputs(context, market_observation, contract, side=side, now=now)
+            market_verified = True
+        compare_fields = tuple(key for key in RULE_FIELDS if key != "capabilityStatus") if market_verified else RULE_FIELDS
+        if market_verified:
+            from .native_spot_preflight import source_rules_fit_current
+            source_rules_fit_current(contract, current)
+        elif any(current.get(key) != contract.get(key) for key in compare_fields):
             raise ValueError("NATIVE_QUANTITY_CURRENT_RULES_DIFFER_FROM_SOURCE")
         source_fee, source_slippage = source_cost_rates(spec.artifact, spec.parameters)
-        model = calculate_model_quantity(sizing, side=side, price=price, deployment_equity=context.get("deploymentEquity"), available_cash=context.get("availableCash"), allocation_weight=allocation_weight, position_percent=spec.parameters.get("positionSize"), source_fee_rate=source_fee, source_slippage_rate=source_slippage, actual_fee_rate=context.get("actualFeeRate"), position_quantity=position_quantity, notional_reference_price=context.get("notionalReferencePrice"))
+        model = calculate_model_quantity(sizing, side=side, price=price, deployment_equity=context.get("deploymentEquity"), available_cash=context.get("availableCash"), allocation_weight=allocation_weight, position_percent=spec.parameters.get("positionSize"), source_fee_rate=source_fee, source_slippage_rate=source_slippage, actual_fee_rate=context.get("actualFeeRate"), position_quantity=position_quantity, notional_reference_price=context.get("notionalReferencePrice"), current_maximum_quote=(market_observation or {}).get("currentMaximumQuoteAmount"))
         blocked["modelResult"] = model
-        blocked["nativeEligibility"] = model["nativeEligibility"]
+        blocked["nativeEligibility"] = "VERIFIED" if market_verified else model["nativeEligibility"]
         if model["actualFeeObserved"] is not True:
             raise ValueError("NATIVE_QUANTITY_ACTUAL_ACCOUNT_FEE_NOT_OBSERVED")
         if model["status"] != "READY":
             raise ValueError(model["reason"])
-        if model["nativeEligibility"] != "VERIFIED":
+        if blocked["nativeEligibility"] != "VERIFIED":
             raise ValueError("NATIVE_QUANTITY_MARKET_CAPABILITY_OR_REFERENCE_UNPROVEN")
         quantity = decimal_value(model["quantity"], "quantity", positive=True)
         # OrderIntent currently carries float. Refuse lossy decimal transport.
         transported = float(quantity)
         if not Decimal(str(transported)) == quantity:
             raise ValueError("NATIVE_QUANTITY_FLOAT_TRANSPORT_LOSES_EXACT_STEP")
-        return {**blocked, "status": "READY", "quantityForSubmission": transported, "reasons": []}
+        return {**blocked, "status": "READY", "quantityForSubmission": transported, "reasons": [], "preflightBinding": {"asOf":context.get("asOf"),"accountFingerprint":context.get("accountFingerprint"),"capitalScopeHash":context.get("capitalScopeHash"),"deploymentId":identity["deploymentId"],"sourceContractHash":contract["contractHash"],"marketObservationHash":(market_observation or {}).get("contentHash"),"actualFeeRate":context.get("actualFeeRate"),"sourceSlippageRate":str(source_slippage),"modelFeeRate":model["feeRateUsed"]}}
     except (ValueError, TypeError, KeyError, ArithmeticError) as error:
         blocked["reasons"].append(str(error))
         return blocked

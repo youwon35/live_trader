@@ -158,17 +158,32 @@ def source_snapshot(request, roots):
         specs = [spec for spec in loaded.specs if spec.strategy_instance_id == identity["strategyInstanceId"]]
         if len(specs) != 1:
             raise ValueError("검증된 실행 단위가 하나로 확인되지 않습니다.")
-        instruments = [_instrument(spec.strategy_instance_id, spec.symbol, spec.provider, spec.broker_id) for spec in specs]
+        all_specs = list(loaded.specs)
+        from .native_spot_quantity import decimal_value
+        weights = [decimal_value(spec.target_weight, "canonical allocation", positive=True) for spec in all_specs]
+        total_weight = sum(weights)
+        instruments = [_paper_instrument(spec, weight / total_weight) for spec, weight in zip(all_specs, weights)]
     else:
         instance, _ = inbox._exact_instance(inbox._instance_catalog(root), identity["strategyInstanceId"], strategy)
         symbol = instance.get("qualifiedSymbol") or instance.get("symbol") or strategy.get("symbol")
         provider, broker, _ = infer_market_route(symbol)
-        instruments = [_instrument(identity["strategyInstanceId"], symbol,
-            instance.get("marketDataProvider") or provider, instance.get("brokerId") or broker)]
+        from types import SimpleNamespace
+        spec = SimpleNamespace(strategy_instance_id=identity["strategyInstanceId"], symbol=symbol, provider=instance.get("marketDataProvider") or provider, broker_id=instance.get("brokerId") or broker, parameters=instance.get("parameters") or strategy.get("parameters") or {}, artifact=strategy, artifact_hash=identity["strategyArtifactHash"], portfolio_hash="")
+        instruments = [_paper_instrument(spec, 1)]
     return {"kind": kind, "evidenceClass": strategy.get("evidenceClass"), "evidenceId": row["evidenceId"],
             "evidenceHash": identity["evidenceHash"], "portfolioId": row.get("portfolioId", ""),
             "portfolioHash": identity.get("portfolioArtifactHash", ""), "identityHash": stable_sha256(identity),
             "qualification": "SEALED_PAPER_EVIDENCE_ONLY", "instruments": instruments}
+
+
+def _paper_instrument(spec, allocation):
+    from .native_spot_quantity import sizing_from_artifact, source_cost_rates
+    result = _instrument(spec.strategy_instance_id, spec.symbol, spec.provider, spec.broker_id)
+    sizing = sizing_from_artifact(spec.artifact)
+    if sizing is not None:
+        fee, slippage = source_cost_rates(spec.artifact, spec.parameters)
+        result.update(executionSizing=sizing, allocationWeight=float(allocation), canonicalAllocationWeight=str(allocation), sourceMaxOrderPercent=spec.parameters.get("positionSize"), sourceArtifactHash=spec.artifact_hash, portfolioHash=spec.portfolio_hash, executionPolicy={"feePercent":str(fee*100), "slippagePercent":str(slippage*100)})
+    return result
 
 
 def _draft(value):
@@ -216,12 +231,20 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
         uses_runtime_settings = reader is None
         reader = reader or ReadOnlyBrokerReader(runtime_settings())
         settings_hash = stable_sha256(reader.settings) if isinstance(getattr(reader, "settings", None), dict) else None
-        read = reader.observe_preparation if before["kind"] == "SEALED_SOURCE" else reader.read
-        observation = read(selected["broker"], selected["symbol"], side=draft["side"],
-                           quantity=numbers["quantity"], limit_price=numbers["limitPrice"])
+        native_contract = (selected.get("executionSizing") or {}).get("quantityContract")
+        if native_contract is not None and native_contract.get("schemaVersion") == "native-spot-quantity-v1" and draft["side"] in {"BUY", "SELL"}:
+            from .native_spot_preflight import observe_native_spot
+            observation = observe_native_spot(reader, native_contract, side=draft["side"])
+            receipt = dict(observation)
+            reference = observation.get("marketReference") or {}
+            observation["notionalReferencePrice"] = reference.get("price")
+            observation["nativeMarketObservation"] = receipt
+        else:
+            read = reader.observe_preparation if before["kind"] == "SEALED_SOURCE" else reader.read
+            observation = read(selected["broker"], selected["symbol"], side=draft["side"], quantity=numbers["quantity"], limit_price=numbers["limitPrice"])
         if settings_hash is not None and (stable_sha256(reader.settings) != settings_hash or (uses_runtime_settings and stable_sha256(runtime_settings()) != settings_hash)):
             raise ValueError("조회 중 저장 계좌 설정이 바뀌어 결과를 폐기했습니다.")
-        if before["kind"] == "SEALED_SOURCE":
+        if before["kind"] == "SEALED_SOURCE" or (selected.get("executionSizing") or {}).get("quantityContract") is not None:
             from .cash_preparation_preview import cash_preview
             observation["cashPreview"] = cash_preview(selected, observation, draft)
     after = source_snapshot(request["source"], folders)

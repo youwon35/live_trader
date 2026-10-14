@@ -26,7 +26,7 @@ def sizing(**changes):
 
 
 def spec(sizing_value=None):
-    return types.SimpleNamespace(broker_id="binance",provider="binance",symbol="ETHUSDT",strategy_id="source",strategy_instance_id="member",portfolio_hash="portfolio",artifact_hash="sourceHash",target_weight=1,parameters={"positionSize":5,"fee":0.1,"slippage":0.2},artifact={"standalone":True,"executionSizing":sizing_value or sizing()})
+    return types.SimpleNamespace(broker_id="binance",provider="binance",symbol="ETHUSDT",strategy_id="source",strategy_instance_id="member",portfolio_hash="portfolio",artifact_hash="sourceHash",target_weight=1,parameters={"positionSize":5,"fee":0.1,"slippage":0.2,"executionTiming":"next-open"},artifact={"standalone":True,"executionSizing":sizing_value or sizing()})
 
 
 def context(sizing_value=None):
@@ -106,14 +106,16 @@ class NativeSpotQuantityTests(unittest.TestCase):
         fake_state.append_audit=Mock();fake_state.account_risk_for_intent=Mock(side_effect=AssertionError("account access should not occur without exact context"))
         with patch.dict(sys.modules,{PACKAGE+".state":fake_state}),patch.object(package,"state",fake_state,create=True):
             controller_module=importlib.import_module(PACKAGE+".continuous_live")
-            controller=controller_module.LiveContinuousController(APP)
+            import tempfile
+            temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
+            controller=controller_module.LiveContinuousController(Path(temporary.name))
             controller.mode="SMALL_LIVE";controller.deployment_id="deployment"
-            selected=spec();controller.supervisor=types.SimpleNamespace(engine=types.SimpleNamespace(specs=(selected,)))
+            selected=spec();selected.instrument_id="binance:spot:ETHUSDT";selected.timeframe="5m";controller.supervisor=types.SimpleNamespace(engine=types.SimpleNamespace(specs=(selected,)))
             controller._decision_context_blocker=Mock(return_value="")
             controller._submit_cycle_intent=Mock(side_effect=AssertionError("submit must stay unreachable"))
-            decision=types.SimpleNamespace(strategy_id="source",strategy_instance_id="member",signal="BUY",reason="fixture",bar=types.SimpleNamespace(close=100))
+            decision=types.SimpleNamespace(strategy_id="source",strategy_instance_id="member",signal="BUY",reason="fixture",evaluation_key="evaluation",bar=types.SimpleNamespace(close=100,end_time=datetime.now(timezone.utc).isoformat()))
             result=controller._handle_cycle_locked(types.SimpleNamespace(decisions=(decision,)))
-            self.assertEqual("BLOCKED",result["results"][0]["action"])
+            self.assertEqual("WAIT_OPEN_BOUNDARY",result["results"][0]["action"])
             controller._submit_cycle_intent.assert_not_called();fake_state.account_risk_for_intent.assert_not_called()
             with self.assertRaises(ValueError):controller._order_quantity(selected,100)
 

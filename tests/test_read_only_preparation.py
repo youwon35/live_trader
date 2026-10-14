@@ -141,6 +141,9 @@ class TransportTests(unittest.TestCase):
     def test_all_mutation_methods_order_test_cancel_and_arbitrary_hosts_denied_before_transport(self):
         attempts=[("binance",m,p) for m in ("POST","PUT","PATCH","DELETE","GET")
                   for p in ("/api/v3/order","/api/v3/order/test","https://evil.test/api/v3/account","/api/v3/account/../order")]
+        # Exact GET /api/v3/order observes one already-submitted order; every
+        # mutation/test/redirect-shaped path remains forbidden.
+        attempts = [item for item in attempts if item != ("binance", "GET", "/api/v3/order")]
         attempts += [("upbit","GET","/v1/orders"),("kis","POST","/uapi/domestic-stock/v1/trading/order-cash")]
         for provider,method,path in attempts:
             with self.assertRaises(account.ReadBoundaryError):self.transport.request(provider,method,path)
