@@ -80,6 +80,172 @@ class NativePreflightTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
         self.net=patch.object(socket,"socket",side_effect=AssertionError("real network forbidden"));self.net.start();self.addCleanup(self.net.stop)
 
+    def test_first_native_start_binds_reconciliation_to_requested_deployment(self):
+        from threading import RLock
+        from unittest.mock import MagicMock
+
+        fake = types.ModuleType(P + ".state")
+        fake.STATE = {}
+        fake.snapshot = Mock(return_value={})
+        fake.append_audit = Mock()
+        fake.FUNCTIONAL_TEST_EXECUTION_PURPOSE = "FUNCTIONAL_TEST"
+        fake.RUNTIME_MODE_LOCK = RLock()
+        with patch.dict(sys.modules, {P + ".state": fake}), patch.object(package, "state", fake, create=True):
+            module = importlib.import_module(P + ".continuous_live")
+            source = spec()
+            strategy = {
+                **source.artifact,
+                "strategy_id": source.strategy_id,
+                "strategy_instance_id": source.strategy_instance_id,
+                "symbol": source.symbol,
+                "timeframe": source.timeframe,
+                "provider": source.provider,
+                "broker_id": source.broker_id,
+                "artifact_hash": source.artifact_hash,
+                "parameters": source.parameters,
+                "permissions": {"live_small_eligible": True},
+            }
+            controller = module.LiveContinuousController(self.root, latency_diagnostics_enabled=False)
+            native = MagicMock()
+            native.deployment_id = "requested-deployment"
+            engine = MagicMock()
+            engine.transition_mode.return_value = None
+            engine.seed_history.return_value = 0
+            supervisor = MagicMock()
+            supervisor.snapshot.return_value = {"phase": "RUNNING", "running": True}
+            feed = MagicMock()
+            feed.provider_id = source.provider
+            feed.warmup.return_value = []
+            with (
+                patch.object(controller, "_dispatch_status", return_value={"reconciliationRequired": False}),
+                patch.object(controller, "_select_standalone_strategy", return_value=strategy),
+                patch.object(controller, "_paper_final_binding_blocker", return_value=""),
+                patch.object(controller, "_restore_context_assessment", return_value={}),
+                patch.object(controller, "_dispatcher", return_value=contextlib.nullcontext()),
+                patch.object(runtime_module, "NativeSpotRuntime", return_value=native) as runtime_factory,
+                patch.object(module, "PortfolioRuntimeEngine", return_value=engine),
+                patch.object(module, "ContinuousRuntimeSupervisor", return_value=supervisor),
+                patch.object(module, "DurableRuntimeState"),
+                patch.object(module, "feeds_for_specs", return_value=[feed]),
+                patch.object(module, "required_warmup_bars", return_value=1),
+            ):
+                result = controller.start("crypto", "SMALL_LIVE", strategy_id=source.strategy_id, deployment_id="requested-deployment")
+
+            self.assertTrue(result["ok"], result.get("reason"))
+            self.assertEqual("requested-deployment", controller.deployment_id)
+            self.assertEqual("SMALL_LIVE", controller.mode)
+            self.assertEqual("requested-deployment", runtime_factory.call_args.args[1])
+            native.initialize_at_reviewed_manual_start.assert_called_once_with()
+            native.scope.assert_called_once_with()
+            supervisor.start.assert_called_once_with()
+
+    def test_native_reconciliation_keeps_active_deployment_on_mode_transition(self):
+        fake = types.ModuleType(P + ".state")
+        with patch.dict(sys.modules, {P + ".state": fake}), patch.object(package, "state", fake, create=True):
+            module = importlib.import_module(P + ".continuous_live")
+            controller = module.LiveContinuousController(self.root)
+            controller.deployment_id = "active-deployment"
+            with patch.object(controller, "_ensure_native_runtime") as ensure:
+                self.assertEqual("", controller._portfolio_reconciliation_blocker((spec(),)))
+            ensure.assert_called_once_with((unittest.mock.ANY,), "active-deployment")
+
+    def test_stopped_native_runtime_same_deployment_reuses_owned_principal(self):
+        from unittest.mock import MagicMock
+        module = importlib.import_module(P + ".continuous_live")
+        source = spec()
+        current_deployment, account, old_scope = deployment(source)
+        runtime = runtime_module.NativeSpotRuntime(self.root, "deployment", (source,), reader=Reader(source), roots=[], deployment_reader=lambda *args: current_deployment, dispatch_reader=lambda: [])
+        runtime.initialize_at_reviewed_manual_start()
+        controller = module.LiveContinuousController(self.root)
+        controller._native_runtime = runtime
+        controller.native_context_provider = runtime.context
+        controller.supervisor = MagicMock()
+        controller.supervisor.running = False
+        controller.supervisor.snapshot.return_value = {"phase": "STOPPED", "running": False}
+        with patch.object(runtime_module, "NativeSpotRuntime") as create:
+            self.assertIs(runtime, controller._ensure_native_runtime((source,), "deployment"))
+        create.assert_not_called()
+        self.assertEqual("1000", runtime.store.project(old_scope, {})["initialPrincipal"])
+
+    def test_clean_stop_allows_reviewed_other_account_preserving_prior_capital(self):
+        from unittest.mock import MagicMock
+        module = importlib.import_module(P + ".continuous_live")
+        source = spec()
+        prior_deployment, account, old_scope = deployment(source)
+        prior = runtime_module.NativeSpotRuntime(self.root, "deployment", (source,), reader=Reader(source), roots=[], deployment_reader=lambda *args: prior_deployment, dispatch_reader=lambda: [])
+        prior.initialize_at_reviewed_manual_start()
+        next_source = spec("upbit")
+        next_deployment, next_account, _ = deployment(next_source)
+        next_deployment["deploymentId"] = "next-deployment"
+        candidate = runtime_module.NativeSpotRuntime(self.root, "next-deployment", (next_source,), reader=Reader(next_source), roots=[], deployment_reader=lambda *args: next_deployment, dispatch_reader=lambda: [])
+        controller = module.LiveContinuousController(self.root)
+        controller._native_runtime = prior
+        controller.native_context_provider = prior.context
+        controller.supervisor = MagicMock()
+        controller.supervisor.running = False
+        controller.supervisor.snapshot.return_value = {"phase": "STOPPED", "running": False}
+        with patch.object(controller, "_dispatch_status", return_value={"reconciliationRequired": False}), patch.object(runtime_module, "NativeSpotRuntime", return_value=candidate):
+            self.assertIs(candidate, controller._ensure_native_runtime((next_source,), "next-deployment"))
+        self.assertEqual("1000", prior.store.project(old_scope, {})["initialPrincipal"])
+        self.assertEqual("1000", candidate.store.project(candidate.scope(), {})["initialPrincipal"])
+        self.assertEqual(candidate.context, controller.native_context_provider)
+
+    def test_restart_cannot_reallocate_reserved_same_account_cash(self):
+        from unittest.mock import MagicMock
+        module = importlib.import_module(P + ".continuous_live")
+        source = spec()
+        prior_deployment, account, old_scope = deployment(source)
+        prior = runtime_module.NativeSpotRuntime(self.root, "deployment", (source,), reader=Reader(source), roots=[], deployment_reader=lambda *args: prior_deployment, dispatch_reader=lambda: [])
+        prior.initialize_at_reviewed_manual_start()
+        next_deployment = deepcopy(prior_deployment)
+        next_deployment["deploymentId"] = "next-deployment"
+        candidate = runtime_module.NativeSpotRuntime(self.root, "next-deployment", (source,), reader=Reader(source), roots=[], deployment_reader=lambda *args: next_deployment, dispatch_reader=lambda: [])
+        controller = module.LiveContinuousController(self.root)
+        controller._native_runtime = prior
+        controller.native_context_provider = prior.context
+        controller.supervisor = MagicMock()
+        controller.supervisor.running = False
+        controller.supervisor.snapshot.return_value = {"phase": "STOPPED", "running": False}
+        with patch.object(controller, "_dispatch_status", return_value={"reconciliationRequired": False}), patch.object(runtime_module, "NativeSpotRuntime", return_value=candidate), self.assertRaisesRegex(ValueError, "OWNED_CAPITAL_ALREADY_RESERVED"):
+            controller._ensure_native_runtime((source,), "next-deployment")
+        self.assertIs(prior, controller._native_runtime)
+        self.assertEqual(prior.context, controller.native_context_provider)
+        self.assertEqual("1000", prior.store.project(old_scope, {})["initialPrincipal"])
+
+    def test_other_deployment_requires_clean_stop_and_resolved_dispatch(self):
+        from unittest.mock import MagicMock
+        module = importlib.import_module(P + ".continuous_live")
+        for phase, running, unresolved in (("RUNNING", True, False), ("FAILED", False, False), ("STOPPED", False, True), ("STOPPED", False, None)):
+            with self.subTest(phase=phase, running=running, unresolved=unresolved):
+                prior = MagicMock()
+                prior.deployment_id = "prior-deployment"
+                controller = module.LiveContinuousController(self.root)
+                controller._native_runtime = prior
+                controller.supervisor = MagicMock()
+                controller.supervisor.running = running
+                controller.supervisor.snapshot.return_value = {"phase": phase, "running": running}
+                with patch.object(controller, "_dispatch_status", return_value={"reconciliationRequired": unresolved}), patch.object(runtime_module, "NativeSpotRuntime") as create, self.assertRaises(ValueError):
+                    controller._ensure_native_runtime((spec(),), "next-deployment")
+                create.assert_not_called()
+                self.assertIs(prior, controller._native_runtime)
+
+    def test_other_deployment_waits_for_prior_native_order_truth(self):
+        from unittest.mock import MagicMock
+        module = importlib.import_module(P + ".continuous_live")
+        prior = MagicMock()
+        prior.deployment_id = "prior-deployment"
+        prior.sync_owned_fills.side_effect = ValueError("OWNED_DISPATCH_UNRESOLVED")
+        controller = module.LiveContinuousController(self.root)
+        controller._native_runtime = prior
+        controller.supervisor = MagicMock()
+        controller.supervisor.running = False
+        controller.supervisor.snapshot.return_value = {"phase": "STOPPED", "running": False}
+        with patch.object(controller, "_dispatch_status", return_value={"reconciliationRequired": False}), patch.object(runtime_module, "NativeSpotRuntime") as create, self.assertRaisesRegex(ValueError, "OWNED_DISPATCH_UNRESOLVED"):
+            controller._ensure_native_runtime((spec(),), "next-deployment")
+        create.assert_not_called()
+        prior.sync_owned_fills.assert_called_once_with(prior.scope.return_value)
+        self.assertIs(prior, controller._native_runtime)
+
     def test_fresh_average_and_directional_all_commissions_are_bound(self):
         s=spec();r=Reader(s);o=pre.observe_native_spot(r,s.artifact["executionSizing"]["quantityContract"],side="BUY")
         self.assertEqual(Decimal("0.0033"),Decimal(o["feeRate"]));self.assertFalse(o["orderAuthorityGranted"]);self.assertEqual(5,o["marketReference"]["minutes"])
@@ -231,7 +397,7 @@ class NativePreflightTests(unittest.TestCase):
         contexts={}
         for selected in (s,other):
             contexts[selected.strategy_instance_id]={"deploymentId":"deployment","sourceArtifactHash":SHA,"portfolioHash":PH,"strategyInstanceId":selected.strategy_instance_id,"quoteCurrency":"USDT","equityScope":"OWNED_DEPLOYMENT_ONLY","deploymentEquity":"1000","availableCash":"1000","accountKnown":True,"accountFresh":True,"asOf":observed_receipt["asOf"],"actualFeeRate":observed_receipt["feeRate"],"notionalReferencePrice":observed_receipt["marketReference"]["price"],"currentQuantityContract":observed_receipt["currentQuantityContract"],"nativeMarketObservation":observed_receipt,"ownedPositions":{"member":"0","member2":"0"},"accountFingerprint":"a"*64,"capitalScopeHash":"b"*64}
-        fake=types.ModuleType(P+".state");fake.STATE={"strategy_runner":{},"risk_settings":{"strategy_capital_limit_krw":1000},"dry_run":True};fake.append_audit=Mock();fake.asset_from_symbol=lambda symbol:"CRYPTO";fake.FUNCTIONAL_TEST_EXECUTION_PURPOSE="FUNCTIONAL_TEST"
+        fake=types.ModuleType(P+".state");fake.STATE={"strategy_runner":{},"risk_settings":{"strategy_capital_limit_krw":1000},"dry_run":True};fake.append_audit=Mock();fake.asset_from_symbol=lambda symbol,**route:"CRYPTO";fake.FUNCTIONAL_TEST_EXECUTION_PURPOSE="FUNCTIONAL_TEST"
         with patch.dict(sys.modules,{P+".state":fake}),patch.object(package,"state",fake,create=True):
             module=importlib.import_module(P+".continuous_live");controller=module.LiveContinuousController(self.root);controller.mode="SMALL_LIVE";controller.profile_id="crypto";controller.deployment_id="deployment";controller.portfolio_id="portfolio";controller.strategy_ids=(s.strategy_id,);controller.allowed_symbols=(s.symbol,);controller.supervisor=types.SimpleNamespace(engine=types.SimpleNamespace(specs=(s,other)));controller.native_context_provider=lambda selected,*args:contexts[selected.strategy_instance_id]
             controller._dispatcher=Mock(return_value=contextlib.nullcontext());captured=[]
@@ -276,7 +442,7 @@ class NativePreflightTests(unittest.TestCase):
     def test_actual_controller_source_closed_open_quantity_ticket_e2e_without_order(self):
         s=spec();d,a,scope=deployment(s);reader=Reader(s);runtime=runtime_module.NativeSpotRuntime(self.root,"deployment",(s,),reader=reader,roots=[],deployment_reader=lambda *args:d,dispatch_reader=lambda:[])
         runtime.initialize_at_reviewed_manual_start()
-        fake=types.ModuleType(P+".state");fake.STATE={"strategy_runner":{},"risk_settings":{"strategy_capital_limit_krw":1000},"dry_run":True};fake.append_audit=Mock();fake.asset_from_symbol=lambda symbol:"CRYPTO";fake.FUNCTIONAL_TEST_EXECUTION_PURPOSE="FUNCTIONAL_TEST"
+        fake=types.ModuleType(P+".state");fake.STATE={"strategy_runner":{},"risk_settings":{"strategy_capital_limit_krw":1000},"dry_run":True};fake.append_audit=Mock();fake.asset_from_symbol=lambda symbol,**route:"CRYPTO";fake.FUNCTIONAL_TEST_EXECUTION_PURPOSE="FUNCTIONAL_TEST"
         with patch.dict(sys.modules,{P+".state":fake}),patch.object(package,"state",fake,create=True):
             module=importlib.import_module(P+".continuous_live");controller=module.LiveContinuousController(self.root);controller.mode="SMALL_LIVE";controller.profile_id="crypto";controller.deployment_id="deployment";controller.requested_strategy_id=s.strategy_id;controller.strategy_ids=(s.strategy_id,);controller.allowed_symbols=(s.symbol,);controller.supervisor=types.SimpleNamespace(engine=types.SimpleNamespace(specs=(s,)));controller.native_context_provider=runtime.context
             controller._dispatcher=Mock(return_value=contextlib.nullcontext());captured=[]

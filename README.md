@@ -23,7 +23,9 @@ The desktop workspace has eight top-level tabs:
 
 See [the architecture review](docs/architecture-review-20260906.md) for the current implementation limits and [the manual tab guide](docs/manual-tab-validation.md) for each tab's purpose, internal behavior, steps, and acceptance criteria.
 
-As of 2026-09-06, ordinary continuous execution supports observation but its final live dispatch remains blocked by `CONTINUOUS_FINAL_DISPATCH_LOCK_ORDER_UNAVAILABLE`. The UI reads this capability from the server; missing capability data is unverified. The separate supervised crypto release also remains closed. Paper candidate evidence is verified read-only; first-time Live adoption and initial limited-live approval are not connected yet. Adapter code and completed validation stages do not establish that a production route is available.
+Ordinary continuous dispatch is implemented; its availability is projected from the durable stock/crypto queues in `execution_availability.py`. Unknown queue status or unresolved submissions block execution. Paper publication verification, inactive candidate import, and saved-account review are connected. Each deployment still requires exact Paper qualification, a reviewed account and capital policy, current reconciliation and Preflight, native confirmation, and explicit runtime start. Adapter availability is separate from deployment readiness.
+
+The ordinary manager currently has one stock controller and one crypto controller. A controller supports one exact deployment at a time, including multiple strategy instances in one sealed, single-broker portfolio. Independent Binance and Upbit deployments cannot run concurrently through that crypto controller; cross-broker portfolios are rejected. KIS stock/ETF adapters and feeds exist, but the newer native-equity execution path is incomplete: authenticated current fee/capability observations, owned capital, and the final native ticket are not connected. The reference conversion module grants no trading authority. See [current native preparation limits](docs/native-spot-live-preparation-20261015.md) and the offline prelaunch report instead of treating a running application as ready to trade.
 
 ## Run The Desktop App
 
@@ -49,6 +51,14 @@ Output:
 release\LiveTrader.exe
 ```
 
+## Read-only Prelaunch Inventory
+
+```powershell
+.\.venv\Scripts\python.exe -B tools\prelaunch_readiness.py --artifact-root "$env:LOCALAPPDATA\trading-system\artifacts\strategy-core" --runtime-root "$env:LOCALAPPDATA\live_trader"
+```
+
+For source execution, pass the app directory as `--runtime-root`. The tool reads the exact stored artifacts, deployment definitions, saved account bindings and capital metadata without importing application state, contacting a broker, migrating credentials, or starting a runtime. Exit code 0 means the inventory was readable; the report remains `NOT_READY` because live broker evidence and final start are outside this read-only tool. It never grants trading permission.
+
 ## Required Broker/API Settings
 
 Create `.env` next to this README for non-secret runtime flags. Do not commit real credentials.
@@ -68,7 +78,7 @@ BINANCE_API_SECRET=
 
 Current implementation includes signed KIS/Binance/Upbit order adapters and private KIS/Upbit execution streams. Real orders still require an eligible immutable portfolio, Paper evidence, account reconciliation, risk checks, explicit mode/route enablement, and a natural confirmed-bar signal.
 
-Route availability must be implemented and verified before a live test can proceed. For a supported route, the backend additionally requires exactly one Deployment, operator confirmation, appropriate mode and safety controls, and a fresh Preflight for that exact Deployment. These conditions alone cannot open the currently blocked ordinary continuous route. A Deployment, risk policy, account route, or risk-opening control change invalidates the Preflight and requires it to be run again. Tightening a safety control takes effect immediately; enabling new-entry protection still permits only independently verified position-reducing orders. The global Kill Switch blocks orders and requests cancellation of working orders; it never creates a position-flattening order.
+Route availability must be implemented and verified before a live test can proceed. For a supported route, the backend additionally requires exactly one Deployment, operator confirmation, appropriate mode and safety controls, and a fresh Preflight for that exact Deployment. Queue availability alone cannot satisfy these deployment-specific conditions. A Deployment, risk policy, account route, or risk-opening control change invalidates the Preflight and requires it to be run again. Tightening a safety control takes effect immediately; enabling new-entry protection still permits only independently verified position-reducing orders. The global Kill Switch blocks orders and requests cancellation of working orders; it never creates a position-flattening order.
 
 Operational identity and recovery evidence are persisted as append-only records:
 
@@ -117,4 +127,4 @@ MONITOR, heartbeat gap, loss-gate event, late/unrecovered disconnect, or
 - Strategy plugin folders are read from `LIVE_TRADER_STRATEGY_PLUGIN_DIR` or `TRADER_STRATEGY_PLUGIN_DIR`; when unset, each artifact folder's `plugins` subfolder is used.
 - Shared live permission checks mirror `packages/trading-contracts`.
 - The React UI imports `../../../packages/design/design-tokens.css`.
-- Live execution requires artifacts with `permissions.live_allowed === true` or `live_allowed === true`.
+- Live execution requires the exact mode-specific permissions and Paper/deployment/account checks. Limited live uses its own eligibility and does not grant full-live permission.

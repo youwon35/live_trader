@@ -20159,22 +20159,20 @@ def durable_control_snapshot() -> dict[str, Any]:
         }
 
 
-def asset_from_symbol(symbol: str) -> str:
-    text = symbol.upper()
-    if any(token in text for token in ("BTC", "ETH", "USDT", "KRW-")):
-        return "코인"
-    if text.endswith(".KS") or text.isdigit():
-        return "한국주식"
-    return "미국주식"
+def asset_from_symbol(
+    symbol: str, *, broker_id: str = "", provider: str = "", market_type: str = ""
+) -> str:
+    from .market_routes import market_asset
+
+    return market_asset(
+        symbol, broker_id=broker_id, provider=provider, market_type=market_type
+    )
 
 
 def broker_id_from_symbol(symbol: str, asset: str) -> str:
-    text = f"{symbol} {asset}".lower()
-    if "krw-" in text or "upbit" in text:
-        return "upbit"
-    if any(token in text for token in ("btc", "eth", "usdt", "코인", "crypto")):
-        return "binance"
-    return "kis"
+    from .market_routes import market_broker_id
+
+    return market_broker_id(symbol, asset=asset)
 
 
 def broker_ready_for_intent(checks: dict[str, Any], intent: OrderIntent) -> bool:

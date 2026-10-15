@@ -449,7 +449,9 @@ class LiveContinuousController:
                     else None
                 )
                 portfolio_restore_blocker = (
-                    self._portfolio_reconciliation_blocker(specs)
+                    self._portfolio_reconciliation_blocker(
+                        specs, deployment_id=requested_deployment
+                    )
                     if normalized_mode != "MONITOR"
                     else ""
                 )
@@ -1078,13 +1080,19 @@ class LiveContinuousController:
         )
 
     def _portfolio_reconciliation_blocker(
-        self, specs: tuple[Any, ...]
+        self, specs: tuple[Any, ...], *, deployment_id: str | None = None
     ) -> str:
         """Fail closed before live whenever sleeve ownership is not exact."""
 
         if self._native_spot_specs(specs):
             try:
-                self._ensure_native_runtime(specs, self.deployment_id)
+                # A first start has not published self.deployment_id yet.
+                # Reconcile the requested identity without changing active state
+                # until the engine's restore and mode transition both succeed.
+                self._ensure_native_runtime(
+                    specs,
+                    self.deployment_id if deployment_id is None else deployment_id,
+                )
                 return ""
             except (ValueError, TypeError, KeyError, OSError) as error:
                 return str(error)
@@ -1326,9 +1334,23 @@ class LiveContinuousController:
             if portfolio_id and str(portfolio.get("id") or "") != portfolio_id:
                 continue
             instances = portfolio.get("strategy_instances") if isinstance(portfolio.get("strategy_instances"), list) else []
-            symbols = [str(item.get("symbol") or item.get("qualifiedSymbol") or "") for item in instances if isinstance(item, dict)]
+            profile_matches = []
+            for instance in instances:
+                if not isinstance(instance, dict):
+                    continue
+                source_id = str(instance.get("sourceStrategyId") or instance.get("strategyId") or "")
+                source_hash = str(instance.get("sourceArtifactHash") or "")
+                sources = [row for row in strategies_by_id.get(source_id, []) if not source_hash or str(row.get("artifact_hash") or "") in {"", source_hash}]
+                source = sources[0] if len(sources) == 1 else {}
+                profile_matches.append(self._symbol_matches_profile(
+                    str(instance.get("symbol") or instance.get("qualifiedSymbol") or ""),
+                    profile_id,
+                    broker_id=instance.get("broker_id") or instance.get("brokerId") or source.get("broker_id") or source.get("brokerId") or "",
+                    provider=instance.get("provider") or source.get("provider") or "",
+                    market_type=instance.get("market_type") or instance.get("marketType") or source.get("market_type") or source.get("marketType") or "",
+                ))
             if (
-                any(self._symbol_matches_profile(symbol, profile_id) for symbol in symbols)
+                any(profile_matches)
                 and self._portfolio_components_eligible(portfolio, strategies_by_id, mode)
             ):
                 candidates.append(portfolio)
@@ -1411,7 +1433,12 @@ class LiveContinuousController:
                 if strategy.get(required) is not True:
                     continue
             symbol = str(strategy.get("symbol") or "")
-            if self._symbol_matches_profile(symbol, profile_id):
+            if self._symbol_matches_profile(
+                symbol, profile_id,
+                broker_id=strategy.get("broker_id") or strategy.get("brokerId") or "",
+                provider=strategy.get("provider") or "",
+                market_type=strategy.get("market_type") or strategy.get("marketType") or "",
+            ):
                 return strategy
         return None
 
@@ -1458,13 +1485,17 @@ class LiveContinuousController:
         )
 
     @staticmethod
-    def _symbol_matches_profile(symbol: str, profile_id: str) -> bool:
-        text = str(symbol).upper()
-        crypto = text.startswith("KRW-") or text.endswith("USDT") or "BTC" in text or "ETH" in text
-        return crypto if profile_id == "crypto" else not crypto
+    def _symbol_matches_profile(symbol: str, profile_id: str, **route: str) -> bool:
+        from .market_routes import market_profile
+
+        return profile_id in {"stock", "crypto"} and market_profile(symbol, **route) == profile_id
 
     def _matches_profile(self, spec: Any, profile_id: str) -> bool:
-        return self._symbol_matches_profile(spec.symbol, profile_id)
+        return self._symbol_matches_profile(
+            spec.symbol, profile_id,
+            broker_id=getattr(spec, "broker_id", ""),
+            provider=getattr(spec, "provider", ""),
+        )
 
     @staticmethod
     def _spec_mode_allowed(spec: Any, mode: str) -> bool:
@@ -1911,7 +1942,7 @@ class LiveContinuousController:
                 }
             intent = OrderIntent(
                 strategy_id=decision.strategy_id,
-                asset=state.asset_from_symbol(spec.symbol),
+                asset=state.asset_from_symbol(spec.symbol, broker_id=spec.broker_id, provider=spec.provider),
                 symbol=spec.symbol,
                 side=decision.signal,
                 quantity=quantity,
@@ -2088,7 +2119,7 @@ class LiveContinuousController:
         }
         return OrderIntent(
             strategy_id=str(decision.strategy_id),
-            asset=state.asset_from_symbol(spec.symbol),
+            asset=state.asset_from_symbol(spec.symbol, broker_id=spec.broker_id, provider=spec.provider),
             symbol=spec.symbol,
             side=plan.side,
             quantity=float(plan.quantity),
@@ -2693,15 +2724,33 @@ class LiveContinuousController:
 
     def _ensure_native_runtime(self, specs, deployment_id):
         from .native_spot_runtime import NativeSpotRuntime
-        if self._native_runtime is None:
-            runtime = NativeSpotRuntime(self.root, deployment_id, specs)
-            runtime.initialize_at_reviewed_manual_start()
-            self._native_runtime = runtime
-            self.native_context_provider = runtime.context
-        else:
-            if self._native_runtime.deployment_id != deployment_id:
+
+        runtime = self._native_runtime
+        if runtime is not None and runtime.deployment_id != deployment_id:
+            supervisor = self.supervisor
+            status = supervisor.snapshot() if supervisor is not None else {}
+            if (
+                supervisor is None
+                or supervisor.running
+                or status.get("running") is not False
+                or status.get("phase") != "STOPPED"
+            ):
                 raise ValueError("NATIVE_CAPITAL_ACTIVE_DEPLOYMENT_CHANGED")
-            self._native_runtime.scope()
+            if self._dispatch_status().get("reconciliationRequired") is not False:
+                raise ValueError("NATIVE_CAPITAL_PREVIOUS_DISPATCH_UNRESOLVED")
+            # Stopping does not release principal or prove order finality. Check
+            # every prior owned order before selecting another reviewed scope.
+            runtime.sync_owned_fills(runtime.scope())
+            runtime = None
+        if runtime is None:
+            candidate = NativeSpotRuntime(self.root, deployment_id, specs)
+            # The append-only store retains all previous account reservations.
+            # Publish only after the new reviewed scope and capital pass.
+            candidate.initialize_at_reviewed_manual_start()
+            self._native_runtime = candidate
+            self.native_context_provider = candidate.context
+        else:
+            runtime.scope()
         return self._native_runtime
 
     @staticmethod
@@ -2781,7 +2830,7 @@ class LiveContinuousController:
             context = self.native_context_provider(spec, side, price, specs, self._native_boundary_receipt)
         if isinstance(context, dict) and "nativeMarketObservation" not in context:
             context = dict(context)
-            probe = OrderIntent(strategy_id=spec.strategy_id, asset=state.asset_from_symbol(spec.symbol), symbol=spec.symbol, side=side, quantity=1, reference_price=float(price), mode=self.mode, reason="native quantity preflight scope only", metadata={"broker_id": spec.broker_id, "quote_currency": context.get("quoteCurrency")})
+            probe = OrderIntent(strategy_id=spec.strategy_id, asset=state.asset_from_symbol(spec.symbol, broker_id=spec.broker_id, provider=spec.provider), symbol=spec.symbol, side=side, quantity=1, reference_price=float(price), mode=self.mode, reason="native quantity preflight scope only", metadata={"broker_id": spec.broker_id, "quote_currency": context.get("quoteCurrency")})
             account = state.account_risk_for_intent(probe)
             context.update(accountKnown=account.get("known") is True, accountFresh=account.get("fresh") is True, availableCash=account.get("available_cash"))
         try:
