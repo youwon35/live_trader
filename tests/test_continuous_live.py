@@ -921,6 +921,7 @@ class LiveContinuousControllerTest(unittest.TestCase):
         state.STATE["automation"]["crypto"]["enabled"] = False
         try:
             with (
+                patch.object(state, "resolve_continuous_runtime_scope", return_value=None),
                 patch.object(
                     state.LIVE_CONTINUOUS_CONTROLLER,
                     "start",
@@ -945,6 +946,7 @@ class LiveContinuousControllerTest(unittest.TestCase):
             )
 
             with (
+                patch.object(state, "resolve_continuous_runtime_scope", return_value=None),
                 patch.object(
                     state.LIVE_CONTINUOUS_CONTROLLER,
                     "start",

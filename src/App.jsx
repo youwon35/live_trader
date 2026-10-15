@@ -1,5 +1,6 @@
 import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, ReconciliationEvidence, CapitalAllowance, DeploymentChanges, OrderInvestigation, OperatorNoteEditor } from "./OperatorInsights.jsx";
 import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
+import { runtimeRows, runtimeForDeployment, runtimeModeForDeployment, runningDeploymentIds, artifactIsRunning } from "./runtimeSelection.js";
 import OperationalChecklistPanel from "./OperationalChecklistPanel";
 import { ordinaryExecutionView, recordedReconciliation, verifiedCanaryExecution } from "./executionAvailability.js";
 import * as React from "react";
@@ -2029,14 +2030,13 @@ function App() {
     document.title = "[LIVE] Live Trader";
   }, []);
 
-  const runningDeploymentId = snapshot.live_governance?.activeSession?.deploymentId
-    || (snapshot.continuous_runtime?.running ? snapshot.continuous_runtime?.deploymentId : "")
-    || "";
+  const activeDeploymentIds = useMemo(() => runningDeploymentIds(snapshot.continuous_runtime), [snapshot.continuous_runtime]);
+  const runningDeploymentId = snapshot.live_governance?.activeSession?.deploymentId || activeDeploymentIds[0] || "";
   const deploymentOptions = useMemo(
     () => buildCurrentDeploymentOptions(snapshot.strategies ?? [], {
-      pinnedDeploymentIds: [runningDeploymentId],
+      pinnedDeploymentIds: [...activeDeploymentIds, runningDeploymentId],
     }),
-    [runningDeploymentId, snapshot.strategies],
+    [activeDeploymentIds, runningDeploymentId, snapshot.strategies],
   );
 
   useEffect(() => {
@@ -2346,6 +2346,7 @@ function App() {
     || deploymentOptions[0]?.strategy
     || null;
   const deploymentContext = strategyDeploymentContext(selectedStrategy);
+  const selectedRuntimeMode = runtimeModeForDeployment(snapshot, deploymentContext);
   const notifications = buildNotificationItems(snapshot, error);
   const notificationKey = notificationFingerprint(notifications);
   const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
@@ -2412,8 +2413,8 @@ function App() {
             </div>
           </div>
           <div className="topbar-actions">
-            <StatusPill tone={snapshot.mode === "FULL_LIVE" ? "danger" : snapshot.mode === "SMALL_LIVE" ? "warning" : "info"}>
-              {liveRuntimeModeLabel(snapshot.mode)}
+            <StatusPill tone={selectedRuntimeMode === "FULL_LIVE" ? "danger" : selectedRuntimeMode === "SMALL_LIVE" ? "warning" : "info"}>
+              {liveRuntimeModeLabel(selectedRuntimeMode)}
             </StatusPill>
             <StatusPill tone={snapshot.new_entries_blocked ? "warning" : "success"}>
               신규 진입 {snapshot.new_entries_blocked ? "차단" : "허용"}
@@ -2530,7 +2531,7 @@ function App() {
             deploymentContext.id,
             deploymentContext.strategyId,
           ))}
-          onRuntimeStop={(profileId) => runAction(() => stopContinuousRuntime(profileId))}
+          onRuntimeStop={(profileId, runtimeId = "", deploymentId = "") => runAction(() => stopContinuousRuntime(profileId, { runtimeId, deploymentId }))}
           onPromoteLive={(strategyId) => runAction(() => promoteStrategyToLive(strategyId))}
           onStrategyLifecycle={(strategyId, action) => runAction(() => setStrategyLifecycle(strategyId, action))}
           onWatchdog={() => runAction(runWatchdog)}
@@ -3072,7 +3073,7 @@ function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, on
 
 function RuntimeComponentStatusPanel({ snapshot = {} }) {
   const runtime = snapshot.continuous_runtime ?? {};
-  const profiles = Object.values(runtime.profiles ?? {});
+  const profiles = runtimeRows(runtime);
   const runtimeRunning = profiles.some((profile) => profile?.running === true) || runtime.running === true;
   const activeLive = ["SMALL_LIVE", "FULL_LIVE"].includes(String(snapshot.mode || "").toUpperCase());
   const streams = snapshot.execution_streams?.brokers ?? {};
@@ -5262,7 +5263,8 @@ function AutomationLauncherPanel({
     .map((strategy) => liveStrategyBarSchedule(strategy, activeProfile.provider))
     .filter(Boolean);
   const runnerText = runnerState?.last_profile === activeProfile.id ? runnerState.last_action : activeProfile.last_action;
-  const profileRuntime = runtime?.profiles?.[activeProfile.id] || runtime;
+  const accountRuntimes = runtimeRows(runtime).filter((row) => row.running === true);
+  const profileRuntime = runtimeForDeployment(runtime, deploymentContext) || {};
   const runtimeForProfile = profileRuntime?.profileId === activeProfile.id;
   const runtimeRunning = Boolean(profileRuntime?.running && runtimeForProfile);
   const runtimeTone = runtimeRunning
@@ -5288,7 +5290,21 @@ function AutomationLauncherPanel({
 
   return (
     <section className={`panel automation-panel ${className}`.trim()}>
-      <PanelHeader title="브로커별 자동화" />
+      <PanelHeader title="계좌별 포트폴리오 자동화" />
+      {accountRuntimes.length > 0 && (
+        <div className="runtime-account-list" aria-label="실행 중인 계좌별 포트폴리오">
+          {accountRuntimes.map((row) => (
+            <div className="runtime-deployment-binding" key={row.runtimeId || row.deploymentId || row.profileId}>
+              <strong>{row.brokerId || row.profileId} · {row.portfolioId || row.requestedStrategyId || "관찰"}</strong>
+              <StatusPill tone={row.phase === "DEGRADED" ? "warning" : "success"}>{liveRuntimeModeLabel(row.mode)} · {row.phase}</StatusPill>
+              <button className="ts-action-button" type="button"
+                onClick={() => onRuntimeStop(row.profileId, row.runtimeId || "", row.deploymentId || "")}>
+                <CircleStop size={16} /><span>이 실행 중지</span>
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <NoOrderExplanation snapshot={reviewSnapshot} context={deploymentContext || {}} />
       <StopEffects />
       <NestedTabs
@@ -5407,7 +5423,7 @@ function AutomationLauncherPanel({
             className="ts-action-button"
             type="button"
             disabled={!profileRuntime?.running}
-            onClick={() => onRuntimeStop(activeProfile.id)}
+            onClick={() => onRuntimeStop(activeProfile.id, profileRuntime.runtimeId || "", profileRuntime.deploymentId || "")}
           >
             <CircleStop size={16} />
             <span>실행 중지</span>
@@ -6127,8 +6143,7 @@ function artifactQuickFilterLabel(value) {
 }
 
 function liveArtifactRunning(runtime, artifactId) {
-  if (!runtime?.running || !artifactId) return false;
-  return JSON.stringify(runtime).includes(String(artifactId));
+  return artifactIsRunning(runtime, artifactId);
 }
 
 function ArtifactMetadataEditor({ artifactId, artifactType, metadata, onSave, compact = false }) {

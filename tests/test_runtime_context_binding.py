@@ -482,7 +482,7 @@ class RuntimeContextBindingTest(unittest.TestCase):
         session = SimpleNamespace(
             session_id="session-1",
             deployment_id="dep-selected",
-            metadata={"portfolioId": "portfolio-1", "strategyId": "selected"},
+            metadata={"portfolioId": "portfolio-1", "strategyId": "selected", "previousRuntimeSessionId": "previous-session"},
         )
         state.STATE.setdefault("active_runtime_session_ids", {})["crypto"] = (
             "previous-session"
@@ -657,6 +657,8 @@ class RuntimeContextBindingTest(unittest.TestCase):
             "allowed": True,
             "portfolioId": "portfolio-1",
         }
+        parent = _strategy("alpha", deployment_id="dep-alpha", symbol="ETHUSDT")
+        parent["portfolio_gate"] = dict(current["portfolio_gate"])
         member_hash = state._operational_artifact_hash(current)
         paper_bindings = [
             {
@@ -800,14 +802,22 @@ class RuntimeContextBindingTest(unittest.TestCase):
                     return_value=manifest,
                 ),
                 patch.object(state, "portfolio_rows", return_value=[]),
-                patch.object(state, "strategy_rows", return_value=[current]),
+                patch.object(state, "strategy_rows", return_value=[parent, current]),
+                patch.object(state.OPERATIONAL_GOVERNANCE, "get_runtime_session",
+                    return_value=SimpleNamespace(session_id="session-1", mode="SMALL_LIVE", to_dict=lambda: {
+                        "profile": "crypto", "deploymentId": "dep-alpha", "mode": "SMALL_LIVE", "metadata": {"brokerId": "binance"}
+                    })),
                 patch.object(
                     state,
                     "_operational_manifest_inputs",
                     return_value=current_inputs,
-                ),
+                ) as resolve_parent_inputs,
             ):
                 allowed = state.operational_runtime_dispatch_allowed(intent)
+                resolve_parent_inputs.assert_called_with(parent)
+                parent["live_small_eligible"] = False
+                revoked_parent = state.operational_runtime_dispatch_allowed(intent)
+                parent["live_small_eligible"] = True
                 missing_instance = state.operational_runtime_dispatch_allowed(
                     OrderIntent(
                         **{
@@ -889,8 +899,9 @@ class RuntimeContextBindingTest(unittest.TestCase):
             state.STATE["active_runtime_session_ids"] = original_sessions
             state.STATE["mode"] = original_mode
 
-        self.assertTrue(allowed[0])
+        self.assertTrue(allowed[0], allowed)
         self.assertEqual("operational-runtime-authorized", allowed[1])
+        self.assertEqual("operational-current-deployment-permission-revoked", revoked_parent[1])
         self.assertFalse(missing_instance[0])
         self.assertEqual(
             "operational-strategy-instance-context-missing",
@@ -923,7 +934,7 @@ class RuntimeContextBindingTest(unittest.TestCase):
             "operational-deployment-context-changed",
             replaced_deployment[1],
         )
-        self.assertEqual(8, authorize.call_count)
+        self.assertEqual(9, authorize.call_count)
         self.assertTrue(
             all(
                 call.kwargs.get("require_fresh_preflight") is True

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import re
 import secrets
 import sqlite3
 import uuid
@@ -307,6 +308,25 @@ class ProgramLedger:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kis_order_identity_verifications (
+                    idempotency_key TEXT PRIMARY KEY,
+                    order_id TEXT NOT NULL,
+                    before_hash TEXT NOT NULL,
+                    after_hash TEXT NOT NULL,
+                    official_receipt_hash TEXT NOT NULL,
+                    identity_json TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                )
+                """
+            )
+            for operation in ("UPDATE", "DELETE"):
+                conn.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS kis_identity_no_{operation.lower()} "
+                    f"BEFORE {operation} ON kis_order_identity_verifications "
+                    "BEGIN SELECT RAISE(ABORT, 'kis-identity-verification-append-only'); END"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS functional_test_order_reservations (
@@ -2190,6 +2210,128 @@ class ProgramLedger:
                 ),
             )
         return cursor.rowcount == 1
+
+    def record_verified_kis_order_identity(
+        self,
+        idempotency_key: str,
+        expected_dispatch_hash: str,
+        identity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """CAS only exact missing/provisional ACK metadata after official GET.
+
+        This local journal update preserves the broker response, state and all
+        original execution metadata. It grants no financial execution authority.
+        The normalized row hash is the same one returned by the ledger reader.
+        """
+        from trading_runtime.artifact_governance import stable_sha256
+        from .kis_equity_execution import checked, RESULT
+        normalized = str(idempotency_key or "").strip()
+        if not normalized or not re.fullmatch("[a-f0-9]{64}", str(expected_dispatch_hash or "")):
+            raise ValueError("KIS_IDENTITY_EXACT_DISPATCH_CAS_REQUIRED")
+        identity = dict(identity)
+        fields = ("order_date", "organization_no", "broker_order_id", "broker_order_key")
+        day = str(identity.get("order_date") or "")
+        branch = str(identity.get("organization_no") or "")
+        number = str(identity.get("broker_order_id") or "")
+        if (identity.get("broker_order_identity_verified") is not True
+            or identity.get("order_date_source") != "OFFICIAL_ORDER_QUERY_EXACT_COMPOSITE_IDENTITY"
+            or identity.get("verifiedDispatchHash") != expected_dispatch_hash
+            or identity.get("querySessionDateWasProvisional") is not True
+            or identity.get("orderAuthorityGranted") is not False
+            or not re.fullmatch("[0-9]{8}", day)
+            or not re.fullmatch("[0-9]{1,16}", branch)
+            or not re.fullmatch("[0-9]{1,16}", number)
+            or identity.get("broker_order_key") != f"{day}:{branch}:{number}"
+            or identity.get("requestSessionDate") != day
+            or any(not re.fullmatch("[a-f0-9]{64}", str(identity.get(key) or ""))
+                   for key in ("officialReceiptHash", "requestSessionBoundaryHash"))):
+            raise ValueError("KIS_IDENTITY_OFFICIAL_EXACT_VERIFICATION_REQUIRED")
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT order_id,idempotency_key,broker_id,broker_order_id,state,created_at,updated_at,order_json "
+                "FROM order_dispatch_journal WHERE idempotency_key=?", (normalized,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("KIS_IDENTITY_DISPATCH_NOT_FOUND")
+            try:
+                raw = json.loads(row["order_json"])
+            except (ValueError, TypeError):
+                raise ValueError("KIS_IDENTITY_DISPATCH_JSON_INVALID") from None
+            if not isinstance(raw, dict):
+                raise ValueError("KIS_IDENTITY_DISPATCH_JSON_INVALID")
+            current = self._dispatch_order_from_row(row)
+            if stable_sha256(current) != expected_dispatch_hash:
+                raise ValueError("KIS_IDENTITY_STALE_DISPATCH_CAS")
+            metadata = current.get("metadata") or {}
+            ticket = checked(metadata.get("native_quantity_model"), RESULT)
+            boundary = metadata.get("native_open_boundary") or {}
+            if (row["broker_id"] != "kis" or current.get("broker_id") != "kis"
+                or row["broker_order_id"] != number or current.get("broker_order_id") != number
+                or str(current.get("organization_no") or "") != branch
+                or ticket.get("boundaryHash") != stable_sha256(boundary)
+                or ticket.get("boundaryHash") != identity["requestSessionBoundaryHash"]
+                or ticket.get("sourceArtifactHash") != metadata.get("source_artifact_hash")
+                or ticket.get("deploymentId") != metadata.get("deployment_id")
+                or ticket.get("accountFingerprint") != metadata.get("native_account_fingerprint")
+                or ticket.get("exchange") not in {"KRX", "NASD", "NYSE", "AMEX"}
+                or ticket.get("symbol") != current.get("symbol") or ticket.get("side") != current.get("side")
+                or boundary.get("provider") != "kis" or boundary.get("attestation") != "KIS_WEBSOCKET"
+                or boundary.get("recoveryOnly") is not False or boundary.get("promotionEligible") is not True):
+                raise ValueError("KIS_IDENTITY_CURRENT_DISPATCH_SCOPE_MISMATCH")
+            # Recompute the request-session date from the immutable event, not
+            # from local submission time or any caller-supplied calendar date.
+            from zoneinfo import ZoneInfo
+            from .kis_equity_execution import timestamp
+            actual_session_day = timestamp(boundary.get("startTime")).astimezone(
+                ZoneInfo("Asia/Seoul" if ticket.get("exchange") == "KRX" else "America/New_York")
+            ).strftime("%Y%m%d")
+            if actual_session_day != day:
+                raise ValueError("KIS_IDENTITY_SEALED_SESSION_DATE_MISMATCH")
+            verified = current.get("broker_order_identity_verified") is True
+            provisional = current.get("order_date_source") in {
+                "KST_SUBMISSION_DATE_PROVISIONAL", "MARKET_SESSION_DATE_PROVISIONAL", "AWAITING_BROKER_TRADING_DATE",
+            }
+            for field in ("order_date", "broker_order_key"):
+                existing = str(current.get(field) or "")
+                if existing and existing != identity[field] and (verified or not provisional):
+                    raise ValueError("KIS_IDENTITY_VERIFIED_OR_UNKNOWN_KEY_CONFLICT")
+            existing_audit = conn.execute(
+                "SELECT after_hash,identity_json FROM kis_order_identity_verifications WHERE idempotency_key=?", (normalized,),
+            ).fetchone()
+            if existing_audit:
+                if not verified or any(current.get(key) != identity[key] for key in fields):
+                    raise ValueError("KIS_IDENTITY_EXISTING_AUDIT_CONFLICT")
+                previous_identity = json.loads(existing_audit["identity_json"])
+                if any(previous_identity.get(key) != identity[key] for key in fields):
+                    raise ValueError("KIS_IDENTITY_EXISTING_AUDIT_CONFLICT")
+                conn.commit()
+                return {"applied": False, "alreadyVerified": True, "order": current, "orderAuthorityGranted": False}
+            updated = dict(current)
+            updated.update({key: identity[key] for key in fields})
+            updated.update({"broker_order_identity_verified": True,
+                            "order_date_source": identity["order_date_source"],
+                            "broker_order_identity_receipt_hash": identity["officialReceiptHash"]})
+            after_hash = stable_sha256(updated)
+            conn.execute(
+                "UPDATE order_dispatch_journal SET order_json=? WHERE idempotency_key=?",
+                (json.dumps(updated,ensure_ascii=False,sort_keys=True),normalized),
+            )
+            conn.execute(
+                "INSERT INTO kis_order_identity_verifications VALUES (?,?,?,?,?,?,?)",
+                (normalized,current["order_id"],expected_dispatch_hash,after_hash,
+                 identity["officialReceiptHash"],json.dumps(identity,ensure_ascii=False,sort_keys=True),
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            return {"applied": True, "alreadyVerified": False, "order": updated, "orderAuthorityGranted": False}
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def order_dispatch_for_idempotency_key(
         self,

@@ -42,6 +42,56 @@ def _source(request, roots):
     return matches[0]
 
 
+def _review_execution_policies(root, strategy, portfolio, account, controls, *, now=None, specs=None):
+    """Prepare exact KIS documents inside the ordinary one-use review CAS.
+
+    No account query, ledger initialization, permission arm or runtime start.
+    The bounded review hour is deterministic across challenge/consume; crossing
+    its boundary invalidates the challenge and requires a fresh review.
+    """
+    if account["brokerId"] != "kis":
+        return {}
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from trading_runtime.portfolio_runtime import load_portfolio_runtime
+    from .kis_equity_execution import prepare_reviewed_policies, seal
+    from .native_spot_quantity import sizing_from_artifact
+    current = now or datetime.now(timezone.utc)
+    current = current.replace(minute=0, second=0, microsecond=0)
+    slippage = (controls or {}).get("savedSlippageBps", 50)
+    if specs is None:
+        if portfolio is not None:
+            portfolio_id = str(portfolio.get("portfolioId") or portfolio.get("id") or "")
+            specs = load_portfolio_runtime(root, portfolio_id).specs
+        else:
+            reference = inbox.artifact_reference(strategy) if hasattr(inbox, "artifact_reference") else None
+            if reference is None:
+                from trading_runtime.artifact_governance import artifact_reference
+                reference = artifact_reference(strategy)
+            specs = [SimpleNamespace(artifact=strategy, artifact_hash=reference["artifactHash"])]
+    if not specs or len(specs) > 32:
+        raise ValueError("KIS_REVIEW_CANONICAL_MEMBERS_REQUIRED")
+    execution = {}; fees = []; currencies = set(); venues = set()
+    for spec in specs:
+        sizing = sizing_from_artifact(spec.artifact)
+        if not sizing or sizing["quantityContract"].get("schemaVersion") != "native-equity-quantity-v1":
+            raise ValueError("KIS_REVIEW_SEALED_EQUITY_SOURCE_REQUIRED")
+        contract = sizing["quantityContract"]
+        currencies.add(contract["quoteCurrency"]); venues.add(contract["exchange"])
+        documents = prepare_reviewed_policies(
+            account, spec,
+            authorization_text="계좌별 포트폴리오 준비 승인: 봉인 Source의 MARKET 연구 모델과 별개로 저장 슬리피지 이내 보호 지정가를 사용하며 미체결될 수 있습니다. 1% 및 KRW 1000/USD 1은 실제 수수료가 아닌 미사용 비용 예비금입니다. 실주문 활성화·시작은 별도입니다.",
+            now=current, saved_slippage_bps=slippage, valid_seconds=604800,
+        )
+        execution[spec.artifact_hash] = documents["executionPolicy"]
+        fees.append(documents["feeReservePolicy"])
+    if len(currencies) != 1:
+        raise ValueError("KIS_REVIEW_SEPARATE_KRW_USD_PORTFOLIOS_REQUIRED")
+    fee = seal({**fees[0], "venues": sorted(venues)})
+    return {"kisEquityExecutionPolicies": execution,
+            "kisEquityFeeReservePolicy": fee, "kisSavedSlippageBps": slippage}
+
+
 def _plan(root, request, registry, settings, controls):
     catalogs = {kind: inbox._catalog(root, kind) for kind in ("strategy", "portfolio")}
     catalogs["instance"] = inbox._instance_catalog(root)
@@ -64,6 +114,7 @@ def _plan(root, request, registry, settings, controls):
     qualification = inbox.validate_paper_live_evidence(evidence).qualification
     scope = qualification.forward_scope
     strategy = inbox._exact_artifact(catalogs["strategy"], scope.strategy_artifact_id, scope.strategy_artifact_hash)
+    portfolio = None
     if scope.portfolio_required:
         portfolio = inbox._exact_artifact(catalogs["portfolio"], scope.portfolio_artifact_id, scope.portfolio_artifact_hash)
         child = next(item for item in portfolio["strategyInstances"] if str(item.get("instanceId") or item.get("strategyInstanceId") or "") == scope.strategy_instance_id)
@@ -81,6 +132,9 @@ def _plan(root, request, registry, settings, controls):
         "accountProfileId": account["profileId"], "accountFingerprint": account["accountFingerprint"],
         "credentialConfigurationHash": account["credentialConfigurationHash"], "capitalPolicy": capital,
         "controls": dict(controls or {})}
+    execution_policies = _review_execution_policies(root, strategy, portfolio, account, controls)
+    if execution_policies:
+        context["executionPolicies"] = execution_policies
     context_hash = stable_sha256(context)
     successor_id = request["deploymentId"] + ":account:" + context_hash[:16]
     display = {"action": ACTION, "provider": account["alias"], "accountHint": account["maskedAccount"],
@@ -91,6 +145,8 @@ def _plan(root, request, registry, settings, controls):
         "totalCapital": f"현재 계좌 주문가능액의 {capital['percent']:g}% (금액은 시작 점검에서 조회)",
         "orderSizing": str(strategy.get("order_quantity") or strategy.get("orderQuantity") or (instance.get("parameters") or {}).get("paperOrderQuantity") or (strategy.get("parameters") or {}).get("positionSize") or "봉인 전략의 주문 수량·위험 설정"),
         "execution": "계좌 연결과 제한 실거래 준비만 승인. 실주문 ON·시작 점검·운용 시작은 별도."}
+    if execution_policies:
+        display["execution"] += " 보호 지정가는 저장 슬리피지 이내로 제한되며 미체결될 수 있습니다. 1% 및 KRW 1000/USD 1 비용 예비금은 실제 계좌 수수료율·브로커 최소수수료가 아닙니다. KRW/USD 자금은 별도이며 자동환전하지 않습니다."
     return row, account, capital, context, display, successor_id
 
 
@@ -113,6 +169,7 @@ def approve_paper_candidate(request, confirmation, *, safety_store, roots: Seque
         if consumed.get("ok") is not True:
             return consumed
         permissions = {
+            **dict(context.get("executionPolicies") or {}),
             **inbox.candidate_pins(row["identity"]), "paper_candidate_imported": True,
             "paper_trader_verified": True, "live_small_eligible": True,
             "live_eligible": False, "live_allowed": False, "fail_reasons": [],

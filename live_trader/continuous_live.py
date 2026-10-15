@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
 import os
@@ -67,6 +67,26 @@ class LiveContinuousController:
         self.native_context_provider = None
         self._native_boundary_receipt = None
         self._native_runtime = None
+        self._native_kis_marks = {}
+        self.runtime_scope = None
+        self.runtime_data_root = self.root / "logs"
+
+    def bind_runtime_scope(self, scope):
+        from .runtime_scope import scope_directory, scope_from_mapping
+
+        normalized = scope_from_mapping(scope)
+        if self.supervisor is not None or self._deferred_dispatcher is not None:
+            raise ValueError("runtime-scope-must-bind-before-use")
+        if self.runtime_scope is not None and self.runtime_scope != normalized:
+            raise ValueError("runtime-scope-cannot-be-retargeted")
+        self.runtime_scope = normalized
+        self.runtime_data_root = scope_directory(self.root, normalized)
+        self.profile_id = normalized.profile_id
+        self.deployment_id = normalized.deployment_id
+
+    def _portfolio_scope_id(self, portfolio_id, portfolio_hash):
+        scope = f"live:{portfolio_id}:{portfolio_hash}"
+        return scope + ":" + self.runtime_scope.runtime_id if self.runtime_scope is not None else scope
 
     def start(
         self,
@@ -85,6 +105,10 @@ class LiveContinuousController:
         requested_portfolio = str(portfolio_id or "").strip()
         requested_strategy = str(strategy_id or "").strip()
         requested_deployment = str(deployment_id or "").strip()
+        if self.runtime_scope is not None:
+            if normalized_profile != self.runtime_scope.profile_id or (requested_deployment and requested_deployment != self.runtime_scope.deployment_id):
+                return {"ok": False, "reason": "runtime-scope-start-identity-mismatch"}
+            requested_deployment = self.runtime_scope.deployment_id
         normalized_purpose = str(execution_purpose or "").strip().upper()
         functional_context = (
             dict(functional_test_context)
@@ -362,6 +386,8 @@ class LiveContinuousController:
                     "reason": broker_context_blocker,
                     "snapshot": state.snapshot(),
                 }
+            if self.runtime_scope is not None and any(spec.broker_id != self.runtime_scope.broker_id for spec in specs):
+                return {"ok": False, "reason": "runtime-scope-source-broker-mismatch", "snapshot": state.snapshot()}
             if normalized_purpose == state.FUNCTIONAL_TEST_EXECUTION_PURPOSE:
                 functional_blocker = self._functional_test_spec_blocker(
                     specs,
@@ -417,7 +443,7 @@ class LiveContinuousController:
                     "reason": portfolio_execution_blocker,
                     "snapshot": state.snapshot(),
                 }
-            if normalized_mode != "MONITOR" and self._native_spot_specs(specs):
+            if normalized_mode != "MONITOR" and self._native_capital_specs(specs):
                 try:
                     self._ensure_native_runtime(specs, requested_deployment)
                 except (ValueError, TypeError, KeyError, OSError, ArithmeticError, RuntimeError) as error:
@@ -439,7 +465,7 @@ class LiveContinuousController:
                 ),
                 cycle_handler=self._handle_cycle,
                 open_boundary_handler=self._handle_native_open_boundary,
-                state_store=DurableRuntimeState(self.root / "logs" / f"continuous_{normalized_profile}_{runtime_hash[:16]}_engine.json"),
+                state_store=DurableRuntimeState(self.runtime_data_root / f"continuous_{normalized_profile}_{runtime_hash[:16]}_engine.json"),
                 **latency_kwargs,
             )
             with state.RUNTIME_MODE_LOCK:
@@ -561,7 +587,7 @@ class LiveContinuousController:
             self.supervisor = ContinuousRuntimeSupervisor(
                 engine=engine,
                 feeds=feeds,
-                status_store=DurableRuntimeState(self.root / "logs" / f"continuous_{normalized_profile}_status.json"),
+                status_store=DurableRuntimeState(self.runtime_data_root / f"continuous_{normalized_profile}_status.json"),
                 poll_seconds=2.0,
                 heartbeat_seconds=5.0,
                 operation_lock=self._dispatcher(),
@@ -631,6 +657,7 @@ class LiveContinuousController:
         return {
             **base,
             "profileId": self.profile_id,
+            **(self.runtime_scope.to_dict() if self.runtime_scope is not None else {}),
             "mode": self.mode,
             "dispatch": self._dispatch_status(),
             "portfolioPath": self.portfolio_path,
@@ -908,7 +935,7 @@ class LiveContinuousController:
     ) -> str:
         from . import state
 
-        if self._native_spot_specs(specs):
+        if self._native_capital_specs(specs):
             self.portfolio_ledger = None
             self.portfolio_execution_scope_id = ""
             self.portfolio_execution_account_id = ""
@@ -940,10 +967,10 @@ class LiveContinuousController:
         normalized_hash = str(portfolio_hash or "").strip().lower()
         if not normalized_portfolio or not normalized_hash:
             return "KIS 다중 Sleeve 원장에 필요한 Portfolio identity가 없습니다."
-        scope_id = f"live:{normalized_portfolio}:{normalized_hash}"
+        scope_id = self._portfolio_scope_id(normalized_portfolio, normalized_hash)
         try:
             ledger = LivePortfolioLedger(
-                self.root / "logs" / "live_portfolio_sleeves.sqlite3"
+                self.runtime_data_root / "live_portfolio_sleeves.sqlite3"
             )
             ledger.register_scope(
                 scope_id=scope_id,
@@ -1084,7 +1111,7 @@ class LiveContinuousController:
     ) -> str:
         """Fail closed before live whenever sleeve ownership is not exact."""
 
-        if self._native_spot_specs(specs):
+        if self._native_capital_specs(specs):
             try:
                 # A first start has not published self.deployment_id yet.
                 # Reconcile the requested identity without changing active state
@@ -1649,7 +1676,7 @@ class LiveContinuousController:
             if self._deferred_dispatcher is None:
                 profile = "stock" if (profile_id or self.profile_id) == "stock" else "crypto"
                 self._deferred_dispatcher = ContinuousDispatcher(
-                    self.root / "logs" / f"continuous_{profile}_intents.sqlite3",
+                    self.runtime_data_root / f"continuous_{profile}_intents.sqlite3",
                     state.RUNTIME_MODE_LOCK,
                     self._submit_deferred_intent,
                     self._deferred_dispatch_failed,
@@ -1690,7 +1717,7 @@ class LiveContinuousController:
                 continue
             if self.portfolio_ledger is None:
                 continue
-            exact_scope = f"live:{plan.portfolio_id}:{plan.portfolio_hash}"
+            exact_scope = self._portfolio_scope_id(plan.portfolio_id, plan.portfolio_hash)
             if (
                 plan.scope_id == self.portfolio_execution_scope_id == exact_scope
                 and plan.portfolio_id == self.portfolio_id
@@ -1848,7 +1875,7 @@ class LiveContinuousController:
             from .native_spot_quantity import sizing_from_artifact
             native_quantity = None
             try:
-                native_sizing = sizing_from_artifact(spec.artifact) if position_direction == "long" and self._market_type(spec) == "spot" else None
+                native_sizing = sizing_from_artifact(spec.artifact) if position_direction == "long" and (self._market_type(spec) == "spot" or self._native_equity_specs((spec,))) else None
             except (ValueError, TypeError, KeyError) as error:
                 native_sizing = {"invalid": str(error)}
             if native_sizing is not None:
@@ -1956,6 +1983,8 @@ class LiveContinuousController:
                     "portfolio_id": "" if spec.artifact.get("standalone") else spec.portfolio_id,
                     "portfolio_hash": spec.portfolio_hash,
                     "deployment_id": self.deployment_id,
+                    "runtime_scope_id": self.runtime_scope.runtime_id if self.runtime_scope is not None else "",
+                    "runtimeScopeId": self.runtime_scope.runtime_id if self.runtime_scope is not None else "",
                     "runtime_strategy_ids": list(self.strategy_ids),
                     "runtime_allowed_symbols": list(self.allowed_symbols),
                     "strategy_instance_id": spec.strategy_instance_id,
@@ -2000,14 +2029,15 @@ class LiveContinuousController:
                     ],
                     "runtime_evaluation_key": decision.evaluation_key,
                     "confirmed_bar_end": decision.bar.end_time,
-                    "order_type": self._order_type_for_broker(
+                    "order_type": "00" if self._native_equity_specs((spec,)) else self._order_type_for_broker(
                         spec.broker_id,
                         decision.signal,
                         spec.symbol,
                         functional_test=functional_test,
                     ),
+                    **({"exchange": native_quantity["modelResult"]["exchange"], "quote_currency": native_quantity["modelResult"]["currency"]} if native_quantity is not None and self._native_equity_specs((spec,)) else {}),
                     "execution_timing": "next-open-boundary",
-                    "decision_price_role": "SOURCE_SLIPPAGE_ADJUSTED_EXACT_OPEN" if self._native_boundary_receipt is not None else "reference-and-sizing-only",
+                    "decision_price_role": "PROTECTIVE_LIMIT_AT_EXACT_OPEN" if self._native_equity_specs((spec,)) else "SOURCE_SLIPPAGE_ADJUSTED_EXACT_OPEN" if self._native_boundary_receipt is not None else "reference-and-sizing-only",
                     **({"native_open_boundary": self._native_boundary_receipt, "source_artifact_hash": spec.artifact_hash} if self._native_boundary_receipt is not None else {}),
                 },
             )
@@ -2134,6 +2164,8 @@ class LiveContinuousController:
                 "portfolio_id": spec.portfolio_id,
                 "portfolio_hash": spec.portfolio_hash,
                 "deployment_id": self.deployment_id,
+                    "runtime_scope_id": self.runtime_scope.runtime_id if self.runtime_scope is not None else "",
+                    "runtimeScopeId": self.runtime_scope.runtime_id if self.runtime_scope is not None else "",
                 "runtime_strategy_ids": list(self.strategy_ids),
                 "runtime_allowed_symbols": list(self.allowed_symbols),
                 "strategy_instance_id": spec.strategy_instance_id,
@@ -2722,9 +2754,26 @@ class LiveContinuousController:
         from .native_spot_quantity import sizing_from_artifact
         return LiveContinuousController._native_specs(specs) and all(sizing_from_artifact(spec.artifact)["quantityContract"]["schemaVersion"] == "native-spot-quantity-v1" for spec in specs)
 
+    @staticmethod
+    def _native_equity_specs(specs):
+        from .native_spot_quantity import sizing_from_artifact
+        return LiveContinuousController._native_specs(specs) and all(
+            spec.broker_id == spec.provider == "kis"
+            and sizing_from_artifact(spec.artifact)["quantityContract"]["schemaVersion"] == "native-equity-quantity-v1"
+            for spec in specs
+        )
+
+    @staticmethod
+    def _native_capital_specs(specs):
+        return LiveContinuousController._native_spot_specs(specs) or LiveContinuousController._native_equity_specs(specs)
+
     def _ensure_native_runtime(self, specs, deployment_id):
         from .native_spot_runtime import NativeSpotRuntime
 
+        runtime_type = NativeSpotRuntime
+        if self._native_equity_specs(specs):
+            from .kis_equity_runtime import NativeEquityRuntime
+            runtime_type = NativeEquityRuntime
         runtime = self._native_runtime
         if runtime is not None and runtime.deployment_id != deployment_id:
             supervisor = self.supervisor
@@ -2743,7 +2792,9 @@ class LiveContinuousController:
             runtime.sync_owned_fills(runtime.scope())
             runtime = None
         if runtime is None:
-            candidate = NativeSpotRuntime(self.root, deployment_id, specs)
+            candidate = runtime_type(self.root, deployment_id, specs)
+            if self._native_equity_specs(specs):
+                candidate.mark_provider = self._native_equity_mark
             # The append-only store retains all previous account reservations.
             # Publish only after the new reviewed scope and capital pass.
             candidate.initialize_at_reviewed_manual_start()
@@ -2764,7 +2815,7 @@ class LiveContinuousController:
     def _boundary_queue(self):
         from .native_open_boundary import NativeBoundaryQueue
         if self._native_boundary_queue is None:
-            self._native_boundary_queue = NativeBoundaryQueue(self.root / "logs" / "native_next_open_intents.sqlite3")
+            self._native_boundary_queue = NativeBoundaryQueue(self.runtime_data_root / "native_next_open_intents.sqlite3")
         return self._native_boundary_queue
 
     def _stage_native_cycle(self, cycle, specs):
@@ -2798,9 +2849,57 @@ class LiveContinuousController:
             return 0.0  # live_quantity will block the missing exact owned scope
         return float(Decimal(str((context.get("ownedPositions") or {}).get(spec.strategy_instance_id, 0))))
 
+    def _native_equity_mark(self, spec):
+        """Use fresh observed WS prints; REST/warmup histories cannot attest a mark."""
+        from trading_runtime.realtime_feeds import KisWebSocketClosedBarFeed, CompositeClosedBarFeed
+        from .native_spot_quantity import decimal_value
+
+        current = datetime.now(timezone.utc)
+        candidates = []
+        cached = self._native_kis_marks.get((spec.instrument_id, spec.symbol))
+        if cached is not None:
+            observed = datetime.fromisoformat(cached["observedAt"].replace("Z", "+00:00"))
+            started = datetime.fromisoformat(cached["providerWindowStart"].replace("Z", "+00:00"))
+            if 0 <= (current - observed).total_seconds() <= 15 and 0 <= (current - started).total_seconds() <= 15:
+                candidates.append(cached)
+        pending = list(getattr(self.supervisor, "feeds", ())) if self.supervisor is not None else []
+        while pending:
+            feed = pending.pop()
+            if isinstance(feed, CompositeClosedBarFeed):
+                pending.extend(feed.feeds)
+                continue
+            if not isinstance(feed, KisWebSocketClosedBarFeed) or feed.demo or not feed._websocket_owner_active or feed._connected_at <= 0:
+                continue
+            for bar in tuple(feed._active.values()):
+                if (bar.provider != "kis" or bar.source_provider != "kis" or bar.symbol != spec.symbol
+                    or bar.instrument_id != spec.instrument_id or bar.timeframe != spec.timeframe
+                    or bar.evidence_class or bar.event_count <= 0 or not bar.source_sequence.startswith("kis:")):
+                    continue
+                observed = datetime.fromisoformat(bar.received_time.replace("Z", "+00:00"))
+                started = datetime.fromisoformat(bar.start_time.replace("Z", "+00:00"))
+                # A recent receipt of an old provider bucket is not a fresh print.
+                if not (0 <= (current - observed).total_seconds() <= 15 and 0 <= (current - started).total_seconds() <= 15):
+                    continue
+                candidates.append({"provider": "kis", "symbol": spec.symbol,
+                                   "attestation": "KIS_WEBSOCKET", "observedAt": bar.received_time,
+                                   "providerWindowStart": bar.start_time,
+                                   "price": str(decimal_value(bar.close, "fresh WS mark", positive=True))})
+        if not candidates:
+            raise ValueError("KIS_V2_OTHER_HELD_MEMBER_FRESH_MARK_REQUIRED")
+        return max(candidates, key=lambda row: datetime.fromisoformat(row["observedAt"].replace("Z", "+00:00")))
+
     def _handle_native_open_boundary(self, boundary):
         from types import SimpleNamespace
         from . import state
+        if (self.supervisor is not None and boundary.provider == boundary.source_provider == "kis"
+            and boundary.attestation == "KIS_WEBSOCKET" and boundary.promotion_eligible and not boundary.recovery_only
+            and any(s.instrument_id == boundary.instrument_id and s.symbol == boundary.symbol for s in self.supervisor.engine.specs)):
+            mark = {"provider": "kis", "symbol": boundary.symbol, "attestation": "KIS_WEBSOCKET",
+                    "observedAt": boundary.observed_time, "providerWindowStart": boundary.start_time, "price": str(boundary.open)}
+            key = (boundary.instrument_id, boundary.symbol)
+            previous = self._native_kis_marks.get(key)
+            if previous is None or datetime.fromisoformat(mark["observedAt"].replace("Z", "+00:00")) >= datetime.fromisoformat(previous["observedAt"].replace("Z", "+00:00")):
+                self._native_kis_marks[key] = mark
         if self.mode == "MONITOR" or self.supervisor is None:
             return {"ok": True, "action": "MONITOR", "orderAuthorityGranted": False}
         specs = tuple(self.supervisor.engine.specs)
@@ -2824,11 +2923,15 @@ class LiveContinuousController:
     def _native_quantity_result(self, spec: Any, side: str, price: float, current_position_quantity: float, specs: tuple[Any, ...]) -> dict[str, Any]:
         from . import state
         from .native_spot_quantity import decimal_value, live_quantity
+        quantity_consumer = live_quantity
+        if self._native_equity_specs((spec,)):
+            from .kis_equity_execution import live_equity_quantity
+            quantity_consumer = live_equity_quantity
         contexts = state.STATE.get("native_spot_quantity_contexts") or {}
         context = contexts.get(spec.strategy_instance_id) if isinstance(contexts, dict) else None
         if callable(self.native_context_provider):
             context = self.native_context_provider(spec, side, price, specs, self._native_boundary_receipt)
-        if isinstance(context, dict) and "nativeMarketObservation" not in context:
+        if isinstance(context, dict) and "nativeMarketObservation" not in context and not self._native_equity_specs((spec,)):
             context = dict(context)
             probe = OrderIntent(strategy_id=spec.strategy_id, asset=state.asset_from_symbol(spec.symbol, broker_id=spec.broker_id, provider=spec.provider), symbol=spec.symbol, side=side, quantity=1, reference_price=float(price), mode=self.mode, reason="native quantity preflight scope only", metadata={"broker_id": spec.broker_id, "quote_currency": context.get("quoteCurrency")})
             account = state.account_risk_for_intent(probe)
@@ -2841,7 +2944,7 @@ class LiveContinuousController:
                     precision.prec = 2048
                     weights = [decimal_value(item.target_weight, "canonical target weight", positive=True) for item in specs]
                     allocation = decimal_value(spec.target_weight, "canonical target weight", positive=True) / sum(weights)
-            result = live_quantity(spec, side=side, price=price, allocation_weight=allocation, identity={"deploymentId": self.deployment_id}, context=context, position_quantity=current_position_quantity)
+            result = quantity_consumer(spec, side=side, price=price, allocation_weight=allocation, identity={"deploymentId": self.deployment_id}, context=context, position_quantity=current_position_quantity)
             return result or {"status": "BLOCKED", "quantityForSubmission": None, "reasons": ["native quantity contract missing"]}
         except (ValueError, TypeError, KeyError, ArithmeticError) as error:
             return {"status": "BLOCKED", "quantityForSubmission": None, "reasons": [str(error)]}
@@ -2849,8 +2952,8 @@ class LiveContinuousController:
     @staticmethod
     def _order_quantity(spec: Any, price: float) -> float:
         from .native_spot_quantity import sizing_from_artifact
-        if LiveContinuousController._position_direction(spec) == "long" and LiveContinuousController._market_type(spec) == "spot" and sizing_from_artifact(spec.artifact) is not None:
-            raise ValueError("native spot quantity requires exact owned deployment equity, current cash/rules and canonical allocation")
+        if LiveContinuousController._native_specs((spec,)):
+            raise ValueError("native quantity requires exact owned deployment equity, current cash/rules and canonical allocation")
         override = spec.parameters.get("liveOrderQuantity")
         if override not in (None, ""):
             try:
@@ -2933,173 +3036,287 @@ class LiveContinuousController:
 
 
 class LiveContinuousRuntimeManager:
-    """Runs stock and crypto portfolio loops independently and concurrently."""
+    """Independent account/deployment owners; profiles are UI aggregates only."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, scope_resolver=None, controller_factory=None, account_feed_coordinator=None, account_writer_lease_root: Path | None = None) -> None:
+        from .runtime_scope import load_scopes
+
+        self.root = Path(root)
         self._lock = threading.RLock()
-        self.controllers = {
-            "stock": LiveContinuousController(root),
-            "crypto": LiveContinuousController(root),
-        }
-        for profile, controller in self.controllers.items():
-            controller.profile_id = profile
+        self._control_lock = threading.RLock()
+        self._scope_resolver = scope_resolver
+        self._account_feed_coordinator = account_feed_coordinator
+        self._account_writer_lease_root = account_writer_lease_root
+        self._controller_factory = controller_factory or LiveContinuousController
+        self.controllers = {key: self._controller_factory(self.root) for key in ("stock", "crypto")}
+        for key, controller in self.controllers.items():
+            controller.profile_id = key
+        self.runtimes = {}
+        self.runtime_scopes = {}
+        self._writer_leases = {}
+        self._scope_loading_error = ""
+        try:
+            for scope in load_scopes(self.root):
+                self._register_scope(scope)
+        except (OSError, ValueError, TypeError) as error:
+            self._scope_loading_error = "runtime-scope-history-unavailable:" + type(error).__name__
 
-    def reconcile_deferred_dispatches(self, dispatch_rows: list[dict[str, Any]]) -> dict[str, Any]:
-        results = {}
-        for profile, controller in self.controllers.items():
-            try:
-                results[profile] = controller.reconcile_deferred_dispatches(dispatch_rows)
-            except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
-                results[profile] = {"reconciliationRequired": True, "reason": type(error).__name__}
-        return {
-            "reconciliationRequired": any(item.get("reconciliationRequired") for item in results.values()),
-            "profiles": results,
-        }
+    def _register_scope(self, scope):
+        current = self.runtime_scopes.get(scope.runtime_id)
+        if current is not None:
+            if current != scope:
+                raise ValueError("runtime-scope-current-binding-changed")
+            return self.runtimes[scope.runtime_id]
+        controller = self._controller_factory(self.root)
+        controller.bind_runtime_scope(scope)
+        self.runtime_scopes[scope.runtime_id] = scope
+        self.runtimes[scope.runtime_id] = controller
+        return controller
 
-    def start(
-        self,
-        profile_id: str,
-        mode: str,
-        portfolio_id: str = "",
-        strategy_id: str = "",
-        deployment_id: str = "",
-        execution_purpose: str = "",
-        functional_test_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        normalized = "stock" if profile_id == "stock" else "crypto"
+    def resolve_scope(self, profile_id: str, mode: str, portfolio_id: str = "", strategy_id: str = "", deployment_id: str = "", execution_purpose: str = "", functional_test_context=None):
+        from .runtime_scope import scope_from_mapping
+
+        if profile_id not in {"stock", "crypto"}:
+            raise ValueError("runtime-profile-unknown")
+        if str(mode).upper() not in {"MONITOR", "SMALL_LIVE", "FULL_LIVE"}:
+            raise ValueError("runtime-mode-unknown")
+        resolver = self._scope_resolver
+        if resolver is None:
+            from . import state
+            resolver = getattr(state, "resolve_continuous_runtime_scope", None)
+        if not callable(resolver):
+            if str(mode).upper() == "MONITOR" and not deployment_id:
+                return None
+            raise ValueError("trusted-runtime-scope-resolver-unavailable")
+        value = resolver(profile_id=profile_id, mode=str(mode).upper(), portfolio_id=portfolio_id,
+                         strategy_id=strategy_id, deployment_id=deployment_id,
+                         execution_purpose=execution_purpose,
+                         functional_test_context=functional_test_context)
+        if value is None:
+            if str(mode).upper() == "MONITOR" and not deployment_id:
+                return None
+            raise ValueError("exact-runtime-deployment-account-scope-required")
+        scope = scope_from_mapping(value)
+        if scope.profile_id != profile_id or (deployment_id and scope.deployment_id != deployment_id):
+            raise ValueError("resolved-runtime-scope-request-mismatch")
+        return scope
+
+    def runtime_for(self, runtime_id: str = "", *, deployment_id: str = "", profile_id: str = ""):
         with self._lock:
-            return self.controllers[normalized].start(
-                normalized,
-                mode,
-                portfolio_id,
-                strategy_id,
-                deployment_id,
-                execution_purpose,
-                functional_test_context,
-            )
+            matches = [controller for key, controller in self.runtimes.items()
+                       if (not runtime_id or key == runtime_id)
+                       and (not deployment_id or self.runtime_scopes[key].deployment_id == deployment_id)
+                       and (not profile_id or self.runtime_scopes[key].profile_id == profile_id)]
+            return matches[0] if (runtime_id or deployment_id or profile_id) and len(matches) == 1 else None
 
-    def validate_portfolio_execution_dispatch(
-        self, intent: OrderIntent
-    ) -> tuple[bool, str, dict[str, Any]]:
+    @staticmethod
+    def _running(controller):
+        return controller.supervisor is not None and bool(controller.supervisor.running)
+
+    def _account_start_blocker(self, scope, mode):
+        if self._running(self.controllers[scope.profile_id]):
+            return "unbound-profile-monitor-must-stop-before-account-runtime"
+        for key, other in self.runtime_scopes.items():
+            if other.account_key != scope.account_key or key == scope.runtime_id:
+                continue
+            controller = self.runtimes[key]
+            if self._running(controller):
+                separate_kis_currency = (
+                    scope.broker_id == other.broker_id == "kis"
+                    and scope.capital_currency in {"KRW", "USD"}
+                    and other.capital_currency in {"KRW", "USD"}
+                    and scope.capital_currency != other.capital_currency
+                )
+                if not separate_kis_currency:
+                    return "runtime-account-already-running-another-deployment"
+                coordinator = self._account_feed_coordinator
+                if coordinator is None or coordinator.can_share(scope, other) is not True:
+                    return "kis-account-shared-market-feed-owner-unavailable"
+            if mode != "MONITOR":
+                if controller._dispatch_status().get("reconciliationRequired") is not False:
+                    return "runtime-account-prior-dispatch-reconciliation-required"
+                native = controller._native_runtime
+                if native is not None:
+                    native.sync_owned_fills(native.scope())
+        if mode != "MONITOR" and self.controllers[scope.profile_id]._dispatch_status().get("reconciliationRequired") is not False:
+            return "legacy-profile-dispatch-reconciliation-required"
+        return ""
+
+    def start(self, profile_id: str, mode: str, portfolio_id: str = "", strategy_id: str = "", deployment_id: str = "", execution_purpose: str = "", functional_test_context=None) -> dict[str, Any]:
+        from .runtime_scope import AccountWriterLease, save_scope
+
+        normalized_mode = str(mode).upper()
+        with self._control_lock, self._lock:
+            if self._scope_loading_error:
+                return {"ok": False, "reason": self._scope_loading_error}
+            try:
+                scope = self.resolve_scope(profile_id, normalized_mode, portfolio_id, strategy_id, deployment_id, execution_purpose, functional_test_context)
+                if scope is None:
+                    if any(self._running(c) for key, c in self.runtimes.items() if self.runtime_scopes[key].profile_id == profile_id):
+                        raise ValueError("account-runtime-must-stop-before-unbound-profile-monitor")
+                    return self.controllers[profile_id].start(profile_id, normalized_mode, portfolio_id, strategy_id, deployment_id, execution_purpose, functional_test_context)
+                blocker = self._account_start_blocker(scope, normalized_mode)
+                if blocker:
+                    raise ValueError(blocker)
+                save_scope(self.root, scope)
+                controller = self._register_scope(scope)
+                lease = self._writer_leases.get(scope.runtime_id)
+                newly_acquired = False
+                if normalized_mode != "MONITOR" and lease is None:
+                    lease = next((held for key, held in self._writer_leases.items()
+                                  if self.runtime_scopes[key].account_key == scope.account_key), None)
+                    if lease is None:
+                        lease = AccountWriterLease(self.root, scope, lease_root=self._account_writer_lease_root)
+                        lease.acquire()
+                    self._writer_leases[scope.runtime_id] = lease
+                    newly_acquired = True
+                try:
+                    result = controller.start(profile_id, normalized_mode, portfolio_id, strategy_id, scope.deployment_id, execution_purpose, functional_test_context)
+                except Exception:
+                    if newly_acquired and not self._running(controller):
+                        self._drop_writer_reference(scope.runtime_id)
+                    raise
+                if result.get("ok") is not True and newly_acquired and not self._running(controller):
+                    self._drop_writer_reference(scope.runtime_id)
+                return {**result, "runtimeId": scope.runtime_id, "runtimeScopeId": scope.runtime_id, "scope": scope.to_dict()}
+            except (OSError, ValueError, TypeError, RuntimeError) as error:
+                return {"ok": False, "reason": str(error), "runtimeStarted": False, "brokerSubmissionPerformed": False}
+
+    def reconcile_deferred_dispatches(self, dispatch_rows):
+        with self._lock:
+            results = {}
+            for key, controller in {**self.controllers, **self.runtimes}.items():
+                try:
+                    results[key] = controller.reconcile_deferred_dispatches(dispatch_rows)
+                except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
+                    results[key] = {"reconciliationRequired": True, "reason": type(error).__name__}
+            return {"reconciliationRequired": bool(self._scope_loading_error) or any(row.get("reconciliationRequired") for row in results.values()), "runtimes": {key: row for key, row in results.items() if key in self.runtimes}, "profiles": results}
+
+    def validate_portfolio_execution_dispatch(self, intent):
         metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
         payload = metadata.get("portfolio_execution")
-        scope_id = (
-            str(payload.get("scopeId") or "").strip()
-            if isinstance(payload, dict)
-            else ""
-        )
-        if not scope_id:
-            reason = "portfolio-pre-post-validation-blocked:scope-missing"
-            return False, reason, {
-                "schemaVersion": "live-portfolio-pre-post-validation-v1",
-                "allowed": False,
-                "reason": reason,
-            }
-        matches = [
-            controller
-            for controller in self.controllers.values()
-            if controller.portfolio_execution_scope_id == scope_id
-            and controller.portfolio_ledger is not None
-        ]
+        scope_id = str(payload.get("scopeId") or "").strip() if isinstance(payload, dict) else ""
+        matches = [controller for controller in {**self.controllers, **self.runtimes}.values()
+                   if scope_id and controller.portfolio_execution_scope_id == scope_id and controller.portfolio_ledger is not None]
         if len(matches) != 1:
-            reason = (
-                "portfolio-pre-post-validation-blocked:"
-                f"runtime-scope-match-count:{len(matches)}"
-            )
-            return False, reason, {
-                "schemaVersion": "live-portfolio-pre-post-validation-v1",
-                "scopeId": scope_id,
-                "allowed": False,
-                "reason": reason,
-            }
+            reason = "portfolio-pre-post-validation-blocked:" + ("scope-missing" if not scope_id else f"runtime-scope-match-count:{len(matches)}")
+            return False, reason, {"schemaVersion": "live-portfolio-pre-post-validation-v1", "scopeId": scope_id, "allowed": False, "reason": reason}
         return matches[0].validate_portfolio_execution_dispatch(intent)
 
-    def stop(self, profile_id: str = "") -> dict[str, Any]:
+    def _drop_writer_reference(self, key):
+        lease = self._writer_leases.pop(key, None)
+        if lease is not None and not any(held is lease for held in self._writer_leases.values()):
+            lease.release()
+
+    def _release_stopped_lease(self, key, result):
+        snapshot = result.get("runtime") or {}
+        if result.get("ok") is True and snapshot.get("phase") == "STOPPED" and snapshot.get("running") is False:
+            controller = self.runtimes.get(key)
+            if controller is not None and controller._dispatch_status().get("reconciliationRequired") is not False:
+                result["writerLeaseRetained"] = True
+                return
+            self._drop_writer_reference(key)
+
+    def stop(self, profile_id: str = "", *, runtime_id: str = "", deployment_id: str = ""):
+        # Worker completion may snapshot the manager. Do not hold _lock while
+        # joining a worker; only the independent control lock serializes owners.
+        with self._control_lock:
+            with self._lock:
+                if profile_id and profile_id not in {"stock", "crypto"}:
+                    return {"ok": False, "reason": "runtime-profile-unknown"}
+                exact = bool(runtime_id or deployment_id)
+                targets = [(key, controller) for key, controller in self.runtimes.items()
+                           if (not runtime_id or key == runtime_id)
+                           and (not deployment_id or self.runtime_scopes[key].deployment_id == deployment_id)
+                           and (not profile_id or self.runtime_scopes[key].profile_id == profile_id)]
+                if exact and len(targets) != 1:
+                    return {"ok": False, "reason": "exact-runtime-stop-target-unavailable-or-ambiguous", "runtimeStopped": False}
+                if not exact:
+                    if profile_id and len(targets) > 1:
+                        return {"ok": False, "reason": "runtime-profile-stop-ambiguous-select-runtime", "runtimeStopped": False}
+                    targets.extend((key, c) for key, c in self.controllers.items() if not profile_id or key == profile_id)
+            results = {}
+            for key, controller in targets:
+                try:
+                    results[key] = controller.stop()
+                except Exception as error:
+                    results[key] = {"ok": False, "reason": type(error).__name__}
+                with self._lock:
+                    self._release_stopped_lease(key, results[key])
+            if exact:
+                key = targets[0][0]
+                return {**results[key], "runtimeId": key, "runtimeScopeId": key}
+            if profile_id and not any(key in self.runtimes for key in results):
+                return results[profile_id]
+            failed = [key for key, row in results.items() if row.get("ok") is not True]
+            return {"ok": not failed, "reason": "all selected continuous runtimes stopped" if not failed else "continuous runtime stop failed: " + ", ".join(failed), "results": results, "runtime": self.snapshot()}
+
+    def transition_running(self, mode):
+        normalized = str(mode).upper()
+        if normalized not in {"MONITOR", "SMALL_LIVE", "FULL_LIVE"}:
+            return {"ok": False, "reason": "runtime-mode-unknown"}
+        with self._control_lock:
+            with self._lock:
+                running = [(key, c) for key, c in {**self.controllers, **self.runtimes}.items() if self._running(c)]
+            previous = {key: c.mode for key, c in running}
+            results, transitioned = {}, []
+            for key, controller in running:
+                profile = self.runtime_scopes[key].profile_id if key in self.runtime_scopes else key
+                args = (profile, normalized, controller.portfolio_id, controller.requested_strategy_id, controller.deployment_id, controller.execution_purpose, controller.functional_test_context)
+                try:
+                    result = controller.start(*args) if normalized == "MONITOR" else self.start(*args)
+                except Exception as error:
+                    result = {"ok": False, "reason": type(error).__name__}
+                result = {**result, "profileId": profile, "runtimeId": key}
+                results[key] = result
+                if result.get("ok"):
+                    transitioned.append((key, controller))
+                    continue
+                if normalized == "MONITOR":
+                    # Safety tightening never restores another runtime to LIVE.
+                    try:
+                        results[key]["stopFallback"] = controller.stop()
+                        self._release_stopped_lease(key, results[key]["stopFallback"])
+                    except Exception as error:
+                        results[key]["stopFallback"] = {"ok": False, "reason": type(error).__name__}
+                    continue
+                rank = {"MONITOR": 0, "SMALL_LIVE": 1, "FULL_LIVE": 2}
+                for rollback_key, rollback in reversed(transitioned):
+                    # Roll back upgrades only; never undo a safety reduction.
+                    if rank[previous[rollback_key]] >= rank[normalized]:
+                        continue
+                    rollback_profile = self.runtime_scopes[rollback_key].profile_id if rollback_key in self.runtime_scopes else rollback_key
+                    try:
+                        restored = rollback.start(rollback_profile, previous[rollback_key], rollback.portfolio_id, rollback.requested_strategy_id, rollback.deployment_id, rollback.execution_purpose, rollback.functional_test_context)
+                    except Exception as error:
+                        restored = {"ok": False, "reason": type(error).__name__}
+                    results[rollback_key]["rollback"] = restored
+                break
+            failed = [key for key, row in results.items() if row.get("ok") is not True]
+            profile_results = {profile: {key: row for key, row in results.items() if row.get("profileId") == profile} for profile in ("stock", "crypto")}
+            return {"ok": not failed, "reason": "running continuous runtimes transitioned" if not failed else str(results[failed[0]].get("reason") or "runtime mode transition failed"), "results": results, "profileResults": profile_results, "runtime": self.snapshot()}
+
+    def snapshot(self):
         with self._lock:
-            if profile_id in self.controllers:
-                return self.controllers[profile_id].stop()
-            results = {
-                key: controller.stop()
-                for key, controller in self.controllers.items()
-            }
-            failed_profiles = [
-                key
-                for key, result in results.items()
-                if result.get("ok") is not True
-            ]
-            return {
-                "ok": not failed_profiles,
-                "reason": (
-                    "all continuous runtimes stopped"
-                    if not failed_profiles
-                    else "continuous runtime stop failed: "
-                    + ", ".join(failed_profiles)
-                ),
-                "results": results,
-                "runtime": self.snapshot(),
-            }
-
-    def transition_running(self, mode: str) -> dict[str, Any]:
-        """Transition all running profiles together, rolling back on failure."""
-
-        with self._lock:
-            running = [
-                (profile_id, controller)
-                for profile_id, controller in self.controllers.items()
-                if controller.supervisor is not None
-                and controller.supervisor.running
-            ]
-            acquired: list[threading.RLock] = []
-            previous_modes = {
-                profile_id: controller.mode
-                for profile_id, controller in running
-            }
-            try:
-                for _profile_id, controller in running:
-                    controller._lock.acquire()  # noqa: SLF001 - coordinated owner
-                    acquired.append(controller._lock)  # noqa: SLF001
-                results: dict[str, dict[str, Any]] = {}
-                transitioned: list[tuple[str, LiveContinuousController]] = []
-                for profile_id, controller in running:
-                    result = controller.start(profile_id, mode)
-                    results[profile_id] = result
-                    if not result.get("ok"):
-                        for rollback_id, rollback_controller in reversed(
-                            transitioned
-                        ):
-                            rollback_controller.start(
-                                rollback_id,
-                                previous_modes[rollback_id],
-                            )
-                        return {
-                            "ok": False,
-                            "reason": str(
-                                result.get("reason")
-                                or f"{profile_id} runtime mode transition failed"
-                            ),
-                            "results": results,
-                            "runtime": self.snapshot(),
-                        }
-                    transitioned.append((profile_id, controller))
-                return {
-                    "ok": True,
-                    "reason": "running continuous runtimes transitioned",
-                    "results": results,
-                    "runtime": self.snapshot(),
-                }
-            finally:
-                for lock in reversed(acquired):
-                    lock.release()
-
-    def snapshot(self) -> dict[str, Any]:
-        profiles = {key: controller.snapshot() for key, controller in self.controllers.items()}
-        running_profiles = [key for key, value in profiles.items() if value.get("running")]
-        return {
-            "schemaVersion": "multi-profile-continuous-runtime-v1",
-            "running": bool(running_profiles),
-            "runningProfiles": running_profiles,
-            "profiles": profiles,
-        }
+            runtimes = {key: {**controller.snapshot(), **self.runtime_scopes[key].to_dict()} for key, controller in self.runtimes.items()}
+            profiles = {}
+            for profile in ("stock", "crypto"):
+                members = {key: row for key, row in runtimes.items() if self.runtime_scopes[key].profile_id == profile}
+                active = {key: row for key, row in members.items() if row.get("running")}
+                candidates = active or members
+                legacy = self.controllers[profile].snapshot()
+                if len(candidates) == 1:
+                    projected = dict(next(iter(candidates.values())))
+                elif not candidates:
+                    projected = dict(legacy)
+                else:
+                    projected = {"profileId": profile, "running": bool(active), "phase": "RUNNING" if active else "STOPPED", "mode": "MIXED", "ambiguous": True}
+                statuses = [row.get("dispatch") or {} for row in members.values()] + [legacy.get("dispatch") or {}]
+                projected.update(runtimeIds=list(members), activeRuntimeIds=list(active), runtimeCount=len(members), ambiguous=len(candidates) > 1,
+                                 dispatch={"reconciliationRequired": bool(self._scope_loading_error) or any(row.get("reconciliationRequired") is not False for row in statuses), "restartReplayEnabled": False})
+                profiles[profile] = projected
+            running_profiles = [key for key, value in profiles.items() if value.get("running")]
+            return {"schemaVersion": "account-scoped-continuous-runtime-v2", "running": bool(running_profiles), "runningProfiles": running_profiles, "runningRuntimeIds": [key for key, row in runtimes.items() if row.get("running")], "runtimes": runtimes, "profiles": profiles, "scopeHistoryError": self._scope_loading_error}
 
 
 def validate_portfolio_execution_dispatch(

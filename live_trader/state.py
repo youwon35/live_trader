@@ -9407,6 +9407,10 @@ def _current_live_deployment_binding(
         "executionPermissionDigest": _normalized_execution_permission_digest(
             dict(permissions)
         ),
+        "operationalExecutionPolicyDigest": governance_sha256({
+            "kisEquityExecutionPolicies": permissions.get("kisEquityExecutionPolicies"),
+            "kisEquityFeeReservePolicy": permissions.get("kisEquityFeeReservePolicy"),
+        }),
         "strategyArtifact": {
             key: str(strategy_reference.get(key) or "").strip().lower()
             if key != "artifactId"
@@ -10716,6 +10720,10 @@ def _set_mode_serialized(mode: str) -> dict[str, Any]:
     blockers = data["summary"]["blocker_count"]
     watchdog_critical = int(data.get("watchdog", {}).get("critical_count", 0))
     normalized = normalize_runtime_mode(mode)
+    if normalized != "MONITOR" and any(
+        row.get("running") for row in (LIVE_CONTINUOUS_CONTROLLER.snapshot().get("runtimes") or {}).values()
+    ):
+        return {"ok": False, "reason": "계좌별 실행의 모드는 해당 Deployment 시작 화면에서 변경하세요.", "snapshot": data}
     if normalized != "MONITOR" and watchdog_critical:
         reason = f"Watchdog critical {watchdog_critical}개 때문에 {normalized} 전환이 차단되었습니다."
         append_audit("danger", "모드 전환 차단", reason)
@@ -10726,12 +10734,27 @@ def _set_mode_serialized(mode: str) -> dict[str, Any]:
     if normalized == "FULL_LIVE" and data["summary"]["warning_count"]:
         append_audit("warn", "FULL LIVE 차단", "경고 항목이 남아 있어 FULL LIVE 전환을 차단했습니다.")
         return {"ok": False, "reason": "FULL LIVE는 경고 0개일 때만 허용됩니다.", "snapshot": snapshot()}
-    runtime_transition = LIVE_CONTINUOUS_CONTROLLER.transition_running(
-        normalized
-    )
+    if normalized == "MONITOR":
+        # Publish the safety reduction before waiting for a worker. Even an
+        # engine downgrade/stop failure must never retain LIVE authority.
+        with RUNTIME_MODE_LOCK:
+            STATE["mode"] = "MONITOR"
+            for profile in STATE["automation"].values():
+                profile["mode"] = "MONITOR"
+                profile["enabled"] = False
+                profile["last_action"] = "Global MONITOR 우선 적용"
+    try:
+        runtime_transition = LIVE_CONTINUOUS_CONTROLLER.transition_running(normalized)
+    except Exception as exc:
+        if normalized != "MONITOR":
+            raise
+        runtime_transition = {"ok": False, "reason": "MONITOR 전환 실패: " + type(exc).__name__}
     if not runtime_transition.get("ok"):
+        if normalized == "MONITOR":
+            STATE["new_entries_blocked"] = True
         reason = (
-            "continuous runtime mode 전환 실패로 global mode를 유지했습니다: "
+            ("global MONITOR는 적용됐지만 일부 실행 정지·대조가 필요합니다: "
+             if normalized == "MONITOR" else "continuous runtime mode 전환 실패로 global mode를 유지했습니다: ") +
             f"{runtime_transition.get('reason') or 'unknown'}"
         )
         append_audit("danger", "모드 전환 차단", reason)
@@ -10746,6 +10769,12 @@ def _set_mode_serialized(mode: str) -> dict[str, Any]:
         transitioned_profiles = set(
             (runtime_transition.get("results") or {}).keys()
         )
+        transitioned_snapshot = runtime_transition.get("runtime") or {}
+        scoped_rows = transitioned_snapshot.get("runtimes") or {}
+        transitioned_profiles = {
+            str((scoped_rows.get(key) or {}).get("profileId") or key)
+            for key in transitioned_profiles
+        }.intersection({"stock", "crypto"})
         for profile_id in transitioned_profiles:
             profile = STATE["automation"][profile_id]
             profile["mode"] = normalized
@@ -13276,6 +13305,8 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
         )
         runtime_transition: dict[str, Any] | None = None
         if runtime_profile.get("running"):
+            if runtime_profile.get("runtimeIds"):
+                return {"ok": False, "reason": "계좌별 실행은 선택한 Deployment의 시작/중지 버튼으로 제어하세요.", "snapshot": data}
             runtime_transition = LIVE_CONTINUOUS_CONTROLLER.start(
                 profile_id,
                 next_mode,
@@ -19923,6 +19954,31 @@ def intent_market_data_age_seconds(
     return max(age, declared_latency)
 
 
+def absolute_currency_limits_for_intent(intent: OrderIntent) -> dict[str, Any]:
+    """Use current internal conversion proof; never compare KRW with USD/USDT."""
+    from .account_currency_limits import native_absolute_limits, latest_conversion_observation
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker = str(metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset)).lower()
+    symbol = str(intent.symbol).upper()
+    currency = (
+        "KRW" if broker == "kis" and re.fullmatch(r"[0-9]{6}(?:\.K[QS])?", symbol)
+        else "USD" if broker == "kis"
+        else "KRW" if broker == "upbit" and symbol.startswith("KRW-")
+        else "USDT" if broker == "binance" and symbol.endswith("USDT")
+        else ""
+    )
+    declared = str(metadata.get("quote_currency") or metadata.get("currency") or "").upper()
+    if declared and declared != currency:
+        return {"status": "BLOCKED", "nativeCurrency": currency, "maxOrderValue": "0",
+                "strategyCapitalLimit": "0", "reasons": ["NATIVE_RISK_DECLARED_CURRENCY_MISMATCH"], "orderAuthorityGranted": False}
+    settings = STATE["risk_settings"]
+    return native_absolute_limits(
+        settings["strategy_capital_limit_krw"], native_currency=currency, broker_id=broker,
+        conversion_observation=latest_conversion_observation(currency, broker),
+        fx_buffer_bps=settings["max_slippage_bps"],
+    )
+
+
 def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool) -> PreTradeContext:
     settings = STATE["risk_settings"]
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
@@ -19991,6 +20047,10 @@ def pre_trade_context(checks: dict[str, Any], intent: OrderIntent, dry_run: bool
             rollout_cap,
         )
         strategy_capital_limit = maximum_order_value
+    elif live_account_required and broker_id in {"binance", "upbit", "kis"}:
+        absolute_limits = absolute_currency_limits_for_intent(intent)
+        maximum_order_value = float(absolute_limits["maxOrderValue"])
+        strategy_capital_limit = float(absolute_limits["strategyCapitalLimit"])
     else:
         maximum_order_value = float(settings["strategy_capital_limit_krw"])
         strategy_capital_limit = float(settings["strategy_capital_limit_krw"])
@@ -21467,7 +21527,7 @@ def live_broker_dispatch_allowed(
     normalized_mode = str(intent.mode or "").strip().upper()
     if normalized_mode not in LIVE_BROKER_DISPATCH_MODES:
         return False, "non-live-intent-broker-dispatch-forbidden"
-    runtime_mode = current_mode()
+    runtime_mode = _intent_runtime_mode(intent)
     if runtime_mode not in LIVE_BROKER_DISPATCH_MODES:
         return False, "non-live-runtime-broker-dispatch-forbidden"
     if runtime_mode != normalized_mode:
@@ -21530,6 +21590,16 @@ def live_broker_dispatch_allowed(
         and not verified_risk_reducing
     ):
         return False, "reduce-only-position-verification-failed"
+    if broker_id in {"binance", "upbit", "kis"}:
+        absolute_limits = absolute_currency_limits_for_intent(intent)
+        if absolute_limits.get("status") != "READY":
+            return False, "native-currency-risk-limit-unavailable:" + ",".join(absolute_limits.get("reasons") or [])
+    if isinstance(metadata.get("native_quantity_model"), dict):
+        try:
+            from .native_order_ticket import validate_native_ticket
+            validate_native_ticket(intent)
+        except (ValueError, TypeError, KeyError, ArithmeticError):
+            return False, "native-order-ticket-expired-or-invalid-at-dispatch"
     return True, ""
 
 
@@ -21962,7 +22032,7 @@ def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str
 
     if intent.mode not in {"SMALL_LIVE", "FULL_LIVE"}:
         return False, "operational-session-live-mode-required", {}
-    if current_mode() != intent.mode:
+    if _intent_runtime_mode(intent) != intent.mode:
         return False, "operational-runtime-intent-mode-mismatch", {}
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     broker_id = str(
@@ -21970,11 +22040,13 @@ def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str
         or broker_id_from_symbol(intent.symbol, intent.asset)
     ).strip().lower()
     profile_id = "stock" if broker_id == "kis" else "crypto"
-    session_id = str(
-        (STATE.get("active_runtime_session_ids") or {}).get(profile_id) or ""
-    )
+    try:
+        _runtime_key, selected_session = _active_session_for_intent(intent)
+    except (OSError, sqlite3.Error, ValueError):
+        return False, "operational-runtime-session-unreadable", {}
+    session_id = str(getattr(selected_session, "session_id", "") or "")
     if not session_id:
-        return False, "operational-runtime-session-missing", {}
+        return False, "operational-runtime-session-missing-or-ambiguous", {}
     try:
         authorization = OPERATIONAL_GOVERNANCE.runtime_authorization(
             session_id,
@@ -22240,34 +22312,38 @@ def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str
                 authorization,
             )
         strategies = strategy_rows(portfolio_rows())
-        strategy = next(
-            (
-                item
-                for item in strategies
-                if str(item.get("strategy_id") or "") == str(intent.strategy_id)
-                and (
-                    not manifest_portfolio
-                    or str(
-                        (item.get("portfolio_gate") or {}).get("portfolioId")
-                        if isinstance(item.get("portfolio_gate"), dict)
-                        else ""
-                    )
-                    == manifest_portfolio
-                )
-            ),
-            None,
-        )
+        if manifest.portfolio_artifact_hash:
+            # A sleeve's unrelated standalone Deployment grants no authority
+            # to this account portfolio. Re-resolve the exact parent and its
+            # complete, currently sealed canonical member/instance bindings.
+            strategy = _operational_strategy(
+                strategies, deployment_id=str(manifest.deployment_id),
+                portfolio_id=manifest_portfolio,
+            )
+        else:
+            strategy = next((item for item in strategies
+                             if str(item.get("strategy_id") or "") == str(intent.strategy_id)
+                             and str(item.get("deployment_id") or "") == str(manifest.deployment_id)), None)
         if strategy is None:
             return False, "operational-current-strategy-missing", authorization
-        required_permission = (
-            "live_eligible" if intent.mode == "FULL_LIVE" else "live_small_eligible"
-        )
+        required_permission = "live_eligible" if intent.mode == "FULL_LIVE" else "live_small_eligible"
         if strategy.get(required_permission) is not True:
             return False, "operational-current-deployment-permission-revoked", authorization
-        current_member_hash = _operational_artifact_hash(strategy)
+        current_inputs = _operational_manifest_inputs(strategy)
+        if manifest.portfolio_artifact_hash:
+            canonical_members = (current_inputs.get("metadata") or {}).get("strategyMembers") or []
+            matching_current = [item for item in canonical_members
+                                if str(item.get("strategyId") or "") == str(intent.strategy_id)
+                                and str(item.get("strategyInstanceId") or "") == requested_strategy_instance
+                                and str(item.get("symbol") or "").upper() == str(intent.symbol).upper()
+                                and str(item.get("brokerId") or "").lower() == broker_id]
+            if len(matching_current) != 1:
+                return False, "operational-current-portfolio-member-missing-or-ambiguous", authorization
+            current_member_hash = str(matching_current[0].get("artifactHash") or "")
+        else:
+            current_member_hash = _operational_artifact_hash(strategy)
         if str(member.get("artifactHash") or "") != current_member_hash:
             return False, "operational-strategy-hash-changed", authorization
-        current_inputs = _operational_manifest_inputs(strategy)
         if str(current_inputs.get("deployment_id") or "").strip() != str(
             manifest.deployment_id or ""
         ).strip():
@@ -22947,13 +23023,12 @@ def dispatch_live_order_with_checkpoint(
                     if isinstance(response_payload.get("output"), dict)
                     else {}
                 )
-                order_date = str(
-                    output.get("ORD_DT")
-                    or output.get("ORD_DATE")
-                    or datetime.now(timezone(timedelta(hours=9))).strftime(
-                        "%Y%m%d"
-                    )
-                ).strip()
+                explicit_order_date = str(output.get("ORD_DT") or output.get("ORD_DATE") or "").strip()
+                is_domestic = bool(re.fullmatch(r"[0-9]{6}(?:\.K[QS])?", str(intent.symbol).upper()))
+                order_date = explicit_order_date or (
+                    datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d")
+                    if is_domestic else ""
+                )
                 organization_no = str(
                     output.get("KRX_FWDG_ORD_ORGNO")
                     or output.get("KRX_FWDG_ORD_ORG_NO")
@@ -22970,6 +23045,8 @@ def dispatch_live_order_with_checkpoint(
                     "order_date": order_date,
                     "organization_no": organization_no,
                     "broker_order_key": broker_order_key,
+                    "order_date_source": "BROKER_ACK" if explicit_order_date else "KST_SUBMISSION_DATE_PROVISIONAL" if is_domestic else "AWAITING_BROKER_TRADING_DATE",
+                    "broker_order_identity_verified": bool(explicit_order_date and broker_order_key),
                 }
             LIVE_OMS.acknowledge(
                 managed_order.order_id,
@@ -25634,6 +25711,112 @@ def _prepare_functional_test_runtime_session(
     return session, "FUNCTIONAL_TEST 전용 거버넌스 Session을 생성했습니다."
 
 
+def _intent_runtime_mode(intent: OrderIntent) -> Mode:
+    # The global MONITOR switch always wins. Otherwise authority comes from
+    # this exact session, so one account's FULL mode cannot alter another's.
+    if current_mode() == "MONITOR":
+        return "MONITOR"
+    try:
+        _key, session = _active_session_for_intent(intent)
+        if session is not None:
+            return normalize_runtime_mode(getattr(session, "mode", "MONITOR"))
+        if not any(str(key).startswith("runtime-") for key in (STATE.get("active_runtime_session_ids") or {})):
+            return current_mode()
+    except (OSError, sqlite3.Error, ValueError):
+        pass
+    return "MONITOR"
+
+
+def _active_session_for_intent(intent: OrderIntent):
+    from .account_runtime_governance import unique_session_binding
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    broker = str(metadata.get("broker_id") or broker_id_from_symbol(intent.symbol, intent.asset)).lower()
+    return unique_session_binding(
+        STATE.get("active_runtime_session_ids") or {},
+        OPERATIONAL_GOVERNANCE.get_runtime_session,
+        runtime_id=str(metadata.get("runtime_scope_id") or metadata.get("runtimeScopeId") or ""),
+        deployment_id=str(metadata.get("deployment_id") or metadata.get("deploymentId") or ""),
+        broker_id=broker, profile_id="stock" if broker == "kis" else "crypto",
+    )
+
+
+def resolve_continuous_runtime_scope(
+    profile_id: str, mode: str, portfolio_id: str = "", strategy_id: str = "",
+    deployment_id: str = "", execution_purpose: str = "",
+    functional_test_context: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve authority from current saved credentials and exact registry data.
+
+    Request metadata never supplies an account fingerprint or a writer key.
+    MONITOR without an explicit artifact remains an unbound safe observer.
+    """
+    from .account_profiles import saved_account_profiles
+    from .runtime_scope import RuntimeScope
+
+    if profile_id not in {"stock", "crypto"}:
+        raise ValueError("runtime-profile-invalid")
+    normalized_mode = str(mode or "MONITOR").upper()
+    if normalized_mode not in {"MONITOR", "SMALL_LIVE", "FULL_LIVE"}:
+        raise ValueError("runtime-mode-invalid")
+    if not any((portfolio_id, strategy_id, deployment_id)) and normalized_mode == "MONITOR":
+        return None
+    if str(execution_purpose or "").upper() == FUNCTIONAL_TEST_EXECUTION_PURPOSE:
+        context = dict(functional_test_context or {})
+        permit, _activation = functional_test_active_authority()
+        if str(context.get("functional_test_permit_id") or "") != permit.permit_id:
+            raise ValueError("functional-test-runtime-scope-permit-mismatch")
+        broker = "kis"
+        actual_deployment = str(deployment_id or "").strip()
+    else:
+        strategy = _operational_strategy(
+            strategy_rows(portfolio_rows()), deployment_id=str(deployment_id or ""),
+            strategy_id=str(strategy_id or ""), portfolio_id=str(portfolio_id or ""),
+        )
+        if strategy is None:
+            raise ValueError("runtime-scope-current-deployment-missing")
+        broker = strategy_broker_id(strategy)
+        binding = _current_live_deployment_binding(
+            strategy, require_store=normalized_mode != "MONITOR",
+        )
+        actual_deployment = str(binding.get("deploymentId") or "")
+        if deployment_id and deployment_id != actual_deployment:
+            raise ValueError("runtime-scope-deployment-mismatch")
+    accounts = [row for row in saved_account_profiles(runtime_settings())
+                if row.get("brokerId") == broker]
+    if len(accounts) != 1:
+        raise ValueError("runtime-scope-saved-account-ambiguous-or-missing")
+    account = accounts[0]
+    capital_currency = ""
+    if not execution_purpose:
+        from .native_spot_quantity import sizing_from_artifact
+        sizing = sizing_from_artifact(strategy)
+        if sizing is not None:
+            capital_currency = str(sizing["quantityContract"].get("quoteCurrency") or "")
+        if broker == "kis" and normalized_mode != "MONITOR" and capital_currency not in {"KRW", "USD"}:
+            raise ValueError("runtime-scope-sealed-equity-currency-required")
+    if normalized_mode != "MONITOR" and not execution_purpose:
+        source = Path(str(strategy.get("artifact_source_path") or ""))
+        deployment = DeploymentStore(source.parent).get(actual_deployment)
+        if not isinstance(deployment, dict):
+            raise ValueError("runtime-scope-current-registry-entry-missing")
+        permissions = deployment.get("permissions") or {}
+        if deployment.get("route") != broker or deployment.get("accountId") != account["accountBindingId"]:
+            raise ValueError("runtime-scope-reviewed-account-mismatch")
+        if any(permissions.get(field) != account[account_field] for field, account_field in (
+            ("liveAccountProfileId", "profileId"),
+            ("liveAccountFingerprint", "accountFingerprint"),
+            ("liveAccountCredentialConfigurationHash", "credentialConfigurationHash"),
+        )):
+            raise ValueError("runtime-scope-reviewed-credentials-changed")
+    return RuntimeScope(
+        broker_id=broker, account_fingerprint=account["accountFingerprint"],
+        deployment_id=actual_deployment, profile_id=profile_id,
+        account_binding_id=account["accountBindingId"],
+        credential_configuration_hash=account["credentialConfigurationHash"],
+        capital_currency=capital_currency,
+    ).to_dict()
+
+
 def _prepare_operational_runtime_session(
     profile_id: str,
     mode: Mode,
@@ -25797,6 +25980,11 @@ def _prepare_operational_runtime_session(
                 "Artifact/Paper/Portfolio binding이 변경되었습니다."
             )
         strategy = current_strategy
+    runtime_scope = resolve_continuous_runtime_scope(
+        profile_id, mode, actual_portfolio, actual_strategy, actual_deployment,
+    )
+    runtime_key = str((runtime_scope or {}).get("runtimeScopeId") or profile_id)
+    previous_session_id = str((STATE.get("active_runtime_session_ids") or {}).get(runtime_key) or "")
     session = OPERATIONAL_GOVERNANCE.create_runtime_session(
         deployment_id=manifest.deployment_id,
         deployment_manifest_hash=manifest.manifest_hash,
@@ -25805,6 +25993,8 @@ def _prepare_operational_runtime_session(
         runtime_instance_id=f"desktop-{os.getpid()}-{secrets.token_hex(8)}",
         preflight_snapshot_id=preflight_id if mode in {"SMALL_LIVE", "FULL_LIVE"} else "",
         metadata={
+            **(runtime_scope or {}),
+            "previousRuntimeSessionId": previous_session_id,
             "portfolioId": str((strategy.get("portfolio_gate") or {}).get("portfolioId") or ""),
             "strategyId": str(strategy.get("strategy_id") or ""),
             "brokerId": strategy_broker_id(strategy),
@@ -25829,7 +26019,7 @@ def _prepare_operational_runtime_session(
     )
     STATE["selected_deployment_id"] = manifest.deployment_id
     STATE["selected_strategy_id"] = str(strategy.get("strategy_id") or "")
-    STATE.setdefault("active_runtime_session_ids", {})[profile_id] = session.session_id
+    STATE.setdefault("active_runtime_session_ids", {})[runtime_key] = session.session_id
     return session, "운영 거버넌스 Session을 생성했습니다."
 
 
@@ -25849,21 +26039,53 @@ def _finish_operational_runtime_start(session: object | None, ok: bool, reason: 
         STATE["new_entries_blocked"] = True
 
 
+def _retire_superseded_runtime_session(previous_id: str, current_session: object) -> bool:
+    """A replaced session cannot remain RUNNING after its exact successor starts."""
+    if not previous_id or previous_id == str(getattr(current_session, "session_id", "")):
+        return True
+    try:
+        current_metadata = dict(getattr(current_session, "metadata", {}) or {})
+        previous = OPERATIONAL_GOVERNANCE.get_runtime_session(previous_id)
+        previous_metadata = dict(getattr(previous, "metadata", {}) or {})
+        key = str(current_metadata.get("runtimeScopeId") or "")
+        if not key or previous_metadata.get("runtimeScopeId") != key:
+            raise ValueError("superseded-runtime-scope-mismatch")
+        for eligible, target in (({"RUNNING", "DEGRADED"}, "DRAINING"), ({"STARTING", "DRAINING"}, "STOPPING"), ({"STOPPING"}, "STOPPED")):
+            if previous.lifecycle in eligible:
+                previous = OPERATIONAL_GOVERNANCE.transition_runtime_session(
+                    previous_id, target, actor="live_trader.desktop",
+                    event_type="RUNTIME_SESSION_SUPERSEDED",
+                    payload={"runtimeId": key, "successorSessionId": current_session.session_id},
+                )
+        return previous.lifecycle in {"STOPPED", "FAILED"}
+    except (OSError, sqlite3.Error, ValueError, AttributeError):
+        STATE["new_entries_blocked"] = True
+        return False
+
+
 def _restore_previous_runtime_session_binding(
-    profile_id: str,
-    failed_session: object | None,
-    previous_session_id: str,
+    profile_id: str, failed_session: object | None, previous_session_id: str,
 ) -> None:
-    failed_session_id = str(getattr(failed_session, "session_id", "") or "")
+    failed_id = str(getattr(failed_session, "session_id", "") or "")
+    metadata = dict(getattr(failed_session, "metadata", {}) or {})
+    key = str(metadata.get("runtimeScopeId") or profile_id)
     active = STATE.setdefault("active_runtime_session_ids", {})
-    if not isinstance(active, dict) or not failed_session_id:
+    if not isinstance(active, dict) or not failed_id or str(active.get(key) or "") != failed_id:
         return
-    if str(active.get(profile_id) or "") != failed_session_id:
-        return
+    if previous_session_id and key.startswith("runtime-"):
+        try:
+            previous = OPERATIONAL_GOVERNANCE.get_runtime_session(previous_session_id)
+            previous_metadata = dict(getattr(previous, "metadata", {}) or {})
+            if previous_metadata.get("runtimeScopeId") != key:
+                previous_session_id = ""
+                STATE["new_entries_blocked"] = True
+        except (OSError, sqlite3.Error, ValueError):
+            previous_session_id = ""
+            STATE["new_entries_blocked"] = True
     if previous_session_id:
-        active[profile_id] = previous_session_id
+        active[key] = previous_session_id
     else:
-        active.pop(profile_id, None)
+        active.pop(key, None)
 
 
 @_serialized_safety_mutation
@@ -26053,7 +26275,9 @@ def start_continuous_runtime(
     *,
     _functional_test_capability: object | None = None,
 ) -> dict[str, Any]:
-    normalized_profile = "stock" if profile_id == "stock" else "crypto"
+    if profile_id not in {"stock", "crypto"}:
+        return {"ok": False, "reason": "runtime-profile-invalid", "runtimeStarted": False, "brokerSubmissionPerformed": False}
+    normalized_profile = profile_id
     normalized_mode = normalize_runtime_mode(mode)
     normalized_purpose = str(execution_purpose or "").strip().upper()
     if _upbit_functional_durable_authority_open():
@@ -26093,10 +26317,7 @@ def start_continuous_runtime(
             "snapshot": snapshot(),
         }
     governance_session: object | None = None
-    previous_session_id = str(
-        (STATE.get("active_runtime_session_ids") or {}).get(normalized_profile)
-        or ""
-    )
+    previous_session_id = str((STATE.get("active_runtime_session_ids") or {}).get(normalized_profile) or "")
     try:
         if normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE:
             governance_session, _governance_reason = (
@@ -26166,6 +26387,8 @@ def start_continuous_runtime(
         if governance_session is not None
         else {}
     )
+    if normalized_purpose != FUNCTIONAL_TEST_EXECUTION_PURPOSE:
+        previous_session_id = str(session_metadata.get("previousRuntimeSessionId") or "")
     bound_portfolio_id = str(
         session_metadata.get("portfolioId") or portfolio_id or ""
     ).strip()
@@ -26248,9 +26471,13 @@ def start_continuous_runtime(
             raise
         if result.get("ok"):
             with RUNTIME_MODE_LOCK:
+                from .account_runtime_governance import runtime_rows
+                active_modes = [normalize_runtime_mode(row.get("mode"))
+                                for row in runtime_rows(LIVE_CONTINUOUS_CONTROLLER.snapshot()).values()
+                                if row.get("running") and row.get("profileId") == normalized_profile]
                 sync_runtime_profile_mode(
                     normalized_profile,
-                    normalized_mode,
+                    max(active_modes, key=lambda value: RUNTIME_MODE_RANK[value], default=normalized_mode),
                     action=f"Continuous runtime {normalized_mode} 동기화",
                 )
                 result["snapshot"] = snapshot()
@@ -26259,6 +26486,9 @@ def start_continuous_runtime(
             bool(result.get("ok")),
             str(result.get("reason") or ""),
         )
+        if result.get("ok") and governance_session is not None and not normalized_purpose:
+            if not _retire_superseded_runtime_session(previous_session_id, governance_session):
+                result["sessionHistoryReconciliationRequired"] = True
         if (
             result.get("ok")
             and normalized_purpose == FUNCTIONAL_TEST_EXECUTION_PURPOSE
@@ -26378,81 +26608,86 @@ def _continuous_stop_control(function: Any) -> Any:
 
 @_continuous_stop_control
 @_two_phase_kis_route_control("STOP")
-def stop_continuous_runtime(profile_id: str = "") -> dict[str, Any]:
-    normalized_profile = (
-        profile_id if profile_id in {"stock", "crypto"} else ""
-    )
-    target_profiles = (
-        (normalized_profile,)
-        if normalized_profile
-        else ("stock", "crypto")
-    )
-    governance_sessions: list[tuple[str, str]] = []
-    for target in target_profiles:
-        session_id = str(
-            (STATE.get("active_runtime_session_ids") or {}).get(target) or ""
-        )
-        if not session_id:
-            continue
+def stop_continuous_runtime(
+    profile_id: str = "", *, runtime_id: str = "", deployment_id: str = "",
+) -> dict[str, Any]:
+    from .account_runtime_governance import runtime_rows, select_session_bindings
+
+    profile_id, runtime_id, deployment_id = (str(value or "").strip() for value in (profile_id, runtime_id, deployment_id))
+    if profile_id and profile_id not in {"stock", "crypto"}:
+        return {"ok": False, "reason": "runtime-profile-unknown", "runtimeStopped": False}
+    with RUNTIME_CONTROL_LOCK:
+        before = LIVE_CONTINUOUS_CONTROLLER.snapshot()
+        rows = runtime_rows(before)
+        selected = {key: row for key, row in rows.items()
+                    if (not runtime_id or key == runtime_id)
+                    and (not deployment_id or row.get("deploymentId") == deployment_id)
+                    and (not profile_id or row.get("profileId", key) == profile_id)}
+        if (runtime_id or deployment_id) and len(selected) != 1:
+            return {"ok": False, "reason": "exact-runtime-stop-target-unavailable-or-ambiguous", "runtimeStopped": False}
+        if profile_id and not runtime_id and not deployment_id and len(selected) > 1:
+            return {"ok": False, "reason": "runtime-profile-stop-ambiguous-select-runtime", "runtimeStopped": False}
         try:
-            session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
-            if session is not None and session.lifecycle in {"RUNNING", "DEGRADED"}:
-                session = OPERATIONAL_GOVERNANCE.transition_runtime_session(
-                    session_id,
-                    "DRAINING",
-                    actor="live_trader.desktop",
-                    event_type="RUNTIME_DRAIN_REQUESTED",
-                    payload={"profile": target},
-                )
-            if session is not None and session.lifecycle in {"STARTING", "RUNNING", "DEGRADED", "DRAINING"}:
-                OPERATIONAL_GOVERNANCE.transition_runtime_session(
-                    session_id,
-                    "STOPPING",
-                    actor="live_trader.desktop",
-                    event_type="RUNTIME_STOP_REQUESTED",
-                    payload={"profile": target},
-                )
-            governance_sessions.append((target, session_id))
+            sessions = select_session_bindings(
+                STATE.get("active_runtime_session_ids") or {},
+                OPERATIONAL_GOVERNANCE.get_runtime_session,
+                runtime_id=runtime_id, deployment_id=deployment_id, profile_id=profile_id,
+            )
         except (OSError, sqlite3.Error, ValueError):
             STATE["new_entries_blocked"] = True
-    # Controller.stop() first transitions the engine to MONITOR under
-    # RUNTIME_MODE_LOCK, then releases that lock before joining the worker.
-    # Holding it here across stop() would deadlock a worker that is flushing a
-    # due bar through the supervisor's operation_lock.
-    with RUNTIME_CONTROL_LOCK:
-        result = LIVE_CONTINUOUS_CONTROLLER.stop(normalized_profile)
+            return {"ok": False, "reason": "runtime-stop-session-binding-unreadable", "runtimeStopped": False}
+        target_profiles = {str(row.get("profileId") or key) for key, row in selected.items()}
+        if not any((profile_id, runtime_id, deployment_id)):
+            target_profiles.update(("stock", "crypto"))
+        for key, session in sessions:
+            try:
+                if session.lifecycle in {"RUNNING", "DEGRADED"}:
+                    session = OPERATIONAL_GOVERNANCE.transition_runtime_session(
+                        session.session_id, "DRAINING", actor="live_trader.desktop",
+                        event_type="RUNTIME_DRAIN_REQUESTED", payload={"runtimeId": key},
+                    )
+                if session.lifecycle in {"STARTING", "DRAINING"}:
+                    OPERATIONAL_GOVERNANCE.transition_runtime_session(
+                        session.session_id, "STOPPING", actor="live_trader.desktop",
+                        event_type="RUNTIME_STOP_REQUESTED", payload={"runtimeId": key},
+                    )
+            except (OSError, sqlite3.Error, ValueError):
+                STATE["new_entries_blocked"] = True
+        # No mode lock across worker join: the worker drains outside RUNTIME.
+        result = LIVE_CONTINUOUS_CONTROLLER.stop(
+            profile_id, runtime_id=runtime_id, deployment_id=deployment_id,
+        ) if runtime_id or deployment_id else LIVE_CONTINUOUS_CONTROLLER.stop(profile_id)
         if "stock" in target_profiles:
-            result["functional_test_guard"] = (
-                stop_functional_test_runtime_guard()
-            )
+            result["functional_test_guard"] = stop_functional_test_runtime_guard()
+        after = LIVE_CONTINUOUS_CONTROLLER.snapshot()
+        remaining = runtime_rows(after)
         with RUNTIME_MODE_LOCK:
-            for target in target_profiles:
-                sync_runtime_profile_mode(
-                    target,
-                    "MONITOR",
-                    action=(
-                        "Continuous runtime 정지 동기화"
-                        if result.get("ok")
-                        else "Continuous runtime 정지 실패 fail-closed MONITOR"
-                    ),
-                )
-        for target, session_id in governance_sessions:
+            for profile in target_profiles.intersection({"stock", "crypto"}):
+                modes = [normalize_runtime_mode(row.get("mode")) for row in remaining.values()
+                         if row.get("running") and row.get("profileId") == profile]
+                remaining_mode = max(modes, key=lambda mode: RUNTIME_MODE_RANK[mode], default="MONITOR")
+                sync_runtime_profile_mode(profile, remaining_mode,
+                    action="계좌별 실행 중지 후 남은 실행 모드 동기화")
+        per_runtime = result.get("results") or {}
+        for key, original in sessions:
+            session_id = original.session_id
+            stopped = (per_runtime.get(key) or result).get("ok") is True
             try:
                 session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
                 if session is not None and session.lifecycle == "STOPPING":
                     OPERATIONAL_GOVERNANCE.transition_runtime_session(
-                        session_id,
-                        "STOPPED" if result.get("ok") else "FAILED",
-                        actor="live_trader.desktop",
-                        event_type="RUNTIME_STOPPED" if result.get("ok") else "RUNTIME_STOP_FAILED",
-                        payload={"profile": target, "detail": str(result.get("reason") or "")[:500]},
+                        session_id, "STOPPED" if stopped else "FAILED", actor="live_trader.desktop",
+                        event_type="RUNTIME_STOPPED" if stopped else "RUNTIME_STOP_FAILED",
+                        payload={"runtimeId": key, "detail": str(result.get("reason") or "")[:500]},
                     )
-                if result.get("ok"):
-                    STATE.setdefault("active_runtime_session_ids", {}).pop(target, None)
+                if stopped:
+                    active = STATE.setdefault("active_runtime_session_ids", {})
+                    if active.get(key) == session_id:
+                        active.pop(key, None)
             except (OSError, sqlite3.Error, ValueError):
                 STATE["new_entries_blocked"] = True
         result["snapshot"] = snapshot()
-    return result
+        return result
 
 
 def stop_functional_test_runtime_safely(
@@ -27772,7 +28007,8 @@ def paper_candidate_review_controls() -> dict[str, Any]:
         "riskPolicyRevision": int(STATE.get("risk_policy_revision") or 0),
         "mode": str(STATE.get("mode") or "MONITOR"),
         "killSwitch": bool(STATE.get("kill_switch")), "dryRun": bool(STATE.get("dry_run")),
-        "newEntriesBlocked": bool(STATE.get("new_entries_blocked"))}
+        "newEntriesBlocked": bool(STATE.get("new_entries_blocked")),
+        "savedSlippageBps": STATE.get("risk_settings", {}).get("max_slippage_bps", 50)}
 
 
 def issue_paper_candidate_review_confirmation(payload: dict[str, Any]) -> dict[str, Any]:
@@ -27833,19 +28069,28 @@ def capture_operator_preflight(scope, checks, manifest_hash=""):
 
 
 def operator_runtime_bindings(runtime):
+    from .account_runtime_governance import runtime_rows, unique_session_binding
     result = []
-    profiles = runtime.get("profiles") or {str(runtime.get("profileId") or ""): runtime}
-    for profile, value in profiles.items():
-        if not isinstance(value, dict) or value.get("running") is not True:
+    for key, value in runtime_rows(runtime).items():
+        if value.get("running") is not True:
             continue
-        item = {"profile": profile, "running": True, "deploymentId": value.get("deploymentId", ""), "manifest": None}
+        profile = str(value.get("profileId") or (key if key in {"stock", "crypto"} else ""))
+        runtime_id = str(value.get("runtimeScopeId") or value.get("runtimeId") or "")
+        item = {"profile": profile, "runtimeId": runtime_id, "running": True,
+                "brokerId": value.get("brokerId", ""),
+                "accountFingerprint": value.get("accountFingerprint", ""),
+                "deploymentId": value.get("deploymentId", ""), "manifest": None}
         try:
-            session_id = str((STATE.get("active_runtime_session_ids") or {}).get(profile) or "")
-            session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id) if session_id else None
+            _binding_key, session = unique_session_binding(
+                STATE.get("active_runtime_session_ids") or {},
+                OPERATIONAL_GOVERNANCE.get_runtime_session,
+                runtime_id=runtime_id, deployment_id=str(item["deploymentId"] or ""), profile_id=profile,
+            )
             if session and session.lifecycle in {"STARTING", "RUNNING", "DEGRADED", "DRAINING", "STOPPING"}:
                 manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(session.deployment_manifest_hash)
                 if manifest and (not item["deploymentId"] or item["deploymentId"] == session.deployment_id):
-                    item.update({"deploymentId": session.deployment_id, "sessionId": session.session_id, "mode": session.mode, "lifecycle": session.lifecycle, "manifest": manifest.to_dict()})
+                    item.update({"deploymentId": session.deployment_id, "sessionId": session.session_id,
+                                 "mode": session.mode, "lifecycle": session.lifecycle, "manifest": manifest.to_dict()})
         except (OSError, sqlite3.Error, ValueError):
             item["error"] = "실행 고정 구성 조회 실패"
         result.append(item)

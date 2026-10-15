@@ -941,7 +941,11 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             ))
             return
         if parsed.path == "/api/runtime/stop":
-            self.send_json(state.stop_continuous_runtime(str(payload.get("profile_id", ""))))
+            self.send_json(state.stop_continuous_runtime(
+                str(payload.get("profile_id", "")),
+                runtime_id=str(payload.get("runtime_id", "")),
+                deployment_id=str(payload.get("deployment_id", "")),
+            ))
             return
         if parsed.path == "/api/strategy-live-promotion":
             self.send_json(state.promote_strategy_to_live(str(payload.get("strategy_id", ""))))

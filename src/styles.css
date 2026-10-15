@@ -1046,6 +1046,28 @@ button {
   background: var(--surface-subtle);
 }
 
+/* Scoped account rows must give long canonical IDs a shrinkable track. */
+.runtime-account-list {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.runtime-account-list > .runtime-deployment-binding {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.runtime-account-list > .runtime-deployment-binding > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.runtime-account-list > .runtime-deployment-binding > button {
+  grid-column: 1 / -1;
+  justify-self: start;
+  min-width: 132px;
+}
+
 .runtime-deployment-binding span,
 .runtime-deployment-binding small {
   min-width: 0;

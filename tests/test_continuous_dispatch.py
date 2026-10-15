@@ -313,8 +313,10 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
         # Fake only external authority/evidence, strategy signal and market feed.
         # HTTP handler, start controls, supervisor, engine, queue, OMS and final
         # dispatch fences are the same implementations used by the application.
-        manager = LiveContinuousRuntimeManager(self.root)
-        controller = manager.controllers["stock"]
+        from live_trader.runtime_scope import RuntimeScope
+        trusted_scope = RuntimeScope("kis", "a" * 64, "dispatch-safety-live-deployment", "stock")
+        manager = LiveContinuousRuntimeManager(self.root, account_writer_lease_root=self.root / "isolated-account-writers", scope_resolver=lambda **kw: trusted_scope)
+        controller = manager._register_scope(trusted_scope)
         poll_release, posted = threading.Event(), threading.Event()
         now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         strategy = {
@@ -360,6 +362,7 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
         with (
             patch("socket.socket.connect", side_effect=AssertionError("external socket forbidden")),
             patch.object(state, "LIVE_CONTINUOUS_CONTROLLER", manager),
+            patch.object(state, "resolve_continuous_runtime_scope", return_value=trusted_scope.to_dict()),
             patch.object(state, "LiveBrokerRouter", return_value=self.router),
             patch.object(state, "_prepare_operational_runtime_session", return_value=(None, "fixture approval")) as prepare,
             patch.object(state, "_finish_operational_runtime_start"),
@@ -385,7 +388,7 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
             finally:
                 poll_release.set()
                 if controller.supervisor is not None:
-                    controller.stop()
+                    manager.stop(runtime_id=trusted_scope.runtime_id)
             self.assertEqual(1, self.router.place_order.call_count)
             self.assertEqual("COMPLETED", controller._dispatcher().journal.rows()[0]["state"])
             self.assertEqual("acknowledged", self.fixture.ledger.order_dispatch_rows()[0]["state"])
@@ -408,6 +411,7 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
     def test_stop_after_checkpoint_invalidates_final_post_even_if_mode_unchanged(self):
         checkpoint = self.fixture.ledger.checkpoint_order_dispatch
         manager = Mock()
+        manager.snapshot.return_value = {"runtimes": {}, "profiles": {}}
         manager.stop.return_value = {"ok": True, "reason": "fixture stopped"}
         def save_and_stop(order):
             saved = checkpoint(order)

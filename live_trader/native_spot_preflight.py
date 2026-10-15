@@ -51,14 +51,12 @@ def valid_observation(observation, source, *, side, now=None):
         raise ValueError("CURRENT_ACTUAL_SIDE_FEE_NOT_VERIFIED")
     reference = body.get("marketReference")
     if source["notionalReferenceMinutes"] > 0:
-        if not isinstance(reference, Mapping) or reference.get("kind") != "BINANCE_AVG_PRICE" or reference.get("symbol") != source["symbol"] or reference.get("minutes") != source["notionalReferenceMinutes"]:
+        if not isinstance(reference, Mapping) or reference.get("kind") != "BINANCE_AVG_PRICE" or reference.get("symbol") != source["symbol"] or type(reference.get("minutes")) is not int or reference.get("minutes") != source["notionalReferenceMinutes"]:
             raise ValueError("CURRENT_AVERAGE_INTERVAL_OR_SYMBOL_MISMATCH")
         if reference.get("responseHash") is None or reference.get("endpoint") != "/api/v3/avgPrice":
             raise ValueError("CURRENT_AVERAGE_SOURCE_NOT_VERIFIED")
-        close = timestamp(reference.get("closeTime"))
-        close_age = ((now or datetime.now(timezone.utc)) - close).total_seconds()
-        if not 0 <= close_age <= 15:
-            raise ValueError("CURRENT_AVERAGE_PRICE_STALE")
+        from .binance_reference_clock import validate_average_reference
+        validate_average_reference(reference, as_of=timestamp(body["asOf"]), now=now or datetime.now(timezone.utc))
         decimal_value(reference.get("price"), "average", positive=True)
     return dict(observation)
 
@@ -122,10 +120,9 @@ def observe_native_spot(reader, source, *, side, now=None):
         if len(matches)!=1:
             raise ValueError("CURRENT_SYMBOL_RULES_AMBIGUOUS")
         current = _binance_rules(source,matches[0])
-        clock,_ = reader._get(provider,"/api/v3/time")
-        milliseconds = clock.get("serverTime")
-        if type(milliseconds) is not int or abs(milliseconds / 1000 - begin.timestamp()) > 15:
-            raise ValueError("CURRENT_EXCHANGE_CLOCK_STALE")
+        from .binance_reference_clock import observe_clock
+        clock = observe_clock(reader, now=now)
+        milliseconds = clock["serverTimeMilliseconds"]
         query = sign_binance_query({"symbol":symbol,"timestamp":milliseconds,"recvWindow":5000},reader.settings["BINANCE_API_SECRET"])
         commission,_ = reader._get(provider,"/api/v3/account/commission",query=query,headers={"X-MBX-APIKEY":reader.settings["BINANCE_API_KEY"]})
         if commission.get("symbol") != symbol:
@@ -138,7 +135,13 @@ def observe_native_spot(reader, source, *, side, now=None):
             average,_ = reader._get(provider,"/api/v3/avgPrice",query={"symbol":symbol})
             if type(average.get("closeTime")) is not int or type(average.get("mins")) is not int:
                 raise ValueError("CURRENT_AVERAGE_RESPONSE_INVALID")
-            reference = {"kind":"BINANCE_AVG_PRICE","symbol":symbol,"minutes":average["mins"],"price":average["price"],"closeTime":datetime.fromtimestamp(average["closeTime"]/1000,timezone.utc).isoformat(),"endpoint":"/api/v3/avgPrice","responseHash":stable_sha256(average)}
+            average_received = now or datetime.now(timezone.utc)
+            # The official avgPrice closeTime is the last trade time, not the
+            # response time. Observe server time after that response, then bind
+            # its age to a bounded local request interval.
+            reference = {"kind":"BINANCE_AVG_PRICE","symbol":symbol,"minutes":average["mins"],"price":average["price"],"closeTime":datetime.fromtimestamp(average["closeTime"]/1000,timezone.utc).isoformat(),"endpoint":"/api/v3/avgPrice","responseHash":stable_sha256(average),
+                         "responseReceivedAt":average_received.isoformat(),"closeTimeRole":"LAST_TRADE_TIME",
+                         "freshnessClock":"BINANCE_SERVER_TIME_WITH_BOUNDED_LOCAL_RTT","clockObservation":observe_clock(reader, now=now)}
     else:
         reader._credentials("upbit")
         from .live_adapters import build_upbit_authorization
@@ -159,7 +162,7 @@ def observe_native_spot(reader, source, *, side, now=None):
         fee=decimal_value(chance["bid_fee" if side=="BUY" else "ask_fee"],"side fee")
         fee_scope="CURRENT_UPBIT_SIDE_FEE"
     end=now or datetime.now(timezone.utc)
-    if (end-begin).total_seconds()>15:
+    if not 0 <= (end-begin).total_seconds() <= 15:
         raise ValueError("CURRENT_NATIVE_MULTIPLE_READS_STALE")
     body={**observation,"schemaVersion":SCHEMA,"provider":provider,"symbol":symbol,"side":side,"asOf":end.isoformat(),"sourceContractHash":source["contractHash"],"currentQuantityContract":current,"marketCapabilityVerified":True,"sourceCurrentRuleDifferences":source_rules_fit_current(source,current),"feeRate":str(fee),"feeScope":fee_scope,"marketReference":reference,"credentialsUnchanged":stable_sha256(reader.settings)==settings_hash,"priceRole":"READ_ONLY_REFERENCE_NOT_NEXT_OPEN","orderAuthorityGranted":False}
     receipt=seal(body)
@@ -181,14 +184,15 @@ def verify_calculation_inputs(context, receipt, source, *, side, fee_field="actu
     return current
 
 def source_rules_fit_current(source, current):
-    """Only a raised current maxQuantity is compatible; the frozen cap stays used."""
+    """Keep sealed rules; Binance maximum drift requires a LIVE-only intersection."""
     source=validate_quantity_contract(source);current=validate_quantity_contract(current)
     differences=[]
     for key in MATH_FIELDS:
         if current.get(key)==source.get(key):
             continue
-        if key=="maxQuantity" and decimal_value(current[key],"current maximum",positive=True)>=decimal_value(source[key],"Source maximum",positive=True):
-            differences.append({"field":key,"source":source[key],"current":current[key],"effect":"FROZEN_SOURCE_LOWER_CAP_RETAINED"})
+        if key=="maxQuantity" and (source["provider"] == "binance" or decimal_value(current[key],"current maximum",positive=True)>=decimal_value(source[key],"Source maximum",positive=True)):
+            effect = "LIVE_OPERATIONAL_MAXIMUM_INTERSECTION" if decimal_value(current[key],"current maximum",positive=True) < decimal_value(source[key],"Source maximum",positive=True) else "FROZEN_SOURCE_LOWER_CAP_RETAINED"
+            differences.append({"field":key,"source":source[key],"current":current[key],"effect":effect,"sourceArtifactUnchanged":True})
         else:
             raise ValueError("CURRENT_NATIVE_RULES_DIFFER_FROM_SOURCE")
     return differences

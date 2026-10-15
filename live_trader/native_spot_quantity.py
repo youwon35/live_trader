@@ -136,7 +136,13 @@ def live_quantity(spec, *, side, price, allocation_weight, identity, context=Non
         elif any(current.get(key) != contract.get(key) for key in compare_fields):
             raise ValueError("NATIVE_QUANTITY_CURRENT_RULES_DIFFER_FROM_SOURCE")
         source_fee, source_slippage = source_cost_rates(spec.artifact, spec.parameters)
-        model = calculate_model_quantity(sizing, side=side, price=price, deployment_equity=context.get("deploymentEquity"), available_cash=context.get("availableCash"), allocation_weight=allocation_weight, position_percent=spec.parameters.get("positionSize"), source_fee_rate=source_fee, source_slippage_rate=source_slippage, actual_fee_rate=context.get("actualFeeRate"), position_quantity=position_quantity, notional_reference_price=context.get("notionalReferencePrice"), current_maximum_quote=(market_observation or {}).get("currentMaximumQuoteAmount"))
+        calculator = calculate_model_quantity
+        calculator_options = {}
+        if market_verified and contract["provider"] == "binance":
+            from .spot_operational_bounds import calculate_live_spot_model
+            calculator = calculate_live_spot_model
+            calculator_options = {"market_observation": market_observation, "now": now}
+        model = calculator(sizing, **calculator_options, side=side, price=price, deployment_equity=context.get("deploymentEquity"), available_cash=context.get("availableCash"), allocation_weight=allocation_weight, position_percent=spec.parameters.get("positionSize"), source_fee_rate=source_fee, source_slippage_rate=source_slippage, actual_fee_rate=context.get("actualFeeRate"), position_quantity=position_quantity, notional_reference_price=context.get("notionalReferencePrice"), current_maximum_quote=(market_observation or {}).get("currentMaximumQuoteAmount"))
         blocked["modelResult"] = model
         blocked["nativeEligibility"] = "VERIFIED" if market_verified else model["nativeEligibility"]
         if model["actualFeeObserved"] is not True:
@@ -150,7 +156,7 @@ def live_quantity(spec, *, side, price, allocation_weight, identity, context=Non
         transported = float(quantity)
         if not Decimal(str(transported)) == quantity:
             raise ValueError("NATIVE_QUANTITY_FLOAT_TRANSPORT_LOSES_EXACT_STEP")
-        return {**blocked, "status": "READY", "quantityForSubmission": transported, "reasons": [], "preflightBinding": {"asOf":context.get("asOf"),"accountFingerprint":context.get("accountFingerprint"),"capitalScopeHash":context.get("capitalScopeHash"),"deploymentId":identity["deploymentId"],"sourceContractHash":contract["contractHash"],"marketObservationHash":(market_observation or {}).get("contentHash"),"actualFeeRate":context.get("actualFeeRate"),"sourceSlippageRate":str(source_slippage),"modelFeeRate":model["feeRateUsed"]}}
+        return {**blocked, "status": "READY", "quantityForSubmission": transported, "reasons": [], "preflightBinding": {"asOf":context.get("asOf"),"accountFingerprint":context.get("accountFingerprint"),"capitalScopeHash":context.get("capitalScopeHash"),"deploymentId":identity["deploymentId"],"sourceContractHash":contract["contractHash"],"marketObservationHash":(market_observation or {}).get("contentHash"),"actualFeeRate":context.get("actualFeeRate"),"sourceSlippageRate":str(source_slippage),"modelFeeRate":model["feeRateUsed"], **({"sourceQuantityContract":contract,"nativeMarketObservation":market_observation,"currentQuantityContractHash":current["contractHash"],"operationalQuantityPolicyHash":model["operationalQuantityPolicy"]["contentHash"]} if market_verified and contract["provider"] == "binance" else {})}}
     except (ValueError, TypeError, KeyError, ArithmeticError) as error:
         blocked["reasons"].append(str(error))
         return blocked

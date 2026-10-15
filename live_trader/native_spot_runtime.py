@@ -10,6 +10,7 @@ from .owned_deployment_capital import OwnedCapitalStore, reviewed_scope
 from .native_spot_quantity import sizing_from_artifact, decimal_value
 from .native_spot_preflight import observe_native_spot
 from .read_only_account import ReadOnlyBrokerReader, runtime_settings, ReadFailure
+from .verified_terminal_cache import VerifiedTerminalCache,terminal_identity,terminal_proof
 
 def current_deployment(deployment_id,specs,roots):
     matches=[]
@@ -45,6 +46,7 @@ def current_deployment(deployment_id,specs,roots):
 class NativeSpotRuntime:
     def __init__(self,root,deployment_id,specs,*,reader=None,roots=None,deployment_reader=None,dispatch_reader=None):
         self.store=OwnedCapitalStore(Path(root)/"logs"/"native_owned_capital.sqlite3")
+        self.terminal_cache=VerifiedTerminalCache(Path(root)/"logs"/"verified_terminal_order_cache.sqlite3")
         self.deployment_id=deployment_id;self.specs=tuple(specs)
         self.reader=reader or ReadOnlyBrokerReader(runtime_settings())
         self.roots=roots
@@ -71,6 +73,9 @@ class NativeSpotRuntime:
     def initialize_at_reviewed_manual_start(self):
         scope=self.scope()
         observation=observe_native_spot(self.reader,sizing_from_artifact(self.specs[0].artifact)["quantityContract"],side="BUY")
+        if scope["quoteCurrency"] == "USDT" and self.specs[0].provider == "binance":
+            from .account_currency_limits import refresh_conversion_observation
+            refresh_conversion_observation(self.reader, native_currency="USDT", broker_id="binance")
         result=self.store.initialize(scope,observation)
         self._position_context=result
         return result
@@ -93,7 +98,7 @@ class NativeSpotRuntime:
             rows=state.PROGRAM_LEDGER.order_dispatch_rows(1000000)
         else:rows=self.dispatch_reader()
         if not isinstance(rows,list) or len(rows)>=1000000:raise ValueError("OWNED_DISPATCH_HISTORY_INCOMPLETE")
-        pending=[]
+        pending=[];verified=[]
         members={s.strategy_instance_id:s for s in self.specs}
         for row in rows:
             metadata=row.get("metadata") or {}
@@ -106,6 +111,12 @@ class NativeSpotRuntime:
                 if row.get("state") not in {"risk_blocked","adapter_blocked","rejected"}:raise ValueError("OWNED_DISPATCH_UNRESOLVED")
                 continue
             spec=members[sid];contract=sizing_from_artifact(spec.artifact)["quantityContract"]
+            identity=terminal_identity(scope,spec,row)
+            cached=self.terminal_cache.get(identity)
+            if cached is not None:
+                pending.extend((fill,row) for fill in cached['receipts'])
+                continue
+            first=len(pending)
             if spec.provider=="binance":
                 clock,_=self.reader._get("binance","/api/v3/time")
                 def get(path,query):
@@ -138,6 +149,7 @@ class NativeSpotRuntime:
                 volume=sum((decimal_value(t.get("volume"),"trade volume",positive=True) for t in trades),Decimal(0))
                 if volume!=decimal_value(order.get("executed_volume"),"executed volume"):raise ValueError("OWNED_UPBIT_TRADES_TOTAL_MISMATCH")
                 fee=decimal_value(order.get("paid_fee"),"paid fee")
+                if not volume and fee:raise ValueError('OWNED_ZERO_FILL_FEE_UNRECONCILED')
                 # Final immutable order-level receipt avoids reassigning a changing
                 # cumulative paid_fee to partial trades. Actual VWAP is exact Decimal.
                 if volume:
@@ -146,8 +158,13 @@ class NativeSpotRuntime:
                         precision.prec=2048
                         funds=sum((decimal_value(t.get("funds"),"trade funds",positive=True) for t in trades),Decimal(0))
                         pending.append((self._fill(scope,spec,row,"terminal-order",volume,funds/volume,fee,scope["quoteCurrency"],max(str(t["created_at"]) for t in trades)),row))
+            fills=[fill for fill,_ in pending[first:]]
+            proof=terminal_proof(identity,fills,broker_response=order,
+                executed_quantity=order.get('executedQty' if spec.provider=='binance' else 'executed_volume'),all_trades=trades)
+            verified.append((identity,fills,proof))
         for fill,row in sorted(pending,key=lambda pair:(pair[0]["occurredAt"],pair[0]["eventId"])):
             self.store.append_verified_fill(scope,fill,{"brokerOrderId":str(row["broker_order_id"]),"metadata":row["metadata"],"persistedDispatchVerified":True})
+        for identity,fills,proof in verified:self.terminal_cache.put(identity,fills,proof)
         return len(pending)
 
     @staticmethod
@@ -163,6 +180,9 @@ class NativeSpotRuntime:
             if side=="POSITION":return projection
             started=datetime.now(timezone.utc)
             observation=observe_native_spot(self.reader,sizing_from_artifact(spec.artifact)["quantityContract"],side=side)
+            if scope["quoteCurrency"] == "USDT" and spec.provider == "binance":
+                from .account_currency_limits import refresh_conversion_observation
+                refresh_conversion_observation(self.reader, native_currency="USDT", broker_id="binance")
             marks={s.strategy_instance_id:self._mark(s) for s in self.specs if decimal_value(projection["ownedPositions"][s.strategy_instance_id],"owned position")>0}
             projection=self.store.project(scope,marks)
             if decimal_value(observation["availableCash"],"available cash") < decimal_value(projection["ownedCash"],"owned cash"):

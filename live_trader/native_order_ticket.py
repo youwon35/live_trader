@@ -8,6 +8,9 @@ from .native_spot_preflight import timestamp
 
 def validate_native_ticket(intent,*,now=None):
     metadata=intent.metadata or {}
+    if metadata.get('broker_id')=='kis' or (metadata.get('native_quantity_model') or {}).get('version')=='kis-equity-operational-quantity-v2':
+        from .kis_equity_execution import validate_ticket
+        return validate_ticket(intent,now=now)
     boundary=metadata.get("native_open_boundary")
     model=metadata.get("native_quantity_model")
     binding=metadata.get("native_preflight")
@@ -38,6 +41,9 @@ def validate_native_ticket(intent,*,now=None):
             raise ValueError("NATIVE_TICKET_DECIMAL_MODEL_TRANSPORT_CHANGED")
         if decimal_value(binding["actualFeeRate"],"actual fee")>decimal_value(model["feeRateUsed"],"conservative fee"):
             raise ValueError("NATIVE_TICKET_FEE_ALLOWANCE_NOT_CONSERVATIVE")
+    if provider == "binance":
+        from .spot_operational_bounds import validate_operational_ticket
+        validate_operational_ticket(model, binding, side=intent.side, now=current)
     text=format(notional,"f")
     text=text.rstrip("0").rstrip(".") if "." in text else text
     return {"quoteAmount":text,"quantity":model["quantity"],"orderAuthorityGranted":False,"actualFillQuantityGuaranteed":False}

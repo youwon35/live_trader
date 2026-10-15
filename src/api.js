@@ -819,8 +819,12 @@ export async function startContinuousRuntime(
   });
 }
 
-export async function stopContinuousRuntime(profileId = "") {
-  return request("/api/runtime/stop", { method: "POST", body: { profile_id: profileId }, timeoutMs: 15000 });
+export async function stopContinuousRuntime(profileId = "", { runtimeId = "", deploymentId = "" } = {}) {
+  return request("/api/runtime/stop", {
+    method: "POST",
+    body: { profile_id: profileId, runtime_id: runtimeId, deployment_id: deploymentId },
+    timeoutMs: 30000,
+  });
 }
 
 export async function promoteStrategyToLive(strategyId) {

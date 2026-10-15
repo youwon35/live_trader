@@ -1,3 +1,5 @@
+import { runtimeRows, runtimeForDeployment } from "./runtimeSelection.js";
+
 const STATUS_DEFINITIONS = {
   normal: { label: "정상", tone: "success", known: true, blocking: false },
   ready: { label: "준비됨", tone: "success", known: true, blocking: false },
@@ -433,16 +435,19 @@ function deploymentCandidates(snapshot) {
   return result;
 }
 
-function activeRuntimeScope(snapshot) {
+function activeRuntimeScope(snapshot, context = null) {
   const runtime = safeObject(snapshot?.continuous_runtime || snapshot?.continuousRuntime);
-  const profiles = Object.values(safeObject(runtime.profiles));
-  const active = profiles.find((profile) => profile?.running) || (runtime.running ? runtime : {}) || {};
+  const activeRows = runtimeRows(runtime).filter((row) => row.running === true);
+  const selectedId = context?.deploymentId || context?.id || "";
+  const selected = selectedId ? runtimeForDeployment(runtime, { ...context, deploymentId: selectedId }) : null;
+  const active = selectedId ? selected || {} : activeRows.length === 1 ? activeRows[0] : {};
   return {
-    deploymentId: firstText(active, ["deploymentId", "deployment_id"], firstText(runtime, ["deploymentId", "deployment_id"])),
-    portfolioId: firstText(active, ["portfolioId", "portfolio_id"], firstText(runtime, ["portfolioId", "portfolio_id"])),
-    strategyId: firstText(active, ["strategyId", "strategy_id", "artifactId", "artifact_id"]),
+    deploymentId: firstText(active, ["deploymentId", "deployment_id"]),
+    portfolioId: firstText(active, ["portfolioId", "portfolio_id"]),
+    strategyId: firstText(active, ["requestedStrategyId", "strategyId", "strategy_id", "artifactId", "artifact_id"]),
     profileId: firstText(active, ["profileId", "profile_id"]),
-    running: active?.running === true || runtime?.running === true,
+    running: active?.running === true,
+    ambiguous: !selectedId && activeRows.length > 1,
     raw: active,
   };
 }
@@ -579,9 +584,14 @@ export function buildLiveEnvironmentModel(snapshot = {}, deploymentContext = nul
   const context = deploymentContext?.contextKey
     ? deploymentContext
     : selectCurrentDeploymentContext(snapshot, deploymentContext || {});
-  const mode = normalizeMode(snapshot?.mode || context?.mode || "MONITOR");
+  const runtime = activeRuntimeScope(snapshot, context);
+  const allRuntime = safeObject(snapshot?.continuous_runtime || snapshot?.continuousRuntime);
+  const scoped = Object.keys(safeObject(allRuntime.runtimes)).length > 0;
+  const globalMode = normalizeMode(snapshot?.mode || "MONITOR");
+  const mode = scoped
+    ? globalMode.code === "MONITOR" ? globalMode : normalizeMode(runtime.running ? runtime.raw.mode : "MONITOR")
+    : normalizeMode(snapshot?.mode || context?.mode || "MONITOR");
   const safety = safetyModel(snapshot, mode);
-  const runtime = activeRuntimeScope(snapshot);
   const selectedBroker = asArray(snapshot?.brokers).find((broker) => firstText(broker, ["brokerId", "broker_id"]) === context.brokerId);
   const sessionId = firstText(runtime.raw, ["sessionId", "session_id", "runId", "run_id"], firstText(snapshot, ["sessionId", "session_id"]));
   const brokerLabel = firstText(selectedBroker, ["name", "label"], context.brokerId || "확인 불가");
@@ -615,18 +625,15 @@ export function buildRuntimeComponentModel(snapshot = {}, deploymentContext = nu
     ? deploymentContext
     : selectCurrentDeploymentContext(snapshot, deploymentContext || {});
   const runtime = safeObject(snapshot?.continuous_runtime || snapshot?.continuousRuntime);
-  const profiles = Object.values(safeObject(runtime.profiles));
-  const profile = profiles.find((item) => (
-    (context.portfolioId && firstText(item, ["portfolioId", "portfolio_id"]) === context.portfolioId)
-    || (context.deploymentId && firstText(item, ["deploymentId", "deployment_id"]) === context.deploymentId)
-  )) || profiles.find((item) => item?.running) || runtime;
+  const scope = activeRuntimeScope(snapshot, context);
+  const profile = scope.raw;
   const engine = safeObject(profile.engine || runtime.engine);
   const market = safeObject(profile.marketData || profile.market_data || runtime.marketData || runtime.market_data || snapshot?.market_data);
   const streams = safeObject(snapshot?.execution_streams || snapshot?.executionStreams);
   const watchdog = safeObject(snapshot?.watchdog);
   const environment = buildLiveEnvironmentModel(snapshot, context);
   const selectedBroker = asArray(snapshot?.brokers).find((broker) => firstText(broker, ["brokerId", "broker_id"]) === context.brokerId);
-  const runtimeRunning = profile?.running === true || runtime?.running === true;
+  const runtimeRunning = profile?.running === true;
   const marketStatus = firstText(market, ["status", "phase"])
     || (firstText(engine, ["lastBarAt", "last_bar_at", "lastCycleAt", "last_cycle_at"]) ? (runtimeRunning ? "running" : "stopped") : (runtimeRunning ? "unknown" : "stopped"));
   const schedulerStatus = firstText(profile, ["phase", "status"], runtimeRunning ? "running" : "stopped");

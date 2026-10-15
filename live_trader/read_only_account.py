@@ -29,10 +29,18 @@ READ_PATHS = {
          "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
          "/uapi/overseas-stock/v1/trading/inquire-psamount",
          "/uapi/domestic-stock/v1/quotations/inquire-price",
+         "/uapi/overseas-price/v1/quotations/price-detail",
+         "/uapi/overseas-price/v1/quotations/inquire-time-indexchartprice",
+         "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+         "/uapi/overseas-stock/v1/trading/inquire-ccnl",
          "/uapi/overseas-price/v1/quotations/price",
          "/uapi/overseas-stock/v1/trading/inquire-nccs"},
 }
 KIS_TR_IDS = {
+ "/uapi/overseas-price/v1/quotations/inquire-time-indexchartprice": "FHKST03030200",
+ "/uapi/overseas-price/v1/quotations/price-detail": "HHDFS76200200",
+ "/uapi/domestic-stock/v1/trading/inquire-daily-ccld": "TTTC0081R",
+ "/uapi/overseas-stock/v1/trading/inquire-ccnl": "TTTS3035R",
  "/uapi/domestic-stock/v1/quotations/inquire-price": "FHKST01010100",
  "/uapi/overseas-price/v1/quotations/price": "HHDFS00000300",
  "/uapi/domestic-stock/v1/trading/inquire-psbl-order": "TTTC8908R",

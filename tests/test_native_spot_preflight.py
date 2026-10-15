@@ -276,7 +276,7 @@ class NativePreflightTests(unittest.TestCase):
         self.assertEqual("FROZEN_SOURCE_LOWER_CAP_RETAINED",diff[0]["effect"])
         model=base.service.calculate_model_quantity(s.artifact["executionSizing"],side="BUY",price=100,deployment_equity="10000000",available_cash="10000000",allocation_weight=1,position_percent=100,source_fee_rate=0,source_slippage_rate=0)
         self.assertEqual("1000",model["quantity"])
-        for changes in ({"maxQuantity":"999"},{"stepSize":"0.0001"},{"minQuantity":"0.01"},{"notionalReferenceMinutes":1}):
+        for changes in ({"stepSize":"0.0001"},{"minQuantity":"0.01"},{"notionalReferenceMinutes":1}):
             current=seal_quantity_contract({**source,**changes})
             with self.assertRaises(ValueError):pre.source_rules_fit_current(source,current)
         for value in ("0","NaN","Infinity",True):
@@ -354,7 +354,17 @@ class NativePreflightTests(unittest.TestCase):
         reader.trades=[{"symbol":s.symbol,"orderId":42,"id":1,"isBuyer":True,"qty":"1","price":"100","commission":"0.01","commissionAsset":"ETH","time":int(NOW.timestamp()*1000)}]
         runtime.sync_owned_fills(scope)
         result=runtime.store.project(scope,{"member":"110"});self.assertEqual("0.99",result["ownedPositions"]["member"]);self.assertEqual("1008.90",result["deploymentEquity"])
+        calls = len(reader.calls)
         reader.trades[0]["orderId"]=43
+        runtime.sync_owned_fills(scope)
+        self.assertEqual(calls, len(reader.calls), "complete terminal receipt must not repeat financial history GETs")
+        self.assertEqual("0.99", runtime.store.project(scope,{"member":"110"})["ownedPositions"]["member"])
+        # A different order has no cached authority: unrelated remote trade data
+        # must still fail its first complete terminal receipt verification.
+        uncached = {**row, "broker_order_id":"43"}
+        runtime.dispatch_reader=lambda:[row, uncached]
+        reader.order={**reader.order, "orderId":43}
+        reader.trades[0]["orderId"]=44
         with self.assertRaises(ValueError):runtime.sync_owned_fills(scope)
 
     def test_trade_identity_is_account_and_symbol_scoped(self):

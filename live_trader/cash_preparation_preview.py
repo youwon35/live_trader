@@ -82,10 +82,16 @@ def native_contract_preview(instrument, observation, draft, result):
     from .native_spot_quantity import CAPITAL_BASIS, RULE_FIELDS, calculate_model_quantity
     from trading_runtime.execution_quantity import validate_quantity_contract
     result.update(capitalBasis=CAPITAL_BASIS, initialBudgetBasis="ACCOUNT_AVAILABLE_CASH", calculationScope="SOURCE_MARKET_QUANTITY_MODEL_AT_ENTERED_REFERENCE_PRICE", modelQuantity=None, nativeEligibility="UNKNOWN", availableCash=observation.get("availableCash"), deploymentEquity=observation.get("deploymentEquity"), actualBrokerFeeObserved=observation.get("feeRate") is not None)
+    calculator = calculate_model_quantity
+    calculator_options = {}
     if observation.get("nativeMarketObservation") is not None:
         try:
             from .native_spot_preflight import verify_calculation_inputs
             verify_calculation_inputs(observation, observation["nativeMarketObservation"], instrument["executionSizing"]["quantityContract"], side="BUY", fee_field="feeRate")
+            if instrument["executionSizing"]["quantityContract"]["provider"] == "binance":
+                from .spot_operational_bounds import calculate_live_spot_model
+                calculator = calculate_live_spot_model
+                calculator_options = {"market_observation": observation["nativeMarketObservation"]}
         except (ValueError, TypeError, KeyError, ArithmeticError) as error:
             result["reasons"].append(str(error))
             return result
@@ -94,7 +100,7 @@ def native_contract_preview(instrument, observation, draft, result):
         # This is an initial allocation proposal, never current owned equity.
         try:
             policy = instrument.get("executionPolicy") or {}
-            proposal = calculate_model_quantity(instrument["executionSizing"], side="BUY", price=draft.get("limitPrice"), deployment_equity=observation.get("availableCash"), available_cash=observation.get("availableCash"), allocation_weight=instrument.get("canonicalAllocationWeight", instrument.get("allocationWeight")), position_percent=instrument.get("sourceMaxOrderPercent"), source_fee_rate=Decimal(str(policy["feePercent"]))/100, source_slippage_rate=Decimal(str(policy["slippagePercent"]))/100, actual_fee_rate=observation.get("feeRate"), notional_reference_price=observation.get("notionalReferencePrice"), current_maximum_quote=observation.get("currentMaximumQuoteAmount"))
+            proposal = calculator(instrument["executionSizing"], **calculator_options, side="BUY", price=draft.get("limitPrice"), deployment_equity=observation.get("availableCash"), available_cash=observation.get("availableCash"), allocation_weight=instrument.get("canonicalAllocationWeight", instrument.get("allocationWeight")), position_percent=instrument.get("sourceMaxOrderPercent"), source_fee_rate=Decimal(str(policy["feePercent"]))/100, source_slippage_rate=Decimal(str(policy["slippagePercent"]))/100, actual_fee_rate=observation.get("feeRate"), notional_reference_price=observation.get("notionalReferencePrice"), current_maximum_quote=observation.get("currentMaximumQuoteAmount"))
             result.update(proposedInitialCapital=observation.get("availableCash"), proposedInitialCapitalPercent=100, proposedInitialQuantity=proposal["quantity"], proposalModelResult=proposal, proposalScope="INITIAL_REVIEW_PROPOSAL_NOT_CURRENT_DEPLOYMENT_EQUITY", currentOwnedCapitalInitialized=False)
         except (ValueError, TypeError, KeyError, ArithmeticError):
             pass
@@ -104,7 +110,7 @@ def native_contract_preview(instrument, observation, draft, result):
         fee = number(policy.get("feePercent")); slippage = number(policy.get("slippagePercent"))
         if fee is None or slippage is None:
             raise ValueError("봉인 원본의 수수료·슬리피지가 미확인입니다.")
-        model = calculate_model_quantity(instrument["executionSizing"], side="BUY", price=draft.get("limitPrice"), deployment_equity=observation["deploymentEquity"], available_cash=observation.get("availableCash"), allocation_weight=instrument.get("canonicalAllocationWeight", instrument.get("allocationWeight")), position_percent=instrument.get("sourceMaxOrderPercent"), source_fee_rate=fee/100, source_slippage_rate=slippage/100, actual_fee_rate=observation.get("feeRate"), notional_reference_price=observation.get("notionalReferencePrice"), current_maximum_quote=observation.get("currentMaximumQuoteAmount"))
+        model = calculator(instrument["executionSizing"], **calculator_options, side="BUY", price=draft.get("limitPrice"), deployment_equity=observation["deploymentEquity"], available_cash=observation.get("availableCash"), allocation_weight=instrument.get("canonicalAllocationWeight", instrument.get("allocationWeight")), position_percent=instrument.get("sourceMaxOrderPercent"), source_fee_rate=fee/100, source_slippage_rate=slippage/100, actual_fee_rate=observation.get("feeRate"), notional_reference_price=observation.get("notionalReferencePrice"), current_maximum_quote=observation.get("currentMaximumQuoteAmount"))
         result.update(modelQuantity=model["quantity"], quantityContractHash=model["contractHash"], nativeEligibility=model["nativeEligibility"], feeRateUsed=model["feeRateUsed"], feeAssumptionAdjusted=model["feeAssumptionAdjusted"], actualBrokerFeeObserved=model["actualFeeObserved"], modelResult=model)
         current = validate_quantity_contract(observation.get("currentQuantityContract"))
         source = instrument["executionSizing"]["quantityContract"]
