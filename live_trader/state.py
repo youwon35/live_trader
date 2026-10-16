@@ -124,6 +124,7 @@ from .account_risk import (
     update_account_risk_budget,
 )
 from .env_loader import LIVE_TRADER_SECRET_KEYS, default_runtime_data_root
+from .read_only_account import runtime_settings
 from .emergency_stop import (
     clear_emergency_stop,
     emergency_stop_dispatch_boundary,
@@ -3823,6 +3824,13 @@ def _require_kis_scoped_runtime_clock_integrity(runtime_id: str) -> None:
     failures = market_clock_integrity_failure_codes({"marketClockIntegrity": reader()})
     if failures:
         raise ValueError("kis-operational-market-clock-integrity:" + ",".join(sorted(failures)))
+    from trading_runtime.market_source_integrity import source_integrity_failure_codes
+    source_reader = getattr(supervisor, "market_source_integrity_snapshot", None)
+    if not callable(source_reader):
+        raise ValueError("kis-operational-market-source-proof-unavailable")
+    source_failures = source_integrity_failure_codes({"sourceIntegrity": source_reader()})
+    if source_failures:
+        raise ValueError("kis-operational-market-source-integrity:" + ",".join(sorted(source_failures)))
 
 
 def _kis_scoped_start_material(profile_id: str, mode: str, portfolio_id: str = "",
@@ -22312,6 +22320,101 @@ def _block_managed_order_before_dispatch(
     return False, reason
 
 
+def runtime_market_integrity_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str]:
+    """Check the exact live runtime's short, sticky negative evidence readers.
+
+    No controller/engine snapshot or runtime/route lock is acquired here. This
+    is an additional PLACE veto, never an order or cleanup authority grant.
+    """
+    try:
+        from .runtime_scope import RuntimeScope
+        from trading_runtime.market_clock_integrity import market_clock_integrity_failure_codes
+        from trading_runtime.market_source_integrity import source_integrity_failure_codes
+
+        metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+        broker = str(metadata.get("broker_id") or "").strip().lower()
+        mode = str(intent.mode or "").strip().upper()
+        requested_runtime = metadata.get("runtime_scope_id") or metadata.get("runtimeScopeId")
+        requested_deployment = metadata.get("deployment_id") or metadata.get("deploymentId")
+        if (broker not in {"binance", "binance-futures", "upbit", "kis"}
+                or mode not in {"SMALL_LIVE", "FULL_LIVE"} or current_mode() == "MONITOR"
+                or type(requested_runtime) is not str or not requested_runtime.startswith("runtime-")
+                or type(requested_deployment) is not str or not requested_deployment):
+            raise ValueError("exact-live-runtime-required")
+        for names, expected in ((("runtime_scope_id", "runtimeScopeId"), requested_runtime),
+                                (("deployment_id", "deploymentId"), requested_deployment)):
+            if any(name in metadata and metadata[name] != expected for name in names):
+                raise ValueError("intent-runtime-alias-mismatch")
+
+        def capture():
+            key, session = _active_session_for_intent(intent)
+            if key != requested_runtime or session is None:
+                raise ValueError("active-runtime-session-unavailable")
+            runtimes = getattr(LIVE_CONTINUOUS_CONTROLLER, "runtimes", None)
+            if not isinstance(runtimes, dict):
+                raise ValueError("runtime-controller-map-unavailable")
+            controller = runtimes.get(key)
+            scope = getattr(controller, "runtime_scope", None)
+            if not isinstance(scope, RuntimeScope):
+                raise ValueError("bound-runtime-scope-unavailable")
+            scope.__post_init__()
+            expected = scope.to_dict()
+            session_metadata = dict(session.metadata)
+            if (scope.runtime_id != key or scope.broker_id != broker
+                    or scope.deployment_id != requested_deployment
+                    or not scope.credential_configuration_hash or not scope.account_binding_id
+                    or session.deployment_id != requested_deployment or session.profile != scope.profile_id
+                    or session.mode != mode or session.lifecycle not in {"RUNNING", "DEGRADED"}
+                    or not session.session_id or not session.runtime_instance_id
+                    or not session.deployment_manifest_hash
+                    or any(session_metadata.get(name) != expected[name] for name in (
+                        "runtimeScopeId", "brokerId", "deploymentId", "profileId", "accountFingerprint",
+                        "accountBindingId", "credentialConfigurationHash", "capitalCurrency"))
+                    or getattr(controller, "mode", None) != mode
+                    or getattr(controller, "profile_id", None) != scope.profile_id
+                    or getattr(controller, "deployment_id", None) != requested_deployment):
+                raise ValueError("runtime-session-controller-binding-mismatch")
+            for name, expected_value in (("native_account_fingerprint", scope.account_fingerprint),
+                    ("runtime_session_id", session.session_id), ("runtimeSessionId", session.session_id)):
+                if name in metadata and metadata[name] != expected_value:
+                    raise ValueError("intent-runtime-account-session-mismatch")
+            supervisor = getattr(controller, "supervisor", None)
+            if supervisor is None:
+                raise ValueError("runtime-supervisor-unavailable")
+            stop_event = getattr(supervisor, "_stop", None)
+            if (getattr(supervisor, "running", None) is not True
+                    or not isinstance(stop_event, threading.Event) or stop_event.is_set()
+                    or getattr(supervisor, "phase", None) not in {"STARTING", "RUNNING", "DEGRADED"}):
+                raise ValueError("runtime-supervisor-not-running-or-stopping")
+            identity = (key, session.session_id, session.runtime_instance_id, session.lifecycle,
+                        session.mode, session.deployment_manifest_hash, session.config_revision,
+                        session.config_hash, scope)
+            return controller, supervisor, identity
+
+        controller, supervisor, identity = capture()
+        source_reader = getattr(supervisor, "market_source_integrity_snapshot", None)
+        clock_reader = getattr(supervisor, "market_clock_integrity_snapshot", None)
+        if not callable(source_reader) or not callable(clock_reader):
+            raise ValueError("runtime-integrity-proof-unavailable")
+        failures = source_integrity_failure_codes({"sourceIntegrity": source_reader()})
+        failures |= market_clock_integrity_failure_codes({"marketClockIntegrity": clock_reader()})
+        current_controller, current_supervisor, current_identity = capture()
+        if (current_controller is not controller or current_supervisor is not supervisor
+                or current_identity != identity or current_mode() == "MONITOR"):
+            raise ValueError("runtime-integrity-binding-changed-during-read")
+        # Source may latch while the clock reader or durable-session lookup
+        # runs. Re-read both short latches, with Source last, before returning.
+        failures |= market_clock_integrity_failure_codes({"marketClockIntegrity": clock_reader()})
+        failures |= source_integrity_failure_codes({"sourceIntegrity": source_reader()})
+        if failures:
+            return False, "runtime-market-integrity:" + ",".join(sorted(failures))
+        return True, ""
+    except Exception:
+        # A missing/unreadable proof or changed identity cannot borrow another
+        # account's clean reader. Remote/error text is not authority evidence.
+        return False, "runtime-market-integrity-proof-unavailable-or-scope-mismatch"
+
+
 def live_broker_dispatch_allowed(
     intent: OrderIntent,
     *,
@@ -22407,7 +22510,7 @@ def live_broker_dispatch_allowed(
             validate_native_ticket(intent)
         except (ValueError, TypeError, KeyError, ArithmeticError):
             return False, "native-order-ticket-expired-or-invalid-at-dispatch"
-    return True, ""
+    return runtime_market_integrity_dispatch_allowed(intent)
 
 
 def kis_cross_process_dispatch_lease(

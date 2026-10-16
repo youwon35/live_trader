@@ -1750,6 +1750,9 @@ class LiveContinuousController:
     def _submit_deferred_intent(intent: OrderIntent) -> dict[str, Any]:
         from . import state
 
+        integrity_allowed, integrity_reason = state.runtime_market_integrity_dispatch_allowed(intent)
+        if not integrity_allowed:
+            return {"ok": False, "reason": integrity_reason, "orderSubmitted": False}
         if str((intent.metadata or {}).get("broker_id") or "").lower() == "kis":
             refreshed = state.refresh_kis_scoped_runtime_preflight(intent)
             if refreshed.get("ok") is not True:

@@ -11,6 +11,14 @@ from live_trader.order_management import OrderIntent
 
 class ReduceOnlyVerificationTests(unittest.TestCase):
     def setUp(self) -> None:
+        # These fixtures test broker-position reduce-only verification; the
+        # independent exact runtime integrity gate has dedicated tests.
+        integrity = patch.object(state, "runtime_market_integrity_dispatch_allowed", return_value=(True, ""))
+        integrity.start()
+        self.addCleanup(integrity.stop)
+        limits = patch.object(state, "absolute_currency_limits_for_intent", return_value={"status": "READY"})
+        limits.start()
+        self.addCleanup(limits.stop)
         self.original_state = copy.deepcopy(state.STATE)
         state.STATE.update(
             {

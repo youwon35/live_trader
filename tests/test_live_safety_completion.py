@@ -201,6 +201,9 @@ class LiveSafetyCompletionTests(unittest.TestCase):
 
         self.assertFalse(incident.call_args.kwargs["active"])
 
+    @patch.dict(os.environ, {"KIS_APP_KEY":"fixture-key", "KIS_APP_SECRET":"fixture-secret",
+        "KIS_ACCOUNT_NO":"12345678", "KIS_ACCOUNT_PRODUCT_CODE":"01",
+        "KIS_BASE_URL":"https://openapi.koreainvestment.com:9443"})
     def test_kill_switch_cancels_known_working_orders_without_flattening(self) -> None:
         state.STATE["mode"] = "SMALL_LIVE"
         state.STATE["new_entries_blocked"] = False
@@ -593,6 +596,9 @@ class LiveSafetyCompletionTests(unittest.TestCase):
         self.assertIn("미완료", str(audit.call_args_list[0]))
         self.assertIn("완료", str(audit.call_args_list[1]))
 
+    @patch.dict(os.environ, {"KIS_APP_KEY":"fixture-key", "KIS_APP_SECRET":"fixture-secret",
+        "KIS_ACCOUNT_NO":"12345678", "KIS_ACCOUNT_PRODUCT_CODE":"01",
+        "KIS_BASE_URL":"https://openapi.koreainvestment.com:9443"})
     def test_unmatched_official_kis_working_order_keeps_kill_cleanup_incomplete(self) -> None:
         state.STATE["orders"] = []
         state.record_complete_kis_order_truth(
@@ -689,8 +695,12 @@ class LiveSafetyCompletionTests(unittest.TestCase):
                 }
             ],
         }
+        # Isolate the existing kill/reduce-only contract from the separately
+        # tested exact-runtime and native-currency prerequisites.
         with patch.object(state, "real_orders_enabled", return_value=True), patch.object(
             state, "durable_control_halt_active", return_value=False
+        ), patch.object(state, "runtime_market_integrity_dispatch_allowed", return_value=(True, "")), patch.object(
+            state, "absolute_currency_limits_for_intent", return_value={"status":"READY"}
         ):
             allowed, reason = state.live_broker_dispatch_allowed(
                 self._intent(), dry_run=False
@@ -1134,7 +1144,14 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             after_policy_change["risk_policy_hash"],
         )
 
+    @patch.dict(os.environ, {"BINANCE_API_KEY":"fixture-key", "BINANCE_API_SECRET":"fixture-secret",
+        "BINANCE_BASE_URL":"https://api.binance.com"})
     def test_real_intent_fresh_preflight_reaches_runtime_authorization(self) -> None:
+        from live_trader.account_profiles import saved_account_profiles
+        account = next(row for row in saved_account_profiles(state.runtime_settings()) if row["brokerId"] == "binance")
+        reviewed_deployment = {"route":"binance", "accountId":account["accountBindingId"], "permissions":{
+            "liveAccountProfileId":account["profileId"], "liveAccountFingerprint":account["accountFingerprint"],
+            "liveAccountCredentialConfigurationHash":account["credentialConfigurationHash"]}}
         strategy = {
             "deployment_id": "dep-real-e2e",
             "strategy_id": "strategy-real-e2e",
@@ -1298,7 +1315,7 @@ class LiveSafetyCompletionTests(unittest.TestCase):
                 state, "append_audit"
             ), patch.object(
                 state, "LiveBrokerRouter", router_factory
-            ):
+            ), patch.object(state, "DeploymentStore", return_value=SimpleNamespace(get=lambda deployment_id: reviewed_deployment)):
                 preflight_result = state.run_final_preflight(
                     "dep-real-e2e",
                     "strategy-real-e2e",

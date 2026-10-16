@@ -24,6 +24,11 @@ from live_trader.risk_engine import PreTradeRiskReport, RiskCheck
 
 class OrderDispatchSafetyTest(unittest.TestCase):
     def setUp(self) -> None:
+        # This fixture isolates OMS/lease/latch ordering. Exact runtime Source
+        # and clock bindings are exercised in test_runtime_market_integrity.
+        self.integrity_fixture = patch.object(state, "runtime_market_integrity_dispatch_allowed", return_value=(True, ""))
+        self.integrity_fixture.start()
+        self.addCleanup(self.integrity_fixture.stop)
         # Contract tests must not depend on (or read) the operator's real keys.
         self.fixture_credentials = patch.dict(os.environ, {
             "KIS_APP_KEY": "dispatch-fixture-key", "KIS_APP_SECRET": "dispatch-fixture-secret",
@@ -91,6 +96,8 @@ class OrderDispatchSafetyTest(unittest.TestCase):
             )
         self.temporary.cleanup()
         self.fixture_credentials.stop()
+        # Integration fixtures call tearDown directly as well as unittest cleanup.
+        self.integrity_fixture.stop()
 
     @staticmethod
     def passing_report() -> PreTradeRiskReport:

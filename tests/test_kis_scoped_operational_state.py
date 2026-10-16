@@ -215,7 +215,10 @@ class ScopedStateWireTests(unittest.TestCase):
     def test_valid_queued_intent_is_blocked_if_sticky_kis_clock_failure_arrives_later(self):
         from trading_runtime.market_clock_integrity import StickyMarketClockIntegrity
         integrity=StickyMarketClockIntegrity()
-        controller=SimpleNamespace(supervisor=SimpleNamespace(market_clock_integrity_snapshot=integrity.snapshot))
+        from trading_runtime.market_source_integrity import StickyMarketSourceIntegrity
+        source_integrity=StickyMarketSourceIntegrity()
+        controller=SimpleNamespace(supervisor=SimpleNamespace(market_clock_integrity_snapshot=integrity.snapshot,
+            market_source_integrity_snapshot=source_integrity.snapshot))
         self.namespace['LIVE_CONTINUOUS_CONTROLLER'].runtimes={'runtime-alpha':controller}
         exec(compile(selected_functions(['_require_kis_scoped_runtime_clock_integrity']),'<clock final gate>','exec'),self.namespace)
         self.assertTrue(self.read()['allowed'])

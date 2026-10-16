@@ -9,6 +9,11 @@ from live_trader.server import LiveTraderHandler
 
 
 class KisDeferredSubmissionTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(state, 'runtime_market_integrity_dispatch_allowed', return_value=(True, ''))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def intent(self,broker='kis',mode='SMALL_LIVE'):
         return OrderIntent('source','equity','005930','BUY',1,100,mode,'fixture',
             {'broker_id':broker,'native_open_boundary':{}})
