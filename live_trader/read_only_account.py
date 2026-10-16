@@ -34,9 +34,15 @@ READ_PATHS = {
          "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
          "/uapi/overseas-stock/v1/trading/inquire-ccnl",
          "/uapi/overseas-price/v1/quotations/price",
-         "/uapi/overseas-stock/v1/trading/inquire-nccs"},
+         "/uapi/overseas-stock/v1/trading/inquire-nccs",
+         "/uapi/overseas-stock/v1/trading/inquire-paymt-stdr-balance",
+         "/uapi/overseas-stock/v1/trading/inquire-period-trans",
+         "/uapi/overseas-stock/v1/trading/inquire-present-balance"},
 }
 KIS_TR_IDS = {
+ "/uapi/overseas-stock/v1/trading/inquire-paymt-stdr-balance": "CTRP6010R",
+ "/uapi/overseas-stock/v1/trading/inquire-period-trans": "CTOS4001R",
+ "/uapi/overseas-stock/v1/trading/inquire-present-balance": "CTRP6504R",
  "/uapi/overseas-price/v1/quotations/inquire-time-indexchartprice": "FHKST03030200",
  "/uapi/overseas-price/v1/quotations/price-detail": "HHDFS76200200",
  "/uapi/domestic-stock/v1/trading/inquire-daily-ccld": "TTTC0081R",
@@ -106,7 +112,15 @@ class ReadOnlyTransport:
                 raw = response.read(4 * 1024 * 1024 + 1)
                 if len(raw) > 4 * 1024 * 1024:
                     raise ReadFailure("RESPONSE_LIMIT")
-                payload = json.loads(raw)
+                if provider == "kis" and path in {
+                    "/uapi/overseas-stock/v1/trading/inquire-paymt-stdr-balance",
+                    "/uapi/overseas-stock/v1/trading/inquire-period-trans",
+                    "/uapi/overseas-stock/v1/trading/inquire-present-balance",
+                }:
+                    from .kis_usd_observations import decode_usd_response
+                    payload = decode_usd_response(raw)
+                else:
+                    payload = json.loads(raw)
                 event["status"] = "AVAILABLE"
                 return payload, {str(k).lower(): str(v) for k, v in response.headers.items()}
         except ReadFailure:
