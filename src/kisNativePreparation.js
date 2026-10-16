@@ -17,6 +17,7 @@ export const KIS_PREPARATION_LABELS = Object.freeze({
 
 export function kisPreparationFailureMessage(result = {}) {
   const code = [result.reasonCode, result.code, result.errorCode, result.reason].filter((v) => typeof v === "string").join(" ");
+  if (/KIS_NATIVE_TICK_WINDOW_UNAVAILABLE/.test(code)) return "오늘 장중에 필요한 길이의 체결 자료를 모을 시간이 부족해 시작을 보류했습니다. 다음 정규장에 다시 준비해 주세요.";
   if (/KIS_LABEL_SCOPE_UNPROVEN|LIVE_NATIVE_REVIEWED_LABEL_/.test(code)) {
     return "국내 시세의 분봉 시각 검증이 완료되지 않아 시작을 보류했습니다.";
   }
@@ -42,7 +43,7 @@ export function createKisPreparationCoordinator({ request, now = Date.now,
   function progress(flow, status, detail = "") {
     if (active.get(flow.scopeKey) !== flow) return;
     onProgress({ scopeKey: flow.scopeKey, flowId: flow.id, preparationId: flow.preparationId,
-      label: flow.label, status, detail, canCancel: !TERMINAL.has(status) && !["COMPLETE", "STARTING"].includes(status) });
+      label: flow.label, status, detail, publicProgress: flow.publicProgress || null, canCancel: !TERMINAL.has(status) && !["COMPLETE", "STARTING"].includes(status) });
   }
   async function cancelRemote(flow) {
     if (!flow.preparationId || flow.cancelSent) return;
@@ -69,6 +70,15 @@ export function createKisPreparationCoordinator({ request, now = Date.now,
     return Promise.all([...active.keys()].map((key) => cancel(key, reason)));
   }
   async function run({ body, scopeKey, label = "한국투자증권", confirmAndStart }) {
+    const options = body?.initializationOptions;
+    const nativeTicks = options?.method === "PUBLIC_H0STCNT0";
+    if (options !== undefined && options !== null) {
+      const exact = Object.keys(options).sort().join(",") === "cutoff,method";
+      const rest = options.method === "REVIEWED_REST" && options.cutoff === null;
+      const cutoff = typeof options.cutoff === "string" && /(?:Z|[+-]\d{2}:\d{2})$/.test(options.cutoff)
+        && Number.isFinite(Date.parse(options.cutoff)) && Date.parse(options.cutoff) % 300000 === 0;
+      if (!exact || (!rest && !(nativeTicks && cutoff))) throw error("시세 준비 방법과 종료 시각을 다시 선택해 주세요.", "KIS_PREPARATION_OPTIONS_INVALID");
+    }
     if (active.has(scopeKey)) throw error("이 계좌의 KIS 시작 준비가 이미 진행 중입니다.", "KIS_START_IN_PROGRESS");
     const flow = { scopeKey, label, id: ++sequence, preparationId: "", cancelled: false, cancelSent: false };
     active.set(scopeKey, flow);
@@ -85,7 +95,7 @@ export function createKisPreparationCoordinator({ request, now = Date.now,
       }
       if (begin?.ok !== true || !flow.preparationId || begin.status !== "PREPARING_PUBLIC"
           || !Number.isFinite(begin.maximumPreparationSeconds) || begin.maximumPreparationSeconds <= 0
-          || begin.maximumPreparationSeconds > 660 || begin.runtimeStarted !== false) {
+          || begin.maximumPreparationSeconds > (nativeTicks ? 16200 : 660) || begin.runtimeStarted !== false) {
         throw error("KIS 시세 준비 응답을 확인할 수 없습니다.", "KIS_PREPARATION_INVALID");
       }
       const deadline = startedAt + begin.maximumPreparationSeconds * 1000;
@@ -105,6 +115,7 @@ export function createKisPreparationCoordinator({ request, now = Date.now,
             : result.status === "EXPIRED" ? "KIS 시세 준비 시간이 만료되었습니다."
               : kisPreparationFailureMessage(result), result.reasonCode || `KIS_PREPARATION_${result.status}`);
         }
+        flow.publicProgress = sanitizePublicProgress(result.publicProgress);
         progress(flow, result.status);
         if (result.status === "READY") { challenge = result; break; }
         await sleep(pollMilliseconds);
@@ -132,4 +143,12 @@ export function createKisPreparationCoordinator({ request, now = Date.now,
     }
   }
   return { run, cancel, cancelAll, activeCount: () => active.size };
+}
+
+export function sanitizePublicProgress(value) {
+  if (!value || !["CAPTURING_NATIVE_TICKS", "REPLAYING_NATIVE_TICKS"].includes(value.phase)
+      || !Number.isSafeInteger(value.frameCount) || value.frameCount < 0
+      || !Number.isFinite(value.elapsedSeconds) || value.elapsedSeconds < 0 || value.elapsedSeconds > 16200
+      || typeof value.cutoff !== "string" || value.cutoff.length > 40 || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value.cutoff) || !Number.isFinite(Date.parse(value.cutoff))) return null;
+  return { phase: value.phase, frameCount: value.frameCount, elapsedSeconds: value.elapsedSeconds, cutoff: value.cutoff };
 }

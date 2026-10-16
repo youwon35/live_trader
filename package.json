@@ -24,7 +24,8 @@
     "ui:smoke": "node scripts/ui_smoke.mjs",
     "test:operator-insights": "node --test scripts/operator_insights.test.mjs",
     "ui:operator-insights": "node scripts/operator_insights_fixture.mjs",
-    "test:runtime-selection": "node --test scripts/runtime_selection.test.mjs"
+    "test:runtime-selection": "node --test scripts/runtime_selection.test.mjs",
+    "test:preparation": "node --test scripts/market_gap_preparation.test.mjs scripts/market_gap_ui.test.mjs scripts/kis_native_preparation.test.mjs scripts/kis_native_preparation_ui.test.mjs scripts/kis_native_api.test.mjs scripts/kis_manual_start_ui.test.mjs scripts/kis_stop_cleanup_ui.test.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

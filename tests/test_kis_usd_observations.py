@@ -10,17 +10,21 @@ from unittest.mock import patch
 # No operational package __init__/env loader/order imports. The only adapter
 # import used by the old reader is stubbed; USD paths never call these helpers.
 ROOT = Path(__file__).resolve().parents[1]
-pkg = types.ModuleType('live_trader')
-pkg.__path__ = [str(ROOT / 'candidate/live_trader')]
-sys.modules['live_trader'] = pkg
-adapters = types.ModuleType('live_trader.live_adapters')
+# A private package keeps the intentionally forbidden signing adapters local
+# to this read-only fixture. It must never replace a real running package.
+PACKAGE = '_kis_usd_observation_fixture_isolated'
+pkg = types.ModuleType(PACKAGE)
+pkg.__path__ = [str(ROOT / 'live_trader')]
+sys.modules[PACKAGE] = pkg
+adapters = types.ModuleType(PACKAGE + '.live_adapters')
 def forbidden(*args, **kwargs):
     raise AssertionError('ORDER_OR_SIGNING_HELPER_USED')
 for key in ('build_upbit_authorization', 'sign_binance_query', 'split_kis_account'):
     setattr(adapters, key, forbidden)
-sys.modules['live_trader.live_adapters'] = adapters
-from live_trader import kis_usd_observations as usd
-from live_trader import read_only_account as ro
+sys.modules[PACKAGE + '.live_adapters'] = adapters
+import importlib
+usd = importlib.import_module(PACKAGE + '.kis_usd_observations')
+ro = importlib.import_module(PACKAGE + '.read_only_account')
 
 SETTINGS = {'KIS_APP_KEY': 'SYNTHETIC_KEY', 'KIS_APP_SECRET': 'SYNTHETIC_SECRET',
             'KIS_ACCOUNT_NO': '12345678-01', 'KIS_ACCOUNT_PRODUCT_CODE': '01',
@@ -331,3 +335,21 @@ class ActualReaderIntegrationTests(unittest.TestCase):
         self.assertEqual(opener.calls,[])
 
 if __name__=='__main__':unittest.main()
+
+class ImportIsolationTests(unittest.TestCase):
+    def test_loading_readonly_fixture_preserves_existing_production_package_and_adapters(self):
+        import runpy
+        production = types.ModuleType('live_trader')
+        production_adapters = types.ModuleType('live_trader.live_adapters')
+        production_adapters.build_kis_live_order_request = object()
+        production_adapters.kis_prepared_payload_hash = object()
+        with patch.dict(sys.modules, {'live_trader': production,
+                                     'live_trader.live_adapters': production_adapters}):
+            runpy.run_path(str(Path(__file__).resolve()), run_name='_readonly_fixture_import_probe')
+            self.assertIs(sys.modules['live_trader'], production)
+            self.assertIs(sys.modules['live_trader.live_adapters'], production_adapters)
+            self.assertIs(production_adapters.build_kis_live_order_request,
+                          sys.modules['live_trader.live_adapters'].build_kis_live_order_request)
+            self.assertIs(production_adapters.kis_prepared_payload_hash,
+                          sys.modules['live_trader.live_adapters'].kis_prepared_payload_hash)
+

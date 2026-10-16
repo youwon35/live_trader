@@ -33,6 +33,11 @@ def build_live_initialization(public_data, *, context, runtime_scope, deployment
     public_data = validate_bound_native_initialization(public_data, portfolio_hash=specs[0].portfolio_hash,
         promotion_policy_hash=public_data['promotionPolicyHash'])
     assert_initialization_matches_runtime(public_data, specs)
+    if public_data.get('schemaVersion') == 'source-bound-native-tick-initialization-v1':
+        capture = public_data['captureManifest']['scope']
+        if capture['mode'] != 'LIVE' or (capture['accountFingerprint'], capture['credentialConfigurationHash'], capture['runtimeScopeId']) != (
+                scope.account_fingerprint, scope.credential_configuration_hash, scope.runtime_id):
+            raise ValueError('LIVE_NATIVE_TICK_PAPER_OR_FOREIGN_ACCOUNT_CAPTURE_REJECTED')
     if (scope.broker_id != 'kis' or scope.capital_currency != 'KRW' or not scope.account_binding_id
             or context['capitalCurrency'] != 'KRW' or context['runtimeScopeId'] != scope.runtime_id
             or context['deploymentId'] != scope.deployment_id or context['profileId'] != scope.profile_id

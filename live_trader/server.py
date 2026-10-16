@@ -41,6 +41,7 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
         "/api/paper-candidates/accounts",
         "/api/preparation/sources",
         "/api/runtime/kis-native-prepare-status",
+        "/api/preparation/market-gaps/status",
         "/api/upbit-functional/status",
         "/api/binance-spot-functional/status",
     }
@@ -49,6 +50,8 @@ _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
         "/api/runtime/kis-manual-start-challenge",
         "/api/runtime/kis-native-prepare-cancel",
+        "/api/preparation/market-gaps/begin",
+        "/api/preparation/market-gaps/cancel",
         "/api/runtime/kis-stop-and-reconcile",
         "/api/paper-candidates/import",
         "/api/paper-candidates/review",
@@ -423,6 +426,13 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path in _FUNCTIONAL_STATUS_PATHS and not self._authorize_functional_http(
             require_origin=False
         ):
+            return
+        if parsed.path == "/api/preparation/market-gaps/status":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if set(query) != {"preparationId"} or len(query["preparationId"]) != 1:
+                self.send_json({"ok": False, "reasonCode": "EXACT_PREPARATION_ID_REQUIRED"})
+                return
+            self.send_json(state.public_market_gap_preparation_status(query["preparationId"][0]))
             return
         if parsed.path == "/api/runtime/kis-native-prepare-status":
             query = parse_qs(parsed.query, keep_blank_values=True)
@@ -916,6 +926,15 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/strategy-cycle":
             self.send_json(state.run_strategy_cycle(str(payload.get("profile_id", "stock"))))
             return
+        if parsed.path == "/api/preparation/market-gaps/begin":
+            self.send_json(state.begin_public_market_gap_preparation(payload))
+            return
+        if parsed.path == "/api/preparation/market-gaps/cancel":
+            if type(payload) is not dict or set(payload) != {"preparationId"}:
+                self.send_json({"ok": False, "reasonCode": "EXACT_PREPARATION_ID_REQUIRED"})
+                return
+            self.send_json(state.cancel_public_market_gap_preparation(payload["preparationId"]))
+            return
         if parsed.path == "/api/runtime/kis-native-prepare-cancel":
             if type(payload) is not dict or set(payload) != {"preparationId"}:
                 self.send_json({"ok": False, "reason": "kis-native-preparation-exact-id-required"})
@@ -927,9 +946,18 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 str(payload.get("profile_id", "stock")), str(payload.get("mode", "MONITOR")),
                 str(payload.get("portfolio_id", "")), str(payload.get("deployment_id", "")),
                 str(payload.get("strategy_id", "")),
+                **({"initialization_options": payload["initializationOptions"]} if "initializationOptions" in payload else {}),
             ))
             return
         if parsed.path == "/api/runtime/start":
+            # An optional UI diagnostic note does not add execution authority.
+            # Its freshness/scope must still be true if the caller includes it.
+            if "marketGapPreparationId" in payload:
+                selection = {key: str(payload.get(key) or "") for key in (
+                    "profile_id", "mode", "portfolio_id", "deployment_id", "strategy_id")}
+                if not state.public_market_gap_start_note_current(payload["marketGapPreparationId"], selection):
+                    self.send_json({"ok": False, "reason": "선택한 구성의 체결 공백 점검이 변경됐거나 오래됐습니다. 다시 점검해 주세요.", "runtimeStarted": False, "brokerSubmissionPerformed": False})
+                    return
             requested_purpose = str(
                 payload.get("execution_purpose")
                 or payload.get("executionPurpose")

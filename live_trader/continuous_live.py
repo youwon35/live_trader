@@ -518,9 +518,10 @@ class LiveContinuousController:
                 if not isinstance(prepared_native_context,LivePreparedKisFeed) or self.runtime_scope is None:
                     return {"ok":False,"reason":"live-kis-native-public-preparation-required","snapshot":state.snapshot()}
                 prepared_native_context.assert_current()
-                validate_live_initialization(prepared_native_context.receipt,
-                    context=prepared_native_context.receipt['context'],runtime_scope=self.runtime_scope,
-                    deployment_manifest_hash=prepared_native_context.receipt['deploymentManifestHash'],specs=specs)
+                with prepared_native_context.initialization_scope():
+                    validate_live_initialization(prepared_native_context.receipt,
+                        context=prepared_native_context.receipt['context'],runtime_scope=self.runtime_scope,
+                        deployment_manifest_hash=prepared_native_context.receipt['deploymentManifestHash'],specs=specs)
             elif prepared_native_context is not None:
                 return {"ok":False,"reason":"live-native-preparation-route-mismatch","snapshot":state.snapshot()}
             if normalized_mode != "MONITOR" and self._native_capital_specs(specs):
@@ -570,9 +571,10 @@ class LiveContinuousController:
             if native_prepared_required:
                 # Public REST/socket I/O already completed outside state/route/
                 # controller locks. Only verified local data seeds MONITOR.
-                prepared_warmup = engine.seed_live_initialization(prepared_native_context.receipt,
-                    context=prepared_native_context.receipt['context'],runtime_scope=self.runtime_scope,
-                    deployment_manifest_hash=prepared_native_context.receipt['deploymentManifestHash'])
+                with prepared_native_context.initialization_scope():
+                    prepared_warmup = engine.seed_live_initialization(prepared_native_context.receipt,
+                        context=prepared_native_context.receipt['context'],runtime_scope=self.runtime_scope,
+                        deployment_manifest_hash=prepared_native_context.receipt['deploymentManifestHash'])
             if native_prepared_required:
                 with self._prepared_start_read_phase(prepared_native_context):
                     restore_context=self._restore_context_assessment(specs,engine)

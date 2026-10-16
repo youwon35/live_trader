@@ -35,11 +35,13 @@ READ_PATHS = {
          "/uapi/overseas-stock/v1/trading/inquire-ccnl",
          "/uapi/overseas-price/v1/quotations/price",
          "/uapi/overseas-stock/v1/trading/inquire-nccs",
+         "/uapi/overseas-stock/v1/trading/foreign-margin",
          "/uapi/overseas-stock/v1/trading/inquire-paymt-stdr-balance",
          "/uapi/overseas-stock/v1/trading/inquire-period-trans",
          "/uapi/overseas-stock/v1/trading/inquire-present-balance"},
 }
 KIS_TR_IDS = {
+ "/uapi/overseas-stock/v1/trading/foreign-margin": "TTTC2101R",
  "/uapi/overseas-stock/v1/trading/inquire-paymt-stdr-balance": "CTRP6010R",
  "/uapi/overseas-stock/v1/trading/inquire-period-trans": "CTOS4001R",
  "/uapi/overseas-stock/v1/trading/inquire-present-balance": "CTRP6504R",
@@ -112,7 +114,10 @@ class ReadOnlyTransport:
                 raw = response.read(4 * 1024 * 1024 + 1)
                 if len(raw) > 4 * 1024 * 1024:
                     raise ReadFailure("RESPONSE_LIMIT")
-                if provider == "kis" and path in {
+                if provider == "kis" and path == "/uapi/overseas-stock/v1/trading/foreign-margin":
+                    from .kis_margin_observation import decode_margin_response
+                    payload = decode_margin_response(raw)
+                elif provider == "kis" and path in {
                     "/uapi/overseas-stock/v1/trading/inquire-paymt-stdr-balance",
                     "/uapi/overseas-stock/v1/trading/inquire-period-trans",
                     "/uapi/overseas-stock/v1/trading/inquire-present-balance",
@@ -268,6 +273,17 @@ class ReadOnlyBrokerReader:
             result["status"] = "INVALID_ACCOUNT_RESPONSE"
         result["asOf"] = datetime.now(timezone.utc).isoformat()
         return result
+
+    def observe_kis_usd_financial_preparation(self):
+        """One currency-margin GET, sanitized information only; no cash inference."""
+        from .kis_margin_observation import KisMarginObservationReader, safe_observation_summary
+        from .kis_usd_preparation import build_usd_preparation_diagnostic
+        try:
+            capture = KisMarginObservationReader(self).observe(max_pages=1)
+            return build_usd_preparation_diagnostic(safe_observation_summary(capture))
+        except (ValueError, OSError, RuntimeError, TypeError, KeyError):
+            # Broker text and private response fields cannot enter the report.
+            return build_usd_preparation_diagnostic()
 
     def kis_reference_price(self, lane, symbol):
         """Official GET quote, no draft selection. NASD scope stays explicit/unverified."""

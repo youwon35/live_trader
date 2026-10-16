@@ -4070,7 +4070,7 @@ def _commit_kis_native_start_preflight(plan, truth, entry):
     return preflight
 
 
-def _prepare_kis_native_manual_challenge(profile_id, mode, portfolio_id, deployment_id, strategy_id, *, _plan=None, _entry=None, _publish=None):
+def _prepare_kis_native_manual_challenge(profile_id, mode, portfolio_id, deployment_id, strategy_id, *, _plan=None, _entry=None, _publish=None, _initialization_options=None):
     from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
     from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
     from .kis_native_public_preparation import prepare_live_kis_native
@@ -4085,7 +4085,9 @@ def _prepare_kis_native_manual_challenge(profile_id, mode, portfolio_id, deploym
             settings = runtime_settings()
         _assert_kis_native_start_outside_locks()
         prepared = prepare_live_kis_native(APP_DATA_ROOT, plan=plan, settings=settings,
-            binding_reader=lambda: registry.binding(entry), preparation_guard=lambda: registry.binding(entry), maximum_seconds=645)
+            binding_reader=lambda: registry.binding(entry), preparation_guard=lambda: registry.binding(entry), maximum_seconds=645,
+            **({'initialization_options':_initialization_options,
+                'public_progress':lambda progress:_publish('PREPARING_PUBLIC',progress)} if _initialization_options is not None and _initialization_options.method=='PUBLIC_H0STCNT0' else {}))
         registry.attach(entry, prepared)
         if _publish is not None:
             _publish("CHECKING_ACCOUNT")
@@ -4225,19 +4227,23 @@ def _start_kis_prepared_native_runtime(profile_id, mode, portfolio_id, deploymen
 
 
 def prepare_kis_scoped_manual_start(profile_id: str, mode: str, portfolio_id: str = "",
-                                    deployment_id: str = "", strategy_id: str = "") -> dict[str, Any]:
+                                    deployment_id: str = "", strategy_id: str = "", *, initialization_options=None) -> dict[str, Any]:
     from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
     from .kis_native_start_preparation_jobs import KIS_NATIVE_PREPARATION_JOBS
     from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
     entry = None
     try:
+        from .kis_native_preparation_options import parse_native_preparation_options
+        options=parse_native_preparation_options(initialization_options)
         KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.register_invalidation_listener(KIS_NATIVE_START_REGISTRY.invalidate_nonce)
         with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
             plan = _capture_kis_native_start_plan(profile_id, mode, portfolio_id, deployment_id, strategy_id)
             entry = KIS_NATIVE_START_REGISTRY.reserve(_kis_native_plan_binding(plan))
-        return KIS_NATIVE_PREPARATION_JOBS.begin(entry=entry, run=lambda publish:
+        return KIS_NATIVE_PREPARATION_JOBS.begin(entry=entry,
+            **({'initialization_options':options} if options.method=='PUBLIC_H0STCNT0' else {}), run=lambda publish:
             _prepare_kis_native_manual_challenge(profile_id, mode, portfolio_id, deployment_id, strategy_id,
-                _plan=plan, _entry=entry, _publish=publish))
+                _plan=plan, _entry=entry, _publish=publish,
+                **({'_initialization_options':options} if options.method=='PUBLIC_H0STCNT0' else {})))
     except Exception as exc:
         if entry is not None:
             KIS_NATIVE_START_REGISTRY.invalidate(entry)
@@ -29591,3 +29597,77 @@ def operator_order_history(order_id, offset=0):
     from .operator_review import read_order_audit
     result = read_order_audit(AUDIT_STORE.path, order_id, offset)
     return {"ok": True, **redact_sensitive_payload(result)}
+
+
+# Public market-gap observations are optional UI diagnostics, not permits.
+_PUBLIC_MARKET_GAP_JOBS = None
+_PUBLIC_MARKET_GAP_JOBS_LOCK = threading.RLock()
+
+def _public_market_gap_jobs():
+    global _PUBLIC_MARKET_GAP_JOBS
+    with _PUBLIC_MARKET_GAP_JOBS_LOCK:
+        if _PUBLIC_MARKET_GAP_JOBS is None:
+            from trading_runtime.market_gap_preparation import MarketGapPreparationJobs
+            _PUBLIC_MARKET_GAP_JOBS = MarketGapPreparationJobs()
+        return _PUBLIC_MARKET_GAP_JOBS
+
+def begin_public_market_gap_preparation(payload):
+    from .market_gap_preparation import capture_preparation,safe_failure
+    try:
+        module=sys.modules[__name__]
+        plan,current,final=capture_preparation(module,payload)
+        return _public_market_gap_jobs().begin(plan,binding_is_current=current,final_binding_is_current=final)
+    except Exception:
+        return safe_failure()
+
+def public_market_gap_preparation_status(preparation_id):
+    from .market_gap_preparation import safe_failure
+    try:
+        if _PUBLIC_MARKET_GAP_JOBS is None:
+            return {"ok":False,"status":"UNKNOWN","reasonCode":"PREPARATION_NOT_FOUND","authorityGranted":False,"qualificationGranted":False,"runtimeStarted":False}
+        return _PUBLIC_MARKET_GAP_JOBS.status(preparation_id)
+    except Exception:
+        return safe_failure()
+
+def cancel_public_market_gap_preparation(preparation_id):
+    if _PUBLIC_MARKET_GAP_JOBS is None:
+        return {"ok":True,"preparationId":preparation_id,"status":"CANCELLED","authorityGranted":False,"qualificationGranted":False,"runtimeStarted":False}
+    return _PUBLIC_MARKET_GAP_JOBS.cancel(preparation_id)
+
+def public_market_gap_start_note_current(preparation_id,payload):
+    """Validate an optional diagnostic note; no Start authority is added."""
+    from .market_gap_preparation import capture_plan
+    try:
+        if _PUBLIC_MARKET_GAP_JOBS is None:return False
+        original=_PUBLIC_MARKET_GAP_JOBS.plan_for_diagnostic_note(preparation_id)
+        if original is None:return False
+        plan=capture_plan(sys.modules[__name__],payload,observed_at_utc=original['observedAtUtc'])
+        return _PUBLIC_MARKET_GAP_JOBS.current_for_start_note(preparation_id,binding_hash=plan['bindingHash'])
+    except Exception:return False
+
+def invalidate_public_market_gap_preparations(*,profile_id="",runtime_id="",deployment_id=""):
+    if _PUBLIC_MARKET_GAP_JOBS is None:return
+    def matches(binding):
+        selection=binding.get('selection') or {}
+        return ((not profile_id or selection.get('profile_id')==profile_id)
+            and (not runtime_id or binding.get('runtimeScopeId')==runtime_id)
+            and (not deployment_id or binding.get('deploymentId')==deployment_id))
+    _PUBLIC_MARKET_GAP_JOBS.invalidate_matching(matches)
+
+def _public_gap_stop_invalidator(function):
+    @wraps(function)
+    def wrapped(profile_id="",*,runtime_id="",deployment_id="",**kwargs):
+        # This outer wrapper closes only diagnostics before any STOP lock waits.
+        invalidate_public_market_gap_preparations(profile_id=profile_id,runtime_id=runtime_id,deployment_id=deployment_id)
+        return function(profile_id,runtime_id=runtime_id,deployment_id=deployment_id,**kwargs)
+    return wrapped
+
+def _public_gap_settings_invalidator(function):
+    @wraps(function)
+    def wrapped(*args,**kwargs):
+        invalidate_public_market_gap_preparations()
+        return function(*args,**kwargs)
+    return wrapped
+
+stop_continuous_runtime = _public_gap_stop_invalidator(stop_continuous_runtime)
+save_environment_settings = _public_gap_settings_invalidator(save_environment_settings)

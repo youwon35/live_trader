@@ -39,6 +39,13 @@ class LivePreparedKisFeed:
     def __reduce__(self):
         raise TypeError('Live prepared native sockets cannot be serialized or cold-restored')
 
+    def initialization_scope(self):
+        """Explicit already-verified local data snapshot, no new IO or grant."""
+        from contextlib import nullcontext
+        from trading_runtime.native_tick_capture_store import native_tick_artifact_scope
+        reader=getattr(self,'_tick_artifact_reader',None)
+        return native_tick_artifact_scope(reader) if reader is not None else nullcontext()
+
     def revoke(self,reason='REVOKED'):
         # Safe while a caller holds state/route locks: no close/join/I/O here.
         self._revoked.set()

@@ -1,3 +1,4 @@
+import { createMarketGapCoordinator } from "./marketGapPreparation.js";
 import { createKisPreparationCoordinator } from "./kisNativePreparation.js";
 
 export const API_DEFAULT_TIMEOUT_MS = 15_000;
@@ -33,9 +34,24 @@ export function cancelKisStartPreparation(scopeKey) { return kisPreparations.can
 export function cancelAllKisStartPreparations(reason = "설정 또는 실행 상태가 변경되어 준비를 취소했습니다.") {
   return kisPreparations.cancelAll(reason);
 }
+let marketGapPresenter = null;
+const marketGapPreparations = createMarketGapCoordinator({
+  begin: (body) => request("/api/preparation/market-gaps/begin", { method: "POST", body, timeoutMs: 15000 }),
+  status: (id) => request(`/api/preparation/market-gaps/status?preparationId=${encodeURIComponent(id)}`, { timeoutMs: 5000 }),
+  cancelRemote: (id) => request("/api/preparation/market-gaps/cancel", { method: "POST", body: { preparationId: id }, timeoutMs: 5000 }),
+  onView: (view) => marketGapPresenter?.(view),
+});
+export function registerMarketGapPresenter(presenter) { marketGapPresenter = presenter; return () => { if (marketGapPresenter === presenter) marketGapPresenter = null; }; }
+export const continueMarketGapPreparation = (key) => marketGapPreparations.accept(key);
+export const cancelMarketGapPreparation = (key) => marketGapPreparations.cancel(key);
+export const cancelAllMarketGapPreparations = () => marketGapPreparations.cancelAll();
+export function prepareMarketGapsForStart(selection, { accountKey, label, continueStart }) {
+  return marketGapPreparations.run({ scopeKey: String(accountKey), label, body: selection, continueStart });
+}
 let functionalHttpSessionFlight = null;
 let functionalHttpSessionGeneration = 0;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
+  "/api/preparation/market-gaps/begin", "/api/preparation/market-gaps/cancel",
   "/api/runtime/kis-manual-start-challenge",
   "/api/runtime/kis-native-prepare-cancel",
   "/api/runtime/kis-stop-and-reconcile",
@@ -53,6 +69,7 @@ const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/crypto-first-live/reprepare",
 ]);
 const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
+  "/api/preparation/market-gaps/status",
   "/api/paper-candidates",
   "/api/paper-candidates/accounts",
   "/api/preparation/sources",
@@ -344,6 +361,7 @@ export async function getEnvSettings() {
 }
 
 export async function saveEnvSettings(values, confirmed = false) {
+  void cancelAllMarketGapPreparations();
   void cancelAllKisStartPreparations();
   const mutation = (confirmation) => request("/api/env-settings", {
     method: "POST",
@@ -369,6 +387,7 @@ export async function setMode(mode) {
 }
 
 export async function setFlag(name, value, confirmed = false) {
+  void cancelAllMarketGapPreparations();
   void cancelAllKisStartPreparations();
   const mutation = (confirmation) => request("/api/flag", {
     method: "POST",
@@ -391,6 +410,7 @@ export function nativeEmergencyStopAvailable() {
 }
 
 export async function engageNativeEmergencyStop(reason = "operator global Kill Switch") {
+  void cancelAllMarketGapPreparations();
   void cancelAllKisStartPreparations("긴급정지가 요청되어 준비를 취소했습니다.");
   const bridge = globalThis.window?.pywebview?.api;
   if (typeof bridge?.engage_emergency_stop !== "function") {
@@ -467,6 +487,7 @@ export async function setAutomationProfile(profileId, enabled, provider, mode) {
 }
 
 export async function setRiskSetting(name, value) {
+  void cancelAllMarketGapPreparations();
   void cancelAllKisStartPreparations();
   return request("/api/risk-setting", { method: "POST", body: { name, value } });
 }
@@ -837,13 +858,15 @@ export async function startContinuousRuntime(
   portfolioId = "",
   deploymentId = "",
   strategyId = "",
-  { accountKey = profileId, label = "한국투자증권" } = {},
+  { accountKey = profileId, label = "한국투자증권", marketGapPreparationId = "", initializationOptions = null } = {},
 ) {
   const nativeKisStart = profileId === "stock" && ["SMALL_LIVE", "FULL_LIVE"].includes(mode);
   const body = {
     profile_id: profileId, mode, portfolio_id: portfolioId,
     deployment_id: deploymentId, strategy_id: strategyId,
   };
+  if (marketGapPreparationId) body.marketGapPreparationId = marketGapPreparationId;
+  if (nativeKisStart && initializationOptions !== null) body.initializationOptions = initializationOptions;
   if (!nativeKisStart) return request("/api/runtime/start", { method: "POST", body, timeoutMs: 30000 });
   const bridge = globalThis.window?.pywebview?.api;
   if (typeof bridge?.request_kis_operational_start_confirmation !== "function") {
@@ -878,6 +901,7 @@ export async function startContinuousRuntime(
 }
 
 export async function stopContinuousRuntime(profileId = "", { runtimeId = "", deploymentId = "" } = {}) {
+  void cancelAllMarketGapPreparations();
   if (!profileId || profileId === "stock") void cancelAllKisStartPreparations("실행 중지가 요청되어 준비를 취소했습니다.");
   const exactStockScope = profileId === "stock" && runtimeId !== "" && deploymentId !== "";
   const path = exactStockScope ? "/api/runtime/kis-stop-and-reconcile" : "/api/runtime/stop";
@@ -913,7 +937,8 @@ export async function request(path, options = {}) {
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const method = options.method ?? "GET";
-    const kisPreparationMutation = ["/api/runtime/kis-manual-start-challenge", "/api/runtime/kis-native-prepare-cancel"].includes(path);
+    const kisPreparationMutation = ["/api/runtime/kis-manual-start-challenge", "/api/runtime/kis-native-prepare-cancel",
+      "/api/preparation/market-gaps/begin", "/api/preparation/market-gaps/cancel"].includes(path);
     const functionalHeaders = kisPreparationMutation ? await new Promise((resolve, reject) => {
         let waiterFlight = null;
         const aborted = () => {

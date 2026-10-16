@@ -242,6 +242,14 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
         else:
             read = reader.observe_preparation if before["kind"] == "SEALED_SOURCE" else reader.read
             observation = read(selected["broker"], selected["symbol"], side=draft["side"], quantity=numbers["quantity"], limit_price=numbers["limitPrice"])
+        if selected["broker"] == "kis-us":
+            from .kis_usd_preparation import build_usd_preparation_diagnostic, validate_usd_preparation_diagnostic
+            observe_usd = getattr(reader, "observe_kis_usd_financial_preparation", None)
+            try:
+                diagnostic = observe_usd() if callable(observe_usd) else build_usd_preparation_diagnostic()
+                observation["usdCashDiagnostics"] = validate_usd_preparation_diagnostic(diagnostic)
+            except (ValueError, OSError, RuntimeError, TypeError, KeyError):
+                observation["usdCashDiagnostics"] = build_usd_preparation_diagnostic()
         if settings_hash is not None and (stable_sha256(reader.settings) != settings_hash or (uses_runtime_settings and stable_sha256(runtime_settings()) != settings_hash)):
             raise ValueError("조회 중 저장 계좌 설정이 바뀌어 결과를 폐기했습니다.")
         if before["kind"] == "SEALED_SOURCE" or (selected.get("executionSizing") or {}).get("quantityContract") is not None:
@@ -288,6 +296,9 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
         {"code": "ORDER_SPECIFIC_RISK", "status": "UNKNOWN", "detail": "정적 LOT_SIZE·PRICE_FILTER·최소금액 관측은 로컬 현금 준비 결과에 표시됩니다. API 키 주문 권한·동적 가격 필터·노출 한도·조건부 주문 및 실행 허가는 미완료입니다." if before["kind"] == "SEALED_SOURCE" else "API 키 주문 권한·LOT_SIZE/MIN_NOTIONAL·수수료·노출 한도·선물 마진 및 조건부 주문은 이 조회로 검증되지 않습니다."},
         {"code": "LIVE_AUTHORITY", "status": "BLOCKED", "detail": "계좌 바인딩·정규 승급·현재 위험 한도·Kill/모드·수동 확인은 기존 Live 절차에서 직접 확인해야 합니다. 이 보고서는 주문 권한을 만들지 않습니다."},
     ]
+    if "usdCashDiagnostics" in observation:
+        from .kis_usd_preparation import usd_preparation_checks
+        checks.extend(usd_preparation_checks(observation["usdCashDiagnostics"]))
     body = {"ok": True, "schemaVersion": SCHEMA, **FLAGS, "asOf": now.isoformat(),
             "expiresAt": (now + timedelta(seconds=60)).isoformat(), "status": "READ_ONLY_INFORMATION",
             "source": before, "draft": draft, "observation": observation, "checks": checks,

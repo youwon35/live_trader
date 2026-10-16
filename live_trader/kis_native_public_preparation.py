@@ -125,9 +125,20 @@ def fetch_current_initialization(spec,fetcher,*,cutoff,objects,utc_clock):
 
 
 def prepare_live_kis_native(root,*,plan,binding_reader,preparation_guard,settings,
-        utc_clock=None,monotonic_clock=None,maximum_seconds=660,feed_factory=None,transport=None):
+        utc_clock=None,monotonic_clock=None,maximum_seconds=660,feed_factory=None,transport=None,
+        initialization_options=None,public_progress=None):
     """State-owned plan only; serialized request data is never accepted as it."""
     utc_clock=utc_clock or (lambda:datetime.now(timezone.utc))
+    from .kis_native_preparation_options import NativePreparationOptions,parse_native_preparation_options
+    if initialization_options is not None:
+        if type(initialization_options) is not NativePreparationOptions:
+            raise ValueError('KIS_NATIVE_PREPARATION_TYPED_OPTIONS_REQUIRED')
+        checked=parse_native_preparation_options({'method':initialization_options.method,'cutoff':initialization_options.cutoff},now=utc_clock())
+        if checked.method=='PUBLIC_H0STCNT0':
+            return prepare_live_kis_native_ticks(root,plan=plan,binding_reader=binding_reader,
+                preparation_guard=preparation_guard,settings=settings,cutoff=checked.cutoff,
+                utc_clock=utc_clock,monotonic_clock=monotonic_clock,feed_factory=feed_factory,
+                public_progress=public_progress)
     loaded=plan['loaded'];specs=tuple(loaded.specs)
     scope=plan['runtimeScope'];context=plan['context']
     policy=validate_paper_promotion_policy(plan['promotionPolicy'],require_promotion=True)
@@ -184,3 +195,64 @@ def prepare_live_kis_native(root,*,plan,binding_reader,preparation_guard,setting
         deployment_manifest_hash=plan['deploymentManifestHash'],initialize=initialize,binding_reader=binding_reader,
         preparation_guard=preparation_guard,utc_clock=utc_clock,monotonic_clock=monotonic_clock,
         maximum_seconds=maximum_seconds,portfolio_path=plan['portfolioPath'],artifact_root=plan['artifactRoot'])
+
+
+def prepare_live_kis_native_ticks(root,*,plan,binding_reader,preparation_guard,settings,cutoff,
+        utc_clock=None,monotonic_clock=None,feed_factory=None,public_progress=None):
+    """Source-owned long PUBLIC data stage; existing START authority is unchanged.
+
+    The selection request carries no initialization/approval/account payload.
+    All account reads, native confirmation, session CAS and financial gates are
+    still performed by the original state-owned normal preparation workflow.
+    """
+    from trading_runtime.native_tick_collector import collect_native_tick_initialization,public_feed_binding
+    from trading_runtime.native_tick_initialization import canonical_graph
+    from trading_runtime.native_tick_capture_store import native_tick_artifact_scope
+    from .kis_native_initialization import build_live_initialization
+    from .kis_prepared_native_feed import LivePreparedKisFeed
+    utc_clock=utc_clock or (lambda:datetime.now(timezone.utc))
+    loaded=plan['loaded'];specs=tuple(loaded.specs);scope=plan['runtimeScope'];context=plan['context']
+    policy=validate_paper_promotion_policy(plan['promotionPolicy'],require_promotion=True)
+    profiles=[row for row in saved_account_profiles(settings) if row.get('brokerId')=='kis']
+    if len(profiles)!=1 or any(profiles[0].get(k)!=scope.get(k) for k in ('accountFingerprint','credentialConfigurationHash','accountBindingId')):
+        raise ValueError('LIVE_NATIVE_CURRENT_SAVED_ACCOUNT_CHANGED')
+    if settings.get('KIS_ENV','').lower() not in {'','real','live'}:
+        raise ValueError('LIVE_NATIVE_PRODUCTION_PUBLIC_DATA_REQUIRED')
+    cano,product=split_kis_account(settings['KIS_ACCOUNT_NO'],settings['KIS_ACCOUNT_PRODUCT_CODE'])
+    factory=feed_factory or feeds_for_specs
+    feeds=tuple(factory(specs,prefer_kis=True,kis_demo=False,kis_app_key=settings['KIS_APP_KEY'],
+        kis_app_secret=settings['KIS_APP_SECRET'],kis_account_id=cano+'-'+product,
+        kis_websocket_owner_id='live-native-tick-preparation:'+uuid4().hex))
+    if len(feeds)!=1:
+        raise ValueError('LIVE_NATIVE_TICK_ONE_PUBLIC_FEED_REQUIRED')
+    feed=feeds[0];graph=canonical_graph(loaded,policy);graph_hash=stable_sha256(graph)
+    expected_binding={key:plan[key] for key in ('context','runtimeScope','deploymentManifestHash')}
+    def current_scope():
+        preparation_guard()
+        if binding_reader()!=expected_binding:
+            raise ValueError('LIVE_NATIVE_TICK_STATE_SCOPE_CHANGED')
+        return {'mode':'LIVE','portfolioHash':loaded.portfolio_hash,'promotionPolicyHash':policy['policyHash'],
+            'sourceGraphHash':graph_hash,'runtimeScopeId':context['runtimeScopeId'],
+            'accountFingerprint':scope['accountFingerprint'],'credentialConfigurationHash':scope['credentialConfigurationHash'],
+            **public_feed_binding(feed)}
+    captured=None
+    try:
+        objects=plan.get('calendarObjects') or calendar_objects()
+        captured=collect_native_tick_initialization(feed=feed,loaded=loaded,promotion_policy=policy,
+            scope=current_scope(),scope_reader=current_scope,raw_root=Path(root)/'logs/native_tick_objects',
+            calendar_bytes=objects['XKRX'],cutoff=cutoff,preparation_guard=preparation_guard,
+            utc_clock=utc_clock,monotonic_clock=monotonic_clock,public_progress=public_progress,
+            cancellation_guard=preparation_guard,calendar_objects=objects)
+        with native_tick_artifact_scope(captured.reader):
+            public=captured.take(mode='LIVE',scope=current_scope())
+            receipt=build_live_initialization(public,context=context,runtime_scope=scope,
+                deployment_manifest_hash=plan['deploymentManifestHash'],specs=specs)
+            prepared=LivePreparedKisFeed(feeds=feeds,specs=specs,receipt=receipt,binding_reader=binding_reader,
+                utc_clock=utc_clock,monotonic_clock=monotonic_clock or __import__('time').monotonic,
+                portfolio_path=plan['portfolioPath'],artifact_root=plan['artifactRoot'])
+            prepared._tick_artifact_reader=captured.reader
+            return prepared
+    except BaseException:
+        if captured is not None:
+            captured.close()
+        raise

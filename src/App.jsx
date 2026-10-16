@@ -4,6 +4,7 @@ import { runtimeRows, runtimeForDeployment, runtimeModeForDeployment, runningDep
 import { kisStopCleanupView, kisCleanupBlocksStart, kisManualStartPathSupported } from "./kisStopCleanup.js";
 import { KIS_PREPARATION_LABELS } from "./kisNativePreparation.js";
 import KisNativePreparationPanel from "./KisNativePreparationPanel.jsx";
+import MarketGapPreparationPanel from "./MarketGapPreparationPanel.jsx";
 import OperationalChecklistPanel from "./OperationalChecklistPanel";
 import { ordinaryExecutionView, recordedReconciliation, verifiedCanaryExecution } from "./executionAvailability.js";
 import * as React from "react";
@@ -62,6 +63,8 @@ import {
   previewBinanceFuturesSettings,
   previewBinanceFuturesFillSoak,
   registerSafetyConfirmationPresenter,
+  registerMarketGapPresenter, prepareMarketGapsForStart, continueMarketGapPreparation,
+  cancelMarketGapPreparation, cancelAllMarketGapPreparations,
   registerKisPreparationPresenter,
   cancelKisStartPreparation,
   cancelAllKisStartPreparations,
@@ -1863,6 +1866,9 @@ function App() {
   const [emergencyAction, setEmergencyAction] = useState("");
   const [safetyConfirmation, setSafetyConfirmation] = useState(null);
   const [kisPreparationViews, setKisPreparationViews] = useState({});
+  const [marketGapViews, setMarketGapViews] = useState({});
+  const [kisInitializationMethod, setKisInitializationMethod] = useState("REVIEWED_REST");
+  const [kisInitializationCutoff, setKisInitializationCutoff] = useState("");
   const [appearance, setAppearance] = useState(readAppearance);
   const [layoutMode, setLayoutMode] = useState(readLayoutMode);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
@@ -1885,6 +1891,13 @@ function App() {
   }
 
   useEditablePanels(workspaceRef);
+
+  useEffect(() => {
+    const unregister = registerMarketGapPresenter((value) => setMarketGapViews((current) =>
+      current[value.scopeKey]?.flowId > value.flowId ? current : { ...current, [value.scopeKey]: value }));
+    return () => { unregister(); void cancelAllMarketGapPreparations(); };
+  }, []);
+  useEffect(() => { void cancelAllMarketGapPreparations(); }, [selectedDeploymentId]);
 
   useEffect(() => {
     const unregister = registerKisPreparationPresenter((value) => {
@@ -2119,14 +2132,28 @@ function App() {
 
   async function runRuntimeStart(profileId, mode) {
     const args = [profileId, mode, deploymentContext.portfolioId, deploymentContext.id, deploymentContext.strategyId];
-    if (profileId !== "stock" || !["SMALL_LIVE", "FULL_LIVE"].includes(mode)) {
-      return runAction(() => startContinuousRuntime(...args));
+    if (profileId === "crypto") {
+      try {
+        return await prepareMarketGapsForStart({ profile_id: profileId, mode,
+          portfolio_id: args[2], deployment_id: args[3], strategy_id: args[4] }, {
+          accountKey: deploymentContext.accountId || deploymentContext.id,
+          label: deploymentContext.portfolioName || deploymentContext.name || "선택한 코인 구성",
+          continueStart: (marketGapPreparationId) => runAction(() => startContinuousRuntime(...args, { marketGapPreparationId })),
+        });
+      } catch (err) {
+        if (err?.code !== "MARKET_GAP_CANCELLED") setError(err?.message || "최근 체결 공백을 확인하지 못했습니다.");
+        return { ok: false };
+      }
     }
+    if (profileId !== "stock" || !["SMALL_LIVE", "FULL_LIVE"].includes(mode)) return runAction(() => startContinuousRuntime(...args));
     if (emergencyActionInFlightRef.current) return { ok: false, reason: "emergency-action-in-progress" };
     const safetyEpoch = snapshotSafetyEpochRef.current;
     try {
       // This account's preparation never owns the application-wide loading state.
       const result = await startContinuousRuntime(...args, {
+        initializationOptions: kisInitializationMethod === "PUBLIC_H0STCNT0"
+          ? { method: "PUBLIC_H0STCNT0", cutoff: kisInitializationCutoff ? new Date(kisInitializationCutoff).toISOString() : "" }
+          : { method: "REVIEWED_REST", cutoff: null },
         accountKey: deploymentContext.accountId || "stock",
         label: deploymentContext.portfolioName || deploymentContext.name || "한국투자증권",
       });
@@ -2546,6 +2573,16 @@ function App() {
           </section>
         )}
 
+        <MarketGapPreparationPanel views={marketGapViews} onCancel={(key) => { void cancelMarketGapPreparation(key); }} onContinue={continueMarketGapPreparation} />
+        {deploymentContext?.brokerId === "kis" && <section className="panel" aria-label="국내 시세 준비 방법">
+          <label>시세 준비 방법 <select value={kisInitializationMethod} onChange={(event) => { void cancelAllKisStartPreparations(); setKisInitializationMethod(event.target.value); }}>
+            <option value="REVIEWED_REST">기존 분봉 자료로 준비</option><option value="PUBLIC_H0STCNT0">장중 체결 자료를 직접 모으기</option>
+          </select></label>
+          {kisInitializationMethod === "PUBLIC_H0STCNT0" && <>
+            <label>수집 종료 시각 <input type="datetime-local" step="300" value={kisInitializationCutoff} onChange={(event) => { void cancelAllKisStartPreparations(); setKisInitializationCutoff(event.target.value); }} /></label>
+            <p>같은 정규장에서 최소 250분을 모읍니다. 오후 3시 20분 이전의 미래 5분 경계를 선택해 주세요. 준비 중 취소할 수 있으며 완료 후 별도로 계좌와 시작 여부를 확인합니다.</p>
+          </>}
+        </section>}
         <KisNativePreparationPanel views={kisPreparationViews} onCancel={(key) => { void cancelKisStartPreparation(key); }} />
         <WorkspaceContent
           selectedNav={selectedNav}
