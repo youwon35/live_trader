@@ -40,6 +40,7 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
         "/api/paper-candidates",
         "/api/paper-candidates/accounts",
         "/api/preparation/sources",
+        "/api/runtime/kis-native-prepare-status",
         "/api/upbit-functional/status",
         "/api/binance-spot-functional/status",
     }
@@ -47,6 +48,7 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
 _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
         "/api/runtime/kis-manual-start-challenge",
+        "/api/runtime/kis-native-prepare-cancel",
         "/api/runtime/kis-stop-and-reconcile",
         "/api/paper-candidates/import",
         "/api/paper-candidates/review",
@@ -421,6 +423,13 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path in _FUNCTIONAL_STATUS_PATHS and not self._authorize_functional_http(
             require_origin=False
         ):
+            return
+        if parsed.path == "/api/runtime/kis-native-prepare-status":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if set(query) != {"preparationId"} or len(query["preparationId"]) != 1:
+                self.send_json({"ok": False, "reason": "kis-native-preparation-exact-id-required"})
+                return
+            self.send_json(state.kis_native_preparation_status(query["preparationId"][0]))
             return
         if parsed.path == "/api/operator-order-history":
             query = parse_qs(parsed.query)
@@ -906,6 +915,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/strategy-cycle":
             self.send_json(state.run_strategy_cycle(str(payload.get("profile_id", "stock"))))
+            return
+        if parsed.path == "/api/runtime/kis-native-prepare-cancel":
+            if type(payload) is not dict or set(payload) != {"preparationId"}:
+                self.send_json({"ok": False, "reason": "kis-native-preparation-exact-id-required"})
+                return
+            self.send_json(state.cancel_kis_native_preparation(payload["preparationId"]))
             return
         if parsed.path == "/api/runtime/kis-manual-start-challenge":
             self.send_json(state.prepare_kis_scoped_manual_start(

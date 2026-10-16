@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from decimal import Decimal, localcontext
+from decimal import Decimal, localcontext, ROUND_DOWN
 from pathlib import Path
+from contextlib import contextmanager
 import os
 import sqlite3
 import threading
@@ -69,7 +70,54 @@ class LiveContinuousController:
         self._native_runtime = None
         self._native_kis_marks = {}
         self.runtime_scope = None
+        self._prepared_native_context = None
+        self._native_start_token = None
         self.runtime_data_root = self.root / "logs"
+
+    @contextmanager
+    def _start_lock_context(self, prepared):
+        with self._lock:
+            if self._native_start_token is not None:
+                raise ValueError('live-native-controller-start-already-preparing')
+            token=None
+            if prepared is not None:
+                prepared.assert_current()
+                token=object()
+                self._native_start_token=token
+                self._prepared_native_context=prepared
+            try:
+                yield
+            finally:
+                if token is not None and self._native_start_token is token:
+                    self._native_start_token=None
+
+    @contextmanager
+    def _prepared_start_read_phase(self, prepared):
+        """Drop the single start reservation lock for bounded private RO.
+
+        The surrounding start context owns exactly one controller lock level.
+        STOP can revoke the private preparation while this read is blocked;
+        its result cannot be published after the final exact-object CAS fails.
+        """
+        from . import state
+        token=self._native_start_token
+        expected=(self.runtime_scope,self.supervisor)
+        if token is None or self._prepared_native_context is not prepared:
+            raise ValueError('live-native-controller-read-reservation-required')
+        recursion=getattr(self._lock,'_recursion_count',None)
+        if not callable(recursion) or recursion()!=1:
+            raise ValueError('live-native-controller-read-single-lock-level-required')
+        self._lock.release()
+        try:
+            state._assert_kis_native_start_outside_locks()
+            prepared.assert_current()
+            yield
+        finally:
+            self._lock.acquire()
+        if (self._native_start_token is not token or self._prepared_native_context is not prepared
+                or (self.runtime_scope,self.supervisor)!=expected):
+            raise ValueError('live-native-controller-read-cas-changed')
+        prepared.assert_current()
 
     def bind_runtime_scope(self, scope):
         from .runtime_scope import scope_directory, scope_from_mapping
@@ -97,6 +145,8 @@ class LiveContinuousController:
         deployment_id: str = "",
         execution_purpose: str = "",
         functional_test_context: dict[str, Any] | None = None,
+        *,
+        prepared_native_context=None,
     ) -> dict[str, Any]:
         from . import state
 
@@ -155,8 +205,12 @@ class LiveContinuousController:
                     "reason": functional_reason,
                     "snapshot": state.snapshot(),
                 }
-        with self._lock:
+        with self._start_lock_context(prepared_native_context):
+            if self._prepared_native_context is not None and self.supervisor is not None and self.supervisor.phase == 'PREPARED':
+                return {"ok":False,"reason":"live-native-prepared-runtime-must-finalize-or-stop","snapshot":state.snapshot()}
             if self.supervisor and self.supervisor.running:
+                if prepared_native_context is not None:
+                    return {"ok":False,"reason":"live-native-prepared-start-requires-new-runtime","snapshot":state.snapshot()}
                 raw_supervisor_phase = self.supervisor.snapshot().get("phase")
                 supervisor_phase = (
                     raw_supervisor_phase.upper()
@@ -316,7 +370,16 @@ class LiveContinuousController:
                 source_path = str(portfolio.get("source_path") or "")
                 if not source_path or not Path(source_path).exists():
                     return {"ok": False, "reason": "Portfolio Artifact 원본 경로가 없습니다.", "snapshot": state.snapshot()}
-                loaded = load_portfolio_runtime_path(source_path)
+                if prepared_native_context is not None:
+                    from .kis_prepared_native_feed import LivePreparedKisFeed
+                    if (not isinstance(prepared_native_context,LivePreparedKisFeed)
+                            or Path(source_path).resolve()!=prepared_native_context.portfolio_path
+                            or self.runtime_scope is None):
+                        raise ValueError("live-native-prepared-canonical-loader-required")
+                    prepared_native_context.assert_current()
+                    loaded = load_portfolio_runtime_path(source_path,artifact_root=prepared_native_context.artifact_root)
+                else:
+                    loaded = load_portfolio_runtime_path(source_path)
                 if requested_portfolio and loaded.portfolio_id != requested_portfolio:
                     return {
                         "ok": False,
@@ -379,6 +442,10 @@ class LiveContinuousController:
                 runtime_permissions = dict(standalone.get("permissions") or {})
             if not specs:
                 return {"ok": False, "reason": f"선택 Artifact에 {normalized_profile} Strategy Instance가 없습니다.", "snapshot": state.snapshot()}
+            if (loaded is None and normalized_mode != 'MONITOR' and normalized_purpose == ''
+                    and any(spec.broker_id == 'kis' for spec in specs)):
+                return {'ok':False,'reason':'국내주식은 포트폴리오에 전략을 담아 시작해 주세요. 기존 단일 종목 포트폴리오도 사용할 수 있습니다.',
+                    'reasonCode':'KIS_NATIVE_SEALED_PORTFOLIO_REQUIRED','runtimeStarted':False,'snapshot':state.snapshot()}
             broker_context_blocker = self._single_broker_context_blocker(specs)
             if broker_context_blocker:
                 return {
@@ -443,9 +510,39 @@ class LiveContinuousController:
                     "reason": portfolio_execution_blocker,
                     "snapshot": state.snapshot(),
                 }
+            native_prepared_required = (normalized_mode != "MONITOR"
+                and normalized_purpose == "" and self._native_equity_specs(specs))
+            if native_prepared_required:
+                from .kis_prepared_native_feed import LivePreparedKisFeed
+                from .kis_native_initialization import LiveKisNativeInitializedEngine,validate_live_initialization
+                if not isinstance(prepared_native_context,LivePreparedKisFeed) or self.runtime_scope is None:
+                    return {"ok":False,"reason":"live-kis-native-public-preparation-required","snapshot":state.snapshot()}
+                prepared_native_context.assert_current()
+                validate_live_initialization(prepared_native_context.receipt,
+                    context=prepared_native_context.receipt['context'],runtime_scope=self.runtime_scope,
+                    deployment_manifest_hash=prepared_native_context.receipt['deploymentManifestHash'],specs=specs)
+            elif prepared_native_context is not None:
+                return {"ok":False,"reason":"live-native-preparation-route-mismatch","snapshot":state.snapshot()}
             if normalized_mode != "MONITOR" and self._native_capital_specs(specs):
                 try:
-                    self._ensure_native_runtime(specs, requested_deployment)
+                    if native_prepared_required:
+                        with self._prepared_start_read_phase(prepared_native_context):
+                            staged=self._ensure_native_runtime(specs, requested_deployment,publish=False)
+                        # Publish the staged data reader only after the exact
+                        # reservation/generation/revocation CAS reacquires us.
+                        if staged is not None:
+                            staged_native,initialization_fact=staged
+                            if initialization_fact is not None:
+                                staged_native.commit_manual_start_initialization(initialization_fact,
+                                    preparation_guard=prepared_native_context.assert_current)
+                            # A local transaction may have linearized just
+                            # before STOP. Keep its append-only fact, but never
+                            # publish the cancelled reader/engine generation.
+                            prepared_native_context.assert_current()
+                            self._native_runtime=staged_native
+                            self.native_context_provider=staged_native.context
+                    else:
+                        self._ensure_native_runtime(specs, requested_deployment)
                 except (ValueError, TypeError, KeyError, OSError, ArithmeticError, RuntimeError) as error:
                     return {"ok": False, "reason": str(error), "snapshot": state.snapshot()}
             from .runtime_latency_optin import runtime_latency_options
@@ -457,7 +554,8 @@ class LiveContinuousController:
                 {"latency_diagnostics": latency_observer}
                 if latency_observer is not None else {}
             )
-            engine = PortfolioRuntimeEngine(
+            engine_type = LiveKisNativeInitializedEngine if native_prepared_required else PortfolioRuntimeEngine
+            engine = engine_type(
                 specs,
                 mode="MONITOR",
                 evaluator=BuiltinBarSignalEvaluator(
@@ -468,13 +566,24 @@ class LiveContinuousController:
                 state_store=DurableRuntimeState(self.runtime_data_root / f"continuous_{normalized_profile}_{runtime_hash[:16]}_engine.json"),
                 **latency_kwargs,
             )
+            prepared_warmup = None
+            if native_prepared_required:
+                # Public REST/socket I/O already completed outside state/route/
+                # controller locks. Only verified local data seeds MONITOR.
+                prepared_warmup = engine.seed_live_initialization(prepared_native_context.receipt,
+                    context=prepared_native_context.receipt['context'],runtime_scope=self.runtime_scope,
+                    deployment_manifest_hash=prepared_native_context.receipt['deploymentManifestHash'])
+            if native_prepared_required:
+                with self._prepared_start_read_phase(prepared_native_context):
+                    restore_context=self._restore_context_assessment(specs,engine)
+                    portfolio_restore_blocker=self._portfolio_reconciliation_blocker(specs,deployment_id=requested_deployment)
             with state.RUNTIME_MODE_LOCK:
-                restore_context = (
+                restore_context = restore_context if native_prepared_required else (
                     self._restore_context_assessment(specs, engine)
                     if normalized_mode != "MONITOR"
                     else None
                 )
-                portfolio_restore_blocker = (
+                portfolio_restore_blocker = portfolio_restore_blocker if native_prepared_required else (
                     self._portfolio_reconciliation_blocker(
                         specs, deployment_id=requested_deployment
                     )
@@ -535,7 +644,7 @@ class LiveContinuousController:
                 if loaded is not None
                 else ""
             )
-            feeds = feeds_for_specs(
+            feeds = prepared_native_context.feeds if native_prepared_required else feeds_for_specs(
                 specs,
                 prefer_kis=True,
                 kis_demo=False,
@@ -575,14 +684,14 @@ class LiveContinuousController:
                 ),
                 **latency_kwargs,
             )
-            for feed in feeds:
+            for feed in (() if native_prepared_required else feeds):
                 feed.connect()
-            warmup: dict[str, int] = {}
-            for spec in specs:
+            warmup: dict[str, int] = prepared_warmup or {}
+            for spec in (() if native_prepared_required else specs):
                 feed = next(item for item in feeds if item.provider_id == spec.provider)
                 bars = feed.warmup(FeedSubscription(spec.instrument_id, spec.symbol, spec.timeframe), required_warmup_bars(spec))
                 warmup[spec.strategy_instance_id] = engine.seed_history(spec.strategy_instance_id, bars)
-            for feed in feeds:
+            for feed in (() if native_prepared_required else feeds):
                 feed.disconnect()
             self.supervisor = ContinuousRuntimeSupervisor(
                 engine=engine,
@@ -591,18 +700,44 @@ class LiveContinuousController:
                 poll_seconds=2.0,
                 heartbeat_seconds=5.0,
                 operation_lock=self._dispatcher(),
+                **({'prepared_feed_handoff':prepared_native_context} if native_prepared_required else {}),
                 **latency_kwargs,
                 **({"latency_diagnostics_path": latency_path} if latency_observer is not None else {}),
             )
-            self.supervisor.start()
+            if native_prepared_required:
+                self._prepared_native_context=prepared_native_context
+                self.supervisor.phase='PREPARED'
+            else:
+                self.supervisor.start()
             source_kind = "Portfolio" if loaded is not None else "Standalone Strategy"
             state.append_audit("info", "Continuous Runtime", f"{runtime_id} · {source_kind} · {normalized_profile} · {normalized_mode} 시작, {len(specs)}개 전략")
-            return {"ok": True, "reason": "continuous runtime started", "warmup": warmup, "runtime": self.snapshot(), "snapshot": state.snapshot()}
+            return {"ok": True, "reason": "continuous runtime prepared; exact state start finalization required" if native_prepared_required else "continuous runtime started",
+                **({'preparedRuntimeReady':True,'runtimeStarted':False} if native_prepared_required else {}),
+                "warmup": warmup, "runtime": self.snapshot(), "snapshot": state.snapshot()}
+
+    def activate_prepared_native_runtime(self, prepared_native_context):
+        """State invokes once, after its exact manual-start CAS finalizes."""
+        with self._lock:
+            if (self._prepared_native_context is not prepared_native_context or self.supervisor is None
+                    or self.supervisor.phase!='PREPARED' or self.supervisor.running):
+                raise ValueError('live-native-exact-pending-controller-required')
+            prepared_native_context.assert_activation_claimable()
+            supervisor=self.supervisor
+            # Reserve the one-shot transition, then release controller/control
+            # locks before starting a thread that may immediately poll feeds.
+            supervisor.phase='ACTIVATING'
+        # STOP may race this handoff. Its event-only revoke is checked here and
+        # again by claim_for_supervisor before the worker can poll any socket.
+        prepared_native_context.assert_activation_claimable()
+        supervisor.start()
+        return {'ok':True,'runtimeStarted':True,'runtime':self.snapshot()}
 
     def stop(self) -> dict[str, Any]:
         from . import state
 
         with self._lock:
+            if self._prepared_native_context is not None:
+                self._prepared_native_context.revoke('controller-stop')
             if self.supervisor is None:
                 self.mode = "MONITOR"
                 return {"ok": True, "reason": "continuous runtime already stopped", "runtime": self.snapshot(), "snapshot": state.snapshot()}
@@ -1667,6 +1802,8 @@ class LiveContinuousController:
             strategy_identity_hash=engine.strategy_identity_hash,
             checkpoint_seal=engine.restore_context_seal,
             evaluator_state=evaluator_state,
+            **({'live_native_initialization_hash':engine.live_native_initialization['contentHash']}
+                if getattr(engine,'live_native_initialization',None) is not None else {}),
         )
 
     def _dispatcher(self, profile_id: str = "") -> ContinuousDispatcher:
@@ -2775,7 +2912,7 @@ class LiveContinuousController:
     def _native_capital_specs(specs):
         return LiveContinuousController._native_spot_specs(specs) or LiveContinuousController._native_equity_specs(specs)
 
-    def _ensure_native_runtime(self, specs, deployment_id):
+    def _ensure_native_runtime(self, specs, deployment_id, *, publish=True):
         from .native_spot_runtime import NativeSpotRuntime
 
         runtime_type = NativeSpotRuntime
@@ -2805,12 +2942,16 @@ class LiveContinuousController:
                 candidate.mark_provider = self._native_equity_mark
             # The append-only store retains all previous account reservations.
             # Publish only after the new reviewed scope and capital pass.
+            if not publish:
+                return candidate,candidate.observe_manual_start_initialization()
             candidate.initialize_at_reviewed_manual_start()
-            self._native_runtime = candidate
-            self.native_context_provider = candidate.context
+            if publish:
+                self._native_runtime = candidate
+                self.native_context_provider = candidate.context
+            return candidate
         else:
             runtime.scope()
-        return self._native_runtime
+        return runtime if publish else (runtime,None)
 
     @staticmethod
     def _native_specs(specs):
@@ -2951,7 +3092,16 @@ class LiveContinuousController:
                 with localcontext() as precision:
                     precision.prec = 2048
                     weights = [decimal_value(item.target_weight, "canonical target weight", positive=True) for item in specs]
-                    allocation = decimal_value(spec.target_weight, "canonical target weight", positive=True) / sum(weights)
+                    total_weight = sum(weights)
+                    target_weight = decimal_value(spec.target_weight, "canonical target weight", positive=True)
+                # A recurring ratio (three equal sleeves => 1/3) must not
+                # become a 2048-digit input to the bounded decimal consumer.
+                # Sum exactly first; round only the positive ratio downward,
+                # so a rounded denominator can never overallocate capital.
+                with localcontext() as precision:
+                    precision.prec = 128
+                    precision.rounding = ROUND_DOWN
+                    allocation = target_weight / total_weight
             result = quantity_consumer(spec, side=side, price=price, allocation_weight=allocation, identity={"deploymentId": self.deployment_id}, context=context, position_quantity=current_position_quantity)
             return result or {"status": "BLOCKED", "quantityForSubmission": None, "reasons": ["native quantity contract missing"]}
         except (ValueError, TypeError, KeyError, ArithmeticError) as error:
@@ -3063,6 +3213,7 @@ class LiveContinuousRuntimeManager:
         self.runtime_scopes = {}
         self._writer_leases = {}
         self._cleanup_writer_pins = set()
+        self._native_start_inflight = {}
         self._scope_loading_error = ""
         try:
             for scope in load_scopes(self.root):
@@ -3122,7 +3273,10 @@ class LiveContinuousRuntimeManager:
     def _running(controller):
         return controller.supervisor is not None and bool(controller.supervisor.running)
 
-    def _account_start_blocker(self, scope, mode):
+    def _account_start_blocker(self, scope, mode, *, check_native_history=True):
+        if any(self.runtime_scopes[key].account_key == scope.account_key
+                for key in self._native_start_inflight if key in self.runtime_scopes):
+            return 'runtime-account-native-start-read-inflight'
         if any(self.runtime_scopes[key].account_key == scope.account_key
                 for key in self._cleanup_writer_pins if key in self.runtime_scopes):
             return "runtime-account-owned-stop-cleanup-reconciliation-required"
@@ -3132,6 +3286,9 @@ class LiveContinuousRuntimeManager:
             if other.account_key != scope.account_key or key == scope.runtime_id:
                 continue
             controller = self.runtimes[key]
+            if (getattr(controller,'_prepared_native_context',None) is not None
+                    and controller.supervisor is not None and controller.supervisor.phase=='PREPARED'):
+                return 'runtime-account-native-prepared-start-pending'
             if self._running(controller):
                 separate_kis_currency = (
                     scope.broker_id == other.broker_id == "kis"
@@ -3148,15 +3305,18 @@ class LiveContinuousRuntimeManager:
                 if controller._dispatch_status().get("reconciliationRequired") is not False:
                     return "runtime-account-prior-dispatch-reconciliation-required"
                 native = controller._native_runtime
-                if native is not None:
+                if native is not None and check_native_history:
                     native.sync_owned_fills(native.scope())
         if mode != "MONITOR" and self.controllers[scope.profile_id]._dispatch_status().get("reconciliationRequired") is not False:
             return "legacy-profile-dispatch-reconciliation-required"
         return ""
 
-    def start(self, profile_id: str, mode: str, portfolio_id: str = "", strategy_id: str = "", deployment_id: str = "", execution_purpose: str = "", functional_test_context=None) -> dict[str, Any]:
+    def start(self, profile_id: str, mode: str, portfolio_id: str = "", strategy_id: str = "", deployment_id: str = "", execution_purpose: str = "", functional_test_context=None, *, prepared_native_context=None) -> dict[str, Any]:
         from .runtime_scope import AccountWriterLease, save_scope
 
+        if prepared_native_context is not None:
+            return self._start_prepared_native(profile_id,mode,portfolio_id,strategy_id,deployment_id,
+                execution_purpose,functional_test_context,prepared_native_context)
         normalized_mode = str(mode).upper()
         with self._control_lock, self._lock:
             if self._scope_loading_error:
@@ -3166,7 +3326,8 @@ class LiveContinuousRuntimeManager:
                 if scope is None:
                     if any(self._running(c) for key, c in self.runtimes.items() if self.runtime_scopes[key].profile_id == profile_id):
                         raise ValueError("account-runtime-must-stop-before-unbound-profile-monitor")
-                    return self.controllers[profile_id].start(profile_id, normalized_mode, portfolio_id, strategy_id, deployment_id, execution_purpose, functional_test_context)
+                    return self.controllers[profile_id].start(profile_id, normalized_mode, portfolio_id, strategy_id, deployment_id, execution_purpose, functional_test_context,
+                        **({'prepared_native_context':prepared_native_context} if prepared_native_context is not None else {}))
                 blocker = self._account_start_blocker(scope, normalized_mode)
                 if blocker:
                     raise ValueError(blocker)
@@ -3183,7 +3344,8 @@ class LiveContinuousRuntimeManager:
                     self._writer_leases[scope.runtime_id] = lease
                     newly_acquired = True
                 try:
-                    result = controller.start(profile_id, normalized_mode, portfolio_id, strategy_id, scope.deployment_id, execution_purpose, functional_test_context)
+                    result = controller.start(profile_id, normalized_mode, portfolio_id, strategy_id, scope.deployment_id, execution_purpose, functional_test_context,
+                        **({'prepared_native_context':prepared_native_context} if prepared_native_context is not None else {}))
                 except Exception:
                     if newly_acquired and not self._running(controller):
                         self._drop_writer_reference(scope.runtime_id)
@@ -3193,6 +3355,81 @@ class LiveContinuousRuntimeManager:
                 return {**result, "runtimeId": scope.runtime_id, "runtimeScopeId": scope.runtime_id, "scope": scope.to_dict()}
             except (OSError, ValueError, TypeError, RuntimeError) as error:
                 return {"ok": False, "reason": str(error), "runtimeStarted": False, "brokerSubmissionPerformed": False}
+
+    def _start_prepared_native(self, profile_id, mode, portfolio_id, strategy_id, deployment_id,
+            execution_purpose, functional_test_context, prepared):
+        """Reserve the exact writer, release all manager locks for private RO."""
+        from .runtime_scope import AccountWriterLease,save_scope
+        scope=controller=lease=None
+        newly_acquired=False
+        result={'ok':False,'runtimeStarted':False,'brokerSubmissionPerformed':False}
+        try:
+            with self._control_lock,self._lock:
+                if self._scope_loading_error:
+                    raise ValueError(self._scope_loading_error)
+                scope=self.resolve_scope(profile_id,str(mode).upper(),portfolio_id,strategy_id,deployment_id,
+                    execution_purpose,functional_test_context)
+                if scope is None or scope.broker_id!='kis' or scope.capital_currency!='KRW':
+                    raise ValueError('live-native-exact-kis-krw-runtime-required')
+                prepared.assert_current()
+                blocker=self._account_start_blocker(scope,str(mode).upper(),check_native_history=False)
+                if blocker:
+                    raise ValueError(blocker)
+                save_scope(self.root,scope)
+                controller=self._register_scope(scope)
+                lease=self._writer_leases.get(scope.runtime_id)
+                if lease is None:
+                    lease=next((held for key,held in self._writer_leases.items()
+                        if self.runtime_scopes[key].account_key==scope.account_key),None)
+                    if lease is None:
+                        lease=AccountWriterLease(self.root,scope,lease_root=self._account_writer_lease_root)
+                        lease.acquire()
+                    self._writer_leases[scope.runtime_id]=lease
+                    newly_acquired=True
+                self._native_start_inflight[scope.runtime_id]=prepared
+                prior_histories=tuple((key,self.runtimes[key]._native_runtime) for key,other in self.runtime_scopes.items()
+                    if key!=scope.runtime_id and other.account_key==scope.account_key
+                    and self.runtimes[key]._native_runtime is not None)
+            # No shared manager/control/controller/engine/authority lock is
+            # held while a prior terminal history or this start reads brokers.
+            for _key,native in prior_histories:
+                prepared.assert_current()
+                native.sync_owned_fills(native.scope())
+            result=controller.start(profile_id,str(mode).upper(),portfolio_id,strategy_id,scope.deployment_id,
+                execution_purpose,functional_test_context,prepared_native_context=prepared)
+        except (OSError,ValueError,TypeError,RuntimeError) as error:
+            result={'ok':False,'reason':str(error),'runtimeStarted':False,'brokerSubmissionPerformed':False}
+        finally:
+            if scope is not None:
+                with self._control_lock,self._lock:
+                    captured=self._native_start_inflight.get(scope.runtime_id)
+                    if captured is prepared:
+                        try:
+                            if (self.runtimes.get(scope.runtime_id) is not controller
+                                    or self.runtime_scopes.get(scope.runtime_id)!=scope
+                                    or self._writer_leases.get(scope.runtime_id) is not lease or not lease.held):
+                                raise ValueError('live-native-manager-private-read-cas-changed')
+                            prepared.assert_current()
+                        except (OSError,ValueError,TypeError,RuntimeError) as error:
+                            result={'ok':False,'reason':str(error),'runtimeStarted':False,'brokerSubmissionPerformed':False}
+                            prepared.revoke('MANAGER_START_CAS_FAILED')
+                        self._native_start_inflight.pop(scope.runtime_id,None)
+                        if (result.get('ok') is not True and newly_acquired and not self._running(controller)
+                                and scope.runtime_id not in self._cleanup_writer_pins):
+                            self._drop_writer_reference(scope.runtime_id)
+        if scope is not None:
+            result={**result,'runtimeId':scope.runtime_id,'runtimeScopeId':scope.runtime_id,'scope':scope.to_dict()}
+        return result
+
+    def activate_prepared_native_runtime(self, runtime_id, prepared_native_context):
+        with self._control_lock:
+            with self._lock:
+                controller=self.runtimes.get(runtime_id)
+                scope=self.runtime_scopes.get(runtime_id)
+                lease=self._writer_leases.get(runtime_id)
+                if controller is None or scope is None or lease is None or lease.held is not True:
+                    raise ValueError('live-native-current-account-writer-required')
+        return controller.activate_prepared_native_runtime(prepared_native_context)
 
     def reconcile_deferred_dispatches(self, dispatch_rows):
         with self._lock:
@@ -3221,6 +3458,10 @@ class LiveContinuousRuntimeManager:
             lease.release()
 
     def _release_stopped_lease(self, key, result):
+        if key in self._native_start_inflight:
+            result['writerLeaseRetained']=True
+            result['nativeStartReadInFlight']=True
+            return
         if key in self._cleanup_writer_pins:
             result["writerLeaseRetained"] = True
             return

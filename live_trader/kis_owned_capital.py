@@ -31,7 +31,8 @@ class KisOwnedCapitalStore:
                         db.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_no_{operation.lower()} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT,'kis-owned-append-only'); END")
                 yield db
 
-    def initialize(self,scope,observation,*,now=None):
+    def initialize(self,scope,observation,*,now=None,commit_guard=None):
+        if commit_guard is not None:commit_guard()
         now=now or datetime.now(timezone.utc)
         if (scope['quoteCurrency']!=observation.get('currency') or scope['accountProfileId']!=observation.get('profileId')
             or scope['accountFingerprint']!=observation.get('accountFingerprint')
@@ -47,6 +48,7 @@ class KisOwnedCapitalStore:
         body={'scope':scope,'principal':text(principal),'occurredAt':now.isoformat()}
         with self._db() as db:
             db.execute('BEGIN IMMEDIATE')
+            if commit_guard is not None:commit_guard()
             prior=db.execute('SELECT payload FROM principals WHERE deployment_id=?',(scope['deploymentId'],)).fetchone()
             if prior:
                 if json.loads(prior[0]).get('scope')!=scope:raise ValueError('KIS_OWNED_SCOPE_CHANGED')
@@ -58,6 +60,9 @@ class KisOwnedCapitalStore:
                     reserved+=decimal_value(item['principal'],'existing reserved principal')
                 if reserved+principal>cash:raise ValueError('KIS_OWNED_CAPITAL_ALREADY_RESERVED')
                 db.execute('INSERT INTO principals VALUES (?,?,?,?)',(scope['deploymentId'],key,json.dumps(body,sort_keys=True),stable_sha256(body)))
+            # Cancellation/scope/freshness is checked inside this same local
+            # transaction. Failure rolls back the append instead of rebasing it.
+            if commit_guard is not None:commit_guard()
         return self.project(scope,{})
 
     def append_terminal_receipt(self,scope,receipt):

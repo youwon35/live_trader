@@ -11,7 +11,7 @@ import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone, timedelta
-from contextlib import closing
+from contextlib import closing, nullcontext
 from unittest.mock import Mock, patch
 
 from live_trader import state
@@ -314,14 +314,14 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
         # HTTP handler, start controls, supervisor, engine, queue, OMS and final
         # dispatch fences are the same implementations used by the application.
         from live_trader.runtime_scope import RuntimeScope
-        trusted_scope = RuntimeScope("kis", "a" * 64, "dispatch-safety-live-deployment", "stock")
+        trusted_scope = RuntimeScope("upbit", "a" * 64, "dispatch-safety-live-deployment", "crypto")
         manager = LiveContinuousRuntimeManager(self.root, account_writer_lease_root=self.root / "isolated-account-writers", scope_resolver=lambda **kw: trusted_scope)
         controller = manager._register_scope(trusted_scope)
         poll_release, posted = threading.Event(), threading.Event()
         now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         strategy = {
             "strategy_id": "dispatch-safety", "instance_id": "dispatch-safety",
-            "symbol": "005930", "provider": "kis", "broker_id": "kis",
+            "symbol": "KRW-BTC", "provider": "upbit", "broker_id": "upbit",
             "timeframe": "1m", "plugin": "ma-cross",
             "permissions": {"live_small_eligible": True},
             "parameters": {"paperOrderQuantity": 1},
@@ -331,7 +331,7 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
                         (now - timedelta(minutes=1)).isoformat(), now.isoformat(),
                         70000, 70000, 70000, 70000, 1, received_time=now.isoformat())
         class Feed:
-            provider_id = "kis"
+            provider_id = "upbit"
             delivered = False
             def connect(self): pass
             def disconnect(self): pass
@@ -346,10 +346,10 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
                 closed, controller.supervisor.engine._evaluation_key(spec, closed), {"positionQuantity": 0})
         handler = object.__new__(LiveTraderHandler)
         handler.path = "/api/runtime/start"
-        handler.read_json = Mock(return_value={"profile_id": "stock", "mode": "SMALL_LIVE", "strategy_id": "dispatch-safety", "deployment_id": trusted_scope.deployment_id, "safety_confirmation": {"nativeAttestation": {"fixture": "native-proof"}}})
+        handler.read_json = Mock(return_value={"profile_id": "crypto", "mode": "SMALL_LIVE", "strategy_id": "dispatch-safety", "deployment_id": trusted_scope.deployment_id})
         handler.send_json = Mock()
         self.router.list_positions.return_value = []
-        ack = self.router.place_order.return_value
+        ack = {"ok": True, "statusCode": 200, "json": {"uuid": "DEFERRED-ACK", "market": "KRW-BTC", "state": "wait"}}
         def broker(payload):
             self.assertFalse(state.RUNTIME_MODE_LOCK.owned_by_current_thread())
             checkpoint = controller.supervisor.engine.state_store.read()
@@ -364,11 +364,9 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
             patch.object(state, "LIVE_CONTINUOUS_CONTROLLER", manager),
             patch.object(state, "resolve_continuous_runtime_scope", return_value=trusted_scope.to_dict()),
             patch.object(state, "LiveBrokerRouter", return_value=self.router),
-            # External consent is mocked in this queue/checkpoint integration;
-            # exact native start and activation have separate security tests.
-            patch.object(state, "_kis_scoped_start_material", return_value=({"fixture": "exact-context"}, None)),
-            patch("live_trader.kis_operational_native_confirmation.KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.consume", return_value={"ok": True}),
-            patch.object(state, "_reserve_kis_scoped_manual_start"),
+            # Generic standalone crypto remains the supported HTTP->queue path.
+            # KIS uses the separate canonical prepared-native start integration.
+            patch.object(state, "_ordinary_upbit_final_mutation_boundary", side_effect=lambda broker_id: nullcontext({"active": False})),
             patch.object(state, "_prepare_operational_runtime_session", return_value=(None, "fixture approval")) as prepare,
             patch.object(state, "_finish_operational_runtime_start"),
             patch.object(state, "snapshot", return_value={}),
@@ -389,7 +387,7 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
                 self.assertEqual("SMALL_LIVE", state.STATE["mode"])
                 self.router.place_order.assert_not_called()
                 poll_release.set()
-                self.assertTrue(posted.wait(5), controller.snapshot())
+                self.assertTrue(posted.wait(5), controller._dispatcher().last_results)
             finally:
                 poll_release.set()
                 if controller.supervisor is not None:

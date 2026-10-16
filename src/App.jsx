@@ -2,6 +2,8 @@ import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, Re
 import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
 import { runtimeRows, runtimeForDeployment, runtimeModeForDeployment, runningDeploymentIds, artifactIsRunning } from "./runtimeSelection.js";
 import { kisStopCleanupView, kisCleanupBlocksStart, kisManualStartPathSupported } from "./kisStopCleanup.js";
+import { KIS_PREPARATION_LABELS } from "./kisNativePreparation.js";
+import KisNativePreparationPanel from "./KisNativePreparationPanel.jsx";
 import OperationalChecklistPanel from "./OperationalChecklistPanel";
 import { ordinaryExecutionView, recordedReconciliation, verifiedCanaryExecution } from "./executionAvailability.js";
 import * as React from "react";
@@ -60,6 +62,9 @@ import {
   previewBinanceFuturesSettings,
   previewBinanceFuturesFillSoak,
   registerSafetyConfirmationPresenter,
+  registerKisPreparationPresenter,
+  cancelKisStartPreparation,
+  cancelAllKisStartPreparations,
   runFinalPreflight,
   runReconciliation,
   startContinuousRuntime,
@@ -1857,6 +1862,7 @@ function App() {
   const [emergencyFeedback, setEmergencyFeedback] = useState("");
   const [emergencyAction, setEmergencyAction] = useState("");
   const [safetyConfirmation, setSafetyConfirmation] = useState(null);
+  const [kisPreparationViews, setKisPreparationViews] = useState({});
   const [appearance, setAppearance] = useState(readAppearance);
   const [layoutMode, setLayoutMode] = useState(readLayoutMode);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
@@ -1879,6 +1885,14 @@ function App() {
   }
 
   useEditablePanels(workspaceRef);
+
+  useEffect(() => {
+    const unregister = registerKisPreparationPresenter((value) => {
+      setKisPreparationViews((current) => current[value.scopeKey]?.flowId > value.flowId ? current
+        : { ...current, [value.scopeKey]: value });
+    });
+    return () => { unregister(); void cancelAllKisStartPreparations("화면을 닫아 준비를 취소했습니다."); };
+  }, []);
 
   useEffect(() => {
     const unregister = registerSafetyConfirmationPresenter((challenge) => new Promise((resolve) => {
@@ -2100,6 +2114,32 @@ function App() {
       return { ok: false, reason };
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function runRuntimeStart(profileId, mode) {
+    const args = [profileId, mode, deploymentContext.portfolioId, deploymentContext.id, deploymentContext.strategyId];
+    if (profileId !== "stock" || !["SMALL_LIVE", "FULL_LIVE"].includes(mode)) {
+      return runAction(() => startContinuousRuntime(...args));
+    }
+    if (emergencyActionInFlightRef.current) return { ok: false, reason: "emergency-action-in-progress" };
+    const safetyEpoch = snapshotSafetyEpochRef.current;
+    try {
+      // This account's preparation never owns the application-wide loading state.
+      const result = await startContinuousRuntime(...args, {
+        accountKey: deploymentContext.accountId || "stock",
+        label: deploymentContext.portfolioName || deploymentContext.name || "한국투자증권",
+      });
+      if (safetyEpoch === snapshotSafetyEpochRef.current) {
+        if (result.snapshot) setSnapshot({ ...result.snapshot, api_connected: true });
+        setError(result.ok === false ? result.reason : result.syncWarning || "");
+      }
+      return result;
+    } catch (err) {
+      const cancelled = ["KIS_PREPARATION_CANCELLED", "SAFETY_CONFIRMATION_CANCELLED"].includes(err?.code);
+      const reason = err instanceof Error ? err.message : "KIS 시세 준비 실패";
+      if (!cancelled && safetyEpoch === snapshotSafetyEpochRef.current) setError(reason);
+      return { ok: false, cancelled, reason };
     }
   }
 
@@ -2506,6 +2546,7 @@ function App() {
           </section>
         )}
 
+        <KisNativePreparationPanel views={kisPreparationViews} onCancel={(key) => { void cancelKisStartPreparation(key); }} />
         <WorkspaceContent
           selectedNav={selectedNav}
           onNavigate={navigateWorkspace}
@@ -2515,6 +2556,7 @@ function App() {
           onDeploymentSelect={selectDeploymentContext}
           onPaperCandidateRegistered={selectImportedCandidate}
           searchQuery={searchQuery}
+          kisPreparationViews={kisPreparationViews}
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
           onDryRun={() => runAction(() => setFlag("dry_run", !snapshot.dry_run, snapshot.dry_run))}
           onEntryBlock={() =>
@@ -2525,13 +2567,7 @@ function App() {
           onAutomation={(profileId, enabled, provider, mode) => runAction(() => setAutomationProfile(profileId, enabled, provider, mode))}
           onChecklistChange={(key, value) => runAction(() => setChecklistItem(key, value))}
           onValidationEvaluate={(candidateId) => runAction(() => evaluateValidationSmallLive(candidateId))}
-          onRuntimeStart={(profileId, mode) => runAction(() => startContinuousRuntime(
-            profileId,
-            mode,
-            deploymentContext.portfolioId,
-            deploymentContext.id,
-            deploymentContext.strategyId,
-          ))}
+          onRuntimeStart={runRuntimeStart}
           onRuntimeStop={(profileId, runtimeId = "", deploymentId = "") => runAction(() => stopContinuousRuntime(profileId, { runtimeId, deploymentId }))}
           onPromoteLive={(strategyId) => runAction(() => promoteStrategyToLive(strategyId))}
           onStrategyLifecycle={(strategyId, action) => runAction(() => setStrategyLifecycle(strategyId, action))}
@@ -2726,6 +2762,7 @@ function WorkspaceContent({
   onDeploymentSelect,
   onPaperCandidateRegistered,
   searchQuery,
+  kisPreparationViews,
   onConfirm,
   onDryRun,
   onEntryBlock,
@@ -2773,6 +2810,7 @@ function WorkspaceContent({
           executionAvailability={ordinaryExecutionView(snapshot)}
           onValidationEvaluate={onValidationEvaluate}
           onRuntimeStart={onRuntimeStart}
+          kisPreparationViews={kisPreparationViews}
           onRuntimeStop={onRuntimeStop}
           runtime={snapshot.continuous_runtime}
           soakReport={snapshot.soakReport || snapshot.soak_report}
@@ -5175,6 +5213,7 @@ function AutomationLauncherPanel({
   executionAvailability,
   onValidationEvaluate,
   onRuntimeStart,
+  kisPreparationViews = {},
   onRuntimeStop,
   runtime,
   soakReport,
@@ -5300,6 +5339,9 @@ function AutomationLauncherPanel({
     : executionAvailability?.liveDispatchAvailable !== true && !kisManualStartPath;
   const cleanupView = kisStopCleanupView(reviewSnapshot);
   const cleanupStartBlocked = kisCleanupBlocksStart(cleanupView, activeProfile.id, requestedMode);
+  const preparation = kisPreparationViews[deploymentContext?.accountId || "stock"];
+  const preparingKis = activeProfile.id === "stock" && preparation
+    && !["COMPLETE", "CANCELLED", "FAILED", "EXPIRED"].includes(preparation.status);
   const runtimeBindingDetail = !deploymentContext?.id
     ? "상단에서 실행할 Deployment를 먼저 선택하세요."
     : !expectedRuntimeProfile
@@ -5455,13 +5497,13 @@ function AutomationLauncherPanel({
           <button
             className="ts-action-button"
             type="button"
-            disabled={profileRuntime?.running || runtimeBindingBlocked || modeUnavailable || cleanupStartBlocked}
+            disabled={profileRuntime?.running || runtimeBindingBlocked || modeUnavailable || cleanupStartBlocked || preparingKis}
             title={cleanupStartBlocked ? cleanupView.detail : modeUnavailable ? executionAvailability?.detail
               : kisManualStartPath ? "시작 조건을 모두 점검한 뒤 Windows 확인창에서 실행을 승인합니다." : undefined}
             onClick={() => onRuntimeStart(activeProfile.id, requestedMode)}
           >
             <Play size={16} />
-            <span>{liveRuntimeModeLabel(requestedMode)} 시작</span>
+            <span>{preparingKis ? KIS_PREPARATION_LABELS[preparation.status] : `${liveRuntimeModeLabel(requestedMode)} 시작`}</span>
           </button>
           <button
             className="ts-action-button"

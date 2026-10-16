@@ -147,6 +147,19 @@ class KisNativeOperationalStartConfirmations:
         self._secret = secrets.token_bytes(32)
         self._lock = threading.RLock()
         self._pending, self._issued = {}, {}
+        self._invalidation_listeners = []
+
+    def register_invalidation_listener(self, listener):
+        """Internal nonblocking revocation only; listeners grant no authority."""
+        if not callable(listener):
+            raise TypeError("native invalidation listener must be callable")
+        with self._lock:
+            if listener not in self._invalidation_listeners:
+                self._invalidation_listeners.append(listener)
+
+    def _invalidate_nonce(self, nonce):
+        for listener in tuple(self._invalidation_listeners):
+            listener(nonce)
 
     @staticmethod
     def _failure(code):
@@ -172,11 +185,15 @@ class KisNativeOperationalStartConfirmations:
                 for key, record in list(store.items()):
                     if record["context"]["runtimeScopeId"] == runtime_scope_id:
                         del store[key]
+                        self._invalidate_nonce(key)
 
     def revoke_all(self):
         with self._lock:
+            nonces = set(self._pending) | set(self._issued)
             self._pending.clear()
             self._issued.clear()
+            for nonce in nonces:
+                self._invalidate_nonce(nonce)
 
     def arm(self, context):
         try:
@@ -187,6 +204,7 @@ class KisNativeOperationalStartConfirmations:
                     for key, record in list(store.items()):
                         if not self._live(record):
                             del store[key]
+                            self._invalidate_nonce(key)
                 self.revoke_scope(expected["runtimeScopeId"])
                 if len(self._pending) + len(self._issued) >= 16:
                     return self._failure("CAPACITY")
@@ -207,11 +225,15 @@ class KisNativeOperationalStartConfirmations:
         with self._lock:
             record = self._pending.pop(native_nonce, None)
             try:
-                if record is None or not self._live(record):
+                if record is None:
+                    return self._failure("EXPIRED")
+                if not self._live(record):
+                    self._invalidate_nonce(native_nonce)
                     return self._failure("EXPIRED")
                 # Track the in-flight native window so stop/rearm can revoke it.
                 self._issued[native_nonce] = record
             except (ValueError, TypeError):
+                self._invalidate_nonce(native_nonce)
                 return self._failure("CLOCK_INVALID")
         try:
             phrase = self._prompt(KisNativeStartPrompt(
@@ -221,12 +243,15 @@ class KisNativeOperationalStartConfirmations:
             phrase = None
         with self._lock:
             if self._issued.get(native_nonce) is not record:
+                self._invalidate_nonce(native_nonce)
                 return self._failure("REVOKED")
             del self._issued[native_nonce]
             try:
                 if not self._live(record):
+                    self._invalidate_nonce(native_nonce)
                     return self._failure("EXPIRED")
                 if type(phrase) is not str or not hmac.compare_digest(phrase, record["phrase"]):
+                    self._invalidate_nonce(native_nonce)
                     return self._failure("CANCELLED")
                 body = {
                     "schemaVersion": ATTESTATION_SCHEMA,
@@ -239,22 +264,37 @@ class KisNativeOperationalStartConfirmations:
                 self._issued[native_nonce] = {**record, "attestation": attestation}
                 return {"ok": True, "attestation": json.loads(_encoded(attestation))}
             except (ValueError, TypeError):
+                self._invalidate_nonce(native_nonce)
                 return self._failure("CLOCK_INVALID")
 
     def consume(self, attestation, expected_context):
+        result = self.consume_prepared_start(attestation, expected_context)
+        return {key: value for key, value in result.items() if key != "nativeNonce"}
+
+    def consume_prepared_start(self, attestation, expected_context):
+        """Internal-only validated nonce selects a process-private feed object.
+
+        This is the same one-use proof check as consume(), not a new permission
+        and not a client-provided prepared context or serializable capability.
+        """
         with self._lock:
             # Burn a known nonce even if the submitted scope/proof is wrong.
             nonce = attestation.get("oneUseNonce") if type(attestation) is dict else None
             record = self._issued.pop(nonce, None) if type(nonce) is str else None
+            if record is None:
+                return self._failure("EXPIRED_OR_USED")
             try:
                 expected = _context(expected_context)
-                if record is None or not self._live(record):
+                if not self._live(record):
+                    self._invalidate_nonce(nonce)
                     return self._failure("EXPIRED_OR_USED")
                 if (record.get("attestation") != attestation
                         or record["context"] != expected):
+                    self._invalidate_nonce(nonce)
                     return self._failure("SCOPE_OR_PROOF_INVALID")
-                return {"ok": True, "context": expected}
+                return {"ok": True, "context": expected, "nativeNonce": nonce}
             except (ValueError, TypeError, KeyError):
+                self._invalidate_nonce(nonce)
                 return self._failure("CONTEXT_INVALID")
 
 KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS = KisNativeOperationalStartConfirmations()

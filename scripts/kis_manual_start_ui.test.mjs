@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+import { resolve } from "node:path";
 
-const source = process.argv[2] || new URL("../src/api.js", import.meta.url);
-const api = await import("data:text/javascript;base64," + Buffer.from(await readFile(source, "utf8")).toString("base64"));
+const source = process.argv[2] ? pathToFileURL(resolve(process.argv[2])) : new URL("../src/api.js", import.meta.url);
+const api = await import(source.href + "?kis-manual-start-ui-fixture");
 const saved = { fetch: globalThis.fetch, window: globalThis.window };
 const context = { schemaVersion: "kis-scoped-manual-start-context/v1", profileId: "stock",
   mode: "SMALL_LIVE", portfolioId: "p1", deploymentId: "d1", strategyId: "s1" };
@@ -15,23 +16,26 @@ function setup() {
     request_kis_operational_start_confirmation: async (nonce) => { nativeCalls.push(nonce); return nativeResult; },
   } } };
   globalThis.fetch = async (path, options) => {
-    calls.push({ path, body: JSON.parse(options.body), headers: options.headers });
+    calls.push({ path, body: options.body ? JSON.parse(options.body) : undefined, headers: options.headers });
     return { ok: true, headers: { get: () => "application/json" },
-      json: async () => path.endsWith("kis-manual-start-challenge") ? challenge() : { ok: true, runtime_session_id: "mock-session" } };
+      json: async () => path.endsWith("kis-manual-start-challenge")
+        ? { ok: true, preparationId: "fixture-preparation", status: "PREPARING_PUBLIC", maximumPreparationSeconds: 660, runtimeStarted: false }
+        : path.includes("kis-native-prepare-status?") ? { ...challenge(), preparationId: "fixture-preparation", status: "READY" }
+          : { ok: true, runtime_session_id: "mock-session" } };
   };
 }
 try {
   setup();
   await api.startContinuousRuntime("stock","SMALL_LIVE","p1","d1","s1");
-  assert.deepEqual(calls.map(x=>x.path),["/api/runtime/kis-manual-start-challenge","/api/runtime/start"]);
+  assert.deepEqual(calls.map(x=>x.path),["/api/runtime/kis-manual-start-challenge","/api/runtime/kis-native-prepare-status?preparationId=fixture-preparation","/api/runtime/start"]);
   assert.equal(calls[0].headers["X-LiveTrader-CSRF"],"c".repeat(48));
   assert.deepEqual(nativeCalls,["n".repeat(43)]);
-  assert.deepEqual(calls[1].body.safety_confirmation,{nativeAttestation:{oneUseNonce:"test-only"}});
+  assert.deepEqual(calls[2].body.safety_confirmation,{nativeAttestation:{oneUseNonce:"test-only"}});
   assert.equal(Object.hasOwn(calls[0].body,"safety_confirmation"),false);
 
   setup(); nativeResult={ok:false,code:"KIS_NATIVE_CANCELLED"};
   await assert.rejects(api.startContinuousRuntime("stock","SMALL_LIVE","p1","d1","s1"),{code:"SAFETY_CONFIRMATION_CANCELLED"});
-  assert.equal(calls.length,1);
+  assert.equal(calls.length,3); assert.equal(calls.at(-1).path,"/api/runtime/kis-native-prepare-cancel");
   nativeResult={ok:true,attestation:{oneUseNonce:"test-only"}};
 
   setup();
@@ -42,7 +46,7 @@ try {
   for (const changed of [{...context,deploymentId:"other"},{...context,mode:"FULL_LIVE"},{...context,profileId:"crypto"}]) {
     setup(); challenge=()=>({ok:true,nativeNonce:"n".repeat(43),expiresAt:new Date(Date.now()+40000).toISOString(),context:changed});
     await assert.rejects(api.startContinuousRuntime("stock","SMALL_LIVE","p1","d1","s1"),{code:"KIS_NATIVE_CONTEXT_INVALID"});
-    assert.equal(nativeCalls.length,0); assert.equal(calls.length,1);
+    assert.equal(nativeCalls.length,0); assert.equal(calls.length,3); assert.equal(calls.at(-1).path,"/api/runtime/kis-native-prepare-cancel");
   }
 
   setup();challenge=()=>({ok:true,nativeNonce:"n".repeat(43),expiresAt:new Date(Date.now()-1).toISOString(),context});

@@ -4,6 +4,7 @@ from datetime import datetime,timezone
 from pathlib import Path
 from decimal import Decimal
 import sqlite3
+import time
 from trading_runtime.artifact_governance import stable_sha256
 from .native_spot_runtime import current_deployment
 from .native_spot_quantity import sizing_from_artifact,decimal_value
@@ -80,11 +81,36 @@ class NativeEquityRuntime:
         return resolve_official_order_identity(spec,dispatch,rows,request_session_date=request_session_date)
 
     def initialize_at_reviewed_manual_start(self):
+        return self.commit_manual_start_initialization(self.observe_manual_start_initialization())
+
+    def observe_manual_start_initialization(self):
+        """Private GET only; principal/store creation happens after local CAS."""
+        started=datetime.now(timezone.utc);begin=time.monotonic()
         scope,account,policies=self._details();spec=self.specs[0];contract=sizing_from_artifact(spec.artifact)['quantityContract']
         quote=self.observer.quote(contract['exchange'],spec.symbol)
         observation=self.observer.observe(contract,side='BUY',raw_open=quote['price'],protective_bps=policies['executionPolicies'][spec.artifact_hash]['protectiveLimitBps'])
-        if self.scope()!=scope:raise ValueError('KIS_V2_BINDING_CHANGED_DURING_INITIALIZATION')
-        return self.store.initialize(scope,observation)
+        elapsed=time.monotonic()-begin
+        if self.scope()!=scope or not 0<=elapsed<=15:raise ValueError('KIS_V2_BINDING_OR_TIME_CHANGED_DURING_INITIALIZATION')
+        body={'schemaVersion':'kis-manual-start-initialization-observation/v1','scope':scope,
+            'observation':observation,'observedAt':started.isoformat(),'durationSeconds':elapsed}
+        return {**body,'contentHash':stable_sha256(body)}
+
+    def commit_manual_start_initialization(self,fact,*,preparation_guard=None):
+        """Local guarded transaction only. A cancelled read cannot reserve cash."""
+        from .kis_equity_execution import timestamp
+        fields={'schemaVersion','scope','observation','observedAt','durationSeconds','contentHash'}
+        if (not isinstance(fact,dict) or set(fact)!=fields
+                or fact['schemaVersion']!='kis-manual-start-initialization-observation/v1'
+                or stable_sha256({k:v for k,v in fact.items() if k!='contentHash'})!=fact['contentHash']):
+            raise ValueError('KIS_V2_INITIALIZATION_OBSERVATION_INVALID')
+        def commit_guard():
+            if (not 0<=(datetime.now(timezone.utc)-timestamp(fact['observedAt'])).total_seconds()<=15
+                    or type(fact['durationSeconds']) not in {int,float} or not 0<=fact['durationSeconds']<=15
+                    or self.scope()!=fact['scope']):
+                raise ValueError('KIS_V2_INITIALIZATION_CURRENT_SCOPE_OR_FRESHNESS_CHANGED')
+            if preparation_guard is not None:preparation_guard()
+        commit_guard()
+        return self.store.initialize(fact['scope'],fact['observation'],commit_guard=commit_guard)
 
     def sync_owned_fills(self,scope):
         writer=self.dispatch_identity_writer;lookup=self.dispatch_lookup

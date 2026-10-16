@@ -3784,7 +3784,9 @@ def _kis_scoped_store():
 _KIS_SCOPED_PENDING_STARTS: dict[str, dict[str, Any]] = {}
 
 
-def _revoke_kis_scoped_operational_authority(reason: str) -> None:
+def _revoke_kis_scoped_operational_authority(reason: str, *, _keep_native_preparation=None) -> None:
+    from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
+    KIS_NATIVE_START_REGISTRY.invalidate_all(keep=_keep_native_preparation)
     from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
     with kis_route_authority_serialization():
         try:
@@ -3902,6 +3904,7 @@ def _kis_scoped_start_material(profile_id: str, mode: str, portfolio_id: str = "
     context = exact_context({"schemaVersion": "kis-scoped-manual-start-context/v1",
         "scopeHash": governance_sha256({"inputs": inputs, "venues": venues,
             "cleanupPolicy": CLEANUP_POLICY,
+            "nativeInitializationPolicy": "kis-live-source-bound-current-day-initialization/v1",
             "renewalPolicy": {"schemaVersion": "kis-scoped-operational-renewal/v1",
                 "consentLifetime": "EXACT_RUNNING_USER_SESSION_UNTIL_REVOKED", "wirePermitMaximumSeconds": 15,
                 "freshPreflightRequired": True, "nativeMaxAgeSeconds": 15, "boundaryMaxAgeSeconds": 30,
@@ -3916,20 +3919,339 @@ def _kis_scoped_start_material(profile_id: str, mode: str, portfolio_id: str = "
     return context, preflight
 
 
-def prepare_kis_scoped_manual_start(profile_id: str, mode: str, portfolio_id: str = "",
-                                    deployment_id: str = "", strategy_id: str = "") -> dict[str, Any]:
+def _native_prepared_kis_start(function):
+    """Ordinary KIS LIVE alone uses the outside-lock preparation protocol."""
+    @wraps(function)
+    def wrapped(profile_id, mode, portfolio_id="", deployment_id="", strategy_id="",
+                execution_purpose="", functional_test_context=None, **kwargs):
+        if (profile_id == "stock" and normalize_runtime_mode(mode) in {"SMALL_LIVE", "FULL_LIVE"}
+                and not str(execution_purpose or "").strip()):
+            return _start_kis_prepared_native_runtime(profile_id, normalize_runtime_mode(mode),
+                portfolio_id, deployment_id, strategy_id, safety_confirmation=kwargs.get("safety_confirmation"))
+        return function(profile_id, mode, portfolio_id, deployment_id, strategy_id,
+                        execution_purpose, functional_test_context, **kwargs)
+    return wrapped
+
+
+def _assert_kis_native_start_outside_locks():
+    from .kis_order_authority import kis_route_authority_owned_by_current_thread
+    if kis_route_authority_owned_by_current_thread():
+        raise ValueError("kis-native-start-network-under-route-lock")
+    for lock in (SAFETY_CONFIRMATION_MUTATION_LOCK, RUNTIME_MODE_LOCK, RUNTIME_CONTROL_LOCK,
+                 LIVE_CONTINUOUS_CONTROLLER._lock, LIVE_CONTINUOUS_CONTROLLER._control_lock):
+        reader = getattr(lock, "owned_by_current_thread", None) or getattr(lock, "_is_owned", None)
+        if not callable(reader) or reader() is not False:
+            raise ValueError("kis-native-start-network-under-authority-lock")
+    return True
+
+
+def _capture_kis_native_start_plan(profile_id, mode, portfolio_id, deployment_id, strategy_id):
+    """Disk revalidation only. No provider or native confirmation is invoked."""
+    from .contracts import strategy_artifact_dirs
+    from trading_runtime import load_portfolio_runtime_path
+    from trading_runtime.promotion_policy import validate_paper_promotion_policy
+    context, preflight = _kis_scoped_start_material(profile_id, mode, portfolio_id,
+        deployment_id, strategy_id, require_fresh_preflight=False)
+    if STATE.get("kill_switch") or _upbit_functional_durable_authority_open():
+        raise ValueError("kis-native-start-current-controls-blocked")
+    if not context["portfolioId"]:
+        raise ValueError("kis-native-start-sealed-portfolio-required-for-source-instance")
+    portfolios = [row for row in portfolio_rows() if str(row.get("id") or row.get("portfolio_id")
+        or row.get("portfolioId") or "") == context["portfolioId"]]
+    if len(portfolios) != 1 or not portfolios[0].get("source_path"):
+        raise ValueError("kis-native-start-exact-canonical-portfolio-path-required")
+    path = Path(portfolios[0]["source_path"]).resolve()
+    roots = {Path(root).resolve() for root in strategy_artifact_dirs()
+             if path.parent == Path(root).resolve() / "portfolios"}
+    if len(roots) != 1:
+        raise ValueError("kis-native-start-canonical-artifact-root-unproven")
+    root = next(iter(roots))
+    loaded = load_portfolio_runtime_path(path, artifact_root=root)
+    manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest(deployment_id)
+    scope = resolve_continuous_runtime_scope(profile_id, mode, portfolio_id, strategy_id, deployment_id)
+    if (manifest is None or loaded.portfolio_id != context["portfolioId"]
+            or loaded.portfolio_hash != manifest.portfolio_artifact_hash
+            or scope.get("runtimeScopeId") != context["runtimeScopeId"]):
+        raise ValueError("kis-native-start-exact-loaded-portfolio-or-manifest-changed")
+    artifacts, policies = load_strategy_artifacts(), []
+    for spec in loaded.specs:
+        matches = [row for row in artifacts if verified_strategy_artifact_reference(row).get("artifactHash") == spec.artifact_hash
+            and str(row.get("symbol") or "").upper() == spec.symbol.upper()
+            and (row.get("paper_live_qualification") or {}).get("strategyInstanceId") == spec.strategy_instance_id]
+        qualifications = [paper_live_qualification_gate_for_strategy(row) for row in matches]
+        if not qualifications or any(row.get("required") is not True or row.get("ready") is not True
+                or row.get("portfolioRequired") is not True or row.get("portfolioArtifactId") != context["portfolioId"]
+                or row.get("portfolioArtifactHash") != loaded.portfolio_hash
+                or not row.get("promotionPolicy") for row in qualifications):
+            raise ValueError("kis-native-start-exact-paper-promotion-policy-required")
+        member_policies = [validate_paper_promotion_policy(row["promotionPolicy"], require_promotion=True)
+                           for row in qualifications]
+        if any(row.get("promotionPolicyHash") != policy["policyHash"]
+               for row, policy in zip(qualifications, member_policies)) or any(policy != member_policies[0] for policy in member_policies):
+            raise ValueError("kis-native-start-paper-policy-binding-mismatch")
+        policies.append(member_policies[0])
+    if not policies or any(policy != policies[0] for policy in policies):
+        raise ValueError("kis-native-start-portfolio-members-policy-mismatch")
+    binding = {"context": context, "runtimeScope": scope, "deploymentManifestHash": manifest.manifest_hash}
+    return {**binding, "loaded": loaded, "portfolioPath": path, "artifactRoot": root,
+            "promotionPolicy": policies[0], "preflight": preflight}
+
+
+def _kis_native_plan_binding(plan):
+    return {key: plan[key] for key in ("context", "runtimeScope", "deploymentManifestHash")}
+
+
+def _recapture_kis_native_plan(plan):
+    context = plan["context"]
+    current = _capture_kis_native_start_plan("stock", context["mode"], context["portfolioId"],
+        context["deploymentId"], context["strategyId"])
+    if _kis_native_plan_binding(current) != _kis_native_plan_binding(plan):
+        raise ValueError("kis-native-start-source-account-policy-or-config-cas-changed")
+    return current
+
+
+def _collect_kis_native_start_preflight_truth(plan, entry):
+    """START-only producer; no consent/session is created or borrowed."""
+    from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
+    _assert_kis_native_start_outside_locks()
+    KIS_NATIVE_START_REGISTRY.binding(entry)
+    started = datetime.now(timezone.utc).isoformat()
+    monotonic_start = time.monotonic()
+    context = plan["context"]
+    selected = _operational_strategy(strategy_rows(portfolio_rows()), deployment_id=context["deploymentId"],
+        strategy_id=context["strategyId"], portfolio_id=context["portfolioId"])
+    if selected is None or strategy_broker_id(selected) != "kis":
+        raise ValueError("kis-native-start-preflight-current-source-missing")
+    reconciliation = refresh_preflight_reconciliation(selected)
+    KIS_NATIVE_START_REGISTRY.binding(entry)
+    brokers = [broker.to_dict() for broker in broker_readiness()]
+    elapsed = time.monotonic() - monotonic_start
+    if not 0 <= elapsed <= 15:
+        raise ValueError("kis-native-start-preflight-read-budget-exceeded")
+    return {"schemaVersion": "kis-native-start-preflight-truth/v1", "expectedHash": governance_sha256(_kis_native_plan_binding(plan)),
+        "observedAt": started, "durationSeconds": elapsed, "reconciliation": reconciliation, "brokers": brokers}
+
+
+def _commit_kis_native_start_preflight(plan, truth, entry):
+    from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
+    KIS_NATIVE_START_REGISTRY.binding(entry)
+    current = _recapture_kis_native_plan(plan)
+    if (truth.get("schemaVersion") != "kis-native-start-preflight-truth/v1"
+            or truth.get("expectedHash") != governance_sha256(_kis_native_plan_binding(current))):
+        raise ValueError("kis-native-start-preflight-truth-binding-mismatch")
+    age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(truth["observedAt"]).replace("Z", "+00:00"))).total_seconds()
+    if not 0 <= age <= 15 or type(truth.get("durationSeconds")) not in {float, int} or not 0 <= truth["durationSeconds"] <= 15:
+        raise ValueError("kis-native-start-preflight-fresh-truth-required")
+    context, reconciliation = current["context"], truth["reconciliation"]
+    poll, summary = reconciliation.get("poll") or {}, reconciliation.get("summary") or {}
+    ages = summary.get("evidence_ages_seconds") or {}
+    if (poll.get("ok") is not True or poll.get("coalesced") is not False or poll.get("error_count")
+            or summary.get("fresh") is not True or summary.get("three_way_verified") is not True
+            or summary.get("status") != "pass" or summary.get("error_count") or summary.get("blocking_count")
+            or reconciliation.get("errors") or not ages
+            or any(type(age) not in {int, float} or not 0 <= age <= PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS for age in ages.values())):
+        raise ValueError("kis-native-start-fresh-force-poll-three-way-required")
+    selected = _operational_strategy(strategy_rows(portfolio_rows()), deployment_id=context["deploymentId"],
+        strategy_id=context["strategyId"], portfolio_id=context["portfolioId"])
+    checks = final_preflight_checks([selected], truth["brokers"], reconciliation, current_strategy=selected)
+    if not checks or any(str(check.get("status") or "").upper() != "PASS" for check in checks):
+        raise ValueError("kis-native-start-current-preflight-checks-not-pass")
+    manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest(context["deploymentId"])
+    preflight = OPERATIONAL_GOVERNANCE.create_preflight_snapshot(deployment_id=manifest.deployment_id,
+        deployment_manifest_hash=manifest.manifest_hash, checks=[{
+            "checkId": "preflight-" + governance_sha256(str(check.get("label") or index))[:16],
+            "status": "PASS", "detail": str(check.get("detail") or ""), "evidenceHash": governance_sha256(check)
+        } for index, check in enumerate(checks)], reconciliation_hash=governance_sha256(reconciliation),
+        broker_snapshot_hash=governance_sha256(truth), metadata={"mode": context["mode"], "strategyId": context["strategyId"],
+            "portfolioId": context["portfolioId"], "startPolicy": "kis-live-source-bound-current-day-initialization/v1",
+            "consentScopeHash": context["scopeHash"]})
+    if (preflight.status != "PASS" or OPERATIONAL_GOVERNANCE.preflight_validity(preflight.snapshot_id).get("valid") is not True):
+        raise ValueError("kis-native-start-new-preflight-not-positive")
+    return preflight
+
+
+def _prepare_kis_native_manual_challenge(profile_id, mode, portfolio_id, deployment_id, strategy_id, *, _plan=None, _entry=None, _publish=None):
+    from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
     from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+    from .kis_native_public_preparation import prepare_live_kis_native
+    registry, native = KIS_NATIVE_START_REGISTRY, KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+    native.register_invalidation_listener(registry.invalidate_nonce)
+    entry, prepared = _entry, None
     try:
         with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
-            context, _preflight = _kis_scoped_start_material(profile_id, mode, portfolio_id, deployment_id, strategy_id)
-            result = KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.arm(context)
-            result["maximumOperationalPermitSeconds"] = 15
-            result["automaticRenewalEnabled"] = True
-            result["consentLifetime"] = "EXACT_RUNNING_USER_SESSION_UNTIL_REVOKED"
-            result["launchPreflightExpiresAt"] = str(_preflight.expires_at)
-            return result
-    except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+            plan = _capture_kis_native_start_plan(profile_id, mode, portfolio_id, deployment_id, strategy_id) if _plan is None else _recapture_kis_native_plan(_plan)
+            entry = registry.reserve(_kis_native_plan_binding(plan)) if entry is None else entry
+            registry.binding(entry)
+            settings = runtime_settings()
+        _assert_kis_native_start_outside_locks()
+        prepared = prepare_live_kis_native(APP_DATA_ROOT, plan=plan, settings=settings,
+            binding_reader=lambda: registry.binding(entry), preparation_guard=lambda: registry.binding(entry), maximum_seconds=645)
+        registry.attach(entry, prepared)
+        if _publish is not None:
+            _publish("CHECKING_ACCOUNT")
+        with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+            _recapture_kis_native_plan(plan)
+            registry.binding(entry)
+        truth = _collect_kis_native_start_preflight_truth(plan, entry)
+        with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+            preflight = _commit_kis_native_start_preflight(plan, truth, entry)
+            prepared.assert_prepared()
+            prepared.begin_native_confirmation_window()
+            result = native.arm(plan["context"])
+            if result.get("ok") is not True:
+                raise ValueError("kis-native-start-confirmation-arm-failed")
+            registry.arm(entry, result["nativeNonce"])
+            return {**result, "maximumOperationalPermitSeconds": 15, "automaticRenewalEnabled": True,
+                "consentLifetime": "EXACT_RUNNING_USER_SESSION_UNTIL_REVOKED", "launchPreflightExpiresAt": str(preflight.expires_at),
+                "nativeInitializationPrepared": True, "runtimeStarted": False, "brokerSubmissionPerformed": False}
+    except Exception as exc:
+        if entry is not None:
+            registry.invalidate(entry)
+        if prepared is not None and (entry is None or entry.prepared is None):
+            # If mutation won the attach race, the object never entered the
+            # registry. This caller is already outside authority locks.
+            prepared.revoke("PREPARATION_FAILED")
+            prepared.close()
         return {"ok": False, "reason": str(exc), "runtimeStarted": False, "brokerSubmissionPerformed": False}
+
+
+@_two_phase_kis_route_control("START")
+def _prepare_kis_native_runtime_start(profile_id, mode, portfolio_id, deployment_id, strategy_id, *, safety_confirmation=None):
+    from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
+    from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+    registry, native = KIS_NATIVE_START_REGISTRY, KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+    entry, session = None, None
+    try:
+        with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+            plan = _capture_kis_native_start_plan(profile_id, mode, portfolio_id, deployment_id, strategy_id)
+            context, preflight = _kis_scoped_start_material(profile_id, mode, portfolio_id, deployment_id, strategy_id)
+            if context != plan["context"] or type(safety_confirmation) is not dict or set(safety_confirmation) != {"nativeAttestation"}:
+                raise ValueError("kis-operational-fresh-native-manual-start-required")
+            consumed = native.consume_prepared_start(safety_confirmation["nativeAttestation"], context)
+            if consumed.get("ok") is not True:
+                raise ValueError("kis-operational-native-confirmation-invalid")
+            entry = registry.consume(consumed["nativeNonce"], _kis_native_plan_binding(plan))
+            from .kis_native_start_preparation_jobs import KIS_NATIVE_PREPARATION_JOBS
+            KIS_NATIVE_PREPARATION_JOBS.consume(consumed["nativeNonce"])
+            _revoke_kis_scoped_operational_authority("exact-native-start-replacement", _keep_native_preparation=entry)
+            session, _reason = _prepare_operational_runtime_session(profile_id, mode, portfolio_id, deployment_id, strategy_id)
+            _reserve_kis_scoped_manual_start(session, context, preflight)
+            session_id = str(session.session_id)
+            def activation_reader():
+                value = registry.activation(entry)
+                if (STATE.get("active_runtime_session_ids") or {}).get(context["runtimeScopeId"]) != session_id:
+                    raise ValueError("kis-native-start-current-session-changed")
+                return value
+            # Cache the immutable STARTING binding. The sole upgrade to RUNNING
+            # happens only after the prepared controller exists (no thread).
+            registry.activated(entry, session.to_dict())
+            entry.prepared.bind_activation(session=session.to_dict(), activation_reader=activation_reader)
+        _assert_kis_native_start_outside_locks()
+        result = LIVE_CONTINUOUS_CONTROLLER.start(profile_id, mode, context["portfolioId"], context["strategyId"],
+            context["deploymentId"], prepared_native_context=entry.prepared)
+        with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+            registry.binding(entry)
+            _recapture_kis_native_plan(plan)
+            if (result.get("ok") is not True or result.get("preparedRuntimeReady") is not True
+                    or result.get("runtimeStarted") is not False
+                    or _KIS_CONTROL_RESERVATION != getattr(_KIS_CONTROL_RESERVATION_SCOPE, "reservation", None)):
+                raise ValueError("kis-native-start-prepared-runtime-or-reservation-invalid")
+            _finish_operational_runtime_start(session, True, "native-initialized-runtime-prepared")
+            running = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+            if running is None or running.lifecycle != "RUNNING":
+                raise ValueError("kis-native-start-governance-running-transition-failed")
+            registry.activated_running(entry, running.to_dict())
+            entry.prepared.confirm_running(session=running.to_dict(), activation_reader=activation_reader)
+            sync_runtime_profile_mode(profile_id, mode, action="KIS native initialized runtime 준비")
+            result.update({"runtime_session_id": session_id, "execution_purpose": "", "promotion_eligible": None,
+                           "__native_entry": entry})
+            return result
+    except Exception as exc:
+        if entry is not None:
+            registry.invalidate(entry)
+        if session is not None:
+            with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+                _kis_scoped_store().revoke(session_id=str(session.session_id), reason="native-start-prepare-failed")
+                _finish_operational_runtime_start(session, False, str(exc))
+        return {"ok": False, "reason": str(exc), "runtimeStarted": False, "brokerSubmissionPerformed": False,
+                "__native_entry": entry, "runtime_session_id": str(getattr(session, "session_id", ""))}
+
+
+def _start_kis_prepared_native_runtime(profile_id, mode, portfolio_id, deployment_id, strategy_id, *, safety_confirmation=None):
+    from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
+    try:
+        result = _prepare_kis_native_runtime_start(profile_id, mode, portfolio_id, deployment_id, strategy_id,
+            safety_confirmation=safety_confirmation)
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc), "runtimeStarted": False,
+                "kisOperationalAuthority": {"status": "REVOKED"}, "brokerSubmissionPerformed": False}
+    entry = result.pop("__native_entry", None)
+    try:
+        if result.get("ok") is not True or (result.get("kisOperationalAuthority") or {}).get("status") != "ACTIVE" or entry is None:
+            raise ValueError(str(result.get("reason") or "kis-native-start-final-consent-not-active"))
+        _assert_kis_native_start_outside_locks()
+        # Final PLACE still independently requires supervisor.running. There is
+        # no bar/decision/dispatch before this exact one-shot thread activation.
+        activated = LIVE_CONTINUOUS_CONTROLLER.activate_prepared_native_runtime(
+            entry.binding["context"]["runtimeScopeId"], entry.prepared)
+        if activated.get("ok") is not True:
+            raise ValueError("kis-native-start-supervisor-activation-failed")
+        result.update({"runtimeStarted": True, "snapshot": snapshot()})
+        if portfolio_id:
+            ArtifactMetadataStore().update(portfolio_id, "portfolio", mark_used=True)
+        return result
+    except Exception as exc:
+        if entry is not None:
+            KIS_NATIVE_START_REGISTRY.invalidate(entry)
+        session_id = str(result.get("runtime_session_id") or "")
+        if session_id:
+            with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+                _kis_scoped_store().revoke(session_id=session_id, reason="native-start-not-activated")
+                STATE["new_entries_blocked"] = True
+            # Stop/join is deliberately outside both authority locks. Exact
+            # scope prevents a failed start from stopping another account.
+            stopped = False
+            try:
+                stop_result = LIVE_CONTINUOUS_CONTROLLER.stop(runtime_id=entry.binding["context"]["runtimeScopeId"],
+                    deployment_id=deployment_id)
+                stopped = isinstance(stop_result, dict) and stop_result.get("ok") is True
+            except Exception:
+                pass
+            result["runtimeStopAcknowledged"] = stopped
+            result["runtimeMayBeRunning"] = not stopped
+            result["requiresReconciliation"] = not stopped
+        return {**result, "ok": False, "reason": str(exc), "runtimeStarted": False,
+                "kisOperationalAuthority": {"status": "REVOKED"}, "brokerSubmissionPerformed": False}
+
+
+def prepare_kis_scoped_manual_start(profile_id: str, mode: str, portfolio_id: str = "",
+                                    deployment_id: str = "", strategy_id: str = "") -> dict[str, Any]:
+    from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
+    from .kis_native_start_preparation_jobs import KIS_NATIVE_PREPARATION_JOBS
+    from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+    entry = None
+    try:
+        KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.register_invalidation_listener(KIS_NATIVE_START_REGISTRY.invalidate_nonce)
+        with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+            plan = _capture_kis_native_start_plan(profile_id, mode, portfolio_id, deployment_id, strategy_id)
+            entry = KIS_NATIVE_START_REGISTRY.reserve(_kis_native_plan_binding(plan))
+        return KIS_NATIVE_PREPARATION_JOBS.begin(entry=entry, run=lambda publish:
+            _prepare_kis_native_manual_challenge(profile_id, mode, portfolio_id, deployment_id, strategy_id,
+                _plan=plan, _entry=entry, _publish=publish))
+    except Exception as exc:
+        if entry is not None:
+            KIS_NATIVE_START_REGISTRY.invalidate(entry)
+        return {"ok": False, "reason": str(exc), "runtimeStarted": False, "brokerSubmissionPerformed": False}
+
+
+def kis_native_preparation_status(preparation_id):
+    from .kis_native_start_preparation_jobs import KIS_NATIVE_PREPARATION_JOBS
+    return KIS_NATIVE_PREPARATION_JOBS.status(preparation_id)
+
+
+def cancel_kis_native_preparation(preparation_id):
+    from .kis_native_start_preparation_jobs import KIS_NATIVE_PREPARATION_JOBS
+    return KIS_NATIVE_PREPARATION_JOBS.cancel(preparation_id)
 
 
 def _reserve_kis_scoped_manual_start(session: object, context: dict[str, Any], preflight: object) -> None:
@@ -7937,6 +8259,60 @@ def _publish_forced_restore_positions(
     cache["fetched_at"] = observed_at
 
 
+def _capture_kis_native_restore_expected(initialization_hash, *, specs, portfolio_id, portfolio_hash):
+    from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
+    registry = KIS_NATIVE_START_REGISTRY
+    with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+        entry = registry.entry_for_initialization(initialization_hash)
+        binding, session = registry.binding(entry), registry.activation(entry)
+        context = binding["context"]
+        plan = _capture_kis_native_start_plan("stock", context["mode"], context["portfolioId"],
+            context["deploymentId"], context["strategyId"])
+        actual = OPERATIONAL_GOVERNANCE.get_runtime_session(session["sessionId"])
+        receipt = entry.prepared.receipt
+        if (_kis_native_plan_binding(plan) != binding or actual is None or actual.to_dict() != session
+                or actual.lifecycle not in {"STARTING", "RUNNING"}
+                or (STATE.get("active_runtime_session_ids") or {}).get(context["runtimeScopeId"]) != session["sessionId"]
+                or STATE.get("kill_switch") or receipt["portfolioId"] != portfolio_id
+                or receipt["portfolioHash"] != portfolio_hash
+                or tuple(spec.to_dict() for spec in plan["loaded"].specs) != tuple(spec.to_dict() for spec in specs)):
+            raise ValueError("kis-native-restore-exact-source-session-config-or-owner-changed")
+        entry.prepared.assert_current()
+        return entry, binding, session
+
+
+@contextmanager
+def _kis_native_restore_collection_lock(native_expected):
+    if native_expected is None:
+        with RESTORE_CONTEXT_LOCK:
+            yield
+    else:
+        _assert_kis_native_start_outside_locks()
+        yield
+
+
+@contextmanager
+def _kis_native_restore_publish_lock(native_expected, initialization_hash, *, specs, portfolio_id, portfolio_hash):
+    if native_expected is None:
+        yield  # The unchanged legacy collection lock is still held.
+    else:
+        with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+            current = _capture_kis_native_restore_expected(initialization_hash, specs=specs,
+                portfolio_id=portfolio_id, portfolio_hash=portfolio_hash)
+            if current != native_expected:
+                raise ValueError("kis-native-restore-binding-changed-during-read")
+            # Legacy restore may hold its lock across private I/O. Never wait
+            # for that producer while retaining global safety/route ownership.
+            # A busy snapshot is discarded; no cached truth or authority is
+            # published, and the ordinary failed-start path revokes this entry.
+            if not RESTORE_CONTEXT_LOCK.acquire(blocking=False):
+                raise RuntimeError("KIS_NATIVE_RESTORE_PUBLICATION_BUSY_RETRY_PREPARATION")
+            try:
+                yield
+            finally:
+                RESTORE_CONTEXT_LOCK.release()
+
+
 def forced_restore_context_assessment(
     specs: tuple[Any, ...],
     *,
@@ -7945,15 +8321,20 @@ def forced_restore_context_assessment(
     strategy_identity_hash: str,
     checkpoint_seal: dict[str, Any] | None,
     evaluator_state: dict[str, Any] | None,
+    live_native_initialization_hash: str | None = None,
 ) -> dict[str, Any]:
     """Force fresh broker truth and build an exact restart context seal.
 
-    This path never trusts the long-lived reconciliation cache.  Every
-    required broker is queried synchronously while RESTORE_CONTEXT_LOCK is
-    held, then compared with the program ledger and in-flight order set at
-    exact broker/account/exchange/instrument scope.
+    This path never trusts the long-lived reconciliation cache. Legacy
+    callers retain their collection lock. A registered native KIS start alone
+    collects outside that global lock, then revalidates its exact private
+    Source/account/session/config before a short local publication lock.
     """
 
+    if live_native_initialization_hash is not None and (type(live_native_initialization_hash) is not str
+            or len(live_native_initialization_hash) != 64
+            or any(char not in "0123456789abcdef" for char in live_native_initialization_hash)):
+        raise ValueError("live-native-initialization-hash-invalid")
     resolved_specs = tuple(specs)
     routes = [_restore_spec_route(spec) for spec in resolved_specs]
     broker_ids = sorted(
@@ -7969,7 +8350,10 @@ def forced_restore_context_assessment(
     ).replace("+00:00", "Z")
     broker_rows_by_id: dict[str, list[dict[str, Any]]] = {}
     errors: list[str] = []
-    with RESTORE_CONTEXT_LOCK:
+    native_expected = (_capture_kis_native_restore_expected(live_native_initialization_hash,
+        specs=resolved_specs, portfolio_id=portfolio_id, portfolio_hash=portfolio_hash)
+        if live_native_initialization_hash is not None else None)
+    with _kis_native_restore_collection_lock(native_expected):
         router = LiveBrokerRouter()
         for broker_id in broker_ids:
             try:
@@ -7989,31 +8373,36 @@ def forced_restore_context_assessment(
         observed_at = datetime.now(timezone.utc).isoformat(
             timespec="milliseconds"
         ).replace("+00:00", "Z")
-        _publish_forced_restore_positions(
-            broker_rows_by_id,
-            observed_at=observed_at,
-        )
-
-        try:
-            ledger_positions = [
-                dict(item) for item in PROGRAM_LEDGER.position_rows()
-                if isinstance(item, dict)
-            ]
-            ledger_events = [
-                dict(item) for item in PROGRAM_LEDGER.execution_event_rows(500)
-                if isinstance(item, dict)
-            ]
-        except Exception as exc:
-            ledger_positions = []
-            ledger_events = []
-            errors.append(
-                "program-ledger:"
-                f"{type(exc).__name__}:{audit_clip(str(exc), 160)}"
+        with _kis_native_restore_publish_lock(native_expected, live_native_initialization_hash,
+                specs=resolved_specs, portfolio_id=portfolio_id, portfolio_hash=portfolio_hash):
+            if native_expected is not None and (errors or set(broker_rows_by_id) != set(broker_ids)
+                    or not 0 <= elapsed_seconds <= RESTORE_CONTEXT_MAX_AGE_SECONDS):
+                raise ValueError("kis-native-restore-complete-fresh-read-required-before-publication")
+            _publish_forced_restore_positions(
+                broker_rows_by_id,
+                observed_at=observed_at,
             )
-        all_orders = [
-            dict(item) for item in STATE.get("orders", [])
-            if isinstance(item, dict)
-        ]
+
+            try:
+                ledger_positions = [
+                    dict(item) for item in PROGRAM_LEDGER.position_rows()
+                    if isinstance(item, dict)
+                ]
+                ledger_events = [
+                    dict(item) for item in PROGRAM_LEDGER.execution_event_rows(500)
+                    if isinstance(item, dict)
+                ]
+            except Exception as exc:
+                ledger_positions = []
+                ledger_events = []
+                errors.append(
+                    "program-ledger:"
+                    f"{type(exc).__name__}:{audit_clip(str(exc), 160)}"
+                )
+            all_orders = [
+                dict(item) for item in STATE.get("orders", [])
+                if isinstance(item, dict)
+            ]
 
     route_keys = {
         (
@@ -8301,6 +8690,8 @@ def forced_restore_context_assessment(
             ),
         ),
     }
+    if live_native_initialization_hash is not None:
+        context_body["liveNativeInitializationHash"] = live_native_initialization_hash
     current_seal = {
         "schemaVersion": "live-restore-context-seal-v1",
         "body": context_body,
@@ -27174,6 +27565,7 @@ def start_functional_test_runtime(
     return result
 
 
+@_native_prepared_kis_start
 @_serialized_safety_mutation
 @_serialized_upbit_order_authority
 @_two_phase_kis_route_control("START")
@@ -27570,6 +27962,10 @@ def _continuous_stop_requires_kis_route(*args, **kwargs):
 def _continuous_stop_control(function: Any) -> Any:
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
+        from .kis_native_start_registry import KIS_NATIVE_START_REGISTRY
+        KIS_NATIVE_START_REGISTRY.invalidate_stop_selector(
+            args[0] if args else kwargs.get("profile_id", ""),
+            runtime_id=kwargs.get("runtime_id", ""), deployment_id=kwargs.get("deployment_id", ""))
         try:
             plan = _continuous_exact_stop_plan(*args, **kwargs)
         except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:

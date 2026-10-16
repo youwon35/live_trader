@@ -1,3 +1,5 @@
+import { createKisPreparationCoordinator } from "./kisNativePreparation.js";
+
 export const API_DEFAULT_TIMEOUT_MS = 15_000;
 export const BROKER_REFRESH_TIMEOUT_MS = 45_000;
 
@@ -19,10 +21,23 @@ export const SAFETY_CONFIRMATION_ACTIONS = Object.freeze({
 
 let safetyConfirmationPresenter = null;
 let activeSafetyConfirmationFlow = null;
-let activeKisManualStartFlow = false;
-let functionalHttpSessionPromise = null;
+let kisPreparationPresenter = null;
+const kisPreparations = createKisPreparationCoordinator({ request,
+  onProgress: (value) => kisPreparationPresenter?.(value),
+});
+export function registerKisPreparationPresenter(presenter) {
+  kisPreparationPresenter = presenter;
+  return () => { if (kisPreparationPresenter === presenter) kisPreparationPresenter = null; };
+}
+export function cancelKisStartPreparation(scopeKey) { return kisPreparations.cancel(scopeKey); }
+export function cancelAllKisStartPreparations(reason = "설정 또는 실행 상태가 변경되어 준비를 취소했습니다.") {
+  return kisPreparations.cancelAll(reason);
+}
+let functionalHttpSessionFlight = null;
+let functionalHttpSessionGeneration = 0;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/runtime/kis-manual-start-challenge",
+  "/api/runtime/kis-native-prepare-cancel",
   "/api/runtime/kis-stop-and-reconcile",
   "/api/paper-candidates/import",
   "/api/paper-candidates/review",
@@ -44,9 +59,10 @@ const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
   ...FUNCTIONAL_HTTP_MUTATION_PATHS,
   "/api/upbit-functional/status",
   "/api/binance-spot-functional/status",
+  "/api/runtime/kis-native-prepare-status",
 ]);
 
-async function trustedFunctionalHttpHeaders(path, method) {
+async function trustedFunctionalHttpHeaders(path, method, observeFlight = () => {}) {
   if (!FUNCTIONAL_HTTP_SESSION_PATHS.has(path)) {
     return {};
   }
@@ -55,8 +71,10 @@ async function trustedFunctionalHttpHeaders(path, method) {
     // never touch (or poison) the native CSRF bridge cache.
     return {};
   }
-  if (!functionalHttpSessionPromise) {
-    functionalHttpSessionPromise = (async () => {
+  if (!functionalHttpSessionFlight) {
+    const flight = { generation: ++functionalHttpSessionGeneration, state: "PENDING", promise: null };
+    functionalHttpSessionFlight = flight;
+    flight.promise = (async () => {
       const bridge = globalThis.window?.pywebview?.api;
       if (typeof bridge?.functional_http_session !== "function") {
         throw new ApiRequestError(
@@ -78,17 +96,24 @@ async function trustedFunctionalHttpHeaders(path, method) {
           "TRUSTED_APP_SESSION_UNAVAILABLE",
         );
       }
+      flight.state = "VALIDATED";
       return value.csrfToken;
     })();
   }
+  const flight = functionalHttpSessionFlight;
+  observeFlight(flight);
   try {
-    const csrfToken = await functionalHttpSessionPromise;
+    const csrfToken = await flight.promise;
+    if (functionalHttpSessionFlight !== flight) {
+      throw new ApiRequestError("네이티브 앱 안전 세션을 다시 확인해 주세요.", "TRUSTED_APP_SESSION_REPLACED");
+    }
     return { "X-LiveTrader-CSRF": csrfToken };
   } catch (error) {
     // WebView can expose the bridge shortly after the first render. Do not
     // permanently cache an unavailable/rejected bridge; every attempt remains
     // fail-closed until a valid native CSRF value is returned.
-    functionalHttpSessionPromise = null;
+    flight.state = "FAILED";
+    if (functionalHttpSessionFlight === flight) functionalHttpSessionFlight = null;
     throw error;
   }
 }
@@ -319,6 +344,7 @@ export async function getEnvSettings() {
 }
 
 export async function saveEnvSettings(values, confirmed = false) {
+  void cancelAllKisStartPreparations();
   const mutation = (confirmation) => request("/api/env-settings", {
     method: "POST",
     body: { values, confirmed, ...safetyConfirmationPayload(confirmation) },
@@ -343,6 +369,7 @@ export async function setMode(mode) {
 }
 
 export async function setFlag(name, value, confirmed = false) {
+  void cancelAllKisStartPreparations();
   const mutation = (confirmation) => request("/api/flag", {
     method: "POST",
     body: { name, value, confirmed, ...safetyConfirmationPayload(confirmation) },
@@ -364,6 +391,7 @@ export function nativeEmergencyStopAvailable() {
 }
 
 export async function engageNativeEmergencyStop(reason = "operator global Kill Switch") {
+  void cancelAllKisStartPreparations("긴급정지가 요청되어 준비를 취소했습니다.");
   const bridge = globalThis.window?.pywebview?.api;
   if (typeof bridge?.engage_emergency_stop !== "function") {
     throw new ApiRequestError(
@@ -439,6 +467,7 @@ export async function setAutomationProfile(profileId, enabled, provider, mode) {
 }
 
 export async function setRiskSetting(name, value) {
+  void cancelAllKisStartPreparations();
   return request("/api/risk-setting", { method: "POST", body: { name, value } });
 }
 
@@ -808,25 +837,20 @@ export async function startContinuousRuntime(
   portfolioId = "",
   deploymentId = "",
   strategyId = "",
+  { accountKey = profileId, label = "한국투자증권" } = {},
 ) {
   const nativeKisStart = profileId === "stock" && ["SMALL_LIVE", "FULL_LIVE"].includes(mode);
-  if (nativeKisStart && activeKisManualStartFlow) {
-    throw new ApiRequestError("KIS 시작 확인이 이미 진행 중입니다.", "KIS_START_IN_PROGRESS");
+  const body = {
+    profile_id: profileId, mode, portfolio_id: portfolioId,
+    deployment_id: deploymentId, strategy_id: strategyId,
+  };
+  if (!nativeKisStart) return request("/api/runtime/start", { method: "POST", body, timeoutMs: 30000 });
+  const bridge = globalThis.window?.pywebview?.api;
+  if (typeof bridge?.request_kis_operational_start_confirmation !== "function") {
+    throw new ApiRequestError("KIS 실거래 시작은 네이티브 앱에서 직접 확인해야 합니다.", "KIS_NATIVE_UNAVAILABLE");
   }
-  if (nativeKisStart) activeKisManualStartFlow = true;
-  try {
-    const body = {
-      profile_id: profileId, mode, portfolio_id: portfolioId,
-      deployment_id: deploymentId, strategy_id: strategyId,
-    };
-    if (nativeKisStart) {
-      const bridge = globalThis.window?.pywebview?.api;
-      if (typeof bridge?.request_kis_operational_start_confirmation !== "function") {
-        throw new ApiRequestError("KIS 실거래 시작은 네이티브 앱에서 직접 확인해야 합니다.", "KIS_NATIVE_UNAVAILABLE");
-      }
-      const challenge = await request("/api/runtime/kis-manual-start-challenge", {
-        method: "POST", body, timeoutMs: 30000,
-      });
+  return kisPreparations.run({ body, scopeKey: String(accountKey), label,
+    confirmAndStart: async (challenge, assertCurrent, starting) => {
       const context = challenge?.context;
       if (challenge?.ok !== true || typeof challenge.nativeNonce !== "string"
           || !Number.isFinite(Date.parse(challenge.expiresAt))
@@ -839,18 +863,22 @@ export async function startContinuousRuntime(
         throw new ApiRequestError("KIS 시작 확인의 대상 또는 유효기간이 변경되었습니다.", "KIS_NATIVE_CONTEXT_INVALID");
       }
       const native = await bridge.request_kis_operational_start_confirmation(challenge.nativeNonce);
+      assertCurrent();
       if (native?.ok !== true || !native.attestation) {
         throw new ApiRequestError("KIS 시작 확인이 취소되었거나 만료되었습니다.", "SAFETY_CONFIRMATION_CANCELLED");
       }
+      if (Date.parse(challenge.expiresAt) <= Date.now()) {
+        throw new ApiRequestError("KIS 시작 확인 시간이 만료되었습니다.", "SAFETY_CONFIRMATION_CANCELLED");
+      }
       body.safety_confirmation = { nativeAttestation: native.attestation };
-    }
-    return await request("/api/runtime/start", { method: "POST", body, timeoutMs: 30000 });
-  } finally {
-    if (nativeKisStart) activeKisManualStartFlow = false;
-  }
+      assertCurrent(); starting();
+      return request("/api/runtime/start", { method: "POST", body, timeoutMs: 30000 });
+    },
+  });
 }
 
 export async function stopContinuousRuntime(profileId = "", { runtimeId = "", deploymentId = "" } = {}) {
+  if (!profileId || profileId === "stock") void cancelAllKisStartPreparations("실행 중지가 요청되어 준비를 취소했습니다.");
   const exactStockScope = profileId === "stock" && runtimeId !== "" && deploymentId !== "";
   const path = exactStockScope ? "/api/runtime/kis-stop-and-reconcile" : "/api/runtime/stop";
   return request(path, {
@@ -885,7 +913,22 @@ export async function request(path, options = {}) {
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const method = options.method ?? "GET";
-    const functionalHeaders = await trustedFunctionalHttpHeaders(path, method);
+    const kisPreparationMutation = ["/api/runtime/kis-manual-start-challenge", "/api/runtime/kis-native-prepare-cancel"].includes(path);
+    const functionalHeaders = kisPreparationMutation ? await new Promise((resolve, reject) => {
+        let waiterFlight = null;
+        const aborted = () => {
+          if (functionalHttpSessionFlight === waiterFlight && waiterFlight?.state === "PENDING") {
+            functionalHttpSessionFlight = null;
+          }
+          reject(new DOMException("Request aborted", "AbortError"));
+        };
+        if (controller.signal.aborted) { aborted(); return; }
+        controller.signal.addEventListener("abort", aborted, { once: true });
+        trustedFunctionalHttpHeaders(path, method, (flight) => { waiterFlight = flight; }).then(resolve, reject).finally(() => {
+          controller.signal.removeEventListener("abort", aborted);
+        });
+      }) : await trustedFunctionalHttpHeaders(path, method);
+    controller.signal.throwIfAborted();
     const response = await fetch(path, {
       method,
       headers: { "Content-Type": "application/json", ...functionalHeaders },
