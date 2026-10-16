@@ -68,6 +68,9 @@ from .kis_order_authority import (
     kis_order_authority_binding,
     kis_read_diagnostic_boundary,
     ordinary_kis_final_mutation_boundary,
+    has_scoped_kis_dispatch_context,
+    scoped_kis_authenticated_mutation_preflight,
+    scoped_kis_final_mutation_boundary,
 )
 
 BrokerStatus = Literal["connected", "missing_credentials", "adapter_required", "disabled"]
@@ -3001,7 +3004,10 @@ class LiveBrokerRouter:
         broker_id = str(intent.get("broker_id") or intent.get("broker") or "").lower()
         if broker_id == "kis":
             try:
-                with kis_authenticated_mutation_preflight(mode="ORDINARY"):
+                scoped = has_scoped_kis_dispatch_context()
+                authentication = (scoped_kis_authenticated_mutation_preflight(intent) if scoped
+                                  else kis_authenticated_mutation_preflight(mode="ORDINARY"))
+                with authentication:
                     token = issue_kis_access_token()
                     prepared = build_kis_live_order_request(
                         intent, access_token=token
@@ -3013,8 +3019,10 @@ class LiveBrokerRouter:
                             "kis-ordinary-place-" + secrets.token_hex(16)
                         ),
                     )
-                    with ordinary_kis_final_mutation_boundary(
-                        operation="PLACE_ORDER", intent=authority_intent
+                    final_boundary = scoped_kis_final_mutation_boundary if scoped else ordinary_kis_final_mutation_boundary
+                    final_options = {"prepared_request": prepared} if scoped else {}
+                    with final_boundary(
+                        operation="PLACE_ORDER", intent=authority_intent, **final_options
                     ):
                         response = send_prepared_request(prepared)
                     body = (
@@ -3629,6 +3637,26 @@ class LiveBrokerRouter:
         if not isinstance(payload, dict):
             raise BrokerNotReadyError("Upbit 개별 주문 응답 형식이 올바르지 않습니다.")
         return payload
+
+    def cancel_kis_scoped_cleanup(self, cleanup_context: dict[str, Any], proof: dict[str, Any]) -> dict[str, object]:
+        """Only the state-owned STOP scope can reach this separate cancel path."""
+        from .kis_scoped_cleanup_adapter import build_kis_scoped_cleanup_request
+        from .kis_order_authority import (kis_scoped_cleanup_dispatch_boundary,
+            scoped_kis_cleanup_authenticated_preflight, scoped_kis_cleanup_final_boundary)
+        if not real_orders_enabled():
+            raise BrokerNotReadyError("KIS scoped cancel requires LIVE_TRADER_ENABLE_REAL_ORDERS=true")
+        try:
+            with kis_scoped_cleanup_dispatch_boundary(cleanup_context), scoped_kis_cleanup_authenticated_preflight():
+                token = issue_kis_access_token()
+                prepared = build_kis_scoped_cleanup_request(proof, access_token=token)
+                operation = "SCOPED_CANCEL_KR" if proof["market"] == "KR" else "SCOPED_CANCEL_US"
+                authority = build_kis_mutation_authority_intent(prepared, operation=operation,
+                    claim_id="kis-stop-cancel-" + secrets.token_hex(16), owned_order_key={
+                        "orderDate": proof["orderDate"], "organizationNo": proof["organizationNo"], "orderNo": proof["orderNo"]})
+                with scoped_kis_cleanup_final_boundary(operation=operation, intent=authority, prepared_request=prepared):
+                    return send_prepared_request(prepared)
+        except KisOrderAuthorityError as exc:
+            raise BrokerNotReadyError(str(exc)) from exc
 
     def cancel_order(self, broker_id: str, broker_order_id: str, **context: object) -> dict[str, object]:
         if not real_orders_enabled():

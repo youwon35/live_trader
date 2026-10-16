@@ -3,11 +3,14 @@ from __future__ import annotations
 import base64
 from collections import deque
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any, Callable, Iterable
@@ -313,59 +316,116 @@ def parse_binance_futures_order_update(
     }
 
 
-def parse_kis_domestic_execution(fields: list[str]) -> dict[str, Any] | None:
-    if len(fields) < 14:
+def _kis_notice_number(value: str) -> Decimal:
+    # Never turn malformed broker values into a plausible zero fill.
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+        raise ValueError("KIS_NOTICE_INVALID_NUMBER")
+    try:
+        number = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError("KIS_NOTICE_INVALID_NUMBER") from exc
+    if not number.is_finite():
+        raise ValueError("KIS_NOTICE_INVALID_NUMBER")
+    return number
+
+
+def _parse_kis_notice(fields: list[str], *, domestic: bool) -> dict[str, Any] | None:
+    """CNTG_YN=1 is intake, 2 is an execution delta, never terminal proof.
+
+    Official samples explicitly reuse CNTG_QTY as ORDER quantity on intake
+    (including amendment/cancel/rejection).  A positive value cannot promote
+    an intake message to a fill.  Neither notice supplies actual fees or an
+    exact cumulative terminal order receipt.
+    """
+    if not isinstance(fields, (list, tuple)) or len(fields) != (26 if domestic else 25):
         return None
-    order_no = str(fields[2])
-    symbol = str(fields[8]).upper()
-    quantity = _float(fields[9])
-    price = _float(fields[10])
-    rejected = str(fields[12]).upper() == "Y"
-    filled = str(fields[13]) in {"1", "2", "Y"} or quantity > 0
+    if any(not isinstance(item, str) for item in fields):
+        return None
+    quantity_index, price_index, time_index, reject_index, kind_index = (
+        (9, 10, 11, 12, 13) if domestic else (8, 9, 10, 11, 12)
+    )
+    order_no, symbol = fields[2].strip(), fields[8 if domestic else 7].strip().upper()
+    side = {"01": "SELL", "02": "BUY"}.get(fields[4])
+    kind, rejection, provider_time = fields[kind_index], fields[reject_index].upper(), fields[time_index]
+    # Current scoped cash-equity scope is direct KRX only. Never relabel an
+    # NXT/SOR notice or a truncated legacy frame with no route proof as KRX.
+    venue = ({"1": "KRX"}.get(fields[19]) if domestic
+        else {"6": "NASD", "7": "NYSE", "8": "AMEX"}.get(fields[18]))
+    if (
+        not order_no or not symbol or side is None or kind not in {"1", "2"}
+        or rejection not in {"0", "1"}
+        or venue is None
+        or (provider_time != "" and not re.fullmatch(r"[0-9]{6}", provider_time))
+        or (domestic and not provider_time)
+    ):
+        return None
+    try:
+        if provider_time:
+            datetime.strptime(provider_time, "%H%M%S")
+        # Official CNTG_QTY is ten integer digits. This bound also prevents
+        # an out-of-schema large integer losing shares in the float bridge.
+        if not re.fullmatch(r"[0-9]{1,10}", fields[quantity_index]):
+            return None
+        reported_quantity = _kis_notice_number(fields[quantity_index])
+        if reported_quantity != reported_quantity.to_integral_value():
+            return None
+        reported_price = _kis_notice_number(fields[price_index] or "0")
+        if domestic and fields[price_index] and not re.fullmatch(r"[0-9]{1,9}", fields[price_index]):
+            return None
+        if not domestic:
+            # Official US CNTG_UNPR omits FOUR decimal places. Column24's
+            # "12" is the documented field length, not a decimal-scale proof;
+            # keep that raw field without inventing its interpretation.
+            if fields[price_index] and not re.fullmatch(r"[0-9]{1,9}", fields[price_index]):
+                return None
+            reported_price /= Decimal(10000)
+            if fields[24] and not re.fullmatch(r"[0-9]{1,12}", fields[24]):
+                return None
+    except (ValueError, InvalidOperation):
+        return None
+    rejected = rejection == "1"
+    execution = kind == "2"
+    if execution and (rejected or reported_quantity <= 0 or reported_price <= 0):
+        return None
+    quantity = float(reported_quantity) if execution else 0.0
+    price = float(reported_price) if execution else 0.0
+    if not all(math.isfinite(value) for value in (quantity, price)):
+        return None
+    prefix = "kis" if domestic else "kis-overseas"
+    # Classification/raw hash distinguish same-second intake, rejection and
+    # fills.  Provider time is retained without inventing a date/timezone.
+    raw_hash = hashlib.sha256("^".join(fields).encode("utf-8")).hexdigest()
     return {
-        "event_id": f"kis:{order_no}:{fields[11]}:{quantity}:{price}",
-        "broker_id": "kis",
-        "order_id": "",
-        "broker_order_id": order_no,
-        "symbol": f"{symbol}.KS" if symbol.isdigit() and len(symbol) == 6 else symbol,
-        "side": "SELL" if str(fields[4]) in {"01", "1", "S"} else "BUY",
-        "quantity": quantity,
-        "price": price,
-        "fee": 0.0,
-        "state": "rejected" if rejected else "filled" if filled else "accepted",
-        "occurred_at": datetime.now(timezone.utc).isoformat(
-            timespec="microseconds"
-        ).replace("+00:00", "Z"),
-        "raw_type": "kis_domestic_execution",
+        "event_id": f"{prefix}:{order_no}:{provider_time}:{kind}:{rejection}:{raw_hash}",
+        "broker_id": "kis", "order_id": "", "broker_order_id": order_no,
+        "symbol": f"{symbol}.KS" if domestic and symbol.isdigit() and len(symbol) == 6 else symbol,
+        "side": side, "quantity": quantity, "price": price,
+        "fee": None, "actual_fee_observed": False, "fee_mode": "unavailable",
+        "quantity_mode": "delta", "terminal": False,
+        "execution_identity_status": "NO_OFFICIAL_EXECUTION_SEQUENCE_IN_NOTICE",
+        "financial_projection_proven": False,
+        # A rejected cancel/amendment intake does not reject the ORIGINAL
+        # order. Only an exact official REST terminal receipt may close it.
+        "state": "partially_filled" if execution else "intake_rejected" if rejected else "order_intake",
+        "occurred_at": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        "occurred_at_meaning": "LOCAL_NOTICE_PARSED_NOT_PROVIDER_EXECUTION_TIME",
+        "provider_time": provider_time, "provider_time_zone": None,
+        "notice_kind": "EXECUTION" if execution else "ORDER_INTAKE",
+        "intake_correction_class": fields[5], "intake_acceptance_flag": fields[14 if domestic else 13] if len(fields) > (14 if domestic else 13) else None,
+        "exchange": venue, "currency": "KRW" if domestic else "USD",
+        "raw_alternate_price": None if domestic else fields[24],
+        "reported_notice_quantity": str(reported_quantity), "raw_notice_hash": raw_hash,
+        "raw_type": "kis_domestic_execution" if domestic else "kis_overseas_execution",
     }
+
+
+def parse_kis_domestic_execution(fields: list[str]) -> dict[str, Any] | None:
+    return _parse_kis_notice(fields, domestic=True)
 
 
 def parse_kis_overseas_execution(fields: list[str]) -> dict[str, Any] | None:
     """Normalize official H0GSCNI0/H0GSCNI9 25-column notice."""
-    if len(fields) < 25:
-        return None
-    order_no = str(fields[2])
-    symbol = str(fields[7]).upper()
-    quantity = _float(fields[8])
-    price = _float(fields[9]) or _float(fields[24])
-    rejected = str(fields[11]).upper() == "Y"
-    filled = str(fields[12]) in {"1", "2", "Y"} or quantity > 0
-    return {
-        "event_id": f"kis-overseas:{order_no}:{fields[10]}:{quantity}:{price}",
-        "broker_id": "kis",
-        "order_id": "",
-        "broker_order_id": order_no,
-        "symbol": symbol,
-        "side": "SELL" if str(fields[4]) in {"01", "1", "S"} else "BUY",
-        "quantity": quantity,
-        "price": price,
-        "fee": 0.0,
-        "state": "rejected" if rejected else "filled" if filled else "accepted",
-        "occurred_at": datetime.now(timezone.utc).isoformat(
-            timespec="microseconds"
-        ).replace("+00:00", "Z"),
-        "raw_type": "kis_overseas_execution",
-    }
+    return _parse_kis_notice(fields, domestic=False)
 
 
 def _float(value: Any) -> float:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 import os
 import re
 import tempfile
@@ -172,7 +173,10 @@ class OrderDispatchSafetyTest(unittest.TestCase):
         intent: OrderIntent,
     ) -> dict:
         passing = self.passing_report()
+        # This journal/OMS fixture fakes external order authority. Dedicated
+        # scoped-authority tests exercise the actual native/permit boundary.
         with (
+            patch("live_trader.kis_order_authority.kis_scoped_operational_dispatch_boundary", side_effect=lambda *a, **kw: nullcontext()),
             patch.object(
                 state,
                 "evaluate_order_gate_with_report",

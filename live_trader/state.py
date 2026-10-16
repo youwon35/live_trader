@@ -345,6 +345,8 @@ def _serialized_safety_mutation(function: Any) -> Any:
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         with SAFETY_CONFIRMATION_MUTATION_LOCK:
+            if function.__name__ != "start_continuous_runtime" and "_revoke_kis_scoped_operational_authority" in globals():
+                _revoke_kis_scoped_operational_authority(function.__name__)
             with continuous_control_boundary(function.__name__):
                 result = function(*args, **kwargs)
         # Kill is a two-phase protocol.  Phase one durably latches ON while
@@ -543,15 +545,29 @@ def _two_phase_kis_route_control(
                         reservation
                     )
                     owns_reservation = True
+            result = None
             try:
                 # A controller/manager may run here; the KIS route is not held.
-                return function(*args, **kwargs)
+                result = function(*args, **kwargs)
+                return result
             finally:
                 if owns_reservation:
                     with kis_route_authority_serialization():
                         if _KIS_CONTROL_RESERVATION == reservation:
                             _KIS_CONTROL_RESERVATION = {}
                             _advance_kis_route_state_revision()
+                            if normalized_kind == "START" and "_finalize_kis_scoped_manual_start" in globals():
+                                finalized = _finalize_kis_scoped_manual_start(reservation)
+                                if isinstance(result, dict) and isinstance(finalized, dict):
+                                    was_started = result.get("ok") is True
+                                    result["kisOperationalAuthority"] = finalized
+                                    if finalized.get("status") != "ACTIVE":
+                                        result["ok"] = False
+                                        result["runtimeStarted"] = was_started
+                                        result["reason"] = str(finalized.get("reason") or "kis-operational-consent-not-active")
+                                    if isinstance(result.get("snapshot"), dict):
+                                        result["snapshot"]["kis_scoped_operational_authority"] = _kis_scoped_authority_status()
+                                        result["snapshot"]["new_entries_blocked"] = bool(STATE.get("new_entries_blocked"))
                         elif str(
                             reservation.get("reservationId") or ""
                         ) in _KIS_CONTROL_SUPERSEDED_IDS:
@@ -563,6 +579,10 @@ def _two_phase_kis_route_control(
                                     reservation.get("reservationId") or ""
                                 )
                             )
+                            if normalized_kind == "START" and isinstance(result, dict):
+                                result["ok"] = False
+                                result["reason"] = "kis-operational-start-superseded-by-stop"
+                                result["kisOperationalAuthority"] = {"status": "REVOKED"}
                         else:
                             raise RuntimeError(
                                 "kis-route-control-reservation-changed"
@@ -3747,6 +3767,789 @@ register_kis_order_authority_reader(
     _kis_order_authority_snapshot,
     kill_cancel_journal_path=KIS_ORDER_AUTHORITY_DB_PATH,
 )
+
+
+# Inserted after the existing KIS authority reader registration. No function
+# here is called by an import to mint a grant or establish exclusion.
+
+
+def _kis_scoped_store():
+    from .kis_scoped_operational_authority import KisScopedOperationalAuthority
+    from .process_safety import process_lock_root
+    # Source and frozen builds share the ownership/exclusion journal.
+    return KisScopedOperationalAuthority(process_lock_root() / "kis-scoped-operational-authority.sqlite3")
+
+
+_KIS_SCOPED_PENDING_STARTS: dict[str, dict[str, Any]] = {}
+
+
+def _revoke_kis_scoped_operational_authority(reason: str) -> None:
+    from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+    with kis_route_authority_serialization():
+        try:
+            _kis_scoped_store().revoke(reason=reason)
+        except (OSError, sqlite3.Error, ValueError, RuntimeError):
+            # Even a failed durable write cannot keep a grant usable. The
+            # final state resolver checks this before every wire consumption.
+            STATE["new_entries_blocked"] = True
+        finally:
+            _KIS_SCOPED_PENDING_STARTS.clear()
+            KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.revoke_all()
+
+
+def _kis_scoped_specialized_exclusion_snapshot() -> dict[str, Any]:
+    # Installing this mandatory final-edge closure actively excludes every
+    # specialized NEW order. Missing storage is UNKNOWN and stays closed.
+    account, _credential = _kis_environment_order_authority_binding()
+    return _kis_scoped_store().exclusion(account)
+
+
+def _kis_scoped_authority_status() -> dict[str, Any]:
+    try:
+        return _kis_scoped_store().status()
+    except (OSError, sqlite3.Error, ValueError, RuntimeError):
+        return {"status": "UNREADABLE", "permits": [], "orderAuthorityGranted": False}
+
+
+def _require_kis_scoped_runtime_clock_integrity(runtime_id: str) -> None:
+    from trading_runtime.market_clock_integrity import market_clock_integrity_failure_codes
+    controller = getattr(LIVE_CONTINUOUS_CONTROLLER, "runtimes", {}).get(runtime_id)
+    supervisor = getattr(controller, "supervisor", None)
+    # This dedicated reader takes only each feed's short integrity lock. A
+    # full supervisor/engine snapshot while holding ROUTE would invert locks.
+    reader = getattr(supervisor, "market_clock_integrity_snapshot", None)
+    if not callable(reader):
+        raise ValueError("kis-operational-market-clock-proof-unavailable")
+    failures = market_clock_integrity_failure_codes({"marketClockIntegrity": reader()})
+    if failures:
+        raise ValueError("kis-operational-market-clock-integrity:" + ",".join(sorted(failures)))
+
+
+def _kis_scoped_start_material(profile_id: str, mode: str, portfolio_id: str = "",
+                               deployment_id: str = "", strategy_id: str = "", *, require_fresh_preflight: bool = True, usd_operation: str = "START") -> tuple[dict[str, Any], object]:
+    from .kis_scoped_operational_authority import exact_context
+    from .kis_scoped_cleanup_authority import CLEANUP_POLICY
+    from .native_spot_quantity import sizing_from_artifact
+    from .process_safety import held_process_lease_status
+    from .account_profiles import saved_account_profiles
+
+    if profile_id != "stock" or mode not in {"SMALL_LIVE", "FULL_LIVE"} or not deployment_id:
+        raise ValueError("kis-manual-start-exact-live-deployment-required")
+    strategy = _operational_strategy(strategy_rows(portfolio_rows()),
+        deployment_id=deployment_id, strategy_id=strategy_id, portfolio_id=portfolio_id)
+    if strategy is None or strategy_broker_id(strategy) != "kis":
+        raise ValueError("kis-manual-start-current-deployment-missing")
+    scope = resolve_continuous_runtime_scope(profile_id, mode, portfolio_id, strategy_id, deployment_id)
+    if not isinstance(scope, dict) or scope.get("brokerId") != "kis":
+        raise ValueError("kis-manual-start-current-account-missing")
+    # The saved-profile and legacy wire fingerprints use different hash
+    # schemes. Re-derive the SAVED scheme from actual transport credentials so
+    # independently valid account A and account B cannot form a mixed grant.
+    wire_settings = {key: env_value(key) for key in ("KIS_APP_KEY", "KIS_APP_SECRET",
+        "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE", "KIS_BASE_URL")}
+    wire_profiles = [row for row in saved_account_profiles(wire_settings) if row.get("brokerId") == "kis"]
+    if len(wire_profiles) != 1 or any(wire_profiles[0].get(key) != scope.get(key)
+            for key in ("accountFingerprint", "credentialConfigurationHash")):
+        raise ValueError("kis-manual-start-saved-profile-differs-from-actual-wire-account")
+    if scope.get("capitalCurrency") == "USD":
+        from .kis_native_usd_reconciliation import require_native_usd_reconciliation
+        require_native_usd_reconciliation(operation=usd_operation)
+    if _kis_cleanup_store().pending_for_account(str(scope["accountFingerprint"])):
+        raise ValueError("kis-owned-stop-cleanup-reconciliation-required-before-live-start")
+    inputs = _operational_manifest_inputs(strategy)
+    if not _live_deployment_binding_is_executable(inputs["metadata"]["deploymentBinding"], mode=mode):
+        raise ValueError("kis-manual-start-deployment-not-executable")
+    papers = inputs["metadata"]["paperFinalBindings"]
+    if not papers or any(row.get("ready") is not True for row in papers):
+        raise ValueError("kis-manual-start-exact-paper-required")
+    manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest(deployment_id)
+    if manifest is None or not _operational_manifest_matches_inputs(manifest, inputs):
+        raise ValueError("kis-manual-start-current-preflight-manifest-required")
+    preflight = OPERATIONAL_GOVERNANCE.latest_preflight_for_deployment(deployment_id)
+    if require_fresh_preflight and (preflight is None or OPERATIONAL_GOVERNANCE.preflight_validity(preflight.snapshot_id).get("valid") is not True):
+        raise ValueError("kis-manual-start-fresh-preflight-required")
+    reconciliation = _reconciliation_summary_for_broker_snapshot(reconciliation_snapshot(), "kis")
+    if reconciliation.get("status") != "pass" or reconciliation.get("error_count", 0) or reconciliation.get("blocking_count", 0):
+        raise ValueError("kis-manual-start-exact-broker-reconciliation-required")
+    wire_account, wire_credential = _kis_environment_order_authority_binding()
+    _epoch_id, epoch_hash, application_held = _kis_application_owner_epoch()
+    if not application_held or not wire_account or not wire_credential:
+        raise ValueError("kis-manual-start-official-owner-lease-required")
+    artifacts = load_strategy_artifacts()
+    venues = []
+    for member in inputs["metadata"]["strategyMembers"]:
+        candidates = [artifact for artifact in artifacts
+            if _operational_artifact_hash(artifact) == member["artifactHash"]
+            and str(artifact.get("symbol") or "").upper() == member["symbol"].upper()]
+        if len(candidates) != 1:
+            raise ValueError("kis-manual-start-exact-source-route-ambiguous")
+        sizing = sizing_from_artifact(candidates[0])
+        contract = sizing["quantityContract"] if sizing else {}
+        if contract.get("schemaVersion") != "native-equity-quantity-v1" or contract.get("quoteCurrency") != scope.get("capitalCurrency"):
+            raise ValueError("kis-manual-start-source-currency-contract-required")
+        venue = contract.get("exchange")
+        if venue not in ({"KRX"} if scope.get("capitalCurrency") == "KRW" else {"NASD", "NYSE", "AMEX"}):
+            raise ValueError("kis-manual-start-source-exchange-mismatch")
+        venues.append({"artifactHash": member["artifactHash"], "symbol": member["symbol"], "exchange": venue})
+    context = exact_context({"schemaVersion": "kis-scoped-manual-start-context/v1",
+        "scopeHash": governance_sha256({"inputs": inputs, "venues": venues,
+            "cleanupPolicy": CLEANUP_POLICY,
+            "renewalPolicy": {"schemaVersion": "kis-scoped-operational-renewal/v1",
+                "consentLifetime": "EXACT_RUNNING_USER_SESSION_UNTIL_REVOKED", "wirePermitMaximumSeconds": 15,
+                "freshPreflightRequired": True, "nativeMaxAgeSeconds": 15, "boundaryMaxAgeSeconds": 30,
+                "revokeOnScopeChange": True}}),
+        "profileId": "stock", "mode": mode, "portfolioId": str(inputs["metadata"].get("portfolioId") or ""),
+        "deploymentId": deployment_id, "strategyId": str(strategy.get("strategy_id") or ""),
+        "runtimeScopeId": str(scope["runtimeScopeId"]), "capitalCurrency": str(scope["capitalCurrency"]),
+        "accountFingerprint": str(scope["accountFingerprint"]),
+        "credentialConfigurationHash": str(scope["credentialConfigurationHash"]),
+        "wireAccountFingerprint": wire_account, "wireCredentialConfigurationHash": wire_credential,
+        "ownerEpochHash": epoch_hash})
+    return context, preflight
+
+
+def prepare_kis_scoped_manual_start(profile_id: str, mode: str, portfolio_id: str = "",
+                                    deployment_id: str = "", strategy_id: str = "") -> dict[str, Any]:
+    from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+    try:
+        with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+            context, _preflight = _kis_scoped_start_material(profile_id, mode, portfolio_id, deployment_id, strategy_id)
+            result = KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.arm(context)
+            result["maximumOperationalPermitSeconds"] = 15
+            result["automaticRenewalEnabled"] = True
+            result["consentLifetime"] = "EXACT_RUNNING_USER_SESSION_UNTIL_REVOKED"
+            result["launchPreflightExpiresAt"] = str(_preflight.expires_at)
+            return result
+    except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+        return {"ok": False, "reason": str(exc), "runtimeStarted": False, "brokerSubmissionPerformed": False}
+
+
+def _reserve_kis_scoped_manual_start(session: object, context: dict[str, Any], preflight: object) -> None:
+    from .process_safety import hold_kis_dispatch_lease
+    from .kis_order_authority import kis_specialized_operational_fence_status
+    reservation = dict(_KIS_CONTROL_RESERVATION)
+    if reservation.get("reservationKind") != "START" or not reservation.get("reservationId"):
+        raise ValueError("kis-operational-start-reservation-missing")
+    with kis_route_authority_serialization():
+        fence = kis_specialized_operational_fence_status(scoped_reader=_kis_scoped_operational_dispatch_authority,
+            specialized_reader=_kis_scoped_specialized_exclusion_snapshot)
+        if fence.get("installed") is not True or fence.get("routeHeld") is not True or fence.get("mutationInFlight") is not False:
+            raise ValueError("kis-operational-specialized-exclusion-closure-unproven")
+        # This is invoked ONLY after a fresh native human proof is consumed.
+        # The old account lock denies another source/frozen/specialized writer.
+        lease = hold_kis_dispatch_lease(context["wireAccountFingerprint"])
+        if lease.get("acquired") is not True:
+            raise ValueError("kis-operational-same-account-os-lease-unavailable")
+        # Older state entrypoints also retain this account identity domain.
+        # Own both aliases, rather than allowing different hash conventions to
+        # create two independent writers for the same real KIS account.
+        legacy_account = functional_test_account_fingerprint(kis_functional_test_account_id())
+        if hold_kis_dispatch_lease(legacy_account).get("acquired") is not True:
+            raise ValueError("kis-operational-legacy-account-os-lease-unavailable")
+        legacy = _kis_order_authority_snapshot()
+        if legacy.get("functionalSessionId") or legacy.get("functionalMutationIntent"):
+            raise ValueError("kis-operational-specialized-session-reconciliation-required")
+        rows = PROGRAM_LEDGER.order_dispatch_rows(1_000_000)
+        if len(rows) >= 1_000_000 or any(str(row.get("broker_id") or "").lower() == "kis"
+            and str(row.get("state") or "").lower() not in {"filled", "cancelled", "canceled", "rejected", "expired"}
+            for row in rows):
+            raise ValueError("kis-operational-old-order-reconciliation-required")
+        store = _kis_scoped_store()
+        store.establish_exclusion(context, proof={"routeQuiescent": fence["routeHeld"] and not fence["mutationInFlight"],
+            "specializedClosureInstalled": fence["installed"], "sameAccountLeaseHeld": lease.get("acquired") is True,
+            "reconciliationClear": not bool(legacy.get("functionalSessionId") or legacy.get("functionalMutationIntent"))})
+        expiry = min(time.time() + 300, datetime.fromisoformat(str(preflight.expires_at).replace("Z", "+00:00")).timestamp())
+        store.reserve(context, session_id=str(session.session_id), reservation_id=reservation["reservationId"], expires_at=expiry)
+        from .kis_scoped_cleanup_authority import CLEANUP_POLICY
+        store.record_native_cleanup_policy(str(session.session_id), context=context, policy=CLEANUP_POLICY)
+        _KIS_SCOPED_PENDING_STARTS[reservation["reservationId"]] = {"sessionId": str(session.session_id), "context": dict(context)}
+
+
+def _finalize_kis_scoped_manual_start(reservation: dict[str, Any]) -> dict[str, Any] | None:
+    pending = _KIS_SCOPED_PENDING_STARTS.pop(str(reservation.get("reservationId") or ""), None)
+    if pending is None:
+        return
+    session_id = pending["sessionId"]
+    try:
+        context = pending["context"]
+        current, _preflight = _kis_scoped_start_material(context["profileId"], context["mode"],
+            context["portfolioId"], context["deploymentId"], context["strategyId"])
+        session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+        exact_running = bool(session is not None and session.lifecycle == "RUNNING"
+            and (STATE.get("active_runtime_session_ids") or {}).get(context["runtimeScopeId"]) == session_id
+            and getattr(LIVE_CONTINUOUS_CONTROLLER, "_writer_leases", {}).get(context["runtimeScopeId"]) is not None
+            and LIVE_CONTINUOUS_CONTROLLER._writer_leases[context["runtimeScopeId"]].held)
+        if current != context or STATE.get("mode") == "MONITOR" or STATE.get("kill_switch"):
+            exact_running = False
+        _kis_scoped_store().activate(session_id, context=current, reservation_id=reservation["reservationId"],
+            reservation_finalized=not bool(_KIS_CONTROL_RESERVATION), session_running=exact_running)
+        return {"status": "ACTIVE", **_kis_scoped_store().authorize_consent(session_id, context=current)}
+    except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+        _kis_scoped_store().revoke(session_id=session_id, reason="start-finalization-failed")
+        STATE["new_entries_blocked"] = True
+        try:
+            current_session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+            if current_session is not None and current_session.lifecycle in {"STARTING", "RUNNING"}:
+                OPERATIONAL_GOVERNANCE.transition_runtime_session(session_id, "DEGRADED",
+                    actor="live_trader.desktop", event_type="KIS_OPERATIONAL_AUTHORITY_REVOKED", payload={"reason": str(exc)[:200]})
+        except (OSError, sqlite3.Error, ValueError, RuntimeError):
+            pass
+        return {"status": "REVOKED", "reason": "kis-operational-start-finalization-failed:" + str(exc)[:200]}
+
+
+def _kis_scoped_operational_dispatch_assessment(intent: object, *, broker_payload, authority_intent=None, prepared_request=None, consume=False) -> dict[str, Any]:
+    from .kis_equity_execution import validate_ticket
+    from .process_safety import held_process_lease_status
+    if not isinstance(intent, OrderIntent) or STATE.get("mode") == "MONITOR" or STATE.get("kill_switch") or STATE.get("new_entries_blocked"):
+        raise ValueError("kis-operational-live-intent-required")
+    if not isinstance(broker_payload, dict) or not str(broker_payload.get("identifier") or ""):
+        raise ValueError("kis-operational-state-owned-broker-payload-required")
+    expected_payload = live_broker_payload(intent, idempotency_key=str(broker_payload["identifier"]))
+    if broker_payload != expected_payload:
+        raise ValueError("kis-operational-broker-payload-differs-from-native-intent")
+    controls_allowed, controls_reason = live_broker_dispatch_allowed(intent, dry_run=False)
+    if not controls_allowed:
+        raise ValueError(controls_reason)
+    allowed, reason, _authorization = operational_runtime_dispatch_allowed(intent)
+    if not allowed:
+        raise ValueError(reason)
+    _key, session = _active_session_for_intent(intent)
+    if session is None or session.lifecycle != "RUNNING":
+        raise ValueError("kis-operational-exact-running-session-required")
+    metadata = dict(session.metadata)
+    context, _preflight = _kis_scoped_start_material("stock", session.mode,
+        str(metadata.get("portfolioId") or ""), str(session.deployment_id), str(metadata.get("strategyId") or ""), usd_operation="RENEWAL")
+    _require_kis_scoped_runtime_clock_integrity(context["runtimeScopeId"])
+    validate_ticket(intent, settings=runtime_settings())
+    lease = held_process_lease_status("live-trader:kis-account:" + context["wireAccountFingerprint"])
+    manager_lease = getattr(LIVE_CONTINUOUS_CONTROLLER, "_writer_leases", {}).get(context["runtimeScopeId"])
+    if lease.get("acquired") is not True or manager_lease is None or not manager_lease.held:
+        raise ValueError("kis-operational-account-writer-lease-lost")
+    legacy_account = functional_test_account_fingerprint(kis_functional_test_account_id())
+    if held_process_lease_status("live-trader:kis-account:" + legacy_account).get("acquired") is not True:
+        raise ValueError("kis-operational-legacy-account-writer-lease-lost")
+    if authority_intent is not None:
+        expected_endpoint = "/uapi/domestic-stock/v1/trading/order-cash" if context["capitalCurrency"] == "KRW" else "/uapi/overseas-stock/v1/trading/order"
+        if authority_intent.get("endpoint") != expected_endpoint:
+            raise ValueError("kis-operational-currency-wire-endpoint-mismatch")
+        from .live_adapters import build_kis_live_order_request, kis_prepared_payload_hash
+        if prepared_request is None:
+            raise ValueError("kis-operational-final-prepared-wire-required")
+        authorization = str(prepared_request.headers.get("authorization") or "")
+        if not authorization.startswith("Bearer ") or len(authorization) <= 7:
+            raise ValueError("kis-operational-authenticated-wire-required")
+        expected_request = build_kis_live_order_request(expected_payload, access_token=authorization[7:])
+        if kis_prepared_payload_hash(expected_request) != authority_intent.get("payloadHash"):
+            raise ValueError("kis-operational-native-intent-wire-hash-mismatch")
+    model = dict(intent.metadata["native_quantity_model"])
+    fresh_evidence = {"schemaVersion": "kis-operational-wire-evidence/v1",
+        "preflightHash": str(_preflight.snapshot_hash),
+        "preflightExpiresAt": datetime.fromisoformat(str(_preflight.expires_at).replace("Z", "+00:00")).timestamp(),
+        "nativeTicketHash": governance_sha256(model),
+        "nativeAsOf": datetime.fromisoformat(str(model["asOf"]).replace("Z", "+00:00")).timestamp(),
+        "boundaryHash": str(model["boundaryHash"]),
+        "boundaryStartsAt": datetime.fromisoformat(str(intent.metadata["native_open_boundary"]["startTime"]).replace("Z", "+00:00")).timestamp()}
+    grant = _kis_scoped_store().authorize(str(session.session_id), context=context, fresh_evidence=fresh_evidence)
+    if consume:
+        dispatch_key = governance_sha256({"sourceArtifactHash": model["sourceArtifactHash"],
+            "evaluationKey": model["evaluationKey"], "boundaryHash": model["boundaryHash"],
+            "symbol": intent.symbol, "side": intent.side})
+        _kis_scoped_store().consume_wire(str(session.session_id), context=context, intent=authority_intent, dispatch_key=dispatch_key, fresh_evidence=fresh_evidence)
+    return {"allowed": True, **grant}
+
+
+def _kis_scoped_operational_dispatch_authority(intent: object, *, broker_payload, authority_intent=None, prepared_request=None, consume=False) -> dict[str, Any]:
+    try:
+        return _kis_scoped_operational_dispatch_assessment(intent, broker_payload=broker_payload,
+            authority_intent=authority_intent, prepared_request=prepared_request, consume=consume)
+    except Exception:
+        # Once a final-edge control/identity/freshness failure is observed, a
+        # later restoration of the old fields must not resurrect this consent.
+        try:
+            if isinstance(intent, OrderIntent):
+                _key, session = _active_session_for_intent(intent)
+                if session is not None:
+                    _kis_scoped_store().revoke(session_id=str(session.session_id), reason="final-edge-authority-rejected")
+                    if session.lifecycle == "RUNNING":
+                        OPERATIONAL_GOVERNANCE.transition_runtime_session(session.session_id, "DEGRADED",
+                            actor="live_trader.kis_scoped.final_dispatch", event_type="KIS_OPERATIONAL_CONSENT_REVOKED",
+                            payload={"reason": "final-edge-authority-rejected"})
+        except (OSError, sqlite3.Error, ValueError, RuntimeError):
+            STATE["new_entries_blocked"] = True
+        raise
+
+
+from .kis_order_authority import register_kis_scoped_operational_reader
+register_kis_scoped_operational_reader(_kis_scoped_operational_dispatch_authority,
+    specialized_exclusion_reader=_kis_scoped_specialized_exclusion_snapshot)
+
+
+def _kis_cleanup_store():
+    from .kis_scoped_cleanup_authority import KisScopedCleanupStore
+    return KisScopedCleanupStore(_kis_scoped_store())
+
+
+def _kis_cleanup_status():
+    try:
+        return _kis_cleanup_store().public_status()
+    except (OSError, sqlite3.Error, ValueError, RuntimeError):
+        return {"schemaVersion": "kis-scoped-owned-stop-cleanup/v1", "status": "UNREADABLE", "scopes": []}
+
+
+def _assert_kis_preflight_collection_outside_authority_locks_for_runtime(runtime_id):
+    from .kis_order_authority import kis_route_authority_owned_by_current_thread
+    if kis_route_authority_owned_by_current_thread():
+        raise ValueError("kis-cleanup-network-under-route-lock")
+    controller = LIVE_CONTINUOUS_CONTROLLER.runtimes.get(runtime_id)
+    if controller is None:
+        raise ValueError("kis-cleanup-exact-controller-required")
+    for lock in (SAFETY_CONFIRMATION_MUTATION_LOCK, RUNTIME_MODE_LOCK, RUNTIME_CONTROL_LOCK,
+            LIVE_CONTINUOUS_CONTROLLER._lock, LIVE_CONTINUOUS_CONTROLLER._control_lock, controller._lock):
+        owned = getattr(lock, "owned_by_current_thread", None) or getattr(lock, "_is_owned", None)
+        if not callable(owned) or owned() is not False:
+            raise ValueError("kis-cleanup-network-under-authority-lock")
+    return True
+
+
+def _kis_cleanup_current_owner(context, session_id, *, stopped):
+    from .process_safety import held_process_lease_status
+    from .account_profiles import saved_account_profiles
+    if _kis_cleanup_store().consent_context(session_id) != context:
+        raise ValueError("kis-cleanup-original-native-consent-changed")
+    session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+    key = context["runtimeScopeId"]
+    if (session is None or session.deployment_id != context["deploymentId"] or session.mode != context["mode"]
+            or session.profile != "stock" or dict(session.metadata).get("brokerId") != "kis"
+            or str(dict(session.metadata).get("runtimeScopeId") or "") != key
+            or (STATE.get("active_runtime_session_ids") or {}).get(key) != session_id):
+        raise ValueError("kis-cleanup-exact-original-session-required")
+    controller = LIVE_CONTINUOUS_CONTROLLER.runtimes.get(key)
+    if controller is None or controller._native_runtime is None:
+        raise ValueError("kis-cleanup-current-native-runtime-required")
+    scope = LIVE_CONTINUOUS_CONTROLLER.runtime_scopes.get(key)
+    scope = scope.to_dict() if scope is not None else {}
+    if (scope.get("brokerId") != "kis" or scope.get("profileId") != "stock"
+            or any(scope.get(name) != context[name] for name in ("accountFingerprint", "credentialConfigurationHash", "capitalCurrency", "deploymentId"))):
+        raise ValueError("kis-cleanup-runtime-account-binding-changed")
+    wire_account, wire_credential = _kis_environment_order_authority_binding()
+    _epoch, epoch_hash, held = _kis_application_owner_epoch()
+    actual = saved_account_profiles({name: env_value(name) for name in
+        ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE", "KIS_BASE_URL")})
+    accounts = [row for row in actual if row.get("brokerId") == "kis"]
+    if (not held or epoch_hash != context["ownerEpochHash"] or wire_account != context["wireAccountFingerprint"]
+            or wire_credential != context["wireCredentialConfigurationHash"] or len(accounts) != 1
+            or any(accounts[0].get(name) != context[name] for name in ("accountFingerprint", "credentialConfigurationHash"))):
+        raise ValueError("kis-cleanup-current-wire-owner-account-credentials-changed")
+    manager_lease = LIVE_CONTINUOUS_CONTROLLER._writer_leases.get(key)
+    if manager_lease is None or manager_lease.held is not True:
+        raise ValueError("kis-cleanup-account-writer-lease-lost")
+    for account in (wire_account, functional_test_account_fingerprint(kis_functional_test_account_id())):
+        if held_process_lease_status("live-trader:kis-account:" + account).get("acquired") is not True:
+            raise ValueError("kis-cleanup-shared-specialized-account-lease-lost")
+    if stopped and (session.lifecycle != "STOPPING" or key not in LIVE_CONTINUOUS_CONTROLLER._cleanup_writer_pins
+            or controller.mode != "MONITOR" or LIVE_CONTINUOUS_CONTROLLER._running(controller)):
+        raise ValueError("kis-cleanup-worker-must-be-drained-with-place-revoked")
+    return session, controller
+
+
+def _kis_cleanup_owned_orders(session, controller):
+    from .kis_equity_execution import checked, RESULT
+    from .kis_scoped_cleanup_authority import dispatch_business_hash
+    from .kis_scoped_cleanup_scope import original_owned_cleanup_scope, cached_cleanup_terminal_is_complete
+    from .verified_terminal_cache import terminal_identity
+    rows = PROGRAM_LEDGER.order_dispatch_rows(1000000)
+    if not isinstance(rows, list) or len(rows) >= 1000000:
+        raise ValueError("kis-cleanup-complete-durable-dispatch-set-required")
+    key = str(dict(session.metadata).get("runtimeScopeId") or "")
+    members = {spec.strategy_instance_id: spec for spec in controller._native_runtime.specs}
+    reservation = _kis_cleanup_store().for_session(session.session_id)
+    reserved_keys = {row["dispatchKey"] for row in json.loads(reservation["orders_json"])} if reservation and reservation["status"] != "CLEAN" else set()
+    cleanup_scope = None
+    owned = []
+    for row in rows:
+        metadata = row.get("metadata") or {}
+        if metadata.get("runtime_scope_id") != key:
+            continue
+        if row.get("broker_id") != "kis" or metadata.get("deployment_id") != session.deployment_id:
+            raise ValueError("kis-cleanup-owned-runtime-dispatch-scope-conflict")
+        authorization = row.get("runtime_authorization") or {}
+        authorized_session = authorization.get("session") or {}
+        if not authorized_session.get("sessionId"):
+            raise ValueError("kis-cleanup-original-session-receipt-unproven")
+        if authorized_session.get("sessionId") != session.session_id:
+            # Earlier stopped sessions retain their own cleanup reservation;
+            # a new native confirmation cannot borrow their receipts.
+            continue
+        if not row.get("broker_order_id") or row.get("broker_order_id") == "-":
+            if row.get("state") in {"risk_blocked", "adapter_blocked", "rejected"}:
+                continue
+            raise ValueError("kis-cleanup-owned-submission-outcome-unknown")
+        spec = members.get(metadata.get("strategy_instance_id"))
+        ticket = checked(metadata.get("native_quantity_model"), RESULT)
+        if (spec is None or metadata.get("source_artifact_hash") != spec.artifact_hash
+                or metadata.get("portfolio_hash") != spec.portfolio_hash or ticket.get("deploymentId") != session.deployment_id
+                or ticket.get("symbol") != row.get("symbol") or ticket.get("side") != row.get("side")
+                or ticket.get("quantity") is None or ticket.get("accountFingerprint") != dict(session.metadata).get("accountFingerprint")
+                or ticket.get("credentialConfigurationHash") != dict(session.metadata).get("credentialConfigurationHash")):
+            raise ValueError("kis-cleanup-original-sealed-order-member-changed")
+        if row.get("broker_order_identity_verified") is True:
+            if cleanup_scope is None:
+                cleanup_scope = original_owned_cleanup_scope(controller._native_runtime,
+                    _kis_cleanup_store().consent_context(session.session_id))
+            cache = controller._native_runtime.terminal_cache
+            cached = cache.get(terminal_identity(cleanup_scope, spec, row))
+            if row.get("idempotency_key") not in reserved_keys and cached_cleanup_terminal_is_complete(cached):
+                # Only a sealed complete terminal receipt can be omitted from
+                # the bounded pending set. Local accepted/filled labels cannot.
+                continue
+        owned.append({"dispatchKey": str(row.get("idempotency_key") or ""), "runtimeScopeId": key,
+            "sessionId": session.session_id, "accountFingerprint": ticket["accountFingerprint"],
+            "credentialConfigurationHash": ticket["credentialConfigurationHash"], "deploymentId": session.deployment_id,
+            "market": "KR" if ticket["exchange"] == "KRX" else "US", "currency": ticket["currency"],
+            "symbol": row["symbol"], "side": row["side"], "venue": ticket["exchange"],
+            "orderDate": str(row.get("order_date") or ""), "organizationNo": str(row.get("organization_no") or ""),
+            "orderNo": str(row["broker_order_id"]), "originalQuantity": str(ticket["quantity"]),
+            "dispatchHash": governance_sha256(row), "businessHash": dispatch_business_hash(row), "dispatch": row})
+    if len(owned) > 64 or len({row["dispatchKey"] for row in owned}) != len(owned):
+        raise ValueError("kis-cleanup-bounded-unique-dispatch-set-required")
+    return sorted(owned, key=lambda row: row["dispatchKey"])
+
+
+def _recover_kis_cleanup_owned_identities(session, controller, reserved):
+    from .kis_scoped_cleanup_authority import dispatch_business_hash, dispatch_ownership_hash
+    orders = _kis_cleanup_owned_orders(session, controller)
+    if [{"dispatchKey": row["dispatchKey"], "ownershipHash": dispatch_ownership_hash(row["dispatch"])} for row in orders] != reserved:
+        raise ValueError("kis-cleanup-owned-dispatch-set-changed-after-drain")
+    native = controller._native_runtime
+    members = {spec.strategy_instance_id: spec for spec in native.specs}
+    for item in orders:
+        row = item["dispatch"]
+        if row.get("broker_order_identity_verified") is True:
+            continue
+        identity = native.recover_order_identity(members[row["metadata"]["strategy_instance_id"]], row)
+        PROGRAM_LEDGER.record_verified_kis_order_identity(item["dispatchKey"], governance_sha256(row), identity)
+        current = PROGRAM_LEDGER.order_dispatch_for_idempotency_key(item["dispatchKey"])
+        if (not isinstance(current, dict) or current.get("broker_order_identity_verified") is not True
+                or dispatch_business_hash(current) != item["businessHash"]
+                or any(current.get(name) != identity[name] for name in ("order_date", "organization_no", "broker_order_id", "broker_order_key"))):
+            raise ValueError("kis-cleanup-verified-order-identity-cas-reread-required")
+    return _kis_cleanup_owned_orders(session, controller)
+
+
+def _prepare_kis_owned_stop_cleanup(key, session):
+    from .kis_scoped_cleanup_authority import dispatch_ownership_hash
+    # No caller-supplied receipt, account or cancel quantity is accepted.
+    context = _kis_cleanup_store().consent_context(session.session_id)
+    _session, controller = _kis_cleanup_current_owner(context, session.session_id, stopped=False)
+    orders = _kis_cleanup_owned_orders(session, controller)
+    reserved = [{"dispatchKey": row["dispatchKey"], "ownershipHash": dispatch_ownership_hash(row["dispatch"])} for row in orders]
+    row = _kis_cleanup_store().reserve(session.session_id, context, reserved)
+    from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+    KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.revoke_scope(key)
+    return {"cleanupId": row["cleanup_id"], "sessionId": session.session_id, "runtimeScopeId": key,
+        "context": context, "reserved": reserved, "controller": controller}
+
+
+def _kis_scoped_cleanup_dispatch_authority(payload, *, authority_intent=None, prepared_request=None, consume=False):
+    from .kis_scoped_cleanup_truth import validate_cleanup_truth
+    from .kis_scoped_cleanup_adapter import build_kis_scoped_cleanup_request
+    from .kis_scoped_cleanup_authority import dispatch_business_hash
+    from .live_adapters import kis_prepared_payload_hash
+    if not isinstance(payload, dict) or set(payload) != {"cleanupId", "dispatchKey"}:
+        raise ValueError("kis-cleanup-only-state-owned-exact-dispatch-selector-is-accepted")
+    row = _kis_cleanup_store().read(str(payload["cleanupId"]))
+    context = json.loads(row["context_json"])
+    session, controller = _kis_cleanup_current_owner(context, row["session_id"], stopped=True)
+    current = _kis_cleanup_owned_orders(session, controller)
+    truth = json.loads(row["truth_json"])
+    validate_cleanup_truth(truth, current)
+    _row, proof = _kis_cleanup_store().authorize(row["cleanup_id"], context=context, dispatch_key=payload["dispatchKey"])
+    stored = PROGRAM_LEDGER.order_dispatch_for_idempotency_key(payload["dispatchKey"])
+    if (not isinstance(stored, dict) or governance_sha256(stored) != proof["dispatchHash"]
+            or dispatch_business_hash(stored) != proof["businessHash"]):
+        raise ValueError("kis-cleanup-owned-ledger-receipt-changed-before-wire")
+    if authority_intent is not None:
+        if prepared_request is None:
+            raise ValueError("kis-cleanup-final-actual-prepared-wire-required")
+        bearer = str(prepared_request.headers.get("authorization") or "")
+        if not bearer.startswith("Bearer ") or not bearer[7:]:
+            raise ValueError("kis-cleanup-authenticated-wire-required")
+        expected = build_kis_scoped_cleanup_request(proof, access_token=bearer[7:])
+        operation = "SCOPED_CANCEL_KR" if proof["market"] == "KR" else "SCOPED_CANCEL_US"
+        owned = {"orderDate": proof["orderDate"], "organizationNo": proof["organizationNo"], "orderNo": proof["orderNo"]}
+        if (authority_intent.get("operation") != operation or authority_intent.get("ownedOrderKey") != owned
+                or authority_intent.get("endpoint") != expected.endpoint or authority_intent.get("payloadHash") != kis_prepared_payload_hash(expected)
+                or kis_prepared_payload_hash(prepared_request) != kis_prepared_payload_hash(expected)):
+            raise ValueError("kis-cleanup-actual-wire-differs-from-original-current-owned-remainder")
+    if consume:
+        _kis_cleanup_store().consume(row["cleanup_id"], context=context, dispatch_key=payload["dispatchKey"], intent=authority_intent)
+    return {"allowed": True, "cleanupOnly": True, "expiresAt": row["truth_expires"]}
+
+
+from .kis_order_authority import register_kis_scoped_cleanup_reader
+register_kis_scoped_cleanup_reader(_kis_scoped_cleanup_dispatch_authority)
+
+
+def _finish_kis_owned_stop_cleanup(plan):
+    from .kis_scoped_cleanup_truth import collect_cleanup_truth, validate_cleanup_truth
+    from .kis_scoped_cleanup_authority import dispatch_ownership_hash
+    from .kis_scoped_cleanup_scope import cleanup_read_runtime
+    cleanup_id = plan["cleanupId"]
+    try:
+        # No SAFETY/ROUTE/RUNTIME/control/manager lock may surround these GETs.
+        _assert_kis_preflight_collection_outside_authority_locks_for_runtime(plan["runtimeScopeId"])
+        session, controller = _kis_cleanup_current_owner(plan["context"], plan["sessionId"], stopped=True)
+        current = _recover_kis_cleanup_owned_identities(session, controller, plan["reserved"])
+        truth = {"orders": []}
+        reader = cleanup_read_runtime(controller._native_runtime, plan["context"])
+        if current:
+            truth = collect_cleanup_truth(reader, current)
+            validate_cleanup_truth(truth, current)
+            expires = datetime.fromisoformat(truth["observedAt"].replace("Z", "+00:00")).timestamp() + 15
+            with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+                _kis_cleanup_current_owner(plan["context"], plan["sessionId"], stopped=True)
+                _kis_cleanup_store().bind_truth(cleanup_id, truth, expires_at=expires,
+                    ownership=[{"dispatchKey": item["dispatchKey"], "ownershipHash": dispatch_ownership_hash(item["dispatch"])} for item in current])
+            for proof in truth["orders"]:
+                if proof["state"] != "WORKING":
+                    continue
+                # No truth or ACK is reusable authority. Final transport calls
+                # the sole state reader and consumes its durable one-use claim.
+                LiveBrokerRouter().cancel_kis_scoped_cleanup({"cleanupId": cleanup_id, "dispatchKey": proof["dispatchKey"]}, proof)
+            # A cancel acknowledgement neither proves cancellation nor removes
+            # a partial fill. Only a fresh complete official terminal row can.
+            truth = collect_cleanup_truth(reader, current)
+            validate_cleanup_truth(truth, current)
+            if any(item["state"] != "TERMINAL" for item in truth["orders"]):
+                raise ValueError("kis-cleanup-cancel-acknowledged-but-official-terminal-not-confirmed")
+        # Re-apply sealed history receipts idempotently even when all orders
+        # were already terminal-cached before STOP. A cache is not a cash book.
+        controller._native_runtime.sync_owned_fills(reader.scope())
+        refreshed = refresh_preflight_reconciliation({"broker_id": "kis"})
+        if plan["context"]["capitalCurrency"] == "USD":
+            from .kis_native_usd_reconciliation import require_native_usd_reconciliation
+            require_native_usd_reconciliation(operation="CLEAN",
+                generic_reconciliation=refreshed)
+        summary = refreshed.get("summary") or {}
+        poll = refreshed.get("poll") or {}
+        passed = (poll.get("ok") is True and poll.get("coalesced") is False and not poll.get("error_count")
+            and summary.get("fresh") is True and summary.get("three_way_verified") is True
+            and summary.get("status") == "pass" and not summary.get("error_count") and not summary.get("blocking_count")
+            and not refreshed.get("errors"))
+        with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+            _kis_cleanup_current_owner(plan["context"], plan["sessionId"], stopped=True)
+            _kis_cleanup_store().finish(cleanup_id, terminal_truth=truth, owned_capital_settled=True, reconciliation_passed=passed)
+            OPERATIONAL_GOVERNANCE.transition_runtime_session(plan["sessionId"], "STOPPED", actor="live_trader.kis_scoped.cleanup",
+                event_type="KIS_OWNED_STOP_CLEANUP_TERMINAL_RECONCILED", payload={"runtimeId": plan["runtimeScopeId"]})
+            active = STATE.setdefault("active_runtime_session_ids", {})
+            if active.get(plan["runtimeScopeId"]) == plan["sessionId"]:
+                active.pop(plan["runtimeScopeId"], None)
+        # Manager locking comes after the short authority mutation, never
+        # while holding ROUTE. Retain the lease for every unknown outcome.
+        LIVE_CONTINUOUS_CONTROLLER.complete_cleanup_writer(plan["runtimeScopeId"])
+        return {"ok": True, "status": "CLEAN", "runtimeScopeId": plan["runtimeScopeId"]}
+    except Exception as exc:
+        try:
+            _kis_cleanup_store().fail(cleanup_id, type(exc).__name__ + ":" + str(exc))
+        except (OSError, sqlite3.Error, ValueError, RuntimeError):
+            STATE["new_entries_blocked"] = True
+        return {"ok": False, "status": "STOPPED_PENDING_RECONCILIATION", "runtimeScopeId": plan["runtimeScopeId"],
+            "reason": str(exc)[:300], "requiresReconciliation": True, "placementBlocked": True, "writerLeaseRetained": True}
+
+
+def _capture_kis_scoped_preflight_assessment(intent: OrderIntent) -> dict[str, Any]:
+    if not isinstance(intent, OrderIntent) or str(intent.metadata.get("broker_id") or "") != "kis":
+        raise ValueError("kis-scoped-preflight-exact-intent-required")
+    with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+        if STATE.get("mode") == "MONITOR" or STATE.get("kill_switch") or STATE.get("new_entries_blocked"):
+            raise ValueError("kis-scoped-preflight-controls-blocked")
+        key, session = _active_session_for_intent(intent)
+        if session is None or session.lifecycle != "RUNNING" or session.mode != intent.mode:
+            raise ValueError("kis-scoped-preflight-exact-running-session-required")
+        metadata = dict(session.metadata)
+        context, _preflight = _kis_scoped_start_material("stock", session.mode,
+            str(metadata.get("portfolioId") or ""), str(session.deployment_id),
+            str(metadata.get("strategyId") or ""), require_fresh_preflight=False, usd_operation="RENEWAL")
+        if key != context["runtimeScopeId"]:
+            raise ValueError("kis-scoped-preflight-runtime-key-mismatch")
+        _require_kis_scoped_runtime_clock_integrity(key)
+        _kis_scoped_store().authorize_consent(str(session.session_id), context=context)
+        from .process_safety import held_process_lease_status
+        lease = held_process_lease_status("live-trader:kis-account:" + context["wireAccountFingerprint"])
+        manager_lease = getattr(LIVE_CONTINUOUS_CONTROLLER, "_writer_leases", {}).get(key)
+        if lease.get("acquired") is not True or manager_lease is None or not manager_lease.held:
+            raise ValueError("kis-scoped-preflight-account-owner-lost")
+        validity = OPERATIONAL_GOVERNANCE.preflight_validity(str(session.preflight_snapshot_id))
+        return {"schemaVersion": "kis-scoped-preflight-expected/v1", "sessionId": str(session.session_id),
+            "runtimeScopeId": key, "context": context, "manifestHash": str(session.deployment_manifest_hash),
+            "configRevision": int(session.config_revision), "configHash": str(session.config_hash),
+            "preflightSnapshotId": str(session.preflight_snapshot_id), "preflightValid": validity.get("valid") is True}
+
+
+def capture_kis_scoped_preflight_expected(intent: OrderIntent) -> dict[str, Any]:
+    try:
+        return _capture_kis_scoped_preflight_assessment(intent)
+    except Exception:
+        # An initial capture can fail before the orchestrator receives an
+        # expected object. Revoke only the uniquely resolved KIS session here.
+        try:
+            if isinstance(intent, OrderIntent) and str(intent.metadata.get("broker_id") or "") == "kis":
+                _key, session = _active_session_for_intent(intent)
+                if session is not None:
+                    revoke_kis_scoped_preflight_failure({"sessionId": str(session.session_id)}, "capture-authority-rejected")
+        except (OSError, sqlite3.Error, ValueError, RuntimeError):
+            STATE["new_entries_blocked"] = True
+        raise
+
+
+def collect_kis_scoped_preflight_truth(expected: dict[str, Any]) -> dict[str, Any]:
+    # Called by the deferred dispatcher without SAFETY, manager/controller or
+    # engine locks. Existing authenticated GET scopes remain mandatory.
+    context = dict(expected["context"])
+    selected = _operational_strategy(strategy_rows(portfolio_rows()), deployment_id=context["deploymentId"],
+        strategy_id=context["strategyId"], portfolio_id=context["portfolioId"])
+    if selected is None or strategy_broker_id(selected) != "kis":
+        raise ValueError("kis-scoped-preflight-selected-source-missing")
+    reconciliation = refresh_preflight_reconciliation(selected)
+    return {"schemaVersion": "kis-scoped-preflight-truth/v1", "expectedHash": governance_sha256(expected),
+        "collectedAt": datetime.now(timezone.utc).isoformat(), "reconciliation": reconciliation,
+        "brokers": [broker.to_dict() for broker in broker_readiness()]}
+
+
+def commit_kis_scoped_preflight_rebind(expected: dict[str, Any], truth: dict[str, Any]) -> dict[str, Any]:
+    with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+        if truth.get("schemaVersion") != "kis-scoped-preflight-truth/v1" or truth.get("expectedHash") != governance_sha256(expected):
+            raise ValueError("kis-scoped-preflight-truth-binding-mismatch")
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(truth["collectedAt"]).replace("Z", "+00:00"))).total_seconds()
+        if not 0 <= age <= 15:
+            raise ValueError("kis-scoped-preflight-truth-stale")
+        context = dict(expected["context"])
+        current, _preflight = _kis_scoped_start_material("stock", context["mode"], context["portfolioId"],
+            context["deploymentId"], context["strategyId"], require_fresh_preflight=False, usd_operation="RENEWAL")
+        if current != context or STATE.get("mode") == "MONITOR" or STATE.get("kill_switch") or STATE.get("new_entries_blocked"):
+            raise ValueError("kis-scoped-preflight-consent-changed-during-read")
+        session = OPERATIONAL_GOVERNANCE.get_runtime_session(expected["sessionId"])
+        if session is None or session.lifecycle != "RUNNING" or (STATE.get("active_runtime_session_ids") or {}).get(context["runtimeScopeId"]) != session.session_id:
+            raise ValueError("kis-scoped-preflight-session-stopped-during-read")
+        if (session.deployment_manifest_hash, session.config_revision, session.config_hash, session.preflight_snapshot_id) != (expected["manifestHash"], expected["configRevision"], expected["configHash"], expected["preflightSnapshotId"]):
+            raise ValueError("kis-scoped-preflight-session-cas-conflict")
+        _kis_scoped_store().authorize_consent(str(session.session_id), context=current)
+        _require_kis_scoped_runtime_clock_integrity(context["runtimeScopeId"])
+        from .process_safety import held_process_lease_status
+        manager_lease = getattr(LIVE_CONTINUOUS_CONTROLLER, "_writer_leases", {}).get(context["runtimeScopeId"])
+        if manager_lease is None or not manager_lease.held or held_process_lease_status("live-trader:kis-account:" + context["wireAccountFingerprint"]).get("acquired") is not True:
+            raise ValueError("kis-scoped-preflight-owner-lost-during-read")
+        selected = _operational_strategy(strategy_rows(portfolio_rows()), deployment_id=context["deploymentId"],
+            strategy_id=context["strategyId"], portfolio_id=context["portfolioId"])
+        if selected is None:
+            raise ValueError("kis-scoped-preflight-selected-source-missing")
+        manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest_by_hash(expected["manifestHash"])
+        if manifest is None or not _operational_manifest_matches_inputs(manifest, _operational_manifest_inputs(selected)):
+            raise ValueError("kis-scoped-preflight-current-manifest-changed")
+        reconciliation = truth["reconciliation"]
+        summary = reconciliation.get("summary") or {}
+        ages = summary.get("evidence_ages_seconds") or {}
+        if summary.get("fresh") is not True or summary.get("three_way_verified") is not True or not ages or any(type(age) not in {int,float} or not 0 <= age <= PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS for age in ages.values()):
+            raise ValueError("kis-scoped-preflight-fresh-three-way-reconciliation-required")
+        scoped_checks = final_preflight_checks([selected], truth["brokers"], reconciliation, current_strategy=selected)
+        if not scoped_checks or any(str(check.get("status") or "").upper() != "PASS" for check in scoped_checks):
+            raise ValueError("kis-scoped-preflight-current-checks-not-pass")
+        checks = [{"checkId": "preflight-" + governance_sha256(str(check.get("label") or index))[:16],
+            "status": str(check["status"]).upper(), "detail": str(check.get("detail") or ""),
+            "evidenceHash": governance_sha256(check)} for index, check in enumerate(scoped_checks)]
+        preflight = OPERATIONAL_GOVERNANCE.create_preflight_snapshot(deployment_id=manifest.deployment_id,
+            deployment_manifest_hash=manifest.manifest_hash, checks=checks,
+            reconciliation_hash=governance_sha256(reconciliation), broker_snapshot_hash=governance_sha256(truth),
+            metadata={"mode": context["mode"], "strategyId": context["strategyId"], "portfolioId": context["portfolioId"],
+                "renewalPolicy": "kis-scoped-operational-renewal/v1", "consentScopeHash": context["scopeHash"]})
+        if preflight.status != "PASS":
+            raise ValueError("kis-scoped-preflight-snapshot-not-pass")
+        OPERATIONAL_GOVERNANCE.rebind_runtime_preflight(session.session_id, preflight.snapshot_id,
+            actor="live_trader.kis_scoped.preflight_refresh")
+        return {"ok": True, "action": "REFRESHED", "sessionId": session.session_id,
+            "preflightSnapshotId": preflight.snapshot_id, "preflightHash": preflight.snapshot_hash, "expiresAt": preflight.expires_at}
+
+
+def revoke_kis_scoped_preflight_failure(expected: dict[str, Any], reason: str) -> None:
+    with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+        session_id = str(expected.get("sessionId") or "")
+        if not session_id:
+            return
+        _kis_scoped_store().revoke(session_id=session_id, reason="fresh-preflight-failed:" + str(reason)[:100])
+        try:
+            session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
+            if session is not None and session.lifecycle == "RUNNING":
+                OPERATIONAL_GOVERNANCE.transition_runtime_session(session_id, "DEGRADED",
+                    actor="live_trader.kis_scoped.preflight_refresh", event_type="KIS_OPERATIONAL_CONSENT_REVOKED",
+                    payload={"reason": str(reason)[:200]})
+        except (OSError, sqlite3.Error, ValueError, RuntimeError):
+            STATE["new_entries_blocked"] = True
+
+
+def _assert_kis_scoped_preflight_outside_locks(intent: OrderIntent) -> bool:
+    from .kis_order_authority import kis_route_authority_owned_by_current_thread
+    if kis_route_authority_owned_by_current_thread():
+        raise ValueError("kis-scoped-preflight-network-under-route-lock")
+    locks = [SAFETY_CONFIRMATION_MUTATION_LOCK, RUNTIME_MODE_LOCK, RUNTIME_CONTROL_LOCK,
+        LIVE_CONTINUOUS_CONTROLLER._lock, LIVE_CONTINUOUS_CONTROLLER._control_lock]
+    runtime_id = str(intent.metadata.get("runtime_scope_id") or intent.metadata.get("runtimeScopeId") or "")
+    controller = LIVE_CONTINUOUS_CONTROLLER.runtimes.get(runtime_id)
+    if controller is None:
+        raise ValueError("kis-scoped-preflight-exact-controller-required")
+    locks.append(controller._lock)
+    for lock in locks:
+        reader = getattr(lock, "owned_by_current_thread", None) or getattr(lock, "_is_owned", None)
+        if not callable(reader) or reader() is not False:
+            raise ValueError("kis-scoped-preflight-network-under-authority-lock")
+    return True
+
+
+def _revoke_kis_scoped_unacknowledged_intent_failure(intent: OrderIntent) -> bool:
+    """Revoke only; never invert controller -> SAFETY/ROUTE on a bad caller.
+
+    The final wire claim and this revocation serialize in SQLite. A claim
+    already consumed is in flight; no new claim may consume a revoked row.
+    This path cannot issue authority, renew, join workers or collect truth.
+    """
+    try:
+        if not isinstance(intent, OrderIntent) or str(intent.metadata.get("broker_id") or "") != "kis":
+            return False
+        key, session = _active_session_for_intent(intent)
+        if session is None or not key or dict(session.metadata).get("runtimeScopeId") != key:
+            return False
+        store = _kis_scoped_store()
+        store.revoke(session_id=str(session.session_id), reason="preflight-outside-lock-proof-rejected")
+        status = store.status(session_id=str(session.session_id))
+        if status.get("status") not in {"REVOKED", "MISSING"}:
+            STATE["new_entries_blocked"] = True
+            return False
+        from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+        KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.revoke_scope(key)
+        if session.lifecycle == "RUNNING":
+            OPERATIONAL_GOVERNANCE.transition_runtime_session(session.session_id, "DEGRADED",
+                actor="live_trader.kis_scoped.preflight_refresh", event_type="KIS_OPERATIONAL_CONSENT_REVOKED",
+                payload={"reason": "outside-lock-proof-rejected"})
+        return True
+    except (OSError, sqlite3.Error, ValueError, RuntimeError):
+        STATE["new_entries_blocked"] = True
+        return False
+
+
+def refresh_kis_scoped_runtime_preflight(intent: OrderIntent) -> dict[str, Any]:
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    if str(metadata.get("broker_id") or "") != "kis" or functional_test_execution_requested(intent):
+        return {"ok": True, "action": "NOT_REQUIRED"}
+    from .kis_operational_preflight_refresh import refresh_kis_operational_preflight
+    result = refresh_kis_operational_preflight(intent,
+        capture_expected=capture_kis_scoped_preflight_expected,
+        collect_fresh_truth=collect_kis_scoped_preflight_truth,
+        commit_rebind=commit_kis_scoped_preflight_rebind,
+        revoke_on_failure=revoke_kis_scoped_preflight_failure,
+        assert_outside_authority_locks=lambda: _assert_kis_scoped_preflight_outside_locks(intent))
+    if result.get("ok") is not True and result.get("revocationAcknowledged") is not True:
+        result["revocationAcknowledged"] = _revoke_kis_scoped_unacknowledged_intent_failure(intent)
+    return result
+
 
 
 def _reserve_kis_kill_cancel_authority(
@@ -10415,6 +11218,10 @@ def snapshot() -> dict[str, Any]:
         "broker_adapter_contract": broker_adapter_contract(),
         "automation_profiles": automations,
         "continuous_runtime": continuous_runtime,
+        "kis_scoped_operational_authority": _kis_scoped_authority_status(),
+        "kis_scoped_cleanup": _kis_cleanup_status(),
+        "kis_manual_start_support": {"schemaVersion": "kis-scoped-manual-start-support/v1", "supported": True,
+            "requiresNativeConfirmation": True, "ordinaryRoutesRemainClosed": True, "orderAuthorityGranted": False},
         "execution_streams": LIVE_EXECUTION_STREAMS.snapshot(),
         "functional_test_runtime_guard": (
             functional_test_runtime_guard_snapshot()
@@ -22925,9 +23732,12 @@ def dispatch_live_order_with_checkpoint(
                         "SUBMITTING",
                         "broker request dispatch",
                     )
-                    broker_response = LiveBrokerRouter().place_order(
-                        broker_payload
-                    )
+                    if broker_id == "kis" and not functional_execution:
+                        from .kis_order_authority import kis_scoped_operational_dispatch_boundary
+                        with kis_scoped_operational_dispatch_boundary(intent, broker_payload):
+                            broker_response = LiveBrokerRouter().place_order(broker_payload)
+                    else:
+                        broker_response = LiveBrokerRouter().place_order(broker_payload)
                     if broker_id == "kis":
                         response_dict = (
                             dict(broker_response)
@@ -26274,12 +27084,15 @@ def start_continuous_runtime(
     functional_test_context: dict[str, Any] | None = None,
     *,
     _functional_test_capability: object | None = None,
+    safety_confirmation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if profile_id not in {"stock", "crypto"}:
         return {"ok": False, "reason": "runtime-profile-invalid", "runtimeStarted": False, "brokerSubmissionPerformed": False}
     normalized_profile = profile_id
     normalized_mode = normalize_runtime_mode(mode)
     normalized_purpose = str(execution_purpose or "").strip().upper()
+    if normalized_profile == "stock" and normalized_mode == "MONITOR":
+        _revoke_kis_scoped_operational_authority("stock-monitor-start")
     if _upbit_functional_durable_authority_open():
         return {
             "ok": False,
@@ -26316,6 +27129,23 @@ def start_continuous_runtime(
             "reason": "FUNCTIONAL_TEST requires stock/SMALL_LIVE",
             "snapshot": snapshot(),
         }
+    kis_manual_context = None
+    kis_manual_preflight = None
+    if normalized_profile == "stock" and normalized_mode != "MONITOR" and not normalized_purpose:
+        from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+        try:
+            kis_manual_context, kis_manual_preflight = _kis_scoped_start_material(
+                normalized_profile, normalized_mode, portfolio_id, deployment_id, strategy_id)
+            confirmation = safety_confirmation if isinstance(safety_confirmation, dict) else {}
+            if set(confirmation) != {"nativeAttestation"}:
+                raise ValueError("kis-operational-fresh-native-manual-start-required")
+            consumed = KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.consume(
+                confirmation["nativeAttestation"], kis_manual_context)
+            if consumed.get("ok") is not True:
+                raise ValueError("kis-operational-native-confirmation-invalid")
+            _revoke_kis_scoped_operational_authority("exact-native-start-replacement")
+        except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+            return {"ok": False, "reason": str(exc), "runtimeStarted": False, "brokerSubmissionPerformed": False}
     governance_session: object | None = None
     previous_session_id = str((STATE.get("active_runtime_session_ids") or {}).get(normalized_profile) or "")
     try:
@@ -26338,7 +27168,13 @@ def start_continuous_runtime(
                     strategy_id,
                 )
             )
-    except (OSError, sqlite3.Error, ValueError) as exc:
+        if kis_manual_context is not None:
+            _reserve_kis_scoped_manual_start(governance_session, kis_manual_context, kis_manual_preflight)
+    except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+        if governance_session is not None:
+            _kis_scoped_store().revoke(session_id=str(governance_session.session_id), reason="start-reservation-failed")
+            _finish_operational_runtime_start(governance_session, False, str(exc))
+            _restore_previous_runtime_session_binding(normalized_profile, governance_session, previous_session_id)
         STATE["new_entries_blocked"] = True
         append_audit(
             "danger",
@@ -26590,26 +27426,130 @@ def run_validation_small_live_once(
     }
 
 
+_CONTINUOUS_STOP_SCOPE = threading.local()
+
+
+def _continuous_exact_stop_plan(profile_id="", *, runtime_id="", deployment_id="", cleanup_requested=False):
+    from .account_runtime_governance import runtime_rows, select_session_bindings
+    profile_id, runtime_id, deployment_id = (str(value or "").strip() for value in (profile_id, runtime_id, deployment_id))
+    if profile_id and profile_id not in {"stock", "crypto"}:
+        raise ValueError("runtime-profile-unknown")
+    with RUNTIME_CONTROL_LOCK:
+        before = LIVE_CONTINUOUS_CONTROLLER.snapshot()
+        if not isinstance(before, dict):
+            raise ValueError("runtime-stop-current-owner-snapshot-unreadable")
+        rows = runtime_rows(before)
+        selected = {key: row for key, row in rows.items()
+            if (not runtime_id or key == runtime_id) and (not deployment_id or row.get("deploymentId") == deployment_id)
+            and (not profile_id or row.get("profileId", key) == profile_id)}
+        if (runtime_id or deployment_id) and len(selected) != 1:
+            raise ValueError("exact-runtime-stop-target-unavailable-or-ambiguous")
+        if profile_id and not runtime_id and not deployment_id and len(selected) > 1:
+            raise ValueError("runtime-profile-stop-ambiguous-select-runtime")
+        sessions = select_session_bindings(STATE.get("active_runtime_session_ids") or {},
+            OPERATIONAL_GOVERNANCE.get_runtime_session, runtime_id=runtime_id, deployment_id=deployment_id, profile_id=profile_id)
+        kis_sessions = [(key, session) for key, session in sessions
+            if dict(session.metadata).get("brokerId") == "kis" and session.mode in {"SMALL_LIVE", "FULL_LIVE"}
+            and key in getattr(LIVE_CONTINUOUS_CONTROLLER, "runtimes", {})
+            and getattr(LIVE_CONTINUOUS_CONTROLLER.runtimes[key], "_native_runtime", None) is not None]
+        return {"selected": selected, "sessions": sessions, "kisSessions": kis_sessions, "cleanups": [],
+            "cleanupErrors": [], "cleanupKeys": {key for key, _session in kis_sessions},
+            "kisRouteStop": bool(kis_sessions) or (not any((profile_id, runtime_id, deployment_id)))
+                or (profile_id == "stock" and not any((runtime_id, deployment_id)))
+                or any(row.get("brokerId") == "kis" for row in selected.values())}
+
+
+def _continuous_stop_requires_kis_route(*args, **kwargs):
+    plan = getattr(_CONTINUOUS_STOP_SCOPE, "plan", None)
+    return isinstance(plan, dict) and plan.get("kisRouteStop") is True
+
+
 def _continuous_stop_control(function: Any) -> Any:
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        # Revoke queued generations before waiting on any controller. Never
-        # retain SAFETY across worker join: the worker drains outside RUNTIME.
+        try:
+            plan = _continuous_exact_stop_plan(*args, **kwargs)
+        except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+            # A rejected selector is observational: do not revoke a different
+            # account's consent or supersede its in-progress START reservation.
+            return {"ok": False, "runtimeStopped": False, "reason": str(exc)}
+        _CONTINUOUS_STOP_SCOPE.plan = plan
+        # The short manager lease pin never runs under SAFETY or ROUTE.
+        for key, session in plan["kisSessions"]:
+            try:
+                LIVE_CONTINUOUS_CONTROLLER.retain_cleanup_writer(key)
+                with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
+                    plan["cleanups"].append(_prepare_kis_owned_stop_cleanup(key, session))
+            except Exception as exc:
+                # STOP still drains the engine when a receipt cannot be read.
+                # Retain the lease and forbid a misleading CLEAN acknowledgement.
+                try:
+                    _kis_scoped_store().revoke(session_id=session.session_id, reason="owned-stop-cleanup-preparation-failed")
+                    _kis_cleanup_store().ensure_recovery_block(session.session_id, str(exc))
+                except (OSError, sqlite3.Error, ValueError, RuntimeError):
+                    STATE["new_entries_blocked"] = True
+                plan["cleanupErrors"].append({"ok": False, "runtimeScopeId": key,
+                    "status": "STOPPED_PENDING_RECONCILIATION", "reason": str(exc)[:300]})
+        # Revoke only selected KIS native proofs, including an exact pending
+        # START if this STOP legitimately supersedes that same target.
+        if plan["kisRouteStop"]:
+            from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+            for key, session in plan["sessions"]:
+                if dict(session.metadata).get("brokerId") == "kis":
+                    try:
+                        _kis_scoped_store().revoke(session_id=session.session_id, reason="exact-runtime-stop-before-join")
+                    except (OSError, sqlite3.Error, ValueError, RuntimeError):
+                        STATE["new_entries_blocked"] = True
+                    finally:
+                        KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.revoke_scope(key)
+            target_keys = set(plan["selected"])
+            for reservation_id, pending in list(_KIS_SCOPED_PENDING_STARTS.items()):
+                if pending.get("context", {}).get("runtimeScopeId") in target_keys:
+                    _kis_scoped_store().revoke(session_id=pending["sessionId"], reason="exact-runtime-stop-start-superseded")
+                    _KIS_SCOPED_PENDING_STARTS.pop(reservation_id, None)
         with SAFETY_CONFIRMATION_MUTATION_LOCK:
             token = begin_continuous_control()
         try:
-            return function(*args, **kwargs)
+            result = function(*args, **kwargs)
+        except Exception as exc:
+            result = {"ok": False, "runtimeStopped": False, "reason": "runtime-stop-failed:" + type(exc).__name__}
         finally:
             with SAFETY_CONFIRMATION_MUTATION_LOCK:
                 end_continuous_control(token)
+        try:
+            result = dict(result) if isinstance(result, dict) else {"ok": False, "reason": "runtime-stop-result-unreadable"}
+            engine_stopped = result.get("ok") is True
+            cleanup_results = list(plan["cleanupErrors"])
+            for cleanup in plan["cleanups"]:
+                if engine_stopped and kwargs.get("cleanup_requested") is True:
+                    cleanup_results.append(_finish_kis_owned_stop_cleanup(cleanup))
+                else:
+                    reason = "WORKER_DRAIN_NOT_CONFIRMED" if not engine_stopped else "TRUSTED_KIS_STOP_AND_RECONCILE_REQUEST_REQUIRED"
+                    _kis_cleanup_store().fail(cleanup["cleanupId"], reason)
+                    cleanup_results.append({"ok": False, "status": "STOPPED_PENDING_RECONCILIATION",
+                        "runtimeScopeId": cleanup["runtimeScopeId"], "reason": reason})
+            result["runtimeStopped"] = engine_stopped
+            if cleanup_results:
+                clean = all(item.get("ok") is True for item in cleanup_results)
+                result["cleanupStatus"] = "CLEAN" if clean else "STOPPED_PENDING_RECONCILIATION"
+                status = _kis_cleanup_status()
+                selected_keys = plan["cleanupKeys"]
+                result["cleanup"] = {**status, "scopes": [row for row in status.get("scopes", []) if row.get("runtimeScopeId") in selected_keys], "results": cleanup_results}
+                if not clean:
+                    result["ok"] = False
+                    result["reason"] = "runtime-stopped-owned-pending-terminal-reconciliation-required"
+            result["snapshot"] = snapshot()
+            return result
+        finally:
+            del _CONTINUOUS_STOP_SCOPE.plan
     wrapped._authority_fence = "CONTINUOUS_CONTROL"
     return wrapped
 
 
 @_continuous_stop_control
-@_two_phase_kis_route_control("STOP")
+@_two_phase_kis_route_control("STOP", when=_continuous_stop_requires_kis_route)
 def stop_continuous_runtime(
-    profile_id: str = "", *, runtime_id: str = "", deployment_id: str = "",
+    profile_id: str = "", *, runtime_id: str = "", deployment_id: str = "", cleanup_requested: bool = False,
 ) -> dict[str, Any]:
     from .account_runtime_governance import runtime_rows, select_session_bindings
 
@@ -26672,15 +27612,17 @@ def stop_continuous_runtime(
         for key, original in sessions:
             session_id = original.session_id
             stopped = (per_runtime.get(key) or result).get("ok") is True
+            stop_plan = getattr(_CONTINUOUS_STOP_SCOPE, "plan", {})
+            cleanup_pending = key in stop_plan.get("cleanupKeys", set())
             try:
                 session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
-                if session is not None and session.lifecycle == "STOPPING":
+                if session is not None and session.lifecycle == "STOPPING" and not cleanup_pending:
                     OPERATIONAL_GOVERNANCE.transition_runtime_session(
                         session_id, "STOPPED" if stopped else "FAILED", actor="live_trader.desktop",
                         event_type="RUNTIME_STOPPED" if stopped else "RUNTIME_STOP_FAILED",
                         payload={"runtimeId": key, "detail": str(result.get("reason") or "")[:500]},
                     )
-                if stopped:
+                if stopped and not cleanup_pending:
                     active = STATE.setdefault("active_runtime_session_ids", {})
                     if active.get(key) == session_id:
                         active.pop(key, None)

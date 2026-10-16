@@ -1,6 +1,7 @@
 import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, ReconciliationEvidence, CapitalAllowance, DeploymentChanges, OrderInvestigation, OperatorNoteEditor } from "./OperatorInsights.jsx";
 import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
 import { runtimeRows, runtimeForDeployment, runtimeModeForDeployment, runningDeploymentIds, artifactIsRunning } from "./runtimeSelection.js";
+import { kisStopCleanupView, kisCleanupBlocksStart, kisManualStartPathSupported } from "./kisStopCleanup.js";
 import OperationalChecklistPanel from "./OperationalChecklistPanel";
 import { ordinaryExecutionView, recordedReconciliation, verifiedCanaryExecution } from "./executionAvailability.js";
 import * as React from "react";
@@ -5184,6 +5185,8 @@ function AutomationLauncherPanel({
   const [validationLoading, setValidationLoading] = useState(false);
   const [selectedValidationId, setSelectedValidationId] = useState("");
   const [lastValidationResult, setLastValidationResult] = useState(null);
+  const [cleanupCheckingId, setCleanupCheckingId] = useState("");
+  const cleanupFlights = useRef(new Set());
   const [requestedModes, setRequestedModes] = useState({
     stock: "MONITOR",
     crypto: "MONITOR",
@@ -5249,6 +5252,19 @@ function AutomationLauncherPanel({
     }
   }
 
+  async function recheckKisCleanup(scope) {
+    const key = scope.sessionId;
+    if (cleanupFlights.current.size > 0) return;
+    cleanupFlights.current.add(key);
+    setCleanupCheckingId(key);
+    try {
+      return await onRuntimeStop("stock", scope.runtimeScopeId, scope.deploymentId);
+    } finally {
+      cleanupFlights.current.delete(key);
+      setCleanupCheckingId((current) => current === key ? "" : current);
+    }
+  }
+
   if (!activeProfile) {
     return (
       <section className={`panel automation-panel ${className}`.trim()}>
@@ -5277,9 +5293,13 @@ function AutomationLauncherPanel({
   const runtimeBindingBlocked = !deploymentContext?.id
     || !expectedRuntimeProfile
     || expectedRuntimeProfile !== activeProfile.id;
+  const kisManualStartPath = kisManualStartPathSupported(reviewSnapshot, activeProfile.id,
+    deploymentContext?.brokerId, requestedMode);
   const modeUnavailable = requestedMode === "MONITOR"
     ? executionAvailability?.monitorSupported !== true
-    : executionAvailability?.liveDispatchAvailable !== true;
+    : executionAvailability?.liveDispatchAvailable !== true && !kisManualStartPath;
+  const cleanupView = kisStopCleanupView(reviewSnapshot);
+  const cleanupStartBlocked = kisCleanupBlocksStart(cleanupView, activeProfile.id, requestedMode);
   const runtimeBindingDetail = !deploymentContext?.id
     ? "상단에서 실행할 Deployment를 먼저 선택하세요."
     : !expectedRuntimeProfile
@@ -5305,8 +5325,31 @@ function AutomationLauncherPanel({
           ))}
         </div>
       )}
+      {cleanupView.blocked && (
+        <div {...semanticSurfaceProps("warning", "continuous-runtime-status")} role="status" aria-label="KIS 미체결 정리">
+          <StatusPill tone="warning">주문 확인 필요</StatusPill>
+          <span>{cleanupView.detail}</span>
+          {cleanupView.scopes.map((scope) => (
+            <div className="runtime-deployment-binding" key={scope.sessionId}>
+              <strong>{scope.deploymentId}</strong>
+              <span>{scope.detail}</span>
+              {scope.reason && <small>{scope.reason}</small>}
+              <button className="ts-action-button" type="button"
+                disabled={Boolean(cleanupCheckingId)}
+                onClick={() => void recheckKisCleanup(scope)}>
+                <RefreshCcw size={16} /><span>{cleanupCheckingId === scope.sessionId ? "주문 상태 확인 중" : "미체결 정리 재확인"}</span>
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <NoOrderExplanation snapshot={reviewSnapshot} context={deploymentContext || {}} />
       <StopEffects />
+      {activeProfile.id === "stock" && (
+        <div {...semanticSurfaceProps("info", "runtime-deployment-binding")}>
+          <span>계좌별 KIS 실행 중지는 이 실행이 접수한 미체결 잔량의 취소를 요청합니다. 최종 대조가 끝나기 전에는 재시작을 차단하며, 보유 포지션은 유지합니다.</span>
+        </div>
+      )}
       <NestedTabs
         ariaLabel="자동화 자산군"
         className="internal-tabs automation-profile-tabs"
@@ -5412,8 +5455,9 @@ function AutomationLauncherPanel({
           <button
             className="ts-action-button"
             type="button"
-            disabled={profileRuntime?.running || runtimeBindingBlocked || modeUnavailable}
-            title={modeUnavailable ? executionAvailability?.detail : undefined}
+            disabled={profileRuntime?.running || runtimeBindingBlocked || modeUnavailable || cleanupStartBlocked}
+            title={cleanupStartBlocked ? cleanupView.detail : modeUnavailable ? executionAvailability?.detail
+              : kisManualStartPath ? "시작 조건을 모두 점검한 뒤 Windows 확인창에서 실행을 승인합니다." : undefined}
             onClick={() => onRuntimeStart(activeProfile.id, requestedMode)}
           >
             <Play size={16} />

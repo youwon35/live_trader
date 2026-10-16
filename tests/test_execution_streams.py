@@ -361,15 +361,16 @@ class ExecutionStreamTest(unittest.TestCase):
     def test_mux_sink_records_domestic_notice_and_rejects_malformed_frame(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manager = ExecutionStreamManager(Path(temporary))
-            fields = [""] * 14
+            fields = [""] * 26
             fields[2] = "12345"
             fields[4] = "02"
             fields[8] = "005930"
             fields[9] = "1"
             fields[10] = "70000"
             fields[11] = "090001"
-            fields[12] = "N"
+            fields[12] = "0"
             fields[13] = "1"
+            fields[19] = "1"
 
             event = manager.ingest_kis_domestic_fields(
                 "H0STCNI0",
@@ -483,11 +484,13 @@ class ExecutionStreamTest(unittest.TestCase):
         self.assertEqual(0.03, event["cumulative_fee"])
 
     def test_kis_domestic_execution_normalizes_fill(self) -> None:
-        fields = ["customer", "account", "order-1", "", "02", "", "", "", "069500", "2", "35000", "090001", "N", "2"]
+        fields = ["customer", "account", "order-1", "", "02", "", "", "", "069500", "2", "35000", "090001", "0", "2"] + [""] * 12
+        fields[19] = "1"
         event = parse_kis_domestic_execution(fields)
         self.assertIsNotNone(event)
         self.assertEqual("069500.KS", event["symbol"])
-        self.assertEqual("filled", event["state"])
+        self.assertEqual("partially_filled", event["state"])
+        self.assertIs(event["terminal"], False)
         self.assertEqual(2.0, event["quantity"])
 
     def test_kis_overseas_execution_normalizes_official_25_columns(self) -> None:
@@ -496,14 +499,16 @@ class ExecutionStreamTest(unittest.TestCase):
         fields[4] = "02"
         fields[7] = "AAPL"
         fields[8] = "1"
-        fields[9] = "327.69"
+        fields[9] = "003276900"
         fields[10] = "160001"
-        fields[11] = "N"
+        fields[11] = "0"
         fields[12] = "2"
+        fields[18] = "6"
         event = parse_kis_overseas_execution(fields)
         self.assertIsNotNone(event)
         self.assertEqual("AAPL", event["symbol"])
-        self.assertEqual("filled", event["state"])
+        self.assertEqual("partially_filled", event["state"])
+        self.assertIs(event["terminal"], False)
         self.assertEqual(327.69, event["price"])
 
     def test_new_fill_queues_telegram_with_ledger_position(self) -> None:

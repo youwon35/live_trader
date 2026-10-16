@@ -1750,6 +1750,11 @@ class LiveContinuousController:
     def _submit_deferred_intent(intent: OrderIntent) -> dict[str, Any]:
         from . import state
 
+        if str((intent.metadata or {}).get("broker_id") or "").lower() == "kis":
+            refreshed = state.refresh_kis_scoped_runtime_preflight(intent)
+            if refreshed.get("ok") is not True:
+                return {"ok": False, "reason": refreshed.get("reason") or "KIS_PREFLIGHT_RENEWAL_BLOCKED",
+                        "orderSubmitted": False, "kisOperationalPreflight": refreshed}
         if "native_open_boundary" in intent.metadata:
             from .native_order_ticket import validate_native_ticket
             try:
@@ -3054,6 +3059,7 @@ class LiveContinuousRuntimeManager:
         self.runtimes = {}
         self.runtime_scopes = {}
         self._writer_leases = {}
+        self._cleanup_writer_pins = set()
         self._scope_loading_error = ""
         try:
             for scope in load_scopes(self.root):
@@ -3114,6 +3120,9 @@ class LiveContinuousRuntimeManager:
         return controller.supervisor is not None and bool(controller.supervisor.running)
 
     def _account_start_blocker(self, scope, mode):
+        if any(self.runtime_scopes[key].account_key == scope.account_key
+                for key in self._cleanup_writer_pins if key in self.runtime_scopes):
+            return "runtime-account-owned-stop-cleanup-reconciliation-required"
         if self._running(self.controllers[scope.profile_id]):
             return "unbound-profile-monitor-must-stop-before-account-runtime"
         for key, other in self.runtime_scopes.items():
@@ -3209,6 +3218,9 @@ class LiveContinuousRuntimeManager:
             lease.release()
 
     def _release_stopped_lease(self, key, result):
+        if key in self._cleanup_writer_pins:
+            result["writerLeaseRetained"] = True
+            return
         snapshot = result.get("runtime") or {}
         if result.get("ok") is True and snapshot.get("phase") == "STOPPED" and snapshot.get("running") is False:
             controller = self.runtimes.get(key)
@@ -3216,6 +3228,23 @@ class LiveContinuousRuntimeManager:
                 result["writerLeaseRetained"] = True
                 return
             self._drop_writer_reference(key)
+
+    def retain_cleanup_writer(self, runtime_id):
+        with self._lock:
+            lease = self._writer_leases.get(runtime_id)
+            if runtime_id not in self.runtime_scopes or lease is None or lease.held is not True:
+                raise ValueError("cleanup-current-account-writer-lease-required")
+            self._cleanup_writer_pins.add(runtime_id)
+
+    def complete_cleanup_writer(self, runtime_id):
+        with self._lock:
+            controller = self.runtimes.get(runtime_id)
+            if controller is None or self._running(controller):
+                raise ValueError("cleanup-worker-must-be-stopped-before-releasing-writer")
+            self._cleanup_writer_pins.discard(runtime_id)
+            # Exact broker terminal reconciliation, rather than the journal's
+            # pending ACK, was independently proved by the state-owned caller.
+            self._drop_writer_reference(runtime_id)
 
     def stop(self, profile_id: str = "", *, runtime_id: str = "", deployment_id: str = ""):
         # Worker completion may snapshot the manager. Do not hold _lock while

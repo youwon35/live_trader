@@ -19,8 +19,11 @@ export const SAFETY_CONFIRMATION_ACTIONS = Object.freeze({
 
 let safetyConfirmationPresenter = null;
 let activeSafetyConfirmationFlow = null;
+let activeKisManualStartFlow = false;
 let functionalHttpSessionPromise = null;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
+  "/api/runtime/kis-manual-start-challenge",
+  "/api/runtime/kis-stop-and-reconcile",
   "/api/paper-candidates/import",
   "/api/paper-candidates/review",
   "/api/monitor-trial/run",
@@ -806,21 +809,51 @@ export async function startContinuousRuntime(
   deploymentId = "",
   strategyId = "",
 ) {
-  return request("/api/runtime/start", {
-    method: "POST",
-    body: {
-      profile_id: profileId,
-      mode,
-      portfolio_id: portfolioId,
-      deployment_id: deploymentId,
-      strategy_id: strategyId,
-    },
-    timeoutMs: 30000,
-  });
+  const nativeKisStart = profileId === "stock" && ["SMALL_LIVE", "FULL_LIVE"].includes(mode);
+  if (nativeKisStart && activeKisManualStartFlow) {
+    throw new ApiRequestError("KIS 시작 확인이 이미 진행 중입니다.", "KIS_START_IN_PROGRESS");
+  }
+  if (nativeKisStart) activeKisManualStartFlow = true;
+  try {
+    const body = {
+      profile_id: profileId, mode, portfolio_id: portfolioId,
+      deployment_id: deploymentId, strategy_id: strategyId,
+    };
+    if (nativeKisStart) {
+      const bridge = globalThis.window?.pywebview?.api;
+      if (typeof bridge?.request_kis_operational_start_confirmation !== "function") {
+        throw new ApiRequestError("KIS 실거래 시작은 네이티브 앱에서 직접 확인해야 합니다.", "KIS_NATIVE_UNAVAILABLE");
+      }
+      const challenge = await request("/api/runtime/kis-manual-start-challenge", {
+        method: "POST", body, timeoutMs: 30000,
+      });
+      const context = challenge?.context;
+      if (challenge?.ok !== true || typeof challenge.nativeNonce !== "string"
+          || !Number.isFinite(Date.parse(challenge.expiresAt))
+          || Date.parse(challenge.expiresAt) <= Date.now()
+          || context?.schemaVersion !== "kis-scoped-manual-start-context/v1"
+          || context.profileId !== profileId || context.mode !== mode
+          || (portfolioId && context.portfolioId !== portfolioId)
+          || (deploymentId && context.deploymentId !== deploymentId)
+          || (strategyId && context.strategyId !== strategyId)) {
+        throw new ApiRequestError("KIS 시작 확인의 대상 또는 유효기간이 변경되었습니다.", "KIS_NATIVE_CONTEXT_INVALID");
+      }
+      const native = await bridge.request_kis_operational_start_confirmation(challenge.nativeNonce);
+      if (native?.ok !== true || !native.attestation) {
+        throw new ApiRequestError("KIS 시작 확인이 취소되었거나 만료되었습니다.", "SAFETY_CONFIRMATION_CANCELLED");
+      }
+      body.safety_confirmation = { nativeAttestation: native.attestation };
+    }
+    return await request("/api/runtime/start", { method: "POST", body, timeoutMs: 30000 });
+  } finally {
+    if (nativeKisStart) activeKisManualStartFlow = false;
+  }
 }
 
 export async function stopContinuousRuntime(profileId = "", { runtimeId = "", deploymentId = "" } = {}) {
-  return request("/api/runtime/stop", {
+  const exactStockScope = profileId === "stock" && runtimeId !== "" && deploymentId !== "";
+  const path = exactStockScope ? "/api/runtime/kis-stop-and-reconcile" : "/api/runtime/stop";
+  return request(path, {
     method: "POST",
     body: { profile_id: profileId, runtime_id: runtimeId, deployment_id: deploymentId },
     timeoutMs: 30000,

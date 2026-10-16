@@ -346,7 +346,7 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
                 closed, controller.supervisor.engine._evaluation_key(spec, closed), {"positionQuantity": 0})
         handler = object.__new__(LiveTraderHandler)
         handler.path = "/api/runtime/start"
-        handler.read_json = Mock(return_value={"profile_id": "stock", "mode": "SMALL_LIVE", "strategy_id": "dispatch-safety"})
+        handler.read_json = Mock(return_value={"profile_id": "stock", "mode": "SMALL_LIVE", "strategy_id": "dispatch-safety", "deployment_id": trusted_scope.deployment_id, "safety_confirmation": {"nativeAttestation": {"fixture": "native-proof"}}})
         handler.send_json = Mock()
         self.router.list_positions.return_value = []
         ack = self.router.place_order.return_value
@@ -364,6 +364,11 @@ class ContinuousDispatchStateIntegrationTest(unittest.TestCase):
             patch.object(state, "LIVE_CONTINUOUS_CONTROLLER", manager),
             patch.object(state, "resolve_continuous_runtime_scope", return_value=trusted_scope.to_dict()),
             patch.object(state, "LiveBrokerRouter", return_value=self.router),
+            # External consent is mocked in this queue/checkpoint integration;
+            # exact native start and activation have separate security tests.
+            patch.object(state, "_kis_scoped_start_material", return_value=({"fixture": "exact-context"}, None)),
+            patch("live_trader.kis_operational_native_confirmation.KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS.consume", return_value={"ok": True}),
+            patch.object(state, "_reserve_kis_scoped_manual_start"),
             patch.object(state, "_prepare_operational_runtime_session", return_value=(None, "fixture approval")) as prepare,
             patch.object(state, "_finish_operational_runtime_start"),
             patch.object(state, "snapshot", return_value={}),

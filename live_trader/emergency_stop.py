@@ -380,7 +380,9 @@ class DesktopEmergencyStopBridge:
         self,
         *,
         functional_http_bootstrap: Callable[[], Mapping[str, str]] | None = None,
+        kis_operational_start_confirmations=None,
     ) -> None:
+        self._kis_operational_start_confirmations = kis_operational_start_confirmations
         self._functional_http_bootstrap = functional_http_bootstrap
 
     def engage_emergency_stop(self, reason: str = "desktop emergency stop") -> dict[str, Any]:
@@ -402,3 +404,9 @@ class DesktopEmergencyStopBridge:
         ):
             return {"ok": False, "available": False}
         return {"ok": True, "available": True, **value}
+
+    def request_kis_operational_start_confirmation(self, native_nonce: str) -> dict[str, Any]:
+        """Only request an opaque armed challenge; never accept a typed phrase."""
+        if self._kis_operational_start_confirmations is None:
+            return {"ok": False, "code": "KIS_NATIVE_UNAVAILABLE"}
+        return self._kis_operational_start_confirmations.request(native_nonce)

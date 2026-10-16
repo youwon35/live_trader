@@ -1,6 +1,6 @@
 from copy import deepcopy
 import contextlib
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -17,6 +17,11 @@ import test_kis_equity_operational as fixtures
 
 class KisEquityControllerTest(unittest.TestCase):
     def setUp(self):
+        # Import-time wall stamps become stale in a broad security suite.
+        # Each case still exercises the unchanged real 15-second guard.
+        clock_patch = patch.object(fixtures, "NOW", datetime.now(timezone.utc))
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
         self.root = Path(self.folder.name)

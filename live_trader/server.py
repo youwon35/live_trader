@@ -46,6 +46,8 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
 )
 _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
+        "/api/runtime/kis-manual-start-challenge",
+        "/api/runtime/kis-stop-and-reconcile",
         "/api/paper-candidates/import",
         "/api/paper-candidates/review",
         "/api/monitor-trial/run",
@@ -905,6 +907,13 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/strategy-cycle":
             self.send_json(state.run_strategy_cycle(str(payload.get("profile_id", "stock"))))
             return
+        if parsed.path == "/api/runtime/kis-manual-start-challenge":
+            self.send_json(state.prepare_kis_scoped_manual_start(
+                str(payload.get("profile_id", "stock")), str(payload.get("mode", "MONITOR")),
+                str(payload.get("portfolio_id", "")), str(payload.get("deployment_id", "")),
+                str(payload.get("strategy_id", "")),
+            ))
+            return
         if parsed.path == "/api/runtime/start":
             requested_purpose = str(
                 payload.get("execution_purpose")
@@ -938,7 +947,18 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                     if isinstance(payload.get("functionalTestContext"), dict)
                     else None
                 ),
+                safety_confirmation=(dict(payload["safety_confirmation"]) if isinstance(payload.get("safety_confirmation"), dict) else None),
             ))
+            return
+        if parsed.path == "/api/runtime/kis-stop-and-reconcile":
+            if (not isinstance(payload, dict) or set(payload) != {"profile_id", "runtime_id", "deployment_id"}
+                or payload.get("profile_id") != "stock"
+                or any(type(payload.get(key)) is not str or not payload[key].strip() or len(payload[key]) > 512
+                    for key in ("runtime_id", "deployment_id"))):
+                self.send_json({"ok": False, "reason": "kis-stop-and-reconcile-exact-stock-runtime-required", "runtimeStopped": False})
+                return
+            self.send_json(state.stop_continuous_runtime("stock", runtime_id=payload["runtime_id"],
+                deployment_id=payload["deployment_id"], cleanup_requested=True))
             return
         if parsed.path == "/api/runtime/stop":
             self.send_json(state.stop_continuous_runtime(

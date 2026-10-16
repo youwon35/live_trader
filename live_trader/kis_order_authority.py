@@ -32,6 +32,9 @@ _PROVIDER_LOCK = threading.RLock()
 _TRANSPORT_CONSUMPTION_LOCK = threading.Lock()
 _THREAD_BOUNDARY = threading.local()
 _AUTHORITY_READER: Callable[[], Mapping[str, Any]] | None = None
+_SCOPED_OPERATIONAL_READER: Callable[..., Mapping[str, Any]] | None = None
+_SCOPED_CLEANUP_READER: Callable[..., Mapping[str, Any]] | None = None
+_SPECIALIZED_EXCLUSION_READER: Callable[[], Mapping[str, Any]] | None = None
 _KILL_CANCEL_JOURNAL_PATH: Path | None = None
 _CONSUMED_KILL_CANCEL_LEASES: set[tuple[str, int, str]] = set()
 _CONSUMED_TRANSPORT_LEASES: set[str] = set()
@@ -86,6 +89,8 @@ _OPERATION_ENDPOINTS = {
     "OVERSEAS_CANCEL_ORDER": frozenset(
         {"/uapi/overseas-stock/v1/trading/order-rvsecncl"}
     ),
+    "SCOPED_CANCEL_KR": frozenset({"/uapi/domestic-stock/v1/trading/order-rvsecncl"}),
+    "SCOPED_CANCEL_US": frozenset({"/uapi/overseas-stock/v1/trading/order-rvsecncl"}),
 }
 
 
@@ -121,6 +126,235 @@ class _AuthenticatedScope:
     account_fingerprint: str
     credential_configuration_hash: str
     control_reservation_hash: str
+
+
+
+def register_kis_scoped_operational_reader(reader, *, specialized_exclusion_reader):
+    """Register the sole production state resolver; serialized grants never suffice."""
+    global _SCOPED_OPERATIONAL_READER, _SPECIALIZED_EXCLUSION_READER
+    if not callable(reader) or not callable(specialized_exclusion_reader):
+        raise KisOrderAuthorityError("KIS scoped authority readers are invalid")
+    with _PROVIDER_LOCK:
+        if _SCOPED_OPERATIONAL_READER is not None and _SCOPED_OPERATIONAL_READER is not reader:
+            raise KisOrderAuthorityError("KIS scoped authority reader is already registered")
+        _SCOPED_OPERATIONAL_READER = reader
+        _SPECIALIZED_EXCLUSION_READER = specialized_exclusion_reader
+
+
+def kis_route_authority_owned_by_current_thread():
+    reader = getattr(_ROUTE_LOCK, "_is_owned", None)
+    # Missing ownership introspection is deliberately treated as held.
+    return reader() is not False if callable(reader) else True
+
+
+def kis_specialized_operational_fence_status(*, scoped_reader, specialized_reader):
+    """Prove installation of the exact production closure under route quiescence."""
+    return {"installed": _SCOPED_OPERATIONAL_READER is scoped_reader
+        and _SPECIALIZED_EXCLUSION_READER is specialized_reader,
+        "routeHeld": kis_route_authority_owned_by_current_thread(),
+        "mutationInFlight": _inherited() is not None}
+
+
+def _scoped_read(*, intent=None, consume=False, prepared_request=None):
+    dispatch = getattr(_THREAD_BOUNDARY, "scoped_dispatch", None)
+    if dispatch is None or _SCOPED_OPERATIONAL_READER is None:
+        raise KisOrderAuthorityError("KIS operational state-owned dispatch context is missing")
+    try:
+        result = _SCOPED_OPERATIONAL_READER(dispatch[0], broker_payload=dispatch[2],
+            authority_intent=intent, prepared_request=prepared_request if prepared_request is not None else getattr(_THREAD_BOUNDARY, "scoped_prepared_request", None), consume=consume)
+    except Exception as exc:
+        raise KisOrderAuthorityError("KIS scoped operational authority rejected: " + str(exc)) from exc
+    if not isinstance(result, Mapping) or result.get("allowed") is not True:
+        raise KisOrderAuthorityError("KIS scoped operational authority is not active")
+    return result
+
+
+def has_scoped_kis_dispatch_context():
+    return getattr(_THREAD_BOUNDARY, "scoped_dispatch", None) is not None
+
+
+@contextmanager
+def kis_scoped_operational_dispatch_boundary(dispatch, broker_payload):
+    if getattr(_THREAD_BOUNDARY, "scoped_dispatch", None) is not None:
+        raise KisOrderAuthorityError("nested KIS operational dispatch is forbidden")
+    detached = json.loads(json.dumps(broker_payload, allow_nan=False))
+    _THREAD_BOUNDARY.scoped_dispatch = (dispatch, _intent_hash(detached), detached)
+    try:
+        _scoped_read()
+        yield
+    finally:
+        del _THREAD_BOUNDARY.scoped_dispatch
+
+
+@contextmanager
+def scoped_kis_authenticated_mutation_preflight(broker_payload):
+    with _ROUTE_LOCK:
+        with emergency_stop_dispatch_boundary() as emergency:
+            if emergency.get("active") is True:
+                raise KisOrderAuthorityError("KIS scoped operational authentication blocked by emergency stop")
+            dispatch = getattr(_THREAD_BOUNDARY, "scoped_dispatch", None)
+            if dispatch is None or dispatch[1] != _intent_hash(broker_payload):
+                raise KisOrderAuthorityError("KIS operational broker payload differs from state-owned intent")
+            _scoped_read()
+            snapshot = _snapshot()
+            if snapshot["applicationInstanceLeaseHeld"] is not True or snapshot["controlReservation"]:
+                raise KisOrderAuthorityError("KIS operational application lease/control reservation changed")
+            scope = _new_auth_scope("SCOPED_OPERATIONAL", snapshot)
+            _push_auth_scope(scope)
+            try:
+                yield
+            finally:
+                _pop_auth_scope(scope)
+
+
+@contextmanager
+def scoped_kis_final_mutation_boundary(*, operation, intent, prepared_request=None):
+    if operation != "PLACE_ORDER":
+        raise KisOrderAuthorityError("KIS operational permit never grants cancellation")
+    normalized = _normalize_intent(intent, expected_operation=operation)
+    with _ROUTE_LOCK:
+        with emergency_stop_dispatch_boundary() as emergency:
+            if emergency.get("active") is True or _inherited() is not None:
+                raise KisOrderAuthorityError("KIS operational final boundary is blocked")
+            scope = _auth_scope()
+            if scope is None or scope.mode != "SCOPED_OPERATIONAL":
+                raise KisOrderAuthorityError("KIS operational final boundary requires exact authenticated scope")
+            initial_lease = None
+            def read(*, endpoint, payload_hash):
+                _validate_transport(normalized, endpoint=endpoint, payload_hash=payload_hash)
+                snapshot = _snapshot()
+                if initial_lease is not None:
+                    _validate_inherited_snapshot(initial_lease, snapshot)
+                if snapshot["applicationInstanceLeaseHeld"] is not True or snapshot["controlReservation"]:
+                    raise KisOrderAuthorityError("KIS operational lease/control changed")
+                if snapshot["functionalAccountFingerprint"] != normalized["accountFingerprint"] or snapshot["credentialConfigurationHash"] != normalized["credentialConfigurationHash"]:
+                    raise KisOrderAuthorityError("KIS operational exact wire account/credentials changed")
+                _scoped_read(intent=normalized, prepared_request=prepared_request)
+                return MappingProxyType({**snapshot, "operation": operation, "intentHash": _intent_hash(normalized), "emergencyActive": False})
+            initial = read(endpoint=normalized["endpoint"], payload_hash=normalized["payloadHash"])
+            lease = _InheritedLease(mode="SCOPED_OPERATIONAL", owner_thread_id=threading.get_ident(),
+                nonce=secrets.token_hex(32), operation=operation, intent_hash=_intent_hash(normalized),
+                owned_order_key=MappingProxyType({}), session_id="", revision=int(initial["functionalRevision"]),
+                state_revision=int(initial["stateRevision"]), owner_epoch_id=str(initial["ownerEpochId"]),
+                owner_epoch_hash=str(initial["ownerEpochHash"]), account_fingerprint=str(initial["functionalAccountFingerprint"]),
+                credential_configuration_hash=str(initial["credentialConfigurationHash"]),
+                control_reservation_hash=_intent_hash(initial["controlReservation"]), cleanup_only=False,
+                public_snapshot=initial, read=read)
+            initial_lease = lease
+            _THREAD_BOUNDARY.lease = lease
+            _THREAD_BOUNDARY.scoped_wire_intent = normalized
+            _THREAD_BOUNDARY.scoped_prepared_request = prepared_request
+            try:
+                yield read
+            finally:
+                del _THREAD_BOUNDARY.scoped_wire_intent
+                del _THREAD_BOUNDARY.lease
+                del _THREAD_BOUNDARY.scoped_prepared_request
+
+
+def register_kis_scoped_cleanup_reader(reader):
+    global _SCOPED_CLEANUP_READER
+    if not callable(reader):
+        raise KisOrderAuthorityError("KIS cleanup state reader is required")
+    with _PROVIDER_LOCK:
+        if _SCOPED_CLEANUP_READER is not None and _SCOPED_CLEANUP_READER is not reader:
+            raise KisOrderAuthorityError("KIS cleanup state reader is already registered")
+        _SCOPED_CLEANUP_READER = reader
+
+
+def _cleanup_read(*, intent=None, prepared_request=None, consume=False):
+    context = getattr(_THREAD_BOUNDARY, "scoped_cleanup", None)
+    if context is None or _SCOPED_CLEANUP_READER is None:
+        raise KisOrderAuthorityError("KIS cleanup requires its state-owned STOP reservation")
+    try:
+        result = _SCOPED_CLEANUP_READER(context, authority_intent=intent,
+            prepared_request=prepared_request if prepared_request is not None else getattr(_THREAD_BOUNDARY, "cleanup_prepared_request", None), consume=consume)
+    except Exception as exc:
+        raise KisOrderAuthorityError("KIS exact cleanup rejected: " + str(exc)) from exc
+    if not isinstance(result, Mapping) or result.get("allowed") is not True:
+        raise KisOrderAuthorityError("KIS exact cleanup authority is closed")
+    return result
+
+
+@contextmanager
+def kis_scoped_cleanup_dispatch_boundary(context):
+    if getattr(_THREAD_BOUNDARY, "scoped_cleanup", None) is not None or has_scoped_kis_dispatch_context():
+        raise KisOrderAuthorityError("nested KIS cleanup/PLACE dispatch is forbidden")
+    _THREAD_BOUNDARY.scoped_cleanup = json.loads(json.dumps(context, allow_nan=False))
+    try:
+        _cleanup_read()
+        yield
+    finally:
+        del _THREAD_BOUNDARY.scoped_cleanup
+
+
+@contextmanager
+def scoped_kis_cleanup_authenticated_preflight():
+    with _ROUTE_LOCK, emergency_stop_dispatch_boundary() as emergency:
+        if emergency.get("active") is True:
+            raise KisOrderAuthorityError("KIS STOP cleanup requires inactive emergency boundary")
+        _cleanup_read()
+        snapshot = _snapshot()
+        if snapshot["applicationInstanceLeaseHeld"] is not True or snapshot["controlReservation"]:
+            raise KisOrderAuthorityError("KIS cleanup owner lease/control reservation changed")
+        scope = _new_auth_scope("SCOPED_CLEANUP", snapshot)
+        _push_auth_scope(scope)
+        try:
+            yield
+        finally:
+            _pop_auth_scope(scope)
+
+
+@contextmanager
+def scoped_kis_cleanup_final_boundary(*, operation, intent, prepared_request):
+    if operation not in {"SCOPED_CANCEL_KR", "SCOPED_CANCEL_US"}:
+        raise KisOrderAuthorityError("KIS STOP cleanup grants exact cancel only")
+    normalized = _normalize_intent(intent, expected_operation=operation)
+    with _ROUTE_LOCK, emergency_stop_dispatch_boundary() as emergency:
+        scope = _auth_scope()
+        if emergency.get("active") is True or _inherited() is not None or scope is None or scope.mode != "SCOPED_CLEANUP":
+            raise KisOrderAuthorityError("KIS STOP cleanup final authenticated scope is invalid")
+        initial_lease = None
+        def read(*, endpoint, payload_hash):
+            _validate_transport(normalized, endpoint=endpoint, payload_hash=payload_hash)
+            snapshot = _snapshot()
+            if initial_lease is not None:
+                _validate_inherited_snapshot(initial_lease, snapshot)
+            if snapshot["applicationInstanceLeaseHeld"] is not True or snapshot["controlReservation"]:
+                raise KisOrderAuthorityError("KIS cleanup application lease/control changed")
+            if snapshot["functionalAccountFingerprint"] != normalized["accountFingerprint"] or snapshot["credentialConfigurationHash"] != normalized["credentialConfigurationHash"]:
+                raise KisOrderAuthorityError("KIS cleanup actual wire credentials changed")
+            _cleanup_read(intent=normalized, prepared_request=prepared_request)
+            return MappingProxyType({**snapshot, "operation": operation, "intentHash": _intent_hash(normalized), "emergencyActive": False})
+        initial = read(endpoint=normalized["endpoint"], payload_hash=normalized["payloadHash"])
+        lease = _InheritedLease(mode="SCOPED_CLEANUP", owner_thread_id=threading.get_ident(), nonce=secrets.token_hex(32),
+            operation=operation, intent_hash=_intent_hash(normalized), owned_order_key=MappingProxyType(normalized["ownedOrderKey"]),
+            session_id="", revision=int(initial["functionalRevision"]), state_revision=int(initial["stateRevision"]),
+            owner_epoch_id=str(initial["ownerEpochId"]), owner_epoch_hash=str(initial["ownerEpochHash"]),
+            account_fingerprint=str(initial["functionalAccountFingerprint"]), credential_configuration_hash=str(initial["credentialConfigurationHash"]),
+            control_reservation_hash=_intent_hash(initial["controlReservation"]), cleanup_only=True, public_snapshot=initial, read=read)
+        initial_lease = lease
+        _THREAD_BOUNDARY.lease = lease
+        _THREAD_BOUNDARY.cleanup_wire_intent = normalized
+        _THREAD_BOUNDARY.cleanup_prepared_request = prepared_request
+        try:
+            yield read
+        finally:
+            del _THREAD_BOUNDARY.cleanup_prepared_request
+            del _THREAD_BOUNDARY.cleanup_wire_intent
+            del _THREAD_BOUNDARY.lease
+
+
+def _require_specialized_writer_not_excluded():
+    # Production installs this reader before exposing a runtime. Unknown is
+    # deliberately closed; a missing graph is not positive inactivity proof.
+    if _SPECIALIZED_EXCLUSION_READER is not None:
+        try:
+            status = _SPECIALIZED_EXCLUSION_READER()
+        except Exception as exc:
+            raise KisOrderAuthorityError("KIS specialized writer exclusion is unreadable") from exc
+        if not isinstance(status, Mapping) or status.get("status") != "SPECIALIZED_ALLOWED":
+            raise KisOrderAuthorityError("KIS specialized writer is fenced by operational exclusion")
 
 
 def _validate_operation(operation: str) -> str:
@@ -182,6 +416,8 @@ def _normalize_intent(
         "CANCEL_ORDER",
         "CLEANUP_CANCEL",
         "KILL_ORDINARY_CANCEL",
+        "SCOPED_CANCEL_KR",
+        "SCOPED_CANCEL_US",
     }
     if cancel_operation:
         if any(not _OFFICIAL_ID.fullmatch(item) for item in values):
@@ -930,6 +1166,10 @@ def require_kis_token_authority() -> Mapping[str, Any]:
         )
     snapshot = _snapshot()
     _validate_auth_scope_snapshot(scope, snapshot)
+    if scope.mode == "SCOPED_OPERATIONAL":
+        _scoped_read()
+    if scope.mode == "SCOPED_CLEANUP":
+        _cleanup_read()
     return snapshot
 
 
@@ -1224,6 +1464,10 @@ def consume_inherited_kis_transport_authority(
         raise KisOrderAuthorityError(
             "KIS trading transport requires an inherited final mutation lease"
         )
+    if lease.mode == "SCOPED_OPERATIONAL":
+        _scoped_read(intent=getattr(_THREAD_BOUNDARY, "scoped_wire_intent", None), consume=True)
+    if lease.mode == "SCOPED_CLEANUP":
+        _cleanup_read(intent=getattr(_THREAD_BOUNDARY, "cleanup_wire_intent", None), consume=True)
     intent_key = (
         lease.owner_epoch_hash,
         lease.state_revision,
@@ -1555,6 +1799,8 @@ def functional_kis_final_mutation_boundary(
         )
     normalized_intent = _normalize_intent(intent, expected_operation=operation)
     normalized_intent_hash = _intent_hash(normalized_intent)
+    if operation in {"NATURAL_BUY", "CLEANUP_SELL"}:
+        _require_specialized_writer_not_excluded()
 
     inherited = _inherited()
     expected_mode = "FUNCTIONAL_CLEANUP" if cleanup_only else "FUNCTIONAL_ENTRY"
@@ -1596,6 +1842,8 @@ def functional_kis_final_mutation_boundary(
                 snapshot = _snapshot()
                 if initial_snapshot is not None:
                     _validate_inherited_snapshot(initial_snapshot, snapshot)
+                if operation in {"NATURAL_BUY", "CLEANUP_SELL"}:
+                    _require_specialized_writer_not_excluded()
                 expected_phases = (
                     {"CLEANUP", "RECONCILIATION_REQUIRED"}
                     if cleanup_only
@@ -1705,7 +1953,11 @@ def functional_kis_final_mutation_boundary(
 def _reset_kis_order_authority_reader_for_tests() -> None:
     global _AUTHORITY_READER
     global _KILL_CANCEL_JOURNAL_PATH
+    global _SCOPED_OPERATIONAL_READER, _SPECIALIZED_EXCLUSION_READER, _SCOPED_CLEANUP_READER
     with _PROVIDER_LOCK:
+        _SCOPED_OPERATIONAL_READER = None
+        _SCOPED_CLEANUP_READER = None
+        _SPECIALIZED_EXCLUSION_READER = None
         _AUTHORITY_READER = None
         _KILL_CANCEL_JOURNAL_PATH = None
     with _ROUTE_LOCK:

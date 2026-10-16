@@ -5,6 +5,7 @@ import hmac
 import copy
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import sys
@@ -2188,6 +2189,8 @@ def _validate_kis_operation_wire(
             KIS_OVERSEAS_CANCEL_ENDPOINT,
             frozenset({"TTTT1004U"}),
         ),
+        "SCOPED_CANCEL_KR": (KIS_DOMESTIC_CANCEL_ENDPOINT, frozenset({"TTTC0013U"})),
+        "SCOPED_CANCEL_US": (KIS_OVERSEAS_CANCEL_ENDPOINT, frozenset({"TTTT1004U"})),
     }
     contract = allowed.get(operation)
     if (
@@ -2216,6 +2219,18 @@ def _validate_kis_operation_wire(
         raise KisOrderAuthorityError(
             "KIS domestic cancel wire differs from exact owned order"
         )
+    if operation in {"SCOPED_CANCEL_KR", "SCOPED_CANCEL_US"}:
+        # This separate mode cannot borrow the legacy all-remaining cancel.
+        quantity = str(exact_body.get("ORD_QTY") or "")
+        domestic = operation == "SCOPED_CANCEL_KR"
+        if (not re.fullmatch(r"[1-9][0-9]*", quantity)
+            or str(exact_body.get("ORGN_ODNO") or "") != str(owned_order_key.get("orderNo") or "")
+            or str(exact_body.get("RVSE_CNCL_DVSN_CD") or "") != "02"
+            or (domestic and (str(exact_body.get("KRX_FWDG_ORD_ORGNO") or "") != str(owned_order_key.get("organizationNo") or "")
+                or exact_body.get("QTY_ALL_ORD_YN") != "N" or exact_body.get("ORD_UNPR") != "0" or exact_body.get("EXCG_ID_DVSN_CD") != "KRX"))
+            or (not domestic and (exact_body.get("OVRS_EXCG_CD") not in {"NASD", "NYSE", "AMEX"}
+                or exact_body.get("OVRS_ORD_UNPR") != "0" or exact_body.get("ORD_SVR_DVSN_CD") != "0"))):
+            raise KisOrderAuthorityError("KIS scoped cleanup wire differs from exact whole-share owned remainder")
     if operation == "OVERSEAS_CANCEL_ORDER" and (
         str(exact_body.get("RVSE_CNCL_DVSN_CD") or "") != "02"
         or str(exact_body.get("OVRS_ORD_UNPR") or "") != "0"

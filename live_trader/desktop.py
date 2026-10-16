@@ -10,6 +10,8 @@ from .server import start_in_thread
 from .env_loader import default_runtime_data_root
 from .process_safety import live_trader_instance_lease_status
 
+from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
+
 WINDOW_STATE_VERSION = 4
 DEFAULT_WINDOW_WIDTH = 1360
 DEFAULT_WINDOW_HEIGHT = 820
@@ -43,7 +45,8 @@ def main() -> None:
             "[LIVE] Live Trader",
             authority.native_bootstrap_url,
             js_api=DesktopEmergencyStopBridge(
-                functional_http_bootstrap=authority.trusted_native_bootstrap
+                functional_http_bootstrap=authority.trusted_native_bootstrap,
+                kis_operational_start_confirmations=KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS,
             ),
             width=window_state["width"],
             height=window_state["height"],
