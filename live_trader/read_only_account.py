@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 
 from .live_adapters import build_upbit_authorization, sign_binance_query, split_kis_account
+from .kis_overseas_funding import DEFAULT_MODE, MODE_KEY, funding_policy, parse_orderable_funding, resolve_funding_mode
 
 ORIGINS = {"binance": "https://api.binance.com", "binance-futures": "https://fapi.binance.com",
            "upbit": "https://api.upbit.com", "kis": "https://openapi.koreainvestment.com:9443"}
@@ -60,7 +61,7 @@ KIS_TR_IDS = {
 }
 SETTING_KEYS = ("BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_BASE_URL", "BINANCE_FUTURES_BASE_URL",
  "UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY", "UPBIT_BASE_URL", "KIS_APP_KEY", "KIS_APP_SECRET",
- "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE", "KIS_BASE_URL", "KIS_ENV")
+ "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE", "KIS_BASE_URL", "KIS_ENV", MODE_KEY)
 _TOKEN_CACHE = {}
 _TOKEN_LOCK = threading.Lock()
 _KIS_LOCK = threading.Lock()
@@ -138,7 +139,9 @@ class ReadOnlyTransport:
 
 def runtime_settings():
     """Snapshot already loaded Live settings; never migrate or write settings."""
-    return {key: os.environ.get(key, "").strip() for key in SETTING_KEYS}
+    values = {key: os.environ.get(key, "").strip() for key in SETTING_KEYS}
+    values[MODE_KEY] = values[MODE_KEY] or DEFAULT_MODE
+    return values
 
 
 def decimal(value):
@@ -191,6 +194,10 @@ class ReadOnlyBrokerReader:
             self._credentials(provider)
             facts = self._binance(provider, symbol) if provider.startswith("binance") else (
                 self._upbit(symbol) if provider == "upbit" else self._kis(lane, symbol))
+            if lane == "kis-us":
+                result["fundingDiagnostics"] = funding_policy(self.settings, exchange="NASD", currency="USD")
+                if resolve_funding_mode(self.settings) == "INTEGRATED_MARGIN":
+                    facts["_quote"] = None  # No USD-cash fallback for a shared KRW funding preference.
             result.update({key: value for key, value in facts.items() if not key.startswith("_")})
             with localcontext() as context:
                 context.prec = 80
@@ -227,6 +234,11 @@ class ReadOnlyBrokerReader:
             if len(profiles) != 1:
                 raise ReadFailure("SAVED_ACCOUNT_BINDING_UNAVAILABLE")
             facts = self._binance(provider, symbol) if provider == "binance" else self._upbit(symbol) if provider == "upbit" else self._kis(lane, symbol)
+            if lane == "kis-us":
+                facts["fundingDiagnostics"] = funding_policy(self.settings, exchange="NASD", currency="USD")
+                if resolve_funding_mode(self.settings) == "INTEGRATED_MARGIN":
+                    facts["_quote"] = None
+                    facts["_maximumQty"] = None
             if provider == "kis" and limit_price is not None:
                 facts.update(self._kis_cash(lane, symbol, limit_price))
             result.update({key: value for key, value in facts.items() if not key.startswith("_")})
@@ -329,6 +341,11 @@ class ReadOnlyBrokerReader:
         if overseas:
             if output.get("tr_crcy_cd") != "USD":
                 raise ReadFailure("ACCOUNT_CURRENCY_MISMATCH")
+            if resolve_funding_mode(self.settings) == "INTEGRATED_MARGIN":
+                reported = parse_orderable_funding(self.settings, output, exchange="NASD", currency="USD")
+                return {"_quote": None, "_maximumQty": None,
+                        "fundingDiagnostics": reported, "cashScope": "KIS_INTEGRATED_MARGIN_REFERENCE_ONLY",
+                        "cashReferencePrice": format(price, "f"), "cashReferencePriceSource": "USER_LIMIT_PRICE"}
             cash = min(_complete_number(output.get("ord_psbl_frcr_amt")), _complete_number(output.get("ovrs_ord_psbl_amt")))
             max_qty = _complete_number(output.get("ord_psbl_qty"))
         else:

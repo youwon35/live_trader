@@ -243,6 +243,15 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
             read = reader.observe_preparation if before["kind"] == "SEALED_SOURCE" else reader.read
             observation = read(selected["broker"], selected["symbol"], side=draft["side"], quantity=numbers["quantity"], limit_price=numbers["limitPrice"])
         if selected["broker"] == "kis-us":
+            from .kis_overseas_funding import funding_policy, resolve_funding_mode
+            selected_settings = reader.settings if isinstance(getattr(reader, "settings", None), dict) else {}
+            observation.setdefault("fundingDiagnostics", funding_policy(selected_settings, exchange="NASD", currency="USD"))
+            if resolve_funding_mode(selected_settings) == "INTEGRATED_MARGIN":
+                observation["availableCash"] = None
+                observation["fundsCheck"] = "UNKNOWN"
+                constraints = observation.get("constraints")
+                if isinstance(constraints, dict):
+                    constraints["maximumBuyQuantity"] = None
             from .kis_usd_preparation import build_usd_preparation_diagnostic, validate_usd_preparation_diagnostic
             observe_usd = getattr(reader, "observe_kis_usd_financial_preparation", None)
             try:
@@ -296,6 +305,10 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
         {"code": "ORDER_SPECIFIC_RISK", "status": "UNKNOWN", "detail": "정적 LOT_SIZE·PRICE_FILTER·최소금액 관측은 로컬 현금 준비 결과에 표시됩니다. API 키 주문 권한·동적 가격 필터·노출 한도·조건부 주문 및 실행 허가는 미완료입니다." if before["kind"] == "SEALED_SOURCE" else "API 키 주문 권한·LOT_SIZE/MIN_NOTIONAL·수수료·노출 한도·선물 마진 및 조건부 주문은 이 조회로 검증되지 않습니다."},
         {"code": "LIVE_AUTHORITY", "status": "BLOCKED", "detail": "계좌 바인딩·정규 승급·현재 위험 한도·Kill/모드·수동 확인은 기존 Live 절차에서 직접 확인해야 합니다. 이 보고서는 주문 권한을 만들지 않습니다."},
     ]
+    if "fundingDiagnostics" in observation:
+        funding = observation["fundingDiagnostics"]
+        checks.append({"code": "KIS_OVERSEAS_FUNDING", "status": "BLOCKED" if funding.get("fundingMode") == "INTEGRATED_MARGIN" else "UNKNOWN",
+            "detail": "해외주식 결제방식: " + funding.get("fundingModeLabel", "미확인") + " · " + " ".join(funding.get("userMessages", []))})
     if "usdCashDiagnostics" in observation:
         from .kis_usd_preparation import usd_preparation_checks
         checks.extend(usd_preparation_checks(observation["usdCashDiagnostics"]))

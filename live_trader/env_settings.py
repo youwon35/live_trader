@@ -12,11 +12,12 @@ from .env_loader import (
     live_secret_store,
 )
 from .live_adapters import BINANCE_BASE_URL, BINANCE_FUTURES_BASE_URL, KIS_LIVE_BASE_URL, UPBIT_BASE_URL
+from .kis_overseas_funding import DEFAULT_MODE, MODE_KEY, resolve_funding_mode
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = default_env_path()
-SettingKind = Literal["text", "secret", "bool"]
+SettingKind = Literal["text", "secret", "bool", "select"]
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class EnvSettingField:
     kind: SettingKind
     default: str = ""
     required: bool = False
+    options: tuple[tuple[str, str], ...] = ()
 
 
 ENV_SETTING_FIELDS = (
@@ -36,6 +38,7 @@ ENV_SETTING_FIELDS = (
     EnvSettingField("KIS_ACCOUNT_NO", "KIS 실계좌 번호", "한국투자증권 로그인 ID가 아니라 실계좌 번호(CANO) 앞 8자리입니다.", "kis", "secret", required=True),
     EnvSettingField("KIS_ACCOUNT_PRODUCT_CODE", "KIS 상품 코드", "계좌번호 뒤 2자리입니다. 보통 01을 사용합니다.", "kis", "text", "01", True),
     EnvSettingField("KIS_BASE_URL", "KIS 실전 URL", "실전 서버 URL입니다. 모의투자 URL과 섞지 마세요.", "kis", "text", KIS_LIVE_BASE_URL),
+    EnvSettingField(MODE_KEY, "해외주식 결제방식", "통합증거금을 지원하는 해외시장의 기본 방식입니다. 계좌 서비스 신청이나 실거래 활성화는 별도로 확인합니다.", "kis", "select", DEFAULT_MODE, True, (("INTEGRATED_MARGIN", "통합증거금 (원화·자동환전)"), ("FOREIGN_CASH", "외화 현금 (사전환전)"))),
     EnvSettingField("KIS_HTS_ID", "KIS HTS ID", "한국투자증권 로그인/HTS ID이며 일부 체결·시세 경로에서 사용합니다.", "kis", "secret"),
     EnvSettingField("BINANCE_API_KEY", "Binance API key", "Binance Spot/Futures API key입니다. Futures 거래 권한은 Binance에서 별도로 활성화해야 합니다.", "binance", "secret", required=True),
     EnvSettingField("BINANCE_API_SECRET", "Binance API secret", "Binance Spot/Futures API secret입니다.", "binance", "secret", required=True),
@@ -81,6 +84,8 @@ def env_settings_snapshot() -> dict[str, Any]:
                 or os.getenv(field.key, "")
                 or store.get(live_secret_name(field.key))
             )
+        elif field.kind == "select":
+            value = file_values.get(field.key) or os.getenv(field.key, "") or field.default
         elif field.key in file_values:
             value = file_values[field.key]
         else:
@@ -98,6 +103,7 @@ def env_settings_snapshot() -> dict[str, Any]:
                 "value": "" if field.kind == "secret" else value,
                 "masked": mask_value(value) if field.kind == "secret" else "",
                 "default": field.default,
+                **({"options": [{"value": value, "label": label} for value, label in field.options]} if field.kind == "select" else {}),
             }
         )
     return {
@@ -113,6 +119,9 @@ def env_settings_snapshot() -> dict[str, Any]:
 
 
 def save_env_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
+    # Reject an invalid funding choice before any credential migration or write.
+    if MODE_KEY in raw_values:
+        resolve_funding_mode({MODE_KEY: raw_values[MODE_KEY]})
     existing = read_env_file()
     field_map = {field.key: field for field in ENV_SETTING_FIELDS}
     store = live_secret_store()
@@ -188,6 +197,8 @@ def write_env_file(
 
 
 def normalize_value(value: Any, field: EnvSettingField) -> str:
+    if field.kind == "select":
+        return resolve_funding_mode({field.key: value})
     if field.kind == "bool":
         if isinstance(value, bool):
             return "true" if value else "false"

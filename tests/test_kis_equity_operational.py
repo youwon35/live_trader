@@ -19,7 +19,7 @@ profiles=importlib.import_module(PACKAGE+'.account_profiles')
 from trading_runtime.execution_quantity import seal_quantity_contract
 
 NOW=datetime.now(timezone.utc)
-SETTINGS={'KIS_APP_KEY':'SYNTHETIC_APPKEY','KIS_APP_SECRET':'SYNTHETIC_SECRET','KIS_ACCOUNT_NO':'12345678','KIS_ACCOUNT_PRODUCT_CODE':'01'}
+SETTINGS={'KIS_OVERSEAS_FUNDING_MODE':'FOREIGN_CASH','KIS_APP_KEY':'SYNTHETIC_APPKEY','KIS_APP_SECRET':'SYNTHETIC_SECRET','KIS_ACCOUNT_NO':'12345678','KIS_ACCOUNT_PRODUCT_CODE':'01'}
 ACCOUNT=profiles.saved_account_profiles(SETTINGS)[0]
 
 

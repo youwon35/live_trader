@@ -20,6 +20,10 @@ def cash_preview(instrument, observation, draft):
         result["status"] = "NOT_APPLICABLE" if draft.get("side") == "SELL" else "BLOCKED"
         result["reasons"].append("매수 방향을 직접 선택한 경우에만 현금 기반 매수 수량을 계산합니다." if draft.get("side") != "SELL" else "매도 수량은 현금 기반 매수 한도로 계산하지 않습니다. 실제 보유·주문가능 수량과 reduce-only/노출 검사를 별도로 확인해야 합니다.")
         return result
+    if (observation.get("fundingDiagnostics") or {}).get("fundingMode") == "INTEGRATED_MARGIN":
+        result["calculationScope"] = "INTEGRATED_MARGIN_AWAITING_SHARED_CASH_AND_SETTLEMENT"
+        result["reasons"].append("통합증거금의 환전 후 주문가능액은 보유 현금과 다릅니다. 국내·해외 공통 자금 예약과 환전·비용·정산 확인 전에는 주문 수량을 확정하지 않습니다.")
+        return result
     if (instrument.get("executionSizing") or {}).get("quantityContract") is not None:
         return native_contract_preview(instrument, observation, draft, result)
     cash = number(observation.get("availableCash"))
@@ -79,6 +83,9 @@ def cash_preview(instrument, observation, draft):
 
 def native_contract_preview(instrument, observation, draft, result):
     """A native Source uses owned deployment equity, with cash as a separate cap."""
+    if (observation.get("fundingDiagnostics") or {}).get("fundingMode") == "INTEGRATED_MARGIN":
+        result["reasons"].append("통합증거금의 원화 예약·자동환전·정산 확인이 필요합니다. 외화 현금 모델로 대신 계산하지 않습니다.")
+        return result
     from .native_spot_quantity import CAPITAL_BASIS, RULE_FIELDS, calculate_model_quantity
     from trading_runtime.execution_quantity import validate_quantity_contract
     result.update(capitalBasis=CAPITAL_BASIS, initialBudgetBasis="ACCOUNT_AVAILABLE_CASH", calculationScope="SOURCE_MARKET_QUANTITY_MODEL_AT_ENTERED_REFERENCE_PRICE", modelQuantity=None, nativeEligibility="UNKNOWN", availableCash=observation.get("availableCash"), deploymentEquity=observation.get("deploymentEquity"), actualBrokerFeeObserved=observation.get("feeRate") is not None)

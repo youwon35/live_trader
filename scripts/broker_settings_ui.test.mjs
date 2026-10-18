@@ -71,6 +71,19 @@ function settings() {
     ],
   };
 }
+function fundingSettings() {
+  const value = settings();
+  value.fields.push({
+    key: "KIS_OVERSEAS_FUNDING_MODE", kind: "select", group: "kis", label: "해외주식 결제 방식",
+    detail: "계좌의 통합증거금 가입을 대신하지 않습니다. 지원시장별 확인 후 사용하며 실거래 활성화와 별개입니다.",
+    value: "INTEGRATED_MARGIN", default: "INTEGRATED_MARGIN", required: true,
+    options: [
+      { value: "INTEGRATED_MARGIN", label: "통합증거금 (원화·자동환전)" },
+      { value: "FOREIGN_CASH", label: "외화 현금 (사전환전)" },
+    ],
+  });
+  return value;
+}
 const success = () => ({ ok: true, settings: settings() });
 const response = (payload) => ({ ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => payload });
 function setup(...responses) {
@@ -151,6 +164,10 @@ function harness(props = {}) {
     input(key) {
       const label = elements(tree, "label").find((item) => item.key === key);
       return elements(label, "input")[0];
+    },
+    select(key) {
+      const label = elements(tree, "label").find((item) => item.key === key);
+      return elements(label, "select")[0];
     },
     edit(key, value) {
       view.input(key).props.onChange({ target: { value } });
@@ -314,4 +331,100 @@ test("a cancelled component ignores a settings response arriving after unmount",
   release(response(success()));
   assert.match(await view.settle(), /읽는 중/);
   assert.equal(view.saveButton().props.disabled, true);
+});
+
+test("funding select shows verified labels, current choice and its scope detail", async () => {
+  setup({ ok: true, settings: fundingSettings() });
+  const view = harness();
+  try {
+    const html = await view.settle();
+    assert.equal(view.select("KIS_OVERSEAS_FUNDING_MODE").props.value, "INTEGRATED_MARGIN");
+    assert.match(html, /통합증거금 \(원화·자동환전\)/);
+    assert.match(html, /외화 현금 \(사전환전\)/);
+    assert.match(html, /계좌의 통합증거금 가입을 대신하지 않습니다/);
+    assert.match(html, /지원시장별 확인 후 사용하며 실거래 활성화와 별개입니다/);
+    assert.equal(view.input("KIS_OVERSEAS_FUNDING_MODE"), undefined, "a validated choice is not a free-form text input");
+    assert.equal(view.saveButton().props.disabled, false);
+    assert.equal(calls.length, 1, "loading funding preferences must not save or enable trading");
+  } finally { view.unmount(); }
+});
+
+test("both funding choices round-trip through existing settings save without enabling real orders", async () => {
+  setup({ ok: true, settings: fundingSettings() });
+  respond = async (_url, options) => {
+    const saved = fundingSettings();
+    if (options.method === "POST") {
+      const body = JSON.parse(options.body);
+      saved.fields[2].value = body.values.KIS_OVERSEAS_FUNDING_MODE;
+    }
+    return response({ ok: true, settings: saved });
+  };
+  const view = harness();
+  try {
+    await view.settle();
+    for (const value of ["FOREIGN_CASH", "INTEGRATED_MARGIN"]) {
+      view.select("KIS_OVERSEAS_FUNDING_MODE").props.onChange({ target: { value } });
+      view.render();
+      assert.equal(view.select("KIS_OVERSEAS_FUNDING_MODE").props.value, value);
+      await view.save();
+      assert.match(view.render(), /2개 설정을 저장했습니다/);
+      const write = calls.at(-1);
+      assert.equal(write.method, "POST");
+      assert.equal(write.body.values.KIS_OVERSEAS_FUNDING_MODE, value);
+      assert.equal(write.body.values.KIS_ACCOUNT_PRODUCT_CODE, "01");
+      assert.equal(write.body.values.KIS_APP_KEY, undefined);
+      assert.equal(write.body.values.LIVE_TRADER_ENABLE_REAL_ORDERS, undefined);
+      assert.equal(write.body.confirmed, false);
+      assert.equal(view.select("KIS_OVERSEAS_FUNDING_MODE").props.value, value);
+    }
+    assert.deepEqual(calls.map((call) => call.method), ["GET", "POST", "POST"]);
+  } finally { view.unmount(); }
+});
+
+test("unverified select options or values block settings load and save", async () => {
+  const valid = fundingSettings().fields[2];
+  const invalid = [
+    { options: undefined }, { options: [] }, { options: {} }, { options: [null] },
+    { options: [["INTEGRATED_MARGIN", "통합증거금"]] },
+    { options: [{ value: "", label: "통합증거금" }] },
+    { options: [{ value: " INTEGRATED_MARGIN ", label: "통합증거금" }] },
+    { options: [{ value: "INTEGRATED_MARGIN", label: " " }] },
+    { options: [{ value: true, label: "통합증거금" }] },
+    { options: [{ value: "INTEGRATED_MARGIN", label: {} }] },
+    { options: [valid.options[0], { ...valid.options[1], value: "INTEGRATED_MARGIN" }] },
+    { options: [valid.options[0], { ...valid.options[1], label: valid.options[0].label }] },
+    { options: [valid.options[0], { ...valid.options[1], label: ` ${valid.options[0].label} ` }] },
+    { value: "UNKNOWN" }, { default: "UNKNOWN" }, { value: true }, { default: null },
+  ];
+  for (const change of invalid) {
+    const value = fundingSettings();
+    value.fields[2] = { ...value.fields[2], ...change };
+    setup({ ok: true, settings: value });
+    const view = harness();
+    try {
+      const html = await view.settle();
+      assert.match(html, /확인 실패/, JSON.stringify(change));
+      assert.equal(view.select("KIS_OVERSEAS_FUNDING_MODE"), undefined);
+      assert.equal(view.saveButton().props.disabled, true);
+      await view.save();
+      assert.equal(calls.length, 1, "invalid metadata must never be sent back as saved settings");
+    } finally { view.unmount(); }
+  }
+});
+
+test("a saved funding response with invalid select metadata never reports success", async () => {
+  setup({ ok: true, settings: fundingSettings() });
+  const invalid = fundingSettings();
+  invalid.fields[2].options = [invalid.fields[2].options[0], invalid.fields[2].options[0]];
+  let writes = 0;
+  const view = harness({ onSave: async () => { writes += 1; return { ok: true, settings: invalid }; } });
+  try {
+    await view.settle();
+    await view.save();
+    assert.match(view.render(), /확인 실패/);
+    assert.doesNotMatch(view.render(), /저장했습니다/);
+    assert.equal(view.saveButton().props.disabled, true);
+    await view.save();
+    assert.equal(writes, 1);
+  } finally { view.unmount(); }
 });

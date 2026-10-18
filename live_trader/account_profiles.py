@@ -4,6 +4,7 @@ import os
 import re
 from typing import Any, Mapping
 from trading_runtime.artifact_governance import stable_sha256
+from .kis_overseas_funding import funding_policy
 
 _SPECS = {
     "kis": ("KIS 실계좌", ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE"), "KIS_BASE_URL", "https://openapi.koreainvestment.com:9443", "KRW"),
@@ -37,7 +38,9 @@ def saved_account_profiles(settings: Mapping[str, Any] | None = None) -> list[di
         if origin != official_origin:
             continue
         fingerprint = stable_sha256({"broker": broker, "identity": identity})
-        configuration_hash = stable_sha256({"broker": broker, "values": values, "origin": origin})
+        funding = funding_policy(settings) if broker == "kis" else None
+        configuration_hash = stable_sha256({"broker": broker, "values": values, "origin": origin,
+            **({"overseasFundingPolicyHash": funding["policyHash"]} if funding else {})})
         profile_id = stable_sha256({"broker": broker, "accountFingerprint": fingerprint, "credentialConfigurationHash": configuration_hash})
         profiles.append({
             "profileId": profile_id, "brokerId": broker,
@@ -45,6 +48,7 @@ def saved_account_profiles(settings: Mapping[str, Any] | None = None) -> list[di
             "accountFingerprint": fingerprint, "credentialConfigurationHash": configuration_hash,
             "accountBindingId": "live-account:" + broker + ":" + fingerprint,
             "currency": currency, "balanceQueried": False,
+            **({"overseasFunding": funding} if funding else {}),
         })
     return profiles
 

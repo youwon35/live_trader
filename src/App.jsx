@@ -4906,7 +4906,15 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         || typeof field.group !== "string" || !field.group.trim()
         || typeof field.label !== "string" || !field.label.trim()
         || typeof field.detail !== "string"
-        || !["secret", "text", "bool"].includes(field.kind)
+        || !["secret", "text", "bool", "select"].includes(field.kind)
+        || (field.kind === "select" && (!Array.isArray(field.options) || !field.options.length
+          || field.options.some((option) => !option || typeof option !== "object" || Array.isArray(option)
+            || typeof option.value !== "string" || !option.value.trim() || option.value !== option.value.trim()
+            || typeof option.label !== "string" || !option.label.trim())
+          || new Set(field.options.map((option) => option.value)).size !== field.options.length
+          || new Set(field.options.map((option) => option.label.trim())).size !== field.options.length
+          || ["value", "default"].some((key) => typeof field[key] !== "string"
+            || !field.options.some((option) => option.value === field[key]))))
         || ["configured", "required"].some((key) => field[key] !== undefined && typeof field[key] !== "boolean")
         || ["value", "default"].some((key) => field[key] !== undefined && field[key] !== null
           && !["string", "number", "boolean"].includes(typeof field[key])))
@@ -5075,6 +5083,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
             >
               <div>
                 <strong>{field.label}</strong>
+                {field.kind === "select" && field.detail && <span>{field.detail}</span>}
               </div>
               {field.kind === "bool" ? (
                 <ToggleSwitch
@@ -5082,6 +5091,10 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
                   label={field.label}
                   onChange={(checked) => updateDraft(field.key, checked ? "true" : "false")}
                 />
+              ) : field.kind === "select" ? (
+                <select aria-label={field.label} onChange={(event) => updateDraft(field.key, event.target.value)} value={String(value)}>
+                  {field.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
               ) : (
                 <input
                   autoComplete={field.kind === "secret" ? "new-password" : undefined}

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import re
 from .account_profiles import saved_account_profiles
+from .kis_overseas_funding import resolve_funding_mode
 from .live_adapters import split_kis_account
 from .native_spot_quantity import decimal_value
 from .read_only_account import ReadFailure, KIS_TR_IDS
@@ -128,6 +129,10 @@ class KisEquityReader:
             'positionResponseHash':stable_sha256(positions),'workingOrdersResponseHash':stable_sha256(pending)}
 
     def observe(self,contract,*,side,raw_open,protective_bps):
+        if contract.get('exchange') != 'KRX' and resolve_funding_mode(self.reader.settings) == 'INTEGRATED_MARGIN':
+            # Post-FX buying power is not an owned USD balance or a shared-cash lease.
+            # Preserve the operational guard until the settlement producer exists.
+            raise ReadFailure('KIS_INTEGRATED_MARGIN_EXECUTION_NOT_VERIFIED')
         started=self.clock(); account=self.account(); exchange=contract['exchange'];symbol=contract['symbol']
         if contract['quoteCurrency']!=VENUES[exchange][0] or side not in {'BUY','SELL'}:raise ReadFailure('KIS_V2_EXACT_SCOPE_REQUIRED')
         quote=self.quote(exchange,symbol)

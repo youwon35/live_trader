@@ -63,10 +63,26 @@ class UsdPreparationTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.run_preview()
         self.transport.request.assert_not_called();self.reader._kis.assert_not_called()
     def test_old_funds_comparison_is_not_replaced_or_aggregated(self):
+        self.reader.settings['KIS_OVERSEAS_FUNDING_MODE']='FOREIGN_CASH'
         report=self.run_preview();self.assertEqual(report['observation']['fundsCheck'],'WITHIN_OBSERVED_BALANCE')
         self.assertNotIn('availableCash',report['observation']['usdCashDiagnostics'])
         self.assertEqual(self.reader._kis.call_args.args,('kis-us','AAPL'))
         self.assertIn('KIS_USD_DEPOSIT_SCOPE_UNPROVEN',[x['code'] for x in report['checks']])
+    def test_integrated_default_discards_cash_fallback_and_does_not_grant_financial_authority(self):
+        report=self.run_preview();observation=report['observation']
+        self.assertEqual(observation['fundsCheck'],'UNKNOWN')
+        self.assertIsNone(observation['availableCash'])
+        self.assertEqual(observation['fundingDiagnostics']['fundingMode'],'INTEGRATED_MARGIN')
+        check=next(x for x in report['checks'] if x['code']=='KIS_OVERSEAS_FUNDING')
+        self.assertEqual(check['status'],'BLOCKED')
+        self.assertFalse(report['authorityGranted'])
+        self.assertFalse(observation['usdCashDiagnostics']['productionReady'])
+    def test_funding_choice_change_during_usd_read_discards_report(self):
+        def mutate(*args,**kwargs):
+            self.reader.settings['KIS_OVERSEAS_FUNDING_MODE']='FOREIGN_CASH'
+            return ({'rt_cd':'0','output':[]},{'tr_id':'TTTC2101R','tr_cont':'D'})
+        self.transport.request.side_effect=mutate
+        with self.assertRaisesRegex(ValueError,'설정'):self.run_preview()
     def test_actual_fee_and_posting_always_blocked(self):
         report=self.run_preview();checks={x['code']:x for x in report['checks']}
         for code in usd.BASE_REASONS:self.assertEqual(checks[code]['status'],'BLOCKED')
