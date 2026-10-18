@@ -31,6 +31,14 @@ class UsdPreparationTests(unittest.TestCase):
         self.reader=account.ReadOnlyBrokerReader(settings(),transport=self.transport)
         self.reader._kis_token=Mock(return_value='private-bearer');self.reader._pace_kis=Mock()
         self.reader._kis=Mock(return_value={'account':'AVAILABLE','openOrders':'NONE_OBSERVED','orderability':'UNKNOWN','_quote':Decimal('55'),'_base':Decimal('2')})
+        # This suite isolates the USD diagnostic's one GET. The separate
+        # integrated-preparation suite exercises its additional account GET.
+        self.reader.observe_kis_integrated_financial_preparation=Mock(return_value={
+            'schemaVersion':'kis-integrated-financial-preparation-v1', 'status':'UNAVAILABLE',
+            'integratedObservation':None, 'sharedKrwReadiness':None, 'localOwnedInventory':None,
+            'productionReady':False, 'orderAuthorityGranted':False,
+            'sharedCashReservationVerified':False, 'actualFeeObserved':False,
+            'actualFxExecutionObserved':False, 'settlementFinalityVerified':False})
     def run_preview(self):return service.prepare_read_only(self.request,roots=[self.root],reader=self.reader)
     def diagnostic(self):return self.reader.observe_kis_usd_financial_preparation()
     def test_normal_source_and_read_flow_adds_one_get_only(self):

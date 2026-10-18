@@ -24,7 +24,8 @@ READ_PATHS = {
  "binance": {"/api/v3/time", "/api/v3/account", "/api/v3/openOrders", "/api/v3/exchangeInfo", "/api/v3/account/commission", "/api/v3/avgPrice", "/api/v3/ticker/price", "/api/v3/myTrades", "/api/v3/order"},
  "binance-futures": {"/fapi/v1/time", "/fapi/v3/account", "/fapi/v1/openOrders", "/fapi/v1/exchangeInfo"},
  "upbit": {"/v1/accounts", "/v1/orders/chance", "/v1/orders/open", "/v1/ticker", "/v1/order"},
- "kis": {"/uapi/domestic-stock/v1/trading/inquire-balance",
+ "kis": {"/uapi/domestic-stock/v1/trading/intgr-margin",
+         "/uapi/domestic-stock/v1/trading/inquire-balance",
          "/uapi/overseas-stock/v1/trading/inquire-balance",
          "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl",
          "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
@@ -42,6 +43,7 @@ READ_PATHS = {
          "/uapi/overseas-stock/v1/trading/inquire-present-balance"},
 }
 KIS_TR_IDS = {
+ "/uapi/domestic-stock/v1/trading/intgr-margin": "TTTC0869R",
  "/uapi/overseas-stock/v1/trading/foreign-margin": "TTTC2101R",
  "/uapi/overseas-stock/v1/trading/inquire-paymt-stdr-balance": "CTRP6010R",
  "/uapi/overseas-stock/v1/trading/inquire-period-trans": "CTOS4001R",
@@ -115,7 +117,10 @@ class ReadOnlyTransport:
                 raw = response.read(4 * 1024 * 1024 + 1)
                 if len(raw) > 4 * 1024 * 1024:
                     raise ReadFailure("RESPONSE_LIMIT")
-                if provider == "kis" and path == "/uapi/overseas-stock/v1/trading/foreign-margin":
+                if provider == "kis" and path == "/uapi/domestic-stock/v1/trading/intgr-margin":
+                    from .kis_integrated_margin_observation import decode_integrated_margin_response
+                    payload = decode_integrated_margin_response(raw)
+                elif provider == "kis" and path == "/uapi/overseas-stock/v1/trading/foreign-margin":
                     from .kis_margin_observation import decode_margin_response
                     payload = decode_margin_response(raw)
                 elif provider == "kis" and path in {
@@ -285,6 +290,46 @@ class ReadOnlyBrokerReader:
             result["status"] = "INVALID_ACCOUNT_RESPONSE"
         result["asOf"] = datetime.now(timezone.utc).isoformat()
         return result
+
+    def observe_kis_integrated_financial_preparation(self):
+        """Explicit preparation: one account GET and existing local books, no writes."""
+        from .kis_integrated_margin_observation import (
+            KisIntegratedMarginObservationReader, safe_observation_summary,
+        )
+        from .kis_shared_krw_readiness import (
+            inspect_shared_krw_readiness, safe_shared_krw_readiness_summary,
+        )
+        from .kis_shared_krw_local import read_existing_owned_books
+        from .kis_integrated_financial_preparation import validate_integrated_financial_preparation_diagnostic
+        from .env_loader import default_runtime_data_root
+        report = {"schemaVersion": "kis-integrated-financial-preparation-v1",
+            "status": "UNAVAILABLE", "integratedObservation": None,
+            "sharedKrwReadiness": None, "localOwnedInventory": None,
+            "productionReady": False, "orderAuthorityGranted": False,
+            "sharedCashReservationVerified": False, "actualFeeObserved": False,
+            "actualFxExecutionObserved": False, "settlementFinalityVerified": False}
+        try:
+            if resolve_funding_mode(self.settings) != "INTEGRATED_MARGIN":
+                report["status"] = "NOT_REQUESTED_FOR_FOREIGN_CASH"
+                return report
+            capture = KisIntegratedMarginObservationReader(self).observe(max_pages=1)
+            inventory = read_existing_owned_books(
+                default_runtime_data_root() / "logs" / "kis_owned_capital_v2.sqlite3",
+                capture["accountBinding"])
+            shared = inspect_shared_krw_readiness(integrated_observation=capture,
+                owned_books=inventory["ownedBooks"], open_orders=None,
+                now=datetime.now(timezone.utc))
+            report.update(status="REPORTED_REFERENCE_AND_LOCAL_DEPENDENCIES_ONLY",
+                integratedObservation=safe_observation_summary(capture),
+                sharedKrwReadiness=safe_shared_krw_readiness_summary(shared),
+                localOwnedInventory={key: inventory.get(key) for key in
+                    ("status", "reasons", "localGeneration", "dependencyHash", "sourceMeaning")})
+            report = validate_integrated_financial_preparation_diagnostic(report)
+        except (ValueError, OSError, RuntimeError, TypeError, KeyError, ArithmeticError):
+            # Private capture, local scope data and remote error text cannot escape.
+            report.update(status="UNAVAILABLE", integratedObservation=None,
+                sharedKrwReadiness=None, localOwnedInventory=None)
+        return report
 
     def observe_kis_usd_financial_preparation(self):
         """One currency-margin GET, sanitized information only; no cash inference."""

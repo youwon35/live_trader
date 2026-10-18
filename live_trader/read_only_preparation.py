@@ -259,6 +259,23 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
                 observation["usdCashDiagnostics"] = validate_usd_preparation_diagnostic(diagnostic)
             except (ValueError, OSError, RuntimeError, TypeError, KeyError):
                 observation["usdCashDiagnostics"] = build_usd_preparation_diagnostic()
+        if selected["broker"] in {"kis-kr", "kis-us"}:
+            from .kis_overseas_funding import resolve_funding_mode
+            settings = reader.settings if isinstance(getattr(reader, "settings", None), dict) else {}
+            if resolve_funding_mode(settings) == "INTEGRATED_MARGIN":
+                from .kis_integrated_financial_preparation import (
+                    FLAGS as integrated_flags, SCHEMA as integrated_schema,
+                    validate_integrated_financial_preparation_diagnostic,
+                )
+                observe_integrated = getattr(reader, "observe_kis_integrated_financial_preparation", None)
+                unavailable = {"schemaVersion": integrated_schema, "status": "UNAVAILABLE",
+                    "integratedObservation": None, "sharedKrwReadiness": None,
+                    "localOwnedInventory": None, **integrated_flags}
+                try:
+                    diagnostic = observe_integrated() if callable(observe_integrated) else unavailable
+                    observation["integratedFinancialDiagnostics"] = validate_integrated_financial_preparation_diagnostic(diagnostic)
+                except (ValueError, OSError, RuntimeError, TypeError, KeyError, ArithmeticError):
+                    observation["integratedFinancialDiagnostics"] = unavailable
         if settings_hash is not None and (stable_sha256(reader.settings) != settings_hash or (uses_runtime_settings and stable_sha256(runtime_settings()) != settings_hash)):
             raise ValueError("조회 중 저장 계좌 설정이 바뀌어 결과를 폐기했습니다.")
         if before["kind"] == "SEALED_SOURCE" or (selected.get("executionSizing") or {}).get("quantityContract") is not None:
@@ -309,6 +326,13 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
         funding = observation["fundingDiagnostics"]
         checks.append({"code": "KIS_OVERSEAS_FUNDING", "status": "BLOCKED" if funding.get("fundingMode") == "INTEGRATED_MARGIN" else "UNKNOWN",
             "detail": "해외주식 결제방식: " + funding.get("fundingModeLabel", "미확인") + " · " + " ".join(funding.get("userMessages", []))})
+    if "integratedFinancialDiagnostics" in observation:
+        diagnostic = observation["integratedFinancialDiagnostics"]
+        seen = diagnostic.get("integratedObservation")
+        checks.append({"code": "KIS_INTEGRATED_MARGIN_REFERENCE", "status": "UNKNOWN",
+            "detail": ("통합증거금 현황 조회: " + str(seen.get("reportedNumericFieldCount", 0)) + "개 수치 항목을 개별 관측했습니다. 원화 기준 참고액이며 실제 현금이나 합산 한도가 아닙니다.") if isinstance(seen, dict) else "통합증거금 현황을 확인하지 못했습니다. 빈 응답을 0원으로 사용하지 않습니다."})
+        checks.append({"code": "KIS_SHARED_KRW_RESERVATION", "status": "BLOCKED",
+            "detail": "국내·해외 공통 원화 예약은 미검증입니다. 기존 통화별 원금·추정 비용은 별도 진단하며, 전체 미체결·실제 비용·환전·확정 정산 확인 전에는 해외 자동 주문을 허용하지 않습니다."})
     if "usdCashDiagnostics" in observation:
         from .kis_usd_preparation import usd_preparation_checks
         checks.extend(usd_preparation_checks(observation["usdCashDiagnostics"]))
