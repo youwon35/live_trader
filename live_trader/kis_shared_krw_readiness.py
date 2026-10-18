@@ -160,7 +160,7 @@ def inspect_shared_krw_readiness(*, integrated_observation, owned_books=None,
     complete broker-wide working orders. None means unavailable, never empty.
     Returned native-currency totals are private diagnostics, not shared money.
     """
-    reasons = ['KIS_SHARED_KRW_GLOBAL_RESERVATION_PRODUCER_UNAVAILABLE',
+    reasons = ['KIS_SHARED_KRW_VERIFIED_BASELINE_PRODUCER_UNAVAILABLE',
         'KIS_SHARED_KRW_FINAL_FX_AND_SETTLEMENT_PRODUCER_UNAVAILABLE']
     checks = {'reportedIntegratedObservationValid': False,
         'localRetrievalWithinExisting15SecondBoundary': False,

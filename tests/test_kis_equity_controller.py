@@ -125,7 +125,10 @@ class KisEquityControllerTest(unittest.TestCase):
                 self.assertTrue(result["results"][0]["ok"], result)
                 self.assertEqual(1, len(captured))
                 intent = captured[0]
-                wire = validate_native_ticket(intent)
+                # Explicit legacy funding environment for this synthetic
+                # quantity/controller test; integrated tickets stay blocked.
+                with patch.dict('os.environ', {'KIS_OVERSEAS_FUNDING_MODE':'FOREIGN_CASH'}):
+                    wire = validate_native_ticket(intent)
                 self.assertEqual("00", intent.metadata["order_type"])
                 self.assertEqual(exchange, intent.metadata["exchange"])
                 self.assertEqual(exchange, wire["exchange"])

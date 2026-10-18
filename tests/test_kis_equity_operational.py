@@ -106,7 +106,10 @@ class KisEquityOperationalTests(unittest.TestCase):
             self.assertEqual(contract,before);self.assertEqual(contract['capabilityStatus'],'UNKNOWN')
             self.assertFalse(result['modelResult']['actualFeeObserved']);self.assertFalse(result['orderAuthorityGranted'])
             self.assertEqual(result['modelResult']['fillPriceRole'],'PROTECTIVE_LIMIT_NOT_ACTUAL_FILL')
-            wire=ticket_module.validate_native_ticket(intent(spec,context,result),now=NOW)
+            # The generic ticket path reads the current public funding mode.
+            # This test exercises the explicit legacy FOREIGN_CASH model.
+            with patch.dict('os.environ',{'KIS_OVERSEAS_FUNDING_MODE':'FOREIGN_CASH'}):
+                wire=ticket_module.validate_native_ticket(intent(spec,context,result),now=NOW)
             self.assertEqual(wire['orderClass'],'00');self.assertEqual(wire['exchange'],exchange)
 
     def test_sell_only_owned_whole_shares_and_broker_available_quantity(self):
@@ -160,10 +163,10 @@ class KisEquityOperationalTests(unittest.TestCase):
         service.validate_ticket(ticket,now=NOW,settings=SETTINGS)
         with self.assertRaises(ValueError):service.validate_ticket(ticket,now=NOW,settings={**SETTINGS,'KIS_APP_SECRET':'changed'})
         ticket.quantity+=1
-        with self.assertRaises(ValueError):service.validate_ticket(ticket,now=NOW)
+        with self.assertRaises(ValueError):service.validate_ticket(ticket,now=NOW,settings=SETTINGS)
         ticket=intent(spec,context,result);bad=service.seal({**ticket.metadata['native_quantity_model'],'costReserve':'0'})
         ticket.metadata['native_quantity_model']=bad;ticket.metadata['native_preflight']['kisEquityTicket']=bad
-        with self.assertRaises(ValueError):service.validate_ticket(ticket,now=NOW)
+        with self.assertRaises(ValueError):service.validate_ticket(ticket,now=NOW,settings=SETTINGS)
 
     def test_authenticated_get_reader_uses_exact_all_venues_and_no_us_echo(self):
         for exchange in service.VENUES:

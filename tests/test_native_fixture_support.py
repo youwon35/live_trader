@@ -14,7 +14,9 @@ from live_trader.kis_equity_execution import prepare_reviewed_policies
 from live_trader.kis_equity_runtime import NativeEquityRuntime
 from live_trader.runtime_scope import scope_from_mapping
 
-SETTINGS={'KIS_APP_KEY':'SYNTHETIC_NATIVE_FLOW_APP','KIS_APP_SECRET':'SYNTHETIC_NATIVE_FLOW_SECRET',
+# This fixture exercises the existing cash-only native path. Integrated-margin
+# production remains blocked until its separate financial producer is verified.
+SETTINGS={'KIS_OVERSEAS_FUNDING_MODE':'FOREIGN_CASH','KIS_APP_KEY':'SYNTHETIC_NATIVE_FLOW_APP','KIS_APP_SECRET':'SYNTHETIC_NATIVE_FLOW_SECRET',
     'KIS_ACCOUNT_NO':'12345678','KIS_ACCOUNT_PRODUCT_CODE':'01','KIS_ENV':'real'}
 
 

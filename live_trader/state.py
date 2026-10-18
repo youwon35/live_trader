@@ -3856,7 +3856,7 @@ def _kis_scoped_start_material(profile_id: str, mode: str, portfolio_id: str = "
     # schemes. Re-derive the SAVED scheme from actual transport credentials so
     # independently valid account A and account B cannot form a mixed grant.
     wire_settings = {key: env_value(key) for key in ("KIS_APP_KEY", "KIS_APP_SECRET",
-        "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE", "KIS_BASE_URL")}
+        "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE", "KIS_BASE_URL", "KIS_OVERSEAS_FUNDING_MODE")}
     wire_profiles = [row for row in saved_account_profiles(wire_settings) if row.get("brokerId") == "kis"]
     if len(wire_profiles) != 1 or any(wire_profiles[0].get(key) != scope.get(key)
             for key in ("accountFingerprint", "credentialConfigurationHash")):
@@ -10618,6 +10618,8 @@ def _current_live_deployment_binding(
         "operationalExecutionPolicyDigest": governance_sha256({
             "kisEquityExecutionPolicies": permissions.get("kisEquityExecutionPolicies"),
             "kisEquityFeeReservePolicy": permissions.get("kisEquityFeeReservePolicy"),
+            **({"kisSharedKrwReservationPlan": permissions["kisSharedKrwReservationPlan"]}
+               if permissions.get("kisSharedKrwReservationPlan") is not None else {}),
         }),
         "strategyArtifact": {
             key: str(strategy_reference.get(key) or "").strip().lower()

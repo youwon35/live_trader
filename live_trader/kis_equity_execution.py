@@ -212,6 +212,19 @@ def live_equity_quantity(spec, *, side, price, allocation_weight, identity, cont
 
 
 def validate_ticket(intent, *, now=None, settings=None):
+    # A local shared-KRW reservation is not a verified fee/FX/settlement
+    # producer. Guard every venue, including domestic KRX, at the final ticket
+    # boundary. The generic native-ticket path omits settings; read only its
+    # public mode preference, so the requested integrated default cannot bypass
+    # this guard. Explicit FOREIGN_CASH keeps its existing validation semantics.
+    from .kis_overseas_funding import KEY, INTEGRATED_MARGIN, resolve_funding_mode
+    if settings is None:
+        import os
+        funding_settings = {KEY: os.environ.get(KEY, '')}
+    else:
+        funding_settings = settings
+    if resolve_funding_mode(funding_settings) == INTEGRATED_MARGIN:
+        raise ValueError('KIS_INTEGRATED_MARGIN_EXECUTION_NOT_VERIFIED')
     meta=intent.metadata or {}; model=checked(meta.get('native_quantity_model'),RESULT)
     binding=meta.get('native_preflight') or {}; boundary=meta.get('native_open_boundary') or {}
     if (meta.get('broker_id')!='kis' or meta.get('native_quantity_status')!='READY'

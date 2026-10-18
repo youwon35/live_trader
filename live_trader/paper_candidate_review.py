@@ -88,8 +88,13 @@ def _review_execution_policies(root, strategy, portfolio, account, controls, *, 
     if len(currencies) != 1:
         raise ValueError("KIS_REVIEW_SEPARATE_KRW_USD_PORTFOLIOS_REQUIRED")
     fee = seal({**fees[0], "venues": sorted(venues)})
-    return {"kisEquityExecutionPolicies": execution,
-            "kisEquityFeeReservePolicy": fee, "kisSavedSlippageBps": slippage}
+    result = {"kisEquityExecutionPolicies": execution,
+              "kisEquityFeeReservePolicy": fee, "kisSavedSlippageBps": slippage}
+    shared_input = (controls or {}).get("kisSharedKrwReservationPlan")
+    if shared_input is not None:
+        from .kis_shared_krw_bridge import validate_reviewed_allocation_input
+        result["kisSharedKrwReservationPlan"] = validate_reviewed_allocation_input(shared_input, account=account)
+    return result
 
 
 def _plan(root, request, registry, settings, controls):
@@ -146,7 +151,12 @@ def _plan(root, request, registry, settings, controls):
         "orderSizing": str(strategy.get("order_quantity") or strategy.get("orderQuantity") or (instance.get("parameters") or {}).get("paperOrderQuantity") or (strategy.get("parameters") or {}).get("positionSize") or "봉인 전략의 주문 수량·위험 설정"),
         "execution": "계좌 연결과 제한 실거래 준비만 승인. 실주문 ON·시작 점검·운용 시작은 별도."}
     if execution_policies:
-        display["execution"] += " 보호 지정가는 저장 슬리피지 이내로 제한되며 미체결될 수 있습니다. 1% 및 KRW 1000/USD 1 비용 예비금은 실제 계좌 수수료율·브로커 최소수수료가 아닙니다. KRW/USD 자금은 별도이며 자동환전하지 않습니다."
+        display["execution"] += " 보호 지정가는 저장 슬리피지 이내로 제한되며 미체결될 수 있습니다. 1% 및 KRW 1000/USD 1 비용 예비금은 실제 계좌 수수료율·브로커 최소수수료가 아닙니다. 통합증거금은 공통 원화 예약과 실제 비용·환전·정산 검증 전 자동 주문이 차단됩니다."
+        shared_input = execution_policies.get("kisSharedKrwReservationPlan")
+        if shared_input is not None:
+            display["totalCapital"] += (" · 공통 원화 예산 " + format(int(shared_input["policy"]["capKrw"]), ",")
+                + "원 · 이 포트폴리오 예약 " + format(int(shared_input["allocationKrw"]), ",")
+                + "원 (사용자 로컬 예산이며 증권사 확정 현금 증명이 아닙니다)")
     return row, account, capital, context, display, successor_id
 
 

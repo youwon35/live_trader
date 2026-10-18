@@ -106,7 +106,7 @@ class SharedKrwReadinessTests(unittest.TestCase):
         self.assertEqual(result['currencyBooks']['USD']['ownedCash'], '750')
         self.assertFalse(result['brokerCapacityAndOwnedCashCombined'])
         self.assertIn('KIS_SHARED_KRW_INDEPENDENT_CURRENCY_ALLOCATIONS_NOT_SHARED_POOL', result['reasons'])
-        self.assertIn('KIS_SHARED_KRW_GLOBAL_RESERVATION_PRODUCER_UNAVAILABLE', result['reasons'])
+        self.assertIn('KIS_SHARED_KRW_VERIFIED_BASELINE_PRODUCER_UNAVAILABLE', result['reasons'])
 
     def test_duplicate_deployment_cannot_double_count_cash_or_hide_behind_currency(self):
         krw = owned_book(self.observation)

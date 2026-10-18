@@ -332,7 +332,7 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
         checks.append({"code": "KIS_INTEGRATED_MARGIN_REFERENCE", "status": "UNKNOWN",
             "detail": ("통합증거금 현황 조회: " + str(seen.get("reportedNumericFieldCount", 0)) + "개 수치 항목을 개별 관측했습니다. 원화 기준 참고액이며 실제 현금이나 합산 한도가 아닙니다.") if isinstance(seen, dict) else "통합증거금 현황을 확인하지 못했습니다. 빈 응답을 0원으로 사용하지 않습니다."})
         checks.append({"code": "KIS_SHARED_KRW_RESERVATION", "status": "BLOCKED",
-            "detail": "국내·해외 공통 원화 예약은 미검증입니다. 기존 통화별 원금·추정 비용은 별도 진단하며, 전체 미체결·실제 비용·환전·확정 정산 확인 전에는 해외 자동 주문을 허용하지 않습니다."})
+            "detail": "국내·해외 공통 원화 예약 기능은 준비됐습니다. 현재 계좌 예산의 실제 현금 대조·전체 미체결·실제 비용·환전·확정 정산 확인 전에는 통합증거금 자동 주문을 허용하지 않습니다."})
     if "usdCashDiagnostics" in observation:
         from .kis_usd_preparation import usd_preparation_checks
         checks.extend(usd_preparation_checks(observation["usdCashDiagnostics"]))

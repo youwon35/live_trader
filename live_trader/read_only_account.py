@@ -302,6 +302,7 @@ class ReadOnlyBrokerReader:
         from .kis_shared_krw_local import read_existing_owned_books
         from .kis_integrated_financial_preparation import validate_integrated_financial_preparation_diagnostic
         from .env_loader import default_runtime_data_root
+        from .kis_shared_krw_paths import selected_capital_path
         report = {"schemaVersion": "kis-integrated-financial-preparation-v1",
             "status": "UNAVAILABLE", "integratedObservation": None,
             "sharedKrwReadiness": None, "localOwnedInventory": None,
@@ -314,7 +315,7 @@ class ReadOnlyBrokerReader:
                 return report
             capture = KisIntegratedMarginObservationReader(self).observe(max_pages=1)
             inventory = read_existing_owned_books(
-                default_runtime_data_root() / "logs" / "kis_owned_capital_v2.sqlite3",
+                selected_capital_path(default_runtime_data_root(),self.settings),
                 capture["accountBinding"])
             shared = inspect_shared_krw_readiness(integrated_observation=capture,
                 owned_books=inventory["ownedBooks"], open_orders=None,

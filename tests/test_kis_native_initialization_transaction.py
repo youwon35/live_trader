@@ -24,6 +24,7 @@ class NativeInitializationTransactionTests(unittest.TestCase):
         observation=deepcopy(context['nativeMarketObservation'])
         observation.update(asOf=datetime.now(timezone.utc).isoformat())
         runtime=object.__new__(NativeEquityRuntime);runtime.specs=(spec,)
+        runtime.reader=SimpleNamespace(settings={'KIS_OVERSEAS_FUNDING_MODE':'FOREIGN_CASH'})
         runtime._details=lambda:(deepcopy(scope),account,policies)
         runtime.store=KisOwnedCapitalStore(Path(folder)/'owned.sqlite3')
         runtime.observer=SimpleNamespace(quote=lambda *args:{'price':'100'},observe=lambda *a,**kw:deepcopy(observation))

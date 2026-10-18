@@ -120,7 +120,7 @@ class PublicDiagnosticTests(unittest.TestCase):
             self.reject(bad)
         bad = reported(); bad['sharedKrwReadiness']['reasons'].append(bad['sharedKrwReadiness']['reasons'][0]); self.reject(bad)
         bad = reported(); bad['sharedKrwReadiness']['reasons'] = []; self.reject(bad)
-        bad = reported(); bad['sharedKrwReadiness']['reasons'].remove('KIS_SHARED_KRW_GLOBAL_RESERVATION_PRODUCER_UNAVAILABLE'); self.reject(bad)
+        bad = reported(); bad['sharedKrwReadiness']['reasons'].remove('KIS_SHARED_KRW_VERIFIED_BASELINE_PRODUCER_UNAVAILABLE'); self.reject(bad)
 
     def test_shared_cannot_add_cash_authority_unsupported_currencies_or_remote_checks(self):
         for key, value in (('status', 'READY'), ('sharedKrwAvailableAmount', '12345.67'),

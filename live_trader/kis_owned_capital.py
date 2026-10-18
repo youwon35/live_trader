@@ -31,7 +31,7 @@ class KisOwnedCapitalStore:
                         db.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_no_{operation.lower()} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT,'kis-owned-append-only'); END")
                 yield db
 
-    def initialize(self,scope,observation,*,now=None,commit_guard=None):
+    def initialize(self,scope,observation,*,now=None,commit_guard=None,shared_reservation=None):
         if commit_guard is not None:commit_guard()
         now=now or datetime.now(timezone.utc)
         if (scope['quoteCurrency']!=observation.get('currency') or scope['accountProfileId']!=observation.get('profileId')
@@ -46,13 +46,28 @@ class KisOwnedCapitalStore:
             principal=cash*decimal_value(scope['capitalPercent'],'capital percent',positive=True)/100
         key=scope['accountFingerprint']+':'+scope['quoteCurrency']
         body={'scope':scope,'principal':text(principal),'occurredAt':now.isoformat()}
+        from .kis_shared_krw_reservations import ensure_schema, inspect_in_transaction, reserve_in_transaction
+        from .kis_shared_krw_bridge import validate_shared_allocation, assert_owned_books_covered
+        if shared_reservation is not None:
+            shared_reservation=validate_shared_allocation(scope,shared_reservation,principal=principal)
         with self._db() as db:
             db.execute('BEGIN IMMEDIATE')
             if commit_guard is not None:commit_guard()
-            prior=db.execute('SELECT payload FROM principals WHERE deployment_id=?',(scope['deploymentId'],)).fetchone()
+            pool=inspect_in_transaction(db,scope['accountFingerprint'])
+            if shared_reservation is None and pool['status']!='UNKNOWN_NO_POOL':
+                raise ValueError('KIS_SHARED_KRW_EXISTING_POOL_REQUIRES_EXACT_RESERVATION')
+            if shared_reservation is not None:
+                assert_owned_books_covered(db,scope['accountFingerprint'],pool)
+            prior=db.execute('SELECT payload,content_hash FROM principals WHERE deployment_id=?',(scope['deploymentId'],)).fetchone()
             if prior:
-                if json.loads(prior[0]).get('scope')!=scope:raise ValueError('KIS_OWNED_SCOPE_CHANGED')
-            else:
+                old=json.loads(prior[0])
+                if stable_sha256(old)!=prior[1] or old.get('scope')!=scope:raise ValueError('KIS_OWNED_SCOPE_CHANGED')
+                principal=decimal_value(old['principal'],'existing principal',positive=True)
+            if shared_reservation is not None:
+                validate_shared_allocation(scope,shared_reservation,principal=principal)
+                ensure_schema(db)
+                reserve_in_transaction(db,policy=shared_reservation['policy'],request=shared_reservation['request'])
+            if not prior:
                 reserved=Decimal(0)
                 for raw,digest in db.execute('SELECT payload,content_hash FROM principals WHERE account_currency=?',(key,)):
                     item=json.loads(raw)
@@ -60,10 +75,63 @@ class KisOwnedCapitalStore:
                     reserved+=decimal_value(item['principal'],'existing reserved principal')
                 if reserved+principal>cash:raise ValueError('KIS_OWNED_CAPITAL_ALREADY_RESERVED')
                 db.execute('INSERT INTO principals VALUES (?,?,?,?)',(scope['deploymentId'],key,json.dumps(body,sort_keys=True),stable_sha256(body)))
+            if shared_reservation is not None:
+                assert_owned_books_covered(db,scope['accountFingerprint'],
+                    inspect_in_transaction(db,scope['accountFingerprint']))
             # Cancellation/scope/freshness is checked inside this same local
             # transaction. Failure rolls back the append instead of rebasing it.
             if commit_guard is not None:commit_guard()
         return self.project(scope,{})
+
+    def reserve_shared_krw_budget(self,policy,request,*,commit_guard=None):
+        """Explicit local budget preparation only; never initializes a principal.
+
+        The same account pool covers domestic and foreign intended uses. The
+        native foreign funding/fee/settlement producer remains a separate gate.
+        """
+        from .kis_shared_krw_reservations import ensure_schema, validate_policy, validate_request, inspect_in_transaction, reserve_in_transaction
+        from .kis_shared_krw_bridge import assert_owned_books_covered
+        policy=validate_policy(policy);request=validate_request(request)
+        if any(policy[key]!=request[key] for key in
+                ('accountFingerprint','accountProfileId','credentialConfigurationHash','policyHash')):
+            raise ValueError('KIS_SHARED_KRW_CURRENT_POLICY_REQUEST_BINDING_MISMATCH')
+        if commit_guard is not None:commit_guard()
+        with self._db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if commit_guard is not None:commit_guard()
+            assert_owned_books_covered(db,policy['accountFingerprint'],
+                inspect_in_transaction(db,policy['accountFingerprint']))
+            ensure_schema(db)
+            result=reserve_in_transaction(db,policy=policy,request=request)
+            if commit_guard is not None:commit_guard()
+        return result
+
+    def shared_krw_budget(self,account_fingerprint):
+        """Read local pool state without creating a database or a reservation."""
+        from .kis_shared_krw_reservations import inspect_in_transaction
+        if not self.path.is_file():
+            raise ValueError('KIS_SHARED_KRW_LOCAL_POOL_NOT_INITIALIZED')
+        from .kis_shared_krw_local import _ordinary_rollback_file
+        _ordinary_rollback_file(self.path)
+        with closing(sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro',uri=True)) as db:
+            db.execute('PRAGMA query_only=ON');db.execute('BEGIN')
+            result=inspect_in_transaction(db,account_fingerprint)
+            _ordinary_rollback_file(self.path)
+            return result
+
+    def shared_krw_reservation(self,scope):
+        from .kis_shared_krw_bridge import reservation_for_scope, assert_owned_books_covered
+        from .kis_shared_krw_reservations import inspect_in_transaction
+        if not self.path.is_file():raise ValueError('KIS_SHARED_KRW_LOCAL_POOL_NOT_INITIALIZED')
+        from .kis_shared_krw_local import _ordinary_rollback_file
+        _ordinary_rollback_file(self.path)
+        with closing(sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro',uri=True)) as db:
+            db.execute('PRAGMA query_only=ON');db.execute('BEGIN')
+            pool=inspect_in_transaction(db,scope['accountFingerprint'])
+            assert_owned_books_covered(db,scope['accountFingerprint'],pool)
+            result=reservation_for_scope(scope,pool)
+            _ordinary_rollback_file(self.path)
+            return result
 
     def append_terminal_receipt(self,scope,receipt):
         if (receipt.get('deploymentId')!=scope['deploymentId'] or receipt.get('accountFingerprint')!=scope['accountFingerprint']
