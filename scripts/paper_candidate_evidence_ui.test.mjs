@@ -511,6 +511,40 @@ test("changing an input during fee profile digest discards the old asynchronous 
   }
 });
 
+test("fee preview expiring during profile digest is discarded before it becomes a current result", async () => {
+  const previous = globalThis.window;
+  const originalDigest = globalThis.crypto.subtle.digest;
+  const originalNow = Date.now;
+  let currentTime = originalNow();
+  const timers = [];
+  try {
+    Date.now = () => currentTime;
+    globalThis.window = preparationWindow(timers); allowPreparation = true;
+    const { view, source } = await kisProvisionalView();
+    responseForFetch = async () => response(preparationReply({ notional: "1000000" }, { source,
+      observation: { status: "NOT_REQUESTED", provisionalFeeEstimate: provisionalPreview() } }));
+    let release;
+    globalThis.crypto.subtle.digest = function (...args) {
+      const digestResult = originalDigest.apply(this, args);
+      return new Promise((resolve) => { release = async () => resolve(await digestResult); });
+    };
+    const pending = view.buttons().find((button) => button.props.children === "원본 확인 · 계좌 조회 없음").props.onClick();
+    for (let attempt = 0; attempt < 30 && !release; attempt += 1) await Promise.resolve();
+    assert.ok(release, "the initially valid result must be waiting on its fee profile digest");
+    const priorTimers = timers.length;
+    currentTime += 60000;
+    await release(); await pending;
+    const html = view.render();
+    assert.match(html, /준비 결과가 계산 중 만료됐습니다\. 다시 조회하세요/);
+    assert.doesNotMatch(html, /조회 시각|임시 수수료 추정 · 확인 필요 · 실제 적용 요율 미확인|수수료만 추정/);
+    assert.equal(timers.length, priorTimers, "an expired response must never get a current-result timer");
+  } finally {
+    Date.now = originalNow;
+    globalThis.crypto.subtle.digest = originalDigest;
+    allowPreparation = false; globalThis.window = previous;
+  }
+});
+
 test("fee preview rejects nested private data, invented proofs, mismatched amounts and authority", async () => {
   const previous = globalThis.window;
   try {

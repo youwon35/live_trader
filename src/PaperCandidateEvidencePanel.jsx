@@ -260,6 +260,9 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
         throw new Error("임시 수수료 추정의 범위·미확인 상태를 확인하지 못했습니다. 다시 계산하세요.");
       }
       if (preparationGeneration.current !== generation) return;
+      if (Date.parse(result.expiresAt) <= Date.now()) {
+        throw new Error("준비 결과가 계산 중 만료됐습니다. 다시 조회하세요.");
+      }
       setPreparationSource(result.source);
       setPreparationResult(result);
       setPreparationExpired(false);
