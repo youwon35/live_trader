@@ -214,7 +214,11 @@ def _draft(value):
 
 
 def prepare_read_only(request, *, roots=None, reader=None, clock=None):
-    if not isinstance(request, dict) or set(request) != {"source", "draft", "readAccount"} or type(request["readAccount"]) is not bool:
+    fields = {"source", "draft", "readAccount"}
+    if (not isinstance(request, dict) or set(request) not in (fields, fields | {"readReservedOrders"})
+            or type(request["readAccount"]) is not bool
+            or type(request.get("readReservedOrders", False)) is not bool
+            or (request.get("readReservedOrders", False) and not request["readAccount"])):
         raise ValueError("읽기 전용 준비 요청 형식이 올바르지 않습니다.")
     folders = preparation_roots(roots)
     before = source_snapshot(request["source"], folders)
@@ -222,6 +226,8 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
     matches = [item for item in before["instruments"] if item["instanceId"] == draft["instanceId"]]
     if draft["instanceId"] and len(matches) != 1:
         raise ValueError("원본에 포함된 종목을 직접 선택하세요.")
+    if request.get("readReservedOrders", False) and (len(matches) != 1 or matches[0]["broker"] not in {"kis-kr", "kis-us"}):
+        raise ValueError("예약·조건 필드 조회 전에 KIS 원본의 종목을 선택하세요.")
     provisional_preview = None
     provisional_settings_hash = None
     if len(matches) == 1 and matches[0]["broker"] in {"kis-kr", "kis-us"}:
@@ -295,6 +301,14 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
                 observation["accountInventoryDiagnostics"] = validate_inventory_preparation(inventory_diagnostic)
             except (ValueError, OSError, RuntimeError, TypeError, KeyError, ArithmeticError):
                 observation["accountInventoryDiagnostics"] = inventory_preparation()
+            if request.get("readReservedOrders", False):
+                from .kis_reserved_order_preparation import reserved_preparation, validate_reserved_preparation
+                observe_reserved = getattr(reader, "observe_kis_reserved_order_preparation", None)
+                try:
+                    diagnostic = observe_reserved() if callable(observe_reserved) else reserved_preparation()
+                    observation["reservedOrderDiagnostics"] = validate_reserved_preparation(diagnostic)
+                except (ValueError, OSError, RuntimeError, TypeError, KeyError, ArithmeticError):
+                    observation["reservedOrderDiagnostics"] = reserved_preparation()
         if settings_hash is not None and (stable_sha256(reader.settings) != settings_hash or (uses_runtime_settings and stable_sha256(runtime_settings()) != settings_hash)):
             raise ValueError("조회 중 저장 계좌 설정이 바뀌어 결과를 폐기했습니다.")
         if before["kind"] == "SEALED_SOURCE" or (selected.get("executionSizing") or {}).get("quantityContract") is not None:
@@ -361,6 +375,12 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
             "detail": ("국내·미국 잔고와 일반 미체결의 조회 범위를 기록했습니다. " if recorded else
                        "국내·미국 잔고와 일반 미체결의 조회 범위 기록을 확인하지 못했습니다. ") +
                       "예약·조건부 주문·다른 국가·요청 간 동시성은 별도 확인이 필요하며 계좌 전체 대조 통과를 뜻하지 않습니다."})
+    if "reservedOrderDiagnostics" in observation:
+        recorded = observation["reservedOrderDiagnostics"].get("status") == "OBSERVED_LIMITED_SCOPES"
+        checks.append({"code": "KIS_RESERVED_CONDITIONAL_ORDER_COVERAGE", "status": "UNKNOWN",
+            "detail": ("최근 30일 날짜 필터의 국내·미국 예약 조회와 국내 일반 주문의 조건 필드를 기록했습니다. " if recorded else
+                       "예약·조건 필드의 조회 기록을 확인하지 못했습니다. ") +
+                      "상태 필터의 전체 활성 주문 포함 여부·기간 밖 예약·미발동 HTS/MTS 조건·다른 국가는 미확인으로 남으며, 전체 계좌 무주문이나 실거래 허가를 뜻하지 않습니다."})
     if "integratedFinancialDiagnostics" in observation:
         diagnostic = observation["integratedFinancialDiagnostics"]
         seen = diagnostic.get("integratedObservation")

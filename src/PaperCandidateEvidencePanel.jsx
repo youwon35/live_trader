@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { getPaperCandidateEvidence, importPaperCandidate, runLocalMonitorTrial, previewReadOnlyPreparation, getReadOnlyPreparationSources, getPaperCandidateAccounts, reviewPaperCandidate } from "./api";
+import { validReservedOrderDiagnostics, RESERVED_SCOPE_DEFINITIONS, RESERVED_UNCOVERED_SCOPES } from "./kisReservedOrderDiagnostics";
 
 const SCOPE_LABELS = {
   evidenceId: "Evidence ID", evidenceHash: "봉인 Evidence hash",
@@ -315,15 +316,18 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
     }
   }
 
-  async function prepare(readAccount) {
+  async function prepare(readAccount, readReservedOrders = false) {
     const selected = preparationChoices.find((item) => item.key === preparationSelection);
     if (preparationPending.current || !selected) return;
+    if (readReservedOrders && (readAccount !== true || !preparationSource?.instruments?.some((item) =>
+      item.instanceId === orderDraft.instanceId && ["kis-kr", "kis-us"].includes(item.broker)))) return;
     clearPreparation();
     const generation = preparationGeneration.current;
     preparationPending.current = true;
     setPreparationBusy(true);
     try {
-      const result = await previewReadOnlyPreparation({ source: selected.request, draft: orderDraft, readAccount });
+      const result = await previewReadOnlyPreparation({ source: selected.request, draft: orderDraft, readAccount,
+        ...(readReservedOrders ? { readReservedOrders: true } : {}) });
       if (result?.ok !== true || result.schemaVersion !== "live-read-only-preparation-v1"
         || result.reportPurpose !== "READ_ONLY_PREPARATION" || result.readOnly !== true
         || ["authorityGranted", "authorizationGranted", "executable", "promotionEligible", "useAsPromotionEvidence", "tradingEnabled", "currentDeploymentChanged"].some((key) => result[key] !== false)
@@ -359,6 +363,10 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
       if (result.observation?.accountInventoryDiagnostics !== undefined
         && !validAccountInventoryDiagnostics(result.observation.accountInventoryDiagnostics, result, orderDraft, readAccount)) {
         throw new Error("계좌 조회 범위 기록의 형식과 권한 제한을 확인하지 못했습니다. 다시 조회하세요.");
+      }
+      if ((readReservedOrders || result.observation?.reservedOrderDiagnostics !== undefined)
+        && !validReservedOrderDiagnostics(result.observation?.reservedOrderDiagnostics, result, orderDraft, readAccount, readReservedOrders)) {
+        throw new Error("예약·조건 응답 기록의 형식과 권한 제한을 확인하지 못했습니다. 다시 조회하세요.");
       }
       if (preparationGeneration.current !== generation) return;
       if (Date.parse(result.expiresAt) <= Date.now()) {
@@ -614,7 +622,11 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
             <label>지정가 <input style={PREPARATION_INPUT_STYLE} aria-label="지정가" inputMode="decimal" placeholder="직접 입력" value={orderDraft.limitPrice} disabled={preparationBusy} onChange={(event) => { setOrderDraft({ ...orderDraft, limitPrice: event.target.value }); clearPreparation(); }} /></label>
           </div>
           <button type="button" className="secondary-button" disabled={preparationBusy || !orderDraft.instanceId} onClick={() => prepare(true)}>계좌·미체결 읽기 및 입력 금액 계산</button>
+          {preparationSource.instruments.some((item) => item.instanceId === orderDraft.instanceId && ["kis-kr", "kis-us"].includes(item.broker))
+            && <button type="button" className="secondary-button" disabled={preparationBusy || !orderDraft.instanceId} onClick={() => prepare(true, true)}>KIS 예약·조건 응답도 추가 조회</button>}
           <small>수량을 잔액에서 자동 선택하지 않습니다. 빈 입력은 미입력입니다.</small>
+          {preparationSource.instruments.some((item) => item.instanceId === orderDraft.instanceId && ["kis-kr", "kis-us"].includes(item.broker))
+            && <p>추가 버튼을 누를 때만 최근 30일 예약 필터 4개와 국내 응답 조건 필드를 별도로 읽습니다. 추가 최대 10회 GET · 자동 주문·예약 생성·전체 계좌 확인은 하지 않습니다.</p>}
         </>}
         {preparationResult && <div role="status">
           <p>조회 시각 {preparationResult.asOf} · 만료 {preparationResult.expiresAt}</p>
@@ -633,6 +645,30 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
                 <p><a href={FEE_DOMESTIC_URL} target="_blank" rel="noreferrer">국내 공식 기본 수수료표</a> · <a href={FEE_US_URL} target="_blank" rel="noreferrer">미국 공식 기본 수수료표</a> · 개인 약정 요율은 별도 확인 필요</p>
                 <ul>{FEE_FOLLOWUP_STEPS.map(([code, , , label]) => <li key={code}>{label}</li>)}</ul>
               </details>
+            </div>}
+            {preparationResult.observation?.reservedOrderDiagnostics && <div className="live-assistant-provisional-note" role="note" aria-label="예약·조건 응답 범위 기록">
+              <strong>예약·조건 응답 범위 기록 · 전체 활성 주문 대조 미완료</strong>
+              {preparationResult.observation.reservedOrderDiagnostics.reservations ? <>
+                <p>조회 기간 {preparationResult.observation.reservedOrderDiagnostics.reservations.requestWindow.startDate} ~ {preparationResult.observation.reservedOrderDiagnostics.reservations.requestWindow.endDate} · API 이름의 날짜 필터이며 기간 밖 예약은 포함하지 않습니다.</p>
+                <p>수집 {preparationResult.observation.reservedOrderDiagnostics.reservations.startedAt} ~ {preparationResult.observation.reservedOrderDiagnostics.reservations.completedAt} · 평가 {preparationResult.observation.reservedOrderDiagnostics.reservations.assessedAt}</p>
+                <p>{preparationResult.observation.reservedOrderDiagnostics.reservations.freshnessStatus === "STALE_OR_CLOCK_INVALID"
+                  ? "기록상 15초 범위 초과 또는 시각 불일치 · 재조회 필요"
+                  : "조회 당시 로컬 15초 범위 내 수집 기록 · 현재 상태는 재조회 필요"}</p>
+                <table><thead><tr><th>별도 조회 범위</th><th>응답 행</th><th>페이지</th><th>조회 종료 표식</th></tr></thead>
+                  <tbody>{preparationResult.observation.reservedOrderDiagnostics.reservations.scopes.map((scope, index) => <tr key={scope.scopeId}>
+                    <td>{RESERVED_SCOPE_DEFINITIONS[index].label}<br /><small>행 식별 미확인 {scope.missingIdentityCount} · 동일 행 중복 {scope.identicalDuplicateCount} · 상태 의미 미확인</small></td>
+                    <td>{scope.rowCount}</td><td>{scope.pageCount}</td><td>{({ COMPLETE: "해당 조회의 마지막 페이지", PARTIAL: "추가 페이지 있음 · 부분 기록", UNKNOWN: "종료 표식 미확인" })[scope.paginationStatus]}</td>
+                  </tr>)}</tbody>
+                </table>
+                <p>국내 조건 필드의 원문 값과 가격은 표시하지 않습니다. 보고된 필드의 존재만 기록하며 미발동 조건의 부재를 증명하지 않습니다.</p>
+                {preparationResult.observation.reservedOrderDiagnostics.reservations.scopes[4].conditionFieldStates.map((field, index) => <p key={field.field}>
+                  {index === 0 ? "조건 가격 필드" : "조건 효력 발생 여부 필드"} · 문자열 보고 {field.reportedTextCount}행 · 빈 값 {field.emptyCount}행 · 필드 없음 {field.absentCount}행 · 형식 미확인 {field.invalidTypeCount}행
+                </p>)}
+              </> : <p>예약·조건 응답 범위 기록을 확인하지 못했습니다. 조회되지 않은 예약은 없는 것으로 처리하지 않습니다. 직접 재조회 필요.</p>}
+              <p>국내 CNCL_YN=Y·PRCS_DVSN_CD=0 예제 필터가 모든 활성 예약을 포함하는지 미확인입니다. 미국 거래소별 결과는 중복 가능성이 있어 합산하거나 병합하지 않습니다.</p>
+              <p>0행·마지막 페이지·조건 필드 존재는 전체 계좌 무예약·무조건 주문, 최종 정산 또는 대조 통과를 뜻하지 않습니다.</p>
+              <ul>{RESERVED_UNCOVERED_SCOPES.map(([code, label]) => <li key={code}>{label}</li>)}</ul>
+              <p>전체 예약·조건부 주문 대조 미완료 · 실제 수수료·환전·정산 미확인 · 주문·실거래 권한 없음</p>
             </div>}
             {preparationResult.observation?.accountInventoryDiagnostics && <div className="live-assistant-provisional-note" role="note" aria-label="계좌 조회 범위 기록">
               <strong>계좌 조회 범위 기록 · 전체 계좌 대조 미완료</strong>

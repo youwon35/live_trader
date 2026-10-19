@@ -8,6 +8,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { transformSync } from "esbuild";
 import * as api from "../src/api.js";
+import * as reservedHelper from "../src/kisReservedOrderDiagnostics.js";
 
 // No Live App/server is imported or started. Render the actual JSX in memory,
 // retain hook state between renders, and exercise its handlers through real api.js.
@@ -84,7 +85,8 @@ function harness(props = {}) {
   const module = new Module(sourcePath);
   module.filename = sourcePath;
   module.paths = Module._nodeModulePaths(fileURLToPath(new URL("../src", import.meta.url)));
-  module.require = specifier => specifier === "react" ? hooks : specifier === "./api" ? api : require(specifier);
+  module.require = specifier => specifier === "react" ? hooks : specifier === "./api" ? api
+    : specifier === "./kisReservedOrderDiagnostics" ? reservedHelper : require(specifier);
   module._compile(transformed, sourcePath);
   let tree;
   const view = {
@@ -478,6 +480,147 @@ function inventoryDiagnostics({ ageMs = 5000, assessedOffsetMs = 2000, partial =
     inventory: { ...body, contentHash: createHash("sha256").update(fixtureCanonicalJson(body)).digest("hex") },
     fullAccountReady: false, financialReady: false, orderAuthorityGranted: false };
 }
+// Generated once from the actual strict backend collector with an injected fake
+// reader. No private values or live account calls enter this public fixture.
+function reservedDiagnostics() {
+  const reservations = JSON.parse(readFileSync(new URL("./fixtures/kis-reserved-safe-summary.json", import.meta.url), "utf8"));
+  return { schemaVersion: "kis-reserved-order-preparation/v1", status: "OBSERVED_LIMITED_SCOPES", reservations,
+    fullAccountReady: false, reservedOrdersReconciled: false, completeConditionalOrdersVerified: false,
+    financialReady: false, orderAuthorityGranted: false };
+}
+async function renderReservedReply(view, source, diagnostic, optIn = true) {
+  responseForFetch = async (_url, options) => {
+    const posted = JSON.parse(options.body);
+    assert.equal(posted.readAccount, true);
+    assert.equal(Object.hasOwn(posted, "readReservedOrders"), optIn);
+    if (optIn) assert.equal(posted.readReservedOrders, true);
+    return response(preparationReply({ notional: "1000000" }, { source,
+      observation: { status: "OBSERVED", ...(diagnostic === undefined ? {} : { reservedOrderDiagnostics: diagnostic }) } }));
+  };
+  await view.buttons().find((button) => button.props.children === (optIn
+    ? "KIS 예약·조건 응답도 추가 조회" : "계좌·미체결 읽기 및 입력 금액 계산")).props.onClick();
+  return view.render();
+}
+test("reserved records require the separate KIS opt-in and show five unmerged limited scopes", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    for (const market of ["KRX", "US"]) {
+      const { view, source } = await kisProvisionalView(market);
+      assert.match(view.render(), /추가 최대 10회 GET/);
+      const html = await renderReservedReply(view, source, reservedDiagnostics());
+      assert.match(html, /예약·조건 응답 범위 기록 · 전체 활성 주문 대조 미완료/);
+      for (const text of [/국내 예약 조회/, /NASD 범위/, /NYSE 범위/, /AMEX 범위/, /국내 정정·취소 가능 응답의 조건 필드/]) assert.match(html, text);
+      assert.match(html, /예제 필터가 모든 활성 예약을 포함하는지 미확인/);
+      assert.match(html, /합산하거나 병합하지 않습니다/);
+      assert.match(html, /미발동 HTS·MTS/); assert.match(html, /미국 이외 해외시장/);
+      assert.match(html, /0행·마지막 페이지·조건 필드 존재는 전체 계좌 무예약·무조건 주문/);
+      assert.match(html, /주문·실거래 권한 없음/);
+      assert.doesNotMatch(html, /전체 계좌 PASS|현재 유효|READY|PRIVATE/);
+      const count = calls.length; view.render(); view.render();
+      assert.equal(calls.length, count, "rendering must not perform further reads");
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+test("ordinary preparation requests keep the original three fields and non-KIS has no reserved action", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    const { view, source } = await kisProvisionalView();
+    responseForFetch = async (_url, options) => {
+      const posted = JSON.parse(options.body);
+      assert.deepEqual(Object.keys(posted).sort(), ["draft", "readAccount", "source"]);
+      return response(preparationReply({ notional: "1000000" }, { source }));
+    };
+    await view.buttons().find((b) => b.props.children === "계좌·미체결 읽기 및 입력 금액 계산").props.onClick(); view.render();
+    await view.buttons().find((b) => b.props.children === "원본 확인 · 계좌 조회 없음").props.onClick(); view.render();
+    const other = await preparationView();
+    assert.equal(other.buttons().some((b) => b.props.children === "KIS 예약·조건 응답도 추가 조회"), false);
+    assert.equal(reservedHelper.validReservedOrderDiagnostics(reservedDiagnostics(),
+      { source: { instruments: [{ instanceId: "instance-a", broker: "upbit" }] } }, { instanceId: "instance-a" }, true, true), false);
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+test("unrequested or missing reserved diagnostics are rejected instead of being silently adopted", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    for (const [diagnostic, optIn] of [[reservedDiagnostics(), false], [undefined, true]]) {
+      const { view, source } = await kisProvisionalView();
+      const html = await renderReservedReply(view, source, diagnostic, optIn);
+      assert.match(html, /예약·조건 응답 기록의 형식과 권한 제한을 확인하지 못했습니다/);
+      assert.doesNotMatch(html, /조회 시각|전체 활성 주문 대조 미완료/);
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+test("stale partial and unavailable reserved reads remain records without rejecting the outer preview", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    const stale = reservedDiagnostics();
+    stale.reservations.assessedAt = "2026-10-19T01:00:20+00:00";
+    stale.reservations.freshnessStatus = "STALE_OR_CLOCK_INVALID";
+    stale.reservations.reasons.splice(2, 0, "KIS_RESERVED_LOCAL_RETRIEVAL_STALE_OR_CLOCK_INVALID");
+    const partial = reservedDiagnostics(), first = partial.reservations.scopes[0];
+    Object.assign(first, { pageCount: 2, rowCount: 1, missingIdentityCount: 1, reportedStateFieldRows: 1, paginationStatus: "PARTIAL" });
+    partial.reservations.reasons.push("KIS_RESERVED_KR_RESERVED_CNCL_Y_PRCS_0_ROW_IDENTITIES_UNVERIFIED", "KIS_RESERVED_KR_RESERVED_CNCL_Y_PRCS_0_PAGINATION_PARTIAL");
+    const unavailable = { ...reservedDiagnostics(), status: "UNAVAILABLE", reservations: null };
+    for (const diagnostic of [stale, partial, unavailable]) {
+      const { view, source } = await kisProvisionalView();
+      const html = await renderReservedReply(view, source, diagnostic);
+      assert.match(html, /조회 시각/); assert.match(html, /예약·조건 응답 범위 기록/);
+      assert.match(html, /재조회 필요/); assert.match(html, /실제 수수료·환전·정산 미확인/);
+      if (diagnostic === partial) assert.match(html, /추가 페이지 있음 · 부분 기록/);
+      if (diagnostic === unavailable) assert.match(html, /조회되지 않은 예약은 없는 것으로 처리하지 않습니다/);
+      assert.doesNotMatch(html, /형식과 권한 제한을 확인하지 못했습니다/);
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+test("reserved public validator rejects private nested values, changed filters, dates, counts and all authority flags", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    const changes = [
+      (d) => { d.remoteMessage = "PRIVATE_RESERVED_SENTINEL"; },
+      (d) => { d.reservations.accountNumber = "PRIVATE_RESERVED_SENTINEL"; },
+      (d) => { d.reservations.scopes[0].orderId = "PRIVATE_RESERVED_SENTINEL"; },
+      (d) => { d.reservations.scopes[0].queryScope.CANO = "PRIVATE_RESERVED_SENTINEL"; },
+      (d) => { d.reservations.scopes[0].queryScope.CNCL_YN = "N"; },
+      (d) => { d.reservations.scopes[4].queryScope.INQR_STRT_DT = "20260920"; },
+      (d) => { d.reservations.scopes[4].conditionFieldStates[0].value = "PRIVATE_RESERVED_SENTINEL"; },
+      (d) => { d.reservations.scopes[4].conditionFieldStates[0].reportedTextCount = 1; },
+      (d) => { d.reservations.scopes[0].rowCount = true; },
+      (d) => { d.reservations.scopes[0].rowCount = 1; },
+      (d) => { d.reservations.scopes[0].pageCount = 3; },
+      (d) => { d.reservations.scopes[0].stateInterpretation = "ACTIVE"; },
+      (d) => { d.reservations.requestWindow.endDate = "20261020"; },
+      (d) => { d.reservations.requestWindow.startDate = "20260230"; },
+      (d) => { d.reservations.uncoveredScopes = []; },
+      (d) => { d.reservations.reasons.push("PRIVATE_RESERVED_SENTINEL"); },
+      (d) => { d.reservations.contentHash = "bad"; },
+      (d) => { d.reservations.collectionMonotonicDurationSeconds = Infinity; },
+      (d) => { d.reservations.assessedAt = "2026-10-19T01:00:00"; },
+      (d) => { d.reservations.freshnessExpiresAt = d.reservations.startedAt; },
+      (d) => { d.reservations.scopes.reverse(); },
+      ...reservedHelper.RESERVED_FALSE_FLAGS.map((k) => (d) => { d.reservations[k] = true; }),
+      ...["fullAccountReady", "reservedOrdersReconciled", "completeConditionalOrdersVerified", "financialReady", "orderAuthorityGranted"].map((k) => (d) => { d[k] = true; }),
+    ];
+    for (const change of changes) {
+      const { view, source } = await kisProvisionalView(); const diagnostic = reservedDiagnostics(); change(diagnostic);
+      const html = await renderReservedReply(view, source, diagnostic);
+      assert.match(html, /예약·조건 응답 기록의 형식과 권한 제한을 확인하지 못했습니다/);
+      assert.doesNotMatch(html, /조회 시각|PRIVATE_RESERVED_SENTINEL|전체 활성 주문 대조 미완료/);
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+test("reserved UTC microseconds retain the exact local fifteen-second boundary", () => {
+  for (const over of [false, true]) {
+    const d = reservedDiagnostics();
+    const boundary = new Date(Date.parse(d.reservations.freshnessExpiresAt)).toISOString();
+    d.reservations.assessedAt = over ? boundary.replace(".000Z", ".000001+00:00") : boundary;
+    if (over) { d.reservations.freshnessStatus = "STALE_OR_CLOCK_INVALID"; d.reservations.reasons.splice(2, 0, "KIS_RESERVED_LOCAL_RETRIEVAL_STALE_OR_CLOCK_INVALID"); }
+    assert.equal(reservedHelper.validReservedOrderDiagnostics(d, { source: { instruments: [{ instanceId: "a", broker: "kis-kr" }] } }, { instanceId: "a" }, true, true), true);
+  }
+});
 async function renderInventoryReply(view, source, diagnostic, readAccount = true) {
   responseForFetch = async (_url, options) => {
     assert.equal(JSON.parse(options.body).readAccount, readAccount);

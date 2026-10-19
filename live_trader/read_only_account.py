@@ -26,6 +26,8 @@ READ_PATHS = {
  "binance-futures": {"/fapi/v1/time", "/fapi/v3/account", "/fapi/v1/openOrders", "/fapi/v1/exchangeInfo"},
  "upbit": {"/v1/accounts", "/v1/orders/chance", "/v1/orders/open", "/v1/ticker", "/v1/order"},
  "kis": {"/uapi/domestic-stock/v1/trading/intgr-margin",
+         "/uapi/domestic-stock/v1/trading/order-resv-ccnl",
+         "/uapi/overseas-stock/v1/trading/order-resv-list",
          "/uapi/domestic-stock/v1/trading/inquire-balance",
          "/uapi/overseas-stock/v1/trading/inquire-balance",
          "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl",
@@ -44,6 +46,8 @@ READ_PATHS = {
          "/uapi/overseas-stock/v1/trading/inquire-present-balance"},
 }
 KIS_TR_IDS = {
+ "/uapi/domestic-stock/v1/trading/order-resv-ccnl": "CTSC0004R",
+ "/uapi/overseas-stock/v1/trading/order-resv-list": "TTTT3039R",
  "/uapi/domestic-stock/v1/trading/intgr-margin": "TTTC0869R",
  "/uapi/overseas-stock/v1/trading/foreign-margin": "TTTC2101R",
  "/uapi/overseas-stock/v1/trading/inquire-paymt-stdr-balance": "CTRP6010R",
@@ -119,7 +123,13 @@ class ReadOnlyTransport:
                 raw = response.read(4 * 1024 * 1024 + 1)
                 if len(raw) > 4 * 1024 * 1024:
                     raise ReadFailure("RESPONSE_LIMIT")
-                if provider == "kis" and path == "/uapi/domestic-stock/v1/trading/intgr-margin":
+                if provider == "kis" and path in {
+                    "/uapi/domestic-stock/v1/trading/order-resv-ccnl",
+                    "/uapi/overseas-stock/v1/trading/order-resv-list",
+                }:
+                    from .kis_reserved_order_observation import decode_reserved_order_response
+                    payload = decode_reserved_order_response(raw)
+                elif provider == "kis" and path == "/uapi/domestic-stock/v1/trading/intgr-margin":
                     from .kis_integrated_margin_observation import decode_integrated_margin_response
                     payload = decode_integrated_margin_response(raw)
                 elif provider == "kis" and path == "/uapi/overseas-stock/v1/trading/foreign-margin":
@@ -310,6 +320,16 @@ class ReadOnlyBrokerReader:
             return inventory_preparation(safe_inventory_summary(capture))
         except (ValueError, OSError, RuntimeError, TypeError, KeyError, ArithmeticError):
             return inventory_preparation()
+
+    def observe_kis_reserved_order_preparation(self):
+        """Explicit recent-date filtered facts; never all reserved/conditional orders."""
+        from .kis_reserved_order_observation import KisReservedOrderReader, safe_reserved_order_summary
+        from .kis_reserved_order_preparation import recent_reserved_window, reserved_preparation
+        try:
+            capture = KisReservedOrderReader(self).observe(**recent_reserved_window(), max_pages=2)
+            return reserved_preparation(safe_reserved_order_summary(capture))
+        except (ValueError, OSError, RuntimeError, TypeError, KeyError, ArithmeticError):
+            return reserved_preparation()
 
     def observe_kis_settlement_history_preparation(self, *, start_date, end_date, max_pages=2):
         """Explicit caller dates, existing GET-only reader; no automatic lookback."""
