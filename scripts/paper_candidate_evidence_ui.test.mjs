@@ -432,6 +432,192 @@ async function kisProvisionalView(market = "KRX", quantity = "1", price = "10000
   return { view, source };
 }
 
+const inventoryFalseFlags = { fullAccountReady: false, accountWideAbsenceAuthoritative: false,
+  completeAccountWorkingOrdersVerified: false, accountCashReconciled: false,
+  sharedCashBaselineEstablished: false, sharedCashReservationVerified: false,
+  actualFeeObserved: false, actualFxExecutionObserved: false, settlementFinalityVerified: false,
+  financialReady: false, productionReady: false, orderAuthorityGranted: false,
+  ledgerInitialized: false, authenticatedProducerAttested: false };
+function inventoryDiagnostics({ ageMs = 5000, assessedOffsetMs = 2000, partial = false } = {}) {
+  const startMs = Math.floor((Date.now() - ageMs) / 1000) * 1000;
+  const definitions = [
+    ["KR_BASE_POSITIONS", "/uapi/domestic-stock/v1/trading/inquire-balance", "TTTC8434R",
+      { AFHR_FLPR_YN: "N", OFL_YN: "", INQR_DVSN: "02", UNPR_DVSN: "01", FUND_STTL_ICLD_YN: "N", FNCG_AMT_AUTO_RDPT_YN: "N", PRCS_DVSN: "00" },
+      "KR_DEFAULT_BALANCE_SCOPE_NOT_ALL_VENUE_PROOF", "REPORTED"],
+    ["KR_REVOCABLE_ORDERS", "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl", "TTTC0084R",
+      { INQR_DVSN_1: "0", INQR_DVSN_2: "0" }, "KR_REVISION_CANCEL_ELIGIBLE_ORDERS_ONLY", "NOT_APPLICABLE"],
+    ["US_POSITIONS", "/uapi/overseas-stock/v1/trading/inquire-balance", "TTTS3012R",
+      { OVRS_EXCG_CD: "NASD", TR_CRCY_CD: "USD" }, "REAL_NASD_QUERY_US_MARKETS_USD_POSITIONS", "EMPTY_UNREPORTED"],
+    ["US_REGULAR_ORDERS", "/uapi/overseas-stock/v1/trading/inquire-nccs", "TTTS3018R",
+      { OVRS_EXCG_CD: "NASD", SORT_SQN: "DS" }, "NASD_QUERY_US_MARKETS_REGULAR_UNFILLED_ORDERS", "NOT_APPLICABLE"],
+  ];
+  const scopes = definitions.map(([scopeId, path, trId, queryScope, scopeMeaning, auxiliaryOutputState], index) => ({
+    scopeId, path, trId, queryScope, scopeMeaning, auxiliaryOutputState,
+    pageCount: 1, rowCount: partial && index === 3 ? 2 : 0,
+    distinctIdentityCount: partial && index === 3 ? 1 : 0,
+    identicalDuplicateCount: 0, missingIdentityCount: partial && index === 3 ? 1 : 0,
+    paginationStatus: partial && index === 3 ? "PARTIAL" : "COMPLETE",
+    startedAt: new Date(startMs + index * 500).toISOString(), completedAt: new Date(startMs + index * 500 + 250).toISOString(),
+  }));
+  const fresh = 1750 <= assessedOffsetMs && assessedOffsetMs <= 15000;
+  const body = { schemaVersion: "kis-account-inventory-summary/v1", status: "REPORTED_SCOPES_ONLY_NOT_ACCOUNT_RECONCILIATION",
+    provider: "kis", scopes, startedAt: scopes[0].startedAt, completedAt: scopes[3].completedAt,
+    assessedAt: new Date(startMs + assessedOffsetMs).toISOString(), freshnessBoundarySeconds: 15,
+    collectionMonotonicDurationSeconds: 1.75, freshnessExpiresAt: new Date(startMs + 15000).toISOString(),
+    freshnessStatus: fresh ? "WITHIN_LOCAL_15_SECOND_BOUNDARY" : "STALE_OR_CLOCK_INVALID",
+    uncoveredScopes: ["KR_RESERVED_ORDERS", "KR_NON_REVOCABLE_OR_CONDITIONAL_ORDERS", "KR_OTHER_AFHR_OR_VENUE_BALANCE_SCOPES",
+      "US_RESERVED_AND_CONDITIONAL_ORDERS", "OVERSEAS_NON_US_MARKETS", "CROSS_REQUEST_ATOMIC_SNAPSHOT", "ACTUAL_CASH_FEES_FX_AND_SETTLEMENT"],
+    reasons: ["KIS_INVENTORY_SCOPES_DO_NOT_PROVE_FULL_ACCOUNT", "KIS_INVENTORY_ACCOUNT_BASELINE_AND_ACTUAL_COSTS_UNVERIFIED",
+      ...(!fresh ? ["KIS_INVENTORY_LOCAL_RETRIEVAL_STALE_OR_CLOCK_INVALID"] : []),
+      ...(partial ? ["KIS_INVENTORY_US_REGULAR_ORDERS_PAGINATION_PARTIAL", "KIS_INVENTORY_US_REGULAR_ORDERS_ROW_IDENTITIES_UNVERIFIED"] : [])],
+    cashAmountsDerived: false, currencyConversionPerformed: false,
+    hashMeaning: "CANONICAL_PARSED_JSON_NOT_HTTP_WIRE_OR_AUTHENTICATION",
+    retrievalTimeMeaning: "LOCAL_GET_TIMES_NOT_ATOMIC_ACCOUNT_OR_SETTLEMENT_TIME",
+    sourceCaptureHash: "a".repeat(64), ...inventoryFalseFlags };
+  return { schemaVersion: "kis-account-inventory-preparation/v1", status: "OBSERVED_LIMITED_SCOPES",
+    inventory: { ...body, contentHash: createHash("sha256").update(fixtureCanonicalJson(body)).digest("hex") },
+    fullAccountReady: false, financialReady: false, orderAuthorityGranted: false };
+}
+async function renderInventoryReply(view, source, diagnostic, readAccount = true) {
+  responseForFetch = async (_url, options) => {
+    assert.equal(JSON.parse(options.body).readAccount, readAccount);
+    return response(preparationReply({ notional: "1000000" }, { source,
+      observation: { status: readAccount ? "OBSERVED" : "NOT_REQUESTED", accountInventoryDiagnostics: diagnostic } }));
+  };
+  await view.buttons().find((button) => button.props.children === (readAccount
+    ? "계좌·미체결 읽기 및 입력 금액 계산" : "원본 확인 · 계좌 조회 없음")).props.onClick();
+  return view.render();
+}
+
+test("explicit KR and US account reads display four limited scope records without whole-account PASS", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    for (const market of ["KRX", "US"]) {
+      const { view, source } = await kisProvisionalView(market);
+      const html = await renderInventoryReply(view, source, inventoryDiagnostics());
+      assert.match(html, /계좌 조회 범위 기록 · 전체 계좌 대조 미완료/);
+      assert.match(html, /국내 기본 잔고 조회 범위/);
+      assert.match(html, /국내 정정·취소 가능 주문 범위/);
+      assert.match(html, /미국 USD 잔고 · NASD 조회 범위/);
+      assert.match(html, /미국 일반 미체결 · NASD 조회 범위/);
+      assert.match(html, /0행이나 마지막 페이지가 계좌 전체 무잔고·무주문/);
+      assert.match(html, /국내 예약 주문/); assert.match(html, /미국 예약·조건부 주문/);
+      assert.match(html, /미국 이외 해외시장/); assert.match(html, /실제 현금·수수료·자동환전·확정 정산/);
+      assert.match(html, /전체 계좌 준비 완료 아님/);
+      assert.doesNotMatch(html, /전체 계좌 PASS|잔고 없음|미체결 없음|현재 유효|READY/);
+      const callsBeforeRerender = calls.length;
+      view.render(); view.render();
+      assert.equal(calls.length, callsBeforeRerender, "scope display must never trigger an extra account request");
+      assert.ok(calls.filter((call) => call.method === "POST").every((call) => call.url === "/api/preparation/preview"));
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+
+test("stale inventory and old assessment freshness remain records requiring a requery without discarding preparation", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    for (const options of [{ ageMs: 25000, assessedOffsetMs: 22000 }, { ageMs: 25000, assessedOffsetMs: 2000 }]) {
+      const { view, source } = await kisProvisionalView();
+      const html = await renderInventoryReply(view, source, inventoryDiagnostics(options));
+      assert.match(html, /조회 시각/);
+      assert.match(html, /계좌 조회 범위 기록/);
+      assert.match(html, options.assessedOffsetMs > 15000 ? /기록상 15초 범위 초과 또는 시각 불일치 · 재조회 필요/ : /조회 당시 로컬 15초 범위 내 수집 기록 · 현재 상태는 재조회 필요/);
+      assert.doesNotMatch(html, /형식과 권한 제한을 확인하지 못했습니다|현재 유효|전체 계좌 PASS/);
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+
+test("inventory freshness derivations preserve the fifteen-second microsecond boundary", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    for (const overBoundary of [false, true]) {
+      const { view, source } = await kisProvisionalView();
+      const diagnostic = inventoryDiagnostics({ assessedOffsetMs: 15000 });
+      if (overBoundary) {
+        diagnostic.inventory.assessedAt = diagnostic.inventory.assessedAt.replace(".000Z", ".000001+00:00");
+        diagnostic.inventory.freshnessStatus = "STALE_OR_CLOCK_INVALID";
+        diagnostic.inventory.reasons.push("KIS_INVENTORY_LOCAL_RETRIEVAL_STALE_OR_CLOCK_INVALID");
+      }
+      const html = await renderInventoryReply(view, source, diagnostic);
+      assert.match(html, /계좌 조회 범위 기록/);
+      assert.match(html, overBoundary ? /기록상 15초 범위 초과/ : /조회 당시 로컬 15초 범위 내/);
+      assert.doesNotMatch(html, /형식과 권한 제한을 확인하지 못했습니다/);
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+
+test("partial and unavailable account inventory retain uncovered scope warnings", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    for (const diagnostic of [inventoryDiagnostics({ partial: true }),
+      { schemaVersion: "kis-account-inventory-preparation/v1", status: "UNAVAILABLE", inventory: null,
+        fullAccountReady: false, financialReady: false, orderAuthorityGranted: false }]) {
+      const { view, source } = await kisProvisionalView();
+      const html = await renderInventoryReply(view, source, diagnostic);
+      assert.match(html, /조회 시각/);
+      assert.match(html, /미국 예약·조건부 주문/);
+      assert.match(html, /전체 계좌 준비 완료 아님/);
+      assert.match(html, diagnostic.inventory ? /추가 페이지 있음 · 부분 기록/ : /조회 범위 기록을 확인하지 못했습니다/);
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+
+test("inventory cannot appear on no-account preparation and never triggers automatic history retrieval", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    const { view, source } = await kisProvisionalView();
+    assert.doesNotMatch(view.render(), /계좌 조회 범위 기록/);
+    const html = await renderInventoryReply(view, source, inventoryDiagnostics(), false);
+    assert.match(html, /계좌 조회 범위 기록의 형식과 권한 제한을 확인하지 못했습니다/);
+    assert.doesNotMatch(html, /조회 시각/);
+    assert.equal(calls.some((call) => /history|period-trans|settlement/.test(call.url)), false);
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+
+test("inventory rejects nested private data, unknown scopes and any false-authority flag forgery", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    const changes = [
+      (d) => { d.remoteMessage = "PRIVATE_INVENTORY_SENTINEL"; },
+      (d) => { d.inventory.accountNumber = "PRIVATE_INVENTORY_SENTINEL"; },
+      (d) => { d.inventory.scopes[0].balance = "PRIVATE_INVENTORY_SENTINEL"; },
+      (d) => { d.inventory.scopes[0].queryScope.CANO = "PRIVATE_INVENTORY_SENTINEL"; },
+      (d) => { d.inventory.reasons.push("PRIVATE_INVENTORY_SENTINEL"); },
+      (d) => { d.inventory.uncoveredScopes = []; },
+      (d) => { d.inventory.cashAmountsDerived = true; },
+      (d) => { d.inventory.currencyConversionPerformed = true; },
+      (d) => { d.inventory.orderAuthorityGranted = 0; },
+      (d) => { d.inventory.scopes[0].rowCount = true; },
+      (d) => { d.inventory.scopes[0].rowCount = 2; },
+      (d) => { d.inventory.scopes[0].pageCount = 0; },
+      (d) => { d.inventory.scopes[0].paginationStatus = "PASS"; },
+      (d) => { d.inventory.scopes[0].scopeId = "ALL_ACCOUNT"; },
+      (d) => { d.inventory.scopes.reverse(); },
+      (d) => { d.inventory.freshnessBoundarySeconds = 60; },
+      (d) => { d.inventory.collectionMonotonicDurationSeconds = "1.75"; },
+      (d) => { d.inventory.collectionMonotonicDurationSeconds = Infinity; },
+      (d) => { d.inventory.freshnessExpiresAt = d.inventory.startedAt; },
+      (d) => { d.inventory.assessedAt = "2026-10-19T04:00:00"; },
+      (d) => { d.inventory.contentHash = "bad"; },
+      ...["fullAccountReady", "financialReady", "orderAuthorityGranted"].map((key) => (d) => { d[key] = true; }),
+      ...Object.keys(inventoryFalseFlags).map((key) => (d) => { d.inventory[key] = true; }),
+    ];
+    for (const change of changes) {
+      const { view, source } = await kisProvisionalView();
+      const diagnostic = inventoryDiagnostics(); change(diagnostic);
+      const html = await renderInventoryReply(view, source, diagnostic);
+      assert.match(html, /계좌 조회 범위 기록의 형식과 권한 제한을 확인하지 못했습니다/);
+      assert.doesNotMatch(html, /조회 시각|PRIVATE_INVENTORY_SENTINEL|전체 계좌 준비 완료 아님/);
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+
 test("KR and US local fee alternatives render on explicit no-account preview and stay unconfirmed", async () => {
   const previous = globalThis.window;
   try {

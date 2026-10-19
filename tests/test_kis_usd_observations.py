@@ -287,9 +287,15 @@ class TransportTests(unittest.TestCase):
         for raw in (b'{"rt_cd":"0","rt_cd":"1"}',b'{"a":NaN}',b'{"secret":"remote-private-value"'):
             self.opener.raw=raw;p,t=usd.PATHS[CASH]
             with self.assertRaisesRegex(ro.ReadFailure,'^READ_UNAVAILABLE$'):self.transport.request('kis','GET',p,headers={'tr_id':t})
-    def test_old_route_json_semantics_unchanged(self):
-        p='/uapi/overseas-stock/v1/trading/inquire-balance'
+    def test_inventory_routes_reject_duplicate_keys_without_changing_quote_routes(self):
         self.opener.raw=b'{"x":1,"x":2}'
+        for p in ('/uapi/overseas-stock/v1/trading/inquire-balance',
+                  '/uapi/domestic-stock/v1/trading/inquire-balance',
+                  '/uapi/overseas-stock/v1/trading/inquire-nccs',
+                  '/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl'):
+            with self.assertRaisesRegex(ro.ReadFailure,'^READ_UNAVAILABLE$'):
+                self.transport.request('kis','GET',p,headers={'tr_id':ro.KIS_TR_IDS[p]})
+        p='/uapi/overseas-price/v1/quotations/price'
         value,_=self.transport.request('kis','GET',p,headers={'tr_id':ro.KIS_TR_IDS[p]})
         self.assertEqual(value,{'x':2})
     def test_oauth_only_exact_token_schema_not_other_posts(self):

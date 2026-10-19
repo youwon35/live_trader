@@ -132,6 +132,14 @@ class ReadOnlyTransport:
                 }:
                     from .kis_usd_observations import decode_usd_response
                     payload = decode_usd_response(raw)
+                elif provider == "kis" and path in {
+                    "/uapi/domestic-stock/v1/trading/inquire-balance",
+                    "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl",
+                    "/uapi/overseas-stock/v1/trading/inquire-balance",
+                    "/uapi/overseas-stock/v1/trading/inquire-nccs",
+                }:
+                    from .kis_account_inventory_observation import decode_inventory_response
+                    payload = decode_inventory_response(raw)
                 else:
                     payload = json.loads(raw)
                 event["status"] = "AVAILABLE"
@@ -292,6 +300,26 @@ class ReadOnlyBrokerReader:
             result["status"] = "INVALID_ACCOUNT_RESPONSE"
         result["asOf"] = datetime.now(timezone.utc).isoformat()
         return result
+
+    def observe_kis_account_inventory_preparation(self):
+        """Explicit bounded KR/US inventory records, never whole-account authority."""
+        from .kis_account_inventory_observation import KisAccountInventoryReader, safe_inventory_summary
+        from .kis_account_verification import inventory_preparation
+        try:
+            capture = KisAccountInventoryReader(self).observe(max_pages=2)
+            return inventory_preparation(safe_inventory_summary(capture))
+        except (ValueError, OSError, RuntimeError, TypeError, KeyError, ArithmeticError):
+            return inventory_preparation()
+
+    def observe_kis_settlement_history_preparation(self, *, start_date, end_date, max_pages=2):
+        """Explicit caller dates, existing GET-only reader; no automatic lookback."""
+        from .kis_usd_observations import KisUsdObservationReader
+        from .kis_settlement_history_preparation import summarize_settlement_history, validate_history_request
+        validate_history_request(start_date=start_date, end_date=end_date, max_pages=max_pages)
+        capture = KisUsdObservationReader(self).observe('REPORTED_PERIOD_TRANSACTIONS',
+            start_date=start_date, end_date=end_date, max_pages=max_pages)
+        return summarize_settlement_history(capture, expected_start_date=start_date,
+            expected_end_date=end_date, max_pages=max_pages)
 
     def observe_kis_integrated_financial_preparation(self):
         """Explicit preparation: one account GET and existing local books, no writes."""

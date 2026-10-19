@@ -31,6 +31,10 @@ class UsdPreparationTests(unittest.TestCase):
         self.reader=account.ReadOnlyBrokerReader(settings(),transport=self.transport)
         self.reader._kis_token=Mock(return_value='private-bearer');self.reader._pace_kis=Mock()
         self.reader._kis=Mock(return_value={'account':'AVAILABLE','openOrders':'NONE_OBSERVED','orderability':'UNKNOWN','_quote':Decimal('55'),'_base':Decimal('2')})
+        # The separate inventory integration suite covers its four fixed GETs.
+        # Keep this suite's USD read-count and before/after scope assertions local.
+        envelopes=importlib.import_module(base.PACKAGE+'.kis_account_verification')
+        self.reader.observe_kis_account_inventory_preparation=Mock(return_value=envelopes.inventory_preparation())
         # This suite isolates the USD diagnostic's one GET. The separate
         # integrated-preparation suite exercises its additional account GET.
         self.reader.observe_kis_integrated_financial_preparation=Mock(return_value={

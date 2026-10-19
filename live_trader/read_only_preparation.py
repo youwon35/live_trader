@@ -288,6 +288,13 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
                     observation["integratedFinancialDiagnostics"] = validate_integrated_financial_preparation_diagnostic(diagnostic)
                 except (ValueError, OSError, RuntimeError, TypeError, KeyError, ArithmeticError):
                     observation["integratedFinancialDiagnostics"] = unavailable
+            from .kis_account_verification import inventory_preparation, validate_inventory_preparation
+            observe_inventory = getattr(reader, "observe_kis_account_inventory_preparation", None)
+            try:
+                inventory_diagnostic = observe_inventory() if callable(observe_inventory) else inventory_preparation()
+                observation["accountInventoryDiagnostics"] = validate_inventory_preparation(inventory_diagnostic)
+            except (ValueError, OSError, RuntimeError, TypeError, KeyError, ArithmeticError):
+                observation["accountInventoryDiagnostics"] = inventory_preparation()
         if settings_hash is not None and (stable_sha256(reader.settings) != settings_hash or (uses_runtime_settings and stable_sha256(runtime_settings()) != settings_hash)):
             raise ValueError("조회 중 저장 계좌 설정이 바뀌어 결과를 폐기했습니다.")
         if before["kind"] == "SEALED_SOURCE" or (selected.get("executionSizing") or {}).get("quantityContract") is not None:
@@ -348,6 +355,12 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
     if "provisionalFeeEstimate" in observation:
         checks.append({"code": "KIS_PROVISIONAL_FEES", "status": "UNKNOWN",
             "detail": "수수료는 임시값으로 계산했습니다. 계좌 적용 요율·최소수수료·세금·자동환전·확정 정산은 확인이 필요합니다. 설정 저장은 실제 비용 검증이나 주문 허가가 아닙니다."})
+    if "accountInventoryDiagnostics" in observation:
+        recorded = observation["accountInventoryDiagnostics"].get("status") == "OBSERVED_LIMITED_SCOPES"
+        checks.append({"code": "KIS_ACCOUNT_INVENTORY_COVERAGE", "status": "UNKNOWN",
+            "detail": ("국내·미국 잔고와 일반 미체결의 조회 범위를 기록했습니다. " if recorded else
+                       "국내·미국 잔고와 일반 미체결의 조회 범위 기록을 확인하지 못했습니다. ") +
+                      "예약·조건부 주문·다른 국가·요청 간 동시성은 별도 확인이 필요하며 계좌 전체 대조 통과를 뜻하지 않습니다."})
     if "integratedFinancialDiagnostics" in observation:
         diagnostic = observation["integratedFinancialDiagnostics"]
         seen = diagnostic.get("integratedObservation")

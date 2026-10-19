@@ -45,9 +45,106 @@ const FEE_FOLLOWUP_STEPS = [
   ["MANUAL_LIVE_START", "BLOCKED", "USER", "직접 실거래 시작 · 현재 차단"],
 ];
 
+const INVENTORY_FALSE_FLAGS = ["fullAccountReady", "accountWideAbsenceAuthoritative", "completeAccountWorkingOrdersVerified",
+  "accountCashReconciled", "sharedCashBaselineEstablished", "sharedCashReservationVerified", "actualFeeObserved",
+  "actualFxExecutionObserved", "settlementFinalityVerified", "financialReady", "productionReady",
+  "orderAuthorityGranted", "ledgerInitialized", "authenticatedProducerAttested"];
+const INVENTORY_SCOPE_DEFINITIONS = [
+  { id: "KR_BASE_POSITIONS", path: "/uapi/domestic-stock/v1/trading/inquire-balance", trId: "TTTC8434R",
+    query: { AFHR_FLPR_YN: "N", OFL_YN: "", INQR_DVSN: "02", UNPR_DVSN: "01", FUND_STTL_ICLD_YN: "N", FNCG_AMT_AUTO_RDPT_YN: "N", PRCS_DVSN: "00" },
+    meaning: "KR_DEFAULT_BALANCE_SCOPE_NOT_ALL_VENUE_PROOF", auxiliary: true, label: "국내 기본 잔고 조회 범위" },
+  { id: "KR_REVOCABLE_ORDERS", path: "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl", trId: "TTTC0084R",
+    query: { INQR_DVSN_1: "0", INQR_DVSN_2: "0" }, meaning: "KR_REVISION_CANCEL_ELIGIBLE_ORDERS_ONLY",
+    auxiliary: false, label: "국내 정정·취소 가능 주문 범위" },
+  { id: "US_POSITIONS", path: "/uapi/overseas-stock/v1/trading/inquire-balance", trId: "TTTS3012R",
+    query: { OVRS_EXCG_CD: "NASD", TR_CRCY_CD: "USD" }, meaning: "REAL_NASD_QUERY_US_MARKETS_USD_POSITIONS",
+    auxiliary: true, label: "미국 USD 잔고 · NASD 조회 범위" },
+  { id: "US_REGULAR_ORDERS", path: "/uapi/overseas-stock/v1/trading/inquire-nccs", trId: "TTTS3018R",
+    query: { OVRS_EXCG_CD: "NASD", SORT_SQN: "DS" }, meaning: "NASD_QUERY_US_MARKETS_REGULAR_UNFILLED_ORDERS",
+    auxiliary: false, label: "미국 일반 미체결 · NASD 조회 범위" },
+];
+const INVENTORY_UNCOVERED_SCOPES = [
+  ["KR_RESERVED_ORDERS", "국내 예약 주문"],
+  ["KR_NON_REVOCABLE_OR_CONDITIONAL_ORDERS", "국내 정정·취소 불가 주문과 조건부 주문"],
+  ["KR_OTHER_AFHR_OR_VENUE_BALANCE_SCOPES", "국내 다른 시간외·거래소 잔고 범위"],
+  ["US_RESERVED_AND_CONDITIONAL_ORDERS", "미국 예약·조건부 주문"],
+  ["OVERSEAS_NON_US_MARKETS", "미국 이외 해외시장"],
+  ["CROSS_REQUEST_ATOMIC_SNAPSHOT", "여러 조회 사이에 변하지 않은 단일 계좌 상태"],
+  ["ACTUAL_CASH_FEES_FX_AND_SETTLEMENT", "실제 현금·수수료·자동환전·확정 정산"],
+];
+
 function exactFeeKeys(value, keys) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function inventoryUtcMicros(value) {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(?:Z|\+00:00)$/.exec(value);
+  if (!match || match[1].startsWith("0000-")) return null;
+  const base = Date.parse(`${match[1]}Z`);
+  if (!Number.isFinite(base) || new Date(base).toISOString().slice(0, 19) !== match[1]) return null;
+  return BigInt(base) * 1000n + BigInt((match[2] || "").padEnd(6, "0"));
+}
+
+function validAccountInventoryDiagnostics(diagnostic, result, inputDraft, readAccount) {
+  const envelopeKeys = ["schemaVersion", "status", "inventory", "fullAccountReady", "financialReady", "orderAuthorityGranted"];
+  if (!readAccount || !exactFeeKeys(diagnostic, envelopeKeys)
+    || diagnostic.schemaVersion !== "kis-account-inventory-preparation/v1"
+    || ["fullAccountReady", "financialReady", "orderAuthorityGranted"].some((key) => diagnostic[key] !== false)) return false;
+  const selected = result.source.instruments.filter((item) => item.instanceId === inputDraft.instanceId);
+  if (selected.length !== 1 || !["kis-kr", "kis-us"].includes(selected[0].broker)) return false;
+  if (diagnostic.status === "UNAVAILABLE") return diagnostic.inventory === null;
+  if (diagnostic.status !== "OBSERVED_LIMITED_SCOPES") return false;
+  const inventory = diagnostic.inventory;
+  const keys = ["schemaVersion", "status", "provider", "scopes", "startedAt", "completedAt", "assessedAt",
+    "freshnessBoundarySeconds", "collectionMonotonicDurationSeconds", "freshnessExpiresAt", "freshnessStatus",
+    "uncoveredScopes", "reasons", "cashAmountsDerived", "currencyConversionPerformed", "hashMeaning",
+    "retrievalTimeMeaning", "sourceCaptureHash", "contentHash", ...INVENTORY_FALSE_FLAGS];
+  if (!exactFeeKeys(inventory, keys) || inventory.schemaVersion !== "kis-account-inventory-summary/v1"
+    || inventory.status !== "REPORTED_SCOPES_ONLY_NOT_ACCOUNT_RECONCILIATION" || inventory.provider !== "kis"
+    || INVENTORY_FALSE_FLAGS.some((key) => inventory[key] !== false) || inventory.cashAmountsDerived !== false
+    || inventory.currencyConversionPerformed !== false || inventory.freshnessBoundarySeconds !== 15
+    || inventory.hashMeaning !== "CANONICAL_PARSED_JSON_NOT_HTTP_WIRE_OR_AUTHENTICATION"
+    || inventory.retrievalTimeMeaning !== "LOCAL_GET_TIMES_NOT_ATOMIC_ACCOUNT_OR_SETTLEMENT_TIME"
+    || ["sourceCaptureHash", "contentHash"].some((key) => typeof inventory[key] !== "string" || !/^[a-f0-9]{64}$/.test(inventory[key]))
+    || typeof inventory.collectionMonotonicDurationSeconds !== "number" || !Number.isFinite(inventory.collectionMonotonicDurationSeconds)
+    || inventory.collectionMonotonicDurationSeconds < 0 || !Array.isArray(inventory.scopes) || inventory.scopes.length !== 4
+    || canonicalFeeJson(inventory.uncoveredScopes) !== canonicalFeeJson(INVENTORY_UNCOVERED_SCOPES.map(([key]) => key))) return false;
+  const start = inventoryUtcMicros(inventory.startedAt), end = inventoryUtcMicros(inventory.completedAt);
+  const assessed = inventoryUtcMicros(inventory.assessedAt), expires = inventoryUtcMicros(inventory.freshnessExpiresAt);
+  if ([start, end, assessed, expires].some((value) => value === null) || end < start || expires !== start + 15000000n) return false;
+  const freshAtAssessment = start <= assessed && assessed - start <= 15000000n && end <= assessed
+    && inventory.collectionMonotonicDurationSeconds <= 15;
+  if (inventory.freshnessStatus !== (freshAtAssessment ? "WITHIN_LOCAL_15_SECOND_BOUNDARY" : "STALE_OR_CLOCK_INVALID")) return false;
+  const reasons = ["KIS_INVENTORY_SCOPES_DO_NOT_PROVE_FULL_ACCOUNT", "KIS_INVENTORY_ACCOUNT_BASELINE_AND_ACTUAL_COSTS_UNVERIFIED"];
+  if (!freshAtAssessment) reasons.push("KIS_INVENTORY_LOCAL_RETRIEVAL_STALE_OR_CLOCK_INVALID");
+  const countKeys = ["pageCount", "rowCount", "distinctIdentityCount", "identicalDuplicateCount", "missingIdentityCount"];
+  const scopeKeys = ["scopeId", "path", "trId", "queryScope", "scopeMeaning", ...countKeys,
+    "auxiliaryOutputState", "paginationStatus", "startedAt", "completedAt"];
+  let previousEnd = null;
+  for (const [index, row] of inventory.scopes.entries()) {
+    const spec = INVENTORY_SCOPE_DEFINITIONS[index];
+    if (!exactFeeKeys(row, scopeKeys) || row.scopeId !== spec.id || row.path !== spec.path || row.trId !== spec.trId
+      || row.scopeMeaning !== spec.meaning || canonicalFeeJson(row.queryScope) !== canonicalFeeJson(spec.query)
+      || countKeys.some((key) => !Number.isInteger(row[key]) || row[key] < 0 || row[key] > 10000)
+      || row.pageCount < 1 || row.pageCount > 10
+      || row.rowCount !== row.distinctIdentityCount + row.identicalDuplicateCount + row.missingIdentityCount
+      || !["COMPLETE", "PARTIAL", "UNKNOWN"].includes(row.paginationStatus)
+      || !(spec.auxiliary ? ["ABSENT", "EMPTY_UNREPORTED", "REPORTED", "MIXED_PAGE_SHAPES"] : ["NOT_APPLICABLE"]).includes(row.auxiliaryOutputState)) return false;
+    const rowStart = inventoryUtcMicros(row.startedAt), rowEnd = inventoryUtcMicros(row.completedAt);
+    if (rowStart === null || rowEnd === null || rowEnd < rowStart || (previousEnd !== null && rowStart < previousEnd)) return false;
+    previousEnd = rowEnd;
+    if (row.paginationStatus !== "COMPLETE") reasons.push(`KIS_INVENTORY_${spec.id}_PAGINATION_${row.paginationStatus}`);
+    if (row.missingIdentityCount) reasons.push(`KIS_INVENTORY_${spec.id}_ROW_IDENTITIES_UNVERIFIED`);
+    if (row.identicalDuplicateCount) reasons.push(`KIS_INVENTORY_${spec.id}_IDENTICAL_PAGE_OVERLAP`);
+  }
+  // The backend validates the canonical checksum before this public envelope is
+  // returned. JSON parsing cannot preserve Python's 1.0 versus 1 representation;
+  // these formatted hashes are provenance labels, never proof of authority.
+  return inventory.startedAt === inventory.scopes[0].startedAt
+    && inventory.completedAt === inventory.scopes[3].completedAt
+    && canonicalFeeJson(inventory.reasons) === canonicalFeeJson(reasons);
 }
 
 // Decimal strings stay exact; these calculations never use an exchange rate or
@@ -258,6 +355,10 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
       if (result.observation?.provisionalFeeEstimate !== undefined
         && !(await validProvisionalFeePreview(result.observation.provisionalFeeEstimate, result, orderDraft))) {
         throw new Error("임시 수수료 추정의 범위·미확인 상태를 확인하지 못했습니다. 다시 계산하세요.");
+      }
+      if (result.observation?.accountInventoryDiagnostics !== undefined
+        && !validAccountInventoryDiagnostics(result.observation.accountInventoryDiagnostics, result, orderDraft, readAccount)) {
+        throw new Error("계좌 조회 범위 기록의 형식과 권한 제한을 확인하지 못했습니다. 다시 조회하세요.");
       }
       if (preparationGeneration.current !== generation) return;
       if (Date.parse(result.expiresAt) <= Date.now()) {
@@ -532,6 +633,27 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
                 <p><a href={FEE_DOMESTIC_URL} target="_blank" rel="noreferrer">국내 공식 기본 수수료표</a> · <a href={FEE_US_URL} target="_blank" rel="noreferrer">미국 공식 기본 수수료표</a> · 개인 약정 요율은 별도 확인 필요</p>
                 <ul>{FEE_FOLLOWUP_STEPS.map(([code, , , label]) => <li key={code}>{label}</li>)}</ul>
               </details>
+            </div>}
+            {preparationResult.observation?.accountInventoryDiagnostics && <div className="live-assistant-provisional-note" role="note" aria-label="계좌 조회 범위 기록">
+              <strong>계좌 조회 범위 기록 · 전체 계좌 대조 미완료</strong>
+              {preparationResult.observation.accountInventoryDiagnostics.inventory ? <>
+                <p>수집 {preparationResult.observation.accountInventoryDiagnostics.inventory.startedAt} ~ {preparationResult.observation.accountInventoryDiagnostics.inventory.completedAt} · 평가 {preparationResult.observation.accountInventoryDiagnostics.inventory.assessedAt}</p>
+                <p>{preparationResult.observation.accountInventoryDiagnostics.inventory.freshnessStatus === "STALE_OR_CLOCK_INVALID"
+                  ? "기록상 15초 범위 초과 또는 시각 불일치 · 재조회 필요"
+                  : "조회 당시 로컬 15초 범위 내 수집 기록 · 현재 상태는 재조회 필요"}</p>
+                <p>이 표는 응답 범위와 행 수를 기록합니다. 0행이나 마지막 페이지가 계좌 전체 무잔고·무주문, 현금 대조 통과를 뜻하지 않습니다.</p>
+                <table><thead><tr><th>조회 범위</th><th>응답 행</th><th>페이지</th><th>조회 종료 표식</th></tr></thead>
+                  <tbody>{preparationResult.observation.accountInventoryDiagnostics.inventory.scopes.map((scope, index) => <tr key={scope.scopeId}>
+                    <td>{INVENTORY_SCOPE_DEFINITIONS[index].label}<br /><small>행 식별 미확인 {scope.missingIdentityCount} · 동일 행 중복 {scope.identicalDuplicateCount}</small></td>
+                    <td>{scope.rowCount}</td><td>{scope.pageCount}</td>
+                    <td>{({ COMPLETE: "해당 조회의 마지막 페이지", PARTIAL: "추가 페이지 있음 · 부분 기록", UNKNOWN: "종료 표식 미확인" })[scope.paginationStatus]}</td>
+                  </tr>)}</tbody>
+                </table>
+              </> : <p>조회 범위 기록을 확인하지 못했습니다. 원인을 해결한 뒤 직접 재조회가 필요합니다.</p>}
+              <p>미확인 범위는 계속 남아 있습니다.</p>
+              <ul>{INVENTORY_UNCOVERED_SCOPES.map(([code, label]) => <li key={code}>{label}</li>)}</ul>
+              <p>미국 일반 미체결 조회가 끝나도 예약·조건부 주문이나 다른 국가까지 확인된 것은 아닙니다. 조회마다 계좌가 바뀔 수 있으므로 직접 시작 전에 다시 조회해야 합니다.</p>
+              <p>전체 계좌 준비 완료 아님 · 실제 수수료·자동환전·확정 정산 미확인 · 실거래 권한 없음</p>
             </div>}
             {preparationResult.observation?.marketSession && <p>시장 시간: {preparationResult.observation.marketSession.detail} · {preparationResult.observation.marketSession.localTime || "연속 시장"} · 거래 허가 없음</p>}
             {preparationResult.observation?.cashPreview && <div aria-label="주문가능현금 기준 준비">
