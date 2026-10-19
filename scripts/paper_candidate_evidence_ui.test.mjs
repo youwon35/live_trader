@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import Module, { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import test, { after } from "node:test";
@@ -359,6 +360,201 @@ function preparationWindow(timers) {
     ok: true, available: true, csrfHeader: "X-LiveTrader-CSRF", csrfToken: "fixture-csrf-".repeat(4),
   }) } } };
 }
+
+// Public-only fixtures: no credentials, account balances, FX rate or settlement.
+const provisionalFalseFlags = { accountFeeRateApproved: false, actualPersonalFeeObserved: false,
+  actualFeeObserved: false, quantityAuthorityGranted: false, orderAuthorityGranted: false,
+  productionReady: false, financialReady: false };
+const provisionalUnknownCosts = () => ({ minimumCommission: null, buyTaxes: null, sellTaxes: null,
+  automaticFxRate: null, automaticFxSpread: null, settlementAdjustment: null });
+const provisionalStatus = "PROVISIONAL_CONFIRMATION_REQUIRED";
+const provisionalScope = "UNCONFIRMED_COMMISSION_ONLY_NOT_TOTAL_COST";
+function fixtureCanonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(fixtureCanonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") return `{${Object.keys(value).sort()
+    .map((key) => `${JSON.stringify(key)}:${fixtureCanonicalJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+function provisionalPreview(market = "KRX", notional = "1000000") {
+  const rates = [
+    ["KRX", "STOCK", "KIS_ESTIMATED_KRX_STOCK_FEE_PERCENT", "0.0140527", "0.000140527", "KRW"],
+    ["KRX", "ETF", "KIS_ESTIMATED_KRX_ETF_FEE_PERCENT", "0.0146527", "0.000146527", "KRW"],
+    ["NXT", "STOCK", "KIS_ESTIMATED_NXT_STOCK_FEE_PERCENT", "0.0130527", "0.000130527", "KRW"],
+    ["US", "STOCK", "KIS_ESTIMATED_US_FEE_PERCENT", "0.25", "0.0025", "USD"],
+    ["US", "ETF", "KIS_ESTIMATED_US_FEE_PERCENT", "0.25", "0.0025", "USD"],
+  ].map(([rowMarket, product, settingKey, ratePercent, rateFraction, currency]) => ({
+    market: rowMarket, product, settingKey, ratePercent, rateFraction, currency,
+    publicDefaultPercent: ratePercent,
+    sourceUrl: rowMarket === "US" ? "https://www.truefriend.com/main/bond/research/_static/TF03ca050000.jsp"
+      : "https://www.truefriend.com/main/customer/guide/_static/TF04ae010000.jsp?templet-bypass=true",
+    valueOrigin: "PUBLIC_DEFAULT", status: provisionalStatus, confirmationRequired: true, estimateOnly: true,
+  }));
+  const body = { schemaVersion: "kis-provisional-fee-profile-v1", status: provisionalStatus,
+    confirmationRequired: true, estimateOnly: true, sourceClassification: "PUBLIC_BASELINE_NOT_PERSONAL_AGREEMENT",
+    rateUnit: "PERCENT", rates, unknownCosts: provisionalUnknownCosts(), costScope: provisionalScope,
+    ...provisionalFalseFlags };
+  const profile = { ...body, feeProfileHash: createHash("sha256").update(fixtureCanonicalJson(body)).digest("hex") };
+  const expected = market === "KRX" ? ["140.527", "146.527"] : ["2500", "2500"];
+  return { schemaVersion: "kis-provisional-fee-preview-v1", status: provisionalStatus, profile,
+    estimates: ["STOCK", "ETF"].map((product, index) => {
+      const row = rates.find((item) => item.market === market && item.product === product);
+      return { schemaVersion: "kis-provisional-fee-estimate-v1", status: provisionalStatus,
+        confirmationRequired: true, estimateOnly: true, market, product, notional,
+        notionalMeaning: "USER_ENTERED_NOTIONAL_NOT_EXECUTION", ratePercent: row.ratePercent,
+        rateFraction: row.rateFraction, nativeEstimate: notional === null ? null : expected[index],
+        currency: row.currency, feeProfileHash: profile.feeProfileHash, roundingApplied: false,
+        settlementRoundingRule: null, unknownCosts: provisionalUnknownCosts(), costScope: provisionalScope,
+        ...provisionalFalseFlags };
+    }),
+    calculationBasis: "USER_ENTERED_NOTIONAL_ONLY",
+    productClassification: "UNKNOWN_SHOW_SEPARATE_STOCK_ETF_ALTERNATIVES",
+    actualFeeObserved: false, orderAuthorityGranted: false, estimatedNotional: notional, accountReadRequired: false,
+    followupSteps: [
+      { code: "PERSONAL_FEE_TERMS", status: "CONFIRMATION_REQUIRED", owner: "USER_OR_BROKER" },
+      { code: "ACCOUNT_SHARED_KRW_RECONCILIATION", status: "VERIFICATION_REQUIRED", owner: "PROGRAM" },
+      { code: "ACTUAL_FX_AND_SETTLEMENT", status: "VERIFICATION_REQUIRED", owner: "PROGRAM_AND_BROKER" },
+      { code: "PAPER_SOURCE_REVALIDATION", status: "VERIFICATION_REQUIRED", owner: "PROGRAM" },
+      { code: "MANUAL_LIVE_START", status: "BLOCKED", owner: "USER" },
+    ] };
+}
+async function kisProvisionalView(market = "KRX", quantity = "1", price = "1000000") {
+  const view = await preparationView();
+  const source = { ...preparationReply().source, instruments: [{ instanceId: "instance-a",
+    symbol: market === "US" ? "AAPL" : "005930", broker: market === "US" ? "kis-us" : "kis-kr" }] };
+  responseForFetch = async () => response(preparationReply({}, { source }));
+  await view.buttons().find((button) => button.props.children === "원본 확인 · 계좌 조회 없음").props.onClick();
+  view.render();
+  view.elements("select").find((node) => node.props.children?.flat?.().some?.((child) => child?.props?.value === "instance-a"))
+    .props.onChange({ target: { value: "instance-a" } });
+  view.render();
+  view.elements("input")[0].props.onChange({ target: { value: quantity } }); view.render();
+  view.elements("input")[1].props.onChange({ target: { value: price } }); view.render();
+  return { view, source };
+}
+
+test("KR and US local fee alternatives render on explicit no-account preview and stay unconfirmed", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    for (const market of ["KRX", "US"]) {
+      const { view, source } = await kisProvisionalView(market);
+      let posted;
+      responseForFetch = async (_url, options) => {
+        posted = JSON.parse(options.body);
+        return response(preparationReply({ notional: "1000000" }, { source,
+          observation: { status: "NOT_REQUESTED", provisionalFeeEstimate: provisionalPreview(market) } }));
+      };
+      await view.buttons().find((button) => button.props.children === "원본 확인 · 계좌 조회 없음").props.onClick();
+      const html = view.render();
+      assert.equal(posted.readAccount, false);
+      assert.match(html, /임시 수수료 추정 · 확인 필요 · 실제 적용 요율 미확인/);
+      assert.match(html, /주식·ETF 분류가 확인되지 않아 두 대안/);
+      assert.match(html, market === "KRX" ? /140\.527 KRW/ : /2500 USD/);
+      assert.match(html, market === "KRX" ? /146\.527 KRW/ : /미국 ETF 대안/);
+      assert.match(html, /총비용·실제 환전 원화 금액·주문 수량은 확정하지 않습니다/);
+      assert.match(html, /실제 주문은 차단 상태/);
+      assert.match(html, /국내·해외 공통 원화 한도와 원장 대조/);
+      assert.match(html, /직접 실거래 시작 · 현재 차단/);
+      assert.doesNotMatch(html, /READY|수수료 확인 완료<|실제 적용 수수료 관측됨/);
+      assert.equal(calls.filter((call) => call.method === "GET").length, 1);
+      assert.ok(calls.filter((call) => call.method === "POST").every((call) => call.url === "/api/preparation/preview"));
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+
+test("missing notional remains uncalculated and decimal commission is exact below Number precision", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    for (const [quantity, price, notional, estimates] of [
+      ["", "", null, [null, null]],
+      ["1", "0.000000000000000001", "0.000000000000000001", ["0.000000000000000000000140527", "0.000000000000000000000146527"]],
+      ["0.000000000000000001", "0.000000000000000001", "0.000000000000000000000000000000000001", ["0.000000000000000000000000000000000000000140527", "0.000000000000000000000000000000000000000146527"]],
+      ["999999999999999999", "999999999999999999", "999999999999999998000000000000000001", ["140526999999999999718946000000000.000140527", "146526999999999999706946000000000.000146527"]],
+    ]) {
+      const { view, source } = await kisProvisionalView("KRX", quantity, price);
+      const preview = provisionalPreview("KRX", notional);
+      preview.estimates.forEach((estimate, index) => { estimate.nativeEstimate = estimates[index]; });
+      responseForFetch = async () => response(preparationReply({ notional }, { source,
+        observation: { status: "NOT_REQUESTED", provisionalFeeEstimate: preview } }));
+      await view.buttons().find((button) => button.props.children === "원본 확인 · 계좌 조회 없음").props.onClick();
+      const html = view.render();
+      assert.match(html, /임시 수수료 추정 · 확인 필요 · 실제 적용 요율 미확인/);
+      assert.ok(html.includes(`수수료만 추정 ${estimates[0] ?? "미계산"} KRW`));
+      assert.doesNotMatch(html, /추정의 범위·미확인 상태를 확인하지 못했습니다/);
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
+
+test("changing an input during fee profile digest discards the old asynchronous preview", async () => {
+  const previous = globalThis.window;
+  const originalDigest = globalThis.crypto.subtle.digest;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    const { view, source } = await kisProvisionalView();
+    responseForFetch = async () => response(preparationReply({ notional: "1000000" }, { source,
+      observation: { status: "NOT_REQUESTED", provisionalFeeEstimate: provisionalPreview() } }));
+    let release, digestResult;
+    globalThis.crypto.subtle.digest = function (...args) {
+      digestResult = originalDigest.apply(this, args);
+      return new Promise((resolve) => { release = async () => resolve(await digestResult); });
+    };
+    const pending = view.buttons().find((button) => button.props.children === "원본 확인 · 계좌 조회 없음").props.onClick();
+    for (let attempt = 0; attempt < 30 && !release; attempt += 1) await Promise.resolve();
+    assert.ok(release, "preview must await the public profile hash before rendering");
+    view.elements("input")[0].props.onChange({ target: { value: "2" } }); view.render();
+    await release(); await pending;
+    assert.doesNotMatch(view.render(), /조회 시각|임시 수수료 추정 · 확인 필요 · 실제 적용 요율 미확인/);
+  } finally {
+    globalThis.crypto.subtle.digest = originalDigest;
+    allowPreparation = false; globalThis.window = previous;
+  }
+});
+
+test("fee preview rejects nested private data, invented proofs, mismatched amounts and authority", async () => {
+  const previous = globalThis.window;
+  try {
+    globalThis.window = preparationWindow([]); allowPreparation = true;
+    const changes = [
+      (p) => { p.orderAuthorityGranted = true; },
+      (p) => { p.actualFeeObserved = 0; },
+      (p) => { p.accountReadRequired = true; },
+      (p) => { p.privateBalance = "PRIVATE_SENTINEL"; },
+      (p) => { p.profile.remoteMessage = "PRIVATE_SENTINEL"; },
+      (p) => { p.profile.rates[0].accountNumber = "PRIVATE_SENTINEL"; },
+      (p) => { p.estimates[0].privateAmount = "PRIVATE_SENTINEL"; },
+      (p) => { p.followupSteps[0].remoteMessage = "PRIVATE_SENTINEL"; },
+      (p) => { p.profile.actualPersonalFeeObserved = true; },
+      (p) => { p.profile.estimateOnly = 1; },
+      (p) => { p.profile.rateUnit = "FRACTION"; },
+      (p) => { p.profile.sourceClassification = "PERSONAL_AGREEMENT"; },
+      (p) => { p.profile.feeProfileHash = "a".repeat(64); },
+      (p) => { p.profile.unknownCosts.automaticFxRate = "0"; },
+      (p) => { p.profile.rates[0].sourceUrl = "https://example.invalid/PRIVATE_SENTINEL"; },
+      (p) => { p.profile.rates[0].rateFraction = "0.0140527"; },
+      (p) => { p.estimates[0].nativeEstimate = "0"; },
+      (p) => { p.estimates[0].feeProfileHash = "b".repeat(64); },
+      (p) => { p.estimates[0].unknownCosts.minimumCommission = "0"; },
+      (p) => { p.estimates[0].market = "US"; },
+      (p) => { p.estimates[0].product = "UNKNOWN"; },
+      (p) => { p.estimates[0].roundingApplied = true; },
+      (p) => { p.estimatedNotional = "999"; },
+      (p) => { p.followupSteps[1].status = "PASS"; },
+      (p) => { p.followupSteps[4].status = "READY"; },
+      (p) => { p.estimates.reverse(); },
+    ];
+    for (const change of changes) {
+      const { view, source } = await kisProvisionalView();
+      const preview = provisionalPreview(); change(preview);
+      responseForFetch = async () => response(preparationReply({ notional: "1000000" }, { source,
+        observation: { status: "NOT_REQUESTED", provisionalFeeEstimate: preview } }));
+      await view.buttons().find((button) => button.props.children === "원본 확인 · 계좌 조회 없음").props.onClick();
+      const html = view.render();
+      assert.match(html, /임시 수수료 추정의 범위·미확인 상태를 확인하지 못했습니다/);
+      assert.doesNotMatch(html, /조회 시각|PRIVATE_SENTINEL|수수료만 추정/);
+    }
+  } finally { allowPreparation = false; globalThis.window = previous; }
+});
 test("preparation explicit source/read actions keep missing quantity and exact input; changes clear old results", async () => {
   const previous = globalThis.window, timers = []; let posted;
   try {

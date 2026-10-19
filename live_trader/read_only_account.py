@@ -17,6 +17,7 @@ import urllib.request
 
 from .live_adapters import build_upbit_authorization, sign_binance_query, split_kis_account
 from .kis_overseas_funding import DEFAULT_MODE, MODE_KEY, funding_policy, parse_orderable_funding, resolve_funding_mode
+from .kis_provisional_fees import SETTING_DEFAULTS as PROVISIONAL_FEE_DEFAULTS
 
 ORIGINS = {"binance": "https://api.binance.com", "binance-futures": "https://fapi.binance.com",
            "upbit": "https://api.upbit.com", "kis": "https://openapi.koreainvestment.com:9443"}
@@ -63,7 +64,8 @@ KIS_TR_IDS = {
 }
 SETTING_KEYS = ("BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_BASE_URL", "BINANCE_FUTURES_BASE_URL",
  "UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY", "UPBIT_BASE_URL", "KIS_APP_KEY", "KIS_APP_SECRET",
- "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE", "KIS_BASE_URL", "KIS_ENV", MODE_KEY)
+ "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE", "KIS_BASE_URL", "KIS_ENV", MODE_KEY,
+ *PROVISIONAL_FEE_DEFAULTS)
 _TOKEN_CACHE = {}
 _TOKEN_LOCK = threading.Lock()
 _KIS_LOCK = threading.Lock()

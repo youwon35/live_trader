@@ -13,6 +13,9 @@ from .env_loader import (
 )
 from .live_adapters import BINANCE_BASE_URL, BINANCE_FUTURES_BASE_URL, KIS_LIVE_BASE_URL, UPBIT_BASE_URL
 from .kis_overseas_funding import DEFAULT_MODE, MODE_KEY, resolve_funding_mode
+from .kis_provisional_fees import (
+    FEE_SETTING_DEFAULTS, fee_setting_metadata, validate_fee_setting_value,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +42,10 @@ ENV_SETTING_FIELDS = (
     EnvSettingField("KIS_ACCOUNT_PRODUCT_CODE", "KIS 상품 코드", "계좌번호 뒤 2자리입니다. 보통 01을 사용합니다.", "kis", "text", "01", True),
     EnvSettingField("KIS_BASE_URL", "KIS 실전 URL", "실전 서버 URL입니다. 모의투자 URL과 섞지 마세요.", "kis", "text", KIS_LIVE_BASE_URL),
     EnvSettingField(MODE_KEY, "해외주식 결제방식", "통합증거금을 지원하는 해외시장의 기본 방식입니다. 계좌 서비스 신청이나 실거래 활성화는 별도로 확인합니다.", "kis", "select", DEFAULT_MODE, True, (("INTEGRATED_MARGIN", "통합증거금 (원화·자동환전)"), ("FOREIGN_CASH", "외화 현금 (사전환전)"))),
+    EnvSettingField("KIS_ESTIMATED_KRX_STOCK_FEE_PERCENT", "KRX 주식 임시 수수료 (%)", "뱅키스 공개 기본표를 참고한 임시 추정값입니다. 본인 계좌·REST API·우대 적용 요율은 확인이 필요합니다. 최소수수료·제세금·자동환전 비용은 별도 미확인입니다.", "kis", "text", FEE_SETTING_DEFAULTS["KIS_ESTIMATED_KRX_STOCK_FEE_PERCENT"], True),
+    EnvSettingField("KIS_ESTIMATED_KRX_ETF_FEE_PERCENT", "KRX ETF 임시 수수료 (%)", "뱅키스 공개 ETF 기본표를 참고한 임시 추정값입니다. 주식 기본 요율과 다르며 본인 계좌·REST API·우대 적용은 확인이 필요합니다. 최소수수료·제세금·자동환전 비용은 별도 미확인입니다.", "kis", "text", FEE_SETTING_DEFAULTS["KIS_ESTIMATED_KRX_ETF_FEE_PERCENT"], True),
+    EnvSettingField("KIS_ESTIMATED_NXT_STOCK_FEE_PERCENT", "NXT 주식 임시 수수료 (%)", "공개 NXT 주식 기본표를 참고한 임시 추정값입니다. 본인 계좌·REST API 적용 요율과 거래시장 지원은 확인이 필요합니다. 이 설정은 NXT 주문 경로를 활성화하지 않습니다.", "kis", "text", FEE_SETTING_DEFAULTS["KIS_ESTIMATED_NXT_STOCK_FEE_PERCENT"], True),
+    EnvSettingField("KIS_ESTIMATED_US_FEE_PERCENT", "미국 주식·ETF 임시 수수료 (%)", "미국 온라인 공개 기본 요율을 참고한 임시 추정값입니다. 본인 매수·매도·REST API·우대 적용은 확인이 필요합니다. 최소수수료·제세금·자동환전·정산 비용은 별도 미확인입니다.", "kis", "text", FEE_SETTING_DEFAULTS["KIS_ESTIMATED_US_FEE_PERCENT"], True),
     EnvSettingField("KIS_HTS_ID", "KIS HTS ID", "한국투자증권 로그인/HTS ID이며 일부 체결·시세 경로에서 사용합니다.", "kis", "secret"),
     EnvSettingField("BINANCE_API_KEY", "Binance API key", "Binance Spot/Futures API key입니다. Futures 거래 권한은 Binance에서 별도로 활성화해야 합니다.", "binance", "secret", required=True),
     EnvSettingField("BINANCE_API_SECRET", "Binance API secret", "Binance Spot/Futures API secret입니다.", "binance", "secret", required=True),
@@ -84,6 +91,10 @@ def env_settings_snapshot() -> dict[str, Any]:
                 or os.getenv(field.key, "")
                 or store.get(live_secret_name(field.key))
             )
+        elif field.key in FEE_SETTING_DEFAULTS:
+            value = file_values.get(field.key) or os.getenv(field.key, "") or field.default
+            if not str(value).strip():
+                value = field.default
         elif field.kind == "select":
             value = file_values.get(field.key) or os.getenv(field.key, "") or field.default
         elif field.key in file_values:
@@ -103,6 +114,7 @@ def env_settings_snapshot() -> dict[str, Any]:
                 "value": "" if field.kind == "secret" else value,
                 "masked": mask_value(value) if field.kind == "secret" else "",
                 "default": field.default,
+                **fee_setting_metadata(field.key),
                 **({"options": [{"value": value, "label": label} for value, label in field.options]} if field.kind == "select" else {}),
             }
         )
@@ -123,6 +135,13 @@ def save_env_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
     if MODE_KEY in raw_values:
         resolve_funding_mode({MODE_KEY: raw_values[MODE_KEY]})
     existing = read_env_file()
+    # Validate all values which this save would persist before accessing or
+    # migrating secrets. A single bad fee cannot cause a partial credential save.
+    validated_fees = {
+        key: validate_fee_setting_value(key, raw_values[key] if key in raw_values else
+            (existing.get(key) or os.getenv(key, "") or default))
+        for key, default in FEE_SETTING_DEFAULTS.items()
+    }
     field_map = {field.key: field for field in ENV_SETTING_FIELDS}
     store = live_secret_store()
     next_values = {
@@ -134,6 +153,7 @@ def save_env_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
         )
         for key, field in field_map.items()
     }
+    next_values.update(validated_fees)
 
     for key in LIVE_TRADER_SECRET_KEYS:
         legacy = existing.get(key, "")
@@ -197,6 +217,8 @@ def write_env_file(
 
 
 def normalize_value(value: Any, field: EnvSettingField) -> str:
+    if field.key in FEE_SETTING_DEFAULTS:
+        return validate_fee_setting_value(field.key, value)
     if field.kind == "select":
         return resolve_funding_mode({field.key: value})
     if field.kind == "bool":

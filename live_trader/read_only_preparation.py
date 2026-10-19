@@ -222,6 +222,18 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
     matches = [item for item in before["instruments"] if item["instanceId"] == draft["instanceId"]]
     if draft["instanceId"] and len(matches) != 1:
         raise ValueError("원본에 포함된 종목을 직접 선택하세요.")
+    provisional_preview = None
+    provisional_settings_hash = None
+    if len(matches) == 1 and matches[0]["broker"] in {"kis-kr", "kis-us"}:
+        from .kis_provisional_preparation import build_provisional_fee_preview
+        supplied_settings = getattr(reader, "settings", None) if reader is not None else None
+        provisional_uses_runtime = not isinstance(supplied_settings, dict)
+        provisional_settings = runtime_settings() if provisional_uses_runtime else supplied_settings
+        provisional_settings_hash = stable_sha256(provisional_settings)
+        # Validate local assumptions before any requested account GET, including
+        # values supplied by an external environment rather than settings UI.
+        provisional_preview = build_provisional_fee_preview(
+            matches[0]["broker"], draft["notional"], provisional_settings)
     observation = {"status": "NOT_REQUESTED", "account": "UNKNOWN", "openOrders": "UNKNOWN",
                    "orderability": "UNKNOWN", "fundsCheck": "UNKNOWN", "accountBinding": "NOT_VERIFIED"}
     if request["readAccount"]:
@@ -281,6 +293,13 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
         if before["kind"] == "SEALED_SOURCE" or (selected.get("executionSizing") or {}).get("quantityContract") is not None:
             from .cash_preparation_preview import cash_preview
             observation["cashPreview"] = cash_preview(selected, observation, draft)
+    if provisional_preview is not None:
+        # Pure, local assumptions are useful before an account read, but may not
+        # fill observed feeRate, change Source costs, size an order or grant a gate.
+        current_settings = runtime_settings() if provisional_uses_runtime else getattr(reader, "settings", None)
+        if not isinstance(current_settings, dict) or stable_sha256(current_settings) != provisional_settings_hash:
+            raise ValueError("임시 수수료 설정이 변경되어 결과를 폐기했습니다. 다시 계산하세요.")
+        observation["provisionalFeeEstimate"] = provisional_preview
     after = source_snapshot(request["source"], folders)
     if before != after:
         raise ValueError("조회 중 원본이 변경되어 결과를 폐기했습니다. 새로고침하세요.")
@@ -326,6 +345,9 @@ def prepare_read_only(request, *, roots=None, reader=None, clock=None):
         funding = observation["fundingDiagnostics"]
         checks.append({"code": "KIS_OVERSEAS_FUNDING", "status": "BLOCKED" if funding.get("fundingMode") == "INTEGRATED_MARGIN" else "UNKNOWN",
             "detail": "해외주식 결제방식: " + funding.get("fundingModeLabel", "미확인") + " · " + " ".join(funding.get("userMessages", []))})
+    if "provisionalFeeEstimate" in observation:
+        checks.append({"code": "KIS_PROVISIONAL_FEES", "status": "UNKNOWN",
+            "detail": "수수료는 임시값으로 계산했습니다. 계좌 적용 요율·최소수수료·세금·자동환전·확정 정산은 확인이 필요합니다. 설정 저장은 실제 비용 검증이나 주문 허가가 아닙니다."})
     if "integratedFinancialDiagnostics" in observation:
         diagnostic = observation["integratedFinancialDiagnostics"]
         seen = diagnostic.get("integratedObservation")

@@ -23,6 +23,118 @@ const POLICY_CRITERION_LABELS = {
 
 const PREPARATION_INPUT_STYLE = { minHeight: 32, padding: "0 8px", color: "var(--text)", background: "var(--input)", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", font: "inherit", width: 160 };
 
+const FEE_CONFIRMATION_STATUS = "PROVISIONAL_CONFIRMATION_REQUIRED";
+const FEE_COST_SCOPE = "UNCONFIRMED_COMMISSION_ONLY_NOT_TOTAL_COST";
+const FEE_FALSE_FLAGS = ["accountFeeRateApproved", "actualPersonalFeeObserved", "actualFeeObserved",
+  "quantityAuthorityGranted", "orderAuthorityGranted", "productionReady", "financialReady"];
+const FEE_UNKNOWN_COSTS = ["minimumCommission", "buyTaxes", "sellTaxes", "automaticFxRate", "automaticFxSpread", "settlementAdjustment"];
+const FEE_DOMESTIC_URL = "https://www.truefriend.com/main/customer/guide/_static/TF04ae010000.jsp?templet-bypass=true";
+const FEE_US_URL = "https://www.truefriend.com/main/bond/research/_static/TF03ca050000.jsp";
+const FEE_RATE_ROWS = [
+  ["KRX", "STOCK", "KIS_ESTIMATED_KRX_STOCK_FEE_PERCENT", "KRW", "0.0140527"],
+  ["KRX", "ETF", "KIS_ESTIMATED_KRX_ETF_FEE_PERCENT", "KRW", "0.0146527"],
+  ["NXT", "STOCK", "KIS_ESTIMATED_NXT_STOCK_FEE_PERCENT", "KRW", "0.0130527"],
+  ["US", "STOCK", "KIS_ESTIMATED_US_FEE_PERCENT", "USD", "0.25"],
+  ["US", "ETF", "KIS_ESTIMATED_US_FEE_PERCENT", "USD", "0.25"],
+];
+const FEE_FOLLOWUP_STEPS = [
+  ["PERSONAL_FEE_TERMS", "CONFIRMATION_REQUIRED", "USER_OR_BROKER", "본인 적용 수수료 · 사용자 또는 증권사 확인 필요"],
+  ["ACCOUNT_SHARED_KRW_RECONCILIATION", "VERIFICATION_REQUIRED", "PROGRAM", "국내·해외 공통 원화 한도와 원장 대조 · 프로그램 검증 필요"],
+  ["ACTUAL_FX_AND_SETTLEMENT", "VERIFICATION_REQUIRED", "PROGRAM_AND_BROKER", "실제 자동환전·정산 내역 · 프로그램과 증권사 검증 필요"],
+  ["PAPER_SOURCE_REVALIDATION", "VERIFICATION_REQUIRED", "PROGRAM", "현재 원본 기준 Paper 재검증 필요"],
+  ["MANUAL_LIVE_START", "BLOCKED", "USER", "직접 실거래 시작 · 현재 차단"],
+];
+
+function exactFeeKeys(value, keys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+// Decimal strings stay exact; these calculations never use an exchange rate or
+// turn the preview into an account balance, total cost, quantity or order permit.
+function feeDecimalProduct(left, right) {
+  const parts = [left, right].map((value) => {
+    const [whole, fraction = ""] = value.split(".");
+    return { coefficient: BigInt(whole + fraction), scale: fraction.length };
+  });
+  const scale = parts[0].scale + parts[1].scale;
+  const digits = String(parts[0].coefficient * parts[1].coefficient).padStart(scale + 1, "0");
+  const value = scale ? `${digits.slice(0, -scale)}.${digits.slice(-scale)}` : digits;
+  return value.includes(".") ? value.replace(/0+$/, "").replace(/\.$/, "") : value;
+}
+
+function canonicalFeeJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalFeeJson).join(",")}]`;
+  if (value !== null && typeof value === "object") return `{${Object.keys(value).sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalFeeJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+async function validProvisionalFeePreview(preview, result, inputDraft) {
+  const topKeys = ["schemaVersion", "status", "profile", "estimates", "calculationBasis", "productClassification",
+    "actualFeeObserved", "orderAuthorityGranted", "estimatedNotional", "accountReadRequired", "followupSteps"];
+  if (!exactFeeKeys(preview, topKeys) || preview.schemaVersion !== "kis-provisional-fee-preview-v1"
+    || preview.status !== FEE_CONFIRMATION_STATUS || preview.actualFeeObserved !== false
+    || preview.orderAuthorityGranted !== false || preview.accountReadRequired !== false
+    || preview.calculationBasis !== "USER_ENTERED_NOTIONAL_ONLY"
+    || preview.productClassification !== "UNKNOWN_SHOW_SEPARATE_STOCK_ETF_ALTERNATIVES"
+    || preview.estimatedNotional !== result.draft?.notional) return false;
+  const selected = result.source.instruments.filter((item) => item.instanceId === inputDraft.instanceId);
+  if (selected.length !== 1 || !["kis-kr", "kis-us"].includes(selected[0].broker)) return false;
+  const market = selected[0].broker === "kis-kr" ? "KRX" : "US";
+  const notional = preview.estimatedNotional;
+  if (notional !== null && (typeof notional !== "string" || !/^(?:0|[1-9]\d{0,35})(?:\.\d{1,36})?$/.test(notional))) return false;
+  const inputs = [inputDraft.quantity, inputDraft.limitPrice].map((value) => String(value ?? "").trim());
+  if (inputs.every((value) => /^(?:0|[1-9]\d{0,17})(?:\.\d{1,18})?$/.test(value))) {
+    if (inputs.some((value) => feeDecimalProduct(value, "1") === "0") || notional === null
+      || feeDecimalProduct(...inputs) !== feeDecimalProduct(notional, "1")) return false;
+  } else if (notional !== null) return false;
+  const profile = preview.profile;
+  const profileKeys = ["schemaVersion", "status", "confirmationRequired", "estimateOnly", "sourceClassification",
+    "rateUnit", "rates", "unknownCosts", "costScope", "feeProfileHash", ...FEE_FALSE_FLAGS];
+  const unknownCostsValid = (value) => exactFeeKeys(value, FEE_UNKNOWN_COSTS) && FEE_UNKNOWN_COSTS.every((key) => value[key] === null);
+  const unconfirmed = (value) => value.status === FEE_CONFIRMATION_STATUS
+    && value.confirmationRequired === true && value.estimateOnly === true && FEE_FALSE_FLAGS.every((key) => value[key] === false);
+  if (!exactFeeKeys(profile, profileKeys) || profile.schemaVersion !== "kis-provisional-fee-profile-v1"
+    || !unconfirmed(profile) || profile.sourceClassification !== "PUBLIC_BASELINE_NOT_PERSONAL_AGREEMENT"
+    || profile.rateUnit !== "PERCENT" || profile.costScope !== FEE_COST_SCOPE || !unknownCostsValid(profile.unknownCosts)
+    || typeof profile.feeProfileHash !== "string" || !/^[a-f0-9]{64}$/.test(profile.feeProfileHash)
+    || !Array.isArray(profile.rates) || profile.rates.length !== FEE_RATE_ROWS.length) return false;
+  const rowKeys = ["market", "product", "settingKey", "ratePercent", "rateFraction", "currency", "publicDefaultPercent",
+    "sourceUrl", "valueOrigin", "status", "confirmationRequired", "estimateOnly"];
+  for (const [index, row] of profile.rates.entries()) {
+    const [rowMarket, product, key, currency, defaultPercent] = FEE_RATE_ROWS[index];
+    if (!exactFeeKeys(row, rowKeys) || row.market !== rowMarket || row.product !== product || row.settingKey !== key
+      || row.currency !== currency || row.publicDefaultPercent !== defaultPercent || row.sourceUrl !== (rowMarket === "US" ? FEE_US_URL : FEE_DOMESTIC_URL)
+      || row.status !== FEE_CONFIRMATION_STATUS || row.confirmationRequired !== true || row.estimateOnly !== true
+      || typeof row.ratePercent !== "string" || !/^(?:0|[1-9]\d{0,2})(?:\.\d{1,12})?$/.test(row.ratePercent)
+      || Number(row.ratePercent) > 100 || row.ratePercent !== feeDecimalProduct(row.ratePercent, "1")
+      || row.rateFraction !== feeDecimalProduct(row.ratePercent, "0.01")
+      || row.valueOrigin !== (row.ratePercent === defaultPercent ? "PUBLIC_DEFAULT" : "UNCONFIRMED_SETTING")) return false;
+  }
+  if (profile.rates[3].ratePercent !== profile.rates[4].ratePercent || !globalThis.crypto?.subtle) return false;
+  const { feeProfileHash, ...hashBody } = profile;
+  const hashBytes = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalFeeJson(hashBody)));
+  if (Array.from(new Uint8Array(hashBytes), (byte) => byte.toString(16).padStart(2, "0")).join("") !== feeProfileHash) return false;
+  const estimateKeys = ["schemaVersion", "status", "confirmationRequired", "estimateOnly", "market", "product", "notional",
+    "notionalMeaning", "ratePercent", "rateFraction", "nativeEstimate", "currency", "feeProfileHash", "roundingApplied",
+    "settlementRoundingRule", "unknownCosts", "costScope", ...FEE_FALSE_FLAGS];
+  if (!Array.isArray(preview.estimates) || preview.estimates.length !== 2) return false;
+  for (const [index, estimate] of preview.estimates.entries()) {
+    const row = profile.rates.find((item) => item.market === market && item.product === ["STOCK", "ETF"][index]);
+    if (!exactFeeKeys(estimate, estimateKeys) || estimate.schemaVersion !== "kis-provisional-fee-estimate-v1"
+      || !unconfirmed(estimate) || estimate.market !== market || estimate.product !== row.product
+      || estimate.notional !== notional || estimate.notionalMeaning !== "USER_ENTERED_NOTIONAL_NOT_EXECUTION"
+      || estimate.ratePercent !== row.ratePercent || estimate.rateFraction !== row.rateFraction || estimate.currency !== row.currency
+      || estimate.nativeEstimate !== (notional === null ? null : feeDecimalProduct(notional, row.rateFraction))
+      || estimate.feeProfileHash !== feeProfileHash || estimate.roundingApplied !== false || estimate.settlementRoundingRule !== null
+      || estimate.costScope !== FEE_COST_SCOPE || !unknownCostsValid(estimate.unknownCosts)) return false;
+  }
+  return Array.isArray(preview.followupSteps) && preview.followupSteps.length === FEE_FOLLOWUP_STEPS.length
+    && preview.followupSteps.every((step, index) => exactFeeKeys(step, ["code", "status", "owner"])
+      && ["code", "status", "owner"].every((key, column) => step[key] === FEE_FOLLOWUP_STEPS[index][column]));
+}
+
 export default function PaperCandidateEvidencePanel({ strategyId = "", onRegistered }) {
   const [inbox, setInbox] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -141,6 +253,11 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
         || !Number.isFinite(Date.parse(result.asOf)) || !Number.isFinite(Date.parse(result.expiresAt))
         || Date.parse(result.expiresAt) <= Date.now() || Date.parse(result.expiresAt) - Date.parse(result.asOf) > 60000) {
         throw new Error(result?.reason || "읽기 전용 준비 결과의 범위와 유효시간을 확인하지 못했습니다.");
+      }
+      if (preparationGeneration.current !== generation) return;
+      if (result.observation?.provisionalFeeEstimate !== undefined
+        && !(await validProvisionalFeePreview(result.observation.provisionalFeeEstimate, result, orderDraft))) {
+        throw new Error("임시 수수료 추정의 범위·미확인 상태를 확인하지 못했습니다. 다시 계산하세요.");
       }
       if (preparationGeneration.current !== generation) return;
       setPreparationSource(result.source);
@@ -399,6 +516,20 @@ export default function PaperCandidateEvidencePanel({ strategyId = "", onRegiste
           <p>조회 시각 {preparationResult.asOf} · 만료 {preparationResult.expiresAt}</p>
           {preparationExpired ? <p>조회가 만료됐습니다. 현재 상태를 다시 조회하세요.</p> : <>
             <p>입력 금액: {preparationResult.draft.notional ?? "미입력"} {preparationResult.observation?.currency || ""} · 미입력 항목 {preparationResult.draft.missingInputs.length}개</p>
+            {preparationResult.observation?.provisionalFeeEstimate && <div className="live-assistant-provisional-note" role="note" aria-label="임시 수수료 추정 · 확인 필요">
+              <strong>임시 수수료 추정 · 확인 필요 · 실제 적용 요율 미확인</strong>
+              <p>직접 입력한 주문 초안 금액 {preparationResult.observation.provisionalFeeEstimate.estimatedNotional ?? "미입력"} {preparationResult.observation.provisionalFeeEstimate.estimates[0].currency}만 사용한 계산입니다. 계좌 잔고 조회나 실제 체결 비용 관측이 아닙니다.</p>
+              <p>주식·ETF 분류가 확인되지 않아 두 대안을 따로 표시합니다. 종목 종류를 추측하거나 수수료를 합산하지 않습니다.</p>
+              {preparationResult.observation.provisionalFeeEstimate.estimates.map((estimate) => <p key={estimate.product}>
+                {estimate.market === "US" ? "미국" : "KRX"} {estimate.product === "ETF" ? "ETF" : "주식"} 대안 · 임시 {estimate.ratePercent}% · 수수료만 추정 {estimate.nativeEstimate ?? "미계산"} {estimate.currency}
+              </p>)}
+              <p>최소수수료·매수/매도 제세금·자동환전 적용 환율과 스프레드·정산 조정·반올림은 미확인입니다. 총비용·실제 환전 원화 금액·주문 수량은 확정하지 않습니다.</p>
+              <p>임시값을 저장하거나 계산해도 수수료 확인 완료와 실거래 권한은 부여되지 않습니다. 실제 주문은 차단 상태입니다.</p>
+              <details><summary>공식 기본표 출처와 남은 준비</summary>
+                <p><a href={FEE_DOMESTIC_URL} target="_blank" rel="noreferrer">국내 공식 기본 수수료표</a> · <a href={FEE_US_URL} target="_blank" rel="noreferrer">미국 공식 기본 수수료표</a> · 개인 약정 요율은 별도 확인 필요</p>
+                <ul>{FEE_FOLLOWUP_STEPS.map(([code, , , label]) => <li key={code}>{label}</li>)}</ul>
+              </details>
+            </div>}
             {preparationResult.observation?.marketSession && <p>시장 시간: {preparationResult.observation.marketSession.detail} · {preparationResult.observation.marketSession.localTime || "연속 시장"} · 거래 허가 없음</p>}
             {preparationResult.observation?.cashPreview && <div aria-label="주문가능현금 기준 준비">
               <p>{preparationResult.observation.accountAlias} {preparationResult.observation.maskedAccount} · 저장 credential 설정 관측 · Native 계좌 심사 전</p>

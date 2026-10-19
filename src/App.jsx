@@ -4907,6 +4907,21 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         || typeof field.label !== "string" || !field.label.trim()
         || typeof field.detail !== "string"
         || !["secret", "text", "bool", "select"].includes(field.kind)
+        || (isProvisionalKisFeeField(field) && (field.group !== "kis" || field.kind !== "text"
+          || field.confirmationRequired !== true || field.estimateOnly !== true
+          || field.status !== "PROVISIONAL_CONFIRMATION_REQUIRED" || field.rateUnit !== "PERCENT"
+          || field.sourceClassification !== "PUBLIC_BASELINE_NOT_PERSONAL_AGREEMENT"
+          || field.default !== ({ KIS_ESTIMATED_KRX_STOCK_FEE_PERCENT: "0.0140527", KIS_ESTIMATED_KRX_ETF_FEE_PERCENT: "0.0146527",
+            KIS_ESTIMATED_NXT_STOCK_FEE_PERCENT: "0.0130527", KIS_ESTIMATED_US_FEE_PERCENT: "0.25" })[field.key]
+          || ["accountFeeRateApproved", "actualPersonalFeeObserved", "actualFeeObserved", "quantityAuthorityGranted",
+            "orderAuthorityGranted", "productionReady", "financialReady"].some((key) => field[key] !== false)
+          || field.sourceUrl !== (field.key === "KIS_ESTIMATED_US_FEE_PERCENT"
+            ? "https://www.truefriend.com/main/bond/research/_static/TF03ca050000.jsp"
+            : "https://www.truefriend.com/main/customer/guide/_static/TF04ae010000.jsp?templet-bypass=true")
+          || ["value", "default"].some((key) => typeof field[key] !== "string"
+            || !/^(?:0|[1-9]\d{0,2})(?:\.\d{1,12})?$/.test(field[key]) || Number(field[key]) > 100)))
+        || (field.confirmationRequired !== undefined && typeof field.confirmationRequired !== "boolean")
+        || (field.estimateOnly !== undefined && typeof field.estimateOnly !== "boolean")
         || (field.kind === "select" && (!Array.isArray(field.options) || !field.options.length
           || field.options.some((option) => !option || typeof option !== "object" || Array.isArray(option)
             || typeof option.value !== "string" || !option.value.trim() || option.value !== option.value.trim()
@@ -4977,6 +4992,8 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
   ];
   const fields = settings?.fields ?? [];
   const visibleFields = fields.filter((field) => field.group === activeGroup);
+  const provisionalFields = visibleFields.filter(isProvisionalKisFeeField);
+  const confirmationRequired = provisionalFields.length > 0;
   const broker = brokers.find((item) => item.broker_id === activeGroup);
   const diagnostic = diagnostics.find((item) => item.broker_id === activeGroup);
   const checkCount = visibleFields.filter((field) => assistantFieldStatus(field, draft[field.key]) !== "done").length;
@@ -4984,7 +5001,8 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
   const settingsLabel = settingsStatus === "loading" ? "읽는 중"
     : settingsStatus === "error" ? "확인 실패"
       : !visibleFields.length ? "항목 없음"
-        : checkCount ? `${checkCount} CHECK` : "설정 확인";
+        : confirmationRequired ? `${checkCount} CHECK · 수수료 확인 필요`
+          : checkCount ? `${checkCount} CHECK` : "설정 확인";
   const settingsTone = settingsStatus === "error" ? "danger"
     : settingsReady ? checkCount ? "warning" : "success" : "neutral";
 
@@ -5023,7 +5041,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         });
         return next;
       });
-      setMessage(`${Object.keys(values).length}개 설정을 저장했습니다.`);
+      setMessage(`${Object.keys(values).length}개 설정을 저장했습니다.${confirmationRequired ? " 임시 수수료는 계속 확인이 필요합니다." : ""}`);
     } catch (error) {
       setSettingsStatus("error");
       setMessage(error instanceof Error ? error.message : "설정 저장에 실패했습니다. 설정을 다시 확인하세요.");
@@ -5051,13 +5069,20 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
       {settingsReady && broker && (
         <div
           {...semanticSurfaceProps(
-            broker.order_ready ? "success" : broker.status === "missing_credentials" ? "danger" : "warning",
+            confirmationRequired ? "warning" : broker.order_ready ? "success" : broker.status === "missing_credentials" ? "danger" : "warning",
             "live-assistant-summary",
           )}
         >
           <strong>{broker.name}</strong>
           <span>{broker.detail}</span>
-          <StatusPill tone={broker.order_ready ? "success" : broker.status === "missing_credentials" ? "danger" : "warning"}>{broker.order_ready ? "READY" : broker.status}</StatusPill>
+          <StatusPill tone={confirmationRequired ? "warning" : broker.order_ready ? "success" : broker.status === "missing_credentials" ? "danger" : "warning"}>{confirmationRequired ? "수수료 확인 필요" : broker.order_ready ? "READY" : broker.status}</StatusPill>
+        </div>
+      )}
+      {settingsReady && confirmationRequired && (
+        <div {...semanticSurfaceProps("warning", "live-assistant-provisional-note")} role="note">
+          <strong>공식 기본표 참고 임시값 · 본인 적용 수수료 확인 필요</strong>
+          <p>국내 주식·ETF와 미국 주식의 수수료 추정값입니다. 값을 저장하거나 수정해도 본인 계좌의 실제 요율 확인이 완료되지는 않습니다.</p>
+          <p>최소수수료·제세금·자동환전 요율·환전 및 정산 비용은 미확인입니다. 실제 주문은 계속 차단됩니다.</p>
         </div>
       )}
       {settingsReady && diagnostic && (
@@ -5071,19 +5096,20 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         {visibleFields.map((field) => {
           const value = draft[field.key] ?? "";
           const status = assistantFieldStatus(field, value);
-          const fieldTone = status === "done" ? "success" : status === "block" ? "danger" : "neutral";
+          const fieldTone = status === "done" ? "success" : status === "block" ? "danger" : status === "confirm" ? "warning" : "neutral";
           const boolChecked = field.kind === "bool" && settingsBooleanValue(value);
           return (
             <label
               {...semanticSurfaceProps(
                 fieldTone,
-                `live-assistant-field ${field.kind} ${boolChecked ? "active" : ""}`,
+                `live-assistant-field ${field.kind} ${boolChecked ? "active" : ""} ${isProvisionalKisFeeField(field) ? "provisional-fee" : ""}`,
               )}
               key={field.key}
             >
               <div>
                 <strong>{field.label}</strong>
-                {field.kind === "select" && field.detail && <span>{field.detail}</span>}
+                {(field.kind === "select" || isProvisionalKisFeeField(field)) && field.detail && <span>{field.detail}</span>}
+                {isProvisionalKisFeeField(field) && <em>임시값 · 단위 % · 확인 필요</em>}
               </div>
               {field.kind === "bool" ? (
                 <ToggleSwitch
@@ -5104,7 +5130,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
                   value={String(value)}
                 />
               )}
-              <StatusPill tone={fieldTone}>{status === "done" ? "DONE" : status === "block" ? "BLOCK" : "WAIT"}</StatusPill>
+              <StatusPill tone={fieldTone}>{status === "done" ? "DONE" : status === "block" ? "BLOCK" : status === "confirm" ? "확인 필요" : "WAIT"}</StatusPill>
             </label>
           );
         })}
@@ -5183,8 +5209,14 @@ function assistantFieldStatus(field, value) {
   const configured = field.kind === "secret" ? Boolean(field.configured || hasDraftValue) : hasDraftValue;
   if (field.key === "LIVE_TRADER_ENABLE_REAL_ORDERS" && String(value).toLowerCase() !== "true") return "wait";
   if (field.required && !configured) return "block";
+  if (isProvisionalKisFeeField(field) || field.confirmationRequired === true || field.estimateOnly === true) return "confirm";
   if (!configured) return "wait";
   return "done";
+}
+
+function isProvisionalKisFeeField(field) {
+  return ["KIS_ESTIMATED_KRX_STOCK_FEE_PERCENT", "KIS_ESTIMATED_KRX_ETF_FEE_PERCENT",
+    "KIS_ESTIMATED_NXT_STOCK_FEE_PERCENT", "KIS_ESTIMATED_US_FEE_PERCENT"].includes(field?.key);
 }
 
 function clearSecretDrafts(fields, draft) {

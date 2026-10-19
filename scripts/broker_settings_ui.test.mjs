@@ -23,7 +23,7 @@ const isolatedSource = `
 import React, { useEffect, useRef, useState } from "react";
 import { getEnvSettings } from "./api";
 import { PanelHeader, StatusPill, NestedTabs, ToggleSwitch, Save, semanticSurfaceProps } from "test-presentation";
-${["settingsBooleanValue", "assistantFieldStatus", "clearSecretDrafts", "BrokerConnectionAssistant"].map(functionSource).join("\n")}
+${["settingsBooleanValue", "isProvisionalKisFeeField", "assistantFieldStatus", "clearSecretDrafts", "BrokerConnectionAssistant"].map(functionSource).join("\n")}
 export default BrokerConnectionAssistant;
 `;
 const transformed = transformSync(isolatedSource, {
@@ -82,6 +82,25 @@ function fundingSettings() {
       { value: "FOREIGN_CASH", label: "외화 현금 (사전환전)" },
     ],
   });
+  return value;
+}
+function feeSettings() {
+  const value = fundingSettings();
+  for (const [key, amount, label] of [
+    ["KIS_ESTIMATED_KRX_STOCK_FEE_PERCENT", "0.0140527", "KRX 주식 임시 수수료 (%)"],
+    ["KIS_ESTIMATED_KRX_ETF_FEE_PERCENT", "0.0146527", "KRX ETF 임시 수수료 (%)"],
+    ["KIS_ESTIMATED_NXT_STOCK_FEE_PERCENT", "0.0130527", "NXT 주식 임시 수수료 (%)"],
+    ["KIS_ESTIMATED_US_FEE_PERCENT", "0.25", "미국 임시 수수료 (%)"],
+  ]) value.fields.push({ key, kind: "text", group: "kis", label,
+    detail: "공식표 참고 임시값 · 본인/API/우대율 및 최소수수료·제세금·자동환전 별도 확인",
+    configured: true, required: false, value: amount, default: amount,
+    confirmationRequired: true, estimateOnly: true, status: "PROVISIONAL_CONFIRMATION_REQUIRED",
+    rateUnit: "PERCENT", sourceClassification: "PUBLIC_BASELINE_NOT_PERSONAL_AGREEMENT",
+    sourceUrl: key === "KIS_ESTIMATED_US_FEE_PERCENT"
+      ? "https://www.truefriend.com/main/bond/research/_static/TF03ca050000.jsp"
+      : "https://www.truefriend.com/main/customer/guide/_static/TF04ae010000.jsp?templet-bypass=true",
+    accountFeeRateApproved: false, actualPersonalFeeObserved: false, actualFeeObserved: false,
+    quantityAuthorityGranted: false, orderAuthorityGranted: false, productionReady: false, financialReady: false });
   return value;
 }
 const success = () => ({ ok: true, settings: settings() });
@@ -165,6 +184,7 @@ function harness(props = {}) {
       const label = elements(tree, "label").find((item) => item.key === key);
       return elements(label, "input")[0];
     },
+    field(key) { return elements(tree, "label").find((item) => item.key === key); },
     select(key) {
       const label = elements(tree, "label").find((item) => item.key === key);
       return elements(label, "select")[0];
@@ -197,6 +217,90 @@ test("pending settings read never presents READY or stale broker readiness", asy
   } finally {
     release(response(success()));
     await view.settle();
+    view.unmount();
+  }
+});
+
+test("filled official fee defaults stay amber and unconfirmed despite stale broker READY", async () => {
+  setup({ ok: true, settings: feeSettings() });
+  const view = harness({ brokers: [{ broker_id: "kis", order_ready: true, name: "KIS fixture", detail: "연결 관측" }] });
+  const html = await view.settle();
+  assert.match(html, /공식 기본표 참고 임시값 · 본인 적용 수수료 확인 필요/);
+  assert.match(html, /수수료 확인 필요/);
+  assert.match(html, /최소수수료·제세금·자동환전 요율·환전 및 정산 비용은 미확인/);
+  assert.match(html, /실제 주문은 계속 차단/);
+  assert.doesNotMatch(html, /READY|설정 확인<\/span>/);
+  for (const field of feeSettings().fields.filter((item) => item.key.startsWith("KIS_ESTIMATED_"))) {
+    assert.equal(view.input(field.key).props.value, field.default, "default must be a real editable value");
+    const label = view.field(field.key);
+    assert.equal(label.props["data-tone"], "warning");
+    assert.match(renderToStaticMarkup(label), /임시값 · 단위 % · 확인 필요/);
+    assert.doesNotMatch(renderToStaticMarkup(label), /DONE/);
+  }
+  assert.equal(view.saveButton().props.disabled, false);
+  view.unmount();
+});
+
+test("editing and saving provisional fees does not verify them or grant orders", async () => {
+  setup({ ok: true, settings: feeSettings() });
+  const view = harness();
+  await view.settle();
+  view.edit("KIS_ESTIMATED_US_FEE_PERCENT", "0.2");
+  respond = async (_url, options) => {
+    const posted = JSON.parse(options.body);
+    assert.equal(posted.values.KIS_ESTIMATED_US_FEE_PERCENT, "0.2");
+    assert.equal(posted.confirmed, false);
+    const saved = feeSettings();
+    saved.fields.find((field) => field.key === "KIS_ESTIMATED_US_FEE_PERCENT").value = "0.2";
+    return response({ ok: true, settings: saved });
+  };
+  await view.save();
+  const html = view.render();
+  assert.match(html, /설정을 저장했습니다/);
+  assert.match(html, /임시 수수료는 계속 확인이 필요/);
+  assert.equal(view.input("KIS_ESTIMATED_US_FEE_PERCENT").props.value, "0.2");
+  assert.equal(view.field("KIS_ESTIMATED_US_FEE_PERCENT").props["data-tone"], "warning");
+  assert.doesNotMatch(renderToStaticMarkup(view.field("KIS_ESTIMATED_US_FEE_PERCENT")), /DONE/);
+  assert.doesNotMatch(html, /READY|설정 확인<\/span>/);
+  assert.deepEqual(calls.map((call) => call.method), ["GET", "POST"]);
+  view.unmount();
+});
+
+test("known fee keys reject removed or forged provisional metadata on load and save", async () => {
+  const mutations = [
+    (field) => { delete field.confirmationRequired; },
+    (field) => { field.confirmationRequired = false; },
+    (field) => { delete field.estimateOnly; },
+    (field) => { field.estimateOnly = false; },
+    (field) => { field.status = "VERIFIED"; },
+    (field) => { field.rateUnit = "FRACTION"; },
+    (field) => { field.sourceClassification = "PERSONAL_AGREEMENT"; },
+    (field) => { field.actualFeeObserved = true; },
+    (field) => { field.orderAuthorityGranted = 0; },
+    (field) => { field.sourceUrl = "javascript:alert(1)"; },
+    (field) => { field.value = 0.25; },
+    (field) => { field.value = "NaN"; },
+    (field) => { field.default = "0"; },
+    (field) => { field.group = "binance"; },
+    (field) => { field.kind = "secret"; },
+  ];
+  for (const mutate of mutations) {
+    const invalid = feeSettings();
+    mutate(invalid.fields.at(-1));
+    setup({ ok: true, settings: invalid });
+    let view = harness();
+    assert.match(await view.settle(), /확인 실패/);
+    assert.equal(view.saveButton().props.disabled, true);
+    assert.doesNotMatch(view.render(), /설정 확인<\/span>|READY/);
+    view.unmount();
+    setup({ ok: true, settings: feeSettings() });
+    view = harness();
+    await view.settle();
+    respond = async () => response({ ok: true, settings: invalid });
+    await view.save();
+    assert.match(view.render(), /저장 결과를 확인하지 못했습니다/);
+    assert.doesNotMatch(view.render(), /저장했습니다|설정 확인<\/span>|READY/);
+    assert.equal(view.saveButton().props.disabled, true);
     view.unmount();
   }
 });
