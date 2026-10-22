@@ -628,6 +628,8 @@ class UpbitFunctionalMutationEdge:
                 + ",".join(prepared.blocked_reasons)
             )
         def mark_and_send() -> Mapping[str, Any]:
+            from .short_live_order_authority import check_short_live_authority
+            check_short_live_authority("UPBIT")
             try:
                 marker = self.post_boundary_marker(claim_id, request_hash)
             except Exception as exc:

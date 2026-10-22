@@ -154,9 +154,15 @@ def send_binance_signed_request(
     *,
     futures: bool = False,
 ) -> dict[str, object]:
-    response = send_prepared_request(builder())
+    from .short_live_order_authority import short_live_dispatch_present, validate_short_live_prepared_request
+    prepared = builder()
+    short_mutation = short_live_dispatch_present() and str(prepared.method).upper() in {"POST", "DELETE", "PUT"}
+    validate_short_live_prepared_request(prepared, consume=short_mutation)
+    response = send_prepared_request(prepared)
     payload = response.get("json") if isinstance(response.get("json"), dict) else {}
     if int(payload.get("code") or 0) == -1021:
+        if short_mutation:
+            return response  # Never replay a short-session mutation, even -1021.
         refresh_binance_time_offset(futures=futures)
         response = send_prepared_request(builder())
     return response
@@ -2999,6 +3005,8 @@ class LiveBrokerRouter:
         raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
 
     def place_order(self, intent: dict[str, object]) -> dict[str, object]:
+        from .short_live_order_authority import validate_short_live_native_payload, validate_short_live_normalized_payload, validate_short_live_prepared_request
+        validate_short_live_native_payload(intent)
         if not real_orders_enabled():
             raise BrokerNotReadyError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 아니므로 실주문 전송을 차단했습니다.")
         broker_id = str(intent.get("broker_id") or intent.get("broker") or "").lower()
@@ -3012,6 +3020,7 @@ class LiveBrokerRouter:
                     prepared = build_kis_live_order_request(
                         intent, access_token=token
                     )
+                    validate_short_live_prepared_request(prepared)
                     authority_intent = build_kis_mutation_authority_intent(
                         prepared,
                         operation="PLACE_ORDER",
@@ -3060,6 +3069,7 @@ class LiveBrokerRouter:
         if broker_id == "binance":
             try:
                 normalized_intent = normalize_binance_spot_intent(intent)
+                validate_short_live_normalized_payload(normalized_intent)
             except RuntimeError as exc:
                 raise BrokerNotReadyError(str(exc)) from exc
             try:
@@ -3078,6 +3088,7 @@ class LiveBrokerRouter:
                 normalized_intent = normalize_binance_futures_intent(
                     intent
                 )
+                validate_short_live_normalized_payload(normalized_intent)
             except RuntimeError as exc:
                 raise BrokerNotReadyError(str(exc)) from exc
             position_mode_payload = ensure_response_ok(
@@ -3092,6 +3103,11 @@ class LiveBrokerRouter:
                 if isinstance(position_mode_payload, dict)
                 else {}
             )
+            from .short_live_order_authority import short_live_dispatch_present
+            if short_live_dispatch_present():
+                actual_mode = position_mode.get("dualSidePosition")
+                if type(actual_mode) is not bool or normalized_intent.get("position_mode") != ("HEDGE" if actual_mode else "ONE_WAY"):
+                    raise BrokerNotReadyError("SHORT_LIVE_FUTURES_POSITION_MODE_CHANGED")
             symbol = str(normalized_intent.get("symbol") or "")
             symbol_config_payload = ensure_response_ok(
                 "binance-futures",
@@ -3126,6 +3142,7 @@ class LiveBrokerRouter:
                 raise BrokerNotReadyError(str(exc)) from exc
         if broker_id == "upbit":
             prepared = build_upbit_order_request(intent)
+            validate_short_live_prepared_request(prepared, consume=True)
             try:
                 with ordinary_upbit_final_mutation_boundary(
                     operation="PLACE_ORDER"
@@ -3659,6 +3676,8 @@ class LiveBrokerRouter:
             raise BrokerNotReadyError(str(exc)) from exc
 
     def cancel_order(self, broker_id: str, broker_order_id: str, **context: object) -> dict[str, object]:
+        from .short_live_order_authority import validate_short_live_native_payload, validate_short_live_prepared_request
+        validate_short_live_native_payload({"broker_id": broker_id, "broker_order_id": broker_order_id, **context})
         if not real_orders_enabled():
             raise BrokerNotReadyError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 아니므로 실제 주문 취소 전송을 차단했습니다.")
         broker_id = broker_id.lower().strip()
@@ -3690,6 +3709,7 @@ class LiveBrokerRouter:
                     prepared = build_kis_cancel_order_request(
                         order, access_token=token
                     )
+                    validate_short_live_prepared_request(prepared)
                     domestic_cancel = (
                         prepared.endpoint == KIS_DOMESTIC_CANCEL_ENDPOINT
                     )
@@ -3785,6 +3805,7 @@ class LiveBrokerRouter:
                 broker_order_id,
                 identifier=bool(context.get("identifier")),
             )
+            validate_short_live_prepared_request(prepared, consume=True)
             try:
                 with ordinary_upbit_final_mutation_boundary(
                     operation="CANCEL_ORDER"

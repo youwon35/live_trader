@@ -36,6 +36,12 @@ class EnvSettingField:
 
 
 ENV_SETTING_FIELDS = (
+    EnvSettingField("SHORT_LIVE_KIS_COST_CONFIRMED", "짧은 시험: 본인 KIS 비용 확인", "본인 계좌의 실제 적용 수수료와 매도세율을 확인한 경우에만 켜세요. 공개 임시 요율을 실제 요율로 취급하지 않습니다.", "kis", "bool", "false"),
+    EnvSettingField("SHORT_LIVE_KIS_COST_SOURCE", "짧은 시험: KIS 비용 확인 근거", "본인 계좌 요율을 확인한 문서·상담·조회 근거를 적습니다. 계좌번호나 인증정보는 넣지 마세요.", "kis", "text"),
+    EnvSettingField("SHORT_LIVE_KIS_COST_SYMBOLS", "짧은 시험: 확인 요율 적용 종목", "확인한 동일 수수료·세율이 적용되는 6자리 종목코드를 쉼표로 구분합니다. 다른 세율의 주식과 ETF를 섞지 마세요.", "kis", "text"),
+    EnvSettingField("SHORT_LIVE_KIS_COST_OBSERVED_AT", "짧은 시험: 비용 확인 시각", "확인 시각을 시간대 포함 ISO 형식으로 입력합니다. 예: 2026-10-22T15:00:00+09:00. 24시간 이내 확인만 사용합니다.", "kis", "text"),
+    EnvSettingField("SHORT_LIVE_KIS_FEE_RATE", "짧은 시험: KIS 수수료율", "백분율이 아닌 비율로 입력합니다. 실제 적용 요율을 확인해야 하며 빈 값은 시험을 차단합니다.", "kis", "text"),
+    EnvSettingField("SHORT_LIVE_KIS_SELL_TAX_RATE", "짧은 시험: KIS 매도세율", "선택한 종목에 적용되는 매도세율을 비율로 입력합니다. 세금 면제도 확인 근거가 필요합니다.", "kis", "text"),
     EnvSettingField("KIS_APP_KEY", "KIS app key", "KIS 실전투자 app key입니다.", "kis", "secret", required=True),
     EnvSettingField("KIS_APP_SECRET", "KIS app secret", "KIS 실전투자 app secret입니다.", "kis", "secret", required=True),
     EnvSettingField("KIS_ACCOUNT_NO", "KIS 실계좌 번호", "한국투자증권 로그인 ID가 아니라 실계좌 번호(CANO) 앞 8자리입니다.", "kis", "secret", required=True),

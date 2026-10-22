@@ -51,6 +51,7 @@ export function prepareMarketGapsForStart(selection, { accountKey, label, contin
 let functionalHttpSessionFlight = null;
 let functionalHttpSessionGeneration = 0;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
+  "/api/short-live-tests/prepare", "/api/short-live-tests/start", "/api/short-live-tests/stop",
   "/api/preparation/market-gaps/begin", "/api/preparation/market-gaps/cancel",
   "/api/runtime/kis-manual-start-challenge",
   "/api/runtime/kis-native-prepare-cancel",
@@ -69,6 +70,7 @@ const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/crypto-first-live/reprepare",
 ]);
 const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
+  "/api/short-live-tests/snapshot",
   "/api/preparation/market-gaps/status",
   "/api/paper-candidates",
   "/api/paper-candidates/accounts",

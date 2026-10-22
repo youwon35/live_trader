@@ -21,6 +21,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping
 
 from .emergency_stop import emergency_stop_dispatch_boundary
+from .short_live_order_authority import check_short_live_authority
 
 
 class KisOrderAuthorityError(RuntimeError):
@@ -156,6 +157,7 @@ def kis_specialized_operational_fence_status(*, scoped_reader, specialized_reade
 
 
 def _scoped_read(*, intent=None, consume=False, prepared_request=None):
+    check_short_live_authority("KIS")
     dispatch = getattr(_THREAD_BOUNDARY, "scoped_dispatch", None)
     if dispatch is None or _SCOPED_OPERATIONAL_READER is None:
         raise KisOrderAuthorityError("KIS operational state-owned dispatch context is missing")
@@ -263,6 +265,7 @@ def register_kis_scoped_cleanup_reader(reader):
 
 
 def _cleanup_read(*, intent=None, prepared_request=None, consume=False):
+    check_short_live_authority("KIS")
     context = getattr(_THREAD_BOUNDARY, "scoped_cleanup", None)
     if context is None or _SCOPED_CLEANUP_READER is None:
         raise KisOrderAuthorityError("KIS cleanup requires its state-owned STOP reservation")
@@ -346,6 +349,7 @@ def scoped_kis_cleanup_final_boundary(*, operation, intent, prepared_request):
 
 
 def _require_specialized_writer_not_excluded():
+    check_short_live_authority("KIS")
     # Production installs this reader before exposing a runtime. Unknown is
     # deliberately closed; a missing graph is not positive inactivity proof.
     if _SPECIALIZED_EXCLUSION_READER is not None:
@@ -1309,6 +1313,7 @@ def kis_authenticated_mutation_preflight(
                 )
             control = snapshot["controlReservation"]
             if normalized_mode == "ORDINARY":
+                short_scope = check_short_live_authority("KIS")
                 if emergency.get("active") is True:
                     raise KisOrderAuthorityError(
                         "ordinary KIS authentication blocked by durable emergency stop"
@@ -1317,11 +1322,11 @@ def kis_authenticated_mutation_preflight(
                     raise KisOrderAuthorityError(
                         "ordinary KIS authentication blocked by control reservation"
                     )
-                if (
+                if (not short_scope and (
                     snapshot["functionalAuthorityOpen"] is True
                     or snapshot["functionalPhase"] in _OPEN_PHASES
                     or snapshot["ordinaryRoutesClosed"] is True
-                ):
+                )):
                     raise KisOrderAuthorityError(
                         "ordinary KIS authentication blocked by functional authority"
                     )
@@ -1535,6 +1540,7 @@ def ordinary_kis_final_mutation_boundary(
                     endpoint=endpoint,
                     payload_hash=payload_hash,
                 )
+                short_scope = check_short_live_authority("KIS", operation=operation)
                 snapshot = _snapshot()
                 if initial_snapshot is not None:
                     _validate_inherited_snapshot(initial_snapshot, snapshot)
@@ -1546,11 +1552,11 @@ def ordinary_kis_final_mutation_boundary(
                     raise KisOrderAuthorityError(
                         "ordinary KIS mutation blocked by active control reservation"
                     )
-                if (
+                if (not short_scope and (
                     snapshot["functionalAuthorityOpen"] is True
                     or snapshot["functionalPhase"] in _OPEN_PHASES
                     or snapshot["ordinaryRoutesClosed"] is True
-                ):
+                )):
                     raise KisOrderAuthorityError(
                         "ordinary KIS mutation blocked by functional authority"
                     )

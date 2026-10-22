@@ -37,6 +37,7 @@ STRATEGY_SEARCH_PRESET_SCHEMA = "strategy-search-presets-v1"
 STRATEGY_SEARCH_PRESET_LIMIT = 30
 _FUNCTIONAL_STATUS_PATHS = frozenset(
     {
+        "/api/short-live-tests/snapshot",
         "/api/paper-candidates",
         "/api/paper-candidates/accounts",
         "/api/preparation/sources",
@@ -48,6 +49,9 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
 )
 _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
+        "/api/short-live-tests/prepare",
+        "/api/short-live-tests/start",
+        "/api/short-live-tests/stop",
         "/api/runtime/kis-manual-start-challenge",
         "/api/runtime/kis-native-prepare-cancel",
         "/api/preparation/market-gaps/begin",
@@ -427,6 +431,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             require_origin=False
         ):
             return
+        if parsed.path == "/api/short-live-tests/snapshot":
+            self.send_json(state.short_live_test_request("snapshot"))
+            return
         if parsed.path == "/api/preparation/market-gaps/status":
             query = parse_qs(parsed.query, keep_blank_values=True)
             if set(query) != {"preparationId"} or len(query["preparationId"]) != 1:
@@ -617,6 +624,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "reason": "현재 앱 화면에서만 메모를 저장할 수 있습니다."})
                 return
         payload = self.read_json()
+        if parsed.path in {"/api/short-live-tests/prepare", "/api/short-live-tests/start", "/api/short-live-tests/stop"}:
+            if parsed.query or not isinstance(payload, dict):
+                self.send_json({"ok": False, "reasonCode": "EXACT_SHORT_LIVE_REQUEST_REQUIRED"})
+                return
+            self.send_json(state.short_live_test_request(parsed.path.rsplit("/", 1)[1], payload))
+            return
         if parsed.path == "/api/paper-candidates/review":
             self.send_json(state.review_paper_candidate_metadata(payload))
             return

@@ -1577,6 +1577,12 @@ def build_binance_spot_order_request(intent: dict[str, object], *, test: bool = 
         query["quoteOrderQty"] = quote_order_quantity
     else:
         query["quantity"] = quantity
+    identifier = str(intent.get("identifier") or intent.get("new_client_order_id") or "").strip()
+    if identifier:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,36}", identifier):
+            blocked.append("newClientOrderId")
+        else:
+            query["newClientOrderId"] = identifier
     query["timestamp"] = binance_timestamp_ms()
     if order_type == "LIMIT":
         query["timeInForce"] = str(intent.get("time_in_force") or "GTC")

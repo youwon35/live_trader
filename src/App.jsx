@@ -185,6 +185,7 @@ const StatusCard = createStatusCard(React);
 const SharedStatusRow = createStatusRow(React);
 const ToggleSwitch = createToggleSwitch(React);
 const FunctionalTestWorkspace = React.lazy(() => import("./FunctionalTestWorkspace"));
+const ShortLiveTestPanel = React.lazy(() => import("./ShortLiveTestPanel.jsx"));
 const navItems = [
   { id: "overview", label: "시작 점검", icon: LayoutDashboard },
   { id: "gate", label: "운용 전략", icon: ListChecks },
@@ -1857,6 +1858,27 @@ function strategyDeploymentContext(strategy = null) {
   };
 }
 
+export function shortLiveHeaderState(snapshot = {}) {
+  const status = snapshot.short_live_test_status;
+  if (status?.known !== true || status.active !== true) return null;
+  const uncertain = snapshot.api_connected === false || status.ownerAlive !== true;
+  const stopping = status.globalStopRequested === true || status.newEntriesBlocked !== false
+    || !["STARTING", "RUNNING", "PENDING_FILL"].includes(status.status);
+  const unknownOrders = Number.isFinite(status.unknownOrderCount) && status.unknownOrderCount > 0;
+  const pending = Number.isInteger(status.pendingOrderCount) && status.pendingOrderCount >= 0 ? status.pendingOrderCount : null;
+  return {
+    label: uncertain ? "짧은 실거래 상태 미확인" : unknownOrders ? "짧은 실거래 주문 상태 미확정"
+      : status.globalStopRequested === true ? "짧은 실거래 중지 요청됨"
+        : stopping ? "짧은 실거래 종료 확인 중" : "짧은 실거래 기능시험 실행 중",
+    tone: "warning", entriesBlocked: uncertain || stopping || unknownOrders || pending > 0,
+    entriesLabel: uncertain ? "시험 진입 상태 미확인 · 실제 주문 대조 필요"
+      : stopping || unknownOrders ? "시험 신규 진입 차단 · 종료 대조 중"
+        : pending > 0 ? "시험 새 주문 대기 · 체결 대조 중" : "시험 신규 진입 허용",
+    queueLabel: `미결 주문 일반 ${snapshot.order_queue?.active || 0} / 시험 ${pending ?? "미확인"}`,
+    observedAt: typeof status.observedAt === "string" ? status.observedAt : "",
+  };
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState(fallbackSnapshot);
   const [selectedNav, setSelectedNav] = useState(() => readGuidedFlowStep(LIVE_FLOW_STORAGE_KEY, LIVE_FLOW_IDS, "overview"));
@@ -1954,7 +1976,7 @@ function App() {
   }
 
   const liveRuntimeActive = Boolean(
-    snapshot.continuous_runtime?.running || snapshot.execution_streams?.running,
+    snapshot.continuous_runtime?.running || snapshot.execution_streams?.running || snapshot.short_live_test_status?.active === true,
   );
   const pollingIntervals = livePollingIntervals(liveRuntimeActive);
 
@@ -2415,6 +2437,7 @@ function App() {
     || null;
   const deploymentContext = strategyDeploymentContext(selectedStrategy);
   const selectedRuntimeMode = runtimeModeForDeployment(snapshot, deploymentContext);
+  const shortLiveHeader = shortLiveHeaderState(snapshot);
   const notifications = buildNotificationItems(snapshot, error);
   const notificationKey = notificationFingerprint(notifications);
   const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
@@ -2481,14 +2504,15 @@ function App() {
             </div>
           </div>
           <div className="topbar-actions">
-            <StatusPill tone={selectedRuntimeMode === "FULL_LIVE" ? "danger" : selectedRuntimeMode === "SMALL_LIVE" ? "warning" : "info"}>
-              {liveRuntimeModeLabel(selectedRuntimeMode)}
+            <StatusPill tone={shortLiveHeader?.tone || (selectedRuntimeMode === "FULL_LIVE" ? "danger" : selectedRuntimeMode === "SMALL_LIVE" ? "warning" : "info")}
+              title={shortLiveHeader?.observedAt ? `기능시험 상태 관측 ${shortLiveHeader.observedAt}` : undefined}>
+              {shortLiveHeader?.label || liveRuntimeModeLabel(selectedRuntimeMode)}
             </StatusPill>
-            <StatusPill tone={snapshot.new_entries_blocked ? "warning" : "success"}>
-              신규 진입 {snapshot.new_entries_blocked ? "차단" : "허용"}
+            <StatusPill tone={(shortLiveHeader ? shortLiveHeader.entriesBlocked : snapshot.new_entries_blocked) ? "warning" : "success"}>
+              {shortLiveHeader?.entriesLabel || `신규 진입 ${snapshot.new_entries_blocked ? "차단" : "허용"}`}
             </StatusPill>
             <StatusPill tone={(snapshot.order_queue?.active || 0) ? "warning" : "neutral"}>
-              미결 주문 {snapshot.order_queue?.active || 0}
+              {shortLiveHeader?.queueLabel || `미결 주문 ${snapshot.order_queue?.active || 0}`}
             </StatusPill>
             <div className="notification-wrap" ref={notificationRef}>
               <IconButton
@@ -2882,7 +2906,7 @@ function WorkspaceContent({
           </section>
         )}
       >
-        <FunctionalTestWorkspace snapshot={snapshot} />
+        <ShortLiveTestPanel legacyWorkspace={<FunctionalTestWorkspace snapshot={snapshot} />} />
       </React.Suspense>,
     );
   }

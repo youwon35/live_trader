@@ -59,11 +59,15 @@ def main() -> None:
         def remember_window_state(*_args: object) -> None:
             nonlocal shutdown_requested
             shutdown_requested = True
+            from .short_live_runtime import desktop_window_closing
+            desktop_window_closing()
             _save_window_state(window)
 
         def mark_window_visible(*_args: object) -> None:
             nonlocal window_was_visible
             window_was_visible = True
+            from .short_live_runtime import desktop_window_shown
+            desktop_window_shown()
 
         try:
             window.events.closing += remember_window_state
@@ -90,6 +94,8 @@ def main() -> None:
         else:
             print(f"WebView 종료 중 예외가 발생해 서버를 정리합니다: {exc}")
     finally:
+        from .short_live_runtime import desktop_window_closing
+        desktop_window_closing()
         server.shutdown()
 
 

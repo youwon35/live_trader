@@ -11548,6 +11548,20 @@ def _attach_canary_execution_for_display(strategies: list[dict[str, Any]]) -> No
         )
 
 
+def short_live_test_request(action: str, payload=None) -> dict[str, Any]:
+    # Lazy composition: opening the regular dashboard cannot start a test.
+    from .short_live_runtime import request
+    return request(action, payload)
+
+
+def short_live_status_snapshot():
+    # Header projection only: never import/create the service or acquire its
+    # lock while the regular state snapshot may already own state locks.
+    module = sys.modules.get(__package__ + ".short_live_runtime")
+    peek = getattr(module, "peek_status", None)
+    return peek() if callable(peek) else None
+
+
 def snapshot() -> dict[str, Any]:
     brokers = [broker.to_dict() for broker in broker_readiness()]
     portfolios = portfolio_rows()
@@ -11590,6 +11604,7 @@ def snapshot() -> dict[str, Any]:
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "execution_availability": ordinary_execution_availability(continuous_runtime),
+        "short_live_test_status": short_live_status_snapshot(),
         "mode": STATE["mode"],
         "dry_run": STATE["dry_run"],
         "kill_switch": effective_kill_switch,
@@ -11951,6 +11966,8 @@ def _set_mode_serialized(mode: str) -> dict[str, Any]:
     if normalized == "MONITOR":
         # Publish the safety reduction before waiting for a worker. Even an
         # engine downgrade/stop failure must never retain LIVE authority.
+        from .short_live_runtime import request_global_stop
+        request_global_stop()
         with RUNTIME_MODE_LOCK:
             STATE["mode"] = "MONITOR"
             for profile in STATE["automation"].values():

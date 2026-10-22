@@ -7,6 +7,7 @@ import threading
 from typing import Any, Callable, Iterator, Mapping
 
 from .emergency_stop import emergency_stop_dispatch_boundary
+from .short_live_order_authority import check_short_live_authority
 
 
 class UpbitOrderAuthorityError(RuntimeError):
@@ -110,8 +111,9 @@ def _snapshot() -> dict[str, Any]:
 
 
 def _ordinary_snapshot() -> dict[str, Any]:
+    short_scope = check_short_live_authority("UPBIT")
     snapshot = _snapshot()
-    if snapshot["functionalAuthorityOpen"] is not False:
+    if not short_scope and snapshot["functionalAuthorityOpen"] is not False:
         raise UpbitOrderAuthorityError(
             "upbit-functional-authority-blocks-ordinary-mutation"
         )
@@ -123,7 +125,7 @@ def _ordinary_snapshot() -> dict[str, Any]:
         raise UpbitOrderAuthorityError(
             "ordinary-upbit-mutation-real-orders-disabled"
         )
-    if snapshot["ordinaryRoutesClosed"] is not False:
+    if not short_scope and snapshot["ordinaryRoutesClosed"] is not False:
         raise UpbitOrderAuthorityError(
             "ordinary-upbit-routes-closed"
         )
@@ -156,6 +158,7 @@ def ordinary_upbit_final_mutation_boundary(
         # State owns route -> emergency across its final risk check.  The
         # router reuses that exact same-thread lease, but still rereads the
         # durable state immediately before its physical send.
+        check_short_live_authority("UPBIT", operation=operation)
         final_snapshot = _ordinary_snapshot()
         yield {**dict(inherited), **final_snapshot}
         return
@@ -170,6 +173,7 @@ def ordinary_upbit_final_mutation_boundary(
                 raise UpbitOrderAuthorityError(
                     f"ordinary Upbit {operation} blocked by durable emergency stop"
                 )
+            check_short_live_authority("UPBIT", operation=operation)
             final_snapshot = _ordinary_snapshot()
             composite = {
                 **final_snapshot,

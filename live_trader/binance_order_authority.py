@@ -8,6 +8,7 @@ import threading
 from typing import Any, Callable, Iterator, Mapping
 
 from .emergency_stop import emergency_stop_dispatch_boundary
+from .short_live_order_authority import check_short_live_authority
 
 
 class BinanceOrderAuthorityError(RuntimeError):
@@ -97,6 +98,7 @@ def ordinary_binance_final_mutation_boundary(
         # already retain route -> emergency through the immediate adapter
         # send.  Reuse that unforgeable thread-local lease so the adapter does
         # not reacquire either boundary in a different order.
+        check_short_live_authority("BINANCE", operation=operation)
         yield inherited
         return
 
@@ -106,12 +108,13 @@ def ordinary_binance_final_mutation_boundary(
                 raise BinanceOrderAuthorityError(
                     f"Binance {operation} blocked by durable emergency stop"
                 )
+            short_scope = check_short_live_authority("BINANCE", operation=operation)
             snapshot = _snapshot()
             if snapshot.get("applicationInstanceLeaseHeld") is not True:
                 raise BinanceOrderAuthorityError(
                     "Binance mutation requires the official application lease"
                 )
-            if snapshot.get("functionalAuthorityOpen") is not False:
+            if not short_scope and snapshot.get("functionalAuthorityOpen") is not False:
                 raise BinanceOrderAuthorityError(
                     "ordinary Binance mutation blocked by functional authority"
                 )
@@ -135,6 +138,7 @@ def functional_binance_final_mutation_boundary(
     """Bind functional POST to phase/revision and serialize STOP/Kill races."""
 
     with _ROUTE_LOCK:
+        check_short_live_authority("BINANCE")
         with emergency_stop_dispatch_boundary() as emergency:
             if emergency.get("active") is True and not cleanup_only:
                 raise BinanceOrderAuthorityError(
