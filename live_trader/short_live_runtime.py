@@ -41,10 +41,14 @@ class ShortLiveTestService(_ShortLiveTestService):
             public = {"known": True, "active": False, "status": "DISABLED", "pendingOrderCount": 0}
         else:
             keys = ("sessionId", "status", "startedAt", "endsAt", "newEntriesBlocked", "terminalVerified",
-                    "naturalExitObserved", "ownerAlive", "workerAlive", "orderCount", "fillCount", "unknownOrderCount")
+                    "naturalExitObserved", "ownerAlive", "workerAlive", "orderCount", "fillCount", "unknownOrderCount",
+                    "workerRetirementRequired", "workerLaunchState")
             public = {key: deepcopy(runtime.get(key)) for key in keys}
+            never_started = (public["workerRetirementRequired"] is False
+                             and public["workerLaunchState"] == "NOT_ATTEMPTED"
+                             and public["workerAlive"] is False)
             retired = (public["status"] == "TERMINATED" and public["terminalVerified"] is True
-                       and public["naturalExitObserved"] is True)
+                       and (public["naturalExitObserved"] is True or never_started))
             public.update(known=True, active=not retired)
             public["pendingOrderCount"] = sum(row.get("status") in {"SUBMITTING", "UNKNOWN", "ACCEPTED", "PARTIAL"}
                                              for row in (self._session or {}).get("orders", {}).values())

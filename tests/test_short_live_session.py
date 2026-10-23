@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from trading_runtime.continuous_runtime import ClosedBar, OpenBoundary, PortfolioRuntimeEngine, RuntimeStrategySpec
 from trading_runtime.portfolio_runtime import BuiltinBarSignalEvaluator
@@ -365,6 +366,86 @@ class ShortLiveSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(ShortLiveContractError, "WARMUP_INSUFFICIENT"):
             self.start(service)
         self.assertEqual([], brokers["BINANCE_SPOT"].submits)
+
+    def test_background_startup_failure_retires_only_verified_resources_without_fake_worker_exit(self):
+        service, brokers, feeds = self.service()
+        service.background = True
+        feeds["BINANCE_SPOT"].short = True
+        with self.assertRaisesRegex(ShortLiveContractError, "WARMUP_INSUFFICIENT"):
+            self.start(service)
+        runtime = service.snapshot()["runtime"]
+        self.assertEqual("TERMINATED", runtime["status"])
+        self.assertTrue(runtime["terminalVerified"])
+        self.assertFalse(runtime["naturalExitObserved"])
+        self.assertFalse(runtime["workerRetirementRequired"])
+        self.assertEqual("NOT_ATTEMPTED", runtime["workerLaunchState"])
+        self.assertIsNone(service._thread)
+        self.assertTrue(feeds["BINANCE_SPOT"].closed)
+        self.assertEqual(1, brokers["BINANCE_SPOT"].cleanups)
+        self.assertEqual([], brokers["BINANCE_SPOT"].submits)
+        terminal = json.loads(next(service.store_root.glob("session-terminal-*.json")).read_text(encoding="utf-8"))
+        self.assertFalse(terminal["naturalExitObserved"])
+        self.assertFalse(terminal["functionalPass"])
+        self.assertIn("WARMUP_INSUFFICIENT", terminal["firstFailure"])
+        # An explicit new preparation is possible; no automatic restart occurs.
+        self.assertTrue(self.prepare(service)["prepared"]["readyToStart"])
+        self.assertEqual(0, runtime["orderCount"])
+
+    def test_startup_without_worker_still_requires_actual_feed_retirement_and_flat_reconciliation(self):
+        for unknown in ("feed", "account"):
+            with self.subTest(unknown=unknown):
+                service, brokers, feeds = self.service()
+                service.background = True
+                feeds["BINANCE_SPOT"].short = True
+                if unknown == "feed":
+                    feeds["BINANCE_SPOT"].close = lambda: False
+                else:
+                    brokers["BINANCE_SPOT"].reconcile_known = False
+                with self.assertRaisesRegex(ShortLiveContractError, "WARMUP_INSUFFICIENT"):
+                    self.start(service)
+                self.assertEqual("BLOCKED", service.snapshot()["runtime"]["status"])
+                self.assertFalse(service._session["terminalVerified"])
+                self.assertFalse(service._session["naturalExitObserved"])
+                self.assertEqual([], list(service.store_root.glob("session-terminal-*.json")))
+                self.assertEqual([], brokers["BINANCE_SPOT"].submits)
+                _reset_for_tests()
+
+    def test_failed_thread_start_blocks_entries_closes_feed_and_never_claims_exit(self):
+        service, brokers, feeds = self.service()
+        service.background = True
+        with patch("threading.Thread.start", side_effect=RuntimeError("fixture unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "fixture unavailable"):
+                self.start(service)
+        runtime = service.snapshot()["runtime"]
+        self.assertEqual("BLOCKED", runtime["status"])
+        self.assertTrue(runtime["newEntriesBlocked"])
+        self.assertFalse(runtime["terminalVerified"])
+        self.assertFalse(runtime["naturalExitObserved"])
+        self.assertTrue(runtime["workerRetirementRequired"])
+        self.assertEqual("START_FAILED_UNVERIFIED", runtime["workerLaunchState"])
+        self.assertTrue(feeds["BINANCE_SPOT"].closed)
+        self.assertEqual(1, brokers["BINANCE_SPOT"].cleanups)
+        self.assertEqual([], brokers["BINANCE_SPOT"].submits)
+        self.assertIn("STARTUP_FAILED", runtime["firstFailure"])
+        self.assertEqual("BLOCKED", service.close()["runtime"]["status"])
+        self.assertEqual([], list(service.store_root.glob("session-terminal-*.json")))
+
+    def test_explicit_new_session_does_not_poll_old_retired_route_feed(self):
+        service, brokers, feeds = self.service()
+        self.start(service)
+        service.stop()
+        self.assertTrue(feeds["BINANCE_SPOT"].closed)
+        old_poll_calls = []
+        feeds["BINANCE_SPOT"].poll = lambda _: old_poll_calls.append(True) or []
+        new_spec = runtime_spec("UPBIT_KRW_SPOT", "new-scope", "1h")
+        service.catalog_provider.specs = [new_spec]
+        brokers[new_spec["route"]] = Broker(new_spec["route"], new_spec)
+        feeds[new_spec["route"]] = Feed(new_spec)
+        self.start(service)
+        service.tick()
+        self.assertEqual({"UPBIT_KRW_SPOT"}, set(service._feeds))
+        self.assertEqual([], old_poll_calls)
+        self.assertIsNone(service._session["firstFailure"])
 
     def test_loss_expiry_and_owner_exit_stop_entries_and_cleanup_once(self):
         for reason in ("loss", "expiry", "owner"):

@@ -6,11 +6,11 @@ export const SHORT_LIVE_ROUTES = Object.freeze([
 ]);
 export const SHORT_LIVE_TIMEFRAMES = Object.freeze(["5m", "1h", "1d"]);
 export const SHORT_LIVE_CONFIRMATION = "실제 주문 시험 시작";
+export const SHORT_LIVE_BOUNDED_PROFILE = "BOUNDED_TEST_SLEEVE_100_PERCENT_V1";
 export const SHORT_LIVE_DEFAULTS = Object.freeze({
   durationHours: 6, budgetKrwPerBroker: 100000, lossKrwPerBroker: 50000,
 });
 const hashes = /^[0-9a-f]{64}$/i;
-const active = new Set(["RUNNING", "STARTING", "STOPPING", "RECONCILING"]);
 const routeIds = new Set(SHORT_LIVE_ROUTES.map((route) => route.id));
 const strings = (value) => Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
 const text = (value) => typeof value === "string" ? value : "";
@@ -64,6 +64,7 @@ export function shortLiveBlockerLabel(value) {
     FUTURES_CONDITIONAL_ORDER_PRESENT_OR_UNKNOWN: "선물 조건주문이 남아 있거나 조건주문 조회가 미확정임",
     BINANCE_SHARED_BUDGET_ACCOUNT_MISMATCH: "Binance 현물·선물을 같은 거래소 예산으로 묶을 계좌 정보를 확인하지 못함",
     EXCHANGE_SHARED_BUDGET_EXCEEDED: "거래소별 합산 자본 10만원 한도를 초과함",
+    DAILY_LOSS_STOP_REACHED: "이번 시험의 손실 중단 기준에 도달함",
     SHARED_BROKER_BUDGET_EXCEEDED: "거래소별 합산 자본 10만원 한도를 초과함",
     EXCHANGE_BUDGET_TOO_LARGE: "거래소별 자본 한도가 승인된 10만원을 초과함",
     ROUTE_BUDGET_TOO_LARGE: "해당 주문 경로의 배정 자본이 허용 한도를 초과함",
@@ -209,15 +210,20 @@ export function normalizeShortLiveSnapshot(value = {}) {
       sessionId: text(run.sessionId), status: text(run.status) || "UNKNOWN", startedAt: text(run.startedAt), endsAt: text(run.endsAt),
       terminalVerified: run.terminalVerified === true,
       ownerAlive: typeof run.ownerAlive === "boolean" ? run.ownerAlive : null,
+      workerAlive: typeof run.workerAlive === "boolean" ? run.workerAlive : null,
       naturalExitObserved: run.naturalExitObserved === true,
+      workerRetirementRequired: typeof run.workerRetirementRequired === "boolean" ? run.workerRetirementRequired : null,
+      workerLaunchState: text(run.workerLaunchState),
       newEntriesBlocked: typeof run.newEntriesBlocked === "boolean" ? run.newEntriesBlocked : null,
       unknownOrderCount: numeric(run.unknownOrderCount),
       blockers: Array.isArray(run.blockers) ? run.blockers : [],
       brokers: (Array.isArray(run.brokers) ? run.brokers : Array.isArray(run.brokerRows) ? run.brokerRows : []).map((row) => ({
-        broker: sanitizeShortLiveText(row.broker || row.route), budgetKrw: numeric(row.budgetKrw ?? row.routeBudgetKrw),
+        broker: sanitizeShortLiveText(row.broker || row.route), budgetKrw: numeric(row.effectiveRouteBudgetKrw ?? row.budgetKrw ?? row.routeBudgetKrw),
+        brokerBudgetKrw: numeric(row.brokerBudgetKrw),
         exposureKrw: numeric(row.exposureKrw), dailyRealizedLossKrw: numeric(row.dailyRealizedLossKrw ?? row.realizedLossKrw),
         unrealizedLossKrw: numeric(row.unrealizedLossKrw),
         lossLimitKrw: numeric(row.lossLimitKrw ?? row.dailyLossStopKrw),
+        lossBasis: text(row.lossBasis), actualFeeKnown: typeof row.actualFeeKnown === "boolean" ? row.actualFeeKnown : null,
         status: sanitizeShortLiveText(row.status) || (row.ready === true ? "대조 확인" : "미확인"),
       })),
       strategies: (Array.isArray(run.strategies) ? run.strategies : Array.isArray(run.strategyRows) ? run.strategyRows : []).map((row) => ({
@@ -225,6 +231,9 @@ export function normalizeShortLiveSnapshot(value = {}) {
         signal: sanitizeShortLiveText(row.signal || row.lastSignal), signalCount: numeric(row.signalCount),
         decisionCount: numeric(row.decisionCount), orderCount: numeric(row.orderCount),
         fillCount: numeric(row.fillCount), status: sanitizeShortLiveText(row.status),
+        orderAttemptCount: numeric(row.orderAttemptCount), fillObservationCount: numeric(row.fillObservationCount),
+        internalAllocationTransferCount: numeric(row.internalAllocationTransferCount),
+        pluginId: sanitizeShortLiveText(row.pluginId), symbol: sanitizeShortLiveText(row.symbol), route: text(row.route),
         lastObservedAt: text(row.lastObservedAt),
       })),
     } : null,
@@ -238,7 +247,7 @@ export function buildShortLivePrepare(catalog, selectedKeys, limits = SHORT_LIVE
   const durationHours = Number(limits.durationHours);
   if (!Number.isInteger(durationHours) || durationHours < 5 || durationHours > 7) throw new Error("시험 시간은 5~7시간이어야 합니다.");
   if (Number(limits.budgetKrwPerBroker) !== 100000 || Number(limits.lossKrwPerBroker) !== 50000) {
-    throw new Error("거래소별 자본 10만원·일손실 5만원 상한을 유지해야 합니다.");
+    throw new Error("거래소별 자본 10만원·이번 시험 손실 중단 기준 5만원을 유지해야 합니다.");
   }
   const targets = selectedKeys.map((key) => {
     const matches = catalog.filter((item) => item.selectionKey === key);
@@ -258,7 +267,12 @@ export function shortLiveCoverage(catalog = []) {
   })));
 }
 
-export function shortLiveRunning(snapshot) { return active.has(snapshot?.runtime?.status); }
+export function shortLiveRunning(snapshot) {
+  const runtime = snapshot?.runtime;
+  if (!runtime) return false;
+  return !(runtime.status === "TERMINATED" && runtime.terminalVerified === true
+    && (runtime.naturalExitObserved === true || (runtime.workerRetirementRequired === false && runtime.workerLaunchState === "NOT_ATTEMPTED" && runtime.workerAlive === false)));
+}
 export function shortLivePreparationMatches(prepared, catalog, selectedKeys, durationHours) {
   if (!prepared || prepared.durationHours !== durationHours || prepared.budgetKrwPerBroker !== 100000
     || prepared.lossKrwPerBroker !== 50000 || !Array.isArray(prepared.targets)
@@ -283,20 +297,51 @@ export function shortLiveSelectionSignature(catalog, selectedKeys, durationHours
       portfolioFileSha256: row.portfolioFileSha256 };
   }) });
 }
-export function shortLiveCanStart(snapshot, { fresh = false, acknowledged = false, confirmationText = "", selectionUnchanged = false, preparedAuthority = "", preparedScopeMatches = false } = {}) {
+export function shortLiveIsBoundedCandidate(row) {
+  return row.functionalSizingProfiles?.includes(SHORT_LIVE_BOUNDED_PROFILE) === true;
+}
+
+export function shortLiveFilterCandidates(catalog, { route = "ALL", timeframe = "ALL", kind = "ALL", profile = "ALL" } = {}) {
+  return catalog.filter((row) => (route === "ALL" || row.routes.includes(route))
+    && (timeframe === "ALL" || row.timeframes.includes(timeframe)) && (kind === "ALL" || row.kind === kind)
+    && (profile === "ALL" || (profile === "BOUNDED" ? shortLiveIsBoundedCandidate(row) : !shortLiveIsBoundedCandidate(row))));
+}
+
+export function shortLivePreparationWindow(prepared, now = Date.now()) {
+  if (!prepared) return { status: "NONE", remainingSeconds: null };
+  const expiry = Date.parse(prepared.expiresAt);
+  if (!Number.isFinite(expiry) || !Number.isFinite(now)) return { status: "UNKNOWN", remainingSeconds: null };
+  return { status: expiry > now ? "VALID" : "EXPIRED", remainingSeconds: Math.max(0, Math.ceil((expiry - now) / 1000)) };
+}
+
+export function shortLiveCanStart(snapshot, { fresh = false, acknowledged = false, confirmationText = "", selectionUnchanged = false, preparedAuthority = "", preparedScopeMatches = false, now = Date.now() } = {}) {
   const ready = snapshot?.prepared;
   return fresh === true && acknowledged === true && selectionUnchanged === true
     && confirmationText === SHORT_LIVE_CONFIRMATION && ready?.readyToStart === true
     && Boolean(ready.preparationId) && hashes.test(ready.scopeHash)
     && preparedAuthority === `${ready.preparationId}:${ready.scopeHash}`
     && preparedScopeMatches === true
+    && shortLivePreparationWindow(ready, now).status === "VALID"
     && ready.blockers.length === 0 && snapshot.blockers.length === 0 && !shortLiveRunning(snapshot);
 }
 
 export function shortLiveRuntimeMeaning(row) {
-  if (row.timeframe === "1d" && (row.signalCount === null || row.signalCount === 0)) {
+  if (row.fillObservationCount > 0) return "체결 관측 기록이 있습니다. 부분 체결·반복 관측 횟수는 고유 주문 수와 다릅니다.";
+  if (row.fillCount > 0) return "실제 체결 기록이 있습니다. 수익성 검증 결과를 뜻하지 않습니다.";
+  if (row.orderAttemptCount > 0) return "주문 시도가 관측됨 · 실제 체결은 아직 확인되지 않았습니다.";
+  if (row.orderCount > 0) return "주문 기록이 있습니다. 실제 체결 여부를 별도로 확인합니다.";
+  if (row.timeframe === "1h" && row.decisionCount === 0) {
+    return "1시간봉 평가 대기 · 시작 뒤 실제 완성봉 수신과 과거 봉 연결을 확인합니다. 대기는 통과·실패를 뜻하지 않습니다.";
+  }
+  if (row.timeframe === "1h" && row.decisionCount > 0 && row.signal === "HOLD") {
+    return "완성봉 평가됨 · 최근 신호 HOLD. 전략 조건이 충족되지 않으면 주문하지 않습니다.";
+  }
+  if (row.timeframe === "1d" && (row.signalCount === 0 || row.signal === "NOT_OBSERVED")
+      && (!row.signal || row.signal === "NOT_OBSERVED")) {
     return "일봉 신호 미관측 · 짧은 시험 중 신호가 없을 수 있으며 통과·실패를 뜻하지 않습니다.";
   }
+  if (row.signal && row.signal !== "NOT_OBSERVED") return "최근 전략 신호가 관측됐습니다. 신호와 실제 주문·체결은 별도로 확인합니다.";
+  if (row.timeframe === "1d" && row.signalCount === null) return "일봉 신호 관측 여부 미확인 · 신호 수를 추정하지 않습니다.";
   if (!row.orderCount && !row.fillCount) return "주문·체결 미관측 · 신호와 주문 조건을 확인합니다.";
   return "관측된 신호·주문·체결이며 수익성 검증 결과가 아닙니다.";
 }

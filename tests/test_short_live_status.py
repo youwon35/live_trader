@@ -71,6 +71,19 @@ class ShortLiveStatusTests(unittest.TestCase):
         self.publish("TERMINATED",terminalVerified=True,naturalExitObserved=True)
         self.assertFalse(runtime.peek_status()["active"])
 
+    def test_verified_failure_before_worker_creation_is_inactive_without_faking_natural_exit(self):
+        self.publish("TERMINATED",terminalVerified=True,naturalExitObserved=False,
+                     workerAlive=False,workerRetirementRequired=False,workerLaunchState="NOT_ATTEMPTED")
+        self.assertFalse(runtime.peek_status()["active"])
+        self.assertFalse(runtime.peek_status()["naturalExitObserved"])
+        for changes in ({"workerAlive":True}, {"workerRetirementRequired":True},
+                        {"workerLaunchState":"START_FAILED_UNVERIFIED"}, {"terminalVerified":False}):
+            with self.subTest(changes=changes):
+                values={"terminalVerified":True,"naturalExitObserved":False,"workerAlive":False,
+                        "workerRetirementRequired":False,"workerLaunchState":"NOT_ATTEMPTED",**changes}
+                self.publish("TERMINATED",**values)
+                self.assertTrue(runtime.peek_status()["active"])
+
     def test_monitor_stop_latch_is_visible_before_waiting_for_worker(self):
         self.publish()
         runtime.request_global_stop()

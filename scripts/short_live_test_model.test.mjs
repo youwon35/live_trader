@@ -6,6 +6,7 @@ import {
   SHORT_LIVE_CONFIRMATION, buildShortLivePrepare, exactShortLiveTarget, normalizeShortLiveCandidate,
   normalizeShortLiveSnapshot, sanitizeShortLiveText, shortLiveCanStart, shortLiveCoverage,
   shortLiveRuntimeMeaning, shortLiveSelectionSignature, shortLivePreparationMatches, shortLiveBlockerLabel,
+  shortLivePreparationWindow, shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLiveRunning,
 } from "../src/shortLiveTestModel.js";
 
 const instance = (changes = {}) => ({
@@ -23,7 +24,7 @@ const portfolio = (changes = {}) => ({
 });
 const ready = () => normalizeShortLiveSnapshot({ status: "PREPARED", catalog: { candidates: [instance()] },
   blockers: [], prepared: { preparationId: "fixture-preparation", scopeHash: "d".repeat(64), readyToStart: true,
-    durationHours: 6, capitalKrwPerBroker: 100000, dailyLossStopKrwPerBroker: 50000, targets: [instance()], blockers: [] } });
+    durationHours: 6, capitalKrwPerBroker: 100000, dailyLossStopKrwPerBroker: 50000, targets: [instance()], expiresAt: "2099-01-01T00:00:00Z", blockers: [] } });
 const options = { fresh: true, acknowledged: true, confirmationText: SHORT_LIVE_CONFIRMATION,
   selectionUnchanged: true, preparedAuthority: `fixture-preparation:${"d".repeat(64)}`, preparedScopeMatches: true };
 
@@ -166,4 +167,52 @@ test("source position percentages remain explicit, including old 5 percent and n
   assert.deepEqual(normalizeShortLiveCandidate(instance()).positionSizePercents, []);
   const panel = readFileSync(new URL("../src/ShortLiveTestPanel.jsx", import.meta.url), "utf8");
   assert.match(panel, /원래 5% 후보는 5% 그대로/);
+});
+
+test("hourly shortcut filters by exact declared profile while retaining every candidate", () => {
+  const bounded = normalizeShortLiveCandidate(instance({ timeframe: "1h", timeframes: ["1h"], functionalSizingProfiles: ["BOUNDED_TEST_SLEEVE_100_PERCENT_V1"] }));
+  const old = normalizeShortLiveCandidate(instance({ selectionKey: "old", label: "소액 배정금 100% 기능시험", timeframe: "1h", timeframes: ["1h"], positionSizePercents: [100] }));
+  const daily = normalizeShortLiveCandidate(instance({ selectionKey: "daily", timeframe: "1d", timeframes: ["1d"], functionalSizingProfiles: ["BOUNDED_TEST_SLEEVE_100_PERCENT_V1"] }));
+  const catalog = [bounded, old, daily];
+  assert.equal(shortLiveIsBoundedCandidate(old), false);
+  assert.deepEqual(shortLiveFilterCandidates(catalog, { timeframe: "1h", profile: "BOUNDED" }), [bounded]);
+  assert.deepEqual(shortLiveFilterCandidates(catalog, { profile: "ORIGINAL" }), [old]);
+  assert.deepEqual(shortLiveFilterCandidates(catalog), catalog); assert.equal(catalog.length, 3);
+});
+test("preparation expires at the exact boundary and missing expiry never enables start", () => {
+  const state = ready(); state.prepared.expiresAt = "2026-10-24T12:00:00Z";
+  const expiry = Date.parse(state.prepared.expiresAt);
+  assert.deepEqual(shortLivePreparationWindow(state.prepared, expiry - 1), { status: "VALID", remainingSeconds: 1 });
+  assert.deepEqual(shortLivePreparationWindow(state.prepared, expiry), { status: "EXPIRED", remainingSeconds: 0 });
+  assert.equal(shortLiveCanStart(state, { ...options, now: expiry - 1 }), true);
+  assert.equal(shortLiveCanStart(state, { ...options, now: expiry }), false);
+  state.prepared.expiresAt = ""; assert.equal(shortLiveCanStart(state, options), false);
+});
+test("actual route budget, attempts and fill observations stay distinct from inferred trade counts", () => {
+  const state = normalizeShortLiveSnapshot({ runtime: { brokerRows: [{ route: "BINANCE_SPOT", effectiveRouteBudgetKrw: 23000, brokerBudgetKrw: 100000, routeBudgetKrw: 50000, lossBasis: "ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX", actualFeeKnown: false }], strategyRows: [{ instanceId: "actual-instance", route: "BINANCE_SPOT", pluginId: "rsi_revert", symbol: "BTCUSDT", timeframe: "1h", decisionCount: 4, orderAttemptCount: 2, fillObservationCount: 3, internalAllocationTransferCount: 1 }] } });
+  assert.equal(state.runtime.brokers[0].budgetKrw, 23000); assert.equal(state.runtime.brokers[0].brokerBudgetKrw, 100000);
+  assert.equal(state.runtime.brokers[0].actualFeeKnown, false);
+  const row = state.runtime.strategies[0];
+  assert.equal(row.orderAttemptCount, 2); assert.equal(row.fillObservationCount, 3);
+  assert.equal(row.orderCount, null); assert.equal(row.fillCount, null); assert.equal(row.signalCount, null);
+  assert.equal(row.internalAllocationTransferCount, 1); assert.match(shortLiveRuntimeMeaning(row), /고유 주문 수와 다릅니다/);
+});
+test("pending, blocked, drained and unknown sessions retain the preparation lock", () => {
+  for (const status of ["PENDING_FILL", "BLOCKED", "DRAINED", "UNKNOWN", "TERMINATED"]) assert.equal(shortLiveRunning({ runtime: { status } }), true);
+  assert.equal(shortLiveRunning({ runtime: null }), false);
+  assert.equal(shortLiveRunning({ runtime: { status: "TERMINATED", terminalVerified: true, naturalExitObserved: true } }), false);
+  assert.equal(shortLiveRunning({ runtime: { status: "TERMINATED", terminalVerified: true, naturalExitObserved: false, workerRetirementRequired: false, workerLaunchState: "NOT_ATTEMPTED", workerAlive: false } }), false);
+  assert.equal(shortLiveRunning({ runtime: { status: "TERMINATED", terminalVerified: true, naturalExitObserved: false, workerRetirementRequired: false, workerLaunchState: "NOT_ATTEMPTED" } }), true);
+  assert.equal(shortLiveRunning({ runtime: { status: "TERMINATED", terminalVerified: true, naturalExitObserved: false, workerRetirementRequired: false, workerLaunchState: "START_FAILED_UNVERIFIED" } }), true);
+});
+test("hourly waiting and HOLD convey observed evaluation without inventing signal counts", () => {
+  assert.match(shortLiveRuntimeMeaning({ timeframe: "1h", decisionCount: 0 }), /1시간봉 평가 대기/);
+  assert.match(shortLiveRuntimeMeaning({ timeframe: "1h", decisionCount: 3, signal: "HOLD" }), /완성봉 평가됨/);
+  assert.doesNotMatch(shortLiveRuntimeMeaning({ timeframe: "1h", decisionCount: null }), /평가됨/);
+});
+test("daily actual signals and fills take precedence over unavailable signal counters", () => {
+  assert.match(shortLiveRuntimeMeaning({ timeframe: "1d", signalCount: null, signal: "BUY" }), /신호가 관측/);
+  assert.doesNotMatch(shortLiveRuntimeMeaning({ timeframe: "1d", signalCount: null, signal: "BUY" }), /신호 미관측/);
+  assert.match(shortLiveRuntimeMeaning({ timeframe: "1d", signalCount: null, fillObservationCount: 2 }), /체결 관측 기록/);
+  assert.match(shortLiveRuntimeMeaning({ timeframe: "1d", signalCount: null }), /여부 미확인/);
 });

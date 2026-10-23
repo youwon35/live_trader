@@ -203,7 +203,8 @@ class ShortLiveTestService:
         session = self._session
         keys = ("sessionId", "status", "startedAt", "endsAt", "newEntriesBlocked",
                 "terminalVerified", "naturalExitObserved", "stopReason", "firstFailure",
-                "blockers", "unknownOrderCount", "orderCount", "fillCount", "scopeHash", "internalTransferCount")
+                "blockers", "unknownOrderCount", "orderCount", "fillCount", "scopeHash", "internalTransferCount",
+                "workerRetirementRequired", "workerLaunchState")
         result = {key: deepcopy(session.get(key)) for key in keys}
         result["ownerAlive"] = self._owner()
         result["workerAlive"] = bool(self._thread and self._thread.is_alive())
@@ -318,6 +319,11 @@ class ShortLiveTestService:
                 self._prepared["blockers"] = list(dict.fromkeys(blockers))
                 self._prepared["readyToStart"] = False
                 raise ShortLiveContractError("START_BLOCKED:" + ",".join(self._prepared["blockers"]))
+            # A previous verified terminal session may have used other routes.
+            # Its retired feed/Thread objects never belong to this new claim.
+            self._feeds = {}
+            self._thread = None
+            self._last_reconcile_at = float("-inf")
             started = self._now()
             self._session = {
                 "sessionId": contract["sessionId"], "scopeHash": contract["scopeHash"],
@@ -337,6 +343,9 @@ class ShortLiveTestService:
                 "pendingNextOpen": {}, "observedOpenKeys": set(),
                 "feesKnown": True,
                 "workerExitIntent": False,
+                "workerRetirementRequired": self.background,
+                "workerLaunchState": "NOT_ATTEMPTED" if self.background else "SYNCHRONOUS",
+                "startupAbortedBeforeWorker": False,
                 "cancelReservations": {},
                 "effectiveRouteBudgets": {leg["route"]: min(leg["routeBudgetKrw"],
                     finite(readiness[leg["route"]]["availableKrw"], "ACTUAL_START_AVAILABLE", positive=True))
@@ -363,15 +372,24 @@ class ShortLiveTestService:
                 self._session["status"] = "RUNNING"
                 self._session["newEntriesBlocked"] = False
                 self._event("STARTED", sessionId=contract["sessionId"], scopeHash=contract["scopeHash"])
+                if self.background:
+                    self._wake.clear()
+                    self._thread = threading.Thread(target=self._worker,
+                        name=f"ShortLiveTest-{contract['sessionId']}", daemon=True)
+                    self._session["workerLaunchState"] = "START_ATTEMPTED"
+                    self._thread.start()
+                    self._session["workerLaunchState"] = "STARTED"
             except Exception as exc:
+                if self.background and self._session["workerLaunchState"] == "NOT_ATTEMPTED" and self._thread is None:
+                    # This branch precedes any Thread creation/start. Record
+                    # that exact fact instead of inventing a natural exit.
+                    self._session["startupAbortedBeforeWorker"] = True
+                    self._session["workerRetirementRequired"] = False
+                elif self.background:
+                    self._session["workerLaunchState"] = "START_FAILED_UNVERIFIED"
                 self._failure(f"STARTUP_FAILED:{type(exc).__name__}:{exc}")
                 self._stop_once("STARTUP_FAILED")
                 raise
-            if self.background:
-                self._wake.clear()
-                self._thread = threading.Thread(target=self._worker,
-                    name=f"ShortLiveTest-{contract['sessionId']}", daemon=True)
-                self._thread.start()
             return self.snapshot()
 
     def _make_engines(self, contract: Mapping[str, Any]) -> None:
@@ -1223,16 +1241,34 @@ class ShortLiveTestService:
         if not (positive_reconciliation and session["cleanupAttempted"] and session["feedsClosed"] and all_known and all_flat and cleanup_terminal):
             session["status"] = "BLOCKED"
             return
+        if (self.background and session.get("workerLaunchState") == "START_FAILED_UNVERIFIED"
+                and (self._thread is None or self._thread.ident is None)):
+            self._failure("WORKER_START_OUTCOME_UNVERIFIED")
+            session["status"] = "BLOCKED"
+            return
         session["status"] = "DRAINED"
         if not self.background:
             session["naturalExitObserved"] = True
             self._finalize_after_worker_exit()
+        elif (session.get("startupAbortedBeforeWorker") is True
+                and session.get("workerRetirementRequired") is False
+                and session.get("workerLaunchState") == "NOT_ATTEMPTED"
+                and self._thread is None):
+            self._event("STARTUP_RETIRED_BEFORE_WORKER", sessionId=session["sessionId"],
+                        workerLaunchState="NOT_ATTEMPTED", naturalExitObserved=False)
+            self._finalize_after_worker_exit()
 
     def _finalize_after_worker_exit(self) -> None:
         session = self._session
-        if not session or session["status"] != "DRAINED" or not session["naturalExitObserved"]:
+        if not session or session["status"] != "DRAINED":
             return
-        if self.background and (self._thread is None or self._thread.is_alive()):
+        never_started = (session.get("startupAbortedBeforeWorker") is True
+                         and session.get("workerRetirementRequired") is False
+                         and session.get("workerLaunchState") == "NOT_ATTEMPTED"
+                         and self._thread is None)
+        if not never_started and not session["naturalExitObserved"]:
+            return
+        if self.background and not never_started and (self._thread is None or self._thread.is_alive()):
             return
         session["terminalVerified"] = True
         session["status"] = "TERMINATED"
@@ -1246,6 +1282,9 @@ class ShortLiveTestService:
             "manifestHash": session["scopeHash"], "terminatedAt": session["terminatedAt"],
             "normalCleanupConfirmed": True, "ownedOrdersRemaining": 0,
             "ownedPositionsRemaining": 0, "feedsClosed": True,
+            "workerRetirementRequired": session["workerRetirementRequired"],
+            "workerLaunchState": session["workerLaunchState"],
+            "naturalExitObserved": session["naturalExitObserved"],
             "firstFailure": session["firstFailure"],
             "actualFeeKnown": session["feesKnown"],
             "feeReconciliationStatus": "KNOWN" if session["feesKnown"] else "UNVERIFIED_ACTUAL_FEE",
@@ -1256,6 +1295,6 @@ class ShortLiveTestService:
         """Called by the genuine UI owner on shutdown; never kills a worker."""
         result = self.stop({"reason": "UI_OWNER_SHUTDOWN"})
         thread = self._thread
-        if thread and thread is not threading.current_thread():
+        if thread and thread is not threading.current_thread() and thread.ident is not None:
             thread.join(timeout=5)
         return self.snapshot()
