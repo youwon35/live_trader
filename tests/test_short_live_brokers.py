@@ -112,6 +112,74 @@ class ShortLiveBrokerTests(unittest.TestCase):
                 self.assertEqual(mod.Decimal(2), mod.number(f.truth["positions"][0]["quantity"]))
                 self.assertEqual("1", f.inventory["BNB"])
 
+    def test_official_unicode_zero_balance_assets_do_not_block_or_enter_baseline(self):
+        f = self.preserved_spot_fixture()
+        original = f.adapter.readiness(f.manifest)
+        fresh = self.preserved_spot_fixture()
+        fresh.inventory.update({"币安人生": "0", "牛来": "0.00000000"})
+        ready = fresh.adapter.readiness(fresh.manifest)
+        self.assertTrue(ready["ready"], ready)
+        self.assertEqual(original["preservedAssetsBaselineHash"], ready["preservedAssetsBaselineHash"])
+        self.assertNotIn("币安人生", ready["preservedAssetSymbols"])
+        self.assertNotIn("牛来", ready["preservedAssetSymbols"])
+        self.assertEqual([], fresh.calls)
+
+    def test_nonzero_unicode_inventory_is_preserved_and_quantity_changes_still_block(self):
+        f = self.preserved_spot_fixture()
+        f.inventory.update({"币安人生": "2.5", "牛来": ".00001"})
+        ready = f.adapter.readiness(f.manifest)
+        self.assertTrue(ready["ready"], ready)
+        self.assertIn("币安人生", ready["preservedAssetSymbols"])
+        self.assertIn("牛来", ready["preservedAssetSymbols"])
+        observed = f.adapter.reconcile(f.manifest)
+        self.assertTrue(observed["known"], observed)
+        self.assertEqual({}, observed["positionsBySymbol"])
+        self.assertEqual("100000", ready["availableQuoteNative"])
+        self.assertTrue(f.adapter.cleanup(f.manifest)["complete"])
+        self.assertEqual([], f.calls)
+        f.inventory["牛来"] = ".00002"
+        self.assertIn("PRESERVED_SPOT_INVENTORY_CHANGED", f.adapter.reconcile(f.manifest)["blockers"])
+
+    def test_asset_identifiers_are_not_case_folded_or_unicode_normalized(self):
+        f = self.preserved_spot_fixture()
+        f.inventory.update({"é": "1", "e\u0301": "2", "coin": "3", "COIN": "4"})
+        ready = f.adapter.readiness(f.manifest)
+        self.assertTrue(ready["ready"], ready)
+        for asset in ("é", "e\u0301", "coin", "COIN"):
+            self.assertIn(asset, ready["preservedAssetSymbols"])
+        f.inventory["é"], f.inventory["e\u0301"] = "2", "1"
+        self.assertIn("PRESERVED_SPOT_INVENTORY_CHANGED", f.adapter.reconcile(f.manifest)["blockers"])
+        fresh = self.preserved_spot_fixture()
+        fresh.inventory.update(f.inventory)
+        self.assertNotEqual(ready["preservedAssetsBaselineHash"], fresh.adapter.readiness(fresh.manifest)["preservedAssetsBaselineHash"])
+
+    def test_unicode_support_does_not_accept_invalid_quantities_or_control_names(self):
+        for name in ("", "A B", "A\nB", "A\x00B", "A\u202eB", "A" * 257):
+            f = self.preserved_spot_fixture()
+            f.inventory[name] = "0"
+            self.assertIn("SPOT_INVENTORY_INVALID", f.adapter.readiness(f.manifest)["blockers"])
+        for quantity in ("-1", "NaN", "Infinity", None):
+            f = self.preserved_spot_fixture()
+            f.inventory["牛来"] = quantity
+            self.assertFalse(f.adapter.readiness(f.manifest)["ready"])
+
+    def test_external_fee_identifier_uses_the_same_opaque_unicode_identity(self):
+        f = self.preserved_spot_fixture()
+        f.inventory["牛来"] = "1"
+        self.assertTrue(f.adapter.readiness(f.manifest)["ready"])
+        reply = f.adapter.submit(f.adapter.size_order(f.proposal()))
+        f.quote_equity -= 10000
+        row = f.rows[reply["brokerOrderId"]]
+        row.update(externalCommissionKnown=True, externalCommissionQuantities={"牛来": ".01"},
+                   externalCommissionNative={"牛来": ".1"})
+        f.inventory["牛来"] = ".99"
+        result = f.adapter.reconcile(f.manifest)
+        self.assertTrue(result["known"], result)
+        self.assertEqual(mod.Decimal(".1"), mod.number(result["realizedLossKrw"]))
+        row["externalCommissionQuantities"] = {"牛来\u202e": ".01"}
+        row["externalCommissionNative"] = {"牛来\u202e": ".1"}
+        self.assertIn("EXTERNAL_COMMISSION_INVALID", f.adapter.reconcile(f.manifest)["blockers"])
+
     def test_existing_coin_price_changes_do_not_manufacture_or_hide_session_loss(self):
         for price in ("10", "10000"):
             f = self.preserved_spot_fixture()

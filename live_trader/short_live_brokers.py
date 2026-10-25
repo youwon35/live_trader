@@ -50,6 +50,18 @@ def decimal_text(value: Decimal) -> str:
     return format(value, "f")
 
 
+def valid_asset_identifier(value: Any) -> bool:
+    """Treat official UTF-8 asset identifiers as opaque, case-sensitive text.
+
+    Binance permits non-ASCII asset names even in otherwise ASCII requests.
+    Keep their exact code points for inventory and fee joins: do not uppercase
+    or Unicode-normalize. Bound display size and reject whitespace/controls.
+    This identifier is never a path or an executable expression.
+    """
+    return (isinstance(value, str) and 0 < len(value) <= 256 and value.isprintable()
+            and not any(character.isspace() for character in value))
+
+
 def epoch(value: Any) -> float:
     try:
         if isinstance(value, bool):
@@ -227,8 +239,7 @@ class ShortLiveBrokerAdapter:
             raise ShortLiveBrokerBlocked("COMPLETE_SPOT_INVENTORY_REQUIRED")
         current: dict[str, Decimal] = {}
         for asset, value in raw.items():
-            if (not isinstance(asset, str) or not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{0,49}", asset)
-                    or asset == self.currency):
+            if not valid_asset_identifier(asset) or asset == self.currency:
                 raise ShortLiveBrokerBlocked("SPOT_INVENTORY_INVALID")
             qty = number(value)
             if qty < 0:
@@ -268,8 +279,7 @@ class ShortLiveBrokerAdapter:
             total_cost = Decimal(0)
             incremental_cost = Decimal(0)
             for asset, raw_qty in quantities.items():
-                if (not isinstance(asset, str) or not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{0,49}", asset)
-                        or asset == self.currency):
+                if not valid_asset_identifier(asset) or asset == self.currency:
                     raise ShortLiveBrokerBlocked("EXTERNAL_COMMISSION_INVALID")
                 if asset in symbols.values():
                     # Cross-strategy asset fees require sleeve allocation;
