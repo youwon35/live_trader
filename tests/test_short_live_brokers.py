@@ -28,16 +28,23 @@ class Fixture:
         self.manifest = {"route": route, "sessionId": "session-exact", "manifestHash": "a" * 64,
                          "accountId": self.account, "symbols": [self.symbol], "brokerBudgetKrw": 100000,
                          "routeBudgetKrw": 100000, "dailyLossStopKrw": 50000}
+        if route == "BINANCE_USDM_FUTURES":
+            self.manifest["futuresPolicy"] = {"leverage": 1, "marginMode": "ISOLATED", "stopLossPercent": 2}
         self.truth = {"known": True, "ordersComplete": True, "positionsComplete": True,
                       "accountId": self.account, "currency": self.currency, "observedAt": NOW,
                       "availableNative": "100000", "equityNative": "100000", "positions": [], "openOrders": []}
         self.truth["maximumOrderQuantities"] = {self.symbol: "100000"}
+        self.truth["openAlgoOrders"] = []
         self.quote = {"known": True, "symbol": self.symbol, "nativePrice": "1000", "quoteCurrency": self.currency,
                       "krwPerQuote": "1", "fxObservedAt": NOW, "feeRate": "0.001", "lotStep": "1",
                       "minQuantity": "1", "minNotional": "0", "sessionOpen": True, "sellTaxRate": "0",
                       "sessionRemainingSeconds": 24000,
                       "observedAt": NOW, "marginMode": "ISOLATED", "leverage": "1",
-                      "positionMode": "ONE_WAY", "fundingRate": "0.0001"}
+                      "positionMode": "ONE_WAY", "fundingRate": "0.0001", "isAutoAddMargin": False}
+        self.quote.update(markPrice="1000", priceTick="0.01", marketQuantityStep="1",
+            marketMinQuantity="1", marketMaxQuantity="100000", leverageBrackets=[{
+            "notionalFloor": "0", "notionalCap": "100000000", "initialLeverage": "125", "maintMarginRatio": "0.005", "cum": "0"}])
+        self.protections = {}; self.protection_calls = []; self.protection_events = []
         self.calls = []; self.rows = {}; self.allow = True; self.unknown = False
         owner = self
         class Transport:
@@ -50,19 +57,41 @@ class Fixture:
                 previous = sum((mod.number(p["quantity"]) for p in owner.truth["positions"]), mod.Decimal(0))
                 delta = qty if order["side"] == "BUY" else -qty
                 if previous + delta:
-                    owner.truth["positions"] = [{"symbol": owner.symbol, "quantity": str(previous + delta), "markPrice": "1000"}]
+                    owner.truth["positions"] = [{"symbol": owner.symbol, "quantity": str(previous + delta), "markPrice": "1000",
+                        "entryPrice": "1000", "isolatedWallet": str(abs(previous + delta)*1000/mod.number(owner.quote["leverage"])),
+                        "liquidationPrice": "0" if previous + delta > 0 else "2000",
+                        "positionSide": ("LONG" if previous+delta > 0 else "SHORT") if owner.quote["positionMode"] == "HEDGE" else "BOTH"}]
                 else: owner.truth["positions"] = []
                 owner.rows[oid] = {"known": True, "brokerOrderId": oid, "clientOrderId": order["identifier"],
                     "symbol": owner.symbol, "status": "FILLED", "filledQuantity": order["quantity"],
+                    "side": order["side"], "positionSide": "BOTH",
                     "baseCommissionQuantity": "0", "baseCommissionKnown": True,
                     "fillPrice": "1000", "feeNative": "10", "observedAt": NOW}
                 return {"json": {"orderId": oid, "status": "FILLED", "executedQty": order["quantity"],
                                   "avgPrice": "1000", "clientOrderId": order["identifier"]}}
             def read_order(self, route, row): return copy.deepcopy(owner.rows[row["brokerOrderId"]])
             def cancel(self, route, broker_id, row): owner.calls.append({"cancel": broker_id})
+        class ProtectionTransport:
+            def protect(self, order, guard):
+                owner.protection_calls.append(("PROTECT", copy.deepcopy(order)))
+                row = {"known": True, "algoId": str(900+len(owner.protections)), "clientAlgoId": order["clientAlgoId"],
+                    "symbol": order["symbol"], "side": order["side"], "triggerPrice": order["triggerPrice"],
+                    "positionSide": order["positionDirection"].upper() if order["positionMode"] == "HEDGE" else "BOTH",
+                    "type": "STOP_MARKET", "status": "NEW", "closePosition": True, "workingType": "MARK_PRICE", "priceProtect": False, "observedAt": NOW}
+                owner.protections[row["clientAlgoId"]] = row
+                owner.truth["openAlgoOrders"] = [copy.deepcopy(r) for r in owner.protections.values() if r["status"] == "NEW"]
+                return copy.deepcopy(row)
+            def cancel(self, order, guard):
+                owner.protection_calls.append(("CANCEL_PROTECTION", copy.deepcopy(order)))
+                owner.protections[order["clientAlgoId"]]["status"] = "CANCELED"
+                owner.truth["openAlgoOrders"] = [copy.deepcopy(r) for r in owner.protections.values() if r["status"] == "NEW"]
+                return {"code": 200}
         self.adapter = mod.ShortLiveBrokerAdapter(route, snapshot_reader=lambda *_: copy.deepcopy(self.truth),
             market_reader=lambda *_: copy.deepcopy(self.quote), transport=Transport(),
-            authority_guard=lambda _: self.allow, budget=budget, clock=lambda: NOW)
+            authority_guard=lambda _: self.allow, budget=budget, clock=lambda: NOW,
+            protection_reader=lambda route, claim: copy.deepcopy(self.protections.get(claim["clientAlgoId"], {"known": False})),
+            protection_transport=ProtectionTransport(), reserve_protection=lambda _: True,
+            record_protection=lambda event, detail: self.protection_events.append((event, detail)))
         self.adapter.reserve_cleanup_order = lambda _: True
         self.adapter.reserve_cleanup_cancel = lambda _: True
         self.adapter.observe_cleanup_order = lambda *_: True
@@ -300,7 +329,7 @@ class ShortLiveBrokerTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertEqual("100000", result["availableQuoteNative"])
         self.assertEqual({"marginMode": "CROSSED", "leverage": "20", "positionMode": "ONE_WAY"}, result["observedFuturesSettings"])
-        self.assertEqual({"marginMode": "ISOLATED", "leverage": "1"}, result["expectedFuturesSettings"])
+        self.assertEqual(f.manifest["futuresPolicy"], result["expectedFuturesSettings"])
         self.assertNotIn("accountId", result)
 
     @staticmethod

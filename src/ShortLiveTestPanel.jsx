@@ -7,6 +7,7 @@ import {
   buildShortLivePrepare, normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveBlockerLabel,
   shortLiveCanStart, shortLiveCoverage, shortLiveRunning, shortLiveRuntimeMeaning, shortLiveSelectionSignature, shortLivePreparationMatches,
   shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLivePreparationWindow,
+  normalizeShortLiveFuturesPolicy, shortLiveProtectionLabel, shortLiveFuturesIncidentLabel,
 } from "./shortLiveTestModel.js";
 import "./ShortLiveTestPanel.css";
 
@@ -16,6 +17,7 @@ const date = (value) => { const parsed = new Date(value); return value && !Numbe
 const kindLabel = (kind) => kind === "portfolio" ? "포트폴리오" : "인스턴스";
 const compactHash = (value) => value ? `${value.slice(0, 10)}…${value.slice(-6)}` : "원본 해시 없음";
 const remainingTime = (seconds) => `${Math.floor(seconds / 60)}분 ${seconds % 60}초`;
+const futuresPrice = (value) => value === null || value === undefined || value <= 0 ? "미확인" : `${new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 8 }).format(value)} USDT`;
 
 function Blockers({ values = [], label = "진행을 막는 사유" }) {
   const rows = [...new Set(values.map(shortLiveBlockerLabel))];
@@ -27,6 +29,8 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const [fresh, setFresh] = useState(false);
   const [selection, setSelection] = useState([]);
   const [durationHours, setDurationHours] = useState(6);
+  const [futuresLeverage, setFuturesLeverage] = useState("1");
+  const [futuresStopLossPercent, setFuturesStopLossPercent] = useState("");
   const [routeFilter, setRouteFilter] = useState("ALL");
   const [timeframeFilter, setTimeframeFilter] = useState("ALL");
   const [kindFilter, setKindFilter] = useState("ALL");
@@ -51,7 +55,8 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const displayCatalog = useRef(snapshot.catalog);
   const snapshotVersion = useRef(0);
   const mutationPending = useRef(false);
-  const selectionSignature = shortLiveSelectionSignature(snapshot.catalog, selection, durationHours);
+  const futuresPolicy = { leverage: futuresLeverage, marginMode: "ISOLATED", stopLossPercent: futuresStopLossPercent };
+  const selectionSignature = shortLiveSelectionSignature(snapshot.catalog, selection, durationHours, futuresPolicy);
   const active = shortLiveRunning(snapshot);
   const locked = Boolean(busy) || catalogLoading || active || unknownMutation;
   const coverage = useMemo(() => shortLiveCoverage(snapshot.catalog), [snapshot.catalog]);
@@ -59,12 +64,14 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     route: routeFilter, timeframe: timeframeFilter, kind: kindFilter, profile: profileFilter,
   }), [snapshot.catalog, routeFilter, timeframeFilter, kindFilter, profileFilter]);
   const selectedCandidates = snapshot.catalog.filter((row) => selection.includes(row.selectionKey));
+  const hasFutures = selectedCandidates.some((row) => row.routes.includes("BINANCE_USDM_FUTURES"));
+  const futuresPolicyValid = !hasFutures || normalizeShortLiveFuturesPolicy(futuresPolicy) !== null;
   const hiddenSelectionCount = selection.filter((key) => !visibleCandidates.some((row) => row.selectionKey === key)).length;
   const preparationWindow = shortLivePreparationWindow(snapshot.prepared, now);
   const preparationValid = preparationWindow.status === "VALID";
   const canStart = !busy && !catalogLoading && catalogReady && !unknownMutation && shortLiveCanStart(snapshot, {
     fresh, acknowledged, confirmationText, selectionUnchanged: preparedSelection === selectionSignature, preparedAuthority,
-    preparedScopeMatches: shortLivePreparationMatches(snapshot.prepared, snapshot.catalog, selection, durationHours),
+    preparedScopeMatches: shortLivePreparationMatches(snapshot.prepared, snapshot.catalog, selection, durationHours, futuresPolicy),
     now,
   });
 
@@ -147,7 +154,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   async function prepare() {
     if (locked || !fresh || !catalogReady || mutationPending.current) return;
     let body;
-    try { body = buildShortLivePrepare(snapshot.catalog, selection, { ...SHORT_LIVE_DEFAULTS, durationHours }); }
+    try { body = buildShortLivePrepare(snapshot.catalog, selection, { ...SHORT_LIVE_DEFAULTS, durationHours, futuresPolicy }); }
     catch (failure) { setError(failure.message); return; }
     mutationPending.current = true; snapshotVersion.current += 1;
     setBusy("prepare"); setError(""); setMessage(""); setFresh(false);
@@ -159,7 +166,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
       if (returned.prepared && observed?.prepared
         && returned.prepared.preparationId === observed.prepared.preparationId
         && returned.prepared.scopeHash === observed.prepared.scopeHash
-        && shortLivePreparationMatches(observed.prepared, observed.catalog, selection, durationHours)) {
+        && shortLivePreparationMatches(observed.prepared, observed.catalog, selection, durationHours, futuresPolicy)) {
         setPreparedSelection(selectionSignature);
         setPreparedAuthority(`${observed.prepared.preparationId}:${observed.prepared.scopeHash}`);
         setMessage("무주문 준비 결과를 확인했습니다. 차단 사유와 실제 시험 범위를 확인한 뒤 직접 시작해 주세요.");
@@ -280,9 +287,21 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
 
     <section className="panel"><h3>2. 금액·시간 확인 후 무주문 준비</h3>
       <div className="short-live-limits"><label>시험 시간<select value={durationHours} disabled={locked} aria-label="실거래 시험 시간" onChange={(event) => { setDurationHours(Number(event.target.value)); setPreparedSelection(""); }}>{[5, 6, 7].map((hours) => <option key={hours} value={hours}>{hours}시간</option>)}</select></label><div className="short-live-limit-summary"><div><span>거래소별 자본 상한</span><strong>100,000원</strong></div><div><span>이번 시험 손실 중단 기준</span><strong>50,000원</strong></div><p>Binance 현물·선물은 같은 거래소 한도 안에서 합산합니다. 실제 잔고·최소 주문 조건이 우선하며, 여러 대상을 선택하면 배정 자금이 나뉩니다.</p></div></div>
-      {selectedCandidates.some((row) => row.routes.includes("BINANCE_USDM_FUTURES")) && <p className="short-live-notice">선물 준비안: 1x · ISOLATED. 이 화면은 레버리지나 증거금 방식을 실제 변경하지 않습니다. 계좌의 실제 설정을 확인하지 못하면 시작을 막습니다.</p>}
+      <p className="short-live-meta">손실은 시험 범위 손익 또는 계좌 평가 감소를 주기적으로 확인합니다. 수수료·펀딩비와 가격 급변·응답 지연 때문에 실제 손실이 중단 기준을 넘을 수 있습니다.</p>
+      {hasFutures && <fieldset className="short-live-futures-policy" disabled={locked}>
+        <legend>선물 레버리지·거래소 보호 손절</legend>
+        <div className="short-live-futures-fields">
+          <label>Binance에서 설정한 레버리지<input type="number" min="1" max="125" step="1" value={futuresLeverage} aria-label="선물 기대 레버리지" onChange={(event) => { setFuturesLeverage(event.target.value); setPreparedSelection(""); }} /><small>선택한 모든 선물 종목의 실제 설정과 같아야 합니다.</small></label>
+          <label>보호 손절 가격 거리 (%)<input type="number" min="0" step="any" value={futuresStopLossPercent} placeholder="직접 입력" aria-label="선물 보호 손절 가격 거리 퍼센트" onChange={(event) => { setFuturesStopLossPercent(event.target.value); setPreparedSelection(""); }} /><small>진입 주문 기준 가격에서 불리한 방향으로 움직이는 비율입니다.</small></label>
+        </div>
+        <p>격리(ISOLATED) 방식만 지원합니다. 이 화면은 거래소의 레버리지·증거금 설정을 변경하지 않습니다. 실제 설정이 준비 결과와 달라지면 신규 진입을 막습니다.</p>
+        <p>자본 한도 안에서 포지션 투입 증거금을 배정하고, 명목 포지션 규모는 레버리지를 반영해 계산합니다. 비용 예비금은 주문 가능액 계산 시 별도로 차감합니다. 예를 들어 5배여도 실제 잔고가 5배로 늘어나지는 않습니다.</p>
+        <p className="short-live-meta">이 선물 설정과 보호는 이 화면의 5~7시간 기능시험에 적용됩니다.</p>
+        <p className="short-live-meta">보호 손절은 Mark Price 기준의 거래소 STOP_MARKET 주문입니다. 보호 주문을 확인한 뒤 진입하며, 정상 종료 중에도 포지션이 남아 있으면 보호를 유지합니다. 손절 가격과 실제 체결 가격은 다를 수 있습니다.</p>
+        {!futuresPolicyValid && <p className="short-live-error" role="status">레버리지와 보호 손절 가격 거리를 입력해 주세요. 손절 거리는 0%보다 크고 100÷레버리지%보다 작아야 하며, 실제 청산가·증거금 조건은 서버가 추가 검사합니다.</p>}
+      </fieldset>}
       <p>선택 {selection.length}개 · {durationHours}시간 · 자동 재시도 없음</p>
-      <button type="button" className="primary-button" onClick={prepare} disabled={locked || !fresh || !catalogReady || selection.length === 0}>{busy === "prepare" ? "무주문 준비 확인 중…" : "무주문 준비 검사"}</button>
+      <button type="button" className="primary-button" onClick={prepare} disabled={locked || !fresh || !catalogReady || selection.length === 0 || !futuresPolicyValid}>{busy === "prepare" ? "무주문 준비 확인 중…" : "무주문 준비 검사"}</button>
       <Blockers values={snapshot.prepared?.blockers} label="선택한 시험의 준비 차단 사유" />
       {snapshot.prepared?.brokerReadiness?.length > 0 && <div className="short-live-readiness"><h4>거래소별 무주문 계좌 검사</h4>
         <p className="short-live-meta">준비 검사 시 관측한 결과입니다. 계좌 검사와 최종 시작 조건은 따로 표시하며, 시작할 때 다시 검사합니다.</p>
@@ -291,6 +310,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
           {row.fundingBasis === "AVAILABLE_QUOTE_ONLY" && <p>주문 가능 잔고 {row.availableQuoteNative === null ? "미확인" : new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 8 }).format(row.availableQuoteNative)} {row.quoteCurrency} · 이번 경로 배정 가능 {money(row.effectiveRouteBudgetKrw)}</p>}
           {row.preservedAssetSymbols.length > 0 && <p>기존 보유 보호: {row.preservedAssetSymbols.join(", ")} · 시험 주문 자금으로 포함하지 않습니다.</p>}
           {row.observedFuturesSettings && <p>현재 선물 설정: {row.observedFuturesSettings.marginMode || "미확인"} · {row.observedFuturesSettings.leverage ?? "미확인"}배 · {row.observedFuturesSettings.positionMode || "포지션 모드 미확인"}</p>}
+          {Object.entries(row.observedFuturesSettingsBySymbol).map(([symbol, setting]) => <p key={symbol}>{symbol}: {setting.marginMode || "미확인"} · {setting.leverage ?? "미확인"}배 · {setting.positionMode || "포지션 모드 미확인"}</p>)}
           <Blockers values={row.blockers} label="계좌 검사 차단 사유" />
         </div></div>)}
       </div>}
@@ -298,8 +318,9 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
 
     <section className="panel short-live-start"><h3>3. 준비된 범위로 실제 시험 시작</h3>
       {snapshot.prepared ? <><p className="short-live-meta">준비 ID {snapshot.prepared.preparationId} · 범위 해시 {compactHash(snapshot.prepared.scopeHash)}</p><p>{snapshot.prepared.readyToStart && preparationValid ? "서버의 현재 준비 조건 충족" : "준비 조건 미충족"} · 확인한 범위가 바뀌면 다시 준비해야 합니다.</p>
+        {snapshot.prepared.futuresPolicy && <p>확정 선물 범위: {snapshot.prepared.futuresPolicy.leverage}배 · 격리 · 보호 손절 가격 거리 {snapshot.prepared.futuresPolicy.stopLossPercent}%</p>}
         {!active && <div className={`short-live-expiry ${preparationValid ? "" : "is-expired"}`}><Clock3 size={17} /><span>{preparationValid ? `준비 유효시간 ${remainingTime(preparationWindow.remainingSeconds)} 남음` : preparationWindow.status === "EXPIRED" ? "준비 유효시간 만료 · 무주문 준비 검사를 다시 실행해 주세요." : "준비 유효시간 미확인 · 무주문 준비 검사가 필요합니다."}<small>유효 기한 {date(snapshot.prepared.expiresAt)} · 시작 시 서버에서 다시 확인합니다.</small></span></div>}
-        {preparedSelection !== selectionSignature && <p className="short-live-meta">현재 선택·시간으로 무주문 준비 검사를 다시 실행해야 시작할 수 있습니다.</p>}
+        {preparedSelection !== selectionSignature && <p className="short-live-meta">현재 선택·시간·선물 보호 정책으로 무주문 준비 검사를 다시 실행해야 시작할 수 있습니다.</p>}
       </> : <p>아직 준비 결과가 없습니다. 먼저 시험 대상과 시간·금액을 확인해 주세요.</p>}
       <label className="short-live-ack"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} disabled={locked || !fresh || !preparationValid || !snapshot.prepared?.readyToStart} /> 실제 자금으로 주문될 수 있으며 손실이 발생할 수 있음을 확인했습니다. 선택한 거래소·전략·한도로만 시험합니다.</label>
       <label className="short-live-confirm-label">확인 문구: {SHORT_LIVE_CONFIRMATION}<input type="text" value={confirmationText} aria-label="실제 주문 시험 시작 확인 문구" autoComplete="off" placeholder={SHORT_LIVE_CONFIRMATION} onChange={(event) => setConfirmationText(event.target.value)} disabled={locked || !fresh || !preparationValid || !snapshot.prepared?.readyToStart} /></label>
@@ -312,7 +333,13 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
         <p>소유 프로세스 {snapshot.runtime.ownerAlive === true ? "생존 확인" : snapshot.runtime.ownerAlive === false ? "현재 생존 아님" : "미확인"} · 신규 진입 {snapshot.runtime.newEntriesBlocked === true ? "차단" : snapshot.runtime.newEntriesBlocked === false ? "서버 범위 내 허용" : "미확인"} · 미확정 주문 {snapshot.runtime.unknownOrderCount ?? "미확인"}개 · 자연 종료 {snapshot.runtime.naturalExitObserved ? "관측됨" : "아직 미확인"}</p>
         <p>{snapshot.runtime.terminalVerified && snapshot.runtime.workerRetirementRequired === false && snapshot.runtime.workerLaunchState === "NOT_ATTEMPTED" && snapshot.runtime.workerAlive === false ? "작업자 시작 전 종료 확인 · 시세 연결 정리와 잔여 주문·포지션 대조가 확인됐습니다. 실행·거래 성공을 뜻하지 않습니다." : snapshot.runtime.terminalVerified && snapshot.runtime.naturalExitObserved ? "소유 프로세스와 주문 대조를 포함한 정상 종료가 확인됐습니다." : "실제 정상 종료 확인 전입니다. 예정 시간이 지났다는 이유로 종료를 인정하지 않습니다."}</p>
         <Blockers values={snapshot.runtime.blockers} label="실행 중 확인할 사유" />
-        <div className="short-live-table-wrap"><table><thead><tr><th>주문 경로</th><th>실제 배정 한도</th><th>현재 노출</th><th>기준 손실 / 평가손실 / 중단선</th><th>상태</th></tr></thead><tbody>{snapshot.runtime.brokers.map((row, index) => <tr key={`${row.broker}:${index}`}><td>{SHORT_LIVE_ROUTES.find((route) => route.id === row.broker)?.label || row.broker}</td><td>{money(row.budgetKrw)}<small className="short-live-meta">거래소 합산 상한 {money(row.brokerBudgetKrw)}</small></td><td>{money(row.exposureKrw)}</td><td>{money(row.dailyRealizedLossKrw)} / {money(row.unrealizedLossKrw)} / {money(row.lossLimitKrw)}<small className="short-live-meta">{row.lossBasis === "ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX" ? "시험 시작 대비 계좌 평가 감소 기준" : row.lossBasis === "EXACT_SCOPE_PNL" ? "시험 범위의 실제 손익 기준" : "손실 산정 근거 미확인"}</small></td><td>{row.status || "미확인"}<small className="short-live-meta">수수료 {row.actualFeeKnown === true ? "확인됨" : "미확정"}</small></td></tr>)}</tbody></table></div>
+        <div className="short-live-table-wrap"><table><thead><tr><th>주문 경로</th><th>실제 배정 한도</th><th>포지션 금액</th><th>기준 손실 / 평가손실 / 중단선</th><th>상태</th></tr></thead><tbody>{snapshot.runtime.brokers.map((row, index) => <tr key={`${row.broker}:${index}`}><td>{SHORT_LIVE_ROUTES.find((route) => route.id === row.broker)?.label || row.broker}</td><td>{money(row.budgetKrw)}<small className="short-live-meta">거래소 합산 상한 {money(row.brokerBudgetKrw)}</small></td><td>{row.broker === "BINANCE_USDM_FUTURES" ? <>{money(row.committedCapitalKrw)} / {money(row.notionalExposureKrw)}<small className="short-live-meta">포지션 투입 증거금 / 명목 노출</small><small className="short-live-meta">비용 예비금은 주문 가능액 계산 시 별도 차감합니다.</small></> : <>{money(row.exposureKrw)}<small className="short-live-meta">현물 보유 금액</small></>}</td><td>{money(row.dailyRealizedLossKrw)} / {money(row.unrealizedLossKrw)} / {money(row.lossLimitKrw)}<small className="short-live-meta">{row.lossBasis === "ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX" ? "시험 시작 대비 계좌 평가 감소 기준" : row.lossBasis === "EXACT_SCOPE_PNL" ? "시험 범위의 실제 손익 기준" : row.lossBasis === "SESSION_NATIVE_EQUITY_EXCLUDING_PRESERVED_SPOT_WITH_VERIFIED_FEES" ? "기존 보유 자산을 제외한 시험 평가 감소 기준" : "손실 산정 근거 미확인"}</small></td><td>{row.status || "미확인"}<small className="short-live-meta">수수료 {row.actualFeeKnown === true ? "확인됨" : "미확정"}</small></td></tr>)}</tbody></table></div>
+        {snapshot.runtime.brokers.filter((row) => row.broker === "BINANCE_USDM_FUTURES").map((row) => <div key={`${row.broker}:protection`} className="short-live-futures-observation">
+          <h4>선물 보호 주문·청산 관측</h4>
+          {row.protections.length === 0 ? <p className="short-live-meta">아직 거래소 보호 주문 관측 기록이 없습니다. 보호가 확인됐다는 뜻이 아닙니다.</p> : <div className="short-live-table-wrap"><table><thead><tr><th>종목·방향</th><th>보호 상태</th><th>손절 발동 가격</th><th>관측 시각</th></tr></thead><tbody>{row.protections.map((protection, index) => <tr key={`${protection.symbol}:${protection.positionSide}:${index}`}><td>{protection.symbol} · {protection.positionSide}</td><td>{shortLiveProtectionLabel(protection.status)}<small className="short-live-meta">{protection.verified ? "거래소 대조 확인" : "현재 보호 확인 필요"}</small></td><td>{futuresPrice(protection.triggerPrice)}</td><td>{date(protection.observedAt)}</td></tr>)}</tbody></table></div>}
+          {row.futuresPositions.map((position, index) => <p key={`${position.symbol}:${position.positionSide}:${index}`}>{position.symbol} · {position.positionSide} · Mark Price {futuresPrice(position.markPrice)} · 거래소 청산가 {futuresPrice(position.actualLiquidationPrice)} · {position.leverage ?? "미확인"}배</p>)}
+          {row.futuresIncidents.map((incident, index) => <div key={`${incident.symbol}:${incident.type}:${index}`} className="short-live-blockers" role="status"><strong>{shortLiveFuturesIncidentLabel(incident.type)} · {incident.symbol}</strong><p>{incident.positionSide} · 수량 {incident.quantity ?? "미확인"} · {date(incident.observedAt)}</p><p>{incident.verified ? "거래소 사건 확인 · 신규 진입 중단 및 잔여 주문·포지션 대조" : "사건 근거 미확정 · 자동 재시작하지 않음"}</p></div>)}
+        </div>)}
         <div className="short-live-table-wrap"><table><thead><tr><th>전략</th><th>시간봉</th><th>최근 신호</th><th>봉 평가 / 주문 시도 / 체결 관측</th><th>관측 의미</th></tr></thead><tbody>{snapshot.runtime.strategies.map((row, index) => <tr key={`${row.selectionKey}:${index}`}><td>{row.pluginId && row.symbol ? `${row.pluginId} · ${row.symbol}` : row.label || row.selectionKey}<small className="short-live-meta">{SHORT_LIVE_ROUTES.find((route) => route.id === row.route)?.label || row.route}</small></td><td>{row.timeframe}</td><td>{row.signal === "NOT_OBSERVED" ? "미관측" : row.signal || "미관측"}</td><td>{row.decisionCount ?? "미확인"} / {row.orderAttemptCount ?? "미확인"} / {row.fillObservationCount ?? "미확인"}</td><td>{shortLiveRuntimeMeaning(row)}{row.internalAllocationTransferCount > 0 && <small className="short-live-meta">전략 간 내부 배분 {row.internalAllocationTransferCount}회 · 거래소 체결과 구분</small>}</td></tr>)}</tbody></table></div>
       </>}
     </section>

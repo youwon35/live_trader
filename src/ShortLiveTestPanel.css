@@ -45,7 +45,7 @@
 .short-live-selection ul { list-style: none; padding: 0; margin: 10px 0 0; display: grid; gap: 8px; }
 .short-live-selection li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border); }
 .short-live-selection li > span { min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
-.short-live-selection li > button { flex-shrink: 0; }
+.short-live-selection li > button { flex-shrink: 0; width: auto; }
 .short-live-limit-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; }
 .short-live-limit-summary > div { padding: 12px; border: 1px solid var(--border); border-radius: 10px; display: grid; gap: 5px; }
 .short-live-limit-summary > div > span { font-size: 12px; color: var(--text-muted, #718096); }
@@ -57,5 +57,13 @@
 .short-live-expiry.is-expired { color: var(--danger, #bd3535); }
 .short-live-workspace button:focus-visible, .short-live-workspace input:focus-visible, .short-live-workspace select:focus-visible, .short-live-details summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .short-live-candidate:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.short-live-futures-policy { border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin: 14px 0; min-width: 0; }
+.short-live-futures-policy legend { padding: 0 6px; font-weight: 650; }
+.short-live-futures-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.short-live-futures-fields label { display: grid; gap: 7px; }
+.short-live-futures-fields small { color: var(--text-muted, #718096); line-height: 1.5; }
+.short-live-futures-fields input { width: 100%; min-height: 40px; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--panel); color: var(--text); box-sizing: border-box; }
+.short-live-futures-observation { margin-top: 18px; padding-top: 6px; border-top: 1px solid var(--border); }
+.short-live-futures-observation h4 { margin-bottom: 10px; }
 @media (max-width: 850px) { .short-live-catalog, .short-live-filters { grid-template-columns: 1fr; } .short-live-limits { grid-template-columns: 1fr; } .short-live-workspace .panel { padding: 16px; } }
-@media (max-width: 440px) { .short-live-limit-summary { grid-template-columns: 1fr; } .short-live-catalog { max-height: 480px; } }
+@media (max-width: 440px) { .short-live-limit-summary, .short-live-futures-fields { grid-template-columns: 1fr; } .short-live-catalog { max-height: 480px; } }

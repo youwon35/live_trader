@@ -111,6 +111,7 @@ class Broker:
 
     def readiness(self, manifest):
         return {"ready": True, "accountId": "fixture-binance" if "BINANCE" in self.route else "fixture-" + self.route,
+                "observedFuturesSettingsBySymbol": {self.spec["symbol"]: {"marginMode": "ISOLATED", "leverage": "1", "positionMode": "ONE_WAY"}},
                 "scopeOwnershipVerified": True, "availableKrw": self.available,
                 "existingExposureKrw": 0, "blockers": [],
                 "boundedCostAllowanceVerified": True, "actualEquityLossTracked": True}
@@ -141,6 +142,8 @@ class Broker:
                 "actualFeeKnown": self.fee_known, "baseCommissionQuantity": 0, "baseCommissionKnown": True}
 
     def observe_order(self, client_id):
+        if self.status in {"UNKNOWN", "RAISE"} and not self.observations:
+            return {"status": "UNKNOWN", "clientOrderId": client_id}
         if self.observations:
             fraction, status = self.observations.pop(0)
             order = self.last_order
@@ -157,6 +160,7 @@ class Broker:
 
     def reconcile(self, session):
         return {"ready": self.reconcile_known, "known": self.reconcile_known,
+                "protectionRetirementVerified": not self.quantity,
                 "exposureKrw": self.exposure, "realizedLossKrw": self.loss,
                 "unrealizedLossKrw": 0, "equityKrw": 100_000,
                 "ownedOrders": [], "ownedPositions": [{"quantity": self.quantity}] if self.exposure else [],
@@ -233,6 +237,7 @@ class ShortLiveSessionTests(unittest.TestCase):
 
     def prepare(self, service, **changes):
         return service.prepare({"selections": [{"selectionKey": "exact", "artifactFileSha256": "d" * 64}],
+                                "futuresPolicy": {"leverage": 1, "marginMode": "ISOLATED", "stopLossPercent": 2},
                                 "durationHours": 6, **changes})
 
     def start(self, service):
@@ -1020,6 +1025,24 @@ class ShortLiveSessionTests(unittest.TestCase):
         service.tick()
         self.assertEqual(2, len(broker.submits))
         self.assertEqual(1, service._session["internalTransferCount"])
+
+    def test_unknown_reply_read_recovery_preserves_first_failure_and_does_not_restart(self):
+        specs, service, broker = self.five_percent_pair()
+        broker.status, broker.cleanup_complete = "UNKNOWN", False
+        service._session["sleeves"]["exit-sleeve"]["targetWeight"] = .025
+        with service._lock:
+            service._dispatch_symbol(specs[0]["route"], specs[0]["symbol"], 7,
+                                     "fixture-original-unknown", ["exit-sleeve"])
+        first_failure = service._session["firstFailure"]
+        self.assertIn("UNKNOWN", first_failure)
+        self.assertEqual(1, len(broker.submits))
+        broker.observations = [(1, "FILLED")]
+        service.tick()
+        self.assertEqual(first_failure, service._session["firstFailure"])
+        self.assertTrue(service._session["newEntriesBlocked"])
+        self.assertNotEqual("RUNNING", service._session["status"])
+        self.assertEqual(1, len(broker.submits))
+        self.assertEqual(1, service._session["fillCount"])
 
     def test_simultaneous_same_side_exits_net_once_without_negative_holdings(self):
         specs, service, broker = self.five_percent_pair()

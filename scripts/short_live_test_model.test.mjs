@@ -7,6 +7,7 @@ import {
   normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveCanStart, shortLiveCoverage,
   shortLiveRuntimeMeaning, shortLiveSelectionSignature, shortLivePreparationMatches, shortLiveBlockerLabel,
   shortLivePreparationWindow, shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLiveRunning,
+  normalizeShortLiveFuturesPolicy, shortLiveProtectionLabel, shortLiveFuturesIncidentLabel,
 } from "../src/shortLiveTestModel.js";
 
 const instance = (changes = {}) => ({
@@ -77,13 +78,77 @@ test("mixed timeframe portfolio is counted only in declared cells", () => {
   assert.deepEqual(cells.map((cell) => cell.timeframe), ["5m", "1h"]);
   assert.equal(exactShortLiveTarget(row).portfolioId, "fixture-portfolio");
 });
-test("prepare pins selected originals and keeps futures changes disabled", () => {
+test("spot preparation pins selected originals without a futures configuration mutation", () => {
   const catalog = [normalizeShortLiveCandidate(instance()), normalizeShortLiveCandidate(portfolio())];
   const body = buildShortLivePrepare(catalog, catalog.map((row) => row.selectionKey));
   assert.equal(body.durationHours, 6); assert.equal(body.capitalKrwPerBroker, 100000);
   assert.equal(body.dailyLossStopKrwPerBroker, 50000); assert.equal(body.selections.length, 2);
   assert.equal(body.selections[0].instanceFileSha256, "b".repeat(64));
-  assert.deepEqual(body.futuresPreparation, { leverage: 1, marginMode: "ISOLATED", applySettings: false });
+  assert.equal(body.futuresPolicy, undefined);
+  assert.equal(body.futuresPreparation, undefined);
+});
+
+test("futures preparation requires explicit valid protection policy and preserves real capital", () => {
+  const row = instance({ route: "BINANCE_USDM_FUTURES", routes: ["BINANCE_USDM_FUTURES"] });
+  const limits = { durationHours: 6, budgetKrwPerBroker: 100000, lossKrwPerBroker: 50000 };
+  const policy = { leverage: 5, marginMode: "ISOLATED", stopLossPercent: 2 };
+  assert.throws(() => buildShortLivePrepare([row], [row.selectionKey], limits), /손절/);
+  for (const bad of [null, { ...policy, stopLossPercent: "" }, { ...policy, stopLossPercent: 0 },
+    { ...policy, stopLossPercent: 20 }, { ...policy, leverage: true }, { ...policy, leverage: 5.5 },
+    { ...policy, leverage: 126 }, { ...policy, marginMode: "CROSSED" }]) {
+    assert.equal(normalizeShortLiveFuturesPolicy(bad), null);
+    assert.throws(() => buildShortLivePrepare([row], [row.selectionKey], { ...limits, futuresPolicy: bad }));
+  }
+  const body = buildShortLivePrepare([row], [row.selectionKey], { ...limits, futuresPolicy: policy });
+  assert.deepEqual(body.futuresPolicy, policy);
+  assert.equal(body.capitalKrwPerBroker, 100000);
+  assert.equal(body.dailyLossStopKrwPerBroker, 50000);
+  assert.equal(body.futuresPreparation, undefined);
+  assert.equal(JSON.stringify(body).includes("applySettings"), false);
+});
+
+test("futures policy changes invalidate preparation binding and require a new manual acknowledgement", () => {
+  const row = instance({ route: "BINANCE_USDM_FUTURES", routes: ["BINANCE_USDM_FUTURES"] });
+  const policy = { leverage: 5, marginMode: "ISOLATED", stopLossPercent: 2 };
+  const prepared = { durationHours: 6, budgetKrwPerBroker: 100000, lossKrwPerBroker: 50000,
+    targets: [row], futuresPolicy: policy };
+  assert.equal(shortLivePreparationMatches(prepared, [row], [row.selectionKey], 6, policy), true);
+  assert.equal(shortLivePreparationMatches(prepared, [row], [row.selectionKey], 6), false);
+  for (const changed of [{ ...policy, leverage: 3 }, { ...policy, stopLossPercent: 1 }, { ...policy, stopLossPercent: "" }]) {
+    assert.equal(shortLivePreparationMatches(prepared, [row], [row.selectionKey], 6, changed), false);
+    assert.notEqual(shortLiveSelectionSignature([row], [row.selectionKey], 6, policy),
+      shortLiveSelectionSignature([row], [row.selectionKey], 6, changed));
+  }
+  assert.equal(shortLivePreparationMatches({ ...prepared, futuresPolicy: null }, [row], [row.selectionKey], 6, policy), false);
+});
+
+test("futures observations separate margin, notional and actual exchange liquidation without leaking raw accounts", () => {
+  const view = normalizeShortLiveSnapshot({ prepared: { futuresPolicy: { leverage: 5, marginMode: "ISOLATED", stopLossPercent: 2 },
+    brokerReadiness: [{ route: "BINANCE_USDM_FUTURES", observedFuturesSettingsBySymbol: {
+      SOLUSDT: { marginMode: "ISOLATED", leverage: "5", positionMode: "HEDGE", accountId: "private" } } }] },
+    runtime: { brokerRows: [{ route: "BINANCE_USDM_FUTURES", committedCapitalKrw: "1000", notionalExposureKrw: "5000",
+      protections: [{ symbol: "SOLUSDT", positionSide: "LONG", status: "NEW", triggerPrice: "98", verified: true, raw: "private" }],
+      futuresPositions: [{ symbol: "SOLUSDT", liquidationPrice: "80.5", markPrice: "100", leverage: "5", accountId: "private" }],
+      futuresIncidents: [{ type: "LIQUIDATION", symbol: "SOLUSDT", quantity: "0.5", verified: true, raw: "private" }] }] } });
+  assert.equal(view.prepared.futuresPolicy.leverage, 5);
+  assert.equal(view.prepared.brokerReadiness[0].observedFuturesSettingsBySymbol.SOLUSDT.leverage, 5);
+  const broker = view.runtime.brokers[0];
+  assert.equal(broker.committedCapitalKrw, 1000); assert.equal(broker.notionalExposureKrw, 5000);
+  assert.equal(broker.protections[0].verified, true); assert.equal(broker.protections[0].triggerPrice, 98);
+  assert.equal(broker.futuresPositions[0].actualLiquidationPrice, 80.5);
+  assert.equal(broker.futuresIncidents[0].type, "LIQUIDATION");
+  assert.doesNotMatch(JSON.stringify(view), /private|accountId|raw/);
+  assert.match(shortLiveProtectionLabel("UNKNOWN"), /미확인/);
+  assert.match(shortLiveFuturesIncidentLabel("ADL"), /디레버리징/);
+  const unknown = normalizeShortLiveSnapshot({ runtime: { brokerRows: [{ route: "BINANCE_USDM_FUTURES",
+    protections: [{ status: "NEW", verified: "true" }], futuresIncidents: [{ type: "ADL", verified: "true" }] }] } });
+  assert.equal(unknown.runtime.brokers[0].protections[0].verified, false);
+  assert.equal(unknown.runtime.brokers[0].futuresIncidents[0].verified, false);
+  const codeOnly = normalizeShortLiveSnapshot({ runtime: { brokerRows: [{ route: "BINANCE_USDM_FUTURES",
+    futuresIncidents: [{ code: "FUTURES_ACTUAL_LIQUIDATION_BUFFER_BREACHED", symbol: "SOLUSDT" }] }] } });
+  const incident = codeOnly.runtime.brokers[0].futuresIncidents[0];
+  assert.match(shortLiveFuturesIncidentLabel(incident.type), /실제 청산 가격.*여유 부족/);
+  assert.equal(incident.verified, false); assert.equal(incident.quantity, null);
 });
 test("prepare rejects missing and duplicate exact selections", () => {
   assert.throws(() => buildShortLivePrepare([], []));
@@ -168,6 +233,14 @@ test("actual backend blocker codes describe account funding, KIS session/cost an
     ["KIS_KR_CASH:KRX_SESSION_CLOSED",/국내 정규장.*닫혀/],
     ["KIS_KR_CASH:KIS_CONFIRMED_COST_POLICY_REQUIRED",/수수료·매도세율/],
     ["BINANCE_USDM_FUTURES:FUTURES_SETTINGS_REQUIRE_1X_ISOLATED",/1배.*격리/],
+    ["BINANCE_USDM_FUTURES:FUTURES_SETTINGS_DIFFER_FROM_PREPARED_POLICY",/레버리지.*격리.*다름/],
+    ["FUTURES_ACTUAL_LIQUIDATION_BUFFER_BREACHED",/실제 청산 가격.*여유 부족/],
+    ["FUTURES_PROTECTION_ACK_UNKNOWN",/접수 결과 미확정.*진입 차단/],
+    ["FUTURES_PROTECTIVE_STOP_TRIGGERED",/보호 손절 발동.*체결 대조/],
+    ["FUTURES_AUTO_ADD_MARGIN_MUST_BE_DISABLED",/자동 증거금 추가.*꺼야/],
+    ["FUTURES_PROTECTION_RETIREMENT_UNKNOWN",/실제 주문.*종료.*못함/],
+    ["BINANCE:DAILY_LOSS_STOP_REACHED",/Binance 현물·선물 합산.*손실 중단/],
+    ["IMMUTABLE_FUNCTIONAL_CONTRACT_MISMATCH",/버전·범위.*다시 무주문 준비/],
     ["UPBIT_KRW_SPOT:NO_AVAILABLE_BALANCE",/잔고 없음/],
     ["START_BLOCKED:KIS_KR_CASH:KRX_SESSION_CLOSED,UPBIT_KRW_SPOT:AVAILABLE_BELOW_NATIVE_MINIMUM",/국내 정규장.*최소 주문/],
   ]) {

@@ -295,6 +295,8 @@ def get_service() -> ShortLiveTestService:
                     reserve_cleanup_order=lambda order: bool(_SERVICE and _SERVICE.reserve_cleanup_order(order)),
                     reserve_cleanup_cancel=lambda order: bool(_SERVICE and _SERVICE.reserve_cleanup_cancel(order)),
                     observe_cleanup_order=lambda client_id, result: bool(_SERVICE and _SERVICE.observe_cleanup_order(client_id, result)),
+                    reserve_protection=lambda order: bool(_SERVICE and _SERVICE.reserve_protection(order)),
+                    record_protection=lambda event, detail: _SERVICE.record_protection(event, detail),
                 )
 
             _SERVICE = ShortLiveTestService(

@@ -15,7 +15,7 @@ import re
 from typing import Any, Mapping
 from uuid import uuid4
 
-SCHEMA = "short-live-functional-contract-v1"
+SCHEMA = "short-live-functional-contract-v2"
 PURPOSE = "FUNCTIONAL_TEST_ONLY"
 CONFIRMATION_TEXT = "실제 주문 시험 시작"
 ROUTES = {
@@ -79,6 +79,34 @@ def hash_text(value: Any, name: str) -> str:
     if not _HASH.fullmatch(result):
         raise ShortLiveContractError(f"{name}_SHA256_REQUIRED")
     return result
+
+
+def normalize_futures_policy(value: Any) -> dict[str, Any]:
+    """Freeze the operator's expected configuration; never change the account.
+
+    The percentage is only the entry-price trigger distance. Actual exchange
+    margin tiers and liquidation distance must still pass the broker guard.
+    """
+    constants = {"orderType": "STOP_MARKET", "workingType": "MARK_PRICE",
+                 "closePosition": True, "triggerBasis": "ENTRY_LIMIT_PRICE"}
+    if not isinstance(value, Mapping):
+        raise ShortLiveContractError("FUTURES_PROTECTION_POLICY_REQUIRED")
+    if set(value) - ({"leverage", "marginMode", "stopLossPercent"} | constants.keys()):
+        raise ShortLiveContractError("FUTURES_PROTECTION_POLICY_INVALID")
+    leverage = finite(value.get("leverage"), "FUTURES_LEVERAGE", minimum=1, maximum=125)
+    if not leverage.is_integer():
+        raise ShortLiveContractError("FUTURES_LEVERAGE_INTEGER_REQUIRED")
+    if value.get("marginMode") != "ISOLATED":
+        raise ShortLiveContractError("FUTURES_ISOLATED_MARGIN_REQUIRED")
+    stop = finite(value.get("stopLossPercent"), "FUTURES_STOP_LOSS_PERCENT", positive=True)
+    if stop >= 100 / leverage:
+        raise ShortLiveContractError("FUTURES_STOP_DISTANCE_EXCEEDS_MARGIN")
+    for key, expected in constants.items():
+        if key in value and (value[key] != expected or
+                             (key == "closePosition" and value[key] is not True)):
+            raise ShortLiveContractError("FUTURES_PROTECTION_POLICY_INVALID")
+    return {"leverage": int(leverage), "marginMode": "ISOLATED",
+            "stopLossPercent": stop, **constants}
 
 
 def validate_source_pins(pins: list[dict[str, Any]]) -> None:
@@ -232,6 +260,8 @@ def build_contract(resolved: Mapping[str, Any], payload: Mapping[str, Any],
     pins = deepcopy(resolved.get("sourcePins", []))
     validate_source_pins(pins)
     routes = sorted({spec["route"] for spec in specs})
+    futures_policy = (normalize_futures_policy(payload.get("futuresPolicy"))
+                      if "BINANCE_USDM_FUTURES" in routes else None)
     broker_counts = {broker: sum(ROUTES[route] == broker for route in routes)
                      for broker in set(ROUTES[route] for route in routes)}
     session_id = f"short-live-{uuid4()}"
@@ -251,6 +281,8 @@ def build_contract(resolved: Mapping[str, Any], payload: Mapping[str, Any],
                                "instanceIds": [s["strategyInstanceId"] for s in leg_specs]},
             "sameSymbolCrossSleeveTransferPolicy": "EXPLICIT_INTERNAL_OWNERSHIP_TRANSFER_THEN_EXTERNAL_NET_RESIDUAL",
         })
+        if route == "BINANCE_USDM_FUTURES":
+            legs[-1]["futuresPolicy"] = deepcopy(futures_policy)
     body = {
         "schemaVersion": SCHEMA, "purpose": PURPOSE,
         "promotionEligible": False, "useAsPromotionEvidence": False,
@@ -259,6 +291,8 @@ def build_contract(resolved: Mapping[str, Any], payload: Mapping[str, Any],
         "durationHours": duration, "durationSeconds": int(duration * 3600),
         "capitalKrwPerBroker": capital, "dailyLossStopKrwPerBroker": loss,
         "binanceSpotAndFuturesShareBudget": True,
+        "capitalBudgetBasis": "CASH_AND_FUTURES_MARGIN_WITH_COST_RESERVES",
+        "futuresPolicy": deepcopy(futures_policy),
         "targets": targets, "specs": specs, "sourcePins": pins,
         "legs": legs, "automaticRestartAllowed": False,
         "realOrderStartRequiresOperatorConfirmation": True,
@@ -277,6 +311,15 @@ def verify_contract(value: Mapping[str, Any], *, check_sources: bool = True) -> 
             or body.get("automaticRestartAllowed") is not False
             or alias != declared or canonical_hash(body) != declared):
         raise ShortLiveContractError("IMMUTABLE_FUNCTIONAL_CONTRACT_MISMATCH")
+    futures_legs = [leg for leg in body.get("legs", [])
+                    if leg.get("route") == "BINANCE_USDM_FUTURES"]
+    if futures_legs:
+        policy = normalize_futures_policy(body.get("futuresPolicy"))
+        if body.get("futuresPolicy") != policy or any(
+                leg.get("futuresPolicy") != policy for leg in futures_legs):
+            raise ShortLiveContractError("IMMUTABLE_FUTURES_POLICY_MISMATCH")
+    elif body.get("futuresPolicy") is not None:
+        raise ShortLiveContractError("IMMUTABLE_FUTURES_POLICY_MISMATCH")
     if check_sources:
         validate_source_pins(body["sourcePins"])
 

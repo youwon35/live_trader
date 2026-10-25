@@ -29,6 +29,9 @@ export function shortLiveBlockerLabel(value) {
   const code = text(typeof value === "string" ? value : value?.code);
   const route = SHORT_LIVE_ROUTES.find((item) => code.startsWith(`${item.id}:`));
   if (route) return `${route.label} · ${shortLiveBlockerLabel(code.slice(route.id.length + 1))}`;
+  const brokerGroup = Object.entries({ BINANCE: "Binance 현물·선물 합산", UPBIT: "Upbit", KIS: "한국투자증권" })
+    .find(([group]) => code.startsWith(`${group}:`));
+  if (brokerGroup) return `${brokerGroup[1]} · ${shortLiveBlockerLabel(code.slice(brokerGroup[0].length + 1))}`;
   for (const prefix of ["START_BLOCKED:", "NATIVE_ORDER_SIZE_BLOCKED:"]) {
     if (code.startsWith(prefix)) return code.slice(prefix.length).split(",").map(shortLiveBlockerLabel).join(" · ");
   }
@@ -59,10 +62,65 @@ export function shortLiveBlockerLabel(value) {
     NATIVE_ORDERABLE_QUANTITY_UNKNOWN: "증권사가 확인한 실제 주문 가능 수량을 읽지 못함",
     NATIVE_ORDERABLE_QUANTITY_BELOW_MINIMUM: "증권사의 실제 주문 가능 수량이 최소 주문 단위보다 부족함",
     FUTURES_SETTINGS_REQUIRE_1X_ISOLATED: "선물 계좌의 1배 레버리지·격리 방식 확인 필요 · 자동 변경하지 않음",
+    FUTURES_PROTECTION_POLICY_REQUIRED: "선물 기대 레버리지와 보호 손절 가격 거리를 직접 입력해야 함",
+    FUTURES_PROTECTION_POLICY_INVALID: "선물 보호 손절 정책을 확인하지 못함",
+    FUTURES_LEVERAGE_INTEGER_REQUIRED: "선물 레버리지는 1~125 사이의 정수로 입력해야 함",
+    FUTURES_LEVERAGE_INVALID: "선물 레버리지는 1~125 사이의 정수로 입력해야 함",
+    FUTURES_LEVERAGE_EXCEEDS_LIMIT: "선물 레버리지가 지원 상한을 초과함",
+    FUTURES_ISOLATED_MARGIN_REQUIRED: "선물 계좌의 격리 방식을 확인해야 함 · 자동 변경하지 않음",
+    FUTURES_STOP_DISTANCE_EXCEEDS_MARGIN: "보호 손절 가격 거리가 레버리지에 따른 증거금 범위를 벗어남",
+    FUTURES_SETTINGS_CHANGED: "준비 이후 선물 레버리지·증거금·포지션 설정 변경 · 신규 진입 차단",
+    FUTURES_SETTINGS_POLICY_MISMATCH: "실제 선물 계좌 설정과 준비한 레버리지·격리 정책이 다름",
+    FUTURES_PROTECTION_UNVERIFIED: "거래소 보호 손절 주문을 확인하지 못함 · 신규 진입 차단",
+    FUTURES_PROTECTION_REJECTED: "거래소가 보호 손절 주문을 거절함 · 신규 진입 차단",
+    FUTURES_PROTECTION_TRIGGERED: "거래소 보호 손절이 발동함 · 잔여 주문과 실제 포지션 대조 중",
+    FUTURES_LIQUIDATION_DETECTED: "거래소 강제청산이 확인됨 · 신규 진입 중단 및 실제 체결 대조 필요",
+    FUTURES_ADL_DETECTED: "거래소 자동 디레버리징이 확인됨 · 신규 진입 중단 및 실제 체결 대조 필요",
+    FUTURES_FORCE_ORDER_UNKNOWN: "강제청산·자동 디레버리징 여부를 확인하지 못함 · 신규 진입 차단",
     FUTURES_POSITION_MODE_UNKNOWN: "선물 포지션 모드를 확인하지 못함",
     FUTURES_SINGLE_ASSET_MODE_REQUIRED: "현재 선물 계좌를 단일 자산 증거금 모드로 확인해야 함 · 자동 변경하지 않음",
     FUTURES_CONFIG_UNKNOWN: "선물 계좌의 현재 레버리지·격리 설정을 확인하지 못함",
     FUTURES_CONDITIONAL_ORDER_PRESENT_OR_UNKNOWN: "선물 조건주문이 남아 있거나 조건주문 조회가 미확정임",
+    FUTURES_SETTINGS_CHANGED_SINCE_PREPARATION: "준비 이후 선물 계좌 설정 변경 · 다시 준비 필요",
+    FUTURES_SETTINGS_DIFFER_FROM_PREPARED_POLICY: "실제 레버리지·격리 설정이 준비한 정책과 다름 · 신규 진입 차단",
+    FUTURES_SETTINGS_CHANGED_DURING_SESSION: "실행 중 선물 계좌 설정 변경 · 신규 진입 중단 및 기존 포지션 대조",
+    FUTURES_INCIDENT_NEW_ENTRIES_BLOCKED: "선물 보호·청산 사건 발생 · 신규 진입 중단",
+    FUTURES_PROTECTION_TRANSPORT_UNAVAILABLE: "거래소 보호 손절 주문 연결을 확인하지 못함",
+    FUTURES_PROTECTION_NUMBER_UNKNOWN: "보호 주문 가격·수량 계산에 필요한 실제 값을 확인하지 못함",
+    FUTURES_STOP_ALREADY_TRIGGERED_OR_INVALID: "현재 가격이 보호 손절 범위를 벗어났거나 발동 가격이 유효하지 않음",
+    FUTURES_SYMBOL_NOTIONAL_LIMIT_EXCEEDED: "레버리지를 반영한 명목 노출이 거래소 종목 한도를 초과함",
+    FUTURES_MAINTENANCE_BRACKETS_UNKNOWN: "거래소 유지증거금 구간을 확인하지 못함",
+    FUTURES_NOTIONAL_BRACKET_UNKNOWN: "계산된 명목 노출에 해당하는 증거금 구간을 확인하지 못함",
+    FUTURES_LEVERAGE_BRACKET_EXCEEDED: "설정한 레버리지가 해당 명목 노출 구간의 거래소 상한을 초과함",
+    FUTURES_STOP_AT_OR_BEYOND_MAINTENANCE_BUFFER: "보호 손절이 유지증거금 안전 여유 안에서 발동하도록 설정되어야 함",
+    FUTURES_PROTECTION_ACK_UNKNOWN: "보호 손절 주문의 거래소 접수 결과 미확정 · 신규 진입 차단",
+    FUTURES_PROTECTION_ID_UNKNOWN: "접수된 보호 손절 주문을 정확히 식별하지 못함",
+    FUTURES_PROTECTION_OBSERVATION_STALE: "보호 손절 주문의 최신 상태를 확인하지 못함",
+    FUTURES_PROTECTION_NOT_ACTIVE: "거래소 보호 손절 주문이 유효한 대기 상태가 아님 · 신규 진입 차단",
+    FUTURES_EXISTING_STOP_ALREADY_TRIGGERED: "기존 보호 손절의 발동 가격에 도달함 · 신규 진입 차단",
+    FUTURES_PROTECTION_RESERVATION_REQUIRED: "보호 손절 주문의 실행 기록을 확정하지 못함",
+    FUTURES_PROTECTION_CANCEL_RESERVATION_REQUIRED: "보호 손절 취소의 실행 기록을 확정하지 못함",
+    FUTURES_PROTECTION_CANCEL_UNKNOWN: "보호 손절 취소 결과 미확정 · 종료 대조 계속 필요",
+    FUTURES_PROTECTION_RETIREMENT_UNKNOWN: "보호 손절 주문과 발동한 실제 주문의 종료를 확인하지 못함",
+    FUTURES_AUTO_ADD_MARGIN_MUST_BE_DISABLED: "선물 자동 증거금 추가를 꺼야 함 · 계좌 자금 추가 투입 방지",
+    FUTURES_AUTO_ADD_MARGIN_ENABLED: "실행 중 선물 자동 증거금 추가가 켜짐 · 신규 진입 중단",
+    FUTURES_AUTO_ADD_MARGIN_UNKNOWN: "선물 자동 증거금 추가 설정을 확인할 수 없음 · 신규 진입 차단",
+    FUTURES_PROTECTIVE_EXECUTION_UNKNOWN: "발동한 보호 손절의 실제 주문·체결을 확인하지 못함",
+    FUTURES_PROTECTIVE_EXECUTION_IDENTITY_CHANGED: "보호 손절의 실제 체결 주문 식별 정보가 일치하지 않음",
+    FUTURES_PROTECTIVE_STOP_TRIGGERED: "거래소 보호 손절 발동 · 신규 진입 중단 및 실제 체결 대조",
+    FUTURES_POSITION_UNPROTECTED: "실제 선물 포지션의 유효한 보호 손절 주문을 확인하지 못함",
+    FUTURES_LIQUIDATION_PRICE_UNKNOWN: "거래소가 보고한 실제 청산 가격을 확인하지 못함",
+    FUTURES_ACTUAL_LIQUIDATION_BUFFER_BREACHED: "실제 청산 가격까지의 안전 여유 부족 · 신규 진입 중단",
+    FUTURES_STOP_TRIGGER_PENDING: "보호 손절 가격 도달 · 거래소 발동·체결 확인 대기",
+    FUTURES_FORCE_ORDER_HISTORY_UNKNOWN: "거래소 강제청산·자동 디레버리징 주문 이력을 확인하지 못함",
+    FUTURES_FORCE_EXECUTION_IDENTITY_CHANGED: "강제청산·자동 디레버리징의 체결 식별 정보가 일치하지 않음",
+    FUTURES_EXTERNAL_EXECUTION_OR_FEE_UNKNOWN: "보호·청산에 따른 실제 체결 또는 수수료 미확정",
+    FUTURES_EXTERNAL_EXECUTION_IDENTITY_UNKNOWN: "보호·청산에 따른 체결을 정확한 주문과 연결하지 못함",
+    FUTURES_EXTERNAL_CUMULATIVE_FILL_REGRESSED: "거래소 누적 체결 수량이 이전 확인보다 감소함 · 대조 필요",
+    FUTURES_EXTERNAL_SLEEVE_ATTRIBUTION_UNKNOWN: "보호·청산 체결을 해당 전략의 보유 수량에 배분하지 못함",
+    FUTURES_ALGO_ORDERS_UNKNOWN: "거래소 선물 조건주문 전체 조회를 확인하지 못함",
+    UNOWNED_FUTURES_CONDITIONAL_ORDER: "이 시험의 소유로 확인되지 않은 선물 조건주문이 있음",
+    UNOWNED_FUTURES_POSITION_SIDE: "이 시험이 관리하는 방향과 다른 선물 포지션이 있음",
     BINANCE_SHARED_BUDGET_ACCOUNT_MISMATCH: "Binance 현물·선물을 같은 거래소 예산으로 묶을 계좌 정보를 확인하지 못함",
     EXCHANGE_SHARED_BUDGET_EXCEEDED: "거래소별 합산 자본 10만원 한도를 초과함",
     DAILY_LOSS_STOP_REACHED: "이번 시험의 손실 중단 기준에 도달함",
@@ -83,6 +141,9 @@ export function shortLiveBlockerLabel(value) {
     PREPARATION_EXPIRED: "준비 결과의 유효 시간이 지남 · 다시 무주문 준비 필요",
     PREPARATION_REQUIRED: "시작 전에 선택한 범위로 무주문 준비 필요",
     PREPARATION_SCOPE_MISMATCH: "준비 때 확인한 범위와 시작 요청이 다름",
+    IMMUTABLE_FUNCTIONAL_CONTRACT_MISMATCH: "준비 결과의 버전·범위가 현재 실행 계약과 다름 · 다시 무주문 준비 필요",
+    IMMUTABLE_FUTURES_POLICY_MISMATCH: "확정한 선물 보호 정책이 준비 결과와 다름 · 다시 무주문 준비 필요",
+    PROTECTION_SESSION_UNAVAILABLE: "보호 주문을 연결할 현재 시험 세션을 확인하지 못함",
     ACTIVE_SCOPE_CANNOT_BE_REPLACED: "기존 시험의 종료 대조가 끝나기 전에는 시험 범위 변경 불가",
     DUPLICATE_START_FORBIDDEN: "같은 시작 요청을 반복할 수 없음 · 기존 실행 상태 확인 필요",
     EXPLICIT_MANUAL_UI_CONFIRMATION_REQUIRED: "선택 범위·손실 가능성 확인과 시작 문구 직접 입력 필요",
@@ -188,6 +249,56 @@ export function exactShortLiveTarget(candidate) {
   };
 }
 
+export function normalizeShortLiveFuturesPolicy(value) {
+  if (!value || typeof value !== "object" || value.marginMode !== "ISOLATED") return null;
+  const constants = { orderType: "STOP_MARKET", workingType: "MARK_PRICE", closePosition: true, triggerBasis: "ENTRY_LIMIT_PRICE" };
+  if (Object.entries(constants).some(([key, expected]) => key in value && value[key] !== expected)
+    || Object.keys(value).some((key) => !["leverage", "marginMode", "stopLossPercent", ...Object.keys(constants)].includes(key))) return null;
+  const leverage = amount(value.leverage), stopLossPercent = amount(value.stopLossPercent);
+  if (!Number.isInteger(leverage) || leverage < 1 || leverage > 125
+    || stopLossPercent === null || stopLossPercent <= 0 || stopLossPercent >= 100 / leverage) return null;
+  return { leverage, marginMode: "ISOLATED", stopLossPercent };
+}
+
+const futuresSelected = (catalog, keys) => catalog.some((row) => keys.includes(row.selectionKey)
+  && normalizeShortLiveCandidate(row).routes.includes("BINANCE_USDM_FUTURES"));
+
+const normalizeFuturesSettings = (row) => ({
+  marginMode: sanitizeShortLiveText(row?.marginMode), leverage: amount(row?.leverage),
+  positionMode: sanitizeShortLiveText(row?.positionMode),
+});
+const normalizeFuturesSettingsBySymbol = (value) => Object.fromEntries(
+  Object.entries(value && typeof value === "object" && !Array.isArray(value) ? value : {})
+    .filter(([symbol, row]) => /^[A-Z0-9_.-]{2,40}$/.test(symbol) && row && typeof row === "object")
+    .map(([symbol, row]) => [symbol, normalizeFuturesSettings(row)]));
+
+const normalizeFuturesProtection = (row = {}) => ({
+  symbol: sanitizeShortLiveText(row.symbol), positionSide: sanitizeShortLiveText(row.positionSide),
+  status: sanitizeShortLiveText(row.status || row.algoStatus) || "UNKNOWN",
+  triggerPrice: amount(row.triggerPrice), actualLiquidationPrice: amount(row.actualLiquidationPrice),
+  markPrice: amount(row.markPrice), leverage: amount(row.leverage),
+  verified: row.verified === true, observedAt: text(row.observedAt),
+});
+const normalizeFuturesIncident = (row = {}) => ({
+  symbol: sanitizeShortLiveText(row.symbol), positionSide: sanitizeShortLiveText(row.positionSide),
+  type: sanitizeShortLiveText(row.type || row.autoCloseType || row.kind || row.code) || "UNKNOWN",
+  observedAt: text(row.observedAt), quantity: amount(row.quantity ?? row.executedQty),
+  verified: row.verified === true,
+});
+
+export function shortLiveProtectionLabel(status) {
+  return ({ NEW: "보호 주문 대기", WORKING: "보호 주문 대기", VERIFIED: "보호 확인",
+    TRIGGERED: "보호 발동", FINISHED: "보호 주문 종료", FILLED: "보호 체결 확인",
+    CANCELED: "보호 취소 확인", REJECTED: "보호 주문 거절", EXPIRED: "보호 주문 만료",
+    UNKNOWN: "보호 상태 미확인" })[status] || "보호 상태 확인 필요";
+}
+
+export function shortLiveFuturesIncidentLabel(type) {
+  if (typeof type === "string" && type.startsWith("FUTURES_")) return shortLiveBlockerLabel(type);
+  return ({ LIQUIDATION: "거래소 강제청산", ADL: "자동 디레버리징",
+    PROTECTIVE_STOP: "보호 손절 발동", PROTECTION_TRIGGERED: "보호 손절 발동" })[type] || "선물 상태 불일치";
+}
+
 export function normalizeShortLiveSnapshot(value = {}) {
   const source = value.snapshot && typeof value.snapshot === "object" ? value.snapshot : value;
   const preparation = source.prepared && typeof source.prepared === "object" ? source.prepared : null;
@@ -206,6 +317,7 @@ export function normalizeShortLiveSnapshot(value = {}) {
       durationHours: numeric(preparation.durationHours),
       budgetKrwPerBroker: numeric(preparation.budgetKrwPerBroker ?? preparation.capitalKrwPerBroker),
       lossKrwPerBroker: numeric(preparation.lossKrwPerBroker ?? preparation.dailyLossStopKrwPerBroker),
+      futuresPolicy: normalizeShortLiveFuturesPolicy(preparation.futuresPolicy),
       expiresAt: text(preparation.expiresAt),
       brokerReadiness: (Array.isArray(preparation.brokerReadiness) ? preparation.brokerReadiness : []).map((row) => ({
         route: text(row.route), ready: row.ready === true, blockers: strings(row.blockers),
@@ -213,11 +325,8 @@ export function normalizeShortLiveSnapshot(value = {}) {
         availableQuoteNative: amount(row.availableQuoteNative), availableKrw: amount(row.availableKrw),
         effectiveRouteBudgetKrw: amount(row.effectiveRouteBudgetKrw),
         preservedAssetSymbols: strings(row.preservedAssetSymbols).map(sanitizeShortLiveText),
-        observedFuturesSettings: row.observedFuturesSettings ? {
-          marginMode: sanitizeShortLiveText(row.observedFuturesSettings.marginMode),
-          leverage: amount(row.observedFuturesSettings.leverage),
-          positionMode: sanitizeShortLiveText(row.observedFuturesSettings.positionMode),
-        } : null,
+        observedFuturesSettings: row.observedFuturesSettings ? normalizeFuturesSettings(row.observedFuturesSettings) : null,
+        observedFuturesSettingsBySymbol: normalizeFuturesSettingsBySymbol(row.observedFuturesSettingsBySymbol),
       })),
     } : null,
     runtime: run ? {
@@ -235,6 +344,15 @@ export function normalizeShortLiveSnapshot(value = {}) {
         broker: sanitizeShortLiveText(row.broker || row.route), budgetKrw: numeric(row.effectiveRouteBudgetKrw ?? row.budgetKrw ?? row.routeBudgetKrw),
         brokerBudgetKrw: numeric(row.brokerBudgetKrw),
         exposureKrw: numeric(row.exposureKrw), dailyRealizedLossKrw: numeric(row.dailyRealizedLossKrw ?? row.realizedLossKrw),
+        committedCapitalKrw: amount(row.committedCapitalKrw),
+        notionalExposureKrw: amount(row.notionalExposureKrw ?? row.exposureKrw),
+        protections: (Array.isArray(row.protections) ? row.protections : []).map(normalizeFuturesProtection),
+        futuresIncidents: (Array.isArray(row.futuresIncidents) ? row.futuresIncidents : []).map(normalizeFuturesIncident),
+        futuresPositions: (Array.isArray(row.futuresPositions) ? row.futuresPositions : []).map((position) => ({
+          symbol: sanitizeShortLiveText(position.symbol), positionSide: sanitizeShortLiveText(position.positionSide),
+          actualLiquidationPrice: amount(position.actualLiquidationPrice ?? position.liquidationPrice),
+          markPrice: amount(position.markPrice), leverage: amount(position.leverage),
+        })),
         unrealizedLossKrw: numeric(row.unrealizedLossKrw),
         lossLimitKrw: numeric(row.lossLimitKrw ?? row.dailyLossStopKrw),
         lossBasis: text(row.lossBasis), actualFeeKnown: typeof row.actualFeeKnown === "boolean" ? row.actualFeeKnown : null,
@@ -276,8 +394,13 @@ export function buildShortLivePrepare(catalog, selectedKeys, limits = SHORT_LIVE
     if (matches.length !== 1) throw new Error("선택한 전략 원본을 정확히 하나로 식별하지 못했습니다.");
     return exactShortLiveTarget(matches[0]);
   });
-  return { selections: targets, durationHours, capitalKrwPerBroker: 100000, dailyLossStopKrwPerBroker: 50000,
-    futuresPreparation: { leverage: 1, marginMode: "ISOLATED", applySettings: false } };
+  const payload = { selections: targets, durationHours, capitalKrwPerBroker: 100000, dailyLossStopKrwPerBroker: 50000 };
+  if (futuresSelected(catalog, selectedKeys)) {
+    const policy = normalizeShortLiveFuturesPolicy(limits.futuresPolicy);
+    if (!policy) throw new Error("선물 계좌의 실제 레버리지(1~125 정수)와 보호 손절 가격 거리(0% 초과, 100÷레버리지% 미만)를 입력해 주세요.");
+    payload.futuresPolicy = policy;
+  }
+  return payload;
 }
 
 export function shortLiveCoverage(catalog = []) {
@@ -295,10 +418,15 @@ export function shortLiveRunning(snapshot) {
   return !(runtime.status === "TERMINATED" && runtime.terminalVerified === true
     && (runtime.naturalExitObserved === true || (runtime.workerRetirementRequired === false && runtime.workerLaunchState === "NOT_ATTEMPTED" && runtime.workerAlive === false)));
 }
-export function shortLivePreparationMatches(prepared, catalog, selectedKeys, durationHours) {
+export function shortLivePreparationMatches(prepared, catalog, selectedKeys, durationHours, futuresPolicy = null) {
   if (!prepared || prepared.durationHours !== durationHours || prepared.budgetKrwPerBroker !== 100000
     || prepared.lossKrwPerBroker !== 50000 || !Array.isArray(prepared.targets)
     || prepared.targets.length !== selectedKeys.length || !selectedKeys.length) return false;
+  if (futuresSelected(catalog, selectedKeys)) {
+    const expected = normalizeShortLiveFuturesPolicy(futuresPolicy);
+    const observed = normalizeShortLiveFuturesPolicy(prepared.futuresPolicy);
+    if (!expected || !observed || JSON.stringify(expected) !== JSON.stringify(observed)) return false;
+  }
   const targets = prepared.targets.map(normalizeShortLiveCandidate);
   return selectedKeys.every((key) => {
     const current = catalog.filter((row) => row.selectionKey === key);
@@ -308,8 +436,13 @@ export function shortLivePreparationMatches(prepared, catalog, selectedKeys, dur
     catch { return false; }
   });
 }
-export function shortLiveSelectionSignature(catalog, selectedKeys, durationHours) {
-  return JSON.stringify({ durationHours, selections: [...selectedKeys].sort().map((key) => {
+export function shortLiveSelectionSignature(catalog, selectedKeys, durationHours, futuresPolicy = null) {
+  return JSON.stringify({ durationHours,
+    futuresPolicy: futuresSelected(catalog, selectedKeys) ? {
+      leverage: String(futuresPolicy?.leverage ?? ""), stopLossPercent: String(futuresPolicy?.stopLossPercent ?? ""),
+      marginMode: "ISOLATED",
+    } : null,
+    selections: [...selectedKeys].sort().map((key) => {
     const matches = catalog.filter((row) => row.selectionKey === key);
     if (matches.length !== 1) return { selectionKey: key, invalid: true };
     const row = normalizeShortLiveCandidate(matches[0]);

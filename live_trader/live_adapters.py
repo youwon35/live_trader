@@ -146,6 +146,7 @@ BINANCE_TIME_ENDPOINT = "/api/v3/time"
 BINANCE_EXCHANGE_INFO_ENDPOINT = "/api/v3/exchangeInfo"
 BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
 BINANCE_FUTURES_ORDER_ENDPOINT = "/fapi/v1/order"
+BINANCE_FUTURES_ALGO_ORDER_ENDPOINT = "/fapi/v1/algoOrder"
 BINANCE_FUTURES_OPEN_ORDERS_ENDPOINT = "/fapi/v1/openOrders"
 BINANCE_FUTURES_TEST_ORDER_ENDPOINT = "/fapi/v1/order/test"
 BINANCE_FUTURES_ACCOUNT_ENDPOINT = "/fapi/v3/account"
@@ -337,15 +338,19 @@ def binance_symbol_rules(
     *,
     timeout_seconds: float = 5.0,
     futures: bool = False,
+    order_type: str = "MARKET",
 ) -> dict[str, Decimal]:
     normalized_symbol = (
         str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
     )
     if not normalized_symbol:
         raise RuntimeError("Binance symbol이 비어 있습니다.")
+    normalized_type = str(order_type).upper()
+    if normalized_type not in {"LIMIT", "MARKET"}:
+        raise RuntimeError("Binance 거래 규칙에는 정확한 MARKET/LIMIT 유형이 필요합니다.")
     now = time.monotonic()
     with _BINANCE_SYMBOL_RULE_LOCK:
-        cache_key = f"{'futures' if futures else 'spot'}:{normalized_symbol}"
+        cache_key = f"{'futures' if futures else 'spot'}:{normalized_symbol}:{normalized_type}"
         cached = _BINANCE_SYMBOL_RULE_CACHE.get(cache_key)
         if cached and cached[0] > now:
             return dict(cached[1])
@@ -359,31 +364,41 @@ def binance_symbol_rules(
         if futures
         else BINANCE_EXCHANGE_INFO_ENDPOINT
     )
-    url = (
-        f"{base_url.rstrip('/')}{exchange_info_endpoint}?"
-        + urllib.parse.urlencode({"symbol": normalized_symbol})
-    )
+    # USD-M exchangeInfo returns the whole catalogue; it has no symbol query.
+    # Always join the exact symbol instead of using the first catalogue row.
+    url = f"{base_url.rstrip('/')}{exchange_info_endpoint}"
+    if not futures:
+        url += "?" + urllib.parse.urlencode({"symbol": normalized_symbol})
     response = http_json("GET", url, body=None, headers={}, timeout_seconds=timeout_seconds)
     payload = response.get("json") if isinstance(response.get("json"), dict) else {}
     symbols = payload.get("symbols") if isinstance(payload.get("symbols"), list) else []
-    if response.get("ok") is not True or not symbols or not isinstance(symbols[0], dict):
-        raise RuntimeError(str(response.get("text") or f"Binance {normalized_symbol} 거래 규칙 조회 실패"))
-    filters = symbols[0].get("filters") if isinstance(symbols[0].get("filters"), list) else []
+    matches = [row for row in symbols if isinstance(row, dict) and row.get("symbol") == normalized_symbol]
+    if response.get("ok") is not True or len(matches) != 1:
+        raise RuntimeError(f"Binance {normalized_symbol} 정확한 거래 규칙 조회 실패")
+    filters = matches[0].get("filters") if isinstance(matches[0].get("filters"), list) else []
     by_type = {
         str(item.get("filterType") or ""): item
         for item in filters
         if isinstance(item, dict)
     }
-    lot = by_type.get("MARKET_LOT_SIZE") or by_type.get("LOT_SIZE") or {}
-    if Decimal(str(lot.get("stepSize") or "0")) <= 0:
-        lot = by_type.get("LOT_SIZE") or lot
+    standard_lot = by_type.get("LOT_SIZE") or {}
+    lot = (by_type.get("MARKET_LOT_SIZE") or standard_lot) if normalized_type == "MARKET" else standard_lot
+    step = Decimal(str(lot.get("stepSize") or "0"))
+    if not step.is_finite() or step < 0:
+        raise RuntimeError(f"Binance {normalized_symbol} 수량 간격이 유효하지 않습니다.")
+    if step == 0:
+        step = Decimal(str(standard_lot.get("stepSize") or "0"))
     notional = by_type.get("NOTIONAL") or by_type.get("MIN_NOTIONAL") or {}
     rules = {
         "minQty": Decimal(str(lot.get("minQty") or "0")),
         "maxQty": Decimal(str(lot.get("maxQty") or "0")),
-        "stepSize": Decimal(str(lot.get("stepSize") or "0")),
-        "minNotional": Decimal(str(notional.get("minNotional") or "0")),
+        "stepSize": step,
+        "minNotional": Decimal(str(notional.get("minNotional", notional.get("notional", "0")) or "0")),
     }
+    if (any(not value.is_finite() or value < 0 for value in rules.values())
+            or rules["stepSize"] <= 0 or rules["maxQty"] <= 0
+            or rules["minQty"] > rules["maxQty"]):
+        raise RuntimeError(f"Binance {normalized_symbol} 거래 규칙이 불완전합니다.")
     with _BINANCE_SYMBOL_RULE_LOCK:
         _BINANCE_SYMBOL_RULE_CACHE[cache_key] = (now + 1800.0, rules)
     return dict(rules)
@@ -394,7 +409,7 @@ def normalize_binance_spot_intent(intent: dict[str, object]) -> dict[str, object
     symbol = str(normalized.get("symbol") or "").strip().upper()
     side = normalize_side(normalized.get("side"))
     order_type = str(normalized.get("order_type") or "MARKET").strip().upper()
-    rules = binance_symbol_rules(symbol)
+    rules = binance_symbol_rules(symbol, order_type=order_type)
     notional = _decimal_or_zero(normalized.get("notional"))
     if order_type == "MARKET" and side == "BUY" and notional > 0:
         if rules["minNotional"] > 0 and notional < rules["minNotional"]:
@@ -444,16 +459,18 @@ def normalize_binance_futures_intent(
         raise RuntimeError(
             "Binance Futures 자동 주문은 MARKET/LIMIT만 허용합니다."
         )
-    rules = binance_symbol_rules(symbol, futures=True)
+    rules = binance_symbol_rules(symbol, futures=True, order_type=order_type)
     quantity = _decimal_or_zero(
         normalized.get("quantity") or normalized.get("qty")
     )
     step = rules["stepSize"]
-    if step > 0:
+    minimum = rules["minQty"]
+    if step > 0 and quantity >= minimum:
+        # USD-M LOT_SIZE and MARKET_LOT_SIZE are anchored at minQty.
         quantity = (
-            (quantity / step).to_integral_value(rounding=ROUND_DOWN)
+            ((quantity - minimum) / step).to_integral_value(rounding=ROUND_DOWN)
             * step
-        )
+        ) + minimum
     if quantity <= 0 or (
         rules["minQty"] > 0 and quantity < rules["minQty"]
     ):
@@ -469,6 +486,7 @@ def normalize_binance_futures_intent(
         rules["minNotional"] > 0
         and reference_price > 0
         and quantity * reference_price < rules["minNotional"]
+        and not (normalized.get("risk_reducing") is True or normalized.get("reduce_only") is True)
     ):
         raise RuntimeError(
             f"Binance Futures {symbol} 최소 주문금액 "
@@ -1476,6 +1494,49 @@ def build_binance_futures_cancel_order_request(
         query,
         blocked_reasons=blocked,
     )
+
+
+def build_binance_futures_protection_request(intent: dict[str, object]) -> PreparedRequest:
+    """A close-all MARK_PRICE stop, not an entry or a quantity-based stop.
+
+    Binance conditional orders use the algoOrder endpoint. In particular,
+    closePosition must not be combined with quantity or reduceOnly, including
+    in Hedge mode. The service owns the whole corresponding position side.
+    """
+    from .futures_protection_transport import exact_client_algo_id
+    symbol = str(intent.get("symbol") or "")
+    direction = intent.get("position_direction")
+    mode = intent.get("position_mode")
+    side = "BUY" if direction == "short" else "SELL"
+    trigger = _decimal_or_zero(intent.get("trigger_price"))
+    if (not re.fullmatch(r"[A-Z0-9_]{2,40}", symbol)
+            or direction not in {"long", "short"} or mode not in {"ONE_WAY", "HEDGE"}
+            or intent.get("side") != side or intent.get("order_type") != "STOP_MARKET"
+            or intent.get("close_position") is not True or intent.get("working_type") != "MARK_PRICE"
+            or intent.get("price_protect") is not False or trigger <= 0
+            or any(key in intent for key in ("quantity", "qty", "reduce_only", "price"))):
+        raise RuntimeError("EXACT_CLOSE_ALL_MARK_PRICE_PROTECTION_REQUIRED")
+    query = {"algoType": "CONDITIONAL", "symbol": symbol, "side": side,
+             "positionSide": direction.upper() if mode == "HEDGE" else "BOTH",
+             "type": "STOP_MARKET", "triggerPrice": normalize_decimal_text(trigger),
+             "closePosition": "true", "workingType": "MARK_PRICE", "priceProtect": "false",
+             "clientAlgoId": exact_client_algo_id(intent.get("client_algo_id"))}
+    return _build_binance_futures_signed_request("POST", BINANCE_FUTURES_ALGO_ORDER_ENDPOINT, query)
+
+
+def build_binance_futures_protection_lookup_request(*, algo_id: str = "", client_algo_id: str = "",
+                                                    cancel: bool = False) -> PreparedRequest:
+    from .futures_protection_transport import exact_algo_id, exact_client_algo_id
+    # The official query/cancel endpoint accepts identifiers, not symbol. The
+    # returned symbol and both IDs are checked against the caller's claim.
+    if algo_id:
+        query = {"algoId": exact_algo_id(algo_id)}
+    elif client_algo_id and not cancel:
+        query = {"clientAlgoId": exact_client_algo_id(client_algo_id)}
+    else:
+        raise RuntimeError("EXACT_PROTECTION_LOOKUP_ID_REQUIRED")
+    return _build_binance_futures_signed_request(
+        "DELETE" if cancel else "GET", BINANCE_FUTURES_ALGO_ORDER_ENDPOINT, query)
 
 
 def build_upbit_accounts_request() -> PreparedRequest:

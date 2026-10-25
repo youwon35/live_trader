@@ -188,6 +188,7 @@ class ShortLiveTestService:
                             "durationHours": manifest["durationHours"],
                             "capitalKrwPerBroker": manifest["capitalKrwPerBroker"],
                             "dailyLossStopKrwPerBroker": manifest["dailyLossStopKrwPerBroker"],
+                            "futuresPolicy": deepcopy(manifest.get("futuresPolicy")),
                             "preparedAt": manifest["preparedAt"],
                             "expiresAt": prepared["expiresAt"],
                             "readyToStart": prepared["readyToStart"],
@@ -223,7 +224,8 @@ class ShortLiveTestService:
         result["workerAlive"] = bool(self._thread and self._thread.is_alive())
         public_keys = ("route", "ready", "exposureKrw", "realizedLossKrw",
                        "unrealizedLossKrw", "lossBasis", "actualFeeKnown",
-                       "feeReconciliationStatus")
+                       "feeReconciliationStatus", "committedCapitalKrw", "notionalExposureKrw",
+                       "protections", "futuresPositions", "futuresIncidents", "observedFuturesSettingsBySymbol")
         result["brokerRows"] = [{key: deepcopy(row.get(key)) for key in public_keys}
                                 for row in session["brokerRows"].values()]
         for row in result["brokerRows"]:
@@ -293,6 +295,10 @@ class ShortLiveTestService:
             if isinstance(value.get(key), Mapping):
                 result[key] = {field: deepcopy(value[key].get(field))
                                for field in ("marginMode", "leverage", "positionMode")}
+        if isinstance(value.get("observedFuturesSettingsBySymbol"), Mapping):
+            result["observedFuturesSettingsBySymbol"] = {
+                str(symbol): {field: deepcopy(row.get(field)) for field in ("marginMode", "leverage", "positionMode")}
+                for symbol, row in value["observedFuturesSettingsBySymbol"].items() if isinstance(row, Mapping)}
         return result
 
     @staticmethod
@@ -342,6 +348,10 @@ class ShortLiveTestService:
                 readiness[route] = self._validate_readiness(adapter.readiness(leg_manifest(contract, route)), leg, blockers)
                 prior = self._prepared["readiness"].get(route, {})
                 current = readiness[route]
+                if route == "BINANCE_USDM_FUTURES" and (
+                        not prior.get("observedFuturesSettingsBySymbol") or
+                        prior.get("observedFuturesSettingsBySymbol") != current.get("observedFuturesSettingsBySymbol")):
+                    blockers.append("FUTURES_SETTINGS_CHANGED_SINCE_PREPARATION")
                 if route in {"BINANCE_SPOT", "UPBIT_KRW_SPOT"} and (
                         prior.get("fundingBasis") == "AVAILABLE_QUOTE_ONLY"
                         or current.get("fundingBasis") == "AVAILABLE_QUOTE_ONLY"
@@ -395,6 +405,8 @@ class ShortLiveTestService:
                 "workerLaunchState": "NOT_ATTEMPTED" if self.background else "SYNCHRONOUS",
                 "startupAbortedBeforeWorker": False,
                 "cancelReservations": {},
+                "protectionReservations": {}, "protectionObservations": {},
+                "externalExecutions": {},
                 "effectiveRouteBudgets": {leg["route"]: min(leg["routeBudgetKrw"],
                     finite(readiness[leg["route"]]["availableKrw"], "ACTUAL_START_AVAILABLE", positive=True))
                     for leg in contract["legs"]},
@@ -744,7 +756,8 @@ class ShortLiveTestService:
             return
         close_quantity = sum(exit_units.values())
         delta = (current_krw*close_quantity/native_quantity if reducing
-                 else sum(entry_weights.values())*session["effectiveRouteBudgets"][route])
+                 else sum(entry_weights.values())*session["effectiveRouteBudgets"][route] *
+                 float(leg.get("futuresPolicy", {}).get("leverage", 1)))
         if delta <= 0:
             raise ShortLiveContractError("EXACT_CHANGED_SLEEVE_NOTIONAL_REQUIRED")
         direction = members[0]["positionDirection"]
@@ -776,16 +789,17 @@ class ShortLiveTestService:
         if reducing and quantity > close_quantity + max(1e-10, close_quantity*1e-8):
             raise ShortLiveContractError("NATIVE_CLOSE_EXCEEDS_CHANGED_SLEEVE_OWNERSHIP")
         notional = finite(sized.get("estimatedNotionalKrw"), "NATIVE_NOTIONAL", positive=True)
-        projected = finite(sized.get("projectedGrossExposureKrw"), "PROJECTED_EXPOSURE")
+        projected = finite(sized.get("projectedCommittedCapitalKrw", sized.get("projectedGrossExposureKrw")), "PROJECTED_CAPITAL")
         broker_group = ROUTES[route]
-        other_exposure = sum(float(row.get("exposureKrw", 0)) for r, row in session["brokerRows"].items()
+        other_exposure = sum(float(row.get("committedCapitalKrw", row.get("exposureKrw", 0))) for r, row in session["brokerRows"].items()
                              if ROUTES[r] == broker_group and r != route)
         if not reducing and (projected + other_exposure > leg["brokerBudgetKrw"] + 1e-8
-                             or notional > leg["routeBudgetKrw"] + 1e-8):
+                             or finite(sized.get("requiredCapitalKrw", notional), "REQUIRED_CAPITAL") > leg["routeBudgetKrw"] + 1e-8):
             raise ShortLiveContractError("SHARED_BROKER_BUDGET_EXCEEDED")
         order = {**proposal, **{key: value for key, value in sized.items()
                               if key in {"quantity", "referencePrice", "feeKrw", "estimatedNotionalKrw", "projectedGrossExposureKrw",
-                                         "observedAt", "fxObservedAt", "krwPerQuote", "positionMode"}}}
+                                         "observedAt", "fxObservedAt", "krwPerQuote", "positionMode", "leverage",
+                                         "requiredCapitalKrw", "projectedCommittedCapitalKrw"}}}
         order["quantity"] = quantity
         differences = exit_units if reducing else entry_weights
         denominator = sum(differences.values())
@@ -812,13 +826,15 @@ class ShortLiveTestService:
         except Exception as exc:
             reply = {"status": "UNKNOWN", "reason": type(exc).__name__}
         self._handle_order_observation(client_id, reply)
-        self._reconcile()
+        if not self._reconcile():
+            self._stop_once("POST_ORDER_RECONCILIATION_BLOCKED")
 
     def _transfer_internal_units(self, route, symbol, reference_price, boundary_key, changed,
                                  entry_weights, exit_units, krw_per_unit, native_signed_quantity):
         """Reuse normal portfolio crossing; transfer owned units, never broker fills."""
         session = self._session
-        budget = session["effectiveRouteBudgets"][route]
+        budget = session["effectiveRouteBudgets"][route] * float(
+            leg_manifest(session["contract"], route).get("futuresPolicy", {}).get("leverage", 1))
         source_keys = sorted(set(entry_weights) | set(exit_units))
         identity = {"sessionId": session["sessionId"], "route": route, "symbol": symbol,
                     "boundary": boundary_key, "changed": sorted(changed),
@@ -944,7 +960,7 @@ class ShortLiveTestService:
                 record["appliedBaseCommissionQuantity"] = commission
                 self._event("ACTUAL_BASE_ASSET_COMMISSION", clientOrderId=client_id,
                             cumulativeQuantity=commission, incrementalQuantity=increase)
-        if status in {"ACCEPTED", "PARTIAL"}:
+        if status in {"ACCEPTED", "PARTIAL"} and session["firstFailure"] is None:
             session["status"] = "PENDING_FILL"
             session["newEntriesBlocked"] = True
         elif not self._has_pending_orders() and session["firstFailure"] is None:
@@ -1018,6 +1034,7 @@ class ShortLiveTestService:
         result["clientOrderIds"] = [key for key, value in session["orders"].items() if value["order"]["route"] == route]
         result["orders"] = deepcopy({key: value for key, value in session["orders"].items() if value["order"]["route"] == route})
         result["newEntriesBlocked"] = session["newEntriesBlocked"]
+        result["startedAt"] = session["startedAt"]
         return result
 
     def _reconcile(self, *, enforce_limits: bool = True) -> bool:
@@ -1032,6 +1049,12 @@ class ShortLiveTestService:
                     or not isinstance(value.get("ownedPositions"), list)
                     or not isinstance(value.get("positionsBySymbol"), Mapping)):
                 session["brokerRows"].pop(route, None)
+                codes = value.get("blockers", []) if isinstance(value, Mapping) else []
+                # Preserve the first concrete cause instead of masking a
+                # protective-stop/force-close incident as a generic failure.
+                for code in codes:
+                    if isinstance(code, str) and len(code) <= 180 and all(c.isupper() or c.isdigit() or c == "_" for c in code):
+                        self._failure(f"{route}:{code}")
                 self._failure(f"{route}:RECONCILIATION_UNKNOWN")
                 okay = False
                 continue
@@ -1039,6 +1062,7 @@ class ShortLiveTestService:
                 exposure = finite(value.get("exposureKrw"), "EXPOSURE_KRW")
                 realized = finite(value.get("realizedLossKrw"), "REALIZED_LOSS_KRW")
                 unrealized = finite(value.get("unrealizedLossKrw"), "UNREALIZED_LOSS_KRW")
+                committed = finite(value.get("committedCapitalKrw", exposure), "COMMITTED_CAPITAL")
             except ShortLiveContractError:
                 session["brokerRows"].pop(route, None)
                 self._failure(f"{route}:LOSS_OR_EXPOSURE_UNKNOWN")
@@ -1051,12 +1075,48 @@ class ShortLiveTestService:
                 "realizedLossKrw": realized, "unrealizedLossKrw": unrealized,
                 "ownedOrders": deepcopy(value.get("ownedOrders", [])),
                 "ownedPositions": deepcopy(value.get("ownedPositions", [])),
+                "ownedProtectionOrders": deepcopy(value.get("ownedProtectionOrders", [])),
+                "protectionRetirementVerified": value.get("protectionRetirementVerified") is True,
                 "positionsBySymbol": deepcopy(value.get("positionsBySymbol", {})),
                 "lossBasis": value.get("lossBasis", "EXACT_SCOPE_PNL"),
                 "actualFeeKnown": session["feesKnown"],
                 "feeReconciliationStatus": "KNOWN" if session["feesKnown"] else "UNVERIFIED_ACTUAL_FEE",
+                "committedCapitalKrw": committed, "notionalExposureKrw": exposure,
+                **{key: deepcopy(value.get(key, [] if key != "observedFuturesSettingsBySymbol" else {}))
+                   for key in ("protections", "futuresPositions", "futuresIncidents", "observedFuturesSettingsBySymbol")},
             }
-            if any(leg["route"] == route and exposure > leg["routeBudgetKrw"] + 1e-8 for leg in session["contract"]["legs"]):
+            for incident in value.get("futuresIncidents", []):
+                code = incident.get("code") or {"LIQUIDATION": "FUTURES_LIQUIDATION_DETECTED",
+                    "ADL": "FUTURES_ADL_DETECTED", "PROTECTIVE_STOP": "FUTURES_PROTECTIVE_STOP_TRIGGERED"}.get(incident.get("type"))
+                if code:
+                    identity = canonical_hash({key: incident.get(key) for key in
+                        ("type", "code", "symbol", "positionSide", "brokerOrderId", "algoId")})
+                    prior_incident = session["externalExecutions"].get(identity, {})
+                    if incident.get("verified") is True and incident.get("type") in {"PROTECTIVE_STOP", "LIQUIDATION", "ADL"}:
+                        cumulative = finite(incident.get("quantity"), "EXTERNAL_CUMULATIVE_QUANTITY")
+                        increment = cumulative - float(prior_incident.get("quantity", 0))
+                        members = [key for key, spec in self._specs.items() if spec["route"] == route and spec["symbol"] == incident["symbol"]]
+                        total = sum(abs(session["sleeves"][key]["quantity"]) for key in members)
+                        if increment < 0 or increment > total + max(1e-9, total*1e-8):
+                            self._failure("FUTURES_EXTERNAL_SLEEVE_ATTRIBUTION_UNKNOWN")
+                            okay = False
+                        elif increment > 0 and total > 0:
+                            allocations = {key: increment*abs(session["sleeves"][key]["quantity"])/total for key in members}
+                            self._event("FUTURES_EXTERNAL_FILL_ATTRIBUTED", route=route, incident=deepcopy(incident), allocations=allocations)
+                            for key, amount in allocations.items():
+                                sleeve = session["sleeves"][key]
+                                sign = -1 if sleeve["quantity"] < 0 else 1
+                                sleeve["quantity"] -= sign * amount
+                                if abs(sleeve["quantity"]) < 1e-9:
+                                    sleeve["quantity"], sleeve["averagePrice"] = 0.0, 0.0
+                            session["externalExecutions"][identity] = deepcopy(incident)
+                    if not prior_incident or prior_incident.get("quantity") != incident.get("quantity"):
+                        session["externalExecutions"].setdefault(identity, deepcopy(incident))
+                        self._event("FUTURES_RISK_EVENT", route=route, incident=deepcopy(incident))
+                    self._failure(f"{route}:{code}")
+                    if enforce_limits:
+                        okay = False
+            if any(leg["route"] == route and committed > leg["routeBudgetKrw"] + 1e-8 for leg in session["contract"]["legs"]):
                 self._failure(f"{route}:EXPOSURE_LIMIT_REACHED")
                 if enforce_limits:
                     okay = False
@@ -1084,6 +1144,21 @@ class ShortLiveTestService:
                     or order.get("manifestHash") != session["scopeHash"]
                     or order.get("route") not in self._brokers):
                 return False
+            if order.get("operation") in {"PROTECT", "CANCEL_PROTECTION"}:
+                key = (order["operation"], order.get("clientAlgoId"))
+                if (session["protectionReservations"].get(key) != canonical_hash(dict(order))
+                        or session["status"] not in {"RUNNING", "STOPPING"}):
+                    return False
+                if order["operation"] == "CANCEL_PROTECTION":
+                    return True
+                parent = session["orders"].get(order.get("parentClientOrderId"), {})
+                entry = parent.get("order", {})
+                return bool(session["status"] == "RUNNING" and self._owner() and not session["newEntriesBlocked"]
+                    and parent.get("status") == "SUBMITTING" and entry.get("riskReducing") is False
+                    and entry.get("side") in {"BUY", "SELL"}
+                    and order.get("side") == ("SELL" if entry["side"] == "BUY" else "BUY")
+                    and all(entry.get(field) == order.get(field) for field in
+                            ("sessionId", "manifestHash", "route", "accountId", "symbol", "positionDirection", "positionMode")))
             if order.get("operation") == "CANCEL":
                 reserved = session["cancelReservations"].get((order["route"], str(order.get("brokerOrderId", ""))))
                 return bool(session["status"] == "STOPPING" and reserved
@@ -1093,18 +1168,75 @@ class ShortLiveTestService:
                 return False
             expected = record["order"]
             for key in ("sessionId", "manifestHash", "route", "symbol", "side",
-                        "clientOrderId", "riskReducing", "positionDirection", "accountId"):
+                        "clientOrderId", "riskReducing", "positionDirection", "accountId", "operation", "positionMode"):
                 if order.get(key) != expected.get(key):
                     return False
             try:
-                if finite(order.get("quantity"), "ACTUAL_QUANTITY", positive=True) != finite(expected.get("quantity"), "RESERVED_QUANTITY", positive=True):
-                    return False
-            except ShortLiveContractError:
+                for key in ("quantity", "referencePrice", "leverage"):
+                    if key == "leverage" and order.get(key) is None and expected.get(key) is None:
+                        continue
+                    if isinstance(order.get(key), bool) or isinstance(expected.get(key), bool):
+                        return False
+                    actual_number, reserved_number = Decimal(str(order.get(key))), Decimal(str(expected.get(key)))
+                    if (not actual_number.is_finite() or actual_number <= 0
+                            or not reserved_number.is_finite() or actual_number != reserved_number):
+                        return False
+            except (ArithmeticError, ValueError, TypeError):
                 return False
             if record.get("cleanup") is True:
                 return session["status"] == "STOPPING" and order.get("riskReducing") is True
             return self._owner() and session["status"] == "RUNNING" and (
                 order.get("riskReducing") is True or session["newEntriesBlocked"] is False)
+
+    def reserve_protection(self, order):
+        """Durable single-use stop authority; only a reserved entry may arm it."""
+        with self._lock:
+            session = self._session
+            if (not session or not isinstance(order, Mapping) or order.get("route") != "BINANCE_USDM_FUTURES"
+                    or order.get("route") not in self._brokers
+                    or order.get("sessionId") != session["sessionId"]
+                    or order.get("manifestHash") != session["scopeHash"]
+                    or order.get("riskReducing") is not True):
+                return False
+            operation, client = order.get("operation"), order.get("clientAlgoId")
+            key = (operation, client)
+            if operation not in {"PROTECT", "CANCEL_PROTECTION"} or not client or key in session["protectionReservations"]:
+                return False
+            manifest = self._route_session(order["route"])
+            if order.get("symbol") not in manifest["symbols"] or order.get("accountId") != manifest["accountId"]:
+                return False
+            if operation == "PROTECT":
+                parent = session["orders"].get(order.get("parentClientOrderId"), {})
+                entry = parent.get("order", {})
+                if (session["status"] != "RUNNING" or session["newEntriesBlocked"] or not self._owner()
+                        or parent.get("status") != "SUBMITTING" or entry.get("riskReducing") is not False
+                        or entry.get("side") not in {"BUY", "SELL"}
+                        or any(entry.get(field) != order.get(field) for field in
+                               ("sessionId", "manifestHash", "route", "accountId", "symbol", "positionDirection", "positionMode"))
+                        or order.get("side") != ("SELL" if entry.get("side") == "BUY" else "BUY")):
+                    return False
+            else:
+                observed = session["protectionObservations"].get(client, {})
+                original = {**dict(order), "operation": "PROTECT"}
+                original.pop("algoId", None)
+                if (session["status"] not in {"RUNNING", "STOPPING"}
+                        or observed.get("known") is not True
+                        or session["protectionReservations"].get(("PROTECT", client)) != canonical_hash(original)
+                        or str(observed.get("algoId")) != str(order.get("algoId"))
+                        or observed.get("symbol") != order["symbol"]
+                        or observed.get("clientAlgoId") != client):
+                    return False
+            self._event("FUTURES_PROTECTION_RESERVED", operation=operation, order=deepcopy(dict(order)))
+            session["protectionReservations"][key] = canonical_hash(dict(order))
+            return True
+
+    def record_protection(self, event, detail):
+        with self._lock:
+            if not self._session:
+                raise ShortLiveContractError("PROTECTION_SESSION_UNAVAILABLE")
+            self._event(event, detail=deepcopy(detail))
+            if event == "FUTURES_PROTECTION_OBSERVED":
+                self._session["protectionObservations"][detail["clientAlgoId"]] = deepcopy(detail["observation"])
 
     def reserve_cleanup_cancel(self, order: Mapping[str, Any]) -> bool:
         with self._lock:
@@ -1161,11 +1293,20 @@ class ShortLiveTestService:
             client_id = str(order.get("clientOrderId", ""))
             if not client_id or client_id in session["orders"]:
                 return False
+            allocation_weights = {}
+            if route == "BINANCE_USDM_FUTURES":
+                members = [key for key, spec in self._specs.items()
+                           if spec["route"] == route and spec["symbol"] == order["symbol"]]
+                total = sum(abs(session["sleeves"][key]["quantity"]) for key in members)
+                if total <= 0 or abs(total-held) > max(1e-9, held*1e-8):
+                    return False
+                allocation_weights = {key: abs(session["sleeves"][key]["quantity"])/total for key in members}
             self._event("CLEANUP_ORDER_RESERVED", clientOrderId=client_id,
                         route=route, symbol=order["symbol"], quantity=quantity)
             session["orders"][client_id] = {"status": "SUBMITTING", "cleanup": True,
                                             "order": deepcopy(dict(order)), "brokerOrderId": "",
                                             "appliedFilledQuantity": 0.0, "appliedFilledNotional": 0.0,
+                                            "allocationWeights": allocation_weights,
                                             "appliedBaseCommissionQuantity": 0.0}
             return True
 
@@ -1197,7 +1338,12 @@ class ShortLiveTestService:
                     notional = filled * finite(result.get("fillPrice"), "CLEANUP_FILL_PRICE", positive=True)
                     if filled == record["appliedFilledQuantity"] and abs(notional-record["appliedFilledNotional"]) > 1e-8:
                         return False
-                    record["appliedFilledQuantity"], record["appliedFilledNotional"] = filled, notional
+                    if record["order"]["route"] == "BINANCE_USDM_FUTURES":
+                        increment = filled - record["appliedFilledQuantity"]
+                        if increment > 1e-10:
+                            self._apply_fill_increment(client_order_id, result, filled, increment)
+                    else:
+                        record["appliedFilledQuantity"], record["appliedFilledNotional"] = filled, notional
                 if result.get("feeKrw") is None or result.get("actualFeeKnown") is False:
                     session["feesKnown"] = False
                 else:
@@ -1271,20 +1417,57 @@ class ShortLiveTestService:
         session = self._session
         if not session:
             return
+        if session.get("cleanupAttempted") and session["status"] == "BLOCKED":
+            session["status"] = "STOPPING"
         for client_id, record in tuple(session["orders"].items()):
-            if record.get("cleanup") and record["status"] in {"ACCEPTED", "PARTIAL"}:
+            if record["status"] in {"ACCEPTED", "PARTIAL", "UNKNOWN"}:
                 observer = getattr(self._brokers[record["order"]["route"]], "observe_order", None)
                 try:
-                    observed = callable(observer) and self.observe_cleanup_order(client_id, observer(client_id))
+                    result = observer(client_id) if callable(observer) else {}
+                    observed = result.get("status") in {"FILLED", "CANCELED", "REJECTED", "ACCEPTED", "PARTIAL"}
+                    if observed:
+                        if record.get("cleanup"):
+                            observed = self.observe_cleanup_order(client_id, result)
+                        else:
+                            self._handle_order_observation(client_id, result)
                 except Exception:
                     observed = False
                 if not observed:
                     self._failure("CLEANUP_EXACT_ORDER_OBSERVATION_UNVERIFIED")
         positive_reconciliation = self._reconcile(enforce_limits=False)
         rows = session["brokerRows"]
+        if positive_reconciliation:
+            # A previously lost reply may now be proven. Continue draining
+            # that same session; adapters retain one-write intent identities.
+            for route, row in list(rows.items()):
+                if row.get("ownedOrders") or row.get("ownedPositions"):
+                    drain = getattr(self._brokers[route], "continue_cleanup", None)
+                    if callable(drain):
+                        try:
+                            drain(self._route_session(route))
+                        except Exception:
+                            self._failure(f"{route}:CLEANUP_CONTINUATION_UNVERIFIED")
+            positive_reconciliation = self._reconcile(enforce_limits=False)
+            rows = session["brokerRows"]
+            for route, row in list(rows.items()):
+                if ((row.get("ownedProtectionOrders") or
+                        (route == "BINANCE_USDM_FUTURES" and row.get("protectionRetirementVerified") is not True))
+                        and not row.get("ownedOrders") and not row.get("ownedPositions")):
+                    retire = getattr(self._brokers[route], "retire_flat_protection", None)
+                    try:
+                        if not callable(retire) or retire(self._route_session(route)) is not True:
+                            positive_reconciliation = False
+                    except Exception:
+                        positive_reconciliation = False
+            if positive_reconciliation:
+                positive_reconciliation = self._reconcile(enforce_limits=False)
+                rows = session["brokerRows"]
         all_known = len(rows) == len(self._brokers) and all(row.get("ready") is True for row in rows.values())
-        all_flat = all(not row.get("ownedOrders") and not row.get("ownedPositions") and row.get("exposureKrw") == 0 for row in rows.values())
-        cleanup_terminal = all(not record.get("cleanup") or record["status"] in {"FILLED", "CANCELED", "REJECTED"}
+        all_flat = all(not row.get("ownedOrders") and not row.get("ownedPositions") and not row.get("ownedProtectionOrders")
+                       and row.get("exposureKrw") == 0
+                       and (route != "BINANCE_USDM_FUTURES" or row.get("protectionRetirementVerified") is True)
+                       for route, row in rows.items())
+        cleanup_terminal = all(record["status"] in {"FILLED", "CANCELED", "REJECTED"}
                                for record in session["orders"].values())
         if not (positive_reconciliation and session["cleanupAttempted"] and session["feedsClosed"] and all_known and all_flat and cleanup_terminal):
             session["status"] = "BLOCKED"

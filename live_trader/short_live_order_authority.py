@@ -48,6 +48,15 @@ def _exact_native(order, native):
         raise ShortLiveAuthorityError("SHORT_LIVE_NATIVE_ROUTE_SYMBOL_ACCOUNT_CHANGED")
     if order["route"] == "KIS_KR_CASH" and (not re.fullmatch(r"[0-9]{6}", str(order.get("symbol"))) or native.get("asset") != "KR_STOCK"):
         raise ShortLiveAuthorityError("SHORT_LIVE_DOMESTIC_ASSET_BINDING_REQUIRED")
+    if order.get("operation") in {"PROTECT", "CANCEL_PROTECTION"}:
+        from .futures_protection_transport import protection_native
+        try:
+            exact = protection_native(order)
+        except ValueError:
+            raise ShortLiveAuthorityError("SHORT_LIVE_PROTECTION_RESERVATION_INVALID") from None
+        if dict(native) != exact:
+            raise ShortLiveAuthorityError("SHORT_LIVE_PROTECTION_NATIVE_CHANGED")
+        return
     if order.get("operation") == "CANCEL":
         if not order.get("brokerOrderId") or str(native.get("broker_order_id")) != str(order["brokerOrderId"]):
             raise ShortLiveAuthorityError("SHORT_LIVE_NATIVE_CANCEL_ID_CHANGED")
@@ -60,7 +69,8 @@ def _exact_native(order, native):
             or native.get("session_id") != order.get("sessionId")
             or native.get("manifest_hash") != order.get("manifestHash")
             or native.get("execution_purpose") != "FUNCTIONAL_TEST_ONLY"
-            or native.get("order_type") != ("00" if order["route"] == "KIS_KR_CASH" else "LIMIT")
+            or native.get("order_type") != ("00" if order["route"] == "KIS_KR_CASH" else
+                                           "MARKET" if order.get("operation") == "EMERGENCY_CLOSE" else "LIMIT")
             or native.get("risk_reducing") is not (order.get("riskReducing") is True)
             or native.get("reduce_only") is not (order.get("riskReducing") is True)
             or native.get("position_direction") != order.get("positionDirection", "long")):
@@ -69,6 +79,15 @@ def _exact_native(order, native):
         raise ShortLiveAuthorityError("SHORT_LIVE_DOMESTIC_INTEGER_QUANTITY_PRICE_REQUIRED")
     if order["route"] == "BINANCE_USDM_FUTURES" and native.get("position_mode") != order.get("positionMode"):
         raise ShortLiveAuthorityError("SHORT_LIVE_NATIVE_POSITION_MODE_CHANGED")
+    if (order["route"] == "BINANCE_USDM_FUTURES" and order.get("riskReducing") is not True
+            and order.get("leverage") is not None
+            and _finite_positive(native.get("expected_leverage")) != _finite_positive(order["leverage"])):
+        raise ShortLiveAuthorityError("SHORT_LIVE_NATIVE_LEVERAGE_CHANGED")
+    if order.get("operation") == "EMERGENCY_CLOSE" and (
+            order["route"] != "BINANCE_USDM_FUTURES" or order.get("riskReducing") is not True
+            or order.get("positionDirection") not in {"long", "short"}
+            or order.get("side") != ("BUY" if order["positionDirection"] == "short" else "SELL")):
+        raise ShortLiveAuthorityError("SHORT_LIVE_EMERGENCY_CLOSE_DIRECTION_REQUIRED")
 
 
 def short_live_dispatch_present():
@@ -162,8 +181,11 @@ def validate_short_live_prepared_request(prepared, *, consume=False):
     if context is None or str(prepared.method).upper() == "GET":
         return
     order = context["order"]
-    cancel = order.get("operation") == "CANCEL"
-    check_short_live_authority(context["exchange"], operation="CANCEL_ORDER" if cancel else "PLACE_ORDER")
+    cancel = order.get("operation") in {"CANCEL", "CANCEL_PROTECTION"}
+    protection = order.get("operation") in {"PROTECT", "CANCEL_PROTECTION"}
+    operation = ("FUTURES_CANCEL_PROTECTION" if cancel else "FUTURES_PROTECT") if protection else (
+        "CANCEL_ORDER" if cancel else "PLACE_ORDER")
+    check_short_live_authority(context["exchange"], operation=operation)
     if prepared.provider != _PROVIDERS[order["route"]]:
         raise ShortLiveAuthorityError("SHORT_LIVE_WIRE_PROVIDER_CHANGED")
     parsed = urllib.parse.urlsplit(prepared.url)
@@ -176,7 +198,27 @@ def validate_short_live_prepared_request(prepared, *, consume=False):
         raise ShortLiveAuthorityError("SHORT_LIVE_DUPLICATE_WIRE_QUERY")
     query = dict(query_pairs)
     body = prepared.body or {}
-    if context["exchange"] == "KIS":
+    if protection:
+        if (context["route"] != "BINANCE_USDM_FUTURES" or prepared.endpoint != "/fapi/v1/algoOrder"
+                or prepared.method != ("DELETE" if cancel else "POST") or body):
+            raise ShortLiveAuthorityError("SHORT_LIVE_PROTECTION_WIRE_CHANGED")
+        unsigned = {key: value for key, value in query.items() if key not in {"timestamp", "signature", "recvWindow"}}
+        if cancel:
+            expected = {"algoId": str(order["algoId"])}
+        else:
+            expected = {"algoType": "CONDITIONAL", "symbol": order["symbol"], "side": order["side"],
+                        "type": "STOP_MARKET", "triggerPrice": str(order["triggerPrice"]),
+                        "positionSide": order["positionDirection"].upper() if order["positionMode"] == "HEDGE" else "BOTH",
+                        "closePosition": "true", "workingType": "MARK_PRICE", "priceProtect": "false",
+                        "clientAlgoId": order["clientAlgoId"]}
+            # Decimal serialization may remove harmless trailing zeroes only.
+            if "triggerPrice" in unsigned:
+                if _finite_positive(unsigned["triggerPrice"]) != _finite_positive(expected["triggerPrice"]):
+                    raise ShortLiveAuthorityError("SHORT_LIVE_PROTECTION_TRIGGER_CHANGED")
+                unsigned["triggerPrice"] = expected["triggerPrice"]
+        if unsigned != expected:
+            raise ShortLiveAuthorityError("SHORT_LIVE_PROTECTION_RESERVED_WIRE_CHANGED")
+    elif context["exchange"] == "KIS":
         endpoint = "/uapi/domestic-stock/v1/trading/" + ("order-rvsecncl" if cancel else "order-cash")
         if prepared.method != "POST" or prepared.endpoint != endpoint or body.get("ORD_DVSN") != "00":
             raise ShortLiveAuthorityError("SHORT_LIVE_KIS_DOMESTIC_LIMIT_WIRE_REQUIRED")
@@ -198,11 +240,14 @@ def validate_short_live_prepared_request(prepared, *, consume=False):
         if cancel:
             if query.get("orderId") != str(order["brokerOrderId"]):
                 raise ShortLiveAuthorityError("SHORT_LIVE_BINANCE_OWNED_CANCEL_CHANGED")
-        elif (query.get("newClientOrderId") != order["clientOrderId"] or query.get("side") != order["side"]
-                or query.get("type") != "LIMIT"
-                or _finite_positive(query.get("quantity")) != _finite_positive(order["quantity"])
-                or _finite_positive(query.get("price")) != _finite_positive(order["referencePrice"])):
-            raise ShortLiveAuthorityError("SHORT_LIVE_BINANCE_RESERVED_WIRE_CHANGED")
+        else:
+            emergency = order.get("operation") == "EMERGENCY_CLOSE"
+            if (query.get("newClientOrderId") != order["clientOrderId"] or query.get("side") != order["side"]
+                    or query.get("type") != ("MARKET" if emergency else "LIMIT")
+                    or _finite_positive(query.get("quantity")) != _finite_positive(order["quantity"])
+                    or (not emergency and _finite_positive(query.get("price")) != _finite_positive(order["referencePrice"]))
+                    or (emergency and any(key in query for key in ("price", "timeInForce", "closePosition")))):
+                raise ShortLiveAuthorityError("SHORT_LIVE_BINANCE_RESERVED_WIRE_CHANGED")
         if not cancel and order["route"] == "BINANCE_USDM_FUTURES":
             hedge = order.get("positionMode") == "HEDGE"
             expected_side = str(order.get("positionDirection", "long")).upper() if hedge else "BOTH"
@@ -252,6 +297,10 @@ def check_short_live_authority(exchange, *, operation=None):
         cancel = order.get("operation") == "CANCEL"
         route_prefix = "SPOT_" if context["route"] == "BINANCE_SPOT" else "FUTURES_" if context["route"] == "BINANCE_USDM_FUTURES" else ""
         allowed = {"CANCEL_ORDER", route_prefix + "CANCEL_ORDER"} if cancel else {"PLACE_ORDER", route_prefix + "PLACE_ORDER"}
+        if order.get("operation") == "PROTECT":
+            allowed = {"FUTURES_PROTECT"}
+        elif order.get("operation") == "CANCEL_PROTECTION":
+            allowed = {"FUTURES_CANCEL_PROTECTION"}
         if str(operation) not in allowed:
             raise ShortLiveAuthorityError("SHORT_LIVE_OPERATION_MISMATCH")
     return True

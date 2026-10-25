@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -2848,6 +2849,15 @@ def validate_binance_futures_execution_policy(
 ) -> None:
     if intent.get("risk_reducing") is True:
         return
+    if intent.get("expected_leverage") is not None:
+        try:
+            expected = Decimal(str(intent["expected_leverage"]))
+            observed = Decimal(str(symbol_config.get("leverage")))
+            if (isinstance(intent["expected_leverage"], bool) or not expected.is_finite()
+                    or expected < 1 or expected != expected.to_integral_value() or expected != observed):
+                raise ValueError
+        except (InvalidOperation, ValueError, TypeError):
+            raise BrokerNotReadyError("FUTURES_EXACT_LEVERAGE_CHANGED") from None
     raw_policy = intent.get("futures_execution_policy")
     policy = (
         dict(raw_policy)
@@ -3151,6 +3161,65 @@ class LiveBrokerRouter:
             except UpbitOrderAuthorityError as exc:
                 raise BrokerNotReadyError(str(exc)) from exc
         raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
+
+    def place_futures_protection(self, intent: dict[str, object]) -> dict[str, object]:
+        """Submit exactly one service-reserved close-all conditional stop."""
+        from .short_live_order_authority import (
+            short_live_dispatch_present, validate_short_live_native_payload,
+        )
+        from .live_adapters import build_binance_futures_protection_request
+        if not short_live_dispatch_present():
+            raise BrokerNotReadyError("SCOPED_PROTECTION_RESERVATION_REQUIRED")
+        validate_short_live_native_payload(intent)
+        if not real_orders_enabled():
+            raise BrokerNotReadyError("REAL_ORDERS_DISABLED")
+        mode = ensure_response_ok("binance-futures", send_binance_signed_request(
+            build_binance_futures_position_mode_request, futures=True))
+        if (not isinstance(mode, dict) or type(mode.get("dualSidePosition")) is not bool
+                or intent.get("position_mode") != ("HEDGE" if mode["dualSidePosition"] else "ONE_WAY")):
+            raise BrokerNotReadyError("SHORT_LIVE_FUTURES_POSITION_MODE_CHANGED")
+        try:
+            with ordinary_binance_final_mutation_boundary(operation="FUTURES_PROTECT"):
+                return send_binance_signed_request(
+                    lambda: build_binance_futures_protection_request(intent), futures=True)
+        except BinanceOrderAuthorityError as exc:
+            raise BrokerNotReadyError(str(exc)) from exc
+
+    def get_futures_protection(self, symbol: str, *, algo_id: str = "", client_algo_id: str = "") -> dict[str, object]:
+        from .live_adapters import build_binance_futures_protection_lookup_request
+        from .futures_protection_transport import exact_algo_id, exact_client_algo_id
+        if not re.fullmatch(r"[A-Z0-9_]{2,40}", str(symbol)):
+            raise BrokerNotReadyError("EXACT_PROTECTION_SYMBOL_REQUIRED")
+        if algo_id:
+            exact_algo_id(algo_id)
+        if client_algo_id:
+            exact_client_algo_id(client_algo_id)
+        raw = ensure_response_ok("binance-futures", send_binance_signed_request(
+            lambda: build_binance_futures_protection_lookup_request(algo_id=algo_id, client_algo_id=client_algo_id),
+            futures=True))
+        if (not isinstance(raw, dict) or raw.get("symbol") != symbol
+                or algo_id and str(raw.get("algoId")) != str(algo_id)
+                or client_algo_id and raw.get("clientAlgoId") != client_algo_id):
+            raise BrokerNotReadyError("EXACT_PROTECTION_IDENTITY_MISMATCH")
+        return raw
+
+    def cancel_futures_protection(self, intent: dict[str, object]) -> dict[str, object]:
+        """Cancel one exact owned algo; acknowledgment is not flat proof."""
+        from .short_live_order_authority import short_live_dispatch_present, validate_short_live_native_payload
+        from .live_adapters import build_binance_futures_protection_lookup_request
+        if not short_live_dispatch_present():
+            raise BrokerNotReadyError("SCOPED_PROTECTION_RESERVATION_REQUIRED")
+        validate_short_live_native_payload(intent)
+        if not real_orders_enabled():
+            raise BrokerNotReadyError("REAL_ORDERS_DISABLED")
+        self.get_futures_protection(str(intent.get("symbol") or ""),
+            algo_id=str(intent.get("algo_id") or ""), client_algo_id=str(intent.get("client_algo_id") or ""))
+        try:
+            with ordinary_binance_final_mutation_boundary(operation="FUTURES_CANCEL_PROTECTION"):
+                return send_binance_signed_request(lambda: build_binance_futures_protection_lookup_request(
+                    algo_id=str(intent.get("algo_id") or ""), cancel=True), futures=True)
+        except BinanceOrderAuthorityError as exc:
+            raise BrokerNotReadyError(str(exc)) from exc
 
     def list_open_orders(
         self,

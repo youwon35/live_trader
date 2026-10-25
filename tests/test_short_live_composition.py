@@ -33,6 +33,7 @@ if PKG not in sys.modules:
 catalog_module=importlib.import_module(PKG+".short_live_catalog")
 session_module=importlib.import_module(PKG+".short_live_session")
 adapter_module=importlib.import_module(PKG+".short_live_brokers")
+protection_module=importlib.import_module(PKG+".futures_protection_transport")
 router_module=importlib.import_module(PKG+".brokers")
 native_module=importlib.import_module(PKG+".short_live_runtime")
 authority=importlib.import_module(PKG+".short_live_order_authority")
@@ -91,6 +92,9 @@ class CompositionFixture:
         root.mkdir(parents=True)
         self.now=NOW; self.mono=10.0; self.alive=True
         self.calls=[]; self.mutations=[]; self.rows={}; self.position=Decimal(0)
+        self.protection_mutations=[]; self.algos={}
+        self.unknown_protection_read=False; self.protection_cancel_unconfirmed=False
+        self.futures_policy={"leverage":5,"marginMode":"ISOLATED","stopLossPercent":2}
         self.quote_balance=Decimal("200000"); self.external_assets={}
         self.accept_only=False; self.lose_reply=False; self.unknown_cleanup=False; self.unknown_read=False
         self.error_1021=False; self.wire_defects=[]; self.wire_errors=[]
@@ -130,7 +134,9 @@ class CompositionFixture:
         self.budget=adapter_module.SharedExchangeBudget()
         def broker_factory(selected):
             if selected!=route: raise AssertionError(selected)
-            transport=adapter_module.OfficialBrokerTransport(router_module.LiveBrokerRouter(),enabled_reader=lambda:True,order_reader=self.read_order)
+            router=router_module.LiveBrokerRouter()
+            transport=adapter_module.OfficialBrokerTransport(router,enabled_reader=lambda:True,order_reader=self.read_order)
+            protection_transport=protection_module.FuturesProtectionTransport(router,clock=lambda:self.now.timestamp())
             original_submit=transport.submit_authorized
             def submit_authorized(*args):
                 try: return original_submit(*args)
@@ -142,6 +148,11 @@ class CompositionFixture:
                 reserve_cleanup_order=lambda order:self.service.reserve_cleanup_order(order),
                 reserve_cleanup_cancel=lambda order:self.service.reserve_cleanup_cancel(order),
                 observe_cleanup_order=lambda client_id,result:self.service.observe_cleanup_order(client_id,result),
+                protection_reader=lambda selected,claim:protection_transport.lookup(claim),
+                protection_transport=protection_transport,
+                force_order_reader=lambda symbol,since:{"known":True,"events":[],"observedAt":self.now.timestamp()},
+                reserve_protection=lambda order:self.service.reserve_protection(order),
+                record_protection=lambda event,detail:self.service.record_protection(event,detail),
                 budget=self.budget,clock=lambda:self.now.timestamp())
             self.adapters.append(edge); return edge
         self.service=session_module.ShortLiveTestService(self.catalog,broker_factory,
@@ -152,6 +163,10 @@ class CompositionFixture:
     def snapshot(self,route,symbols):
         if route!=self.route or list(symbols)!=[self.symbol]: raise AssertionError((route,symbols))
         positions=[{"symbol":self.symbol,"quantity":str(self.position),"markPrice":"1000"}] if self.position else []
+        if route=="BINANCE_USDM_FUTURES":
+            for row in positions:
+                row.update(entryPrice="1000",isolatedWallet=str(abs(self.position)*1000/self.futures_policy["leverage"]),
+                           liquidationPrice="800",leverage=str(self.futures_policy["leverage"]),positionSide="BOTH")
         spot = route in {"BINANCE_SPOT", "UPBIT_KRW_SPOT"}
         locked_quote = sum((Decimal(row["quantity"])*Decimal("1000") for row in self.rows.values()
                             if row["status"]=="ACCEPTED" and row["side"]=="BUY"), Decimal(0)) if spot else Decimal(0)
@@ -165,6 +180,8 @@ class CompositionFixture:
         return {"known":True,"ordersComplete":True,"positionsComplete":True,"accountId":self.account,
             "currency":self.currency,"observedAt":self.now.timestamp(),"availableNative":str(available),"equityNative":str(equity),
             **inventory,
+            **({"openAlgoOrders":[deepcopy(row) for row in self.algos.values() if row["algoStatus"]=="NEW"]}
+               if route=="BINANCE_USDM_FUTURES" else {}),
             "maximumOrderQuantities":{self.symbol:"200000"},"positions":positions,
             "openOrders":[deepcopy(row) for row in self.rows.values() if row["status"]=="ACCEPTED"]}
 
@@ -172,8 +189,10 @@ class CompositionFixture:
         return {"known":True,"symbol":symbol,"nativePrice":"1000","quoteCurrency":self.currency,"krwPerQuote":"1",
             "fxObservedAt":self.now.timestamp(),"observedAt":self.now.timestamp(),"feeRate":"0.001","sellTaxRate":"0",
             "lotStep":"1","minQuantity":"1","minNotional":"1","priceTick":"1","sessionOpen":True,
-            "sessionRemainingSeconds":19800,"marginMode":"ISOLATED","leverage":"1","positionMode":"ONE_WAY",
-            "fundingRate":"0.0001"}
+            "marketQuantityStep":"1","marketMinQuantity":"1","marketMaxQuantity":"1000000",
+            "sessionRemainingSeconds":19800,"marginMode":"ISOLATED","leverage":str(self.futures_policy["leverage"]),"positionMode":"ONE_WAY",
+            "fundingRate":"0.0001","markPrice":"1000","isAutoAddMargin":False,"maxNotionalValue":"1000000",
+            "leverageBrackets":[{"notionalFloor":"0","notionalCap":"1000000","initialLeverage":125,"maintMarginRatio":"0.004","cum":"0"}]}
 
     def read_order(self,route,claim):
         if self.unknown_read: return {"known":False}
@@ -200,13 +219,44 @@ class CompositionFixture:
         self.calls.append((method,parsed.path))
         if method=="GET":
             if parsed.path.endswith("/exchangeInfo"):
-                payload={"symbols":[{"symbol":"BTCUSDT","filters":[{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"},{"filterType":"MIN_NOTIONAL","minNotional":"1"}]}]}
+                payload={"symbols":[{"symbol":"BTCUSDT","filters":[{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"},{"filterType":"MARKET_LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"},{"filterType":"MIN_NOTIONAL","minNotional":"1"}]}]}
             elif parsed.path.endswith("/positionSide/dual"): payload={"dualSidePosition":False}
-            elif parsed.path.endswith("/symbolConfig"): payload=[{"symbol":"BTCUSDT","marginType":"ISOLATED","leverage":1}]
+            elif parsed.path.endswith("/symbolConfig"): payload=[{"symbol":"BTCUSDT","marginType":"ISOLATED","leverage":self.futures_policy["leverage"]}]
+            elif parsed.path=="/fapi/v1/algoOrder":
+                if self.unknown_protection_read: raise TimeoutError("SYNTHETIC PROTECTION READ UNKNOWN")
+                matches=[row for row in self.algos.values() if
+                         (query.get("algoId") and str(row["algoId"])==query["algoId"]) or
+                         (query.get("clientAlgoId") and row["clientAlgoId"]==query["clientAlgoId"])]
+                if len(matches)!=1: raise AssertionError("Exact synthetic protection lookup required")
+                payload=deepcopy(matches[0])
             elif parsed.path.endswith("/time"): payload={"serverTime":int(self.now.timestamp()*1000)}
             else: raise AssertionError("Unexpected fixture GET: "+parsed.path)
             return Response(url,payload)
         if parsed.path=="/oauth2/tokenP": return Response(url,{"access_token":"SYNTHETIC-ONLY-TOKEN","expires_in":1000})
+        if parsed.path=="/fapi/v1/algoOrder":
+            context=getattr(authority._LOCAL,"dispatch",None)
+            if context is None: raise AssertionError("Protection request escaped exact short dispatch")
+            order=deepcopy(context["order"])
+            self.protection_mutations.append({"method":method,"path":parsed.path,"query":query,"order":order})
+            if method=="POST":
+                if (order["operation"]!="PROTECT" or query.get("clientAlgoId")!=order["clientAlgoId"]
+                        or query.get("type")!="STOP_MARKET" or query.get("workingType")!="MARK_PRICE"
+                        or query.get("closePosition")!="true" or query.get("priceProtect")!="false"
+                        or "quantity" in query or "reduceOnly" in query):
+                    raise AssertionError("Exact close-all protection wire terms required")
+                oid=str(1000+len(self.algos))
+                row={"algoId":oid,"clientAlgoId":query["clientAlgoId"],"symbol":query["symbol"],
+                     "side":query["side"],"positionSide":query["positionSide"],"orderType":"STOP_MARKET",
+                     "algoType":"CONDITIONAL","closePosition":True,"workingType":"MARK_PRICE","priceProtect":False,
+                     "triggerPrice":query["triggerPrice"],"algoStatus":"NEW","actualOrderId":""}
+                self.algos[oid]=row
+            elif method=="DELETE":
+                if order["operation"]!="CANCEL_PROTECTION" or query.get("algoId")!=order["algoId"]:
+                    raise AssertionError("Exact owned protection cancellation required")
+                row=self.algos[query["algoId"]]
+                if not self.protection_cancel_unconfirmed: row["algoStatus"]="CANCELED"
+            else: raise AssertionError("Unexpected protection mutation")
+            return Response(url,deepcopy(row))
         if parsed.path not in {"/api/v3/order","/fapi/v1/order","/v1/orders","/uapi/domestic-stock/v1/trading/order-cash"}:
             raise AssertionError("Unexpected synthetic mutation URL: "+parsed.path)
         context=getattr(authority._LOCAL,"dispatch",None)
@@ -223,7 +273,7 @@ class CompositionFixture:
         if self.lose_reply or (self.unknown_cleanup and order["riskReducing"]): raise TimeoutError("SYNTHETIC LOST REPLY")
         oid=str(len(self.mutations))
         row={"known":True,"brokerOrderId":oid,"clientOrderId":order["clientOrderId"],"symbol":self.symbol,
-            "status":"ACCEPTED","side":order["side"],"quantity":str(order["quantity"]),"filledQuantity":"0",
+            "status":"ACCEPTED","side":order["side"],"positionSide":"BOTH","quantity":str(order["quantity"]),"filledQuantity":"0",
             "remainingQuantity":str(order["quantity"]),"fillPrice":"1000","feeNative":"0",
             "baseCommissionKnown":True,"baseCommissionQuantity":"0","observedAt":self.now.timestamp(),
             "orderDate":"20261022","organizationNo":"00001"}
@@ -235,7 +285,8 @@ class CompositionFixture:
         return Response(url,payload)
 
     def prepare(self):
-        return self.service.prepare({"selections":self.selections,"durationHours":5,"capitalKrwPerBroker":100000,"dailyLossStopKrwPerBroker":50000})["prepared"]
+        return self.service.prepare({"selections":self.selections,"durationHours":5,"capitalKrwPerBroker":100000,"dailyLossStopKrwPerBroker":50000,
+            **({"futuresPolicy":deepcopy(self.futures_policy)} if self.route=="BINANCE_USDM_FUTURES" else {})})["prepared"]
 
     def start(self):
         prepared=self.prepare()
@@ -251,7 +302,7 @@ class CompositionFixture:
 
 class ShortLiveCompositionTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.temp=tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent); self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name); self.fixture=None
         self.environ={"KIS_APP_KEY":"SYNTHETIC-ONLY-KEY","KIS_APP_SECRET":"SYNTHETIC-ONLY-SECRET",
             "KIS_ACCOUNT_NO":"12345678","KIS_ACCOUNT_PRODUCT_CODE":"01","KIS_ENV":"real","LIVE_TRADER_ENABLE_REAL_ORDERS":"true",
@@ -291,8 +342,12 @@ class ShortLiveCompositionTests(unittest.TestCase):
             for count,portfolio in ((1,False),(2,False),(1,True),(2,True)):
                 with self.subTest(route=route,count=count,portfolio=portfolio):
                     f=self.fixture_for(route,count=count,portfolio=portfolio)
-                    f.prepare(); self.assertEqual([],f.mutations)
-                    f.start(); self.assertEqual([],f.mutations)
+                    prepared=f.prepare(); self.assertEqual([],f.mutations); self.assertEqual([],f.protection_mutations)
+                    if route=="BINANCE_USDM_FUTURES":
+                        self.assertEqual(5,prepared["futuresPolicy"]["leverage"])
+                        self.assertEqual("MARK_PRICE",prepared["futuresPolicy"]["workingType"])
+                        self.assertTrue(prepared["futuresPolicy"]["closePosition"])
+                    f.start(); self.assertEqual([],f.mutations); self.assertEqual([],f.protection_mutations)
                     self.assertTrue(f.sockets[-1].connected)
                     view=f.forward()["runtime"]
                     self.assertEqual("RUNNING",view["status"],(view,f.calls,f.wire_errors))
@@ -300,6 +355,16 @@ class ShortLiveCompositionTests(unittest.TestCase):
                     self.assertEqual(1,view["fillCount"],view)
                     self.assertEqual([],f.wire_defects)
                     self.assertTrue(all(s["decisionCount"]==1 for s in view["strategyRows"]))
+                    if route=="BINANCE_USDM_FUTURES":
+                        stop_index=f.calls.index(("POST","/fapi/v1/algoOrder"))
+                        entry_index=f.calls.index(("POST","/fapi/v1/order"))
+                        self.assertLess(stop_index,entry_index)
+                        self.assertIn(("GET","/fapi/v1/algoOrder"),f.calls[stop_index+1:entry_index])
+                        self.assertEqual(1,len(f.protection_mutations))
+                        row=view["brokerRows"][0]
+                        self.assertGreater(row["notionalExposureKrw"],row["committedCapitalKrw"])
+                        self.assertEqual("NEW",row["protections"][0]["status"])
+                        self.assertTrue(row["protections"][0]["verified"])
                     terminal=f.service.stop({"reason":"SYNTHETIC TEST COMPLETE"})["runtime"]
                     self.assertTrue(terminal["terminalVerified"],terminal)
                     self.assertEqual(Decimal(0),f.position)
@@ -307,6 +372,14 @@ class ShortLiveCompositionTests(unittest.TestCase):
                     self.assertFalse(f.mutations[0]["order"]["riskReducing"])
                     self.assertTrue(f.mutations[-1]["order"]["riskReducing"])
                     self.assertTrue(f.sockets[-1].disconnected)
+                    if route=="BINANCE_USDM_FUTURES":
+                        self.assertEqual(["POST","DELETE"],[row["method"] for row in f.protection_mutations])
+                        self.assertTrue(all(row["algoStatus"]=="CANCELED" for row in f.algos.values()))
+                        self.assertTrue(f.service._session["brokerRows"][route]["protectionRetirementVerified"])
+                        self.assertFalse(f.service._session["brokerRows"][route]["ownedProtectionOrders"])
+                        self.assertTrue(f.service._session["sleeves"])
+                        self.assertTrue(all(row["quantity"]==0 for row in f.service._session["sleeves"].values()),
+                                        "Actual cleanup fills were not attributed back to every futures sleeve")
 
     def test_actual_accepted_observation_is_not_inferred_as_fill_or_reposted(self):
         f=self.fixture_for("BINANCE_SPOT"); f.accept_only=True; f.start()
@@ -316,6 +389,49 @@ class ShortLiveCompositionTests(unittest.TestCase):
         f.fill_pending(); observed=f.service.tick()["runtime"]
         self.assertEqual(1,observed["fillCount"],observed); self.assertEqual(1,len(f.mutations))
         self.assertTrue(f.service.stop({})["runtime"]["terminalVerified"])
+
+    def test_futures_unconfirmed_protection_never_submits_entry_or_retries_stop(self):
+        f=self.fixture_for("BINANCE_USDM_FUTURES"); f.start(); f.unknown_protection_read=True
+        view=f.forward()["runtime"]
+        self.assertEqual([],f.mutations,"An entry reached the router without an exact protection read")
+        self.assertEqual(["POST"],[row["method"] for row in f.protection_mutations])
+        self.assertTrue(view["newEntriesBlocked"]); self.assertFalse(view["terminalVerified"])
+        f.service.tick(); f.service.stop({})
+        self.assertEqual([],f.mutations)
+        self.assertEqual(["POST"],[row["method"] for row in f.protection_mutations])
+        self.assertFalse(f.service.snapshot()["runtime"]["terminalVerified"])
+
+    def test_futures_cancel_ack_without_retirement_never_claims_terminal_or_reposts(self):
+        f=self.fixture_for("BINANCE_USDM_FUTURES"); f.start(); f.forward()
+        f.protection_cancel_unconfirmed=True
+        view=f.service.stop({})["runtime"]
+        self.assertEqual(Decimal(0),f.position,"Owned position was not closed by the real reducing path")
+        self.assertTrue(all(row["quantity"]==0 for row in f.service._session["sleeves"].values()),
+                        "Unknown stop retirement must not discard confirmed position-close fills")
+        self.assertEqual(["POST","DELETE"],[row["method"] for row in f.protection_mutations])
+        self.assertTrue(view["newEntriesBlocked"]); self.assertFalse(view["terminalVerified"])
+        self.assertTrue(all(row["algoStatus"]=="NEW" for row in f.algos.values()))
+        f.service.tick(); f.service.stop({})
+        self.assertEqual(["POST","DELETE"],[row["method"] for row in f.protection_mutations])
+        self.assertEqual(2,len(f.mutations),"A cleanup order was resubmitted while stop retirement remained unknown")
+        self.assertFalse(f.service.snapshot()["runtime"]["terminalVerified"])
+
+    def test_futures_finished_algo_with_unknown_child_never_claims_flat_terminal(self):
+        f=self.fixture_for("BINANCE_USDM_FUTURES"); f.start(); f.forward()
+        # The exact algo ID reports its real child ID, but no child fill/fee
+        # observation is supplied. FINISHED alone cannot prove child retirement.
+        algo=next(iter(f.algos.values()))
+        algo.update(algoStatus="FINISHED",actualOrderId="777")
+        view=f.service.stop({})["runtime"]
+        self.assertEqual(Decimal(0),f.position,"The independently confirmed owned close did not complete")
+        self.assertTrue(all(row["quantity"]==0 for row in f.service._session["sleeves"].values()))
+        self.assertTrue(view["newEntriesBlocked"]); self.assertFalse(view["terminalVerified"])
+        self.assertFalse(f.service._session["brokerRows"][f.route]["protectionRetirementVerified"])
+        self.assertEqual([],f.service._session["brokerRows"][f.route]["ownedProtectionOrders"])
+        attempts=(len(f.mutations),len(f.protection_mutations))
+        f.service.tick(); f.service.stop({})
+        self.assertEqual(attempts,(len(f.mutations),len(f.protection_mutations)))
+        self.assertFalse(f.service.snapshot()["runtime"]["terminalVerified"])
 
     def test_complete_spot_inventory_preserves_preexisting_units_through_owned_round_trip(self):
         for route in ("BINANCE_SPOT", "UPBIT_KRW_SPOT"):

@@ -17,6 +17,7 @@ import re
 import threading
 import time
 from typing import Any
+from .short_live_futures import FuturesProtectionError, FuturesProtectionManager, policy as futures_policy
 
 ROUTES = {
     "KIS_KR_CASH": ("kis", "KIS", "KRW"),
@@ -166,6 +167,8 @@ class ShortLiveBrokerAdapter:
                  reserve_cleanup_order: Callable[..., bool] | None = None,
                  reserve_cleanup_cancel: Callable[..., bool] | None = None,
                  observe_cleanup_order: Callable[..., bool] | None = None,
+                 protection_reader=None, protection_transport=None, force_order_reader=None,
+                 reserve_protection=None, record_protection=None,
                  budget: SharedExchangeBudget | None = None, clock: Callable[[], float] = time.time) -> None:
         if route not in ROUTES:
             raise ShortLiveBrokerBlocked("ROUTE_UNSUPPORTED")
@@ -186,6 +189,117 @@ class ShortLiveBrokerAdapter:
         self._observed_market_fx: Decimal | None = None
         self._external_commission_quantities: dict[str, dict[str, Decimal]] = {}
         self._external_commission_costs: dict[str, Decimal] = {}
+        self._futures_policy = None
+        self._observed_futures_by_symbol = {}
+        self._bound_futures_by_symbol = {}
+        self._force_order_reader = force_order_reader
+        self._futures_incidents = []
+        self._session_start_ms = int(clock() * 1000)
+        self._first_entry_ms = None
+        self._cancel_attempts = set()
+        self._protection = (FuturesProtectionManager(clock=clock, reader=protection_reader,
+            transport=protection_transport, guard=authority_guard, reserve=reserve_protection,
+            record=record_protection) if route == "BINANCE_USDM_FUTURES" and all(callable(x) for x in (protection_reader, reserve_protection, record_protection))
+            and protection_transport is not None else None)
+
+    def _capital_committed(self, positions, fx):
+        if self.route != "BINANCE_USDM_FUTURES":
+            return sum((abs(number(row["quantity"])) * number(row["markPrice"], positive=True) * fx for row in positions), Decimal(0))
+        leverage, _ = futures_policy(self._futures_policy)
+        # Entry capital is stable when mark price rises. Actual isolated wallet
+        # can be larger; never silently count that extra collateral as free.
+        return sum((max(number(row.get("isolatedWallet")), abs(number(row["quantity"])) *
+                        number(row.get("entryPrice"), positive=True) / leverage) * fx
+                    for row in positions if number(row["quantity"]) != 0), Decimal(0))
+
+    def _cost_factor(self, market):
+        fee = number(market["feeRate"])
+        if self.route != "BINANCE_USDM_FUTURES":
+            return Decimal(1), fee
+        leverage, _ = futures_policy(self._futures_policy)
+        # Entry + exit commission and funding allowance consume real capital.
+        # Funding changes are also measured by actual account equity at runtime.
+        return Decimal(1) / leverage, 2 * fee + abs(number(market["fundingRate"])) * 2
+
+    def _add_external_fill(self, actual, *, incident_type, position_side, source_id):
+        if actual.get("known") is not True:
+            raise ShortLiveBrokerBlocked("FUTURES_EXTERNAL_EXECUTION_OR_FEE_UNKNOWN")
+        self._fresh(actual.get("observedAt"))
+        qty = number(actual.get("filledQuantity"))
+        if qty <= 0:
+            return
+        if actual.get("feeNative") is None:
+            raise ShortLiveBrokerBlocked("FUTURES_EXTERNAL_EXECUTION_OR_FEE_UNKNOWN")
+        broker_id = str(actual.get("brokerOrderId", ""))
+        symbol = str(actual.get("symbol", ""))
+        side = actual.get("side")
+        if not broker_id or side not in {"BUY", "SELL"}:
+            raise ShortLiveBrokerBlocked("FUTURES_EXTERNAL_EXECUTION_IDENTITY_UNKNOWN")
+        client = "external-" + symbol + "-" + position_side + "-" + broker_id
+        prior = self._fill_rows.get(client, {})
+        if number(prior.get("filledQuantity", 0)) > qty:
+            raise ShortLiveBrokerBlocked("FUTURES_EXTERNAL_CUMULATIVE_FILL_REGRESSED")
+        self._claims[client] = {"externalExecution": True, "status": actual.get("status"),
+            "clientOrderId": client, "actualClientOrderId": actual.get("clientOrderId", ""),
+            "symbol": symbol, "quantity": str(qty), "side": side, "brokerOrderId": broker_id}
+        self._fill_rows[client] = dict(actual)
+        incident = {"type": incident_type, "symbol": symbol, "positionSide": position_side,
+                    "quantity": str(qty), "brokerOrderId": broker_id, "sourceId": str(source_id),
+                    "side": side, "fillPrice": str(actual.get("fillPrice")), "feeNative": str(actual["feeNative"]),
+                    "verified": True, "observedAt": actual["observedAt"]}
+        self._futures_incidents = [row for row in self._futures_incidents
+                                  if (row.get("symbol"), row.get("positionSide"), row.get("brokerOrderId")) !=
+                                     (symbol, position_side, broker_id)]
+        self._futures_incidents.append(incident)
+
+    def _poll_futures_protection(self):
+        if self._protection is None:
+            return
+        try:
+            for item in self._protection.poll():
+                self._add_external_fill(item["order"], incident_type="PROTECTIVE_STOP",
+                    position_side=item["order"].get("positionSide", "BOTH"), source_id=item["claim"]["algoId"])
+        except FuturesProtectionError as exc:
+            # A read outage must block entries, but should not prevent a fresh
+            # account read and exact reducing cleanup of existing exposure.
+            self._protection._incident(str(exc))
+
+    def _detect_forced_close(self, symbol, expected, actual):
+        if (self.route != "BINANCE_USDM_FUTURES" or not callable(self._force_order_reader)
+                or self._first_entry_ms is None or expected == 0 or abs(actual) >= abs(expected)
+                or (actual != 0 and (actual > 0) != (expected > 0))):
+            return False
+        # A manual trade is not liquidation. Require official forceOrders and
+        # exact order/fill/fee evidence in the lifetime of our fresh session.
+        events = self._force_order_reader(symbol, self._first_entry_ms)
+        if events.get("known") is not True:
+            raise ShortLiveBrokerBlocked("FUTURES_FORCE_ORDER_HISTORY_UNKNOWN")
+        self._fresh(events.get("observedAt"))
+        desired_side = "SELL" if expected > 0 else "BUY"
+        mode = self._bound_futures_by_symbol.get(symbol, {}).get("positionMode")
+        desired_position = ("LONG" if expected > 0 else "SHORT") if mode == "HEDGE" else "BOTH"
+        selected = [row for row in events.get("events", [])
+                    if row.get("symbol") == symbol and row.get("side") == desired_side
+                    and row.get("positionSide") == desired_position
+                    and row.get("incidentType") in {"LIQUIDATION", "ADL"}
+                    and self._first_entry_ms <= int(row.get("time", -1)) <= int(self.clock()*1000)
+                    and number(row.get("filledQuantity", 0)) > 0]
+        def previous_quantity(row):
+            key = "external-" + symbol + "-" + desired_position + "-" + str(row.get("brokerOrderId"))
+            return number(self._fill_rows.get(key, {}).get("filledQuantity", 0))
+        if (not selected or any(number(row["filledQuantity"]) < previous_quantity(row) for row in selected)
+                or sum((number(row["filledQuantity"]) - previous_quantity(row) for row in selected), Decimal(0)) != abs(expected - actual)):
+            return False
+        for row in selected:
+            observed = dict(self.transport.read_order(self.route, row))
+            if (str(observed.get("brokerOrderId")) != str(row.get("brokerOrderId"))
+                    or observed.get("symbol") != symbol or observed.get("side") != desired_side
+                    or observed.get("positionSide") != desired_position
+                    or number(observed.get("filledQuantity")) != number(row["filledQuantity"])):
+                raise ShortLiveBrokerBlocked("FUTURES_FORCE_EXECUTION_IDENTITY_CHANGED")
+            self._add_external_fill(observed, incident_type=row["incidentType"],
+                                    position_side=desired_position, source_id=row["brokerOrderId"])
+        return True
 
     def _fresh(self, value: Any, age: float = 30) -> None:
         delta = self.clock() - epoch(value)
@@ -342,6 +456,8 @@ class ShortLiveBrokerAdapter:
         return s
 
     def _snapshot(self, m: Mapping[str, Any], *, establish_spot_baseline: bool = False) -> dict[str, Any]:
+        if self.route == "BINANCE_USDM_FUTURES":
+            self._poll_futures_protection()
         s = dict(self.snapshot_reader(self.route, tuple(m["symbols"])))
         if s.get("known") is not True or s.get("ordersComplete") is not True or s.get("positionsComplete") is not True:
             reason = next((r for r in s.get("blockers", []) if isinstance(r, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,100}", r)), None)
@@ -361,18 +477,11 @@ class ShortLiveBrokerAdapter:
         # Join current official order truth to locally reserved exact IDs.
         # A matching symbol/PID alone never makes an existing holding owned.
         for client_id, claim in self._claims.items():
-            if not claim.get("brokerOrderId"):
-                if claim.get("status") == "UNKNOWN":
-                    raise ShortLiveBrokerBlocked("ORDER_REPLY_UNKNOWN")
+            if claim.get("externalExecution"):
+                continue  # Exact stop/force execution is reconciled separately.
+            if not claim.get("brokerOrderId") and claim.get("status") != "UNKNOWN":
                 continue
-            observed = dict(self.transport.read_order(self.route, claim))
-            if (observed.get("known") is not True or str(observed.get("brokerOrderId")) != claim["brokerOrderId"]
-                    or observed.get("symbol") != claim["symbol"]):
-                raise ShortLiveBrokerBlocked("EXACT_OWNED_ORDER_TRUTH_REQUIRED")
-            returned_client = str(observed.get("clientOrderId") or "")
-            if returned_client and returned_client != client_id:
-                raise ShortLiveBrokerBlocked("OWNED_ORDER_CLIENT_ID_CHANGED")
-            self._fresh(observed.get("observedAt"))
+            observed = self._read_claim_truth(claim)
             self._fill_rows[client_id] = observed
             for key in ("orderDate", "organizationNo"):
                 if observed.get(key):
@@ -394,6 +503,23 @@ class ShortLiveBrokerAdapter:
                 signed -= base_fee
             net[claim["symbol"]] = net.get(claim["symbol"], Decimal(0)) + signed
         s = self._preserve_spot_inventory(s, m, net, establish=establish_spot_baseline)
+        if self.route == "BINANCE_USDM_FUTURES":
+            algos = s.get("openAlgoOrders")
+            if not isinstance(algos, list):
+                raise ShortLiveBrokerBlocked("FUTURES_ALGO_ORDERS_UNKNOWN")
+            if any(self._protection is None or not self._protection.owns(row) for row in algos):
+                raise ShortLiveBrokerBlocked("UNOWNED_FUTURES_CONDITIONAL_ORDER")
+            for symbol, quantity in list(net.items()):
+                actual = sum((number(row["quantity"]) for row in s["positions"] if row.get("symbol") == symbol), Decimal(0))
+                if actual != quantity and self._detect_forced_close(symbol, quantity, actual):
+                    net[symbol] = actual  # Exact official force fills were added above, never inferred.
+            # Do not net the opposite hedge side into the session's holdings.
+            for row in s["positions"]:
+                if number(row.get("quantity", 0)) == 0:
+                    continue
+                specs = [spec for spec in m.get("specs", []) if spec["symbol"] == row.get("symbol")]
+                if specs and ((number(row["quantity"]) < 0) != (specs[0].get("positionDirection") == "short")):
+                    raise ShortLiveBrokerBlocked("UNOWNED_FUTURES_POSITION_SIDE")
         for row in s["positions"]:
             if not isinstance(row, Mapping):
                 raise ShortLiveBrokerBlocked("POSITION_ROW_INVALID")
@@ -409,9 +535,11 @@ class ShortLiveBrokerAdapter:
             actual = sum((number(row["quantity"]) for row in s["positions"] if row.get("symbol") == symbol), Decimal(0))
             if actual != quantity:
                 raise ShortLiveBrokerBlocked("OWNED_FILL_POSITION_MISMATCH")
+        if self._protection and self._claims:
+            self._protection.check_positions(s["positions"])
         return s
 
-    def _market(self, symbol: str, *, require_session_open: bool = False) -> dict[str, Any]:
+    def _market(self, symbol: str, *, require_session_open: bool = False, allow_setting_drift: bool = False) -> dict[str, Any]:
         q = dict(self.market_reader(self.route, symbol))
         if q.get("known") is not True or q.get("symbol") != symbol or q.get("quoteCurrency") != self.currency:
             reason = next((r for r in q.get("blockers", []) if isinstance(r, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,100}", r)), None)
@@ -438,11 +566,28 @@ class ShortLiveBrokerAdapter:
                 "marginMode": q.get("marginMode") if q.get("marginMode") in {"ISOLATED", "CROSSED", "CROSS"} else "UNKNOWN",
                 "leverage": decimal_text(number(q.get("leverage"))),
                 "positionMode": q.get("positionMode") if q.get("positionMode") in {"ONE_WAY", "HEDGE"} else "UNKNOWN"}
-            if q.get("marginMode") != "ISOLATED" or number(q.get("leverage")) != 1:
-                raise ShortLiveBrokerBlocked("FUTURES_SETTINGS_REQUIRE_1X_ISOLATED")
+            leverage, _ = futures_policy(self._futures_policy)
+            if q.get("marginMode") != "ISOLATED" or number(q.get("leverage")) != leverage:
+                if not allow_setting_drift:
+                    raise ShortLiveBrokerBlocked("FUTURES_SETTINGS_DIFFER_FROM_PREPARED_POLICY")
+                self._protection._incident("FUTURES_SETTINGS_CHANGED_DURING_SESSION", symbol=symbol)
             if q.get("positionMode") not in {"ONE_WAY", "HEDGE"}:
                 raise ShortLiveBrokerBlocked("FUTURES_POSITION_MODE_UNKNOWN")
+            if q.get("isAutoAddMargin") not in (True, False) or type(q.get("isAutoAddMargin")) is not bool:
+                if not allow_setting_drift:
+                    raise ShortLiveBrokerBlocked("FUTURES_AUTO_ADD_MARGIN_UNKNOWN")
+                self._protection._incident("FUTURES_AUTO_ADD_MARGIN_UNKNOWN", symbol=symbol)
+            elif q.get("isAutoAddMargin") is True:
+                if not allow_setting_drift:
+                    raise ShortLiveBrokerBlocked("FUTURES_AUTO_ADD_MARGIN_MUST_BE_DISABLED")
+                self._protection._incident("FUTURES_AUTO_ADD_MARGIN_ENABLED", symbol=symbol)
             number(q.get("fundingRate"))
+            self._observed_futures_by_symbol[symbol] = dict(self._observed_futures_settings)
+            bound = self._bound_futures_by_symbol.get(symbol)
+            if bound and bound != self._observed_futures_settings:
+                if not allow_setting_drift:
+                    raise ShortLiveBrokerBlocked("FUTURES_SETTINGS_CHANGED_DURING_SESSION")
+                self._protection._incident("FUTURES_SETTINGS_CHANGED_DURING_SESSION", symbol=symbol)
         return q
 
     def readiness(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -453,6 +598,11 @@ class ShortLiveBrokerAdapter:
         self._observed_market_fx = None
         try:
             m = deepcopy(dict(manifest))
+            if self.route == "BINANCE_USDM_FUTURES":
+                self._futures_policy = deepcopy(m.get("futuresPolicy"))
+                futures_policy(self._futures_policy)
+                if self._protection is None:
+                    raise ShortLiveBrokerBlocked("FUTURES_PROTECTION_TRANSPORT_UNAVAILABLE")
             if self._manifest is not None and self._manifest != m:
                 raise ShortLiveBrokerBlocked("ADAPTER_ALREADY_BOUND")
             if m.get("route") != self.route or not m.get("sessionId") or not re.fullmatch(r"[0-9a-f]{64}", str(m.get("manifestHash") or "")):
@@ -505,7 +655,13 @@ class ShortLiveBrokerAdapter:
                 if self.provider == "kis" and number(s.get("maximumOrderQuantities", {}).get(q["symbol"])) < units:
                     raise ShortLiveBrokerBlocked("NATIVE_ORDERABLE_QUANTITY_BELOW_MINIMUM")
                 costs = number(q["feeRate"]) + number(q.get("sellTaxRate", 0))
-                required = units * price * number(q["krwPerQuote"]) * (1 + costs)
+                margin_factor, reserve_costs = self._cost_factor(q)
+                required = units * price * number(q["krwPerQuote"]) * (margin_factor + reserve_costs + number(q.get("sellTaxRate", 0)))
+                if self.route == "BINANCE_USDM_FUTURES":
+                    from .short_live_futures import stop_price
+                    direction = next((spec.get("positionDirection", "long") for spec in m.get("specs", []) if spec["symbol"] == q["symbol"]), "long")
+                    stop_price({"referencePrice": price, "quantity": ceiling/(margin_factor+reserve_costs)/price/number(q["krwPerQuote"]),
+                                "positionDirection": direction}, q, self._futures_policy)
                 native_minimums[q["symbol"]] = decimal_text(required)
                 if required > ceiling:
                     raise ShortLiveBrokerBlocked("AVAILABLE_BELOW_NATIVE_MINIMUM")
@@ -538,6 +694,8 @@ class ShortLiveBrokerAdapter:
                 if self._manifest is not None and self._manifest != m:
                     raise ShortLiveBrokerBlocked("ADAPTER_ALREADY_BOUND")
                 self._manifest = m
+                if self.route == "BINANCE_USDM_FUTURES":
+                    self._bound_futures_by_symbol = deepcopy(self._observed_futures_by_symbol)
                 if self._spot_baseline is None and "_spotBaselineCandidate" in s:
                     self._spot_baseline = dict(s["_spotBaselineCandidate"])
                     self._spot_baseline_account = s["accountId"]
@@ -550,9 +708,11 @@ class ShortLiveBrokerAdapter:
                     "boundedCostAllowanceVerified": True, "actualEquityLossTracked": True,
                     "availableSessionMinutes": available_minutes,
                     "minimumOrderKrwBySymbol": native_minimums,
-                    "fxObservedAt": markets[0]["fxObservedAt"], "promotionEligible": False}
+                    "fxObservedAt": markets[0]["fxObservedAt"], "promotionEligible": False,
+                    "observedFuturesSettingsBySymbol": deepcopy(self._observed_futures_by_symbol),
+                    "futuresPolicy": deepcopy(self._futures_policy)}
         except Exception as exc:
-            code = str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "BROKER_READINESS_UNKNOWN"
+            code = str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "BROKER_READINESS_UNKNOWN"
             if funding and self._observed_market_fx is not None:
                 try:
                     available = number(funding["availableQuoteNative"]) * self._observed_market_fx
@@ -562,7 +722,8 @@ class ShortLiveBrokerAdapter:
                     pass
             if self._observed_futures_settings:
                 funding.update(observedFuturesSettings=dict(self._observed_futures_settings),
-                               expectedFuturesSettings={"marginMode": "ISOLATED", "leverage": "1"})
+                               expectedFuturesSettings=deepcopy(self._futures_policy),
+                               observedFuturesSettingsBySymbol=deepcopy(self._observed_futures_by_symbol))
             return {"ready": False, "blockers": [code], "scopeOwnershipVerified": False, **funding,
                     "availableSessionMinutes": available_minutes, "minimumOrderKrwBySymbol": native_minimums,
                     "promotionEligible": False}
@@ -573,7 +734,8 @@ class ShortLiveBrokerAdapter:
             symbol, side = str(proposal.get("symbol") or ""), str(proposal.get("side") or "").upper()
             if symbol not in m["symbols"] or side not in {"BUY", "SELL"}:
                 raise ShortLiveBrokerBlocked("ORDER_SCOPE_INVALID")
-            s, q = self._snapshot(m), self._market(symbol, require_session_open=True)
+            s, q = self._snapshot(m), self._market(symbol, require_session_open=True,
+                                                  allow_setting_drift=proposal.get("riskReducing") is True)
             price, fx = number(q["nativePrice"], positive=True), number(q["krwPerQuote"], positive=True)
             if proposal.get("_reservedLimitPrice") is not None:
                 price = number(proposal["_reservedLimitPrice"], positive=True)
@@ -587,6 +749,9 @@ class ShortLiveBrokerAdapter:
             available = number(s["availableNative"]) * fx
             positions = [r for r in s["positions"] if number(r["quantity"]) != 0]
             exposure = sum((abs(number(r["quantity"])) * number(r.get("markPrice"), positive=True) * fx for r in positions), Decimal(0))
+            committed = self._capital_committed(positions, fx)
+            margin_factor, reserve_costs = self._cost_factor(q)
+            leverage = Decimal(1) / margin_factor
             reducing = proposal.get("riskReducing") is True
             matching = [r for r in positions if r.get("symbol") == symbol]
             direction = str(proposal.get("positionDirection") or "long").lower()
@@ -602,14 +767,22 @@ class ShortLiveBrokerAdapter:
                 requested_qty = proposal.get("closeQuantity")
                 raw_qty = owned if requested_qty is not None and number(requested_qty) == owned else min(owned, requested / (price * fx))
             else:
-                cap = min(requested, (route_limit - exposure) / (1 + fee + tax), available / (1 + fee + tax))
+                if self._futures_incidents or (self._protection and self._protection.incidents):
+                    raise ShortLiveBrokerBlocked("FUTURES_INCIDENT_NEW_ENTRIES_BLOCKED")
+                cap = min(requested, (route_limit - committed) / (margin_factor + reserve_costs + tax),
+                          available / (margin_factor + reserve_costs + tax))
                 if cap <= 0:
                     raise ShortLiveBrokerBlocked("AVAILABLE_BUDGET_EXHAUSTED")
                 raw_qty = cap / (price * fx)
-            step = number(q["lotStep"], positive=True)
+            market_exit = self.route == "BINANCE_USDM_FUTURES" and proposal.get("operation") == "EMERGENCY_CLOSE"
+            step = number(q.get("marketQuantityStep") if market_exit else q["lotStep"], positive=True)
+            min_qty = number(q.get("marketMinQuantity") if market_exit else q["minQuantity"])
+            if min_qty < 0:
+                raise ShortLiveBrokerBlocked("ORDER_MINIMUM_QUANTITY_UNKNOWN")
+            max_qty = q.get("marketMaxQuantity") if market_exit else q.get("maxQuantity")
             if proposal.get("_reservedQuantity") is not None:
                 reserved_qty = number(proposal["_reservedQuantity"], positive=True)
-                if reserved_qty % step != 0 or (reducing and reserved_qty > owned):
+                if (reserved_qty - min_qty) % step != 0 or (reducing and reserved_qty > owned):
                     raise ShortLiveBrokerBlocked("RESERVED_NATIVE_QUANTITY_NO_LONGER_VALID")
                 raw_qty = reserved_qty
             if self.provider == "kis" and not reducing:
@@ -617,17 +790,22 @@ class ShortLiveBrokerAdapter:
                 if maximum is None:
                     raise ShortLiveBrokerBlocked("NATIVE_ORDERABLE_QUANTITY_UNKNOWN")
                 raw_qty = min(raw_qty, number(maximum))
-            qty = (raw_qty / step).to_integral_value(rounding=ROUND_DOWN) * step
-            if qty < number(q["minQuantity"], positive=True) or qty * price < number(q["minNotional"]):
+            qty = min_qty + ((raw_qty - min_qty) / step).to_integral_value(rounding=ROUND_DOWN) * step
+            if raw_qty < min_qty:
                 raise ShortLiveBrokerBlocked("ORDER_BELOW_EXCHANGE_MINIMUM")
-            if q.get("maxQuantity") is not None and qty > number(q["maxQuantity"], positive=True):
+            if qty <= 0 or qty < min_qty or (qty * price < number(q["minNotional"]) and
+                    not (reducing and self.route == "BINANCE_USDM_FUTURES")):
+                raise ShortLiveBrokerBlocked("ORDER_BELOW_EXCHANGE_MINIMUM")
+            if max_qty is not None and qty > number(max_qty, positive=True):
                 raise ShortLiveBrokerBlocked("ORDER_ABOVE_EXCHANGE_MAXIMUM")
             notional = qty * price * fx
             cost = notional * (fee + tax)
-            if not reducing and notional + cost > available:
+            required_capital = notional * (margin_factor + reserve_costs + tax)
+            if not reducing and required_capital > available:
                 raise ShortLiveBrokerBlocked("AVAILABLE_BUDGET_EXHAUSTED")
             projected = max(Decimal(0), exposure - notional) if reducing else exposure + notional + cost
-            if not reducing and projected > route_limit:
+            projected_capital = max(Decimal(0), committed - notional * margin_factor) if reducing else committed + required_capital
+            if not reducing and projected_capital > route_limit:
                 raise ShortLiveBrokerBlocked("ROUTE_EXPOSURE_EXCEEDED")
             result = dict(proposal)
             result.update(ready=True, blockers=[], accountId=s["accountId"], quantity=decimal_text(qty),
@@ -635,10 +813,12 @@ class ShortLiveBrokerAdapter:
                           projectedGrossExposureKrw=decimal_text(projected), feeKrw=decimal_text(cost),
                           observedAt=q["observedAt"], krwPerQuote=decimal_text(fx),
                           fxObservedAt=q["fxObservedAt"],
+                          leverage=decimal_text(leverage), requiredCapitalKrw=decimal_text(required_capital),
+                          projectedCommittedCapitalKrw=decimal_text(projected_capital),
                           positionMode=q.get("positionMode", ""), promotionEligible=False)
             return result
         except Exception as exc:
-            return {"ready": False, "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "ORDER_SIZING_UNKNOWN"]}
+            return {"ready": False, "blockers": [str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "ORDER_SIZING_UNKNOWN"]}
 
     @staticmethod
     def _normalize_reply(response: Any, order: Mapping[str, Any], fx: Decimal) -> dict[str, Any]:
@@ -700,19 +880,34 @@ class ShortLiveBrokerAdapter:
                 if number(order.get("quantity")) != number(checked["quantity"]) or str(order.get("accountId")) != checked["accountId"]:
                     raise ShortLiveBrokerBlocked("ORDER_CHANGED_AT_DISPATCH")
                 reducing = order.get("riskReducing") is True
-                reserve = Decimal(0) if reducing else number(checked["estimatedNotionalKrw"]) + number(checked["feeKrw"])
+                reserve = Decimal(0) if reducing else number(checked["requiredCapitalKrw"])
+                if self.route == "BINANCE_USDM_FUTURES" and not reducing:
+                    # A completed round trip must retire its close-all stop
+                    # before a fresh entry can create a new protection identity.
+                    truth = self._snapshot(self._scope(order))
+                    if (self._claims and not truth["openOrders"] and
+                            not any(number(p["quantity"]) for p in truth["positions"])):
+                        self._protection.finish_flat()
+                    self._protection.ensure({**dict(order), "positionMode": checked["positionMode"]},
+                        self._market(order["symbol"]), self._futures_policy)
                 self.budget.reserve(self.exchange, client_id, reserve, Decimal(0))
                 claim = {"status": "UNKNOWN", "clientOrderId": client_id, "symbol": order["symbol"],
                          "quantity": str(order["quantity"]), "side": order["side"], "brokerOrderId": ""}
+                if self.route == "BINANCE_USDM_FUTURES":
+                    claim["positionSide"] = (order.get("positionDirection", "long").upper()
+                                             if checked["positionMode"] == "HEDGE" else "BOTH")
                 self._claims[client_id] = claim
+                if self.route == "BINANCE_USDM_FUTURES" and not reducing and self._first_entry_ms is None:
+                    self._first_entry_ms = int(self.clock() * 1000)
                 native = {"broker_id": self.provider, "symbol": order["symbol"], "side": order["side"],
                           "quantity": str(order["quantity"]), "price": checked["referencePrice"],
-                          "order_type": "LIMIT", "identifier": client_id, "new_client_order_id": client_id,
+                          "order_type": "MARKET" if order.get("operation") == "EMERGENCY_CLOSE" else "LIMIT", "identifier": client_id, "new_client_order_id": client_id,
                           "execution_purpose": "FUNCTIONAL_TEST_ONLY", "session_id": order["sessionId"],
                           "manifest_hash": order["manifestHash"], "risk_reducing": reducing,
                           "reduce_only": reducing, "position_direction": order.get("positionDirection", "long"),
                           "position_mode": checked.get("positionMode", ""),
-                          "max_leverage": 1, "required_margin_type": "ISOLATED"}
+                          "max_leverage": int(number(checked["leverage"])), "expected_leverage": checked["leverage"],
+                          "required_margin_type": "ISOLATED"}
                 if self.provider == "kis":
                     native.update(asset="KR_STOCK", asset_class="KR_STOCK", order_type="00")
                 sender = getattr(self.transport, "submit_authorized", None)
@@ -747,21 +942,38 @@ class ShortLiveBrokerAdapter:
             with self._lock:
                 if client_id in self._claims:
                     return deepcopy(self._claims[client_id])
-            return {"status": "REJECTED", "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "ORDER_DISPATCH_BLOCKED"], "clientOrderId": client_id}
+            return {"status": "REJECTED", "blockers": [str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "ORDER_DISPATCH_BLOCKED"], "clientOrderId": client_id}
+
+    def _read_claim_truth(self, claim):
+        recovering = not claim.get("brokerOrderId")
+        if recovering and (self.route != "BINANCE_USDM_FUTURES" or claim.get("status") != "UNKNOWN"):
+            raise ShortLiveBrokerBlocked("ORDER_REPLY_UNKNOWN")
+        observed = dict(self.transport.read_order(self.route, deepcopy(claim)))
+        broker_id = str(observed.get("brokerOrderId") or "")
+        if (observed.get("known") is not True or not broker_id
+                or (not recovering and broker_id != str(claim["brokerOrderId"]))
+                or observed.get("symbol") != claim["symbol"]
+                or observed.get("clientOrderId") not in (None, "", claim["clientOrderId"])):
+            raise ShortLiveBrokerBlocked("EXACT_OWNED_ORDER_TRUTH_REQUIRED")
+        if self.route == "BINANCE_USDM_FUTURES":
+            if (observed.get("side") != claim["side"] or observed.get("positionSide") != claim["positionSide"]
+                    or (recovering and (observed.get("clientOrderId") != claim["clientOrderId"]
+                        or number(observed.get("quantity"), positive=True) != number(claim["quantity"], positive=True)))):
+                raise ShortLiveBrokerBlocked("EXACT_OWNED_ORDER_TRUTH_REQUIRED")
+        self._fresh(observed.get("observedAt"))
+        if observed.get("status") == "UNKNOWN":
+            raise ShortLiveBrokerBlocked("OWNED_ORDER_STATE_UNKNOWN")
+        claim["brokerOrderId"] = broker_id
+        return observed
 
     def observe_order(self, client_id: str) -> dict[str, Any]:
         """One exact official GET; never replay a POST or infer a fill."""
         try:
             with self._lock:
                 claim = self._claims.get(str(client_id))
-                if claim is None or not claim.get("brokerOrderId"):
+                if claim is None:
                     raise ShortLiveBrokerBlocked("EXACT_ORDER_CLAIM_UNKNOWN")
-                observed = dict(self.transport.read_order(self.route, claim))
-                if (observed.get("known") is not True or str(observed.get("brokerOrderId")) != claim["brokerOrderId"]
-                        or observed.get("symbol") != claim["symbol"]
-                        or observed.get("clientOrderId") not in (None, "", client_id)):
-                    raise ShortLiveBrokerBlocked("EXACT_OWNED_ORDER_TRUTH_REQUIRED")
-                self._fresh(observed.get("observedAt"))
+                observed = self._read_claim_truth(claim)
                 filled = number(observed.get("filledQuantity"))
                 if self.provider == "binance" and filled > 0 and observed.get("baseCommissionKnown") is not True:
                     raise ShortLiveBrokerBlocked("ACTUAL_BASE_COMMISSION_UNKNOWN")
@@ -773,7 +985,7 @@ class ShortLiveBrokerAdapter:
                     "PARTIAL" if status in _ACTIVE | {"PARTIAL"} and filled > 0 else "ACCEPTED" if status in _ACTIVE else "UNKNOWN")
                 if state == "UNKNOWN":
                     raise ShortLiveBrokerBlocked("EXACT_ORDER_STATE_UNKNOWN")
-                q = self._market(claim["symbol"])
+                q = self._market(claim["symbol"], allow_setting_drift=True)
                 fee = observed.get("feeNative")
                 result = {"status": state, "clientOrderId": client_id, "brokerOrderId": claim["brokerOrderId"],
                           "filledQuantity": decimal_text(filled), "fillPrice": str(observed.get("fillPrice")),
@@ -796,8 +1008,9 @@ class ShortLiveBrokerAdapter:
             actual_positions = [p for p in s["positions"] if number(p["quantity"]) != 0]
             quotes = ({symbol: {"krwPerQuote": "1", "nativePrice": "0"} for symbol in m["symbols"]}
                       if self.currency == "KRW" and not actual_positions else
-                      {symbol: self._market(symbol) for symbol in m["symbols"]})
+                      {symbol: self._market(symbol, allow_setting_drift=True) for symbol in m["symbols"]})
             fx = number(next(iter(quotes.values()))["krwPerQuote"])
+            committed = self._capital_committed(actual_positions, fx)
             equity = number(s["equityNative"]) * fx
             exposure = sum((abs(number(p["quantity"])) * number(p.get("markPrice", quotes[p["symbol"]]["nativePrice"])) * fx
                             for p in s["positions"] if number(p["quantity"]) != 0), Decimal(0))
@@ -828,12 +1041,20 @@ class ShortLiveBrokerAdapter:
                     "positionsBySymbol": positions, "realizedLossKrw": decimal_text(realized_loss),
                     "unrealizedLossKrw": decimal_text(unrealized_loss), "equityKrw": decimal_text(equity),
                     "exposureKrw": decimal_text(exposure), "scopeOwnershipVerified": True,
+                    "committedCapitalKrw": decimal_text(committed), "notionalExposureKrw": decimal_text(exposure),
+                    "protections": self._protection.public_rows() if self._protection else [],
+                    "ownedProtectionOrders": deepcopy(s.get("openAlgoOrders", [])),
+                    "protectionRetirementVerified": self._protection.retirement_verified() if self._protection else True,
+                    "futuresIncidents": deepcopy(self._futures_incidents) + deepcopy(self._protection.incidents if self._protection else []),
+                    "observedFuturesSettingsBySymbol": deepcopy(self._observed_futures_by_symbol),
+                    "futuresPositions": deepcopy(actual_positions) if self.route == "BINANCE_USDM_FUTURES" else [],
                     "lossBasis": ("EXACT_SCOPE_PNL" if "realizedPnlNative" in s else
                                   "SESSION_NATIVE_EQUITY_EXCLUDING_PRESERVED_SPOT_WITH_VERIFIED_FEES"
                                   if self._spot_baseline is not None else "ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX"),
                     "promotionEligible": False}
         except Exception as exc:
-            return {"known": False, "ready": False, "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "RECONCILIATION_UNKNOWN"]}
+            return {"known": False, "ready": False, "blockers": [str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "RECONCILIATION_UNKNOWN"],
+                    "futuresIncidents": deepcopy(self._futures_incidents) + deepcopy(self._protection.incidents if self._protection else [])}
 
     def cleanup(self, session: Mapping[str, Any]) -> dict[str, Any]:
         current = self.reconcile(session)
@@ -849,13 +1070,16 @@ class ShortLiveBrokerAdapter:
                 if self.provider == "kis":
                     auth.update(orderDate=row.get("orderDate"), organizationNo=row.get("organizationNo"),
                                 remainingQuantity=row.get("remainingQuantity"))
-                if not callable(self.reserve_cleanup_cancel) or self.reserve_cleanup_cancel(auth) is not True:
-                    raise ShortLiveBrokerBlocked("DURABLE_CANCEL_RESERVATION_REQUIRED")
-                if self.authority_guard(auth) is not True:
-                    raise ShortLiveBrokerBlocked("CLEANUP_AUTHORITY_REQUIRED")
-                cancel = getattr(self.transport, "cancel_authorized", None)
-                if callable(cancel): cancel(self.route, str(row["brokerOrderId"]), row, auth, self.authority_guard)
-                else: self.transport.cancel(self.route, str(row["brokerOrderId"]), row)
+                cancel_key = (str(row.get("symbol")), str(row["brokerOrderId"]))
+                if cancel_key not in self._cancel_attempts:
+                    if not callable(self.reserve_cleanup_cancel) or self.reserve_cleanup_cancel(auth) is not True:
+                        raise ShortLiveBrokerBlocked("DURABLE_CANCEL_RESERVATION_REQUIRED")
+                    if self.authority_guard(auth) is not True:
+                        raise ShortLiveBrokerBlocked("CLEANUP_AUTHORITY_REQUIRED")
+                    self._cancel_attempts.add(cancel_key)
+                    cancel = getattr(self.transport, "cancel_authorized", None)
+                    if callable(cancel): cancel(self.route, str(row["brokerOrderId"]), row, auth, self.authority_guard)
+                    else: self.transport.cancel(self.route, str(row["brokerOrderId"]), row)
             # Cancellation is only an acknowledgement. Re-read before flatten.
             current = self.reconcile(session)
             if current.get("known") is not True or current.get("pendingOrders"):
@@ -864,13 +1088,21 @@ class ShortLiveBrokerAdapter:
                 qty = number(row["quantity"])
                 if not qty:
                     continue
-                q = self._market(str(row["symbol"]))
+                q = self._market(str(row["symbol"]), allow_setting_drift=True)
                 direction = "short" if qty < 0 or row.get("positionDirection") == "short" else "long"
-                key = hashlib.sha256((str(m["sessionId"]) + str(row["symbol"]) + str(qty)).encode()).hexdigest()[:24]
+                key = hashlib.sha256((str(m["sessionId"]) + str(row["symbol"]) + direction).encode()).hexdigest()[:24]
+                client = "sl-clean-" + key
+                if client in self._claims:
+                    # Continue observing the same cleanup intent. A partial
+                    # fill or lost response never creates another close order.
+                    self.observe_cleanup_order(client, self.observe_order(client))
+                    continue
                 proposal = {**dict(session), "route": self.route, "symbol": row["symbol"], "side": "BUY" if direction == "short" else "SELL",
-                            "positionDirection": direction, "riskReducing": True, "clientOrderId": "sl-clean-" + key,
+                            "positionDirection": direction, "riskReducing": True, "clientOrderId": client,
                             "closeQuantity": decimal_text(abs(qty)),
                             "notionalKrw": decimal_text(abs(qty) * number(q["nativePrice"]) * number(q["krwPerQuote"]))}
+                if self.route == "BINANCE_USDM_FUTURES":
+                    proposal["operation"] = "EMERGENCY_CLOSE"
                 sized = self.size_order(proposal)
                 if sized.get("ready") is not True:
                     raise ShortLiveBrokerBlocked("CLEANUP_SIZING_BLOCKED")
@@ -882,11 +1114,31 @@ class ShortLiveBrokerAdapter:
                 if self.observe_cleanup_order(sized["clientOrderId"], reply) is not True:
                     raise ShortLiveBrokerBlocked("DURABLE_CLEANUP_OBSERVATION_FAILED")
             final = self.reconcile(session)
-            complete = final.get("known") is True and not final.get("pendingOrders") and not final.get("positionsBySymbol")
+            if (self._protection and final.get("known") is True and not final.get("pendingOrders")
+                    and not final.get("positionsBySymbol")):
+                self._protection.finish_flat()
+                final = self.reconcile(session)
+            complete = (final.get("known") is True and not final.get("pendingOrders") and not final.get("positionsBySymbol")
+                        and final.get("protectionRetirementVerified") is True)
             return {**final, "complete": complete, "ownedOrdersRemaining": len(final.get("pendingOrders", [])),
                     "ownedPositionsRemaining": len(final.get("positionsBySymbol", {}))}
         except Exception as exc:
             return {"known": False, "complete": False, "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "CLEANUP_UNKNOWN"]}
+
+    def retire_flat_protection(self, session):
+        current = self.reconcile(session)
+        if current.get("known") is not True or current.get("pendingOrders") or current.get("ownedPositions"):
+            return False
+        if self._protection:
+            self._protection.finish_flat()
+        final = self.reconcile(session)
+        return (final.get("known") is True and not final.get("ownedProtectionOrders")
+                and not final.get("pendingOrders") and not final.get("ownedPositions")
+                and final.get("protectionRetirementVerified") is True)
+
+    def continue_cleanup(self, session):
+        """Read the same durable intents, dispatching each cancel/close once."""
+        return self.cleanup(session)
 
 
 def create_production_short_live_broker(route: str, *, settings: Mapping[str, Any],
@@ -898,12 +1150,18 @@ def create_production_short_live_broker(route: str, *, settings: Mapping[str, An
                                       reserve_cleanup_order: Callable[..., bool] | None = None,
                                       reserve_cleanup_cancel: Callable[..., bool] | None = None,
                                       observe_cleanup_order: Callable[..., bool] | None = None,
+                                      reserve_protection=None, record_protection=None,
                                       router: Any = None, clock: Callable[[], float] = time.time) -> ShortLiveBrokerAdapter:
     from .short_live_broker_readers import ProductionShortLiveReaders
+    from .futures_protection_transport import FuturesProtectionTransport
     readers = ProductionShortLiveReaders(settings=settings, fx_reader=fx_reader,
                                         ownership_reader=ownership_reader, cost_reader=cost_reader, clock=clock)
     return ShortLiveBrokerAdapter(route, snapshot_reader=readers.snapshot, market_reader=readers.market,
                                   transport=OfficialBrokerTransport(router, order_reader=readers.get_order), authority_guard=authority_guard,
                                   reserve_cleanup_order=reserve_cleanup_order, reserve_cleanup_cancel=reserve_cleanup_cancel,
                                   observe_cleanup_order=observe_cleanup_order,
+                                  protection_reader=readers.protection_order,
+                                  protection_transport=FuturesProtectionTransport(router),
+                                  force_order_reader=readers.futures_force_orders,
+                                  reserve_protection=reserve_protection, record_protection=record_protection,
                                   budget=budget, clock=clock)

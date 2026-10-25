@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -33,7 +34,8 @@ class ProductionShortLiveReaders:
             class ExtendedReadTransport(ReadOnlyTransport):
                 EXTRA = {"/fapi/v3/positionRisk", "/fapi/v1/positionSide/dual", "/fapi/v1/symbolConfig",
                          "/fapi/v1/commissionRate", "/fapi/v1/premiumIndex", "/fapi/v1/accountConfig",
-                         "/fapi/v1/order", "/fapi/v1/openAlgoOrders", "/fapi/v1/userTrades"}
+                         "/fapi/v1/order", "/fapi/v1/openAlgoOrders", "/fapi/v1/userTrades",
+                         "/fapi/v1/algoOrder", "/fapi/v1/forceOrders", "/fapi/v1/leverageBracket"}
                 def request(self, provider, method, path, *, query=None, headers=None, body=None):
                     extra_allowed = ((provider == "binance-futures" and path in self.EXTRA)
                                      or (provider == "upbit" and path == "/v1/orderbook/instruments"))
@@ -58,6 +60,162 @@ class ProductionShortLiveReaders:
 
     def _now(self) -> str:
         return datetime.fromtimestamp(self.clock(), timezone.utc).isoformat()
+
+    @staticmethod
+    def _positive_id(value: Any, code: str) -> str:
+        if isinstance(value, bool) or not re.fullmatch(r"[1-9][0-9]*", str(value)):
+            raise ShortLiveBrokerBlocked(code)
+        return str(value)
+
+    @staticmethod
+    def _millis(value: Any, code: str) -> int:
+        if type(value) is not int or value < 0:
+            raise ShortLiveBrokerBlocked(code)
+        return value
+
+    @staticmethod
+    def _bool(value: Any, code: str) -> bool:
+        if type(value) is bool:
+            return value
+        if value in ("true", "false"):
+            return value == "true"
+        raise ShortLiveBrokerBlocked(code)
+
+    @staticmethod
+    def _symbol(value: Any) -> str:
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Z0-9_]{1,35}USDT", value):
+            raise ShortLiveBrokerBlocked("FUTURES_SYMBOL_INVALID")
+        return value
+
+    @classmethod
+    def _algo_order(cls, row: Any) -> dict[str, Any]:
+        """Normalize conditional truth without inventing ownership or a fill."""
+        if not isinstance(row, Mapping):
+            raise ShortLiveBrokerBlocked("FUTURES_ALGO_ORDER_INVALID")
+        algo_id = cls._positive_id(row.get("algoId"), "FUTURES_ALGO_ID_INVALID")
+        client = row.get("clientAlgoId")
+        if not isinstance(client, str) or not client or len(client) > 128:
+            raise ShortLiveBrokerBlocked("FUTURES_ALGO_CLIENT_ID_INVALID")
+        symbol = cls._symbol(row.get("symbol"))
+        side, position_side = row.get("side"), row.get("positionSide")
+        if side not in {"BUY", "SELL"} or position_side not in {"BOTH", "LONG", "SHORT"}:
+            raise ShortLiveBrokerBlocked("FUTURES_ALGO_SIDE_INVALID")
+        kind = row.get("orderType", row.get("type"))
+        if kind not in {"STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"}:
+            raise ShortLiveBrokerBlocked("FUTURES_ALGO_TYPE_UNKNOWN")
+        status = row.get("algoStatus", row.get("status"))
+        if status not in {"NEW", "CANCELED", "CANCELLED", "TRIGGERING", "TRIGGERED", "FINISHED", "REJECTED", "EXPIRED"}:
+            raise ShortLiveBrokerBlocked("FUTURES_ALGO_STATUS_UNKNOWN")
+        close = cls._bool(row.get("closePosition"), "FUTURES_ALGO_CLOSE_POSITION_UNKNOWN")
+        reduce = cls._bool(row.get("reduceOnly"), "FUTURES_ALGO_REDUCE_ONLY_UNKNOWN")
+        quantity = row.get("quantity")
+        if quantity is not None:
+            quantity = number(quantity)
+            if quantity < 0 or (not close and quantity <= 0):
+                raise ShortLiveBrokerBlocked("FUTURES_ALGO_QUANTITY_INVALID")
+        elif not close:
+            raise ShortLiveBrokerBlocked("FUTURES_ALGO_QUANTITY_UNKNOWN")
+        trigger = number(row.get("triggerPrice"))
+        if trigger < 0 or (kind != "TRAILING_STOP_MARKET" and trigger <= 0):
+            raise ShortLiveBrokerBlocked("FUTURES_ALGO_TRIGGER_INVALID")
+        working = row.get("workingType")
+        if working not in {"MARK_PRICE", "CONTRACT_PRICE"}:
+            raise ShortLiveBrokerBlocked("FUTURES_ALGO_WORKING_TYPE_UNKNOWN")
+        actual_id = row.get("actualOrderId")
+        if actual_id in (None, "", 0, "0") and not isinstance(actual_id, bool):
+            actual_id = ""
+        else:
+            actual_id = cls._positive_id(actual_id, "FUTURES_ALGO_ACTUAL_ORDER_ID_INVALID")
+        result = {"algoId": algo_id, "clientAlgoId": client, "symbol": symbol,
+                  "side": side, "positionSide": position_side, "type": kind,
+                  "orderType": kind, "status": status, "algoStatus": status,
+                  "quantity": None if quantity is None else decimal_text(quantity),
+                  "triggerPrice": decimal_text(trigger), "workingType": working,
+                  "closePosition": close, "reduceOnly": reduce, "actualOrderId": actual_id}
+        for field in ("createTime", "updateTime", "triggerTime"):
+            if field in row:
+                result[field] = cls._millis(row[field], "FUTURES_ALGO_TIME_INVALID")
+        if "priceProtect" in row:
+            result["priceProtect"] = cls._bool(row["priceProtect"], "FUTURES_ALGO_PRICE_PROTECT_UNKNOWN")
+        return result
+
+    @classmethod
+    def _symbol_config(cls, rows: Any, symbol: str) -> dict[str, Any]:
+        if not isinstance(rows, list):
+            raise ShortLiveBrokerBlocked("FUTURES_CONFIG_UNKNOWN")
+        matches = [row for row in rows if isinstance(row, Mapping) and row.get("symbol") == symbol]
+        if len(matches) != 1:
+            raise ShortLiveBrokerBlocked("FUTURES_CONFIG_UNKNOWN")
+        row = matches[0]
+        leverage = number(row.get("leverage"), positive=True)
+        margin = str(row.get("marginType") or "").upper()
+        if leverage != leverage.to_integral_value() or not 1 <= leverage <= 125 or margin not in {"ISOLATED", "CROSSED"}:
+            raise ShortLiveBrokerBlocked("FUTURES_CONFIG_UNKNOWN")
+        result = {"leverage": decimal_text(leverage), "marginMode": margin}
+        if row.get("maxNotionalValue") is not None:
+            result["maxNotionalValue"] = decimal_text(number(row["maxNotionalValue"], positive=True))
+        if row.get("isAutoAddMargin") is not None:
+            result["isAutoAddMargin"] = cls._bool(row["isAutoAddMargin"], "FUTURES_AUTO_ADD_MARGIN_UNKNOWN")
+        return result
+
+    @classmethod
+    def _futures_position(cls, row: Any, configs: Any) -> dict[str, Any] | None:
+        if not isinstance(row, Mapping):
+            raise ShortLiveBrokerBlocked("FUTURES_POSITION_INVALID")
+        symbol, position_side = cls._symbol(row.get("symbol")), row.get("positionSide")
+        qty = number(row.get("positionAmt"))
+        if position_side not in {"BOTH", "LONG", "SHORT"} or (position_side == "LONG" and qty < 0) or (position_side == "SHORT" and qty > 0):
+            raise ShortLiveBrokerBlocked("FUTURES_POSITION_SIDE_INVALID")
+        if qty == 0:
+            return None
+        result = {"symbol": symbol, "quantity": decimal_text(qty), "positionSide": position_side,
+                  "positionDirection": "short" if qty < 0 else "long", **cls._symbol_config(configs, symbol)}
+        for field in ("markPrice", "entryPrice", "liquidationPrice", "isolatedMargin", "isolatedWallet",
+                      "initialMargin", "positionInitialMargin", "openOrderInitialMargin", "maintMargin"):
+            value = number(row.get(field), positive=field in {"markPrice", "entryPrice"})
+            if field != "isolatedMargin" and value < 0:
+                raise ShortLiveBrokerBlocked("FUTURES_POSITION_MARGIN_INVALID")
+            result[field] = decimal_text(value)
+        result["notional"] = decimal_text(number(row.get("notional")))
+        result["unrealizedPnlNative"] = decimal_text(number(row.get("unRealizedProfit")))
+        result["updateTime"] = cls._millis(row.get("updateTime"), "FUTURES_POSITION_TIME_INVALID")
+        if row.get("marginAsset") != "USDT":
+            raise ShortLiveBrokerBlocked("FUTURES_POSITION_MARGIN_ASSET_UNKNOWN")
+        result["marginAsset"] = "USDT"
+        return result
+
+    @staticmethod
+    def _leverage_brackets(payload: Any, symbol: str) -> tuple[list[dict[str, str]], str]:
+        rows = payload if isinstance(payload, list) else [payload] if isinstance(payload, Mapping) else []
+        selected = [row for row in rows if isinstance(row, Mapping) and row.get("symbol") == symbol]
+        if len(selected) != 1 or not isinstance(selected[0].get("brackets"), list) or not selected[0]["brackets"]:
+            raise ShortLiveBrokerBlocked("FUTURES_LEVERAGE_BRACKETS_UNKNOWN")
+        coefficient = number(selected[0].get("notionalCoef", 1), positive=True)
+        brackets = []
+        for row in selected[0]["brackets"]:
+            if not isinstance(row, Mapping):
+                raise ShortLiveBrokerBlocked("FUTURES_LEVERAGE_BRACKET_INVALID")
+            bracket = {key: number(row.get(key)) for key in
+                       ("notionalFloor", "notionalCap", "maintMarginRatio", "cum", "initialLeverage")}
+            for key in ("notionalFloor", "notionalCap", "cum"):
+                bracket[key] *= coefficient
+            if (bracket["notionalFloor"] < 0 or bracket["notionalCap"] <= bracket["notionalFloor"]
+                    or not 0 < bracket["maintMarginRatio"] < 1 or bracket["cum"] < 0
+                    or not 1 <= bracket["initialLeverage"] <= 125
+                    or bracket["initialLeverage"] != bracket["initialLeverage"].to_integral_value()):
+                raise ShortLiveBrokerBlocked("FUTURES_LEVERAGE_BRACKET_INVALID")
+            brackets.append(bracket)
+        brackets.sort(key=lambda row: row["notionalFloor"])
+        previous_cap, previous_margin = Decimal(0), Decimal(0)
+        for bracket in brackets:
+            at_floor = bracket["notionalFloor"] * bracket["maintMarginRatio"] - bracket["cum"]
+            tolerance = max(Decimal("0.00000001"), abs(previous_margin) * Decimal("0.000000001"))
+            if (bracket["notionalFloor"] != previous_cap or at_floor < -tolerance
+                    or abs(at_floor - previous_margin) > tolerance):
+                raise ShortLiveBrokerBlocked("FUTURES_LEVERAGE_BRACKET_DISCONTINUITY")
+            previous_cap = bracket["notionalCap"]
+            previous_margin = previous_cap * bracket["maintMarginRatio"] - bracket["cum"]
+        return [{key: decimal_text(value) for key, value in row.items()} for row in brackets], decimal_text(coefficient)
 
     def _official_fx(self, currency: str) -> dict[str, Any]:
         if currency != "USDT":
@@ -136,12 +294,22 @@ class ProductionShortLiveReaders:
         side = str(row.get("side") or "").upper()
         if side in {"BID", "ASK"}:
             side = "BUY" if side == "BID" else "SELL"
+        quantity = row.get("origQty") if provider in {"binance", "binance-futures"} else row.get("volume")
+        filled = number(row.get("executedQty", row.get("executed_volume", "0")))
+        remaining = row.get("remaining_volume")
+        if quantity is not None:
+            quantity = number(quantity, positive=True)
+            if filled < 0 or filled > quantity:
+                raise ShortLiveBrokerBlocked("ORDER_TRUTH_QUANTITY_INVALID")
+            remaining = quantity - filled if provider in {"binance", "binance-futures"} else remaining
         return {"symbol": str(row.get("symbol") or row.get("market") or ""),
                 "brokerOrderId": str(row.get("orderId") or row.get("uuid") or ""),
                 "clientOrderId": str(row.get("clientOrderId") or row.get("identifier") or ""),
                 "status": state, "side": side,
-                "filledQuantity": str(row.get("executedQty", row.get("executed_volume", "0"))),
-                "remainingQuantity": str(row.get("remaining_volume", "0")),
+                **({"positionSide": row.get("positionSide")} if provider == "binance-futures" else {}),
+                "quantity": None if quantity is None else decimal_text(quantity),
+                "filledQuantity": decimal_text(filled),
+                "remainingQuantity": None if remaining is None else decimal_text(number(remaining)),
                 "fillPrice": str(row.get("avgPrice") or row.get("price") or "0"),
                 "feeNative": row.get("paid_fee"), "provider": provider}
 
@@ -149,6 +317,7 @@ class ProductionShortLiveReaders:
         provider, _, currency = ROUTES[route]
         positions: list[dict[str, Any]] = []
         inventory: dict[str, str] = {}
+        algo_orders: list[dict[str, Any]] = []
 
         def spot_balance(asset: Any, free: Any, locked: Any) -> tuple[str, Decimal]:
             # Retain even out-of-scope/delisted dust as quantity-only inventory.
@@ -185,20 +354,27 @@ class ProductionShortLiveReaders:
                 raw_positions = self._binance(provider, "/fapi/v3/positionRisk")
                 if not isinstance(raw_positions, list):
                     raise ShortLiveBrokerBlocked("POSITIONS_INCOMPLETE")
+                configs = (self._binance(provider, "/fapi/v1/symbolConfig")
+                           if any(number(row.get("positionAmt")) != 0 for row in raw_positions) else [])
+                seen_positions = set()
                 for row in raw_positions:
-                    qty = number(row.get("positionAmt"))
-                    if row.get("positionSide") == "SHORT": qty = -abs(qty)
-                    elif row.get("positionSide") == "LONG": qty = abs(qty)
-                    if qty:
-                        positions.append({"symbol": str(row.get("symbol")), "quantity": decimal_text(qty),
-                                          "markPrice": str(row.get("markPrice")),
-                                          "positionDirection": "short" if row.get("positionSide") == "SHORT" or qty < 0 else "long"})
+                    position = self._futures_position(row, configs)
+                    if position is not None:
+                        key = (position["symbol"], position["positionSide"])
+                        if key in seen_positions:
+                            raise ShortLiveBrokerBlocked("FUTURES_POSITION_IDENTITY_CONFLICT")
+                        seen_positions.add(key)
+                        positions.append(position)
                 # Regular orders and conditional algo orders are distinct.
                 raw_orders = self._binance(provider, "/fapi/v1/openOrders")
                 algo = self._binance(provider, "/fapi/v1/openAlgoOrders")
                 algo_rows = algo.get("orders") if isinstance(algo, dict) else algo
-                if not isinstance(algo_rows, list) or algo_rows:
-                    raise ShortLiveBrokerBlocked("FUTURES_CONDITIONAL_ORDER_PRESENT_OR_UNKNOWN")
+                if not isinstance(algo_rows, list):
+                    raise ShortLiveBrokerBlocked("FUTURES_CONDITIONAL_ORDERS_UNKNOWN")
+                algo_orders = [self._algo_order(row) for row in algo_rows]
+                algo_keys = [(row["symbol"], row["algoId"]) for row in algo_orders]
+                if len(set(algo_keys)) != len(algo_keys):
+                    raise ShortLiveBrokerBlocked("FUTURES_ALGO_IDENTITY_CONFLICT")
             else:
                 if account.get("canTrade") is not True:
                     raise ShortLiveBrokerBlocked("ACCOUNT_TRADING_DISABLED")
@@ -259,6 +435,8 @@ class ProductionShortLiveReaders:
         return {"known": True, "accountId": self._identity(provider), "currency": currency, **spot,
                 "availableNative": decimal_text(available), "equityNative": decimal_text(equity),
                 "positions": positions, "openOrders": orders, "ordersComplete": True,
+                **({"openAlgoOrders": algo_orders, "algoOrdersComplete": True}
+                   if provider == "binance-futures" else {}),
                 "positionsComplete": True, "observedAt": self._now()}
 
     def _kis_snapshot(self, symbols: tuple[str, ...]) -> dict[str, Any]:
@@ -334,20 +512,41 @@ class ProductionShortLiveReaders:
                     "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "OFFICIAL_ACCOUNT_READ_UNKNOWN"]}
 
     def get_order(self, route: str, claim: Mapping[str, Any]) -> dict[str, Any]:
-        """Read one already reserved order by exact broker ID, never retry POST."""
+        """Read an exact reservation by broker ID or original futures client ID."""
         try:
             observed_started = self._now()
             provider = ROUTES[route][0]
             order_id, symbol = str(claim.get("brokerOrderId") or ""), str(claim.get("symbol") or "")
-            if not order_id or not symbol:
+            if not symbol or (not order_id and provider != "binance-futures"):
                 raise ShortLiveBrokerBlocked("EXACT_OWNED_ORDER_REQUIRED")
             if provider in {"binance", "binance-futures"}:
                 futures = provider == "binance-futures"
                 prefix = "/fapi/v1" if futures else "/api/v3"
-                raw = self._binance(provider, prefix + "/order", {"symbol": symbol, "orderId": order_id})
-                if not isinstance(raw, dict) or str(raw.get("orderId")) != order_id or raw.get("symbol") != symbol:
+                original_client = str(claim.get("clientOrderId") or "")
+                if order_id:
+                    query = {"symbol": symbol, "orderId": order_id}
+                else:
+                    if (claim.get("status") != "UNKNOWN"
+                            or not re.fullmatch(r"[.A-Z:/a-z0-9_-]{1,36}", original_client)
+                            or claim.get("side") not in {"BUY", "SELL"}
+                            or claim.get("positionSide") not in {"BOTH", "LONG", "SHORT"}):
+                        raise ShortLiveBrokerBlocked("EXACT_UNKNOWN_RESERVATION_REQUIRED")
+                    number(claim.get("quantity"), positive=True)
+                    query = {"symbol": symbol, "origClientOrderId": original_client}
+                raw = self._binance(provider, prefix + "/order", query)
+                if (not isinstance(raw, dict) or raw.get("symbol") != symbol
+                        or (order_id and str(raw.get("orderId")) != order_id)):
                     raise ShortLiveBrokerBlocked("ORDER_TRUTH_ID_MISMATCH")
+                order_id = self._positive_id(raw.get("orderId"), "ORDER_TRUTH_ID_MISMATCH")
                 result = self._order(raw, provider=provider)
+                for field in ("side", "positionSide"):
+                    if claim.get(field) is not None and claim[field] != result.get(field):
+                        raise ShortLiveBrokerBlocked("ORDER_TRUTH_SIDE_MISMATCH")
+                expected_client = claim.get("actualClientOrderId") if claim.get("externalExecution") is True else claim.get("clientOrderId")
+                if expected_client and result.get("clientOrderId") != expected_client:
+                    raise ShortLiveBrokerBlocked("ORDER_TRUTH_CLIENT_ID_MISMATCH")
+                if futures and claim.get("quantity") is not None and number(claim["quantity"], positive=True) != number(result.get("quantity"), positive=True):
+                    raise ShortLiveBrokerBlocked("ORDER_TRUTH_QUANTITY_MISMATCH")
                 result.update(baseCommissionQuantity="0", baseCommissionKnown=True,
                               externalCommissionQuantities={}, externalCommissionNative={},
                               externalCommissionKnown=True)
@@ -431,6 +630,116 @@ class ProductionShortLiveReaders:
         except Exception:
             return {"known": False, "status": "UNKNOWN", "blockers": ["OFFICIAL_OWNED_ORDER_UNKNOWN"]}
 
+    def protection_order(self, route: str, claim: Mapping[str, Any]) -> dict[str, Any]:
+        """Read one exact algo and its actual execution; never creates an order."""
+        observed = self._now()
+        try:
+            if route != "BINANCE_USDM_FUTURES" or not isinstance(claim, Mapping):
+                raise ShortLiveBrokerBlocked("FUTURES_PROTECTION_ROUTE_INVALID")
+            symbol = self._symbol(claim.get("symbol"))
+            algo_id, client = claim.get("algoId"), claim.get("clientAlgoId")
+            params = {}
+            if algo_id is not None and algo_id != "":
+                params["algoId"] = self._positive_id(algo_id, "FUTURES_ALGO_ID_INVALID")
+            elif isinstance(client, str) and client and len(client) <= 128:
+                params["clientAlgoId"] = client
+            else:
+                raise ShortLiveBrokerBlocked("EXACT_PROTECTION_ORDER_REQUIRED")
+            raw = self._binance("binance-futures", "/fapi/v1/algoOrder", params)
+            result = self._algo_order(raw)
+            if (result["symbol"] != symbol or (params.get("algoId") and result["algoId"] != params["algoId"])
+                    or (client is not None and client != "" and result["clientAlgoId"] != client)):
+                raise ShortLiveBrokerBlocked("PROTECTION_ORDER_IDENTITY_MISMATCH")
+            for key in ("side", "positionSide"):
+                if claim.get(key) is not None and claim[key] != result[key]:
+                    raise ShortLiveBrokerBlocked("PROTECTION_ORDER_SIDE_MISMATCH")
+            actual_id = result["actualOrderId"]
+            result.update(triggered=bool(actual_id), executionKnown=False, actualOrder=None)
+            if actual_id:
+                actual = self.get_order(route, {"brokerOrderId": actual_id, "symbol": symbol})
+                if (actual.get("known") is not True or actual.get("symbol") != symbol
+                        or str(actual.get("brokerOrderId")) != actual_id
+                        or actual.get("side") != result["side"]
+                        or actual.get("positionSide") != result["positionSide"]):
+                    raise ShortLiveBrokerBlocked("PROTECTION_EXECUTION_UNKNOWN")
+                filled = number(actual.get("filledQuantity"))
+                if filled < 0 or actual.get("status") not in {
+                        "NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
+                    raise ShortLiveBrokerBlocked("PROTECTION_EXECUTION_UNKNOWN")
+                # The exchange can create the MARKET child before its first
+                # fill. Preserve that known zero-fill state without a fee.
+                # Any positive execution still needs actual trade fees.
+                if filled > 0:
+                    if number(actual.get("feeNative")) < 0:
+                        raise ShortLiveBrokerBlocked("PROTECTION_EXECUTION_FEE_UNKNOWN")
+                    number(actual.get("fillPrice"), positive=True)
+                result.update(actualOrder=actual, executionKnown=True)
+            elif result["status"] in {"TRIGGERED", "FINISHED"}:
+                raise ShortLiveBrokerBlocked("PROTECTION_EXECUTION_ID_MISSING")
+            return {**result, "known": True, "observedAt": observed}
+        except Exception as exc:
+            return {"known": False, "executionKnown": False, "status": "UNKNOWN", "observedAt": observed,
+                    "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "OFFICIAL_PROTECTION_ORDER_UNKNOWN"]}
+
+    def futures_force_orders(self, symbol: str, since_ms: int) -> dict[str, Any]:
+        """Bounded exact-symbol forced executions, queried only on reconciliation need.
+
+        Types are queried independently because the response has no reliable
+        autoCloseType field. A saturated page is incomplete, never an empty
+        successful result. Unverified partial evidence remains attached.
+        """
+        observed = self._now()
+        events: list[dict[str, Any]] = []
+        try:
+            symbol = self._symbol(symbol)
+            start = self._millis(since_ms, "FORCE_ORDER_WINDOW_INVALID")
+            end = int(self.clock() * 1000)
+            if start <= 0 or start > end or end - start > 7 * 24 * 3600 * 1000:
+                raise ShortLiveBrokerBlocked("FORCE_ORDER_WINDOW_INVALID")
+            seen = set()
+            for kind in ("LIQUIDATION", "ADL"):
+                rows = self._binance("binance-futures", "/fapi/v1/forceOrders", {
+                    "symbol": symbol, "autoCloseType": kind, "startTime": start, "endTime": end, "limit": 100})
+                if not isinstance(rows, list):
+                    raise ShortLiveBrokerBlocked("FORCE_ORDER_HISTORY_UNKNOWN")
+                for row in rows:
+                    if not isinstance(row, Mapping) or row.get("symbol") != symbol:
+                        raise ShortLiveBrokerBlocked("FORCE_ORDER_SCOPE_MISMATCH")
+                    order_id = self._positive_id(row.get("orderId"), "FORCE_ORDER_ID_INVALID")
+                    if order_id in seen:
+                        raise ShortLiveBrokerBlocked("FORCE_ORDER_IDENTITY_CONFLICT")
+                    seen.add(order_id)
+                    side, position_side = row.get("side"), row.get("positionSide")
+                    if (side not in {"BUY", "SELL"} or position_side not in {"BOTH", "LONG", "SHORT"}
+                            or (position_side == "LONG" and side != "SELL")
+                            or (position_side == "SHORT" and side != "BUY")):
+                        raise ShortLiveBrokerBlocked("FORCE_ORDER_SIDE_INVALID")
+                    created = self._millis(row.get("time"), "FORCE_ORDER_TIME_INVALID")
+                    updated = self._millis(row.get("updateTime"), "FORCE_ORDER_TIME_INVALID")
+                    if not start <= created <= updated <= end:
+                        raise ShortLiveBrokerBlocked("FORCE_ORDER_TIME_OUTSIDE_WINDOW")
+                    quantity, filled = number(row.get("origQty"), positive=True), number(row.get("executedQty"))
+                    price = number(row.get("avgPrice"), positive=filled > 0)
+                    if filled < 0 or filled > quantity or price < 0:
+                        raise ShortLiveBrokerBlocked("FORCE_ORDER_FILL_INVALID")
+                    status = row.get("status")
+                    if status not in {"NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH"}:
+                        raise ShortLiveBrokerBlocked("FORCE_ORDER_STATUS_UNKNOWN")
+                    client = row.get("clientOrderId")
+                    if not isinstance(client, str) or not client:
+                        raise ShortLiveBrokerBlocked("FORCE_ORDER_CLIENT_ID_UNKNOWN")
+                    events.append({"incidentType": kind, "autoCloseType": kind, "brokerOrderId": order_id,
+                                   "clientOrderId": client, "symbol": symbol, "side": side, "positionSide": position_side,
+                                   "status": status, "quantity": decimal_text(quantity), "filledQuantity": decimal_text(filled),
+                                   "fillPrice": decimal_text(price), "time": created, "updateTime": updated})
+                if len(rows) >= 100:
+                    raise ShortLiveBrokerBlocked("FORCE_ORDER_HISTORY_INCOMPLETE")
+            events.sort(key=lambda row: (row["time"], row["brokerOrderId"]))
+            return {"known": True, "events": events, "observedAt": observed, "sinceMs": start, "untilMs": end}
+        except Exception as exc:
+            return {"known": False, "events": events, "observedAt": observed,
+                    "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "OFFICIAL_FORCE_ORDER_UNKNOWN"]}
+
     def market(self, route: str, symbol: str) -> dict[str, Any]:
         try:
             provider, _, currency = ROUTES[route]
@@ -451,6 +760,24 @@ class ProductionShortLiveReaders:
                 minimum = filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {}))
                 min_notional = minimum.get("minNotional", minimum.get("notional"))
                 if futures:
+                    market_lots = [row for row in matches[0].get("filters", [])
+                                   if isinstance(row, Mapping) and row.get("filterType") == "MARKET_LOT_SIZE"]
+                    if len(market_lots) != 1:
+                        raise ShortLiveBrokerBlocked("FUTURES_MARKET_LOT_SIZE_UNKNOWN")
+                    market_lot = market_lots[0]
+                    raw_market_step = number(market_lot.get("stepSize"))
+                    market_min = number(market_lot.get("minQty"))
+                    market_max = number(market_lot.get("maxQty"), positive=True)
+                    if raw_market_step < 0 or market_min < 0 or market_max < market_min:
+                        raise ShortLiveBrokerBlocked("FUTURES_MARKET_LOT_SIZE_INVALID")
+                    market_step = (number(lot.get("stepSize"), positive=True)
+                                   if raw_market_step == 0 else raw_market_step)
+                    extra.update(marketQuantityStep=decimal_text(market_step),
+                                 marketMinQuantity=decimal_text(market_min),
+                                 marketMaxQuantity=decimal_text(market_max),
+                                 marketQuantityStepRaw=decimal_text(raw_market_step),
+                                 marketQuantityStepSource=("LOT_SIZE_FOR_ZERO_MARKET_STEP"
+                                     if raw_market_step == 0 else "MARKET_LOT_SIZE"))
                     premium = self._binance(provider, "/fapi/v1/premiumIndex", {"symbol": symbol}, signed=False)
                     quote_received = self._now()
                     price = premium.get("markPrice")
@@ -461,10 +788,15 @@ class ProductionShortLiveReaders:
                     fee = commission.get("takerCommissionRate")
                     config = self._binance(provider, "/fapi/v1/symbolConfig", {"symbol": symbol})
                     mode = self._binance(provider, "/fapi/v1/positionSide/dual")
-                    if not isinstance(config, list) or len(config) != 1 or config[0].get("symbol") != symbol or type(mode.get("dualSidePosition")) is not bool:
+                    if not isinstance(mode, Mapping) or type(mode.get("dualSidePosition")) is not bool:
                         raise ShortLiveBrokerBlocked("FUTURES_CONFIG_UNKNOWN")
-                    extra.update(marginMode=str(config[0].get("marginType") or "").upper(), leverage=config[0].get("leverage"),
-                                 positionMode="HEDGE" if mode["dualSidePosition"] else "ONE_WAY", fundingRate=premium.get("lastFundingRate"))
+                    brackets, coefficient = self._leverage_brackets(
+                        self._binance(provider, "/fapi/v1/leverageBracket", {"symbol": symbol}), symbol)
+                    extra.update(**self._symbol_config(config, symbol), markPrice=decimal_text(number(price, positive=True)),
+                                 positionMode="HEDGE" if mode["dualSidePosition"] else "ONE_WAY",
+                                 fundingRate=decimal_text(number(premium.get("lastFundingRate"))),
+                                 leverageBrackets=brackets, notionalCoefficient=coefficient,
+                                 leverageBracketsAccountAdjusted=True)
                 else:
                     ticker = self._binance(provider, "/api/v3/ticker/price", {"symbol": symbol}, signed=False)
                     quote_received = self._now()
