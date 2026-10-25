@@ -5023,6 +5023,9 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
   const broker = brokers.find((item) => item.broker_id === activeGroup);
   const diagnostic = diagnostics.find((item) => item.broker_id === activeGroup);
   const checkCount = visibleFields.filter((field) => assistantFieldStatus(field, draft[field.key]) !== "done").length;
+  const dirtyCount = visibleFields.filter((field) => field.kind === "secret"
+    ? Boolean(String(draft[field.key] ?? "").trim())
+    : String(draft[field.key] ?? "") !== String(field.value ?? field.default ?? "")).length;
   const settingsReady = settingsStatus === "ready" && visibleFields.length > 0;
   const settingsLabel = settingsStatus === "loading" ? "읽는 중"
     : settingsStatus === "error" ? "확인 실패"
@@ -5135,6 +5138,23 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
           ))}
         </div>
       )}
+      {message && <p className="workflow-copy" role="status">{message}</p>}
+      {settingsStatus === "error" && (
+        <button className="secondary-button compact-button" disabled={saving} onClick={() => setLoadAttempt((attempt) => attempt + 1)} type="button">
+          설정 다시 확인
+        </button>
+      )}
+      <details className="ts-disclosure live-connection-fields-disclosure" key={activeGroup} open={activeGroup === "live-lock"}>
+        <summary className="ts-disclosure-summary">
+          <span className="ts-disclosure-copy">
+            <strong className="ts-disclosure-title">{activeGroup === "live-lock" ? "실전 주문 라우트 설정" : "API·계좌 설정 더보기"}</strong>
+            <span className="ts-disclosure-hint">{activeGroup === "live-lock"
+              ? "현재 앱의 주문 허용은 여기에서 확인합니다. 설정 저장만으로 거래가 시작되지는 않습니다."
+              : settingsStatus === "error" ? "설정을 읽지 못했습니다. 다시 확인한 뒤 연결 정보를 점검하세요."
+                : settingsReady ? `${visibleFields.length}개 설정 · ${checkCount ? `확인 필요 ${checkCount}개` : "저장 설정 확인됨"}${dirtyCount ? ` · 저장 전 변경 ${dirtyCount}개` : ""} · 연결 정보를 바꿀 때만 여세요.` : "설정 정보를 기다리는 중입니다."}</span>
+          </span>
+        </summary>
+        <div className="ts-disclosure-body">
       <div className="live-assistant-field-grid">
         {visibleFields.map((field) => {
           const value = draft[field.key] ?? "";
@@ -5179,17 +5199,13 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
         })}
       </div>
       <div className="live-assistant-save-row">
-        {message && <em role="status">{message}</em>}
-        {settingsStatus === "error" && (
-          <button className="secondary-button compact-button" disabled={saving} onClick={() => setLoadAttempt((attempt) => attempt + 1)} type="button">
-            설정 다시 확인
-          </button>
-        )}
         <button className="primary-button compact-button" disabled={saving || !settingsReady || typeof onSave !== "function"} onClick={handleSave} type="button">
           <Save size={16} />
           연결 설정 저장
         </button>
       </div>
+        </div>
+      </details>
     </section>
   );
 }
