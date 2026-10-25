@@ -2504,13 +2504,15 @@ function App() {
             </div>
           </div>
           <div className="topbar-actions">
-            <StatusPill tone={shortLiveHeader?.tone || (selectedRuntimeMode === "FULL_LIVE" ? "danger" : selectedRuntimeMode === "SMALL_LIVE" ? "warning" : "info")}
-              title={shortLiveHeader?.observedAt ? `기능시험 상태 관측 ${shortLiveHeader.observedAt}` : undefined}>
-              {shortLiveHeader?.label || liveRuntimeModeLabel(selectedRuntimeMode)}
-            </StatusPill>
-            <StatusPill tone={(shortLiveHeader ? shortLiveHeader.entriesBlocked : snapshot.new_entries_blocked) ? "warning" : "success"}>
-              {shortLiveHeader?.entriesLabel || `신규 진입 ${snapshot.new_entries_blocked ? "차단" : "허용"}`}
-            </StatusPill>
+            {(selectedNav !== "functional-test" || shortLiveHeader) && <>
+              <StatusPill tone={shortLiveHeader?.tone || (selectedRuntimeMode === "FULL_LIVE" ? "danger" : selectedRuntimeMode === "SMALL_LIVE" ? "warning" : "info")}
+                title={shortLiveHeader?.observedAt ? `기능시험 상태 관측 ${shortLiveHeader.observedAt}` : undefined}>
+                {shortLiveHeader?.label || liveRuntimeModeLabel(selectedRuntimeMode)}
+              </StatusPill>
+              <StatusPill tone={(shortLiveHeader ? shortLiveHeader.entriesBlocked : snapshot.new_entries_blocked) ? "warning" : "success"}>
+                {shortLiveHeader?.entriesLabel || `신규 진입 ${snapshot.new_entries_blocked ? "차단" : "허용"}`}
+              </StatusPill>
+            </>}
             <StatusPill tone={(snapshot.order_queue?.active || 0) ? "warning" : "neutral"}>
               {shortLiveHeader?.queueLabel || `미결 주문 ${snapshot.order_queue?.active || 0}`}
             </StatusPill>
