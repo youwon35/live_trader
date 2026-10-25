@@ -148,6 +148,19 @@ class ProductionShortLiveReaders:
     def _crypto_snapshot(self, route: str, symbols: tuple[str, ...]) -> dict[str, Any]:
         provider, _, currency = ROUTES[route]
         positions: list[dict[str, Any]] = []
+        inventory: dict[str, str] = {}
+
+        def spot_balance(asset: Any, free: Any, locked: Any) -> tuple[str, Decimal]:
+            # Retain even out-of-scope/delisted dust as quantity-only inventory.
+            # It is neither buying power nor a position owned by this session.
+            if not isinstance(asset, str) or not asset or asset in inventory:
+                raise ShortLiveBrokerBlocked("SPOT_INVENTORY_INVALID")
+            free_qty, locked_qty = number(free), number(locked)
+            if free_qty < 0 or locked_qty < 0:
+                raise ShortLiveBrokerBlocked("SPOT_INVENTORY_INVALID")
+            qty = free_qty + locked_qty
+            inventory[asset] = decimal_text(qty)
+            return (asset + "USDT" if provider == "binance" else "KRW-" + asset), qty
         if provider in {"binance", "binance-futures"}:
             futures = provider == "binance-futures"
             account = self._binance(provider, "/fapi/v3/account" if futures else "/api/v3/account")
@@ -189,15 +202,15 @@ class ProductionShortLiveReaders:
             else:
                 if account.get("canTrade") is not True:
                     raise ShortLiveBrokerBlocked("ACCOUNT_TRADING_DISABLED")
-                equity += number(quote.get("locked"))
+                locked_quote = number(quote.get("locked"))
+                if available < 0 or locked_quote < 0:
+                    raise ShortLiveBrokerBlocked("QUOTE_BALANCE_INVALID")
+                equity += locked_quote
                 for row in rows:
                     if row.get("asset") == "USDT":
                         continue
-                    qty = number(row.get("free")) + number(row.get("locked"))
-                    if qty:
-                        symbol = str(row.get("asset")) + "USDT"
-                        if symbol not in symbols:
-                            raise ShortLiveBrokerBlocked("UNSCOPED_SPOT_ASSET_PRESENT")
+                    symbol, qty = spot_balance(row.get("asset"), row.get("free"), row.get("locked"))
+                    if qty and symbol in symbols:
                         price = number(self.market(route, symbol)["nativePrice"], positive=True)
                         equity += qty * price
                         positions.append({"symbol": symbol, "quantity": decimal_text(qty), "markPrice": decimal_text(price)})
@@ -213,15 +226,15 @@ class ProductionShortLiveReaders:
             if len(quote) != 1:
                 raise ShortLiveBrokerBlocked("QUOTE_ACCOUNT_UNKNOWN")
             available = number(quote[0].get("balance"))
-            equity = available + number(quote[0].get("locked"))
+            locked_quote = number(quote[0].get("locked"))
+            if available < 0 or locked_quote < 0:
+                raise ShortLiveBrokerBlocked("QUOTE_BALANCE_INVALID")
+            equity = available + locked_quote
             for row in rows:
                 if row.get("currency") == "KRW":
                     continue
-                qty = number(row.get("balance")) + number(row.get("locked"))
-                if qty:
-                    symbol = "KRW-" + str(row.get("currency"))
-                    if symbol not in symbols:
-                        raise ShortLiveBrokerBlocked("UNSCOPED_SPOT_ASSET_PRESENT")
+                symbol, qty = spot_balance(row.get("currency"), row.get("balance"), row.get("locked"))
+                if qty and symbol in symbols:
                     price = number(self.market(route, symbol)["nativePrice"], positive=True)
                     equity += qty * price
                     positions.append({"symbol": symbol, "quantity": decimal_text(qty), "markPrice": decimal_text(price)})
@@ -240,7 +253,10 @@ class ProductionShortLiveReaders:
                         break
                 else:
                     raise ShortLiveBrokerBlocked("OPEN_ORDER_PAGINATION_LIMIT")
-        return {"known": True, "accountId": self._identity(provider), "currency": currency,
+        spot = ({"spotInventoryComplete": True, "spotInventory": inventory,
+                 "equityScope": "QUOTE_AND_SELECTED_SPOT"}
+                if provider in {"binance", "upbit"} else {})
+        return {"known": True, "accountId": self._identity(provider), "currency": currency, **spot,
                 "availableNative": decimal_text(available), "equityNative": decimal_text(equity),
                 "positions": positions, "openOrders": orders, "ordersComplete": True,
                 "positionsComplete": True, "observedAt": self._now()}
@@ -332,7 +348,9 @@ class ProductionShortLiveReaders:
                 if not isinstance(raw, dict) or str(raw.get("orderId")) != order_id or raw.get("symbol") != symbol:
                     raise ShortLiveBrokerBlocked("ORDER_TRUTH_ID_MISMATCH")
                 result = self._order(raw, provider=provider)
-                result.update(baseCommissionQuantity="0", baseCommissionKnown=True)
+                result.update(baseCommissionQuantity="0", baseCommissionKnown=True,
+                              externalCommissionQuantities={}, externalCommissionNative={},
+                              externalCommissionKnown=True)
                 filled = number(result["filledQuantity"])
                 if filled:
                     trades = self._binance(provider, prefix + ("/userTrades" if futures else "/myTrades"),
@@ -340,6 +358,13 @@ class ProductionShortLiveReaders:
                     if not isinstance(trades, list) or len(trades) >= 1000:
                         raise ShortLiveBrokerBlocked("OWNED_TRADES_INCOMPLETE")
                     selected = [r for r in trades if str(r.get("orderId")) == order_id and r.get("symbol") == symbol]
+                    trade_ids = [row.get("id") for row in selected]
+                    if (any(isinstance(value, bool) or not str(value).isdigit() for value in trade_ids)
+                            or len({str(value) for value in trade_ids}) != len(trade_ids)):
+                        raise ShortLiveBrokerBlocked("OWNED_TRADE_IDENTITY_CONFLICT")
+                    for row in selected:
+                        number(row.get("qty"), positive=True)
+                        number(row.get("price"), positive=True)
                     if sum((number(r.get("qty")) for r in selected), Decimal(0)) != filled:
                         raise ShortLiveBrokerBlocked("OWNED_TRADE_QUANTITY_MISMATCH")
                     result["fillPrice"] = decimal_text(sum((number(r.get("qty")) * number(r.get("price")) for r in selected), Decimal(0)) / filled)
@@ -348,6 +373,8 @@ class ProductionShortLiveReaders:
                     for row in selected:
                         fee = number(row.get("commission"))
                         asset = str(row.get("commissionAsset") or "")
+                        if fee < 0 or (fee and not asset):
+                            raise ShortLiveBrokerBlocked("OWNED_TRADE_COMMISSION_INVALID")
                         if not futures and asset == symbol.removesuffix("USDT"):
                             base_commissions += fee
                         if asset == "USDT":
@@ -356,7 +383,15 @@ class ProductionShortLiveReaders:
                             continue
                         else:
                             ticker = self._binance("binance", "/api/v3/ticker/price", {"symbol": asset + "USDT"}, signed=False)
-                            commissions += fee * number(ticker.get("price"), positive=True)
+                            if ticker.get("symbol") != asset + "USDT":
+                                raise ShortLiveBrokerBlocked("COMMISSION_CONVERSION_SYMBOL_MISMATCH")
+                            converted = fee * number(ticker.get("price"), positive=True)
+                            commissions += converted
+                            if not futures and asset != symbol.removesuffix("USDT"):
+                                result["externalCommissionQuantities"][asset] = decimal_text(
+                                    number(result["externalCommissionQuantities"].get(asset, 0)) + fee)
+                                result["externalCommissionNative"][asset] = decimal_text(
+                                    number(result["externalCommissionNative"].get(asset, 0)) + converted)
                     result["feeNative"] = decimal_text(commissions)
                     result["baseCommissionQuantity"] = decimal_text(base_commissions)
             elif provider == "upbit":
@@ -435,6 +470,11 @@ class ProductionShortLiveReaders:
                     quote_received = self._now()
                     price = ticker.get("price")
                     commission = self._binance(provider, "/api/v3/account/commission", {"symbol": symbol})
+                    discount = commission.get("discount", {})
+                    if isinstance(discount, Mapping):
+                        extra["commissionDiscountEnabled"] = (discount.get("enabledForAccount") is True
+                                                                and discount.get("enabledForSymbol") is True)
+                        extra["commissionDiscountAsset"] = str(discount.get("discountAsset") or "")
                     standard = commission.get("standardCommission", {})
                     special = commission.get("specialCommission", {})
                     tax = commission.get("taxCommission", {})

@@ -38,6 +38,7 @@ STRATEGY_SEARCH_PRESET_LIMIT = 30
 _FUNCTIONAL_STATUS_PATHS = frozenset(
     {
         "/api/short-live-tests/snapshot",
+        "/api/short-live-tests/catalog",
         "/api/paper-candidates",
         "/api/paper-candidates/accounts",
         "/api/preparation/sources",
@@ -433,6 +434,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/short-live-tests/snapshot":
             self.send_json(state.short_live_test_request("snapshot"))
+            return
+        if parsed.path == "/api/short-live-tests/catalog":
+            self.send_json(state.short_live_test_request("catalog"))
             return
         if parsed.path == "/api/preparation/market-gaps/status":
             query = parse_qs(parsed.query, keep_blank_values=True)

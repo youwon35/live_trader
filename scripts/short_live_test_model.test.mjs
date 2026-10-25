@@ -4,7 +4,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import {
   SHORT_LIVE_CONFIRMATION, buildShortLivePrepare, exactShortLiveTarget, normalizeShortLiveCandidate,
-  normalizeShortLiveSnapshot, sanitizeShortLiveText, shortLiveCanStart, shortLiveCoverage,
+  normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveCanStart, shortLiveCoverage,
   shortLiveRuntimeMeaning, shortLiveSelectionSignature, shortLivePreparationMatches, shortLiveBlockerLabel,
   shortLivePreparationWindow, shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLiveRunning,
 } from "../src/shortLiveTestModel.js";
@@ -27,6 +27,31 @@ const ready = () => normalizeShortLiveSnapshot({ status: "PREPARED", catalog: { 
     durationHours: 6, capitalKrwPerBroker: 100000, dailyLossStopKrwPerBroker: 50000, targets: [instance()], expiresAt: "2099-01-01T00:00:00Z", blockers: [] } });
 const options = { fresh: true, acknowledged: true, confirmationText: SHORT_LIVE_CONFIRMATION,
   selectionUnchanged: true, preparedAuthority: `fixture-preparation:${"d".repeat(64)}`, preparedScopeMatches: true };
+
+test("fast status preserves only display candidates and replaces all preparation authority", () => {
+  const before = ready();
+  const status = { status: "PREPARED", catalogIncluded: false, catalog: [], observedAt: "2099-01-01T00:00:01Z",
+    prepared: { ...before.prepared, readyToStart: false, blockers: ["PREPARATION_EXPIRED"] },
+    runtime: { sessionId: "new-runtime", status: "BLOCKED", ownerAlive: false }, blockers: ["FRESH_CLOCK_GUARD_UNKNOWN"] };
+  const merged = mergeShortLiveSnapshot(status, before.catalog);
+  assert.equal(merged.catalog, before.catalog);
+  assert.equal(merged.prepared.readyToStart, false);
+  assert.deepEqual(merged.prepared.blockers, ["PREPARATION_EXPIRED"]);
+  assert.equal(merged.runtime.ownerAlive, false);
+  assert.deepEqual(merged.blockers, ["FRESH_CLOCK_GUARD_UNKNOWN"]);
+  assert.equal(shortLiveCanStart(merged, options), false);
+  assert.deepEqual(mergeShortLiveSnapshot({ catalog: [], prepared: null, runtime: null }, before.catalog).catalog, []);
+});
+
+test("prepared funding observations expose numeric quote funds without account identities", () => {
+  const view = normalizeShortLiveSnapshot({ prepared: { brokerReadiness: [{ route: "UPBIT_KRW_SPOT", ready: false,
+    fundingBasis: "AVAILABLE_QUOTE_ONLY", availableQuoteNative: "12345.6", effectiveRouteBudgetKrw: "12345.6",
+    quoteCurrency: "KRW", preservedAssetSymbols: ["BTC"], accountId: "private-fixture", rawAccount: "private-fixture" }] } });
+  assert.equal(view.prepared.brokerReadiness[0].availableQuoteNative, 12345.6);
+  assert.equal(view.prepared.brokerReadiness[0].ready, false);
+  assert.deepEqual(view.prepared.brokerReadiness[0].preservedAssetSymbols, ["BTC"]);
+  assert.equal(JSON.stringify(view).includes("private-fixture"), false);
+});
 
 test("normalizes exact backend catalog without claiming live qualification", () => {
   const row = normalizeShortLiveCandidate(instance());
@@ -155,7 +180,7 @@ test("panel mutates only from explicit event handlers and never retries unknown 
   const panel = readFileSync(new URL("../src/ShortLiveTestPanel.jsx", import.meta.url), "utf8");
   assert.match(panel, /onClick=\{prepare\}/); assert.match(panel, /onClick=\{start\}/); assert.match(panel, /onClick=\{stop\}/);
   assert.match(panel, /setUnknownMutation\("start"\)/); assert.match(panel, /setUnknownMutation\("stop"\)/);
-  const effect = panel.match(/useEffect\(\(\) => \{\n    mounted\.current = true;([\s\S]*?)\n  \}, \[refresh, pollMs\]\);/)?.[1];
+  const effect = panel.match(/useEffect\(\(\) => \{\n    mounted\.current = true;([\s\S]*?)\n  \}, \[refresh, refreshCatalog, pollMs\]\);/)?.[1];
   assert.ok(effect); assert.doesNotMatch(effect, /api\.(start|stop|prepare)/);
   assert.doesNotMatch(panel, /window\.confirm|submitTestIntent|setFlag|applyBinanceFuturesSettings/);
 });

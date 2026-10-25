@@ -34,10 +34,68 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual("100", result["equityNative"])
         self.assertIn(("binance", "/api/v3/openOrders", None), calls)
 
-    def test_unscoped_spot_holdings_never_become_owned(self):
+    def test_unscoped_spot_holdings_are_quantity_only_without_dust_market_queries(self):
         r = self.build()
-        r._binance = lambda *_a, **_k: {"canTrade": True, "balances": [{"asset": "USDT", "free": "10", "locked": "0"}, {"asset": "ETH", "free": "1", "locked": "0"}]}
-        self.assertFalse(r.snapshot("BINANCE_SPOT", ("BTCUSDT",))["known"])
+        def get(_provider, path, *_a, **_k):
+            if path.endswith("/account"):
+                return {"canTrade": True, "balances": [{"asset": "USDT", "free": "10", "locked": "0"},
+                    {"asset": "ETH", "free": "1", "locked": "0"}, {"asset": "OLD_DELISTED", "free": ".00001", "locked": "0"}]}
+            if path.endswith("/openOrders"): return []
+            raise AssertionError(path)
+        r._binance = get
+        r.market = lambda *_: self.fail("Unselected holdings never need tradable markets")
+        result = r.snapshot("BINANCE_SPOT", ("BTCUSDT",))
+        self.assertTrue(result["known"], result)
+        self.assertEqual([], result["positions"])
+        self.assertEqual("10", result["equityNative"])
+        self.assertEqual({"ETH": "1", "OLD_DELISTED": "0.00001"}, result["spotInventory"])
+
+    def test_selected_spot_inventory_is_explicit_and_outside_coins_are_not_equity(self):
+        r = self.build()
+        r.market = lambda *_: {"nativePrice": "1000"}
+        def get(path, params=None, signed=True):
+            if path == "/v1/accounts": return [{"currency": "KRW", "balance": "10000", "locked": "20"},
+                {"currency": "BTC", "balance": "2", "locked": ".5"},
+                {"currency": "ETH", "balance": "100", "locked": "0"}]
+            if path == "/v1/orders/open": return []
+            raise AssertionError(path)
+        r._upbit = get
+        result = r.snapshot("UPBIT_KRW_SPOT", ("KRW-BTC",))
+        self.assertTrue(result["known"], result)
+        self.assertEqual("10000", result["availableNative"])
+        self.assertEqual("12520.0", result["equityNative"])
+        self.assertEqual({"BTC": "2.5", "ETH": "100"}, result["spotInventory"])
+        self.assertEqual(["KRW-BTC"], [row["symbol"] for row in result["positions"]])
+
+    def test_duplicate_negative_or_unknown_spot_balances_block_complete_truth(self):
+        for holdings in ([{"currency": "ETH", "balance": "1", "locked": "0"}] * 2,
+                         [{"currency": "ETH", "balance": "-1", "locked": "2"}],
+                         [{"currency": "ETH", "balance": "1", "locked": None}]):
+            r = self.build()
+            r._upbit = lambda *_a, **_k: [{"currency": "KRW", "balance": "10000", "locked": "0"}] + holdings
+            self.assertFalse(r.snapshot("UPBIT_KRW_SPOT", ("KRW-BTC",))["known"])
+
+    def test_negative_quote_component_cannot_hide_inside_positive_equity(self):
+        for free, locked in (("100", "-1"), ("-1", "100")):
+            r = self.build()
+            r._upbit = lambda *_a, **_k: [{"currency": "KRW", "balance": free, "locked": locked}]
+            self.assertFalse(r.snapshot("UPBIT_KRW_SPOT", ("KRW-BTC",))["known"])
+            r._binance = lambda *_a, **_k: {"canTrade": True, "balances": [{"asset": "USDT", "free": free, "locked": locked}]}
+            self.assertFalse(r.snapshot("BINANCE_SPOT", ("BTCUSDT",))["known"])
+
+    def test_unselected_holdings_do_not_skip_foreign_open_order_observation(self):
+        r = self.build(); calls = []
+        def get(path, params=None, signed=True):
+            calls.append(path)
+            if path == "/v1/accounts": return [{"currency": "KRW", "balance": "10000", "locked": "0"},
+                                               {"currency": "ETH", "balance": "1", "locked": "0"}]
+            if path == "/v1/orders/open": return [{"uuid": "foreign", "market": "KRW-ETH", "state": "wait"}] if params["state"] == "wait" else []
+            raise AssertionError(path)
+        r._upbit = get
+        result = r.snapshot("UPBIT_KRW_SPOT", ("KRW-BTC",))
+        self.assertTrue(result["known"])
+        self.assertEqual(["foreign"], [row["brokerOrderId"] for row in result["openOrders"]])
+        self.assertEqual(2, calls.count("/v1/orders/open"))
 
     def test_upbit_pagination_consumes_wait_and_watch_before_complete(self):
         r = self.build(); calls = []
@@ -124,7 +182,7 @@ class ReaderTests(unittest.TestCase):
         def get(provider, path, params=None, signed=True):
             if path == "/api/v3/order": return {"symbol": "BTCUSDT", "orderId": 1, "clientOrderId": "short-client-001",
                 "side": "BUY", "status": "FILLED", "executedQty": ".01", "price": "1000"}
-            if path == "/api/v3/myTrades": return [{"symbol": "BTCUSDT", "orderId": 1, "qty": ".01", "price": "1000",
+            if path == "/api/v3/myTrades": return [{"id": 100, "symbol": "BTCUSDT", "orderId": 1, "qty": ".01", "price": "1000",
                                                      "commission": ".00001", "commissionAsset": "BTC"}]
             if path == "/api/v3/ticker/price": return {"symbol": "BTCUSDT", "price": "1000"}
             raise AssertionError(path)
@@ -134,6 +192,36 @@ class ReaderTests(unittest.TestCase):
         self.assertTrue(result["baseCommissionKnown"])
         self.assertEqual("0.00001", result["baseCommissionQuantity"])
         self.assertEqual("0.01000", result["feeNative"])
+
+    def test_exact_bnb_commission_quantity_and_actual_quote_cost_are_retained(self):
+        r = self.build()
+        def get(provider, path, params=None, signed=True):
+            if path == "/api/v3/order": return {"symbol": "BTCUSDT", "orderId": 1, "clientOrderId": "short-client-001",
+                "side": "BUY", "status": "FILLED", "executedQty": ".01", "price": "1000"}
+            if path == "/api/v3/myTrades": return [{"id": 100, "symbol": "BTCUSDT", "orderId": 1, "qty": ".01", "price": "1000",
+                                                     "commission": ".001", "commissionAsset": "BNB"}]
+            if path == "/api/v3/ticker/price": return {"symbol": "BNBUSDT", "price": "600"}
+            raise AssertionError(path)
+        r._binance = get
+        result = r.get_order("BINANCE_SPOT", {"brokerOrderId": "1", "symbol": "BTCUSDT"})
+        self.assertTrue(result["known"], result)
+        self.assertEqual({"BNB": "0.001"}, result["externalCommissionQuantities"])
+        self.assertEqual({"BNB": "0.600"}, result["externalCommissionNative"])
+        self.assertTrue(result["externalCommissionKnown"])
+        self.assertEqual("0", result["baseCommissionQuantity"])
+
+    def test_duplicate_or_missing_trade_ids_cannot_create_external_fee_evidence(self):
+        for identity in (100, None):
+            r = self.build()
+            def get(provider, path, params=None, signed=True):
+                if path == "/api/v3/order": return {"symbol": "BTCUSDT", "orderId": 1, "clientOrderId": "short-client-001",
+                    "side": "BUY", "status": "FILLED", "executedQty": ".01", "price": "1000"}
+                if path == "/api/v3/myTrades": return [{"id": identity, "symbol": "BTCUSDT", "orderId": 1,
+                    "qty": ".005", "price": "1000", "commission": ".001", "commissionAsset": "BNB"}] * 2
+                raise AssertionError(path)
+            r._binance = get
+            result = r.get_order("BINANCE_SPOT", {"brokerOrderId": "1", "symbol": "BTCUSDT"})
+            self.assertFalse(result["known"])
 
 
 if __name__ == "__main__": unittest.main()

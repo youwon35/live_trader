@@ -91,6 +91,7 @@ class CompositionFixture:
         root.mkdir(parents=True)
         self.now=NOW; self.mono=10.0; self.alive=True
         self.calls=[]; self.mutations=[]; self.rows={}; self.position=Decimal(0)
+        self.quote_balance=Decimal("200000"); self.external_assets={}
         self.accept_only=False; self.lose_reply=False; self.unknown_cleanup=False; self.unknown_read=False
         self.error_1021=False; self.wire_defects=[]; self.wire_errors=[]
         self.symbol="003490" if route=="KIS_KR_CASH" else "KRW-BTC" if route=="UPBIT_KRW_SPOT" else "BTCUSDT"
@@ -151,8 +152,19 @@ class CompositionFixture:
     def snapshot(self,route,symbols):
         if route!=self.route or list(symbols)!=[self.symbol]: raise AssertionError((route,symbols))
         positions=[{"symbol":self.symbol,"quantity":str(self.position),"markPrice":"1000"}] if self.position else []
+        spot = route in {"BINANCE_SPOT", "UPBIT_KRW_SPOT"}
+        locked_quote = sum((Decimal(row["quantity"])*Decimal("1000") for row in self.rows.values()
+                            if row["status"]=="ACCEPTED" and row["side"]=="BUY"), Decimal(0)) if spot else Decimal(0)
+        inventory = ({"spotInventoryComplete":True,
+                      "spotInventory":{**self.external_assets, "BTC":str(self.position)},
+                      "equityScope":"QUOTE_AND_SELECTED_SPOT"} if spot else {})
+        # Synthetic official account truth: free quote excludes accepted buy
+        # reservations; equity includes quote plus only selected spot units.
+        available = self.quote_balance-locked_quote if spot else Decimal("200000")
+        equity = self.quote_balance+self.position*Decimal("1000") if spot else Decimal("200000")
         return {"known":True,"ordersComplete":True,"positionsComplete":True,"accountId":self.account,
-            "currency":self.currency,"observedAt":self.now.timestamp(),"availableNative":"200000","equityNative":"200000",
+            "currency":self.currency,"observedAt":self.now.timestamp(),"availableNative":str(available),"equityNative":str(equity),
+            **inventory,
             "maximumOrderQuantities":{self.symbol:"200000"},"positions":positions,
             "openOrders":[deepcopy(row) for row in self.rows.values() if row["status"]=="ACCEPTED"]}
 
@@ -174,6 +186,8 @@ class CompositionFixture:
     def _fill(self,row):
         if row["status"]=="FILLED": return
         qty=Decimal(row["quantity"]); self.position+=qty if row["side"]=="BUY" else -qty
+        if self.route in {"BINANCE_SPOT", "UPBIT_KRW_SPOT"}:
+            self.quote_balance += (-qty if row["side"]=="BUY" else qty)*Decimal("1000")-Decimal("0.01")
         row.update(status="FILLED",filledQuantity=str(qty),remainingQuantity="0",feeNative="0.01")
 
     def fill_pending(self):
@@ -302,6 +316,23 @@ class ShortLiveCompositionTests(unittest.TestCase):
         f.fill_pending(); observed=f.service.tick()["runtime"]
         self.assertEqual(1,observed["fillCount"],observed); self.assertEqual(1,len(f.mutations))
         self.assertTrue(f.service.stop({})["runtime"]["terminalVerified"])
+
+    def test_complete_spot_inventory_preserves_preexisting_units_through_owned_round_trip(self):
+        for route in ("BINANCE_SPOT", "UPBIT_KRW_SPOT"):
+            with self.subTest(route=route):
+                f=self.fixture_for(route)
+                f.position=Decimal("3"); f.external_assets={"ETH":"2"}
+                prepared=f.prepare()
+                self.assertTrue(prepared["readyToStart"])
+                self.assertEqual(["BTC", "ETH"], prepared["brokerReadiness"][0]["preservedAssetSymbols"])
+                f.start(); view=f.forward()["runtime"]
+                self.assertEqual("RUNNING", view["status"], view)
+                self.assertEqual(1, view["fillCount"])
+                terminal=f.service.stop({})["runtime"]
+                self.assertTrue(terminal["terminalVerified"], terminal)
+                self.assertEqual(Decimal("3"), f.position)
+                self.assertEqual({"ETH":"2"}, f.external_assets)
+                self.assertEqual(Decimal("199999.98"), f.quote_balance)
 
     def test_source_next_open_waits_for_actual_native_boundary_and_deduplicates(self):
         f=self.fixture_for("BINANCE_SPOT",timing="next-open"); f.start()

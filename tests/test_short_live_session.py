@@ -571,6 +571,105 @@ class ShortLiveSessionTests(unittest.TestCase):
         service.tick()
         self.assertIsNone(service._session["firstFailure"])
 
+    def test_slow_catalog_discovery_does_not_block_fresh_status_or_worker(self):
+        service, _, _ = self.service()
+        self.start(service)
+        entered, release = threading.Event(), threading.Event()
+        result = []
+        def slow_catalog():
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("synthetic catalog did not release")
+            return {"candidates": [], "coverage": []}
+        service.catalog_provider.snapshot = slow_catalog
+        service._catalog_cache = None
+        thread = threading.Thread(target=lambda: result.append(service.catalog()))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            # If discovery held the state lock, neither could return before
+            # the blocking provider failed. No wall-clock performance claim.
+            service.tick()
+            snapshot = service.snapshot(include_catalog=False)
+            self.assertFalse(release.is_set())
+            self.assertEqual("RUNNING", snapshot["runtime"]["status"])
+            self.assertFalse(snapshot["catalogIncluded"])
+            self.assertEqual([], snapshot["catalog"])
+        finally:
+            release.set(); thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(result[0]["readOnly"])
+        self.assertFalse(result[0]["authorityGranted"])
+        self.assertNotIn("prepared", result[0])
+        self.assertNotIn("runtime", result[0])
+
+    def test_prepare_response_and_status_skip_catalog_and_expiry_remains_current(self):
+        service, _, _ = self.service()
+        service.catalog_provider.snapshot = lambda: (_ for _ in ()).throw(AssertionError("discovery in status"))
+        prepared = self.prepare(service)
+        self.assertFalse(prepared["catalogIncluded"])
+        self.assertTrue(prepared["prepared"]["readyToStart"])
+        self.now += timedelta(seconds=121)
+        current = service.snapshot(include_catalog=False)
+        self.assertFalse(current["prepared"]["readyToStart"])
+        self.assertIn("PREPARATION_EXPIRED", current["prepared"]["blockers"])
+
+    def test_cached_display_never_authorizes_changed_source_at_start(self):
+        service, brokers, _ = self.service()
+        service.catalog()
+        prepared = self.prepare(service)["prepared"]
+        self.source.write_text('{"fixture":"changed"}', encoding="utf-8")
+        with self.assertRaisesRegex(ShortLiveContractError, "SOURCE_RAW_HASH_CHANGED"):
+            service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
+                           "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+        self.assertIsNone(service._session)
+        self.assertEqual([], brokers["BINANCE_SPOT"].submits)
+
+    def test_existing_asset_baseline_is_freshly_bound_before_start(self):
+        for changed in ("b" * 64, None):
+            with self.subTest(changed=changed):
+                service, brokers, _ = self.service()
+                broker = brokers["BINANCE_SPOT"]
+                original = broker.readiness
+                digest = ["a" * 64]
+                broker.readiness = lambda manifest: {**original(manifest),
+                    "fundingBasis": "AVAILABLE_QUOTE_ONLY", "preservedAssetsBaselineHash": digest[0],
+                    "quoteCurrency": "USDT", "availableQuoteNative": "200", "preservedAssetSymbols": ["ETH"]}
+                prepared = self.prepare(service)["prepared"]
+                public = prepared["brokerReadiness"][0]
+                self.assertEqual(["ETH"], public["preservedAssetSymbols"])
+                self.assertNotIn("accountId", public)
+                self.assertNotIn("preservedAssetsBaselineHash", public)
+                digest[0] = changed
+                with self.assertRaisesRegex(ShortLiveContractError, "PRESERVED_ASSET_BASELINE_CHANGED"):
+                    service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
+                                   "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+                self.assertIsNone(service._session)
+                self.assertEqual([], broker.submits)
+
+    def test_failed_readiness_only_exposes_allowlisted_observations(self):
+        service, brokers, _ = self.service()
+        brokers["BINANCE_SPOT"].readiness = lambda _: {"ready": False, "blockers": ["NO_AVAILABLE_BALANCE"],
+            "fundingBasis": "AVAILABLE_QUOTE_ONLY", "availableQuoteNative": "0", "quoteCurrency": "USDT",
+            "accountId": "fixture-private", "rawAccount": {"secret": "fixture-only"}}
+        prepared = self.prepare(service)["prepared"]
+        self.assertFalse(prepared["readyToStart"])
+        self.assertEqual("0", prepared["brokerReadiness"][0]["availableQuoteNative"])
+        self.assertNotIn("fixture-private", json.dumps(prepared))
+        self.assertNotIn("fixture-only", json.dumps(prepared))
+
+    def test_public_account_check_does_not_promote_adapter_ready_claim(self):
+        for changes, reason in (({"scopeOwnershipVerified": False}, "ACCOUNT_SCOPE_OWNERSHIP_UNVERIFIED"),
+                                ({"availableKrw": "unknown"}, "FUNDING_OBSERVATION_UNKNOWN")):
+            with self.subTest(reason=reason):
+                service, brokers, _ = self.service()
+                original = brokers["BINANCE_SPOT"].readiness
+                brokers["BINANCE_SPOT"].readiness = lambda manifest: {**original(manifest), **changes}
+                prepared = self.prepare(service)["prepared"]
+                self.assertFalse(prepared["readyToStart"])
+                self.assertFalse(prepared["brokerReadiness"][0]["ready"])
+                self.assertIn(reason, prepared["brokerReadiness"][0]["blockers"])
+
     def test_worker_exit_intent_does_not_claim_actual_thread_death(self):
         service, _, _ = self.service()
         service.background = True

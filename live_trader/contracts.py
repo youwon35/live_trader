@@ -909,7 +909,13 @@ def normalize_portfolio_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def enrich_strategy_artifact_runtime(folder: Path, path: Path, artifact: dict[str, Any]) -> dict[str, Any]:
+def enrich_strategy_artifact_runtime(
+    folder: Path,
+    path: Path,
+    artifact: dict[str, Any],
+    *,
+    deployment_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     payload = dict(artifact)
     try:
         reference = artifact_reference(payload)
@@ -927,7 +933,7 @@ def enrich_strategy_artifact_runtime(folder: Path, path: Path, artifact: dict[st
     payload["_artifact_reference"] = dict(reference)
     deployments = [
         item
-        for item in DeploymentStore(folder).list()
+        for item in (DeploymentStore(folder).list() if deployment_rows is None else deployment_rows)
         if _dict_value(item.get("strategyArtifact")).get("artifactId") == reference.get("artifactId")
         and _dict_value(item.get("strategyArtifact")).get("artifactHash") == reference.get("artifactHash")
         and str(item.get("environment") or "").strip().upper()
@@ -1165,6 +1171,10 @@ def load_strategy_artifacts(limit: int | None = None) -> list[dict[str, Any]]:
     for folder in strategy_artifact_dirs():
         if not folder.exists():
             continue
+        # Reuse this folder's deployment projection only within this read.
+        # The next load reads it again; artifact/evidence verification below
+        # remains fresh for every candidate and every invocation.
+        deployment_rows: list[dict[str, Any]] | None = None
         for path in sorted(folder.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
             if path.name in IGNORED_STRATEGY_FILE_NAMES:
                 continue
@@ -1180,7 +1190,11 @@ def load_strategy_artifacts(limit: int | None = None) -> list[dict[str, Any]]:
             if fingerprint in seen_payloads:
                 continue
             seen_payloads.add(fingerprint)
-            artifacts.append(normalize_strategy_artifact(enrich_strategy_artifact_runtime(folder, path, payload)))
+            if deployment_rows is None:
+                deployment_rows = DeploymentStore(folder).list()
+            artifacts.append(normalize_strategy_artifact(enrich_strategy_artifact_runtime(
+                folder, path, payload, deployment_rows=deployment_rows,
+            )))
             if effective_limit is not None and len(artifacts) >= effective_limit:
                 return artifacts
     return artifacts

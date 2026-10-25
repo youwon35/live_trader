@@ -52,3 +52,16 @@ test("network uncertainty is propagated once without automatic retry", async () 
   await assert.rejects(api.startShortLiveTest({}), (error) => error.message === "FIXTURE_LOST_REPLY" && error.knownPreMutationRejection !== true);
   assert.equal(requests, 1);
 });
+test("catalog discovery is a separate authenticated read-only shape and bounded request", async () => {
+  const response = { ok: true, schemaVersion: "short-live-test-catalog-v1", catalog: [], readOnly: true, authorityGranted: false };
+  const requests = [];
+  globalThis.__shortLiveApiTransport = async (...args) => { requests.push(args); return response; };
+  assert.deepEqual(await api.getShortLiveTestCatalog(), response);
+  assert.equal(requests[0][0], "/api/short-live-tests/catalog");
+  assert.equal(requests[0][1].method || "GET", "GET");
+  assert.equal(requests[0][1].timeoutMs, 45000);
+  for (const value of [good(), { ...response, authorityGranted: true }, { ...response, readOnly: false }, { ...response, catalog: null }]) {
+    globalThis.__shortLiveApiTransport = async () => value;
+    await assert.rejects(api.getShortLiveTestCatalog(), /SHORT_LIVE_CATALOG_UNVERIFIED/);
+  }
+});

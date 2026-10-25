@@ -71,6 +71,7 @@ const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
 ]);
 const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
   "/api/short-live-tests/snapshot",
+  "/api/short-live-tests/catalog",
   "/api/preparation/market-gaps/status",
   "/api/paper-candidates",
   "/api/paper-candidates/accounts",

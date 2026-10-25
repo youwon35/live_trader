@@ -26,6 +26,15 @@ export function verifyShortLiveResponse(value, action) {
 
 // The existing native app-session/CSRF request path remains authoritative.
 export const getShortLiveTestSnapshot = async () => verifyShortLiveResponse(await request("/api/short-live-tests/snapshot", { timeoutMs: 10000 }), "snapshot");
+export async function getShortLiveTestCatalog() {
+  const value = await request("/api/short-live-tests/catalog", { timeoutMs: 45000 });
+  if (value?.ok === false) throw new Error(value.reasonCode || "SHORT_LIVE_CATALOG_UNAVAILABLE");
+  if (value?.ok !== true || value?.schemaVersion !== "short-live-test-catalog-v1"
+      || value.readOnly !== true || value.authorityGranted !== false || !Array.isArray(value.catalog)) {
+    throw new Error("SHORT_LIVE_CATALOG_UNVERIFIED");
+  }
+  return value;
+}
 export const prepareShortLiveTest = async (body) => verifyShortLiveResponse(await request("/api/short-live-tests/prepare", { method: "POST", body, timeoutMs: 45000 }), "prepare");
 export const startShortLiveTest = async (body) => verifyShortLiveResponse(await request("/api/short-live-tests/start", { method: "POST", body, timeoutMs: 45000 }), "start");
 export const stopShortLiveTest = async (body) => verifyShortLiveResponse(await request("/api/short-live-tests/stop", { method: "POST", body, timeoutMs: 45000 }), "stop");

@@ -12,6 +12,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import hashlib
+import json
 import re
 import threading
 import time
@@ -167,6 +168,12 @@ class ShortLiveBrokerAdapter:
         self._lock = threading.RLock()
         self._baseline_equity_native: Decimal | None = None
         self._fill_rows: dict[str, dict[str, Any]] = {}
+        self._spot_baseline: dict[str, Decimal] | None = None
+        self._spot_baseline_account: str | None = None
+        self._observed_futures_settings: dict[str, str] = {}
+        self._observed_market_fx: Decimal | None = None
+        self._external_commission_quantities: dict[str, dict[str, Decimal]] = {}
+        self._external_commission_costs: dict[str, Decimal] = {}
 
     def _fresh(self, value: Any, age: float = 30) -> None:
         delta = self.clock() - epoch(value)
@@ -201,7 +208,130 @@ class ShortLiveBrokerAdapter:
         return bool(claim and claim.get("brokerOrderId")
                     and str(row.get("brokerOrderId")) == claim["brokerOrderId"])
 
-    def _snapshot(self, m: Mapping[str, Any]) -> dict[str, Any]:
+    def _preserve_spot_inventory(self, s: dict[str, Any], m: Mapping[str, Any],
+                                 net: Mapping[str, Decimal], *, establish: bool) -> dict[str, Any]:
+        """Separate immutable pre-test units from exact session-fill units.
+
+        Outside symbols need no price. They never enter buying power, session
+        exposure, cleanup or equity. Any unexplained quantity change blocks.
+        """
+        if self.provider not in {"binance", "upbit"}:
+            return s
+        if "spotInventory" not in s and "spotInventoryComplete" not in s and self._spot_baseline is None:
+            # Older injected readers retain the strict zero-position contract;
+            # only a complete production inventory enables baseline support.
+            return s
+        raw = s.get("spotInventory")
+        if (s.get("spotInventoryComplete") is not True or not isinstance(raw, Mapping)
+                or s.get("equityScope") != "QUOTE_AND_SELECTED_SPOT"):
+            raise ShortLiveBrokerBlocked("COMPLETE_SPOT_INVENTORY_REQUIRED")
+        current: dict[str, Decimal] = {}
+        for asset, value in raw.items():
+            if (not isinstance(asset, str) or not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{0,49}", asset)
+                    or asset == self.currency):
+                raise ShortLiveBrokerBlocked("SPOT_INVENTORY_INVALID")
+            qty = number(value)
+            if qty < 0:
+                raise ShortLiveBrokerBlocked("SPOT_INVENTORY_INVALID")
+            if qty:
+                current[asset] = qty
+        symbols = {symbol: symbol.removesuffix("USDT") if self.provider == "binance" else symbol.removeprefix("KRW-")
+                   for symbol in m["symbols"]}
+        if len(set(symbols.values())) != len(symbols):
+            raise ShortLiveBrokerBlocked("SPOT_SYMBOL_INVENTORY_CONFLICT")
+        if self._spot_baseline is None:
+            if not establish or self._claims:
+                raise ShortLiveBrokerBlocked("SPOT_BASELINE_REQUIRED")
+            baseline = dict(current)
+        else:
+            if s["accountId"] != self._spot_baseline_account:
+                raise ShortLiveBrokerBlocked("SPOT_BASELINE_ACCOUNT_CHANGED")
+            baseline = self._spot_baseline
+        expected = dict(baseline)
+        for symbol, qty in net.items():
+            if symbol not in symbols or qty < 0:
+                raise ShortLiveBrokerBlocked("SPOT_SESSION_INVENTORY_INVALID")
+            asset = symbols[symbol]
+            expected[asset] = expected.get(asset, Decimal(0)) + qty
+        external_debits: dict[str, Decimal] = {}
+        for client_id, row in self._fill_rows.items():
+            quantities = row.get("externalCommissionQuantities", {})
+            costs = row.get("externalCommissionNative", {})
+            if not isinstance(quantities, Mapping) or not isinstance(costs, Mapping) or quantities.keys() != costs.keys():
+                raise ShortLiveBrokerBlocked("EXTERNAL_COMMISSION_UNKNOWN")
+            if quantities and row.get("externalCommissionKnown") is not True:
+                raise ShortLiveBrokerBlocked("EXTERNAL_COMMISSION_UNKNOWN")
+            if quantities and number(row.get("filledQuantity")) <= 0:
+                raise ShortLiveBrokerBlocked("EXTERNAL_COMMISSION_WITHOUT_OWNED_FILL")
+            previous = self._external_commission_quantities.get(client_id, {})
+            current_debits: dict[str, Decimal] = {}
+            total_cost = Decimal(0)
+            incremental_cost = Decimal(0)
+            for asset, raw_qty in quantities.items():
+                if (not isinstance(asset, str) or not re.fullmatch(r"[A-Z0-9][A-Z0-9._-]{0,49}", asset)
+                        or asset == self.currency):
+                    raise ShortLiveBrokerBlocked("EXTERNAL_COMMISSION_INVALID")
+                if asset in symbols.values():
+                    # Cross-strategy asset fees require sleeve allocation;
+                    # never consume another strategy's units implicitly.
+                    raise ShortLiveBrokerBlocked("CROSS_SYMBOL_COMMISSION_ALLOCATION_UNSUPPORTED")
+                qty, cost = number(raw_qty), number(costs[asset])
+                if qty < 0 or cost < 0 or (qty > 0 and cost <= 0):
+                    raise ShortLiveBrokerBlocked("EXTERNAL_COMMISSION_INVALID")
+                current_debits[asset] = qty
+                total_cost += cost
+                if qty:
+                    incremental_cost += max(Decimal(0), qty - previous.get(asset, Decimal(0))) * cost / qty
+                external_debits[asset] = external_debits.get(asset, Decimal(0)) + qty
+            if any(current_debits.get(asset, Decimal(0)) < qty for asset, qty in previous.items()):
+                raise ShortLiveBrokerBlocked("EXTERNAL_COMMISSION_CUMULATIVE_CHANGED")
+            self._external_commission_quantities[client_id] = current_debits
+            # Exact official commission quantities, valued by actual quotes.
+            # A later fall in that asset's price cannot erase a seen fee loss.
+            self._external_commission_costs[client_id] = max(
+                self._external_commission_costs.get(client_id, Decimal(0)) + incremental_cost, total_cost)
+        for asset, qty in external_debits.items():
+            expected[asset] = expected.get(asset, Decimal(0)) - qty
+            if expected[asset] < 0:
+                raise ShortLiveBrokerBlocked("EXTERNAL_COMMISSION_EXCEEDS_BASELINE")
+        if any(current.get(asset, Decimal(0)) != expected.get(asset, Decimal(0))
+               for asset in current.keys() | expected.keys()):
+            raise ShortLiveBrokerBlocked("PRESERVED_SPOT_INVENTORY_CHANGED")
+        actual: dict[str, Mapping[str, Any]] = {}
+        for row in s["positions"]:
+            if not isinstance(row, Mapping) or row.get("symbol") not in symbols or row["symbol"] in actual:
+                raise ShortLiveBrokerBlocked("SPOT_POSITION_INVENTORY_CONFLICT")
+            actual[row["symbol"]] = row
+        normalized = []
+        preserved_value = Decimal(0)
+        for symbol, asset in symbols.items():
+            row = actual.get(symbol)
+            qty = number(row["quantity"]) if row is not None else Decimal(0)
+            if qty != current.get(asset, Decimal(0)):
+                raise ShortLiveBrokerBlocked("SPOT_POSITION_INVENTORY_CONFLICT")
+            if qty:
+                price = number(row.get("markPrice"), positive=True)
+                preserved_value += baseline.get(asset, Decimal(0)) * price
+                owned_qty = net.get(symbol, Decimal(0))
+                if owned_qty:
+                    normalized.append({**dict(row), "quantity": decimal_text(owned_qty),
+                                       "sessionId": m["sessionId"], "manifestHash": m["manifestHash"]})
+        equity = number(s["equityNative"]) - preserved_value - sum(self._external_commission_costs.values(), Decimal(0))
+        if equity < 0:
+            raise ShortLiveBrokerBlocked("SPOT_SCOPED_EQUITY_INVALID")
+        s["positions"] = normalized
+        s["equityNative"] = decimal_text(equity)
+        s["_spotBaselineCandidate"] = dict(baseline)
+        s["preservedAssetSymbols"] = sorted(baseline)
+        quantities = {asset: decimal_text(qty) for asset, qty in sorted(baseline.items())}
+        material = {"route": self.route, "accountId": s["accountId"],
+                    "inventory": {asset: value.rstrip("0").rstrip(".") if "." in value else value
+                                  for asset, value in quantities.items()}}
+        s["preservedAssetsBaselineHash"] = hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return s
+
+    def _snapshot(self, m: Mapping[str, Any], *, establish_spot_baseline: bool = False) -> dict[str, Any]:
         s = dict(self.snapshot_reader(self.route, tuple(m["symbols"])))
         if s.get("known") is not True or s.get("ordersComplete") is not True or s.get("positionsComplete") is not True:
             reason = next((r for r in s.get("blockers", []) if isinstance(r, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,100}", r)), None)
@@ -253,6 +383,7 @@ class ShortLiveBrokerAdapter:
                     raise ShortLiveBrokerBlocked("ACTUAL_BASE_COMMISSION_INVALID")
                 signed -= base_fee
             net[claim["symbol"]] = net.get(claim["symbol"], Decimal(0)) + signed
+        s = self._preserve_spot_inventory(s, m, net, establish=establish_spot_baseline)
         for row in s["positions"]:
             if not isinstance(row, Mapping):
                 raise ShortLiveBrokerBlocked("POSITION_ROW_INVALID")
@@ -292,6 +423,11 @@ class ShortLiveBrokerAdapter:
             if number(q.get("sellTaxRate")) < 0:
                 raise ShortLiveBrokerBlocked("SELL_TAX_UNKNOWN")
         if self.route == "BINANCE_USDM_FUTURES":
+            self._observed_market_fx = number(q["krwPerQuote"], positive=True)
+            self._observed_futures_settings = {
+                "marginMode": q.get("marginMode") if q.get("marginMode") in {"ISOLATED", "CROSSED", "CROSS"} else "UNKNOWN",
+                "leverage": decimal_text(number(q.get("leverage"))),
+                "positionMode": q.get("positionMode") if q.get("positionMode") in {"ONE_WAY", "HEDGE"} else "UNKNOWN"}
             if q.get("marginMode") != "ISOLATED" or number(q.get("leverage")) != 1:
                 raise ShortLiveBrokerBlocked("FUTURES_SETTINGS_REQUIRE_1X_ISOLATED")
             if q.get("positionMode") not in {"ONE_WAY", "HEDGE"}:
@@ -302,8 +438,13 @@ class ShortLiveBrokerAdapter:
     def readiness(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
         available_minutes = None
         native_minimums = {}
+        funding: dict[str, Any] = {}
+        self._observed_futures_settings = {}
+        self._observed_market_fx = None
         try:
             m = deepcopy(dict(manifest))
+            if self._manifest is not None and self._manifest != m:
+                raise ShortLiveBrokerBlocked("ADAPTER_ALREADY_BOUND")
             if m.get("route") != self.route or not m.get("sessionId") or not re.fullmatch(r"[0-9a-f]{64}", str(m.get("manifestHash") or "")):
                 raise ShortLiveBrokerBlocked("MANIFEST_SCOPE_INVALID")
             if not isinstance(m.get("symbols"), list) or not m["symbols"] or len(set(m["symbols"])) != len(m["symbols"]):
@@ -314,8 +455,19 @@ class ShortLiveBrokerAdapter:
                 raise ShortLiveBrokerBlocked("ROUTE_BUDGET_TOO_LARGE")
             if not 0 < number(m.get("dailyLossStopKrw", 50000)) <= MAX_LOSS_KRW:
                 raise ShortLiveBrokerBlocked("LOSS_LIMIT_INVALID")
-            s = self._snapshot(m)
+            s = self._snapshot(m, establish_spot_baseline=True)
+            funding = {"fundingBasis": "AVAILABLE_QUOTE_ONLY", "quoteCurrency": self.currency,
+                       "availableQuoteNative": decimal_text(number(s["availableNative"]))}
+            for key in ("preservedAssetSymbols", "preservedAssetsBaselineHash"):
+                if key in s:
+                    funding[key] = deepcopy(s[key])
             markets = [self._market(symbol, require_session_open=True) for symbol in m["symbols"]]
+            if self.provider == "binance":
+                selected_assets = {symbol.removesuffix("USDT") for symbol in m["symbols"]}
+                if any(q.get("commissionDiscountEnabled") is True
+                       and q.get("commissionDiscountAsset") in selected_assets
+                       and q["symbol"].removesuffix("USDT") != q.get("commissionDiscountAsset") for q in markets):
+                    raise ShortLiveBrokerBlocked("CROSS_SYMBOL_COMMISSION_ALLOCATION_UNSUPPORTED")
             for market in markets:
                 self._fresh(market["observedAt"], 10)
                 self._fresh(market["fxObservedAt"], 15)
@@ -331,6 +483,8 @@ class ShortLiveBrokerAdapter:
             # quote or make an earlier observation fresh with a later time.
             fx = min(number(market["krwPerQuote"], positive=True) for market in markets)
             available = number(s["availableNative"]) * fx
+            funding.update(availableKrw=decimal_text(available), effectiveRouteBudgetKrw=decimal_text(
+                min(available, number(m.get("effectiveRouteBudgetKrw", m.get("routeBudgetKrw", 100000))))))
             if available <= 0:
                 raise ShortLiveBrokerBlocked("NO_AVAILABLE_BALANCE")
             ceiling = min(available, number(m.get("effectiveRouteBudgetKrw", m.get("routeBudgetKrw", 100000))))
@@ -374,9 +528,12 @@ class ShortLiveBrokerAdapter:
                 if self._manifest is not None and self._manifest != m:
                     raise ShortLiveBrokerBlocked("ADAPTER_ALREADY_BOUND")
                 self._manifest = m
+                if self._spot_baseline is None and "_spotBaselineCandidate" in s:
+                    self._spot_baseline = dict(s["_spotBaselineCandidate"])
+                    self._spot_baseline_account = s["accountId"]
                 if self._baseline_equity_native is None:
                     self._baseline_equity_native = number(s["equityNative"])
-            return {"ready": True, "blockers": [], "accountId": s["accountId"],
+            return {"ready": True, "blockers": [], "accountId": s["accountId"], **funding,
                     "availableKrw": decimal_text(available), "existingExposureKrw": "0",
                     "scopeOwnershipVerified": True, "quoteObservedAt": markets[0]["observedAt"],
                     "boundedCost": True, "equityTracked": True,
@@ -386,7 +543,17 @@ class ShortLiveBrokerAdapter:
                     "fxObservedAt": markets[0]["fxObservedAt"], "promotionEligible": False}
         except Exception as exc:
             code = str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "BROKER_READINESS_UNKNOWN"
-            return {"ready": False, "blockers": [code], "scopeOwnershipVerified": False,
+            if funding and self._observed_market_fx is not None:
+                try:
+                    available = number(funding["availableQuoteNative"]) * self._observed_market_fx
+                    funding.update(availableKrw=decimal_text(available), effectiveRouteBudgetKrw=decimal_text(
+                        min(available, number(manifest.get("effectiveRouteBudgetKrw", manifest.get("routeBudgetKrw", 100000))))))
+                except ShortLiveBrokerBlocked:
+                    pass
+            if self._observed_futures_settings:
+                funding.update(observedFuturesSettings=dict(self._observed_futures_settings),
+                               expectedFuturesSettings={"marginMode": "ISOLATED", "leverage": "1"})
+            return {"ready": False, "blockers": [code], "scopeOwnershipVerified": False, **funding,
                     "availableSessionMinutes": available_minutes, "minimumOrderKrwBySymbol": native_minimums,
                     "promotionEligible": False}
 
@@ -651,7 +818,9 @@ class ShortLiveBrokerAdapter:
                     "positionsBySymbol": positions, "realizedLossKrw": decimal_text(realized_loss),
                     "unrealizedLossKrw": decimal_text(unrealized_loss), "equityKrw": decimal_text(equity),
                     "exposureKrw": decimal_text(exposure), "scopeOwnershipVerified": True,
-                    "lossBasis": "EXACT_SCOPE_PNL" if "realizedPnlNative" in s else "ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX",
+                    "lossBasis": ("EXACT_SCOPE_PNL" if "realizedPnlNative" in s else
+                                  "SESSION_NATIVE_EQUITY_EXCLUDING_PRESERVED_SPOT_WITH_VERIFIED_FEES"
+                                  if self._spot_baseline is not None else "ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX"),
                     "promotionEligible": False}
         except Exception as exc:
             return {"known": False, "ready": False, "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "RECONCILIATION_UNKNOWN"]}

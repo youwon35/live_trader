@@ -75,6 +75,167 @@ class Fixture:
 
 class ShortLiveBrokerTests(unittest.TestCase):
     @staticmethod
+    def preserved_spot_fixture(route="BINANCE_SPOT", baseline="2"):
+        f = Fixture(route)
+        f.quote_equity = mod.Decimal("100000")
+        f.inventory = {"BNB": "1", "OLD_DELISTED": ".00001"}
+        f.truth["positions"] = [{"symbol": f.symbol, "quantity": baseline, "markPrice": "1000"}]
+
+        def snapshot(*_):
+            result = copy.deepcopy(f.truth)
+            asset = f.symbol.removesuffix("USDT") if route == "BINANCE_SPOT" else f.symbol.removeprefix("KRW-")
+            quantity = sum((mod.number(p["quantity"]) for p in result["positions"]), mod.Decimal(0))
+            inventory = {**f.inventory, asset: str(quantity)}
+            result.update(spotInventoryComplete=True, spotInventory=inventory, equityScope="QUOTE_AND_SELECTED_SPOT")
+            result["equityNative"] = str(f.quote_equity + sum(
+                (mod.number(p["quantity"]) * mod.number(p["markPrice"]) for p in result["positions"]), mod.Decimal(0)))
+            return result
+
+        f.adapter.snapshot_reader = snapshot
+        return f
+
+    def test_existing_selected_and_unselected_spot_units_are_preserved_through_cleanup(self):
+        for route in ("BINANCE_SPOT", "UPBIT_KRW_SPOT"):
+            with self.subTest(route=route):
+                f = self.preserved_spot_fixture(route)
+                ready = f.adapter.readiness(f.manifest)
+                self.assertTrue(ready["ready"], ready)
+                self.assertEqual("AVAILABLE_QUOTE_ONLY", ready["fundingBasis"])
+                self.assertEqual("100000", ready["availableQuoteNative"])
+                self.assertEqual(["BNB", "BTC", "OLD_DELISTED"], ready["preservedAssetSymbols"])
+                self.assertEqual({}, f.adapter.reconcile(f.manifest)["positionsBySymbol"])
+                self.assertEqual("FILLED", f.adapter.submit(f.adapter.size_order(f.proposal()))["status"])
+                self.assertEqual("10", f.adapter.reconcile(f.manifest)["positionsBySymbol"][f.symbol]["quantity"])
+                final = f.adapter.cleanup(f.manifest)
+                self.assertTrue(final["complete"], final)
+                self.assertEqual("10", f.calls[-1]["quantity"])
+                self.assertEqual(mod.Decimal(2), mod.number(f.truth["positions"][0]["quantity"]))
+                self.assertEqual("1", f.inventory["BNB"])
+
+    def test_existing_coin_price_changes_do_not_manufacture_or_hide_session_loss(self):
+        for price in ("10", "10000"):
+            f = self.preserved_spot_fixture()
+            self.assertTrue(f.adapter.readiness(f.manifest)["ready"])
+            f.truth["positions"][0]["markPrice"] = price
+            f.quote["nativePrice"] = price
+            self.assertEqual("0", f.adapter.reconcile(f.manifest)["realizedLossKrw"])
+            f.quote_equity -= 123
+            self.assertEqual("123", f.adapter.reconcile(f.manifest)["realizedLossKrw"])
+
+    def test_external_spot_addition_sale_withdrawal_or_missing_inventory_blocks(self):
+        for change in (lambda f: f.inventory.update(ETH="1"),
+                       lambda f: f.inventory.update(BNB=".999"),
+                       lambda f: f.truth["positions"][0].update(quantity="3"),
+                       lambda f: f.truth["positions"][0].update(quantity="1")):
+            f = self.preserved_spot_fixture()
+            self.assertTrue(f.adapter.readiness(f.manifest)["ready"])
+            change(f)
+            result = f.adapter.reconcile(f.manifest)
+            self.assertIn("PRESERVED_SPOT_INVENTORY_CHANGED", result["blockers"])
+            self.assertFalse(f.adapter.cleanup(f.manifest)["complete"])
+            self.assertEqual([], f.calls)
+        f = self.preserved_spot_fixture()
+        f.adapter.readiness(f.manifest)
+        f.adapter.snapshot_reader = lambda *_: copy.deepcopy(f.truth)
+        self.assertIn("COMPLETE_SPOT_INVENTORY_REQUIRED", f.adapter.reconcile(f.manifest)["blockers"])
+
+    def test_existing_coins_never_substitute_for_missing_or_insufficient_quote(self):
+        for quote, minimum, blocker in (("0", "0", "NO_AVAILABLE_BALANCE"),
+                                        ("2", "1000", "AVAILABLE_BELOW_NATIVE_MINIMUM")):
+            f = self.preserved_spot_fixture()
+            f.truth["availableNative"] = quote
+            f.quote["minNotional"] = minimum
+            ready = f.adapter.readiness(f.manifest)
+            self.assertFalse(ready["ready"])
+            self.assertIn(blocker, ready["blockers"])
+            self.assertEqual(quote, ready["availableQuoteNative"])
+            self.assertNotIn("accountId", ready)
+            self.assertEqual([], f.calls)
+
+    def test_spot_baseline_is_frozen_per_adapter_and_hash_matches_exact_fresh_inventory(self):
+        f = self.preserved_spot_fixture()
+        ready = f.adapter.readiness(f.manifest)
+        duplicate = self.preserved_spot_fixture(baseline="2.00000")
+        self.assertEqual(ready["preservedAssetsBaselineHash"], duplicate.adapter.readiness(duplicate.manifest)["preservedAssetsBaselineHash"])
+        changed = self.preserved_spot_fixture(baseline="2.1")
+        self.assertNotEqual(ready["preservedAssetsBaselineHash"], changed.adapter.readiness(changed.manifest)["preservedAssetsBaselineHash"])
+        f.truth["positions"][0]["quantity"] = "3"
+        self.assertFalse(f.adapter.readiness(f.manifest)["ready"])
+        self.assertIn("ADAPTER_ALREADY_BOUND", f.adapter.readiness({**f.manifest, "sessionId": "another"})["blockers"])
+
+    def test_exact_third_asset_commission_debit_is_charged_without_becoming_owned(self):
+        f = self.preserved_spot_fixture()
+        self.assertTrue(f.adapter.readiness(f.manifest)["ready"])
+        order = f.adapter.size_order(f.proposal())
+        reply = f.adapter.submit(order)
+        f.quote_equity -= 10000
+        row = f.rows[reply["brokerOrderId"]]
+        row.update(externalCommissionKnown=True, externalCommissionQuantities={"BNB": ".001"},
+                   externalCommissionNative={"BNB": ".6"})
+        f.inventory["BNB"] = ".999"
+        result = f.adapter.reconcile(f.manifest)
+        self.assertTrue(result["known"], result)
+        self.assertEqual(mod.Decimal(".6"), mod.number(result["realizedLossKrw"]))
+        self.assertEqual({f.symbol}, set(result["positionsBySymbol"]))
+        row["externalCommissionNative"]["BNB"] = ".5"
+        self.assertEqual(mod.Decimal(".6"), mod.number(f.adapter.reconcile(f.manifest)["realizedLossKrw"]))
+        row["externalCommissionQuantities"]["BNB"] = ".002"
+        row["externalCommissionNative"]["BNB"] = ".8"
+        f.inventory["BNB"] = ".998"
+        # A further .001BNB costs .4USDT now; earlier .6USDT is not revalued away.
+        self.assertEqual(mod.Decimal("1.0"), mod.number(f.adapter.reconcile(f.manifest)["realizedLossKrw"]))
+        final = f.adapter.cleanup(f.manifest)
+        self.assertTrue(final["complete"], final)
+        self.assertEqual(mod.Decimal(2), mod.number(f.truth["positions"][0]["quantity"]))
+        self.assertEqual(".998", f.inventory["BNB"])
+        f.inventory["BNB"] = ".997"
+        self.assertIn("PRESERVED_SPOT_INVENTORY_CHANGED", f.adapter.reconcile(f.manifest)["blockers"])
+
+    def test_existing_spot_inventory_does_not_authorize_foreign_open_orders(self):
+        f = self.preserved_spot_fixture()
+        f.truth["openOrders"] = [{"brokerOrderId": "foreign", "symbol": f.symbol}]
+        ready = f.adapter.readiness(f.manifest)
+        self.assertIn("UNOWNED_ACCOUNT_ORDER", ready["blockers"])
+        self.assertIsNone(f.adapter._spot_baseline)
+        self.assertEqual([], f.calls)
+
+    def test_unknown_or_regressing_external_fee_never_justifies_inventory_change(self):
+        f = self.preserved_spot_fixture()
+        f.adapter.readiness(f.manifest)
+        reply = f.adapter.submit(f.adapter.size_order(f.proposal()))
+        row = f.rows[reply["brokerOrderId"]]
+        row.update(externalCommissionQuantities={"BNB": ".001"}, externalCommissionNative={"BNB": ".6"})
+        f.inventory["BNB"] = ".999"
+        self.assertIn("EXTERNAL_COMMISSION_UNKNOWN", f.adapter.reconcile(f.manifest)["blockers"])
+        row["externalCommissionKnown"] = True
+        self.assertTrue(f.adapter.reconcile(f.manifest)["known"])
+        row["externalCommissionQuantities"] = {}
+        row["externalCommissionNative"] = {}
+        self.assertIn("EXTERNAL_COMMISSION_CUMULATIVE_CHANGED", f.adapter.reconcile(f.manifest)["blockers"])
+
+    def test_cross_symbol_discount_fee_is_blocked_before_any_order(self):
+        f = self.preserved_spot_fixture()
+        f.manifest["symbols"].append("BNBUSDT")
+        f.adapter.market_reader = lambda _r, symbol: {**f.quote, "symbol": symbol,
+            "commissionDiscountEnabled": True, "commissionDiscountAsset": "BNB"}
+        f.truth["positions"].append({"symbol": "BNBUSDT", "quantity": "1", "markPrice": "1000"})
+        # Supply exact multi-symbol inventory independently of the one-symbol fixture.
+        f.adapter.snapshot_reader = lambda *_: {**copy.deepcopy(f.truth), "spotInventoryComplete": True,
+            "spotInventory": {"BTC": "2", "BNB": "1"}, "equityScope": "QUOTE_AND_SELECTED_SPOT", "equityNative": "103000"}
+        self.assertIn("CROSS_SYMBOL_COMMISSION_ALLOCATION_UNSUPPORTED", f.adapter.readiness(f.manifest)["blockers"])
+        self.assertEqual([], f.calls)
+
+    def test_futures_settings_failure_retains_sanitized_cash_and_exact_settings(self):
+        f = Fixture("BINANCE_USDM_FUTURES")
+        f.quote.update(marginMode="CROSSED", leverage="20")
+        result = f.adapter.readiness(f.manifest)
+        self.assertFalse(result["ready"])
+        self.assertEqual("100000", result["availableQuoteNative"])
+        self.assertEqual({"marginMode": "CROSSED", "leverage": "20", "positionMode": "ONE_WAY"}, result["observedFuturesSettings"])
+        self.assertEqual({"marginMode": "ISOLATED", "leverage": "1"}, result["expectedFuturesSettings"])
+        self.assertNotIn("accountId", result)
+
+    @staticmethod
     def native_cash_fixture(route="BINANCE_SPOT"):
         f = Fixture(route)
         f.truth.update(availableNative="10000", equityNative="10000")

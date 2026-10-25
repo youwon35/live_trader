@@ -15,6 +15,7 @@ const routeIds = new Set(SHORT_LIVE_ROUTES.map((route) => route.id));
 const strings = (value) => Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
 const text = (value) => typeof value === "string" ? value : "";
 const numeric = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
+const amount = (value) => (typeof value === "number" || (typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value))) ? numeric(Number(value)) : null;
 
 export function sanitizeShortLiveText(value) {
   return text(value)
@@ -98,6 +99,7 @@ export function shortLiveBlockerLabel(value) {
     ACCOUNT_SCOPE_OWNERSHIP_UNVERIFIED: "시험 대상 계좌와 실행 소유 관계를 확인하지 못함",
     EXACT_ACCOUNT_BINDING_MISMATCH: "준비한 계좌와 현재 조회 계좌가 일치하지 않음",
     PREPARED_ACCOUNT_CHANGED: "준비 이후 연결 계좌가 변경됨",
+    PRESERVED_ASSET_BASELINE_CHANGED: "준비 이후 보호할 기존 보유 자산이 변경되거나 확인되지 않음 · 다시 무주문 준비 필요",
     UNSCOPED_SPOT_ASSET_PRESENT: "시험 범위 밖의 기존 보유 자산이 있어 분리 확인 필요",
     UNOWNED_ACCOUNT_POSITION: "이 시험의 소유로 확인되지 않은 기존 포지션이 있음",
     UNOWNED_ACCOUNT_ORDER: "이 시험의 소유로 확인되지 않은 기존 미체결 주문이 있음",
@@ -205,6 +207,18 @@ export function normalizeShortLiveSnapshot(value = {}) {
       budgetKrwPerBroker: numeric(preparation.budgetKrwPerBroker ?? preparation.capitalKrwPerBroker),
       lossKrwPerBroker: numeric(preparation.lossKrwPerBroker ?? preparation.dailyLossStopKrwPerBroker),
       expiresAt: text(preparation.expiresAt),
+      brokerReadiness: (Array.isArray(preparation.brokerReadiness) ? preparation.brokerReadiness : []).map((row) => ({
+        route: text(row.route), ready: row.ready === true, blockers: strings(row.blockers),
+        fundingBasis: text(row.fundingBasis), quoteCurrency: text(row.quoteCurrency),
+        availableQuoteNative: amount(row.availableQuoteNative), availableKrw: amount(row.availableKrw),
+        effectiveRouteBudgetKrw: amount(row.effectiveRouteBudgetKrw),
+        preservedAssetSymbols: strings(row.preservedAssetSymbols).map(sanitizeShortLiveText),
+        observedFuturesSettings: row.observedFuturesSettings ? {
+          marginMode: sanitizeShortLiveText(row.observedFuturesSettings.marginMode),
+          leverage: amount(row.observedFuturesSettings.leverage),
+          positionMode: sanitizeShortLiveText(row.observedFuturesSettings.positionMode),
+        } : null,
+      })),
     } : null,
     runtime: run ? {
       sessionId: text(run.sessionId), status: text(run.status) || "UNKNOWN", startedAt: text(run.startedAt), endsAt: text(run.endsAt),
@@ -238,6 +252,14 @@ export function normalizeShortLiveSnapshot(value = {}) {
       })),
     } : null,
   };
+}
+
+export function mergeShortLiveSnapshot(value, displayCatalog = []) {
+  const source = value?.snapshot || value || {};
+  const next = normalizeShortLiveSnapshot(value);
+  // Only discovery rows persist. Expiry, readiness, blockers and runtime are
+  // always replaced by the new status response, never by a catalogue reply.
+  return source.catalogIncluded === false ? { ...next, catalog: displayCatalog } : next;
 }
 
 export function buildShortLivePrepare(catalog, selectedKeys, limits = SHORT_LIVE_DEFAULTS) {

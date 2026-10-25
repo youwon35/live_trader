@@ -309,7 +309,7 @@ def get_service() -> ShortLiveTestService:
 def request(action: str, payload=None):
     restore_prior_stop = False
     try:
-        if action not in {"snapshot", "prepare", "start", "stop"}:
+        if action not in {"snapshot", "catalog", "prepare", "start", "stop"}:
             raise ValueError("UNKNOWN_SHORT_LIVE_ACTION")
         service = get_service()
         if action == "prepare":
@@ -317,7 +317,12 @@ def request(action: str, payload=None):
             if session is None or session.get("status") == "TERMINATED":
                 restore_prior_stop = _GLOBAL_STOP.is_set()
                 _GLOBAL_STOP.clear()
-        result = service.snapshot() if action == "snapshot" else getattr(service, action)(payload or {})
+        if action == "snapshot":
+            result = service.snapshot(include_catalog=False)
+        elif action == "catalog":
+            result = service.catalog()
+        else:
+            result = getattr(service, action)(payload or {})
         return {"ok": True, **result}
     except Exception as exc:
         if restore_prior_stop:

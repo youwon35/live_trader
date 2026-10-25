@@ -105,11 +105,23 @@ class ShortLiveStatusTests(unittest.TestCase):
             state.real_orders_enabled=lambda:False; self.assertIn("REAL_ORDERS_DISABLED",runtime._controls())
 
     def test_only_new_inactive_preparation_clears_global_stop(self):
-        service=types.SimpleNamespace(_session=None,snapshot=lambda:{"ok":True},prepare=lambda _: {})
+        service=types.SimpleNamespace(_session=None,snapshot=lambda **_: {"ok":True},prepare=lambda _: {})
         with patch.object(runtime,"get_service",return_value=service):
             runtime.request_global_stop(); runtime.request("snapshot"); self.assertTrue(runtime._GLOBAL_STOP.is_set())
             runtime.request("prepare",{}); self.assertFalse(runtime._GLOBAL_STOP.is_set())
             service._session={"status":"RUNNING"}; runtime.request_global_stop(); runtime.request("prepare",{})
+            self.assertTrue(runtime._GLOBAL_STOP.is_set())
+
+    def test_status_skips_catalog_and_catalog_does_not_change_global_stop(self):
+        service=types.SimpleNamespace(snapshot=Mock(return_value={"status":"DISABLED"}),
+                                      catalog=Mock(return_value={"catalog":[], "readOnly":True}))
+        with patch.object(runtime,"get_service",return_value=service):
+            runtime.request_global_stop()
+            self.assertTrue(runtime.request("snapshot")["ok"])
+            service.snapshot.assert_called_once_with(include_catalog=False)
+            service.catalog.assert_not_called()
+            self.assertTrue(runtime.request("catalog")["ok"])
+            service.catalog.assert_called_once_with()
             self.assertTrue(runtime._GLOBAL_STOP.is_set())
 
     def test_failed_new_preparation_restores_prior_stop_and_does_not_replace_prepared_scope(self):

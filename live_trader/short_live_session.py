@@ -82,6 +82,8 @@ class ShortLiveTestService:
         self.catalog_display_ttl_seconds = max(1, min(30, float(catalog_display_ttl_seconds)))
         self.order_timeout_seconds = max(10, min(600, float(order_timeout_seconds)))
         self._lock = threading.RLock()
+        # Display discovery must never hold the live state/worker lock.
+        self._catalog_lock = threading.Lock()
         self._prepared: dict[str, Any] | None = None
         self._session: dict[str, Any] | None = None
         self._brokers: dict[str, Any] = {}
@@ -129,15 +131,22 @@ class ShortLiveTestService:
                      "promotionEligible": False, **values})
 
     def _catalog(self) -> dict[str, Any]:
-        if self._catalog_cache is not None and self.monotonic() - self._catalog_cache_at < self.catalog_display_ttl_seconds:
+        with self._catalog_lock:
+            if self._catalog_cache is not None and self.monotonic() - self._catalog_cache_at < self.catalog_display_ttl_seconds:
+                return deepcopy(self._catalog_cache)
+            provider = self.catalog_provider
+            value = provider.snapshot() if hasattr(provider, "snapshot") else provider()
+            if isinstance(value, list):
+                value = {"candidates": value, "coverage": []}
+            self._catalog_cache = deepcopy(dict(value))
+            self._catalog_cache_at = self.monotonic()
             return deepcopy(self._catalog_cache)
-        provider = self.catalog_provider
-        value = provider.snapshot() if hasattr(provider, "snapshot") else provider()
-        if isinstance(value, list):
-            value = {"candidates": value, "coverage": []}
-        self._catalog_cache = deepcopy(dict(value))
-        self._catalog_cache_at = self.monotonic()
-        return deepcopy(self._catalog_cache)
+
+    def catalog(self) -> dict[str, Any]:
+        value = self._catalog()
+        return {"schemaVersion": "short-live-test-catalog-v1",
+                "catalog": value.get("candidates", []), "coverage": value.get("coverage", []),
+                "readOnly": True, "authorityGranted": False, "promotionEligible": False}
 
     def _guard(self, manifest: Mapping[str, Any]) -> list[str]:
         if not callable(self.clock_guard):
@@ -151,6 +160,14 @@ class ShortLiveTestService:
         return callable(self.owner_is_alive) and self.owner_is_alive() is True
 
     def snapshot(self, *, include_catalog: bool = True) -> dict[str, Any]:
+        # Compatibility callers may ask for discovery, but never under the
+        # state lock. HTTP polling and mutation responses omit this work.
+        try:
+            catalog = self._catalog() if include_catalog else {"candidates": [], "coverage": []}
+            catalog_error = []
+        except Exception as exc:
+            catalog = {"candidates": [], "coverage": []}
+            catalog_error = [f"CATALOG_UNAVAILABLE:{type(exc).__name__}"]
         with self._lock:
             # The worker's own finally block cannot prove its death. A later
             # UI/status caller holds the same Thread object and observes it.
@@ -162,12 +179,6 @@ class ShortLiveTestService:
                 self._event("WORKER_DEATH_OBSERVED", sessionId=self._session["sessionId"],
                             threadIdent=self._thread.ident)
                 self._finalize_after_worker_exit()
-            try:
-                catalog = self._catalog() if include_catalog else {"candidates": [], "coverage": []}
-                catalog_error = []
-            except Exception as exc:
-                catalog = {"candidates": [], "coverage": []}
-                catalog_error = [f"CATALOG_UNAVAILABLE:{type(exc).__name__}"]
             prepared = deepcopy(self._prepared)
             if prepared:
                 manifest = prepared["contract"]
@@ -180,6 +191,7 @@ class ShortLiveTestService:
                             "preparedAt": manifest["preparedAt"],
                             "expiresAt": prepared["expiresAt"],
                             "readyToStart": prepared["readyToStart"],
+                            "brokerReadiness": deepcopy(prepared.get("publicReadiness", [])),
                             "blockers": prepared["blockers"]}
                 if self._now() >= datetime.fromisoformat(prepared["expiresAt"].replace("Z", "+00:00")):
                     prepared["readyToStart"] = False
@@ -188,6 +200,7 @@ class ShortLiveTestService:
             mode = runtime["status"] if runtime else "PREPARED" if prepared else "DISABLED"
             return {"schemaVersion": "short-live-test-snapshot-v1", "purpose": PURPOSE,
                     "promotionEligible": False, "mode": mode, "status": mode,
+                    "catalogIncluded": include_catalog,
                     "catalog": catalog.get("candidates", []),
                     "candidates": catalog.get("candidates", []),
                     "coverage": catalog.get("coverage", []),
@@ -247,18 +260,40 @@ class ShortLiveTestService:
                 blockers.append("GENUINE_UI_OWNER_UNAVAILABLE")
             blockers += self._guard(contract)
             readiness: dict[str, Any] = {}
+            public_readiness = []
             for leg in contract["legs"]:
                 manifest = leg_manifest(contract, leg["route"])
                 broker = self.broker_provider(leg["route"])
                 value = broker.readiness(manifest)
+                before_validation = len(blockers)
                 readiness[leg["route"]] = self._validate_readiness(value, manifest, blockers)
+                public = self._public_preparation_readiness(value, leg["route"])
+                public["blockers"] = list(dict.fromkeys([*public["blockers"],
+                    *[reason.removeprefix(leg["route"] + ":") for reason in blockers[before_validation:]]]))
+                public["ready"] = public["ready"] and not public["blockers"]
+                public_readiness.append(public)
             self._prepared = {"contract": contract,
                               "readyToStart": not blockers,
                               "blockers": list(dict.fromkeys(blockers)),
                               "readiness": readiness,
+                              "publicReadiness": public_readiness,
                               "expiresAt": utc_text(self._now() + timedelta(seconds=self.preparation_ttl_seconds))}
             self._write(f"preparation-{contract['preparationId']}", self._prepared)
-            return self.snapshot()
+            return self.snapshot(include_catalog=False)
+
+    @staticmethod
+    def _public_preparation_readiness(value: Any, route: str) -> dict[str, Any]:
+        value = value if isinstance(value, Mapping) else {}
+        keys = ("fundingBasis", "quoteCurrency", "availableQuoteNative", "availableKrw",
+                "effectiveRouteBudgetKrw", "preservedAssetSymbols")
+        result = {key: deepcopy(value[key]) for key in keys if key in value}
+        result.update(route=route, ready=value.get("ready") is True,
+                      blockers=deepcopy(value.get("blockers") or []))
+        for key in ("observedFuturesSettings", "expectedFuturesSettings"):
+            if isinstance(value.get(key), Mapping):
+                result[key] = {field: deepcopy(value[key].get(field))
+                               for field in ("marginMode", "leverage", "positionMode")}
+        return result
 
     @staticmethod
     def _validate_readiness(value: Any, manifest: Mapping[str, Any], blockers: list[str]) -> dict[str, Any]:
@@ -305,6 +340,19 @@ class ShortLiveTestService:
                 route = leg["route"]
                 adapter = self.broker_provider(route)
                 readiness[route] = self._validate_readiness(adapter.readiness(leg_manifest(contract, route)), leg, blockers)
+                prior = self._prepared["readiness"].get(route, {})
+                current = readiness[route]
+                if route in {"BINANCE_SPOT", "UPBIT_KRW_SPOT"} and (
+                        prior.get("fundingBasis") == "AVAILABLE_QUOTE_ONLY"
+                        or current.get("fundingBasis") == "AVAILABLE_QUOTE_ONLY"
+                        or prior.get("preservedAssetsBaselineHash")
+                        or current.get("preservedAssetsBaselineHash")):
+                    before = prior.get("preservedAssetsBaselineHash")
+                    after = current.get("preservedAssetsBaselineHash")
+                    if (not isinstance(before, str) or len(before) != 64
+                            or any(char not in "0123456789abcdef" for char in before)
+                            or after != before):
+                        blockers.append(f"{route}:PRESERVED_ASSET_BASELINE_CHANGED")
                 if (self._prepared["readiness"].get(route, {}).get("accountId")
                         != readiness[route].get("accountId")):
                     blockers.append(f"{route}:PREPARED_ACCOUNT_CHANGED")
@@ -390,7 +438,7 @@ class ShortLiveTestService:
                 self._failure(f"STARTUP_FAILED:{type(exc).__name__}:{exc}")
                 self._stop_once("STARTUP_FAILED")
                 raise
-            return self.snapshot()
+            return self.snapshot(include_catalog=False)
 
     def _make_engines(self, contract: Mapping[str, Any]) -> None:
         self._engines = {}
@@ -1183,12 +1231,12 @@ class ShortLiveTestService:
         with self._lock:
             payload = payload or {}
             if not self._session:
-                return self.snapshot()
+                return self.snapshot(include_catalog=False)
             if payload.get("sessionId") not in {None, self._session["sessionId"]}:
                 raise ShortLiveContractError("STOP_SCOPE_MISMATCH")
             self._stop_once(str(payload.get("reason") or "OPERATOR_STOP"))
             self._wake.set()
-            return self.snapshot()
+            return self.snapshot(include_catalog=False)
 
     def _stop_once(self, reason: str) -> None:
         session = self._session
@@ -1297,4 +1345,4 @@ class ShortLiveTestService:
         thread = self._thread
         if thread and thread is not threading.current_thread() and thread.ident is not None:
             thread.join(timeout=5)
-        return self.snapshot()
+        return self.snapshot(include_catalog=False)

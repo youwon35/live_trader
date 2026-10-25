@@ -745,6 +745,49 @@ class StrategyContractTest(unittest.TestCase):
             if previous_trader_artifact is not None:
                 os.environ["TRADER_STRATEGY_ARTIFACT_DIR"] = previous_trader_artifact
 
+    def test_deployments_read_once_per_folder_load_and_refresh_on_next_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            raw_artifacts = [seal_strategy_artifact({
+                "id": f"source-{index}", "artifactType": "strategy", "symbol": "BTCUSDT",
+                "lifecycle": {"status": "backtested"},
+            }) for index in range(3)]
+            for index, raw in enumerate(raw_artifacts):
+                (folder / f"source-{index}.json").write_text(json.dumps(raw), encoding="utf-8")
+            initial_deployments = [{
+                "deploymentId": f"deployment-{index}", "strategyArtifact": artifact_reference(raw),
+                "environment": "SMALL_LIVE", "lifecycle": "live", "permissions": {},
+            } for index, raw in enumerate(raw_artifacts)]
+            store = Mock()
+            store.list.return_value = initial_deployments
+            with (
+                patch.object(contracts, "strategy_artifact_dirs", return_value=[folder]),
+                patch.object(contracts, "strategy_plugin_dirs", return_value=[]),
+                patch.object(contracts, "DeploymentStore", return_value=store) as store_factory,
+                patch.object(contracts, "load_pinned_paper_live_qualification", return_value={
+                    "ready": False, "required": True, "issues": ["test-no-evidence"],
+                }) as qualification,
+                patch.object(contracts, "verify_strategy_artifact", wraps=contracts.verify_strategy_artifact) as verify,
+            ):
+                first = load_strategy_artifacts()
+                self.assertEqual(3, len(first))
+                self.assertEqual({"live"}, {row["lifecycle_status"] for row in first})
+                store_factory.assert_called_once_with(folder)
+                store.list.assert_called_once_with()
+                self.assertEqual(3, qualification.call_count)
+                self.assertEqual(3, verify.call_count)
+
+                store.list.return_value = [{**row, "lifecycle": "paused"} for row in initial_deployments]
+                second = load_strategy_artifacts()
+                self.assertEqual({"paused"}, {row["lifecycle_status"] for row in second})
+                self.assertEqual(2, store_factory.call_count)
+                self.assertEqual(2, store.list.call_count)
+                self.assertEqual(6, qualification.call_count)
+                self.assertEqual(6, verify.call_count)
+                self.assertEqual([artifact_reference(raw) for raw in raw_artifacts],
+                                 [artifact_reference(json.loads((folder / f"source-{index}.json").read_text(encoding="utf-8")))
+                                  for index in range(3)])
+
     def test_strategy_artifacts_load_beyond_legacy_limit_and_dedupe_mirrors(self) -> None:
         previous_artifact = os.environ.get("LIVE_TRADER_STRATEGY_ARTIFACT_DIR")
         try:

@@ -3029,7 +3029,7 @@ function WorkspaceContent({
   if (selectedNav === "settings") {
     return renderPage(
       <section className="settings-page-layout ts-layout-stack">
-        <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} onSave={onEnvSettings} />
+        <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} runtimeSnapshot={snapshot} onSave={onEnvSettings} />
         <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
         <CompactDisclosure
           title="화면·레이아웃·Telegram"
@@ -4910,7 +4910,7 @@ function AppearanceControlPanel({ appearance, updateAppearance, layoutMode, chan
   );
 }
 
-function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
+function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnapshot = {}, onSave }) {
   const [settings, setSettings] = useState(null);
   const [settingsStatus, setSettingsStatus] = useState("loading");
   const [loadAttempt, setLoadAttempt] = useState(0);
@@ -5029,6 +5029,13 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
           : checkCount ? `${checkCount} CHECK` : "설정 확인";
   const settingsTone = settingsStatus === "error" ? "danger"
     : settingsReady ? checkCount ? "warning" : "success" : "neutral";
+  const storedPermission = fields.find((field) => field.key === "LIVE_TRADER_ENABLE_REAL_ORDERS");
+  const permissionCheck = (Array.isArray(runtimeSnapshot.readiness) ? runtimeSnapshot.readiness : [])
+    .find((check) => check?.label === "실거래 라우트 환경");
+  const currentPermission = runtimeSnapshot.api_connected === true && ["pass", "fail"].includes(permissionCheck?.status)
+    ? permissionCheck.status === "pass" : null;
+  const currentControl = (name, enabled, disabled) => runtimeSnapshot.api_connected === true && typeof runtimeSnapshot[name] === "boolean"
+    ? runtimeSnapshot[name] ? enabled : disabled : "미확인";
 
   function updateDraft(key, value) {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -5090,6 +5097,16 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], onSave }) {
         variant="cards"
         value={activeGroup}
       />
+      {activeGroup === "live-lock" && (
+        <div {...semanticSurfaceProps(currentPermission === true ? "success" : "warning", "live-assistant-provisional-note")} role="note">
+          <strong>저장 설정과 현재 앱의 주문 허용</strong>
+          <p>저장된 실전 주문 라우트: {settingsStatus === "ready" && storedPermission
+            ? settingsBooleanValue(storedPermission.value) ? "허용" : "차단" : "미확인"} · 현재 앱의 실전 주문 허용: {currentPermission === true ? "확인됨" : currentPermission === false ? "차단됨" : "미확인"}</p>
+          <p>운용자 확인 {currentControl("operator_confirmed", "완료", "필요")} · 주문 전송 없이 점검 {currentControl("dry_run", "켜짐", "꺼짐")} · 신규 진입 {currentControl("new_entries_blocked", "차단", "허용")}</p>
+          <p>앱을 다시 열면 실전 주문 허용이 해제됩니다. 이 화면에서 설정을 저장하고 새 확인을 완료해야 현재 앱에 반영됩니다. 위 상태는 마지막 서버 조회 기준이며, 시작할 때 다시 검사합니다.</p>
+          <p>운용자 확인과 주문 차단 설정은 ‘한도·안전장치’에서 확인하세요. 주문 라우트를 허용해도 전략 시험은 시작되지 않으며, 무주문 준비 검사 후 실거래 시작을 별도로 눌러야 합니다.</p>
+        </div>
+      )}
       {settingsReady && broker && (
         <div
           {...semanticSurfaceProps(

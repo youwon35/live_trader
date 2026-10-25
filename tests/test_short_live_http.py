@@ -77,6 +77,22 @@ class ShortLiveHttpTests(unittest.TestCase):
             h.do_GET()
         call.assert_called_once_with("snapshot")
 
+    def test_catalog_requires_same_native_session_and_has_no_mutation_route(self):
+        h = self.handler("/api/short-live-tests/catalog", authorized=False)
+        with patch("live_trader.server.state.short_live_test_request") as call:
+            h.do_GET()
+        call.assert_not_called()
+        h = self.handler("/api/short-live-tests/catalog")
+        with patch("live_trader.server.state.short_live_test_request", return_value={"ok": True}) as call:
+            h.do_GET()
+        call.assert_called_once_with("catalog")
+        h = self.handler("/api/short-live-tests/catalog")
+        h.send_error = Mock()
+        with patch("live_trader.server.state.short_live_test_request") as call:
+            h.do_POST()
+        call.assert_not_called()
+        h.send_error.assert_called_once_with(404, "Unknown API endpoint")
+
     def test_clock_failure_is_sticky_without_os_mutation(self):
         reader = SimpleNamespace(_get=Mock(side_effect=ValueError("unavailable")))
         guard = FreshClock(reader, lambda: [])

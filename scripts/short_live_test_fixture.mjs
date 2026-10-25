@@ -23,9 +23,9 @@ const row={selectionKey:'STRATEGY_INSTANCE:fixture:one',kind:'STRATEGY_INSTANCE'
 const hourly={...row,selectionKey:'STRATEGY_INSTANCE:fixture:hourly',id:'fixture-hourly',label:'소액 배정금 100% 기능시험 · BTCUSDT · 1h',route:'BINANCE_SPOT',routes:['BINANCE_SPOT'],timeframe:'1h',timeframes:['1h'],symbols:['BTCUSDT'],positionSizePercents:[100],functionalSizingProfiles:['BOUNDED_TEST_SLEEVE_100_PERCENT_V1']};
 const originalHourly={...hourly,selectionKey:'STRATEGY_INSTANCE:fixture:original-hourly',id:'original-hourly',label:'기존 5% 1시간봉 전략',positionSizePercents:[5],functionalSizingProfiles:[]};
 let state={schemaVersion:'fixture-only',fixture:true,status:'IDLE',observedAt:'2026-10-24T06:00:00Z',catalog:{candidates:[row,hourly,originalHourly]},blockers:[],prepared:null,runtime:null};
-const calls=[];let failStart=false;let failStop=false;let holdNext=false;let releaseSnapshot=null;
-window.__shortLiveFixture={calls, state:()=>state, setBlocked:()=>{state={...state,blockers:['insufficient-balance']};}, reset:()=>{state={...state,blockers:[]};}, failStart:()=>{failStart=true;},failStop:()=>{failStop=true;},holdNextSnapshot:()=>{holdNext=true;},snapshotHeld:()=>Boolean(releaseSnapshot),releaseSnapshot:()=>{releaseSnapshot?.();releaseSnapshot=null;},expirePreparation:()=>{state={...state,prepared:{...state.prepared,expiresAt:new Date(Date.now()-1000).toISOString()}};}};
-const api={snapshot:async()=>{if(holdNext){holdNext=false;const old=structuredClone(state);return new Promise(resolve=>{releaseSnapshot=()=>resolve(old);});}return structuredClone(state);},prepare:async(body)=>{calls.push({method:'prepare',body});state={...state,status:'PREPARED',prepared:{preparationId:'fixture-preparation',scopeHash:hash,readyToStart:true,targets:body.selections.map(target=>state.catalog.candidates.find(candidate=>candidate.selectionKey===target.selectionKey)),blockers:[],durationHours:body.durationHours,capitalKrwPerBroker:body.capitalKrwPerBroker,dailyLossStopKrwPerBroker:body.dailyLossStopKrwPerBroker,expiresAt:new Date(Date.now()+120000).toISOString()}};return {snapshot:structuredClone(state)};},start:async(body)=>{calls.push({method:'start',body});state={...state,status:'RUNNING',runtime:{sessionId:'fixture-session',status:'RUNNING',ownerAlive:true,workerAlive:true,newEntriesBlocked:false,naturalExitObserved:false,unknownOrderCount:0,terminalVerified:false,startedAt:'2026-10-24T06:05:00Z',endsAt:'2026-10-24T12:05:00Z',brokerRows:[{route:'BINANCE_SPOT',effectiveRouteBudgetKrw:23000,brokerBudgetKrw:100000,exposureKrw:0,realizedLossKrw:0,unrealizedLossKrw:0,dailyLossStopKrw:50000,lossBasis:'ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX',actualFeeKnown:false,ready:true}],strategyRows:[{instanceId:'fixture-daily',pluginId:'moving_average_cross',symbol:'005930',route:'KIS_KR_CASH',timeframe:'1d',lastSignal:'NOT_OBSERVED',decisionCount:0,orderAttemptCount:0,fillObservationCount:0}]}};if(failStart)throw new Error('FIXTURE_LOST_REPLY');return {snapshot:structuredClone(state)};},stop:async(body)=>{calls.push({method:'stop',body});state={...state,status:'STOPPING',runtime:{...state.runtime,status:'STOPPING',newEntriesBlocked:true}};if(failStop)throw new Error('FIXTURE_LOST_STOP_REPLY');return {snapshot:structuredClone(state)};}};
+const status=()=>({...structuredClone(state),catalogIncluded:false,catalog:[]});let catalogReads=0;let failSnapshot=false;let holdCatalog=false;let releaseCatalog=null;const calls=[];let failStart=false;let failStop=false;let holdNext=false;let releaseSnapshot=null;
+window.__shortLiveFixture={calls, state:()=>state,catalogReads:()=>catalogReads,failSnapshot:()=>{failSnapshot=true;},holdCatalog:()=>{holdCatalog=true;},catalogHeld:()=>Boolean(releaseCatalog),releaseCatalog:()=>{releaseCatalog?.();releaseCatalog=null;}, setBlocked:()=>{state={...state,blockers:['insufficient-balance']};}, reset:()=>{state={...state,blockers:[]};}, failStart:()=>{failStart=true;},failStop:()=>{failStop=true;},holdNextSnapshot:()=>{holdNext=true;},snapshotHeld:()=>Boolean(releaseSnapshot),releaseSnapshot:()=>{releaseSnapshot?.();releaseSnapshot=null;},expirePreparation:()=>{state={...state,prepared:{...state.prepared,expiresAt:new Date(Date.now()-1000).toISOString()}};}};
+const api={catalog:async()=>{catalogReads++;if(holdCatalog){holdCatalog=false;await new Promise(resolve=>{releaseCatalog=resolve;});}return {schemaVersion:'short-live-test-catalog-v1',catalog:structuredClone(state.catalog.candidates),readOnly:true,authorityGranted:false};},snapshot:async()=>{if(failSnapshot){failSnapshot=false;throw new Error('검사용 상태 시간 초과');}if(holdNext){holdNext=false;const old=status();return new Promise(resolve=>{releaseSnapshot=()=>resolve(old);});}return status();},prepare:async(body)=>{calls.push({method:'prepare',body});state={...state,status:'PREPARED',prepared:{preparationId:'fixture-preparation',scopeHash:hash,readyToStart:true,targets:body.selections.map(target=>state.catalog.candidates.find(candidate=>candidate.selectionKey===target.selectionKey)),blockers:[],durationHours:body.durationHours,capitalKrwPerBroker:body.capitalKrwPerBroker,dailyLossStopKrwPerBroker:body.dailyLossStopKrwPerBroker,expiresAt:new Date(Date.now()+120000).toISOString()}};return {snapshot:status()};},start:async(body)=>{calls.push({method:'start',body});state={...state,status:'RUNNING',runtime:{sessionId:'fixture-session',status:'RUNNING',ownerAlive:true,workerAlive:true,newEntriesBlocked:false,naturalExitObserved:false,unknownOrderCount:0,terminalVerified:false,startedAt:'2026-10-24T06:05:00Z',endsAt:'2026-10-24T12:05:00Z',brokerRows:[{route:'BINANCE_SPOT',effectiveRouteBudgetKrw:23000,brokerBudgetKrw:100000,exposureKrw:0,realizedLossKrw:0,unrealizedLossKrw:0,dailyLossStopKrw:50000,lossBasis:'ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX',actualFeeKnown:false,ready:true}],strategyRows:[{instanceId:'fixture-daily',pluginId:'moving_average_cross',symbol:'005930',route:'KIS_KR_CASH',timeframe:'1d',lastSignal:'NOT_OBSERVED',decisionCount:0,orderAttemptCount:0,fillObservationCount:0}]}};if(failStart)throw new Error('FIXTURE_LOST_REPLY');return {snapshot:status()};},stop:async(body)=>{calls.push({method:'stop',body});state={...state,status:'STOPPING',runtime:{...state.runtime,status:'STOPPING',newEntriesBlocked:true}};if(failStop)throw new Error('FIXTURE_LOST_STOP_REPLY');return {snapshot:status()};}};
 createRoot(document.getElementById('root')).render(<ShortLiveTestPanel api={api} pollMs={1000}/>);
 `;
 await build({ stdin: { contents: entry, resolveDir: root, loader: "jsx" }, bundle: true, format: "esm",
@@ -61,6 +61,25 @@ try {
   assert.equal(await start.isDisabled(), true);
   assert.deepEqual(await page.evaluate(() => window.__shortLiveFixture.calls), []);
   report.checks.push("mount is GET-only with no implicit prepare/start");
+  await page.waitForFunction(() => window.__shortLiveFixture.catalogReads() === 1);
+  await page.getByRole("button", { name: "전략 목록 새로 확인", exact: true }).waitFor();
+  await page.evaluate(() => window.__shortLiveFixture.failSnapshot());
+  await page.getByRole("button", { name: "상태 새로 확인", exact: true }).click();
+  await page.getByText("상태 조회: 검사용 상태 시간 초과", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "상태 새로 확인", exact: true }).click();
+  await page.waitForFunction(() => !document.body.textContent.includes("상태 조회: 검사용 상태 시간 초과"));
+  assert.equal(await page.evaluate(() => window.__shortLiveFixture.catalogReads()), 1);
+  await page.evaluate(() => window.__shortLiveFixture.holdCatalog());
+  await page.getByRole("button", { name: "전략 목록 새로 확인", exact: true }).click();
+  await page.waitForFunction(() => window.__shortLiveFixture.catalogHeld());
+  await page.getByRole("button", { name: "상태 새로 확인", exact: true }).click();
+  await page.getByText("최근 조회 성공", { exact: false }).waitFor();
+  await page.getByText("전략 목록 미확인", { exact: false }).waitFor();
+  assert.equal(await page.getByText("이 조건에 정확히 연결된 후보가 없습니다.", { exact: false }).count(), 0);
+  assert.equal(await page.getByRole("button", { name: "무주문 준비 검사", exact: true }).isDisabled(), true);
+  await page.evaluate(() => window.__shortLiveFixture.releaseCatalog());
+  await page.getByRole("button", { name: "전략 목록 새로 확인", exact: true }).waitFor();
+  report.checks.push("catalog discovery is separate from fresh status; recovery clears only the polling error");
   await page.getByRole("button", { name: "1시간봉 소액 후보 보기", exact: true }).click();
   const hourly = page.getByRole("checkbox", { name: "시험 대상 소액 배정금 100% 기능시험 · BTCUSDT · 1h", exact: true });
   await hourly.waitFor(); assert.equal(await hourly.isChecked(), false);
@@ -138,6 +157,7 @@ try {
   await page.evaluate(() => window.__shortLiveFixture.failStart()); await start.click();
   await page.getByText("시작 결과 미확정", { exact: false }).waitFor();
   await page.getByRole("button", { name: "상태 새로 확인", exact: true }).click();
+  assert.equal(await page.getByText("시작 결과 미확정", { exact: false }).count(), 1);
   assert.equal(await start.isDisabled(), true);
   assert.equal(await page.evaluate(() => window.__shortLiveFixture.calls.filter((row) => row.method === "start").length), 1);
   await page.evaluate(() => window.__shortLiveFixture.failStop());
