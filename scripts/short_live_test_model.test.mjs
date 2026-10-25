@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import {
-  SHORT_LIVE_CONFIRMATION, buildShortLivePrepare, exactShortLiveTarget, normalizeShortLiveCandidate,
-  normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveCanStart, shortLiveCoverage,
+  buildShortLivePrepare, exactShortLiveTarget, normalizeShortLiveCandidate,
+  normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveReadyForConsent, shortLiveCoverage,
   shortLiveRuntimeMeaning, shortLiveSelectionSignature, shortLivePreparationMatches, shortLiveBlockerLabel,
   shortLivePreparationWindow, shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLiveRunning,
   normalizeShortLiveFuturesPolicy, shortLiveProtectionLabel, shortLiveFuturesIncidentLabel,
@@ -26,7 +26,7 @@ const portfolio = (changes = {}) => ({
 const ready = () => normalizeShortLiveSnapshot({ status: "PREPARED", catalog: { candidates: [instance()] },
   blockers: [], prepared: { preparationId: "fixture-preparation", scopeHash: "d".repeat(64), readyToStart: true,
     durationHours: 6, capitalKrwPerBroker: 100000, dailyLossStopKrwPerBroker: 50000, targets: [instance()], expiresAt: "2099-01-01T00:00:00Z", blockers: [] } });
-const options = { fresh: true, acknowledged: true, confirmationText: SHORT_LIVE_CONFIRMATION,
+const options = { fresh: true,
   selectionUnchanged: true, preparedAuthority: `fixture-preparation:${"d".repeat(64)}`, preparedScopeMatches: true };
 
 test("fast status preserves only display candidates and replaces all preparation authority", () => {
@@ -40,7 +40,7 @@ test("fast status preserves only display candidates and replaces all preparation
   assert.deepEqual(merged.prepared.blockers, ["PREPARATION_EXPIRED"]);
   assert.equal(merged.runtime.ownerAlive, false);
   assert.deepEqual(merged.blockers, ["FRESH_CLOCK_GUARD_UNKNOWN"]);
-  assert.equal(shortLiveCanStart(merged, options), false);
+  assert.equal(shortLiveReadyForConsent(merged, options), false);
   assert.deepEqual(mergeShortLiveSnapshot({ catalog: [], prepared: null, runtime: null }, before.catalog).catalog, []);
 });
 
@@ -107,7 +107,7 @@ test("futures preparation requires explicit valid protection policy and preserve
   assert.equal(JSON.stringify(body).includes("applySettings"), false);
 });
 
-test("futures policy changes invalidate preparation binding and require a new manual acknowledgement", () => {
+test("futures policy changes invalidate preparation binding before a new consent click", () => {
   const row = instance({ route: "BINANCE_USDM_FUTURES", routes: ["BINANCE_USDM_FUTURES"] });
   const policy = { leverage: 5, marginMode: "ISOLATED", stopLossPercent: 2 };
   const prepared = { durationHours: 6, budgetKrwPerBroker: 100000, lossKrwPerBroker: 50000,
@@ -169,11 +169,10 @@ test("only 5-7 hours and fixed authorized ceilings are accepted", () => {
     { durationHours, budgetKrwPerBroker: 100000, lossKrwPerBroker: 50000 }));
   assert.throws(() => buildShortLivePrepare([instance()], [instance().selectionKey], { durationHours: 6, budgetKrwPerBroker: 200000, lossKrwPerBroker: 50000 }));
 });
-test("start requires fresh exact prepared authority, phrase and manual acknowledgement", () => {
-  assert.equal(shortLiveCanStart(ready(), options), true);
-  for (const changes of [{ fresh: false }, { acknowledged: false }, { selectionUnchanged: false },
-    { confirmationText: "yes" }, { preparedAuthority: "old-preparation" }, { preparedScopeMatches: false }]) {
-    assert.equal(shortLiveCanStart(ready(), { ...options, ...changes }), false);
+test("consent button requires fresh exact prepared authority and no prior checkbox or typed phrase", () => {
+  assert.equal(shortLiveReadyForConsent(ready(), options), true);
+  for (const changes of [{ fresh: false }, { selectionUnchanged: false }, { preparedAuthority: "old-preparation" }, { preparedScopeMatches: false }]) {
+    assert.equal(shortLiveReadyForConsent(ready(), { ...options, ...changes }), false);
   }
 });
 test("server blockers, missing hash and active runtime block start", () => {
@@ -183,7 +182,7 @@ test("server blockers, missing hash and active runtime block start", () => {
     (state) => { state.prepared.scopeHash = "invalid"; },
     (state) => { state.prepared.readyToStart = false; },
     (state) => { state.runtime = { status: "RUNNING" }; },
-  ]) { const state = ready(); mutate(state); assert.equal(shortLiveCanStart(state, options), false); }
+  ]) { const state = ready(); mutate(state); assert.equal(shortLiveReadyForConsent(state, options), false); }
 });
 test("catalog pin change invalidates the local preparation selection", () => {
   const before = shortLiveSelectionSignature([instance()], [instance().selectionKey], 6);
@@ -255,7 +254,10 @@ test("panel mutates only from explicit event handlers and never retries unknown 
   assert.match(panel, /setUnknownMutation\("start"\)/); assert.match(panel, /setUnknownMutation\("stop"\)/);
   const effect = panel.match(/useEffect\(\(\) => \{\n    mounted\.current = true;([\s\S]*?)\n  \}, \[refresh, refreshCatalog, pollMs\]\);/)?.[1];
   assert.ok(effect); assert.doesNotMatch(effect, /api\.(start|stop|prepare)/);
-  assert.doesNotMatch(panel, /window\.confirm|submitTestIntent|setFlag|applyBinanceFuturesSettings/);
+  assert.doesNotMatch(panel, /window\.confirm|submitTestIntent|setFlag|applyBinanceFuturesSettings|releaseDryRun|short-live-ack|setAcknowledged/);
+  assert.match(panel, /동의하고 실거래 시작/);
+  assert.match(panel, /confirmed: true, confirmationText: SHORT_LIVE_CONFIRMATION/);
+  assert.match(panel, /실제 자금으로 주문하며 손실이 발생할 수 있습니다/);
 });
 
 test("source position percentages remain explicit, including old 5 percent and new 100 percent", () => {
@@ -282,9 +284,9 @@ test("preparation expires at the exact boundary and missing expiry never enables
   const expiry = Date.parse(state.prepared.expiresAt);
   assert.deepEqual(shortLivePreparationWindow(state.prepared, expiry - 1), { status: "VALID", remainingSeconds: 1 });
   assert.deepEqual(shortLivePreparationWindow(state.prepared, expiry), { status: "EXPIRED", remainingSeconds: 0 });
-  assert.equal(shortLiveCanStart(state, { ...options, now: expiry - 1 }), true);
-  assert.equal(shortLiveCanStart(state, { ...options, now: expiry }), false);
-  state.prepared.expiresAt = ""; assert.equal(shortLiveCanStart(state, options), false);
+  assert.equal(shortLiveReadyForConsent(state, { ...options, now: expiry - 1 }), true);
+  assert.equal(shortLiveReadyForConsent(state, { ...options, now: expiry }), false);
+  state.prepared.expiresAt = ""; assert.equal(shortLiveReadyForConsent(state, options), false);
 });
 test("actual route budget, attempts and fill observations stay distinct from inferred trade counts", () => {
   const state = normalizeShortLiveSnapshot({ runtime: { brokerRows: [{ route: "BINANCE_SPOT", effectiveRouteBudgetKrw: 23000, brokerBudgetKrw: 100000, routeBudgetKrw: 50000, lossBasis: "ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX", actualFeeKnown: false }], strategyRows: [{ instanceId: "actual-instance", route: "BINANCE_SPOT", pluginId: "rsi_revert", symbol: "BTCUSDT", timeframe: "1h", decisionCount: 4, orderAttemptCount: 2, fillObservationCount: 3, internalAllocationTransferCount: 1 }] } });

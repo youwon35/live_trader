@@ -135,6 +135,7 @@ export function shortLiveBlockerLabel(value) {
     EMERGENCY_OR_RISK_HALT_ACTIVE: "긴급 중지 또는 위험 중지가 적용 중",
     MANUAL_NEW_ENTRIES_BLOCKED: "사용자가 신규 진입을 차단한 상태",
     NEW_ENTRIES_BLOCKED: "현재 신규 진입이 차단된 상태",
+    GLOBAL_MONITOR_STOP_REQUESTED: "운영자가 중지를 요청함 · 새 준비 후 직접 재시작 필요",
     OTHER_RUNTIME_ACTIVE: "다른 실행이 진행 중이어서 동시 시험을 시작할 수 없음",
     OTHER_FUNCTIONAL_AUTHORITY_ACTIVE: "다른 주문 기능시험이 같은 주문 경로를 사용 중",
     GENUINE_UI_OWNER_UNAVAILABLE: "정상 Live Trader 앱의 실행 소유자를 확인하지 못함",
@@ -469,10 +470,9 @@ export function shortLivePreparationWindow(prepared, now = Date.now()) {
   return { status: expiry > now ? "VALID" : "EXPIRED", remainingSeconds: Math.max(0, Math.ceil((expiry - now) / 1000)) };
 }
 
-export function shortLiveCanStart(snapshot, { fresh = false, acknowledged = false, confirmationText = "", selectionUnchanged = false, preparedAuthority = "", preparedScopeMatches = false, now = Date.now() } = {}) {
+export function shortLiveReadyForConsent(snapshot, { fresh = false, selectionUnchanged = false, preparedAuthority = "", preparedScopeMatches = false, now = Date.now() } = {}) {
   const ready = snapshot?.prepared;
-  return fresh === true && acknowledged === true && selectionUnchanged === true
-    && confirmationText === SHORT_LIVE_CONFIRMATION && ready?.readyToStart === true
+  return fresh === true && selectionUnchanged === true && ready?.readyToStart === true
     && Boolean(ready.preparationId) && hashes.test(ready.scopeHash)
     && preparedAuthority === `${ready.preparationId}:${ready.scopeHash}`
     && preparedScopeMatches === true

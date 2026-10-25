@@ -24,7 +24,7 @@ const row={selectionKey:'STRATEGY_INSTANCE:fixture:future',kind:'STRATEGY_INSTAN
 let state={schemaVersion:'fixture-only',fixture:true,status:'IDLE',catalog:[row],blockers:[],prepared:null,runtime:null};
 const calls=[];
 window.__futuresFixture={calls,observe:()=>{state={...state,runtime:{sessionId:'fixture',status:'BLOCKED',newEntriesBlocked:true,ownerAlive:true,brokerRows:[{route:'BINANCE_USDM_FUTURES',effectiveRouteBudgetKrw:1000,brokerBudgetKrw:100000,committedCapitalKrw:1000,notionalExposureKrw:5000,protections:[{symbol:'SOLUSDT',positionSide:'LONG',status:'TRIGGERED',triggerPrice:98,verified:true,observedAt:'2026-10-25T12:00:00Z'}],futuresPositions:[{symbol:'SOLUSDT',positionSide:'LONG',markPrice:100,actualLiquidationPrice:80.5,leverage:5}],futuresIncidents:[{type:'LIQUIDATION',symbol:'SOLUSDT',positionSide:'LONG',quantity:0.5,verified:true,observedAt:'2026-10-25T12:00:01Z'}]}]}};}};
-const api={snapshot:async()=>structuredClone(state),catalog:async()=>({catalog:state.catalog}),prepare:async(body)=>{calls.push({method:'prepare',body});state={...state,status:'PREPARED',prepared:{preparationId:'fixture-prep',scopeHash:hash,readyToStart:true,targets:[row],blockers:[],durationHours:body.durationHours,capitalKrwPerBroker:body.capitalKrwPerBroker,dailyLossStopKrwPerBroker:body.dailyLossStopKrwPerBroker,futuresPolicy:body.futuresPolicy,expiresAt:new Date(Date.now()+120000).toISOString()}};return structuredClone(state);},start:async()=>{throw new Error('START_MUST_NOT_BE_CALLED');},stop:async()=>{throw new Error('STOP_MUST_NOT_BE_CALLED');}};
+const api={snapshot:async()=>structuredClone(state),catalog:async()=>({catalog:state.catalog}),prepare:async(body)=>{calls.push({method:'prepare',body});state={...state,status:'PREPARED',prepared:{preparationId:'fixture-prep',scopeHash:hash,readyToStart:true,targets:[row],blockers:[],durationHours:body.durationHours,capitalKrwPerBroker:body.capitalKrwPerBroker,dailyLossStopKrwPerBroker:body.dailyLossStopKrwPerBroker,futuresPolicy:body.futuresPolicy,expiresAt:new Date(Date.now()+180000).toISOString()}};return structuredClone(state);},start:async()=>{throw new Error('START_MUST_NOT_BE_CALLED');},stop:async()=>{throw new Error('STOP_MUST_NOT_BE_CALLED');}};
 createRoot(document.getElementById('root')).render(<ShortLiveTestPanel api={api} pollMs={1000}/>);
 `;
 await build({ stdin: { contents: entry, resolveDir: root, loader: "jsx" }, bundle: true,
@@ -63,7 +63,7 @@ try {
   await page.goto(origin);
   await page.getByRole("checkbox", { name: "시험 대상 선물 화면검사 전략", exact: true }).check();
   const prepare = page.getByRole("button", { name: "무주문 준비 검사", exact: true });
-  const start = page.getByRole("button", { name: "선택한 범위로 실제 주문 시험 시작", exact: true });
+  const start = page.getByRole("button", { name: "동의하고 실거래 시작", exact: true });
   const leverage = page.getByLabel("선물 기대 레버리지", { exact: true });
   const stop = page.getByLabel("선물 보호 손절 가격 거리 퍼센트", { exact: true });
   assert.equal(await leverage.inputValue(), "1"); assert.equal(await stop.inputValue(), "");
@@ -77,14 +77,11 @@ try {
   assert.deepEqual(calls[0].body.futuresPolicy, { leverage: 5, marginMode: "ISOLATED", stopLossPercent: 2 });
   assert.equal(calls[0].body.capitalKrwPerBroker, 100000);
   report.checks.push("explicit valid 5x/2% policy is required; actual capital is unchanged and no settings mutation occurs");
-  const acknowledgment = page.locator('.short-live-ack input');
-  await acknowledgment.check(); await page.getByLabel("실제 주문 시험 시작 확인 문구").fill("실제 주문 시험 시작");
   await page.waitForFunction(() => !document.querySelector('.short-live-real-start').disabled);
   await stop.fill("1.5");
-  assert.equal(await start.isDisabled(), true); assert.equal(await acknowledgment.isChecked(), false);
-  assert.equal(await page.getByLabel("실제 주문 시험 시작 확인 문구").inputValue(), "");
+  assert.equal(await start.isDisabled(), true);
   assert.equal((await page.evaluate(() => window.__futuresFixture.calls)).length, 1);
-  report.checks.push("changing protection policy invalidates preparation and clears manual confirmation without auto-preparing or starting");
+  report.checks.push("changing protection policy invalidates preparation without auto-preparing or starting");
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false);
   const selectedText = await page.locator('.short-live-selection li > span').boundingBox();

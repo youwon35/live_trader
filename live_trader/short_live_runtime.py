@@ -101,7 +101,7 @@ def genuine_owner_alive() -> bool:
 
 
 def request_global_stop() -> None:
-    """Publish a global MONITOR reduction without waiting under state locks."""
+    """Publish an explicit operator stop without waiting under state locks."""
     _GLOBAL_STOP.set()
 
 
@@ -232,21 +232,15 @@ def _controls() -> list[str]:
     reasons = []
     if not state.real_orders_enabled():
         reasons.append("REAL_ORDERS_DISABLED")
-    if state.STATE.get("dry_run") is not False:
-        reasons.append("DRY_RUN_ACTIVE")
-    # This lane receives its own exact manual consent in service.start().
-    # Explicit withdrawal via set_flag still latches a global stop.
-    # This separate, explicitly confirmed bounded lane does not require an
-    # ordinary promoted Deployment mode. Global MONITOR reductions still stop
-    # it through the dedicated latch, while every money/Kill control remains.
+    # A bounded short session receives exact manual consent in service.start().
+    # Ordinary dry-run/operator/aggregate entry flags are not its authority:
+    # fresh selected-route readiness and session reconciliation enforce the
+    # actual funding, ownership, loss and protection conditions. Explicit
+    # operator safety reductions still latch a stop through set_flag/MONITOR.
     if _GLOBAL_STOP.is_set():
         reasons.append("GLOBAL_MONITOR_STOP_REQUESTED")
     if state.STATE.get("kill_switch") or emergency_stop_active() or state.durable_control_snapshot().get("halted"):
         reasons.append("EMERGENCY_OR_RISK_HALT_ACTIVE")
-    if state.STATE.get("manual_new_entries_blocked"):
-        reasons.append("MANUAL_NEW_ENTRIES_BLOCKED")
-    if state.STATE.get("new_entries_blocked"):
-        reasons.append("NEW_ENTRIES_BLOCKED")
     if any(state.STATE.get("active_runtime_session_ids", {}).values()):
         reasons.append("OTHER_RUNTIME_ACTIVE")
     for runtime in state.LIVE_CONTINUOUS_CONTROLLER.snapshot().get("runtimes", {}).values():
@@ -275,9 +269,7 @@ def get_service() -> ShortLiveTestService:
                 reducing = order.get("riskReducing") is True
                 controls = _controls()
                 if reducing:
-                    controls = [r for r in controls if r not in {
-                        "MANUAL_NEW_ENTRIES_BLOCKED", "EXPLICIT_LIVE_MODE_REQUIRED",
-                        "OPERATOR_CONFIRMATION_REQUIRED", "DRY_RUN_ACTIVE", "NEW_ENTRIES_BLOCKED", "GLOBAL_MONITOR_STOP_REQUESTED"}]
+                    controls = [r for r in controls if r != "GLOBAL_MONITOR_STOP_REQUESTED"]
                 return bool(service and service.dispatch_authorized(order) and not controls
                             and live_trader_instance_lease_status().get("acquired") is True)
 

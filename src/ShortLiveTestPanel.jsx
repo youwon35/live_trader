@@ -1,23 +1,30 @@
 import * as React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Clock3, Play, RefreshCw, ShieldAlert, Square } from "lucide-react";
-import { getShortLiveTestSnapshot, getShortLiveTestCatalog, prepareShortLiveTest, startShortLiveTest, stopShortLiveTest, releaseShortLiveDryRun } from "./shortLiveTestApi.js";
+import { getShortLiveTestSnapshot, getShortLiveTestCatalog, prepareShortLiveTest, startShortLiveTest, stopShortLiveTest } from "./shortLiveTestApi.js";
 import {
   SHORT_LIVE_CONFIRMATION, SHORT_LIVE_DEFAULTS, SHORT_LIVE_ROUTES, SHORT_LIVE_TIMEFRAMES,
   buildShortLivePrepare, normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveBlockerLabel,
-  shortLiveCanStart, shortLiveCoverage, shortLiveRunning, shortLiveRuntimeMeaning, shortLiveSelectionSignature, shortLivePreparationMatches,
+  shortLiveReadyForConsent, shortLiveCoverage, shortLiveRunning, shortLiveRuntimeMeaning, shortLiveSelectionSignature, shortLivePreparationMatches,
   shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLivePreparationWindow,
   normalizeShortLiveFuturesPolicy, shortLiveProtectionLabel, shortLiveFuturesIncidentLabel,
 } from "./shortLiveTestModel.js";
 import "./ShortLiveTestPanel.css";
 
-const defaultApi = { snapshot: getShortLiveTestSnapshot, catalog: getShortLiveTestCatalog, prepare: prepareShortLiveTest, start: startShortLiveTest, stop: stopShortLiveTest, releaseDryRun: releaseShortLiveDryRun };
+const defaultApi = { snapshot: getShortLiveTestSnapshot, catalog: getShortLiveTestCatalog, prepare: prepareShortLiveTest, start: startShortLiveTest, stop: stopShortLiveTest };
 const money = (value) => value === null || value === undefined ? "미확인" : `${new Intl.NumberFormat("ko-KR").format(value)}원`;
 const date = (value) => { const parsed = new Date(value); return value && !Number.isNaN(parsed.getTime()) ? parsed.toLocaleString("ko-KR", { timeZone: "Asia/Seoul" }) : "미기록"; };
 const kindLabel = (kind) => kind === "portfolio" ? "포트폴리오" : "인스턴스";
 const compactHash = (value) => value ? `${value.slice(0, 10)}…${value.slice(-6)}` : "원본 해시 없음";
 const remainingTime = (seconds) => `${Math.floor(seconds / 60)}분 ${seconds % 60}초`;
 const futuresPrice = (value) => value === null || value === undefined || value <= 0 ? "미확인" : `${new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 8 }).format(value)} USDT`;
+const preparedTargetText = (target) => [
+  sanitizeShortLiveText(target.label || target.selectionKey || target.id || "선택 대상"),
+  (Array.isArray(target.routes) && target.routes.length ? target.routes : [target.route]).filter(Boolean)
+    .map((id) => SHORT_LIVE_ROUTES.find((route) => route.id === id)?.label || sanitizeShortLiveText(id)).join(" / "),
+  (Array.isArray(target.timeframes) && target.timeframes.length ? target.timeframes : [target.timeframe]).filter(Boolean)
+    .map(sanitizeShortLiveText).join(" / "),
+].filter(Boolean).join(" · ");
 
 function Blockers({ values = [], label = "진행을 막는 사유" }) {
   const rows = [...new Set(values.map(shortLiveBlockerLabel))];
@@ -43,13 +50,10 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const [catalogError, setCatalogError] = useState("");
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogReady, setCatalogReady] = useState(false);
-  const [acknowledged, setAcknowledged] = useState(false);
-  const [confirmationText, setConfirmationText] = useState("");
   const [preparedSelection, setPreparedSelection] = useState("");
   const [preparedAuthority, setPreparedAuthority] = useState("");
   const [unknownMutation, setUnknownMutation] = useState("");
   const [showLegacy, setShowLegacy] = useState(false);
-  const [dryRunReleased, setDryRunReleased] = useState(false);
   const mounted = useRef(false);
   const pollFlight = useRef(null);
   const catalogFlight = useRef(null);
@@ -70,8 +74,8 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const hiddenSelectionCount = selection.filter((key) => !visibleCandidates.some((row) => row.selectionKey === key)).length;
   const preparationWindow = shortLivePreparationWindow(snapshot.prepared, now);
   const preparationValid = preparationWindow.status === "VALID";
-  const canStart = !busy && !catalogLoading && catalogReady && !unknownMutation && shortLiveCanStart(snapshot, {
-    fresh, acknowledged, confirmationText, selectionUnchanged: preparedSelection === selectionSignature, preparedAuthority,
+  const canStart = !busy && !catalogLoading && catalogReady && !unknownMutation && shortLiveReadyForConsent(snapshot, {
+    fresh, selectionUnchanged: preparedSelection === selectionSignature, preparedAuthority,
     preparedScopeMatches: shortLivePreparationMatches(snapshot.prepared, snapshot.catalog, selection, durationHours, futuresPolicy),
     now,
   });
@@ -135,16 +139,12 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     return () => { mounted.current = false; clearInterval(timer); };
   }, [refresh, refreshCatalog, pollMs]);
 
-  useEffect(() => { setAcknowledged(false); setConfirmationText(""); }, [selectionSignature, snapshot.prepared?.scopeHash]);
   useEffect(() => {
     if (!snapshot.prepared || active) return;
     setNow(Date.now());
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [snapshot.prepared?.expiresAt, active]);
-  useEffect(() => {
-    if (!preparationValid) { setAcknowledged(false); setConfirmationText(""); }
-  }, [preparationValid]);
 
   function changeSelection(key) {
     if (locked) return;
@@ -158,7 +158,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     try { body = buildShortLivePrepare(snapshot.catalog, selection, { ...SHORT_LIVE_DEFAULTS, durationHours, futuresPolicy }); }
     catch (failure) { setError(failure.message); return; }
     mutationPending.current = true; snapshotVersion.current += 1;
-    setBusy("prepare"); setError(""); setMessage(""); setFresh(false); setDryRunReleased(false);
+    setBusy("prepare"); setError(""); setMessage(""); setFresh(false);
     setPreparedSelection(""); setPreparedAuthority("");
     try {
       const result = await api.prepare(body);
@@ -181,24 +181,6 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     } finally { mutationPending.current = false; setBusy(""); }
   }
 
-  async function releaseDryRun() {
-    if (locked || !fresh || mutationPending.current || typeof api.releaseDryRun !== "function") return;
-    mutationPending.current = true; snapshotVersion.current += 1;
-    setBusy("release-dry-run"); setError(""); setMessage(""); setFresh(false);
-    setPreparedSelection(""); setPreparedAuthority("");
-    setAcknowledged(false); setConfirmationText("");
-    try {
-      await api.releaseDryRun();
-      setDryRunReleased(true);
-      setMessage("모의 실행 해제를 확인했습니다. 선택한 전략은 유지됩니다. 무주문 준비 검사를 다시 실행한 뒤 마지막 시작 화면에서 확인해 주세요.");
-    } catch (failure) {
-      setError(shortLiveBlockerLabel(failure?.message));
-    } finally {
-      await refresh({ forceFresh: true });
-      mutationPending.current = false; setBusy("");
-    }
-  }
-
   async function start() {
     if (!canStart || mutationPending.current || shortLivePreparationWindow(snapshot.prepared).status !== "VALID") return;
     const prepared = snapshot.prepared;
@@ -208,12 +190,10 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
       const result = await api.start({ preparationId: prepared.preparationId, scopeHash: prepared.scopeHash,
         confirmed: true, confirmationText: SHORT_LIVE_CONFIRMATION });
       acceptStatus(result);
-      setAcknowledged(false); setConfirmationText("");
       setMessage("시작 요청을 보냈습니다. 실제 실행·주문·체결 상태는 아래 관측 결과로 확인합니다.");
       await refresh({ forceFresh: true });
     } catch (failure) {
       setFresh(false); setPreparedSelection(""); setPreparedAuthority("");
-      setAcknowledged(false); setConfirmationText("");
       if (failure?.knownPreMutationRejection === true) {
         setError(`시작 요청이 실행 전에 거절됐습니다. ${shortLiveBlockerLabel(failure?.message)}`);
       } else {
@@ -322,20 +302,6 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
       <p>선택 {selection.length}개 · {durationHours}시간 · 자동 재시도 없음</p>
       <button type="button" className="primary-button" onClick={prepare} disabled={locked || !fresh || !catalogReady || selection.length === 0 || !futuresPolicyValid}>{busy === "prepare" ? "무주문 준비 확인 중…" : "무주문 준비 검사"}</button>
       <Blockers values={snapshot.prepared?.blockers} label="선택한 시험의 준비 차단 사유" />
-      <div className="short-live-control-help" aria-label="시작 설정 안내">
-        <strong>시작 설정은 이렇게 확인하세요</strong>
-        <p>운영자 확인은 아래 3번의 체크박스·확인 문구로 한 번만 받습니다. 이 시험을 위해 다른 메뉴에서 운용자 확인을 켤 필요는 없습니다.</p>
-        {snapshot.prepared?.blockers?.includes("DRY_RUN_ACTIVE") && <div className="short-live-control-action">
-          <p><strong>모의 실행 켜짐</strong> · 앱 시작 때 켜지는 주문 전송 방지 설정입니다. 아래 버튼의 정상 확인 절차로 해제한 뒤 새 준비 검사를 해 주세요.</p>
-          <button type="button" className="secondary-button" onClick={releaseDryRun} disabled={locked || !fresh || dryRunReleased || typeof api.releaseDryRun !== "function"}>{busy === "release-dry-run" ? "설정 확인 중…" : dryRunReleased ? "해제 확인됨 · 다시 준비해 주세요" : "모의 실행 해제"}</button>
-          <small>앱 전체의 모의 실행 설정을 바꿉니다. 이 버튼으로 시험이 시작되지는 않습니다.</small>
-        </div>}
-        {(snapshot.prepared?.blockers || []).some((code) => code === "NEW_ENTRIES_BLOCKED" || code === "MANUAL_NEW_ENTRIES_BLOCKED") && <div className="short-live-control-action">
-          <p><strong>신규 진입 차단</strong> · 새 매수나 포지션을 늘리는 주문을 멈춥니다. 앱 시작 대기·수동 차단·계좌와 원장 불일치·조회 오류·위험 감시 이상에서 켜질 수 있습니다.</p>
-          <p><strong>실거래 운용 → 한도·안전장치 → 운영 차단 설정 → 신규 진입 차단</strong>에서 상태를 확인하고 정상 확인 절차로 해제합니다.</p>
-          <small>해제 후 다시 켜지면 계좌·포지션 대조와 감시 오류를 먼저 해결해야 합니다. 보호 손절과 위험 감소 주문은 별도 안전 조건에 따라 처리하며, 이 스위치는 이미 접수된 주문을 취소하지 않습니다.</small>
-        </div>}
-      </div>
       {snapshot.prepared?.brokerReadiness?.length > 0 && <div className="short-live-readiness"><h4>거래소별 무주문 계좌 검사</h4>
         <p className="short-live-meta">준비 검사 시 관측한 결과입니다. 계좌 검사와 최종 시작 조건은 따로 표시하며, 시작할 때 다시 검사합니다.</p>
         {snapshot.prepared.brokerReadiness.map((row) => <div key={row.route} className="short-live-notice"><div>
@@ -355,9 +321,16 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
         {!active && <div className={`short-live-expiry ${preparationValid ? "" : "is-expired"}`}><Clock3 size={17} /><span>{preparationValid ? `준비 유효시간 ${remainingTime(preparationWindow.remainingSeconds)} 남음` : preparationWindow.status === "EXPIRED" ? "준비 유효시간 만료 · 무주문 준비 검사를 다시 실행해 주세요." : "준비 유효시간 미확인 · 무주문 준비 검사가 필요합니다."}<small>유효 기한 {date(snapshot.prepared.expiresAt)} · 시작 시 서버에서 다시 확인합니다.</small></span></div>}
         {preparedSelection !== selectionSignature && <p className="short-live-meta">현재 선택·시간·선물 보호 정책으로 무주문 준비 검사를 다시 실행해야 시작할 수 있습니다.</p>}
       </> : <p>아직 준비 결과가 없습니다. 먼저 시험 대상과 시간·금액을 확인해 주세요.</p>}
-      <label className="short-live-ack"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} disabled={locked || !fresh || !preparationValid || !snapshot.prepared?.readyToStart} /> 실제 자금으로 주문될 수 있으며 손실이 발생할 수 있음을 확인했습니다. 선택한 거래소·전략·한도로만 시험합니다.</label>
-      <label className="short-live-confirm-label">확인 문구: {SHORT_LIVE_CONFIRMATION}<input type="text" value={confirmationText} aria-label="실제 주문 시험 시작 확인 문구" autoComplete="off" placeholder={SHORT_LIVE_CONFIRMATION} onChange={(event) => setConfirmationText(event.target.value)} disabled={locked || !fresh || !preparationValid || !snapshot.prepared?.readyToStart} /></label>
-      <button type="button" className="primary-button short-live-real-start" onClick={start} disabled={!canStart}><Play size={16} /> {busy === "start" ? "실제 시작 결과 확인 중…" : "선택한 범위로 실제 주문 시험 시작"}</button>
+      <div className="short-live-consent" id="short-live-consent-summary">
+        <strong>실제 자금으로 주문하며 손실이 발생할 수 있습니다.</strong>
+        <p>아래 버튼을 누르면 지금 확인한 거래소·전략·시간·한도로 실거래 시작에 동의합니다. 주문은 전략 신호와 거래소 조건이 충족될 때 전송됩니다.</p>
+        {snapshot.prepared && <>
+          <p>준비된 시험: {snapshot.prepared.durationHours}시간 · 거래소별 자본 상한 {money(snapshot.prepared.budgetKrwPerBroker)} · 손실 중단 기준 {money(snapshot.prepared.lossKrwPerBroker)}</p>
+          <ul>{snapshot.prepared.targets.map((target, index) => <li key={`${target.selectionKey || target.id}:${index}`}>{preparedTargetText(target)}</li>)}</ul>
+          <small>Binance 현물·선물은 같은 한도를 공유합니다. 급변·체결 지연으로 손실 중단 기준을 넘을 수 있습니다.</small>
+        </>}
+      </div>
+      <button type="button" className="primary-button short-live-real-start" onClick={start} disabled={!canStart} aria-describedby="short-live-consent-summary"><Play size={16} /> {busy === "start" ? "실제 시작 결과 확인 중…" : "동의하고 실거래 시작"}</button>
       <p className="short-live-meta">준비 결과·범위·원본·실제 계좌 조건은 서버가 다시 대조합니다. 이 확인은 성능 승급이나 전 계좌 실거래 승인이 아닙니다.</p>
     </section>
 

@@ -91,26 +91,36 @@ class ShortLiveStatusTests(unittest.TestCase):
         self.assertTrue(view["active"]); self.assertTrue(view["globalStopRequested"])
         self.assertEqual("RUNNING",view["status"],"request intent is not an invented actual stop")
 
-    def test_monitor_ordinary_mode_is_compatible_but_global_stop_and_money_controls_remain(self):
+    def test_ordinary_start_flags_do_not_replace_scoped_consent_or_actual_safety(self):
         state=types.ModuleType(PKG+".state")
-        state.STATE={"mode":"MONITOR","dry_run":False,"operator_confirmed":False,"active_runtime_session_ids":{}}
+        state.STATE={"mode":"MONITOR","dry_run":True,"operator_confirmed":False,
+                     "new_entries_blocked":True,"manual_new_entries_blocked":True,
+                     "broker_truth_blocked":True,"daily_loss_entries_blocked":True,
+                     "watchdog":{"status":"fail"},"active_runtime_session_ids":{}}
         state.real_orders_enabled=lambda:True; state.durable_control_snapshot=lambda:{"halted":False}
         state.LIVE_CONTINUOUS_CONTROLLER=types.SimpleNamespace(snapshot=lambda:{"runtimes":{}})
         state._upbit_order_authority_snapshot=lambda:{"functionalAuthorityOpen":False}
         state._binance_order_authority_snapshot=lambda:{"functionalAuthorityOpen":False}
         with patch.dict(sys.modules,{state.__name__:state}), patch.object(emergency,"emergency_stop_active",return_value=False):
-            self.assertEqual([],runtime._controls(), "scoped manual start consent replaces the duplicate global setting")
-            for name, code in (("new_entries_blocked", "NEW_ENTRIES_BLOCKED"),
-                               ("manual_new_entries_blocked", "MANUAL_NEW_ENTRIES_BLOCKED"),
-                               ("kill_switch", "EMERGENCY_OR_RISK_HALT_ACTIVE")):
-                state.STATE[name] = True
-                self.assertIn(code, runtime._controls())
-                state.STATE[name] = False
+            before=deepcopy(state.STATE)
+            self.assertEqual([],runtime._controls(), "selected-route readiness replaces ordinary aggregate startup flags")
+            self.assertEqual(before,state.STATE,"reading controls must not arm ordinary trading")
+            state.STATE["kill_switch"]=True
+            self.assertIn("EMERGENCY_OR_RISK_HALT_ACTIVE",runtime._controls())
+            state.STATE["kill_switch"]=False
+            state.durable_control_snapshot=lambda:{"halted":True}
+            self.assertIn("EMERGENCY_OR_RISK_HALT_ACTIVE",runtime._controls())
+            state.durable_control_snapshot=lambda:{"halted":False}
+            state.STATE["active_runtime_session_ids"]={"other":"active"}
+            self.assertIn("OTHER_RUNTIME_ACTIVE",runtime._controls())
+            state.STATE["active_runtime_session_ids"]={}
+            state._upbit_order_authority_snapshot=lambda:{"functionalAuthorityOpen":True}
+            self.assertIn("OTHER_FUNCTIONAL_AUTHORITY_ACTIVE",runtime._controls())
+            state._upbit_order_authority_snapshot=lambda:{"functionalAuthorityOpen":False}
             runtime.request_global_stop(); self.assertIn("GLOBAL_MONITOR_STOP_REQUESTED",runtime._controls())
-            state.STATE["dry_run"]=True; self.assertIn("DRY_RUN_ACTIVE",runtime._controls())
             state.real_orders_enabled=lambda:False; self.assertIn("REAL_ORDERS_DISABLED",runtime._controls())
 
-    def test_explicit_operator_consent_withdrawal_stops_short_lane_without_service_lock(self):
+    def test_explicit_safety_reductions_stop_short_lane_without_service_lock(self):
         state = {"operator_confirmed": False}
         namespace = {"STATE": state, "snapshot": lambda: {}, "append_audit": lambda *_: None}
         set_flag = state_function("set_flag", namespace)
@@ -122,6 +132,16 @@ class ShortLiveStatusTests(unittest.TestCase):
             runtime._GLOBAL_STOP.clear()
             self.assertTrue(set_flag("operator_confirmed", False)["ok"])
             self.assertTrue(runtime._GLOBAL_STOP.is_set(), "explicit repeated withdrawal is still a stop")
+            for name in ("dry_run", "new_entries_blocked"):
+                for prior in (False, True):
+                    with self.subTest(name=name,prior=prior):
+                        state[name]=prior
+                        runtime._GLOBAL_STOP.clear()
+                        self.assertTrue(set_flag(name, True)["ok"])
+                        self.assertTrue(runtime._GLOBAL_STOP.is_set())
+            runtime._GLOBAL_STOP.clear()
+            self.assertFalse(set_flag("unknown", True)["ok"])
+            self.assertFalse(runtime._GLOBAL_STOP.is_set())
 
     def test_only_new_inactive_preparation_clears_global_stop(self):
         service=types.SimpleNamespace(_session=None,snapshot=lambda **_: {"ok":True},prepare=lambda _: {})

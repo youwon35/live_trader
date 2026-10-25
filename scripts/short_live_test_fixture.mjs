@@ -3,11 +3,12 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { createServer } from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { resolve, join } from "node:path";
+import { resolve, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const dependencyRoot = process.env.SHORT_LIVE_NODE_MODULES || join(root, "node_modules");
+const designRoot = process.env.SHORT_LIVE_DESIGN_ROOT || resolve(root, "../../packages/design");
 const require = createRequire(join(dependencyRoot, "fixture-resolver.cjs"));
 const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
@@ -25,12 +26,16 @@ const originalHourly={...hourly,selectionKey:'STRATEGY_INSTANCE:fixture:original
 let state={schemaVersion:'fixture-only',fixture:true,status:'IDLE',observedAt:'2026-10-24T06:00:00Z',catalog:{candidates:[row,hourly,originalHourly]},blockers:[],prepared:null,runtime:null};
 const status=()=>({...structuredClone(state),catalogIncluded:false,catalog:[]});let catalogReads=0;let failSnapshot=false;let holdCatalog=false;let releaseCatalog=null;const calls=[];let failStart=false;let failStop=false;let holdNext=false;let releaseSnapshot=null;
 window.__shortLiveFixture={calls, state:()=>state,catalogReads:()=>catalogReads,failSnapshot:()=>{failSnapshot=true;},holdCatalog:()=>{holdCatalog=true;},catalogHeld:()=>Boolean(releaseCatalog),releaseCatalog:()=>{releaseCatalog?.();releaseCatalog=null;}, setBlocked:()=>{state={...state,blockers:['insufficient-balance']};}, reset:()=>{state={...state,blockers:[]};}, failStart:()=>{failStart=true;},failStop:()=>{failStop=true;},holdNextSnapshot:()=>{holdNext=true;},snapshotHeld:()=>Boolean(releaseSnapshot),releaseSnapshot:()=>{releaseSnapshot?.();releaseSnapshot=null;},expirePreparation:()=>{state={...state,prepared:{...state.prepared,expiresAt:new Date(Date.now()-1000).toISOString()}};}};
-const api={catalog:async()=>{catalogReads++;if(holdCatalog){holdCatalog=false;await new Promise(resolve=>{releaseCatalog=resolve;});}return {schemaVersion:'short-live-test-catalog-v1',catalog:structuredClone(state.catalog.candidates),readOnly:true,authorityGranted:false};},snapshot:async()=>{if(failSnapshot){failSnapshot=false;throw new Error('검사용 상태 시간 초과');}if(holdNext){holdNext=false;const old=status();return new Promise(resolve=>{releaseSnapshot=()=>resolve(old);});}return status();},prepare:async(body)=>{calls.push({method:'prepare',body});state={...state,status:'PREPARED',prepared:{preparationId:'fixture-preparation',scopeHash:hash,readyToStart:true,targets:body.selections.map(target=>state.catalog.candidates.find(candidate=>candidate.selectionKey===target.selectionKey)),blockers:[],durationHours:body.durationHours,capitalKrwPerBroker:body.capitalKrwPerBroker,dailyLossStopKrwPerBroker:body.dailyLossStopKrwPerBroker,expiresAt:new Date(Date.now()+120000).toISOString()}};return {snapshot:status()};},start:async(body)=>{calls.push({method:'start',body});state={...state,status:'RUNNING',runtime:{sessionId:'fixture-session',status:'RUNNING',ownerAlive:true,workerAlive:true,newEntriesBlocked:false,naturalExitObserved:false,unknownOrderCount:0,terminalVerified:false,startedAt:'2026-10-24T06:05:00Z',endsAt:'2026-10-24T12:05:00Z',brokerRows:[{route:'BINANCE_SPOT',effectiveRouteBudgetKrw:23000,brokerBudgetKrw:100000,exposureKrw:0,realizedLossKrw:0,unrealizedLossKrw:0,dailyLossStopKrw:50000,lossBasis:'ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX',actualFeeKnown:false,ready:true}],strategyRows:[{instanceId:'fixture-daily',pluginId:'moving_average_cross',symbol:'005930',route:'KIS_KR_CASH',timeframe:'1d',lastSignal:'NOT_OBSERVED',decisionCount:0,orderAttemptCount:0,fillObservationCount:0}]}};if(failStart)throw new Error('FIXTURE_LOST_REPLY');return {snapshot:status()};},stop:async(body)=>{calls.push({method:'stop',body});state={...state,status:'STOPPING',runtime:{...state.runtime,status:'STOPPING',newEntriesBlocked:true}};if(failStop)throw new Error('FIXTURE_LOST_STOP_REPLY');return {snapshot:status()};}};
+const api={catalog:async()=>{catalogReads++;if(holdCatalog){holdCatalog=false;await new Promise(resolve=>{releaseCatalog=resolve;});}return {schemaVersion:'short-live-test-catalog-v1',catalog:structuredClone(state.catalog.candidates),readOnly:true,authorityGranted:false};},snapshot:async()=>{if(failSnapshot){failSnapshot=false;throw new Error('검사용 상태 시간 초과');}if(holdNext){holdNext=false;const old=status();return new Promise(resolve=>{releaseSnapshot=()=>resolve(old);});}return status();},prepare:async(body)=>{calls.push({method:'prepare',body});state={...state,status:'PREPARED',prepared:{preparationId:'fixture-preparation',scopeHash:hash,readyToStart:true,targets:body.selections.map(target=>state.catalog.candidates.find(candidate=>candidate.selectionKey===target.selectionKey)),blockers:[],durationHours:body.durationHours,capitalKrwPerBroker:body.capitalKrwPerBroker,dailyLossStopKrwPerBroker:body.dailyLossStopKrwPerBroker,expiresAt:new Date(Date.now()+180000).toISOString()}};return {snapshot:status()};},start:async(body)=>{calls.push({method:'start',body});state={...state,status:'RUNNING',runtime:{sessionId:'fixture-session',status:'RUNNING',ownerAlive:true,workerAlive:true,newEntriesBlocked:false,naturalExitObserved:false,unknownOrderCount:0,terminalVerified:false,startedAt:'2026-10-24T06:05:00Z',endsAt:'2026-10-24T12:05:00Z',brokerRows:[{route:'BINANCE_SPOT',effectiveRouteBudgetKrw:23000,brokerBudgetKrw:100000,exposureKrw:0,realizedLossKrw:0,unrealizedLossKrw:0,dailyLossStopKrw:50000,lossBasis:'ACCOUNT_NATIVE_EQUITY_DECLINE_AT_FRESH_FX',actualFeeKnown:false,ready:true}],strategyRows:[{instanceId:'fixture-daily',pluginId:'moving_average_cross',symbol:'005930',route:'KIS_KR_CASH',timeframe:'1d',lastSignal:'NOT_OBSERVED',decisionCount:0,orderAttemptCount:0,fillObservationCount:0}]}};if(failStart)throw new Error('FIXTURE_LOST_REPLY');return {snapshot:status()};},stop:async(body)=>{calls.push({method:'stop',body});state={...state,status:'STOPPING',runtime:{...state.runtime,status:'STOPPING',newEntriesBlocked:true}};if(failStop)throw new Error('FIXTURE_LOST_STOP_REPLY');return {snapshot:status()};}};
 createRoot(document.getElementById('root')).render(<ShortLiveTestPanel api={api} pollMs={1000}/>);
 `;
 await build({ stdin: { contents: entry, resolveDir: root, loader: "jsx" }, bundle: true, format: "esm",
   nodePaths: [dependencyRoot], outfile: join(output, "fixture.js"), loader: { ".css": "css" },
-  define: { "process.env.NODE_ENV": '"test"' }, logLevel: "silent" });
+  define: { "process.env.NODE_ENV": '"test"' }, logLevel: "silent",
+  plugins: [{ name: "shared-design-location", setup(build) {
+    build.onResolve({ filter: /packages\/design\/(design-tokens|interaction-standards)\.css$/ },
+      (args) => ({ path: join(designRoot, basename(args.path)) }));
+  } }] });
 await writeFile(join(output, "index.html"), '<!doctype html><html lang="ko"><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Offline short live UI fixture</title><link rel="stylesheet" href="/fixture.css"><div id="root"></div><script type="module" src="/fixture.js"></script></html>');
 let forbiddenRequests = 0;
 const server = createServer(async (req, res) => {
@@ -57,7 +62,7 @@ try {
   await page.goto(origin);
   await page.getByText("오프라인 화면 검사", { exact: false }).waitFor();
   await page.getByRole("heading", { name: "짧은 실거래 기능시험", exact: true }).waitFor();
-  const start = page.getByRole("button", { name: "선택한 범위로 실제 주문 시험 시작", exact: true });
+  const start = page.getByRole("button", { name: "동의하고 실거래 시작", exact: true });
   assert.equal(await start.isDisabled(), true);
   assert.deepEqual(await page.evaluate(() => window.__shortLiveFixture.calls), []);
   report.checks.push("mount is GET-only with no implicit prepare/start");
@@ -105,24 +110,21 @@ try {
   assert.equal(await start.isDisabled(), true);
   await page.evaluate(() => window.__shortLiveFixture.releaseSnapshot());
   await page.getByText("서버의 현재 준비 조건 충족", { exact: false }).waitFor();
-  assert.equal(await start.isDisabled(), true);
-  const acknowledgement = page.locator('.short-live-ack input');
-  await acknowledgement.check();
-  await page.getByLabel("실제 주문 시험 시작 확인 문구").fill("실제 주문 시험 시작");
+  assert.equal(await page.locator('.short-live-ack input').count(), 0);
+  assert.equal(await page.getByLabel("실제 주문 시험 시작 확인 문구").count(), 0);
+  assert.equal(await page.getByRole("button", {name:"모의 실행 해제", exact:true}).count(), 0);
   await page.waitForFunction(() => !document.querySelector('.short-live-real-start')?.disabled);
   report.checks.push("a pending stale GET cannot overwrite prepare or prevent binding its exact fresh authority");
   await page.evaluate(() => window.__shortLiveFixture.expirePreparation());
   await page.getByRole("button", { name: "상태 새로 확인", exact: true }).click();
   await page.getByText("준비 유효시간 만료", { exact: false }).waitFor();
-  await page.waitForFunction(() => !document.querySelector('.short-live-ack input')?.checked);
-  assert.equal(await start.isDisabled(), true); assert.equal(await acknowledgement.isChecked(), false);
-  report.checks.push("expired preparation immediately disables start and clears acknowledgement");
+  assert.equal(await start.isDisabled(), true);
+  report.checks.push("expired preparation immediately disables consent start");
   await page.getByLabel("실거래 시험 시간").selectOption("7");
-  assert.equal(await start.isDisabled(), true); assert.equal(await acknowledgement.isChecked(), false);
-  report.checks.push("duration change invalidates prepared authority and manual acknowledgement");
+  assert.equal(await start.isDisabled(), true);
+  report.checks.push("duration change invalidates prepared authority before consent");
   await page.getByRole("button", { name: "무주문 준비 검사", exact: true }).click();
   await page.getByText("서버의 현재 준비 조건 충족", { exact: false }).waitFor();
-  await acknowledgement.check(); await page.getByLabel("실제 주문 시험 시작 확인 문구").fill("실제 주문 시험 시작");
   await page.waitForFunction(() => !document.querySelector('.short-live-real-start')?.disabled);
   await page.evaluate(() => window.__shortLiveFixture.setBlocked());
   await page.getByRole("button", { name: "상태 새로 확인", exact: true }).click();
@@ -130,6 +132,8 @@ try {
   assert.equal(await start.isDisabled(), true); report.checks.push("fresh server blocker disables real start");
   await page.evaluate(() => window.__shortLiveFixture.reset()); await page.getByRole("button", { name: "상태 새로 확인", exact: true }).click();
   await page.waitForFunction(() => !document.querySelector('.short-live-real-start')?.disabled);
+  assert.equal(await page.evaluate(() => window.__shortLiveFixture.calls.filter(row => row.method === "start").length), 0);
+  await page.locator('.short-live-consent').screenshot({path:join(output,"single-consent.png")});
   await start.click();
   await page.getByText("일봉 신호 미관측", { exact: false }).waitFor();
   assert.equal(await page.getByRole("cell", { name: "0 / 0 / 0", exact: true }).count(), 1);
@@ -140,7 +144,7 @@ try {
   await page.getByText("실제 정상 종료 확인 전입니다", { exact: false }).waitFor();
   const calls = await page.evaluate(() => window.__shortLiveFixture.calls);
   assert.deepEqual(calls.map((row) => row.method), ["prepare", "prepare", "start", "stop"]);
-  assert.equal(calls[1].body.durationHours, 7); assert.equal(calls[2].body.confirmed, true);
+  assert.equal(calls[1].body.durationHours, 7); assert.equal(calls[2].body.confirmed, true); assert.equal(calls[2].body.confirmationText, "실제 주문 시험 시작");
   assert.equal(calls[2].body.preparationId, "fixture-preparation");
   assert.equal(calls[3].body.sessionId, "fixture-session");
   report.checks.push("only explicit prepare/start/stop calls; daily no-signal is not failure or PASS; STOPPING is not terminal");
@@ -152,7 +156,6 @@ try {
   await page.getByRole("checkbox", { name: "시험 대상 화면검사 전용 전략", exact: true }).check();
   await page.getByRole("button", { name: "무주문 준비 검사", exact: true }).click();
   await page.getByText("서버의 현재 준비 조건 충족", { exact: false }).waitFor();
-  await acknowledgement.check(); await page.getByLabel("실제 주문 시험 시작 확인 문구").fill("실제 주문 시험 시작");
   await page.waitForFunction(() => !document.querySelector('.short-live-real-start')?.disabled);
   await page.evaluate(() => window.__shortLiveFixture.failStart()); await start.click();
   await page.getByText("시작 결과 미확정", { exact: false }).waitFor();

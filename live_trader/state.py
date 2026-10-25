@@ -13450,9 +13450,11 @@ def set_flag(
                 "emergency_stop_action": emergency_action,
                 "snapshot": snapshot(),
             }
-    if name == "operator_confirmed" and not bool(value):
-        # Preserve explicit consent withdrawal for the separately confirmed
-        # short test. Event-only: never wait on its service lock from here.
+    if ((name == "operator_confirmed" and not bool(value))
+            or (name in {"dry_run", "new_entries_blocked"} and bool(value))):
+        # Explicit safety reductions still stop a separately consented short
+        # test; ordinary startup defaults do not grant or revoke its authority.
+        # Event-only: never wait on its service lock from this mutation lock.
         from .short_live_runtime import request_global_stop
         request_global_stop()
     changed = current_value != bool(value)
