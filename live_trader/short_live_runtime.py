@@ -234,8 +234,8 @@ def _controls() -> list[str]:
         reasons.append("REAL_ORDERS_DISABLED")
     if state.STATE.get("dry_run") is not False:
         reasons.append("DRY_RUN_ACTIVE")
-    if state.STATE.get("operator_confirmed") is not True:
-        reasons.append("OPERATOR_CONFIRMATION_REQUIRED")
+    # This lane receives its own exact manual consent in service.start().
+    # Explicit withdrawal via set_flag still latches a global stop.
     # This separate, explicitly confirmed bounded lane does not require an
     # ordinary promoted Deployment mode. Global MONITOR reductions still stop
     # it through the dedicated latch, while every money/Kill control remains.

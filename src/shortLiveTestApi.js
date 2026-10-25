@@ -1,4 +1,4 @@
-import { request } from "./api.js";
+import { request, setFlag } from "./api.js";
 
 const PRE_START_REJECTIONS = new Set([
   "EXPLICIT_MANUAL_UI_CONFIRMATION_REQUIRED", "PREPARATION_REQUIRED", "DUPLICATE_START_FORBIDDEN",
@@ -38,3 +38,12 @@ export async function getShortLiveTestCatalog() {
 export const prepareShortLiveTest = async (body) => verifyShortLiveResponse(await request("/api/short-live-tests/prepare", { method: "POST", body, timeoutMs: 45000 }), "prepare");
 export const startShortLiveTest = async (body) => verifyShortLiveResponse(await request("/api/short-live-tests/start", { method: "POST", body, timeoutMs: 45000 }), "start");
 export const stopShortLiveTest = async (body) => verifyShortLiveResponse(await request("/api/short-live-tests/stop", { method: "POST", body, timeoutMs: 45000 }), "stop");
+
+// Same operator challenge as the normal safety menu; this never starts a test.
+export async function releaseShortLiveDryRun() {
+  const result = await setFlag("dry_run", false, true);
+  if (result?.ok !== true || result?.snapshot?.dry_run !== false) {
+    throw new Error("모의 실행 해제 결과를 확인하지 못했습니다. 한도·안전장치에서 상태를 확인하고 새 준비 검사를 해 주세요.");
+  }
+  return result;
+}

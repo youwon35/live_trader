@@ -67,3 +67,9 @@
 .short-live-futures-observation h4 { margin-bottom: 10px; }
 @media (max-width: 850px) { .short-live-catalog, .short-live-filters { grid-template-columns: 1fr; } .short-live-limits { grid-template-columns: 1fr; } .short-live-workspace .panel { padding: 16px; } }
 @media (max-width: 440px) { .short-live-limit-summary, .short-live-futures-fields { grid-template-columns: 1fr; } .short-live-catalog { max-height: 480px; } }
+
+.short-live-control-help { margin-top: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.short-live-control-help > p { margin-bottom: 0; }
+.short-live-control-action { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); }
+.short-live-control-action p { margin: 4px 0 10px; }
+.short-live-control-action small { display: block; margin-top: 8px; color: var(--text-muted, #718096); }

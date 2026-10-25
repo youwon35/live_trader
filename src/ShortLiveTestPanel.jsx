@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Clock3, Play, RefreshCw, ShieldAlert, Square } from "lucide-react";
-import { getShortLiveTestSnapshot, getShortLiveTestCatalog, prepareShortLiveTest, startShortLiveTest, stopShortLiveTest } from "./shortLiveTestApi.js";
+import { getShortLiveTestSnapshot, getShortLiveTestCatalog, prepareShortLiveTest, startShortLiveTest, stopShortLiveTest, releaseShortLiveDryRun } from "./shortLiveTestApi.js";
 import {
   SHORT_LIVE_CONFIRMATION, SHORT_LIVE_DEFAULTS, SHORT_LIVE_ROUTES, SHORT_LIVE_TIMEFRAMES,
   buildShortLivePrepare, normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveBlockerLabel,
@@ -11,7 +11,7 @@ import {
 } from "./shortLiveTestModel.js";
 import "./ShortLiveTestPanel.css";
 
-const defaultApi = { snapshot: getShortLiveTestSnapshot, catalog: getShortLiveTestCatalog, prepare: prepareShortLiveTest, start: startShortLiveTest, stop: stopShortLiveTest };
+const defaultApi = { snapshot: getShortLiveTestSnapshot, catalog: getShortLiveTestCatalog, prepare: prepareShortLiveTest, start: startShortLiveTest, stop: stopShortLiveTest, releaseDryRun: releaseShortLiveDryRun };
 const money = (value) => value === null || value === undefined ? "미확인" : `${new Intl.NumberFormat("ko-KR").format(value)}원`;
 const date = (value) => { const parsed = new Date(value); return value && !Number.isNaN(parsed.getTime()) ? parsed.toLocaleString("ko-KR", { timeZone: "Asia/Seoul" }) : "미기록"; };
 const kindLabel = (kind) => kind === "portfolio" ? "포트폴리오" : "인스턴스";
@@ -49,6 +49,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const [preparedAuthority, setPreparedAuthority] = useState("");
   const [unknownMutation, setUnknownMutation] = useState("");
   const [showLegacy, setShowLegacy] = useState(false);
+  const [dryRunReleased, setDryRunReleased] = useState(false);
   const mounted = useRef(false);
   const pollFlight = useRef(null);
   const catalogFlight = useRef(null);
@@ -157,7 +158,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     try { body = buildShortLivePrepare(snapshot.catalog, selection, { ...SHORT_LIVE_DEFAULTS, durationHours, futuresPolicy }); }
     catch (failure) { setError(failure.message); return; }
     mutationPending.current = true; snapshotVersion.current += 1;
-    setBusy("prepare"); setError(""); setMessage(""); setFresh(false);
+    setBusy("prepare"); setError(""); setMessage(""); setFresh(false); setDryRunReleased(false);
     setPreparedSelection(""); setPreparedAuthority("");
     try {
       const result = await api.prepare(body);
@@ -178,6 +179,24 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
       setError(shortLiveBlockerLabel(failure?.message));
       await refresh({ forceFresh: true });
     } finally { mutationPending.current = false; setBusy(""); }
+  }
+
+  async function releaseDryRun() {
+    if (locked || !fresh || mutationPending.current || typeof api.releaseDryRun !== "function") return;
+    mutationPending.current = true; snapshotVersion.current += 1;
+    setBusy("release-dry-run"); setError(""); setMessage(""); setFresh(false);
+    setPreparedSelection(""); setPreparedAuthority("");
+    setAcknowledged(false); setConfirmationText("");
+    try {
+      await api.releaseDryRun();
+      setDryRunReleased(true);
+      setMessage("모의 실행 해제를 확인했습니다. 선택한 전략은 유지됩니다. 무주문 준비 검사를 다시 실행한 뒤 마지막 시작 화면에서 확인해 주세요.");
+    } catch (failure) {
+      setError(shortLiveBlockerLabel(failure?.message));
+    } finally {
+      await refresh({ forceFresh: true });
+      mutationPending.current = false; setBusy("");
+    }
   }
 
   async function start() {
@@ -303,6 +322,20 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
       <p>선택 {selection.length}개 · {durationHours}시간 · 자동 재시도 없음</p>
       <button type="button" className="primary-button" onClick={prepare} disabled={locked || !fresh || !catalogReady || selection.length === 0 || !futuresPolicyValid}>{busy === "prepare" ? "무주문 준비 확인 중…" : "무주문 준비 검사"}</button>
       <Blockers values={snapshot.prepared?.blockers} label="선택한 시험의 준비 차단 사유" />
+      <div className="short-live-control-help" aria-label="시작 설정 안내">
+        <strong>시작 설정은 이렇게 확인하세요</strong>
+        <p>운영자 확인은 아래 3번의 체크박스·확인 문구로 한 번만 받습니다. 이 시험을 위해 다른 메뉴에서 운용자 확인을 켤 필요는 없습니다.</p>
+        {snapshot.prepared?.blockers?.includes("DRY_RUN_ACTIVE") && <div className="short-live-control-action">
+          <p><strong>모의 실행 켜짐</strong> · 앱 시작 때 켜지는 주문 전송 방지 설정입니다. 아래 버튼의 정상 확인 절차로 해제한 뒤 새 준비 검사를 해 주세요.</p>
+          <button type="button" className="secondary-button" onClick={releaseDryRun} disabled={locked || !fresh || dryRunReleased || typeof api.releaseDryRun !== "function"}>{busy === "release-dry-run" ? "설정 확인 중…" : dryRunReleased ? "해제 확인됨 · 다시 준비해 주세요" : "모의 실행 해제"}</button>
+          <small>앱 전체의 모의 실행 설정을 바꿉니다. 이 버튼으로 시험이 시작되지는 않습니다.</small>
+        </div>}
+        {(snapshot.prepared?.blockers || []).some((code) => code === "NEW_ENTRIES_BLOCKED" || code === "MANUAL_NEW_ENTRIES_BLOCKED") && <div className="short-live-control-action">
+          <p><strong>신규 진입 차단</strong> · 새 매수나 포지션을 늘리는 주문을 멈춥니다. 앱 시작 대기·수동 차단·계좌와 원장 불일치·조회 오류·위험 감시 이상에서 켜질 수 있습니다.</p>
+          <p><strong>실거래 운용 → 한도·안전장치 → 운영 차단 설정 → 신규 진입 차단</strong>에서 상태를 확인하고 정상 확인 절차로 해제합니다.</p>
+          <small>해제 후 다시 켜지면 계좌·포지션 대조와 감시 오류를 먼저 해결해야 합니다. 보호 손절과 위험 감소 주문은 별도 안전 조건에 따라 처리하며, 이 스위치는 이미 접수된 주문을 취소하지 않습니다.</small>
+        </div>}
+      </div>
       {snapshot.prepared?.brokerReadiness?.length > 0 && <div className="short-live-readiness"><h4>거래소별 무주문 계좌 검사</h4>
         <p className="short-live-meta">준비 검사 시 관측한 결과입니다. 계좌 검사와 최종 시작 조건은 따로 표시하며, 시작할 때 다시 검사합니다.</p>
         {snapshot.prepared.brokerReadiness.map((row) => <div key={row.route} className="short-live-notice"><div>

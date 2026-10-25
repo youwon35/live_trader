@@ -12,7 +12,7 @@ const { build } = require("esbuild");
 const bundle = await build({ entryPoints: [join(root, "src", "shortLiveTestApi.js")], bundle: true,
   write: false, format: "esm", platform: "node", logLevel: "silent", plugins: [{ name: "no-network-transport", setup(build) {
     build.onResolve({ filter: /^\.\/api\.js$/ }, () => ({ path: "fixture-transport", namespace: "offline" }));
-    build.onLoad({ filter: /.*/, namespace: "offline" }, () => ({ contents: "export const request = (...args) => globalThis.__shortLiveApiTransport(...args);", loader: "js" }));
+    build.onLoad({ filter: /.*/, namespace: "offline" }, () => ({ contents: "export const request = (...args) => globalThis.__shortLiveApiTransport(...args); export const setFlag = (...args) => globalThis.__shortLiveFlagTransport(...args);", loader: "js" }));
   } }] });
 const api = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString("base64")}`);
 const good = () => ({ ok: true, status: "IDLE", catalog: [], prepared: null, runtime: null });
@@ -64,4 +64,20 @@ test("catalog discovery is a separate authenticated read-only shape and bounded 
     globalThis.__shortLiveApiTransport = async () => value;
     await assert.rejects(api.getShortLiveTestCatalog(), /SHORT_LIVE_CATALOG_UNVERIFIED/);
   }
+});
+
+test("dry-run shortcut uses the existing confirmed flag flow and verifies actual false", async () => {
+  const calls = [];
+  globalThis.__shortLiveFlagTransport = async (...args) => { calls.push(args); return { ok: true, snapshot: { dry_run: false } }; };
+  globalThis.__shortLiveApiTransport = async () => { throw new Error("must not prepare or start"); };
+  await api.releaseShortLiveDryRun();
+  assert.deepEqual(calls, [["dry_run", false, true]]);
+  for (const result of [{ok:false}, {ok:true}, {ok:true,snapshot:{dry_run:true}}, {ok:true,snapshot:{dry_run:"false"}}]) {
+    globalThis.__shortLiveFlagTransport = async () => result;
+    await assert.rejects(api.releaseShortLiveDryRun(), /해제 결과를 확인하지 못/);
+  }
+  let count = 0;
+  globalThis.__shortLiveFlagTransport = async () => { count++; throw new Error("cancelled or lost reply"); };
+  await assert.rejects(api.releaseShortLiveDryRun(), /cancelled or lost reply/);
+  assert.equal(count, 1);
 });

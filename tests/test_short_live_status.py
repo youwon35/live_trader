@@ -93,16 +93,35 @@ class ShortLiveStatusTests(unittest.TestCase):
 
     def test_monitor_ordinary_mode_is_compatible_but_global_stop_and_money_controls_remain(self):
         state=types.ModuleType(PKG+".state")
-        state.STATE={"mode":"MONITOR","dry_run":False,"operator_confirmed":True,"active_runtime_session_ids":{}}
+        state.STATE={"mode":"MONITOR","dry_run":False,"operator_confirmed":False,"active_runtime_session_ids":{}}
         state.real_orders_enabled=lambda:True; state.durable_control_snapshot=lambda:{"halted":False}
         state.LIVE_CONTINUOUS_CONTROLLER=types.SimpleNamespace(snapshot=lambda:{"runtimes":{}})
         state._upbit_order_authority_snapshot=lambda:{"functionalAuthorityOpen":False}
         state._binance_order_authority_snapshot=lambda:{"functionalAuthorityOpen":False}
         with patch.dict(sys.modules,{state.__name__:state}), patch.object(emergency,"emergency_stop_active",return_value=False):
-            self.assertEqual([],runtime._controls())
+            self.assertEqual([],runtime._controls(), "scoped manual start consent replaces the duplicate global setting")
+            for name, code in (("new_entries_blocked", "NEW_ENTRIES_BLOCKED"),
+                               ("manual_new_entries_blocked", "MANUAL_NEW_ENTRIES_BLOCKED"),
+                               ("kill_switch", "EMERGENCY_OR_RISK_HALT_ACTIVE")):
+                state.STATE[name] = True
+                self.assertIn(code, runtime._controls())
+                state.STATE[name] = False
             runtime.request_global_stop(); self.assertIn("GLOBAL_MONITOR_STOP_REQUESTED",runtime._controls())
             state.STATE["dry_run"]=True; self.assertIn("DRY_RUN_ACTIVE",runtime._controls())
             state.real_orders_enabled=lambda:False; self.assertIn("REAL_ORDERS_DISABLED",runtime._controls())
+
+    def test_explicit_operator_consent_withdrawal_stops_short_lane_without_service_lock(self):
+        state = {"operator_confirmed": False}
+        namespace = {"STATE": state, "snapshot": lambda: {}, "append_audit": lambda *_: None}
+        set_flag = state_function("set_flag", namespace)
+        with patch.object(runtime, "get_service", side_effect=AssertionError("must not acquire service")):
+            self.assertTrue(set_flag("operator_confirmed", True)["ok"])
+            self.assertFalse(runtime._GLOBAL_STOP.is_set())
+            self.assertTrue(set_flag("operator_confirmed", False)["ok"])
+            self.assertTrue(runtime._GLOBAL_STOP.is_set())
+            runtime._GLOBAL_STOP.clear()
+            self.assertTrue(set_flag("operator_confirmed", False)["ok"])
+            self.assertTrue(runtime._GLOBAL_STOP.is_set(), "explicit repeated withdrawal is still a stop")
 
     def test_only_new_inactive_preparation_clears_global_stop(self):
         service=types.SimpleNamespace(_session=None,snapshot=lambda **_: {"ok":True},prepare=lambda _: {})

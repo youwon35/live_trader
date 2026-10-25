@@ -13450,6 +13450,11 @@ def set_flag(
                 "emergency_stop_action": emergency_action,
                 "snapshot": snapshot(),
             }
+    if name == "operator_confirmed" and not bool(value):
+        # Preserve explicit consent withdrawal for the separately confirmed
+        # short test. Event-only: never wait on its service lock from here.
+        from .short_live_runtime import request_global_stop
+        request_global_stop()
     changed = current_value != bool(value)
     opens_live_risk = risky_release or (
         name == "operator_confirmed"
