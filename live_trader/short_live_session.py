@@ -64,7 +64,7 @@ class ShortLiveTestService:
                  clock_guard: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
                  owner_is_alive: Callable[[], bool] | None = None,
                  background: bool = True, poll_seconds: float = 0.5,
-                 preparation_ttl_seconds: float = 120,
+                 preparation_ttl_seconds: float = 180,
                  account_poll_seconds: float = 5, catalog_display_ttl_seconds: float = 10,
                  order_timeout_seconds: float = 60) -> None:
         self.catalog_provider = catalog_provider

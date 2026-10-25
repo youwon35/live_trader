@@ -614,7 +614,10 @@ class ShortLiveSessionTests(unittest.TestCase):
         prepared = self.prepare(service)
         self.assertFalse(prepared["catalogIncluded"])
         self.assertTrue(prepared["prepared"]["readyToStart"])
-        self.now += timedelta(seconds=121)
+        self.now += timedelta(seconds=179, milliseconds=999)
+        current = service.snapshot(include_catalog=False)
+        self.assertTrue(current["prepared"]["readyToStart"])
+        self.now += timedelta(milliseconds=1)
         current = service.snapshot(include_catalog=False)
         self.assertFalse(current["prepared"]["readyToStart"])
         self.assertIn("PREPARATION_EXPIRED", current["prepared"]["blockers"])
@@ -623,6 +626,9 @@ class ShortLiveSessionTests(unittest.TestCase):
         service, brokers, _ = self.service()
         service.catalog()
         prepared = self.prepare(service)["prepared"]
+        # The extra minute must still revalidate the original source at start.
+        self.now += timedelta(seconds=150)
+        self.mono += 150
         self.source.write_text('{"fixture":"changed"}', encoding="utf-8")
         with self.assertRaisesRegex(ShortLiveContractError, "SOURCE_RAW_HASH_CHANGED"):
             service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
