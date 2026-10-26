@@ -1,4 +1,4 @@
-import { SHORT_LIVE_ROUTES, shortLiveBlockerLabel } from './shortLiveTestModel.js';
+import { SHORT_LIVE_ROUTES, shortLiveBlockerLabel, normalizeShortLiveFailureDiagnostics } from './shortLiveTestModel.js';
 
 const known = value => typeof value === 'number' && Number.isFinite(value);
 const stamp = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
@@ -12,6 +12,17 @@ export const monitorEventLabels = {
   CLEANUP_ORDER_OBSERVED: '종료 주문 관측', WORKER_EXIT_INTENT: '작업자 종료 의사 기록',
   WORKER_DEATH_OBSERVED: '작업자 종료 관측', STARTUP_RETIRED_BEFORE_WORKER: '작업자 시작 전 종료',
 };
+
+export function monitorFailureDiagnostic(row) {
+  const providerLabel = ({ binance: 'Binance 현물', 'binance-futures': 'Binance USDT 선물', upbit: 'Upbit', kis: '한국투자증권' })[row.provider] || '거래소 미확인';
+  const kind = row.failureKind || row.status;
+  const kindLabel = ({ TIMEOUT: '응답 시간 초과', HTTP_ERROR: 'HTTP 오류', CONNECTION_ERROR: '연결 오류',
+    INVALID_RESPONSE: '응답 형식 오류', READ_BOUNDARY: '조회 조건 확인 실패', READ_REJECTED: '조회 요청 거절',
+    READ_UNAVAILABLE: '자료 조회 불가', UNEXPECTED_ERROR: '예상하지 못한 조회 오류',
+    AVAILABLE: '조회 완료', BLOCKED: '조회 차단', UNAVAILABLE: '자료 조회 불가', REJECTED: '요청 거절' })[kind];
+  const resultLabel = [row.httpStatus !== null ? `HTTP ${row.httpStatus}` : '', kindLabel ? `${kindLabel} (${kind})` : kind || '원인 미확인'].filter(Boolean).join(' · ');
+  return { ...row, providerLabel, resultLabel, elapsedLabel: known(row.elapsedMs) ? `${(row.elapsedMs / 1000).toFixed(1)}초` : '소요 시간 미기록' };
+}
 
 export function projectRealtimeMonitor(snapshot, { fresh = false, pollError = '', receivedAt = null, now = Date.now(), staleMs = 20000 } = {}) {
   const run = snapshot?.runtime;
@@ -59,11 +70,29 @@ export function projectRealtimeMonitor(snapshot, { fresh = false, pollError = ''
     else state = { tone: feedsRecent ? 'active' : 'neutral', title: feedsRecent ? '전략을 평가하며 다음 신호를 기다립니다' : '최근 전략 평가 기록을 표시합니다', detail: feedsRecent ? '최근 시세 프레임이 수신됐습니다. 신호와 주문 조건이 충족될 때만 거래합니다.' : '과거 평가 횟수만으로 현재 시세 연결을 확인할 수 없습니다. 아래 마지막 수신 시각을 확인하세요.' };
   }
   const started = stamp(run?.startedAt), ends = stamp(run?.endsAt);
-  const progress = started !== null && ends !== null && ends > started ? Math.min(100, Math.max(0, (now - started) / (ends - started) * 100)) : null;
+  const terminalReported = run?.status === 'TERMINATED';
+  const validEndpoint = value => value !== null && started !== null && value >= started && value <= now + 5000;
+  let ended = null;
+  if (terminal) {
+    if (run.terminatedAt) {
+      const declared = stamp(run.terminatedAt);
+      if (validEndpoint(declared)) ended = declared;
+    } else {
+      // Older snapshots omit terminatedAt; only the session's real retirement event can anchor elapsed time.
+      const kind = run.naturalExitObserved ? 'WORKER_DEATH_OBSERVED' : 'STARTUP_RETIRED_BEFORE_WORKER';
+      const observed = (run.recentActivity || []).filter(event => event.kind === kind)
+        .map(event => stamp(event.observedAt)).filter(validEndpoint);
+      if (observed.length) ended = Math.min(...observed);
+    }
+  }
+  const progressAt = terminalReported ? ended : now;
+  const elapsedSeconds = validEndpoint(progressAt) ? Math.floor((progressAt - started) / 1000) : null;
+  const progress = elapsedSeconds !== null && ends !== null && ends > started
+    ? Math.min(100, Math.max(0, (progressAt - started) / (ends - started) * 100)) : null;
   const routes = brokers.map(row => {
     const equity = row.monitorEquity;
     const observed = stamp(row.accountObservedAt);
-    const accountCurrent = responseCurrent && observed !== null && now - observed <= staleMs && observed - now <= 5000;
+    const accountCurrent = !terminalReported && responseCurrent && observed !== null && now - observed <= staleMs && observed - now <= 5000;
     const equityKnown = equity?.basis === 'OBSERVED_NATIVE_EQUITY_CHANGE' && known(equity.baselineNative)
       && known(equity.currentNative) && known(equity.krwPerQuote) && equity.krwPerQuote > 0;
     const changeKrw = equityKnown ? (equity.currentNative - equity.baselineNative) * equity.krwPerQuote : null;
@@ -74,10 +103,11 @@ export function projectRealtimeMonitor(snapshot, { fresh = false, pollError = ''
   });
   const activity = [...(run?.recentActivity || [])].filter(event => monitorEventLabels[event.kind] && stamp(event.observedAt) !== null && stamp(event.observedAt) - now <= 5000)
     .sort((a,b) => stamp(b.observedAt)-stamp(a.observedAt) || (b.sequence || 0)-(a.sequence || 0)).slice(0, 30);
-  return { state, resultHasIssue, responseCurrent, receivedAt, ageMs, terminal, blockers, counts, progress, feeds, feedsRecent,
+  return { state, resultHasIssue, responseCurrent, receivedAt, ageMs, terminal, blockers, counts, progress, elapsedSeconds, terminalReported, terminatedAt: ended === null ? null : new Date(ended).toISOString(), feeds, feedsRecent,
     allAccountsCurrent: coversExpectedRoutes(routes.map(row => row.broker)) && routes.every(row => row.accountCurrent),
     routes, strategies, activity, startedAt: run?.startedAt, endsAt: run?.endsAt,
     runStatus: run?.status, sessionId: run?.sessionId,
     totalChangeKrw: coversExpectedRoutes(routes.map(row => row.broker)) ? sumKnown(routes.map(row => row.changeKrw)) : null,
+    failureDiagnostics: run?.firstFailure ? normalizeShortLiveFailureDiagnostics(run.firstFailureDiagnostics).filter(row => row.status !== 'AVAILABLE').map(monitorFailureDiagnostic) : [],
     firstFailure: run?.firstFailure ? shortLiveBlockerLabel(run.firstFailure) : null };
 }

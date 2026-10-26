@@ -172,6 +172,26 @@ export function shortLiveBlockerLabel(value) {
     KIS_BALANCE_TOTAL_UNKNOWN: "한국투자증권 계좌 잔고 합계를 확인하지 못함",
     KIS_EQUITY_UNKNOWN: "한국투자증권 계좌 평가금액을 확인하지 못함",
     FRESH_FX_REQUIRED: "원화 예산 환산에 사용할 최신 환율 확인 필요",
+    FIRST_FAILURE_JOURNAL_WRITE_FAILED: "최초 오류 기록을 파일에 저장하지 못함 · 신규 진입 차단 유지",
+    NATIVE_FX_TIME_INVALID: "환율 자료의 시각 형식을 확인하지 못함",
+    NATIVE_FX_EXACT_USDT_MARKET_REQUIRED: "환율 환산에 필요한 정확한 KRW-USDT 응답이 아님",
+    NATIVE_FX_EXACT_USDT_TRADE_TIME_REQUIRED: "환율 원본의 실제 체결 시각을 확인하지 못함",
+    NATIVE_FX_CACHED_HTTP_RESPONSE_REJECTED: "저장된 과거 환율 응답이 반환됨 · 최신 응답 필요",
+    NATIVE_FX_HTTP_CLOCK_RTT_INVALID: "환율 응답의 왕복 조회 시간을 확인하지 못함",
+    NATIVE_FX_HTTP_CLOCK_SKEW_OR_RTT_EXCEEDED: "환율 응답의 시각 오차 또는 조회 지연이 허용 범위를 넘음",
+    NATIVE_FX_OFFICIAL_HTTP_DATE_MISSING_OR_INVALID: "환율 응답의 공식 서버 시각이 없거나 유효하지 않음",
+    NATIVE_FX_OFFICIAL_CURRENCY_ROUTE_UNAVAILABLE: "이 통화의 공식 원화 환산 경로를 확인하지 못함",
+    NATIVE_FX_OBSERVATION_MISSING: "원화 환산에 필요한 공식 환율 관측이 없음",
+    NATIVE_FX_OBSERVATION_STALE_OR_FUTURE: "환율 관측이 오래됐거나 미래 시각임 · 최신 관측 필요",
+    NATIVE_FX_HTTP_CLOCK_PROOF_MISSING: "환율 응답과 서버 시각 검증 자료가 일치하지 않음",
+    NATIVE_FX_HTTP_CLOCK_HEADER_BINDING_CHANGED: "환율 응답과 서버 시각 검증 자료가 일치하지 않음",
+    NATIVE_FX_HTTP_CLOCK_LOCAL_BINDING_CHANGED: "환율 응답과 서버 시각 검증 자료가 일치하지 않음",
+    NATIVE_FX_OBSERVATION_SEAL_INVALID: "환율 관측과 공식 원본의 통화·값·시각이 일치하지 않음",
+    NATIVE_FX_OBSERVATION_CURRENCY_OR_ROUTE_MISMATCH: "환율 관측과 공식 원본의 통화·값·시각이 일치하지 않음",
+    NATIVE_FX_OFFICIAL_RESPONSE_BINDING_CHANGED: "환율 관측과 공식 원본의 통화·값·시각이 일치하지 않음",
+    NATIVE_FX_OFFICIAL_RESPONSE_SCOPE_CHANGED: "환율 관측과 공식 원본의 통화·값·시각이 일치하지 않음",
+    NATIVE_FX_RATE_RESPONSE_CHANGED: "환율 관측과 공식 원본의 통화·값·시각이 일치하지 않음",
+    NATIVE_FX_TIME_RESPONSE_CHANGED: "환율 관측과 공식 원본의 통화·값·시각이 일치하지 않음",
     FX_OBSERVATION_CONFLICT: "계좌와 주문 시세의 환율 관측이 일치하지 않음",
     OBSERVATION_STALE: "시세 또는 계좌 조회가 오래되어 현재 주문 조건 재확인 필요",
     FRESH_CLOCK_GUARD_UNKNOWN: "현재 시각의 정확성을 확인하지 못함",
@@ -300,6 +320,62 @@ export function shortLiveFuturesIncidentLabel(type) {
     PROTECTIVE_STOP: "보호 손절 발동", PROTECTION_TRIGGERED: "보호 손절 발동" })[type] || "선물 상태 불일치";
 }
 
+export function normalizeShortLiveFailureDiagnostics(value) {
+  // Keep this allowlist aligned with short_live_read_diagnostics.py. No URLs, queries or raw responses.
+  const paths = {
+    "binance": [
+        "/api/v3/account",
+        "/api/v3/account/commission",
+        "/api/v3/exchangeInfo",
+        "/api/v3/myTrades",
+        "/api/v3/openOrders",
+        "/api/v3/order",
+        "/api/v3/ticker/price",
+        "/api/v3/time"
+    ],
+    "binance-futures": [
+        "/fapi/v1/accountConfig",
+        "/fapi/v1/algoOrder",
+        "/fapi/v1/commissionRate",
+        "/fapi/v1/exchangeInfo",
+        "/fapi/v1/forceOrders",
+        "/fapi/v1/leverageBracket",
+        "/fapi/v1/openAlgoOrders",
+        "/fapi/v1/openOrders",
+        "/fapi/v1/order",
+        "/fapi/v1/positionSide/dual",
+        "/fapi/v1/premiumIndex",
+        "/fapi/v1/symbolConfig",
+        "/fapi/v1/time",
+        "/fapi/v1/userTrades",
+        "/fapi/v3/account",
+        "/fapi/v3/positionRisk"
+    ],
+    "upbit": [
+        "/v1/accounts",
+        "/v1/order",
+        "/v1/orderbook/instruments",
+        "/v1/orders/chance",
+        "/v1/orders/open",
+        "/v1/ticker"
+    ],
+    "kis": [
+        "/uapi/domestic-stock/v1/trading/inquire-balance",
+        "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
+    ]
+};
+  const statuses = new Set(["AVAILABLE", "BLOCKED", "REJECTED", "UNAVAILABLE"]);
+  const kinds = new Set(["CONNECTION_ERROR", "HTTP_ERROR", "INVALID_RESPONSE", "READ_BOUNDARY", "READ_REJECTED", "READ_UNAVAILABLE", "TIMEOUT", "UNEXPECTED_ERROR"]);
+  return (Array.isArray(value) ? value : []).slice(-32).filter(row => row && typeof row === "object"
+    && Object.hasOwn(paths, row.provider) && paths[row.provider].includes(row.path) && statuses.has(row.status)
+    && typeof row.elapsedMs === "number" && Number.isFinite(row.elapsedMs) && row.elapsedMs >= 0).map(row => ({
+    provider: row.provider, path: row.path, elapsedMs: row.elapsedMs, status: row.status,
+    failureKind: kinds.has(row.failureKind) ? row.failureKind : "",
+    httpStatus: Number.isInteger(row.httpStatus) && row.httpStatus >= 100 && row.httpStatus <= 599 ? row.httpStatus : null,
+    brokerCode: Number.isInteger(row.brokerCode) && row.brokerCode >= -2147483648 && row.brokerCode < 0 ? row.brokerCode : null,
+  }));
+}
+
 export function normalizeShortLiveSnapshot(value = {}) {
   const source = value.snapshot && typeof value.snapshot === "object" ? value.snapshot : value;
   const preparation = source.prepared && typeof source.prepared === "object" ? source.prepared : null;
@@ -331,7 +407,7 @@ export function normalizeShortLiveSnapshot(value = {}) {
       })),
     } : null,
     runtime: run ? {
-      sessionId: text(run.sessionId), status: text(run.status) || "UNKNOWN", startedAt: text(run.startedAt), endsAt: text(run.endsAt),
+      sessionId: text(run.sessionId), status: text(run.status) || "UNKNOWN", startedAt: text(run.startedAt), endsAt: text(run.endsAt), terminatedAt: text(run.terminatedAt),
       terminalVerified: run.terminalVerified === true,
       ownerAlive: typeof run.ownerAlive === "boolean" ? run.ownerAlive : null,
       workerAlive: typeof run.workerAlive === "boolean" ? run.workerAlive : null,
@@ -349,6 +425,7 @@ export function normalizeShortLiveSnapshot(value = {}) {
         })),
       })),
       firstFailure: sanitizeShortLiveText(run.firstFailure), stopReason: sanitizeShortLiveText(run.stopReason),
+      firstFailureDiagnostics: normalizeShortLiveFailureDiagnostics(run.firstFailureDiagnostics),
       recentActivity: (Array.isArray(run.recentActivity) ? run.recentActivity : []).slice(-60).map((event) => ({
         sequence: numeric(event.sequence), kind: sanitizeShortLiveText(event.kind), observedAt: text(event.observedAt),
         route: sanitizeShortLiveText(event.route), symbol: sanitizeShortLiveText(event.symbol), side: sanitizeShortLiveText(event.side),
@@ -443,6 +520,18 @@ export function shortLiveRunning(snapshot) {
   return !(runtime.status === "TERMINATED" && runtime.terminalVerified === true
     && (runtime.naturalExitObserved === true || (runtime.workerRetirementRequired === false && runtime.workerLaunchState === "NOT_ATTEMPTED" && runtime.workerAlive === false)));
 }
+export function shortLiveRetirementMeaning(runtime) {
+  if (!runtime || shortLiveRunning({ runtime })) return "실제 종료 확인 전입니다. 예정 시간이 지났다는 이유로 종료를 인정하지 않습니다.";
+  if (runtime.workerRetirementRequired === false && runtime.workerLaunchState === "NOT_ATTEMPTED" && runtime.workerAlive === false) {
+    return "작업자 시작 전 종료 확인 · 시세 연결 정리와 잔여 주문·포지션 대조가 확인됐습니다. 실행·거래 성공을 뜻하지 않습니다.";
+  }
+  if (runtime.unknownOrderCount > 0) return "종료 기록이 있지만 미확정 주문이 남아 있습니다. 주문·체결 대조를 확인하세요. 시험 성공을 뜻하지 않습니다.";
+  if (runtime.firstFailure || runtime.blockers?.length) {
+    return "오류로 시험이 중단됐으며 작업자 종료와 잔여 주문·포지션 정리가 확인됐습니다. 시험 성공을 뜻하지 않습니다. 최초 오류와 관측 기록을 확인하세요.";
+  }
+  return "작업자 종료와 잔여 주문·포지션 정리가 확인됐습니다. 실제 주문·체결 여부와 시험 성공은 별도로 확인해야 합니다.";
+}
+
 export function shortLivePreparationMatches(prepared, catalog, selectedKeys, durationHours, futuresPolicy = null) {
   if (!prepared || prepared.durationHours !== durationHours || prepared.budgetKrwPerBroker !== 100000
     || prepared.lossKrwPerBroker !== 50000 || !Array.isArray(prepared.targets)
@@ -504,7 +593,10 @@ export function shortLiveReadyForConsent(snapshot, { fresh = false, selectionUnc
     && ready.blockers.length === 0 && snapshot.blockers.length === 0 && !shortLiveRunning(snapshot);
 }
 
-export function shortLiveRuntimeMeaning(row) {
+export function shortLiveRuntimeMeaning(row, runtime = null) {
+  if (runtime?.status === "TERMINATED" && !shortLiveRunning({ runtime }) && row.decisionCount === 0 && !(row.orderAttemptCount > 0) && !(row.orderCount > 0) && !(row.fillObservationCount > 0) && !(row.fillCount > 0)) {
+    return "종료 전 완성봉 평가·주문·체결 기록이 없습니다. 현재 신호를 기다리는 실행 상태가 아닙니다.";
+  }
   if (row.fillObservationCount > 0) return "체결 관측 기록이 있습니다. 부분 체결·반복 관측 횟수는 고유 주문 수와 다릅니다.";
   if (row.fillCount > 0) return "실제 체결 기록이 있습니다. 수익성 검증 결과를 뜻하지 않습니다.";
   if (row.orderAttemptCount > 0) return "주문 시도가 관측됨 · 실제 체결은 아직 확인되지 않았습니다.";

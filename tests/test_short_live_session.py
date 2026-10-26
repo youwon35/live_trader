@@ -480,6 +480,74 @@ class ShortLiveSessionTests(unittest.TestCase):
         self.assertFalse(snapshot["runtime"]["terminalVerified"])
         self.assertEqual("BLOCKED", snapshot["runtime"]["status"])
 
+    def test_first_read_failure_survives_cleanup_and_is_safe_in_public_and_journal(self):
+        service, brokers, _ = self.service()
+        self.start(service)
+        broker = brokers["BINANCE_SPOT"]
+        original = broker.reconcile
+        safe = {"provider": "binance", "path": "/api/v3/account", "elapsedMs": 8000,
+                "status": "UNAVAILABLE", "failureKind": "TIMEOUT"}
+        broker.reconcile = lambda _: {
+            "known": False, "ready": False, "blockers": ["OFFICIAL_ACCOUNT_READ_UNKNOWN"],
+            "readDiagnostics": [{**safe, "body": "private-secret", "query": "private-secret"},
+                                {**safe, "path": "/api/v3/account?signature=private-secret"}]}
+        self.assertFalse(service._reconcile())
+        runtime = service.snapshot(include_catalog=False)["runtime"]
+        self.assertEqual("BINANCE_SPOT:OFFICIAL_ACCOUNT_READ_UNKNOWN", runtime["firstFailure"])
+        self.assertEqual([safe], runtime["firstFailureDiagnostics"])
+        service._failure("CLEANUP_LATER_FAILURE", read_diagnostics=[{
+            **safe, "failureKind": "HTTP_ERROR", "httpStatus": 429}])
+        self.now += timedelta(seconds=70)
+        broker.reconcile = original
+        terminal_runtime = service.stop()["runtime"]
+        self.assertTrue(terminal_runtime["terminalVerified"])
+        self.assertEqual(self.now, datetime.fromisoformat(terminal_runtime["terminatedAt"].replace("Z", "+00:00")))
+        self.assertEqual([safe], terminal_runtime["firstFailureDiagnostics"])
+        terminal = json.loads(next(service.store_root.glob("session-terminal-*.json")).read_text(encoding="utf-8"))
+        self.assertEqual([safe], terminal["firstFailureDiagnostics"])
+        self.assertFalse(terminal["functionalPass"])
+        events = [json.loads(p.read_text(encoding="utf-8")) for p in service.store_root.glob("event-*.json")]
+        failures = [e for e in events if e["kind"] == "FIRST_FAILURE"]
+        self.assertEqual(1, len(failures))
+        self.assertEqual([safe], failures[0]["readDiagnostics"])
+        self.assertNotIn("private-secret", json.dumps([runtime, terminal, events]))
+        self.assertEqual([], broker.submits)
+
+    def test_later_diagnostics_never_get_attributed_to_first_failure(self):
+        service, _, _ = self.service()
+        self.start(service)
+        service._failure("ORIGINAL_CLOCK_FAILURE")
+        service._failure("LATER_API_FAILURE", read_diagnostics=[{
+            "provider": "binance", "path": "/api/v3/account", "elapsedMs": 10,
+            "status": "UNAVAILABLE", "failureKind": "TIMEOUT"}])
+        runtime = service.snapshot(include_catalog=False)["runtime"]
+        self.assertEqual("ORIGINAL_CLOCK_FAILURE", runtime["firstFailure"])
+        self.assertEqual([], runtime["firstFailureDiagnostics"])
+        service.stop()
+
+    def test_first_failure_journal_error_blocks_entries_and_preserves_cleanup_path(self):
+        service, brokers, _ = self.service()
+        self.start(service)
+        original = service._event
+        safe = {"provider": "binance", "path": "/api/v3/account", "elapsedMs": 8000,
+                "status": "UNAVAILABLE", "failureKind": "TIMEOUT"}
+        def fail_first_journal(kind, **values):
+            if kind == "FIRST_FAILURE":
+                self.assertTrue(service._session["newEntriesBlocked"])
+                raise OSError("private filesystem detail")
+            return original(kind, **values)
+        service._event = fail_first_journal
+        service._failure("OFFICIAL_ACCOUNT_READ_UNKNOWN", read_diagnostics=[safe])
+        runtime = service.stop()["runtime"]
+        self.assertTrue(runtime["newEntriesBlocked"])
+        self.assertEqual("OFFICIAL_ACCOUNT_READ_UNKNOWN", runtime["firstFailure"])
+        self.assertEqual([safe], runtime["firstFailureDiagnostics"])
+        self.assertIn("FIRST_FAILURE_JOURNAL_WRITE_FAILED", runtime["blockers"])
+        self.assertTrue(runtime["terminalVerified"])
+        self.assertEqual(1, brokers["BINANCE_SPOT"].cleanups)
+        self.assertEqual([], brokers["BINANCE_SPOT"].submits)
+        self.assertNotIn("private filesystem detail", json.dumps(runtime))
+
     def test_normal_stop_is_idempotent_and_does_not_create_promotion(self):
         service, brokers, _ = self.service()
         self.start(service)

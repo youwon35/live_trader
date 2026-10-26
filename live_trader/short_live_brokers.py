@@ -18,6 +18,7 @@ import threading
 import time
 from typing import Any
 from .short_live_futures import FuturesProtectionError, FuturesProtectionManager, policy as futures_policy
+from .short_live_read_diagnostics import sanitize_read_diagnostics
 
 ROUTES = {
     "KIS_KR_CASH": ("kis", "KIS", "KRW"),
@@ -461,8 +462,9 @@ class ShortLiveBrokerAdapter:
         s = dict(self.snapshot_reader(self.route, tuple(m["symbols"])))
         if s.get("known") is not True or s.get("ordersComplete") is not True or s.get("positionsComplete") is not True:
             reason = next((r for r in s.get("blockers", []) if isinstance(r, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,100}", r)), None)
-            if reason: raise ShortLiveBrokerBlocked(reason)
-            raise ShortLiveBrokerBlocked("COMPLETE_ACCOUNT_TRUTH_REQUIRED")
+            error = ShortLiveBrokerBlocked(reason or "COMPLETE_ACCOUNT_TRUTH_REQUIRED")
+            error.readDiagnostics = sanitize_read_diagnostics(s.get("readDiagnostics"))
+            raise error
         self._fresh(s.get("observedAt"))
         account = str(s.get("accountId") or "")
         if not account or (m.get("accountId") and account != m["accountId"]):
@@ -543,8 +545,9 @@ class ShortLiveBrokerAdapter:
         q = dict(self.market_reader(self.route, symbol))
         if q.get("known") is not True or q.get("symbol") != symbol or q.get("quoteCurrency") != self.currency:
             reason = next((r for r in q.get("blockers", []) if isinstance(r, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,100}", r)), None)
-            if reason: raise ShortLiveBrokerBlocked(reason)
-            raise ShortLiveBrokerBlocked("EXACT_MARKET_TRUTH_REQUIRED")
+            error = ShortLiveBrokerBlocked(reason or "EXACT_MARKET_TRUTH_REQUIRED")
+            error.readDiagnostics = sanitize_read_diagnostics(q.get("readDiagnostics"))
+            raise error
         self._fresh(q.get("observedAt"), 10)
         if q.get("sourceQuoteObservedAt") is not None:
             self._fresh(q["sourceQuoteObservedAt"], 10)
@@ -725,6 +728,7 @@ class ShortLiveBrokerAdapter:
                                expectedFuturesSettings=deepcopy(self._futures_policy),
                                observedFuturesSettingsBySymbol=deepcopy(self._observed_futures_by_symbol))
             return {"ready": False, "blockers": [code], "scopeOwnershipVerified": False, **funding,
+                    "readDiagnostics": sanitize_read_diagnostics(getattr(exc, "readDiagnostics", None)),
                     "availableSessionMinutes": available_minutes, "minimumOrderKrwBySymbol": native_minimums,
                     "promotionEligible": False}
 
@@ -818,7 +822,8 @@ class ShortLiveBrokerAdapter:
                           positionMode=q.get("positionMode", ""), promotionEligible=False)
             return result
         except Exception as exc:
-            return {"ready": False, "blockers": [str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "ORDER_SIZING_UNKNOWN"]}
+            return {"ready": False, "blockers": [str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "ORDER_SIZING_UNKNOWN"],
+                    "readDiagnostics": sanitize_read_diagnostics(getattr(exc, "readDiagnostics", None))}
 
     @staticmethod
     def _normalize_reply(response: Any, order: Mapping[str, Any], fx: Decimal) -> dict[str, Any]:
@@ -876,7 +881,9 @@ class ShortLiveBrokerAdapter:
                                            "deltaKrw": reserved_notional, "_reservedLimitPrice": order.get("referencePrice"),
                                            "_reservedQuantity": order.get("quantity")})
                 if checked.get("ready") is not True:
-                    raise ShortLiveBrokerBlocked(str((checked.get("blockers") or ["ORDER_RECHECK_FAILED"])[0]))
+                    error = ShortLiveBrokerBlocked(str((checked.get("blockers") or ["ORDER_RECHECK_FAILED"])[0]))
+                    error.readDiagnostics = sanitize_read_diagnostics(checked.get("readDiagnostics"))
+                    raise error
                 if number(order.get("quantity")) != number(checked["quantity"]) or str(order.get("accountId")) != checked["accountId"]:
                     raise ShortLiveBrokerBlocked("ORDER_CHANGED_AT_DISPATCH")
                 reducing = order.get("riskReducing") is True
@@ -939,10 +946,15 @@ class ShortLiveBrokerAdapter:
                         self._claims[client_id] = result
                 return deepcopy(result)
         except Exception as exc:
+            diagnostics = sanitize_read_diagnostics(getattr(exc, "readDiagnostics", None))
             with self._lock:
                 if client_id in self._claims:
+                    # Preserve the same claim and first diagnostic on duplicate observations; never resubmit.
+                    if diagnostics and not self._claims[client_id].get("readDiagnostics"):
+                        self._claims[client_id]["readDiagnostics"] = diagnostics
                     return deepcopy(self._claims[client_id])
-            return {"status": "REJECTED", "blockers": [str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "ORDER_DISPATCH_BLOCKED"], "clientOrderId": client_id}
+            return {"status": "REJECTED", "blockers": [str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "ORDER_DISPATCH_BLOCKED"],
+                    "clientOrderId": client_id, "readDiagnostics": diagnostics}
 
     def _read_claim_truth(self, claim):
         recovering = not claim.get("brokerOrderId")
@@ -1068,6 +1080,7 @@ class ShortLiveBrokerAdapter:
                     "promotionEligible": False}
         except Exception as exc:
             return {"known": False, "ready": False, "blockers": [str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "RECONCILIATION_UNKNOWN"],
+                    "readDiagnostics": sanitize_read_diagnostics(getattr(exc, "readDiagnostics", None)),
                     "futuresIncidents": deepcopy(self._futures_incidents) + deepcopy(self._protection.incidents if self._protection else [])}
 
     def cleanup(self, session: Mapping[str, Any]) -> dict[str, Any]:

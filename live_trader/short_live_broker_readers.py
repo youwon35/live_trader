@@ -13,12 +13,77 @@ import hashlib
 import json
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 from typing import Any
 
 from .short_live_brokers import ROUTES, ShortLiveBrokerBlocked, number, decimal_text
+from .short_live_read_diagnostics import DIAGNOSTIC_PATHS, sanitize_read_diagnostics
+
+
+# Exact codes produced by account_currency_limits.py. Arbitrary ValueError
+# messages (including malformed HTTP bodies) never become public blockers.
+_FX_VALIDATION_CODES = frozenset({
+    "NATIVE_FX_TIME_INVALID", "NATIVE_FX_EXACT_USDT_MARKET_REQUIRED",
+    "NATIVE_FX_EXACT_USDT_TRADE_TIME_REQUIRED", "NATIVE_FX_HTTP_CLOCK_PROOF_MISSING",
+    "NATIVE_FX_HTTP_CLOCK_HEADER_BINDING_CHANGED", "NATIVE_FX_CACHED_HTTP_RESPONSE_REJECTED",
+    "NATIVE_FX_OFFICIAL_HTTP_DATE_MISSING_OR_INVALID", "NATIVE_FX_HTTP_CLOCK_LOCAL_BINDING_CHANGED",
+    "NATIVE_FX_HTTP_CLOCK_RTT_INVALID", "NATIVE_FX_HTTP_CLOCK_SKEW_OR_RTT_EXCEEDED",
+    "NATIVE_FX_OFFICIAL_CURRENCY_ROUTE_UNAVAILABLE", "NATIVE_FX_OBSERVATION_MISSING",
+    "NATIVE_FX_OBSERVATION_SEAL_INVALID", "NATIVE_FX_OBSERVATION_CURRENCY_OR_ROUTE_MISMATCH",
+    "NATIVE_FX_OFFICIAL_RESPONSE_BINDING_CHANGED", "NATIVE_FX_OFFICIAL_RESPONSE_SCOPE_CHANGED",
+    "NATIVE_FX_RATE_RESPONSE_CHANGED", "NATIVE_FX_TIME_RESPONSE_CHANGED",
+    "NATIVE_FX_OBSERVATION_STALE_OR_FUTURE",
+})
+
+
+def _safe_broker_code(payload):
+    value = payload.get("code") if isinstance(payload, Mapping) else None
+    return value if type(value) is int and -2147483648 <= value < 0 else None
+
+
+def _safe_read_failure(exc):
+    """Inspect types/numeric status only, including sanitized wrapper causes."""
+    pending, seen = [exc], set()
+    chain = []
+    while pending and len(chain) < 8:
+        item = pending.pop(0)
+        if not isinstance(item, BaseException) or id(item) in seen:
+            continue
+        seen.add(id(item)); chain.append(item)
+        pending.extend((item.__cause__, item.__context__, getattr(item, "reason", None)))
+    http = next((item.code for item in chain if isinstance(item, urllib.error.HTTPError)
+                 and type(item.code) is int and 100 <= item.code <= 599), None)
+    # Boundary exceptions may inherit ValueError. Classify their fixed code
+    # before generic JSON/value failures; the message itself never escapes.
+    if str(exc) in {"READ_ONLY_ENDPOINT_BLOCKED", "READ_ONLY_TR_ID_BLOCKED",
+                    "CONFIGURED_ORIGIN_BLOCKED", "REDIRECT_BLOCKED"}:
+        return {"status": "BLOCKED", "failureKind": "READ_BOUNDARY"}
+    if str(exc) in {"BROKER_READ_REJECTED", "OFFICIAL_PRIVATE_READ_REJECTED", "OFFICIAL_READ_REJECTED"}:
+        return {"status": "REJECTED", "failureKind": "READ_REJECTED"}
+    if any(isinstance(item, TimeoutError) for item in chain):
+        result = {"status": "UNAVAILABLE", "failureKind": "TIMEOUT"}
+    elif http is not None:
+        result = {"status": "REJECTED", "failureKind": "HTTP_ERROR", "httpStatus": http}
+    elif any(isinstance(item, (urllib.error.URLError, ConnectionError, OSError)) for item in chain):
+        result = {"status": "UNAVAILABLE", "failureKind": "CONNECTION_ERROR"}
+    elif any(isinstance(item, (json.JSONDecodeError, ValueError, TypeError, KeyError)) for item in chain):
+        result = {"status": "BLOCKED", "failureKind": "INVALID_RESPONSE"}
+    else:
+        # Only compare to a fixed vocabulary. Never copy exception text.
+        code = str(exc)
+        if code in {"READ_ONLY_ENDPOINT_BLOCKED", "READ_ONLY_TR_ID_BLOCKED",
+                    "CONFIGURED_ORIGIN_BLOCKED", "REDIRECT_BLOCKED"}:
+            result = {"status": "BLOCKED", "failureKind": "READ_BOUNDARY"}
+        elif code in {"BROKER_READ_REJECTED", "OFFICIAL_PRIVATE_READ_REJECTED", "OFFICIAL_READ_REJECTED"}:
+            result = {"status": "REJECTED", "failureKind": "READ_REJECTED"}
+        elif code in {"READ_UNAVAILABLE", "HTTP_ERROR"}:
+            result = {"status": "UNAVAILABLE", "failureKind": "READ_UNAVAILABLE"}
+        else:
+            result = {"status": "BLOCKED", "failureKind": "UNEXPECTED_ERROR"}
+    return result
 
 
 class ProductionShortLiveReaders:
@@ -27,6 +92,7 @@ class ProductionShortLiveReaders:
                  cost_reader: Callable[..., Mapping[str, Any]] | None = None,
                  clock: Callable[[], float] = time.time, reader: Any = None) -> None:
         self.settings = dict(settings)
+        self._read_diagnostics: list[dict[str, Any]] = []
         self.ownership_reader, self.cost_reader, self.clock = ownership_reader, cost_reader, clock
         if reader is None:
             from .read_only_account import ReadOnlyBrokerReader, ReadOnlyTransport
@@ -37,10 +103,13 @@ class ProductionShortLiveReaders:
                          "/fapi/v1/order", "/fapi/v1/openAlgoOrders", "/fapi/v1/userTrades",
                          "/fapi/v1/algoOrder", "/fapi/v1/forceOrders", "/fapi/v1/leverageBracket"}
                 def request(self, provider, method, path, *, query=None, headers=None, body=None):
+                    self.last_broker_code = None
                     extra_allowed = ((provider == "binance-futures" and path in self.EXTRA)
                                      or (provider == "upbit" and path == "/v1/orderbook/instruments"))
                     if not extra_allowed:
-                        return super().request(provider, method, path, query=query, headers=headers, body=body)
+                        result = super().request(provider, method, path, query=query, headers=headers, body=body)
+                        self.last_broker_code = _safe_broker_code(result[0])
+                        return result
                     if method != "GET" or body is not None:
                         raise ShortLiveBrokerBlocked("READ_ONLY_ENDPOINT_BLOCKED")
                     encoded = query if isinstance(query, str) else urllib.parse.urlencode(query or {})
@@ -52,7 +121,9 @@ class ProductionShortLiveReaders:
                         raw = response.read(4 * 1024 * 1024 + 1)
                         if len(raw) > 4 * 1024 * 1024:
                             raise ShortLiveBrokerBlocked("OFFICIAL_READ_TOO_LARGE")
-                        return json.loads(raw), dict(response.headers)
+                        payload = json.loads(raw)
+                        self.last_broker_code = _safe_broker_code(payload)
+                        return payload, dict(response.headers)
             reader = ReadOnlyBrokerReader(self.settings, transport=ExtendedReadTransport())
         self.reader = reader
         self.fx_reader = fx_reader or self._official_fx
@@ -60,6 +131,60 @@ class ProductionShortLiveReaders:
 
     def _now(self) -> str:
         return datetime.fromtimestamp(self.clock(), timezone.utc).isoformat()
+
+    def _record_read(self, provider, path, started, *, exc=None, broker_code=None):
+        safe_provider = provider if provider in DIAGNOSTIC_PATHS else "UNKNOWN_PROVIDER"
+        safe_path = path if path in DIAGNOSTIC_PATHS.get(provider, ()) else "UNLISTED_ENDPOINT"
+        row = {"provider": safe_provider, "path": safe_path,
+               "elapsedMs": round(max(0.0, time.monotonic() - started) * 1000, 3),
+               "status": "AVAILABLE"}
+        if exc is not None:
+            row.update(_safe_read_failure(exc))
+        if type(broker_code) is int and -2147483648 <= broker_code < 0:
+            row.update(status="REJECTED", failureKind="READ_REJECTED", brokerCode=broker_code)
+        self._read_diagnostics.append(row)
+        del self._read_diagnostics[:-32]
+
+    def _read(self, provider, path, **kwargs):
+        started = time.monotonic()
+        transport = getattr(self.reader, "transport", None)
+        if transport is not None and hasattr(transport, "last_broker_code"):
+            transport.last_broker_code = None
+        try:
+            value, headers = self.reader._get(provider, path, **kwargs)
+        except Exception as exc:
+            transport = getattr(self.reader, "transport", None)
+            self._record_read(provider, path, started, exc=exc,
+                              broker_code=getattr(transport, "last_broker_code", None))
+            raise
+        self._record_read(provider, path, started, broker_code=_safe_broker_code(value))
+        return value, headers
+
+    def _fx(self, currency):
+        started = time.monotonic()
+        try:
+            value = dict(self.fx_reader(currency))
+            if value.get("known") is not True:
+                raise ShortLiveBrokerBlocked("FRESH_FX_REQUIRED")
+        except Exception as exc:
+            # The production USDT conversion reader has this exact endpoint.
+            self._record_read("upbit", "/v1/ticker", started, exc=exc)
+            if isinstance(exc, ValueError) and str(exc) in _FX_VALIDATION_CODES:
+                raise ShortLiveBrokerBlocked(str(exc)) from None
+            raise
+        self._record_read("upbit", "/v1/ticker", started)
+        return value
+
+    def _failure_reads(self):
+        return sanitize_read_diagnostics(self._read_diagnostics)
+
+    def _inventory_price(self, route, symbol):
+        market = self.market(route, symbol)
+        if market.get("known") is not True:
+            reason = next((code for code in market.get("blockers", [])
+                           if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,100}", code)), None)
+            raise ShortLiveBrokerBlocked(reason or "EXACT_MARKET_TRUTH_REQUIRED")
+        return number(market.get("nativePrice"), positive=True)
 
     @staticmethod
     def _positive_id(value: Any, code: str) -> str:
@@ -265,13 +390,13 @@ class ProductionShortLiveReaders:
         query = dict(params or {})
         headers = {}
         if signed:
-            clock, _ = self.reader._get(provider, prefix + "/time")
+            clock, _ = self._read(provider, prefix + "/time")
             if not isinstance(clock, dict) or isinstance(clock.get("serverTime"), bool):
                 raise ShortLiveBrokerBlocked("OFFICIAL_SERVER_TIME_UNKNOWN")
             query.update(timestamp=int(clock["serverTime"]), recvWindow=5000)
             query = sign_binance_query(query, self.settings["BINANCE_API_SECRET"])
             headers = {"X-MBX-APIKEY": self.settings["BINANCE_API_KEY"]}
-        payload, _ = self.reader._get(provider, path, query=query, headers=headers)
+        payload, _ = self._read(provider, path, query=query, headers=headers)
         if isinstance(payload, dict) and payload.get("code") is not None and number(payload["code"]) < 0:
             raise ShortLiveBrokerBlocked("OFFICIAL_PRIVATE_READ_REJECTED")
         return payload
@@ -283,7 +408,7 @@ class ProductionShortLiveReaders:
         if signed:
             self.reader._credentials("upbit")
             headers = {"Authorization": build_upbit_authorization(self.settings["UPBIT_ACCESS_KEY"], self.settings["UPBIT_SECRET_KEY"], query)}
-        payload, _ = self.reader._get("upbit", path, query=query, headers=headers)
+        payload, _ = self._read("upbit", path, query=query, headers=headers)
         if isinstance(payload, dict) and "error" in payload:
             raise ShortLiveBrokerBlocked("OFFICIAL_PRIVATE_READ_REJECTED")
         return payload
@@ -387,7 +512,7 @@ class ProductionShortLiveReaders:
                         continue
                     symbol, qty = spot_balance(row.get("asset"), row.get("free"), row.get("locked"))
                     if qty and symbol in symbols:
-                        price = number(self.market(route, symbol)["nativePrice"], positive=True)
+                        price = self._inventory_price(route, symbol)
                         equity += qty * price
                         positions.append({"symbol": symbol, "quantity": decimal_text(qty), "markPrice": decimal_text(price)})
                 raw_orders = self._binance(provider, "/api/v3/openOrders")
@@ -411,7 +536,7 @@ class ProductionShortLiveReaders:
                     continue
                 symbol, qty = spot_balance(row.get("currency"), row.get("balance"), row.get("locked"))
                 if qty and symbol in symbols:
-                    price = number(self.market(route, symbol)["nativePrice"], positive=True)
+                    price = self._inventory_price(route, symbol)
                     equity += qty * price
                     positions.append({"symbol": symbol, "quantity": decimal_text(qty), "markPrice": decimal_text(price)})
             orders, seen = [], set()
@@ -449,7 +574,7 @@ class ProductionShortLiveReaders:
             fk = nk = ""; seen = set(); rows = []; total = None
             for page in range(20):
                 self.reader._pace_kis()
-                payload, headers = self.reader._get("kis", path, query={"CANO": cano, "ACNT_PRDT_CD": product,
+                payload, headers = self._read("kis", path, query={"CANO": cano, "ACNT_PRDT_CD": product,
                     **params, "CTX_AREA_FK100": fk, "CTX_AREA_NK100": nk}, headers={"authorization": "Bearer " + token,
                     "appkey": self.settings["KIS_APP_KEY"], "appsecret": self.settings["KIS_APP_SECRET"],
                     "tr_id": KIS_TR_IDS[path], "custtype": "P", **({"tr_cont": "N"} if page else {})})
@@ -495,6 +620,7 @@ class ProductionShortLiveReaders:
                 "ordersComplete": True, "positionsComplete": True, "observedAt": self._now()}
 
     def snapshot(self, route: str, symbols: tuple[str, ...]) -> dict[str, Any]:
+        self._read_diagnostics = []
         try:
             started = self._now()
             if route not in ROUTES or not symbols:
@@ -509,7 +635,8 @@ class ProductionShortLiveReaders:
             return result
         except Exception as exc:
             return {"known": False, "ordersComplete": False, "positionsComplete": False,
-                    "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "OFFICIAL_ACCOUNT_READ_UNKNOWN"]}
+                    "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "OFFICIAL_ACCOUNT_READ_UNKNOWN"],
+                    "readDiagnostics": self._failure_reads()}
 
     def get_order(self, route: str, claim: Mapping[str, Any]) -> dict[str, Any]:
         """Read an exact reservation by broker ID or original futures client ID."""
@@ -741,11 +868,9 @@ class ProductionShortLiveReaders:
                     "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "OFFICIAL_FORCE_ORDER_UNKNOWN"]}
 
     def market(self, route: str, symbol: str) -> dict[str, Any]:
+        self._read_diagnostics = []
         try:
             provider, _, currency = ROUTES[route]
-            fx = {"known": True, "krwPerQuote": "1", "observedAt": self._now()} if currency == "KRW" else dict(self.fx_reader(currency))
-            if fx.get("known") is not True:
-                raise ShortLiveBrokerBlocked("FRESH_FX_REQUIRED")
             extra: dict[str, Any] = {}
             if provider in {"binance", "binance-futures"}:
                 futures = provider == "binance-futures"
@@ -778,12 +903,6 @@ class ProductionShortLiveReaders:
                                  marketQuantityStepRaw=decimal_text(raw_market_step),
                                  marketQuantityStepSource=("LOT_SIZE_FOR_ZERO_MARKET_STEP"
                                      if raw_market_step == 0 else "MARKET_LOT_SIZE"))
-                    premium = self._binance(provider, "/fapi/v1/premiumIndex", {"symbol": symbol}, signed=False)
-                    quote_received = self._now()
-                    price = premium.get("markPrice")
-                    if type(premium.get("time")) is not int:
-                        raise ShortLiveBrokerBlocked("FUTURES_QUOTE_SOURCE_TIME_UNKNOWN")
-                    extra["sourceQuoteObservedAt"] = datetime.fromtimestamp(premium["time"] / 1000, timezone.utc).isoformat()
                     commission = self._binance(provider, "/fapi/v1/commissionRate", {"symbol": symbol})
                     fee = commission.get("takerCommissionRate")
                     config = self._binance(provider, "/fapi/v1/symbolConfig", {"symbol": symbol})
@@ -792,15 +911,18 @@ class ProductionShortLiveReaders:
                         raise ShortLiveBrokerBlocked("FUTURES_CONFIG_UNKNOWN")
                     brackets, coefficient = self._leverage_brackets(
                         self._binance(provider, "/fapi/v1/leverageBracket", {"symbol": symbol}), symbol)
+                    premium = self._binance(provider, "/fapi/v1/premiumIndex", {"symbol": symbol}, signed=False)
+                    quote_received = self._now()
+                    price = premium.get("markPrice")
+                    if type(premium.get("time")) is not int:
+                        raise ShortLiveBrokerBlocked("FUTURES_QUOTE_SOURCE_TIME_UNKNOWN")
+                    extra["sourceQuoteObservedAt"] = datetime.fromtimestamp(premium["time"] / 1000, timezone.utc).isoformat()
                     extra.update(**self._symbol_config(config, symbol), markPrice=decimal_text(number(price, positive=True)),
                                  positionMode="HEDGE" if mode["dualSidePosition"] else "ONE_WAY",
                                  fundingRate=decimal_text(number(premium.get("lastFundingRate"))),
                                  leverageBrackets=brackets, notionalCoefficient=coefficient,
                                  leverageBracketsAccountAdjusted=True)
                 else:
-                    ticker = self._binance(provider, "/api/v3/ticker/price", {"symbol": symbol}, signed=False)
-                    quote_received = self._now()
-                    price = ticker.get("price")
                     commission = self._binance(provider, "/api/v3/account/commission", {"symbol": symbol})
                     discount = commission.get("discount", {})
                     if isinstance(discount, Mapping):
@@ -814,9 +936,16 @@ class ProductionShortLiveReaders:
                     # additions, without assuming a BNB discount is available.
                     fee = sum((number(group.get("taker")) + max(number(group.get("buyer", 0)), number(group.get("seller", 0)))
                                for group in (standard, special, tax)), Decimal(0))
+                    ticker = self._binance(provider, "/api/v3/ticker/price", {"symbol": symbol}, signed=False)
+                    quote_received = self._now()
+                    price = ticker.get("price")
                 step, min_qty, max_qty = lot.get("stepSize"), lot.get("minQty"), lot.get("maxQty")
             elif provider == "upbit":
                 chance = self._upbit("/v1/orders/chance", {"market": symbol})
+                instruments = self._upbit("/v1/orderbook/instruments", {"markets": symbol}, signed=False)
+                if not isinstance(instruments, list) or len(instruments) != 1 or instruments[0].get("market") != symbol:
+                    raise ShortLiveBrokerBlocked("UPBIT_PRICE_TICK_UNKNOWN")
+                extra["priceTick"] = str(number(instruments[0].get("tick_size"), positive=True))
                 ticker = self._upbit("/v1/ticker", {"markets": symbol}, signed=False)
                 quote_received = self._now()
                 market = chance.get("market", {})
@@ -826,10 +955,6 @@ class ProductionShortLiveReaders:
                 if type(ticker[0].get("trade_timestamp")) is not int or type(ticker[0].get("timestamp")) is not int:
                     raise ShortLiveBrokerBlocked("UPBIT_QUOTE_SOURCE_TIME_UNKNOWN")
                 extra["sourceQuoteObservedAt"] = datetime.fromtimestamp(min(ticker[0]["trade_timestamp"], ticker[0]["timestamp"]) / 1000, timezone.utc).isoformat()
-                instruments = self._upbit("/v1/orderbook/instruments", {"markets": symbol}, signed=False)
-                if not isinstance(instruments, list) or len(instruments) != 1 or instruments[0].get("market") != symbol:
-                    raise ShortLiveBrokerBlocked("UPBIT_PRICE_TICK_UNKNOWN")
-                extra["priceTick"] = str(number(instruments[0].get("tick_size"), positive=True))
                 fee = max(number(chance.get("bid_fee")), number(chance.get("ask_fee")))
                 min_notional = max(number(market.get("bid", {}).get("min_total")), number(market.get("ask", {}).get("min_total")))
                 step, min_qty, max_qty = "0.00000001", "0.00000001", None
@@ -850,6 +975,11 @@ class ProductionShortLiveReaders:
                 extra["sessionRemainingSeconds"] = max(0, (closed - now).total_seconds())
                 extra["sessionClosesAt"] = closed.isoformat()
                 step, min_qty, max_qty, min_notional = "1", "1", None, "0"
+            # Metadata/fee/settings reads can be slow. Observe quote and FX at
+            # the end without caching, retrying, or relabeling their timestamps.
+            fx = {"known": True, "krwPerQuote": "1", "observedAt": self._now()} if currency == "KRW" else self._fx(currency)
+            if fx.get("known") is not True:
+                raise ShortLiveBrokerBlocked("FRESH_FX_REQUIRED")
             result = {"known": True, "symbol": symbol, "nativePrice": str(price), "quoteCurrency": currency,
                       "krwPerQuote": str(fx["krwPerQuote"]), "fxObservedAt": fx["observedAt"], "feeRate": str(fee),
                       "lotStep": str(step), "minQuantity": str(min_qty), "minNotional": str(min_notional),
@@ -859,7 +989,8 @@ class ProductionShortLiveReaders:
             number(result["feeRate"]); number(result["minNotional"])
             return result
         except Exception as exc:
-            return {"known": False, "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "OFFICIAL_MARKET_FEE_OR_FX_UNKNOWN"]}
+            return {"known": False, "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "OFFICIAL_MARKET_FEE_OR_FX_UNKNOWN"],
+                    "readDiagnostics": self._failure_reads()}
 
 
 def deepcopy_rows(value: Mapping[str, Any]) -> dict[str, Any]:

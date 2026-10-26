@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import {
   buildShortLivePrepare, exactShortLiveTarget, normalizeShortLiveCandidate,
   normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveReadyForConsent, shortLiveCoverage,
-  shortLiveRuntimeMeaning, shortLiveSelectionSignature, shortLivePreparationMatches, shortLiveBlockerLabel,
+  shortLiveRuntimeMeaning, shortLiveRetirementMeaning, shortLiveSelectionSignature, shortLivePreparationMatches, shortLiveBlockerLabel,
   shortLivePreparationWindow, shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLiveRunning,
   normalizeShortLiveFuturesPolicy, shortLiveProtectionLabel, shortLiveFuturesIncidentLabel,
 } from "../src/shortLiveTestModel.js";
@@ -218,6 +218,19 @@ test("backend runtime aliases retain only public metrics without inventing fills
   assert.equal(state.runtime.strategies[0].fillCount, null);
   assert.doesNotMatch(JSON.stringify(state.runtime), /private|ownedPositions|ownedOrders|positionsBySymbol/);
 });
+test("retirement is not promoted to a successful test and terminated rows no longer imply waiting", () => {
+  const runtime = {status:"TERMINATED",terminalVerified:true,naturalExitObserved:true,firstFailure:"NETWORK_TIMEOUT",blockers:[]};
+  assert.match(shortLiveRetirementMeaning(runtime), /오류로 시험이 중단/);
+  assert.match(shortLiveRetirementMeaning(runtime), /시험 성공을 뜻하지/);
+  assert.doesNotMatch(shortLiveRetirementMeaning(runtime), /정상 종료/);
+  assert.match(shortLiveRetirementMeaning({...runtime,firstFailure:null}), /시험 성공은 별도로/);
+  assert.match(shortLiveRetirementMeaning({...runtime,terminalVerified:false}), /종료 확인 전/);
+  assert.match(shortLiveRetirementMeaning({...runtime,unknownOrderCount:1}), /미확정 주문이 남아/);
+  assert.doesNotMatch(shortLiveRetirementMeaning({...runtime,unknownOrderCount:1}), /정리가 확인/);
+  assert.match(shortLiveRuntimeMeaning({timeframe:"1h",decisionCount:0,orderAttemptCount:0,fillObservationCount:0},runtime), /현재 신호를 기다리는 실행 상태가 아닙니다/);
+  assert.match(shortLiveRuntimeMeaning({timeframe:"1h",decisionCount:0,orderAttemptCount:1},runtime), /주문 시도가 관측/);
+});
+
 test("daily absence is a normal missing observation rather than PASS", () => {
   assert.match(shortLiveRuntimeMeaning({ timeframe: "1d", signalCount: 0 }), /미관측/);
   assert.match(shortLiveRuntimeMeaning({ timeframe: "1d", signalCount: 0 }), /통과·실패를 뜻하지/);

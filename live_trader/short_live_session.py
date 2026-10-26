@@ -32,6 +32,7 @@ from .short_live_contract import (
 )
 from .short_live_order_authority import activate_short_live_routes, release_short_live_routes
 from .portfolio_execution import SleeveDelta, _split_internal_and_external_allocations
+from .short_live_read_diagnostics import sanitize_read_diagnostics
 
 
 def _spec(value: Mapping[str, Any]) -> RuntimeStrategySpec:
@@ -241,7 +242,7 @@ class ShortLiveTestService:
         session = self._session
         keys = ("sessionId", "status", "startedAt", "endsAt", "newEntriesBlocked",
                 "terminalVerified", "naturalExitObserved", "stopReason", "firstFailure",
-                "blockers", "unknownOrderCount", "orderCount", "fillCount", "scopeHash", "internalTransferCount",
+                "terminatedAt", "firstFailureDiagnostics", "blockers", "unknownOrderCount", "orderCount", "fillCount", "scopeHash", "internalTransferCount",
                 "workerRetirementRequired", "workerLaunchState")
         result = {key: deepcopy(session.get(key)) for key in keys}
         from .short_live_monitor import public_feed_observation
@@ -320,7 +321,8 @@ class ShortLiveTestService:
                 "effectiveRouteBudgetKrw", "preservedAssetSymbols")
         result = {key: deepcopy(value[key]) for key in keys if key in value}
         result.update(route=route, ready=value.get("ready") is True,
-                      blockers=deepcopy(value.get("blockers") or []))
+                      blockers=deepcopy(value.get("blockers") or []),
+                      readDiagnostics=sanitize_read_diagnostics(value.get("readDiagnostics")))
         for key in ("observedFuturesSettings", "expectedFuturesSettings"):
             if isinstance(value.get(key), Mapping):
                 result[key] = {field: deepcopy(value[key].get(field))
@@ -420,7 +422,7 @@ class ShortLiveTestService:
                 "endsAt": utc_text(started + timedelta(seconds=contract["durationSeconds"])),
                 "startedMonotonic": self.monotonic(), "readiness": readiness,
                 "newEntriesBlocked": True, "terminalVerified": False,
-                "naturalExitObserved": False, "firstFailure": None,
+                "naturalExitObserved": False, "firstFailure": None, "firstFailureDiagnostics": [],
                 "stopReason": "", "blockers": [], "unknownOrderCount": 0,
                 "orderCount": 0, "fillCount": 0, "orders": {},
                 "internalTransfers": {}, "internalTransferCount": 0, "startupHistoryReceipts": {},
@@ -624,7 +626,8 @@ class ShortLiveTestService:
                     if self._session["status"] in {"STOPPING", "BLOCKED", "TERMINATED", "DRAINED"}:
                         break
             except Exception as exc:
-                self._failure(f"RUNTIME_BLOCKED:{type(exc).__name__}:{exc}")
+                self._failure(f"RUNTIME_BLOCKED:{type(exc).__name__}:{exc}",
+                              read_diagnostics=getattr(exc, "readDiagnostics", None))
                 self._stop_once("RUNTIME_BLOCKED")
             return self.snapshot(include_catalog=False)
 
@@ -648,7 +651,8 @@ class ShortLiveTestService:
                 else:
                     self._stop_once("ACCOUNT_RECONCILIATION_BLOCKED")
             except Exception as exc:
-                self._failure(f"STEP_BLOCKED:{type(exc).__name__}:{exc}")
+                self._failure(f"STEP_BLOCKED:{type(exc).__name__}:{exc}",
+                              read_diagnostics=getattr(exc, "readDiagnostics", None))
                 self._stop_once("STEP_BLOCKED")
             return self.snapshot(include_catalog=False)
 
@@ -814,7 +818,9 @@ class ShortLiveTestService:
             proposal["closeQuantity"] = close_quantity
         sized = self._brokers[route].size_order(deepcopy(proposal))
         if not isinstance(sized, Mapping) or sized.get("ready") is not True:
-            raise ShortLiveContractError("NATIVE_ORDER_SIZE_BLOCKED:" + ",".join(sized.get("blockers", []) if isinstance(sized, Mapping) else []))
+            error = ShortLiveContractError("NATIVE_ORDER_SIZE_BLOCKED:" + ",".join(sized.get("blockers", []) if isinstance(sized, Mapping) else []))
+            error.readDiagnostics = sanitize_read_diagnostics(sized.get("readDiagnostics") if isinstance(sized, Mapping) else None)
+            raise error
         quantity = finite(sized.get("quantity"), "NATIVE_QUANTITY", positive=True)
         if reducing and quantity > close_quantity + max(1e-10, close_quantity*1e-8):
             raise ShortLiveContractError("NATIVE_CLOSE_EXCEEDS_CHANGED_SLEEVE_OWNERSHIP")
@@ -854,7 +860,8 @@ class ShortLiveTestService:
         try:
             reply = self._brokers[route].submit(deepcopy(order))
         except Exception as exc:
-            reply = {"status": "UNKNOWN", "reason": type(exc).__name__}
+            reply = {"status": "UNKNOWN", "reason": type(exc).__name__,
+                     "readDiagnostics": sanitize_read_diagnostics(getattr(exc, "readDiagnostics", None))}
         self._handle_order_observation(client_id, reply)
         if not self._reconcile():
             self._stop_once("POST_ORDER_RECONCILIATION_BLOCKED")
@@ -952,11 +959,13 @@ class ShortLiveTestService:
                     brokerOrderId=str(reply.get("brokerOrderId", "")) if isinstance(reply, Mapping) else "")
         if status == "UNKNOWN":
             session["unknownOrderCount"] += 1
-            self._failure("ORDER_RESULT_UNKNOWN_NO_RETRY")
+            self._failure("ORDER_RESULT_UNKNOWN_NO_RETRY",
+                          read_diagnostics=reply.get("readDiagnostics") if isinstance(reply, Mapping) else None)
             self._stop_once("ORDER_RESULT_UNKNOWN_NO_RETRY")
             return
         if status == "REJECTED":
-            self._failure("BROKER_ORDER_REJECTED")
+            self._failure("BROKER_ORDER_REJECTED",
+                          read_diagnostics=reply.get("readDiagnostics") if isinstance(reply, Mapping) else None)
             self._stop_once("BROKER_ORDER_REJECTED")
             return
         filled = finite(reply.get("filledQuantity", 0), "FILLED_QUANTITY")
@@ -1080,12 +1089,13 @@ class ShortLiveTestService:
                     or not isinstance(value.get("positionsBySymbol"), Mapping)):
                 session["brokerRows"].pop(route, None)
                 codes = value.get("blockers", []) if isinstance(value, Mapping) else []
+                diagnostics = value.get("readDiagnostics") if isinstance(value, Mapping) else None
                 # Preserve the first concrete cause instead of masking a
                 # protective-stop/force-close incident as a generic failure.
                 for code in codes:
                     if isinstance(code, str) and len(code) <= 180 and all(c.isupper() or c.isdigit() or c == "_" for c in code):
-                        self._failure(f"{route}:{code}")
-                self._failure(f"{route}:RECONCILIATION_UNKNOWN")
+                        self._failure(f"{route}:{code}", read_diagnostics=diagnostics)
+                self._failure(f"{route}:RECONCILIATION_UNKNOWN", read_diagnostics=diagnostics)
                 okay = False
                 continue
             try:
@@ -1400,14 +1410,24 @@ class ShortLiveTestService:
                 self._failure("CLEANUP_ORDER_RESULT_UNKNOWN_NO_RETRY")
             return status != "UNKNOWN"
 
-    def _failure(self, reason: str) -> None:
+    def _failure(self, reason: str, *, read_diagnostics: Any = None) -> None:
         if self._session is None:
             return
-        if self._session["firstFailure"] is None:
-            self._session["firstFailure"] = reason
+        # Block entry before any fallible persistence. A full disk must not
+        # skip the original caller's cleanup path or replace the first cause.
         self._session["newEntriesBlocked"] = True
         if reason not in self._session["blockers"]:
             self._session["blockers"].append(reason)
+        if self._session["firstFailure"] is None:
+            self._session["firstFailure"] = reason
+            diagnostics = sanitize_read_diagnostics(read_diagnostics)
+            self._session["firstFailureDiagnostics"] = diagnostics
+            # Create-only first-cause evidence survives later cleanup failures.
+            # Only fixed route identities and safe numeric codes are retained.
+            try:
+                self._event("FIRST_FAILURE", reason=reason, readDiagnostics=deepcopy(diagnostics))
+            except OSError:
+                self._session["blockers"].append("FIRST_FAILURE_JOURNAL_WRITE_FAILED")
 
     def stop(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
@@ -1553,6 +1573,7 @@ class ShortLiveTestService:
             "workerLaunchState": session["workerLaunchState"],
             "naturalExitObserved": session["naturalExitObserved"],
             "firstFailure": session["firstFailure"],
+            "firstFailureDiagnostics": sanitize_read_diagnostics(session.get("firstFailureDiagnostics")),
             "actualFeeKnown": session["feesKnown"],
             "feeReconciliationStatus": "KNOWN" if session["feesKnown"] else "UNVERIFIED_ACTUAL_FEE",
             "functionalPass": False,

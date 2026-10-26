@@ -103,6 +103,28 @@ class Fixture:
 
 
 class ShortLiveBrokerTests(unittest.TestCase):
+    def test_market_and_account_failure_diagnostics_survive_adapter_safely(self):
+        observed = {"provider": "binance", "path": "/api/v3/account",
+                    "elapsedMs": 8000, "status": "UNAVAILABLE", "failureKind": "TIMEOUT"}
+        dirty = {**observed, "query": "signature=secret", "headers": {"key": "secret"},
+                 "body": "secret", "message": "secret"}
+        for source in ("account", "market"):
+            with self.subTest(source=source):
+                f = Fixture("BINANCE_SPOT")
+                self.assertTrue(f.adapter.readiness(f.manifest)["ready"])
+                failed = {"known": False, "blockers": ["OFFICIAL_MARKET_FEE_OR_FX_UNKNOWN"],
+                          "readDiagnostics": [dirty, {**dirty, "path": "/api/v3/account?signature=secret"}]}
+                if source == "account":
+                    f.adapter.snapshot_reader = lambda *_: copy.deepcopy(failed)
+                else:
+                    f.adapter.market_reader = lambda *_: copy.deepcopy(failed)
+                for result in (f.adapter.readiness(f.manifest), f.adapter.reconcile(f.manifest)):
+                    self.assertFalse(result["ready"])
+                    self.assertEqual(["OFFICIAL_MARKET_FEE_OR_FX_UNKNOWN"], result["blockers"])
+                    self.assertEqual([observed], result["readDiagnostics"])
+                    self.assertNotIn("secret", str(result))
+                self.assertEqual([], f.calls)
+
     @staticmethod
     def preserved_spot_fixture(route="BINANCE_SPOT", baseline="2"):
         f = Fixture(route)

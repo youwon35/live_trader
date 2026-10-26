@@ -52,7 +52,7 @@ class ReaderTests(unittest.TestCase):
 
     def test_selected_spot_inventory_is_explicit_and_outside_coins_are_not_equity(self):
         r = self.build()
-        r.market = lambda *_: {"nativePrice": "1000"}
+        r.market = lambda *_: {"known": True, "nativePrice": "1000"}
         def get(path, params=None, signed=True):
             if path == "/v1/accounts": return [{"currency": "KRW", "balance": "10000", "locked": "20"},
                 {"currency": "BTC", "balance": "2", "locked": ".5"},
@@ -159,7 +159,7 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual([{}], calls)
         self.assertEqual("1399.8", value["krwPerQuote"])
 
-    def test_slow_metadata_does_not_refresh_earlier_quote_receipt(self):
+    def test_final_quote_preserves_stale_provider_time_after_slow_metadata(self):
         r = self.build(); current = [NOW]; r.clock = lambda: current[0]
         def get(path, params=None, signed=True):
             if path == "/v1/orders/chance": return {"market": {"state": "active", "bid": {"min_total": "5000"}, "ask": {"min_total": "5000"}}, "bid_fee": "0.0005", "ask_fee": "0.0005"}
@@ -171,7 +171,8 @@ class ReaderTests(unittest.TestCase):
         r._upbit = get
         result = r.market("UPBIT_KRW_SPOT", "KRW-BTC")
         self.assertTrue(result["known"])
-        self.assertEqual(NOW, mod.epoch(result["observedAt"]))
+        self.assertEqual(NOW + 11, mod.epoch(result["observedAt"]))
+        self.assertEqual(NOW, mod.epoch(result["sourceQuoteObservedAt"]))
         adapter = mod.ShortLiveBrokerAdapter("UPBIT_KRW_SPOT", snapshot_reader=lambda *_: {}, market_reader=lambda *_: result,
                                              transport=None, authority_guard=lambda _: False, clock=lambda: current[0])
         with self.assertRaisesRegex(mod.ShortLiveBrokerBlocked, "OBSERVATION_STALE"):
