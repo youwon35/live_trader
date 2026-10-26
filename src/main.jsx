@@ -13,6 +13,7 @@ import "../../../packages/design/font-unification.css";
 import "../../../packages/design/interface-polish.css";
 import "./surface-polish.css";
 import "../../../packages/design/moa-theme.css";
+import "./moa-surfaces.css";
 import { installLayoutEditingSupport } from "../../../packages/design/layout-editing.js";
 
 installLayoutEditingSupport({ program: "live-trader" });

@@ -1,0 +1,86 @@
+/* App-specific MoA surfaces; trading handlers and semantic status colors are untouched. */
+:root[data-program="live-trader"] :is(
+  .automation-card, .validation-monitor-card, .doctor-detail-panel,
+  .order-detail-section, .order-detail-summary, .live-strategy-parameter-panel,
+  .capital-rollout-summary, .preflight-scope-panel, .broker-row,
+  .short-live-candidate, .short-live-futures-policy, .short-live-limit-summary > div,
+  .short-live-selection, .short-live-hourly-guide, .short-live-consent
+) {
+  border-radius: var(--moa-card-radius);
+  border-color: var(--border);
+  background-color: var(--panel);
+  padding: 18px;
+  min-width: 0;
+}
+:root[data-program="live-trader"] :is(
+  .doctor-hero, .live-environment-bar, .automation-metrics > div,
+  .automation-step, .order-empty-detail, .short-live-fixture
+) {
+  border-radius: var(--moa-card-radius);
+  background-color: var(--moa-soft);
+  border-color: var(--border);
+}
+:root[data-program="live-trader"] :is(
+  .automation-card-head > strong, .doctor-detail-panel h3,
+  .order-detail-section h3, .short-live-workspace h2, .short-live-workspace h3
+) {
+  color: var(--moa-structural-ink);
+  font-weight: 600;
+  letter-spacing: -.25px;
+}
+:root[data-program="live-trader"] :is(
+  .short-live-meta, .short-live-futures-fields small, .automation-card p,
+  .automation-step p, .broker-row p
+) { font-size: 12px; line-height: 1.7; }
+:root[data-program="live-trader"] .short-live-workspace { gap: 18px; }
+:root[data-program="live-trader"] .short-live-workspace > .panel { padding: var(--moa-panel-padding); }
+:root[data-program="live-trader"] .short-live-workspace h2 { font-size: 20px; }
+:root[data-program="live-trader"] .short-live-workspace h3 { font-size: 16px; }
+:root[data-program="live-trader"] .short-live-candidate.is-selected {
+  border-color: var(--ts-selection-accent, var(--primary));
+  box-shadow: inset 0 0 0 1px var(--ts-selection-accent, var(--primary));
+}
+:root[data-program="live-trader"] .live-monitor {
+  --monitor-accent: var(--moa-accent);
+  --monitor-soft: var(--moa-soft);
+  --monitor-ink: var(--moa-structural-ink);
+  --monitor-muted: var(--text-muted);
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border);
+}
+:root[data-program="live-trader"] .live-monitor-heading h2 { font-size: 24px; }
+:root[data-program="live-trader"] :is(.live-monitor-metrics article, .live-monitor-strategies article,
+  .live-monitor-equity article, .live-monitor-feed-strip > div) {
+  background: var(--panel); border-color: var(--border); border-radius: var(--moa-card-radius);
+}
+:root[data-program="live-trader"] :is(.live-monitor .live-monitor-empty, .live-monitor-event-icon) {
+  background: var(--moa-soft); color: var(--text-muted);
+}
+:root[data-program="live-trader"] .live-monitor-hero:not(.tone-danger):not(.tone-warning) {
+  background: var(--moa-soft); color: var(--moa-structural-ink); border-color: var(--border);
+}
+:root[data-program="live-trader"] .live-monitor-hero { border-radius: var(--moa-hero-radius); }
+:root[data-program="live-trader"] :is(.live-monitor-feed-strip strong, .live-monitor-equity-head strong,
+  .live-monitor-equity p) { color: var(--text); }
+:root[data-program="live-trader"] :is(.live-monitor-freshness,
+  .live-monitor-metrics article > span, .live-monitor-metrics article p,
+  .live-monitor-strategies article > div > span, .live-monitor-strategies article > small,
+  .live-monitor-equity small, .live-monitor-equity-head span,
+  .live-monitor .live-monitor-footnote, .live-monitor-activity time,
+  .live-monitor-activity li small, .live-monitor-feed-strip span,
+  .live-monitor-feed-strip small, .live-monitor .live-monitor-feed-strip p) {
+  font-size: 12px; color: var(--text-muted); line-height: 1.65;
+}
+:root[data-program="live-trader"] .live-monitor-activity { border-color: var(--border); }
+:root[data-program="live-trader"] .live-monitor-activity li { border-color: var(--border); }
+:root[data-program="live-trader"] .live-monitor-duration > div,
+:root[data-program="live-trader"] .live-monitor-equity-value > span { color: var(--text-soft); }
+@media (max-width: 900px) {
+  :root[data-program="live-trader"] :is(.automation-card, .doctor-detail-panel,
+    .order-detail-section, .short-live-candidate, .short-live-selection) { padding: 14px; }
+  :root[data-program="live-trader"] .short-live-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 620px) {
+  :root[data-program="live-trader"] .short-live-filters { grid-template-columns: minmax(0, 1fr); }
+}
