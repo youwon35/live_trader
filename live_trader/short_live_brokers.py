@@ -1040,6 +1040,20 @@ class ShortLiveBrokerAdapter:
                     "ownedPositions": deepcopy([p for p in s["positions"] if number(p["quantity"]) != 0]),
                     "positionsBySymbol": positions, "realizedLossKrw": decimal_text(realized_loss),
                     "unrealizedLossKrw": decimal_text(unrealized_loss), "equityKrw": decimal_text(equity),
+                    # Display-only signed change from the existing native-equity
+                    # baseline. Never substitute this for the unchanged loss guard.
+                    # Fresh FX converts both amounts, so idle FX movement is not PnL.
+                    "monitorEquity": {
+                        "basis": "OBSERVED_NATIVE_EQUITY_CHANGE",
+                        "baselineNative": decimal_text(self._baseline_equity_native) if self._baseline_equity_native is not None else None,
+                        "currentNative": decimal_text(number(s["equityNative"])),
+                        "quoteCurrency": self.currency,
+                        "krwPerQuote": decimal_text(fx),
+                        "preservedSpotExcluded": self._spot_baseline is not None,
+                        "cashFlowAdjusted": False,
+                        "realizedPnlKrw": decimal_text(number(s["realizedPnlNative"]) * fx) if "realizedPnlNative" in s else None,
+                        "unrealizedPnlKrw": decimal_text(number(s["unrealizedPnlNative"]) * fx) if "unrealizedPnlNative" in s else None,
+                    },
                     "exposureKrw": decimal_text(exposure), "scopeOwnershipVerified": True,
                     "committedCapitalKrw": decimal_text(committed), "notionalExposureKrw": decimal_text(exposure),
                     "protections": self._protection.public_rows() if self._protection else [],

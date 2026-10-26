@@ -128,7 +128,7 @@ try {
   await page.waitForFunction(() => !document.querySelector('.short-live-real-start')?.disabled);
   await page.evaluate(() => window.__shortLiveFixture.setBlocked());
   await page.getByRole("button", { name: "상태 새로 확인", exact: true }).click();
-  await page.getByText("사용 가능한 잔고 부족", { exact: true }).waitFor();
+  await page.getByLabel("진행을 막는 사유", { exact: true }).getByText("사용 가능한 잔고 부족", { exact: true }).waitFor();
   assert.equal(await start.isDisabled(), true); report.checks.push("fresh server blocker disables real start");
   await page.evaluate(() => window.__shortLiveFixture.reset()); await page.getByRole("button", { name: "상태 새로 확인", exact: true }).click();
   await page.waitForFunction(() => !document.querySelector('.short-live-real-start')?.disabled);

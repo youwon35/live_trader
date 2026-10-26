@@ -93,6 +93,7 @@ class ShortLiveTestService:
         self._thread: threading.Thread | None = None
         self._wake = threading.Event()
         self._journal_sequence = 0
+        self._monitor_events: list[dict[str, Any]] = []
         self._catalog_cache = None
         self._catalog_cache_at = float("-inf")
         self._last_reconcile_at = float("-inf")
@@ -125,10 +126,33 @@ class ShortLiveTestService:
     def _event(self, kind: str, **values: Any) -> None:
         self._journal_sequence += 1
         session_id = (self._session or {}).get("sessionId", "preparation")
+        observed_at = utc_text(self._now())
         self._write(f"event-{session_id}-{self._journal_sequence:08d}-{uuid4().hex}",
                     {"schemaVersion": "short-live-event-v1", "kind": kind,
-                     "observedAt": utc_text(self._now()), "purpose": PURPOSE,
+                     "observedAt": observed_at, "purpose": PURPOSE,
                      "promotionEligible": False, **values})
+        # A bounded, public projection of already journaled events. No private
+        # account, broker reply, order identifier or arbitrary nested payload.
+        if kind in {"STARTED", "BAR_EVALUATED", "NEXT_OPEN_OBSERVED",
+                    "ORDER_DEFERRED_PENDING_FILL", "ORDER_INTENT_BEFORE_SUBMIT",
+                    "ORDER_REPLY", "ACTUAL_FILL_INCREMENT", "INTERNAL_ALLOCATION_TRANSFER",
+                    "CLEANUP_INTENT_ONCE", "CLEANUP_ORDER_OBSERVED",
+                    "WORKER_EXIT_INTENT", "WORKER_DEATH_OBSERVED", "STARTUP_RETIRED_BEFORE_WORKER"}:
+            event = {"sequence": self._journal_sequence, "kind": kind,
+                     "observedAt": observed_at, "sessionId": session_id}
+            order = (self._session or {}).get("orders", {}).get(values.get("clientOrderId"), {}).get("order", {})
+            for key in ("route", "symbol", "side"):
+                item = values.get(key, order.get(key))
+                if isinstance(item, str) and len(item) <= 80:
+                    event[key] = item
+            if isinstance(values.get("status"), str) and values["status"] in {"SUBMITTING", "UNKNOWN", "ACCEPTED", "PARTIAL", "FILLED", "REJECTED", "CANCELED"}:
+                event["status"] = values["status"]
+            for key in ("quantity", "cumulativeQuantity", "incrementalQuantity", "cumulativeAveragePrice"):
+                item = values.get(key)
+                if isinstance(item, (float, int)) and not isinstance(item, bool):
+                    event[key] = item
+            self._monitor_events.append(event)
+            self._monitor_events = self._monitor_events[-60:]
 
     def _catalog(self) -> dict[str, Any]:
         with self._catalog_lock:
@@ -220,11 +244,17 @@ class ShortLiveTestService:
                 "blockers", "unknownOrderCount", "orderCount", "fillCount", "scopeHash", "internalTransferCount",
                 "workerRetirementRequired", "workerLaunchState")
         result = {key: deepcopy(session.get(key)) for key in keys}
+        from .short_live_monitor import public_feed_observation
+        result["feedObservations"] = [dict(route=route, **public_feed_observation(feed))
+                                      for route, feed in self._feeds.items()]
         result["ownerAlive"] = self._owner()
         result["workerAlive"] = bool(self._thread and self._thread.is_alive())
+        result["recentActivity"] = [deepcopy(row) for row in self._monitor_events
+                                    if row["sessionId"] == session["sessionId"]]
         public_keys = ("route", "ready", "exposureKrw", "realizedLossKrw",
                        "unrealizedLossKrw", "lossBasis", "actualFeeKnown",
                        "feeReconciliationStatus", "committedCapitalKrw", "notionalExposureKrw",
+                       "monitorEquity", "accountObservedAt",
                        "protections", "futuresPositions", "futuresIncidents", "observedFuturesSettingsBySymbol")
         result["brokerRows"] = [{key: deepcopy(row.get(key)) for key in public_keys}
                                 for row in session["brokerRows"].values()]
@@ -1072,6 +1102,12 @@ class ShortLiveTestService:
             losses[group] = losses.get(group, 0) + realized + unrealized
             session["brokerRows"][route] = {
                 "route": route, "ready": True, "exposureKrw": exposure,
+                "accountObservedAt": utc_text(self._now()),
+                "monitorEquity": {key: deepcopy(value.get("monitorEquity", {}).get(key))
+                                  for key in ("basis", "baselineNative", "currentNative", "quoteCurrency",
+                                              "krwPerQuote", "preservedSpotExcluded", "cashFlowAdjusted",
+                                              "realizedPnlKrw", "unrealizedPnlKrw")}
+                                  if isinstance(value.get("monitorEquity"), Mapping) else None,
                 "realizedLossKrw": realized, "unrealizedLossKrw": unrealized,
                 "ownedOrders": deepcopy(value.get("ownedOrders", [])),
                 "ownedPositions": deepcopy(value.get("ownedPositions", [])),

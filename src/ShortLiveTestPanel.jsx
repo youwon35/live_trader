@@ -10,6 +10,7 @@ import {
   normalizeShortLiveFuturesPolicy, shortLiveProtectionLabel, shortLiveFuturesIncidentLabel,
 } from "./shortLiveTestModel.js";
 import "./ShortLiveTestPanel.css";
+import RealtimeMonitor from "./RealtimeMonitor.jsx";
 
 const defaultApi = { snapshot: getShortLiveTestSnapshot, catalog: getShortLiveTestCatalog, prepare: prepareShortLiveTest, start: startShortLiveTest, stop: stopShortLiveTest };
 const money = (value) => value === null || value === undefined ? "미확인" : `${new Intl.NumberFormat("ko-KR").format(value)}원`;
@@ -34,6 +35,7 @@ function Blockers({ values = [], label = "진행을 막는 사유" }) {
 export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, pollMs = 5000, legacyWorkspace = null }) {
   const [snapshot, setSnapshot] = useState(() => normalizeShortLiveSnapshot(initialSnapshot));
   const [fresh, setFresh] = useState(false);
+  const [receivedAt, setReceivedAt] = useState(null);
   const [selection, setSelection] = useState([]);
   const [durationHours, setDurationHours] = useState(6);
   const [futuresLeverage, setFuturesLeverage] = useState("1");
@@ -122,7 +124,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
         const value = await api.snapshot();
         if (!mounted.current || version !== snapshotVersion.current) return;
         const next = acceptStatus(value);
-        setFresh(true); setPollError("");
+        setFresh(true); setPollError(""); setReceivedAt(Date.now());
         return next;
       } catch (failure) {
         if (mounted.current && version === snapshotVersion.current) { setFresh(false); setPollError(shortLiveBlockerLabel(failure?.message)); }
@@ -226,6 +228,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   }
 
   return <div className="short-live-workspace" aria-label="짧은 실거래 기능시험">
+    <RealtimeMonitor snapshot={snapshot} fresh={fresh} pollError={pollError} receivedAt={receivedAt} staleMs={Math.max(20000, pollMs * 3)} />
     <section className="panel short-live-intro">
       <div className="short-live-heading"><div><p className="short-live-eyebrow">5~7시간 · 실제 주문 경로 확인</p><h2>짧은 실거래 기능시험</h2></div>
         <button type="button" className="secondary-button" onClick={refresh} disabled={Boolean(busy)}><RefreshCw size={16} /> 상태 새로 확인</button></div>
