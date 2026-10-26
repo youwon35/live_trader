@@ -374,17 +374,25 @@ class ShortLiveTestService:
             blockers += self._guard(contract)
             self._brokers = {}
             readiness = {}
+            public_readiness = []
             for leg in contract["legs"]:
                 route = leg["route"]
                 adapter = self.broker_provider(route)
-                readiness[route] = self._validate_readiness(adapter.readiness(leg_manifest(contract, route)), leg, blockers)
+                value = adapter.readiness(leg_manifest(contract, route))
+                before_validation = len(blockers)
+                readiness[route] = self._validate_readiness(value, leg, blockers)
                 prior = self._prepared["readiness"].get(route, {})
                 current = readiness[route]
-                if route == "BINANCE_USDM_FUTURES" and (
+                # A failed read has no comparable account/baseline/settings.
+                # Keep its original blocker; absence is not proof of change.
+                comparable = bool(prior and current and prior.get("accountId") and current.get("accountId")
+                                  and prior.get("scopeOwnershipVerified") is True
+                                  and current.get("scopeOwnershipVerified") is True)
+                if comparable and route == "BINANCE_USDM_FUTURES" and (
                         not prior.get("observedFuturesSettingsBySymbol") or
                         prior.get("observedFuturesSettingsBySymbol") != current.get("observedFuturesSettingsBySymbol")):
                     blockers.append("FUTURES_SETTINGS_CHANGED_SINCE_PREPARATION")
-                if route in {"BINANCE_SPOT", "UPBIT_KRW_SPOT"} and (
+                if comparable and route in {"BINANCE_SPOT", "UPBIT_KRW_SPOT"} and (
                         prior.get("fundingBasis") == "AVAILABLE_QUOTE_ONLY"
                         or current.get("fundingBasis") == "AVAILABLE_QUOTE_ONLY"
                         or prior.get("preservedAssetsBaselineHash")
@@ -395,9 +403,14 @@ class ShortLiveTestService:
                             or any(char not in "0123456789abcdef" for char in before)
                             or after != before):
                         blockers.append(f"{route}:PRESERVED_ASSET_BASELINE_CHANGED")
-                if (self._prepared["readiness"].get(route, {}).get("accountId")
-                        != readiness[route].get("accountId")):
+                if comparable and prior.get("accountId") != current.get("accountId"):
                     blockers.append(f"{route}:PREPARED_ACCOUNT_CHANGED")
+                public = self._public_preparation_readiness(value, route)
+                public["blockers"] = list(dict.fromkeys([*public["blockers"],
+                    *[reason.removeprefix(route + ":") for reason in blockers[before_validation:]]]))
+                public["ready"] = public["ready"] and not public["blockers"]
+                public["checkedAt"] = utc_text(self._now())
+                public_readiness.append(public)
                 self._brokers[route] = adapter
             binance_accounts = {readiness[leg["route"]].get("accountId") for leg in contract["legs"]
                                 if leg["brokerGroup"] == "BINANCE" and readiness[leg["route"]]}
@@ -408,6 +421,14 @@ class ShortLiveTestService:
             if blockers:
                 self._prepared["blockers"] = list(dict.fromkeys(blockers))
                 self._prepared["readyToStart"] = False
+                # Display the actual failed recheck, not the old green prepare
+                # result. Preserve a sanitized receipt without rewriting it.
+                self._prepared["publicReadiness"] = public_readiness
+                self._write(f"start-readiness-{contract['preparationId']}-{uuid4().hex}", {
+                    "schemaVersion": "short-live-start-readiness-v1",
+                    "preparationId": contract["preparationId"], "scopeHash": contract["scopeHash"],
+                    "checkedAt": utc_text(self._now()), "readyToStart": False,
+                    "blockers": self._prepared["blockers"], "brokerReadiness": public_readiness})
                 raise ShortLiveContractError("START_BLOCKED:" + ",".join(self._prepared["blockers"]))
             # A previous verified terminal session may have used other routes.
             # Its retired feed/Thread objects never belong to this new claim.

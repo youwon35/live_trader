@@ -737,6 +737,48 @@ class ShortLiveSessionTests(unittest.TestCase):
         self.assertNotIn("fixture-private", json.dumps(prepared))
         self.assertNotIn("fixture-only", json.dumps(prepared))
 
+    def test_failed_start_read_is_not_a_changed_account_inventory_or_futures_setting(self):
+        for route in ("UPBIT_KRW_SPOT", "BINANCE_SPOT", "BINANCE_USDM_FUTURES"):
+            with self.subTest(route=route):
+                service, brokers, feeds = self.service([runtime_spec(route)])
+                broker = brokers[route]; original = broker.readiness
+                broker.readiness = lambda manifest: {**original(manifest),
+                    "fundingBasis": "AVAILABLE_QUOTE_ONLY", "preservedAssetsBaselineHash": "a"*64}
+                prepared = self.prepare(service)["prepared"]
+                before = list(service.store_root.glob("preparation-*.json"))[0].read_bytes()
+                broker.readiness = lambda _: {"ready": False, "blockers": ["ACCOUNT_OBSERVATION_STALE"],
+                    "readDiagnostics": [{"provider": "upbit", "path": "/v1/accounts", "status": "AVAILABLE", "elapsedMs": 31000,
+                                         "rawAccount": "fixture-private"}], "accountId": "fixture-private"}
+                with self.assertRaisesRegex(ShortLiveContractError, "ACCOUNT_OBSERVATION_STALE"):
+                    service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
+                                   "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+                current = service.snapshot(include_catalog=False)["prepared"]
+                self.assertEqual([route + ":ACCOUNT_OBSERVATION_STALE"], current["blockers"])
+                public = current["brokerReadiness"][0]
+                self.assertFalse(public["ready"])
+                self.assertEqual(["ACCOUNT_OBSERVATION_STALE"], public["blockers"])
+                self.assertEqual("/v1/accounts", public["readDiagnostics"][0]["path"])
+                receipts = list(service.store_root.glob("start-readiness-*.json"))
+                self.assertEqual(1, len(receipts))
+                receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+                self.assertEqual(current["blockers"], receipt["blockers"])
+                self.assertNotIn("fixture-private", json.dumps(receipt))
+                self.assertEqual(before, list(service.store_root.glob("preparation-*.json"))[0].read_bytes())
+                self.assertIsNone(service._session)
+                self.assertFalse(feeds[route].connected)
+                self.assertEqual([], broker.submits)
+
+    def test_successful_read_of_a_different_account_still_blocks_start(self):
+        service, brokers, _ = self.service([runtime_spec("UPBIT_KRW_SPOT")])
+        broker = brokers["UPBIT_KRW_SPOT"]; original = broker.readiness
+        prepared = self.prepare(service)["prepared"]
+        broker.readiness = lambda manifest: {**original(manifest), "accountId": "fixture-different-account"}
+        with self.assertRaisesRegex(ShortLiveContractError, "PREPARED_ACCOUNT_CHANGED"):
+            service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
+                           "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+        self.assertIsNone(service._session)
+        self.assertEqual([], broker.submits)
+
     def test_public_account_check_does_not_promote_adapter_ready_claim(self):
         for changes, reason in (({"scopeOwnershipVerified": False}, "ACCOUNT_SCOPE_OWNERSHIP_UNVERIFIED"),
                                 ({"availableKrw": "unknown"}, "FUNDING_OBSERVATION_UNKNOWN")):

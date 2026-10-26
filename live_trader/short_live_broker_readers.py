@@ -179,12 +179,35 @@ class ProductionShortLiveReaders:
         return sanitize_read_diagnostics(self._read_diagnostics)
 
     def _inventory_price(self, route, symbol):
-        market = self.market(route, symbol)
-        if market.get("known") is not True:
-            reason = next((code for code in market.get("blockers", [])
-                           if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,100}", code)), None)
-            raise ShortLiveBrokerBlocked(reason or "EXACT_MARKET_TRUTH_REQUIRED")
-        return number(market.get("nativePrice"), positive=True)
+        """Value existing spot units with one exact public native-price read.
+
+        Account collection does not need order filters, commissions or FX for
+        this valuation. Full order readiness still reads them independently.
+        Avoid spending the account's 30-second freshness budget on duplicate
+        trading-rule requests; never cache or relabel an earlier observation.
+        """
+        started = self.clock()
+        if route == "BINANCE_SPOT":
+            quote = self._binance("binance", "/api/v3/ticker/price", {"symbol": symbol}, signed=False)
+            if not isinstance(quote, Mapping) or quote.get("symbol") != symbol:
+                raise ShortLiveBrokerBlocked("EXACT_MARKET_TRUTH_REQUIRED")
+            price = quote.get("price")
+        elif route == "UPBIT_KRW_SPOT":
+            rows = self._upbit("/v1/ticker", {"markets": symbol}, signed=False)
+            if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping) or rows[0].get("market") != symbol:
+                raise ShortLiveBrokerBlocked("EXACT_MARKET_TRUTH_REQUIRED")
+            quote = rows[0]
+            if type(quote.get("trade_timestamp")) is not int or type(quote.get("timestamp")) is not int:
+                raise ShortLiveBrokerBlocked("UPBIT_QUOTE_SOURCE_TIME_UNKNOWN")
+            age = self.clock() - min(quote["trade_timestamp"], quote["timestamp"]) / 1000
+            if age < -2 or age > 10:
+                raise ShortLiveBrokerBlocked("SOURCE_QUOTE_OBSERVATION_STALE")
+            price = quote.get("trade_price")
+        else:
+            raise ShortLiveBrokerBlocked("EXACT_SPOT_ROUTE_REQUIRED")
+        if not -2 <= self.clock() - started <= 10:
+            raise ShortLiveBrokerBlocked("MARKET_OBSERVATION_STALE")
+        return number(price, positive=True)
 
     @staticmethod
     def _positive_id(value: Any, code: str) -> str:
@@ -632,6 +655,7 @@ class ProductionShortLiveReaders:
                     if field in annotations:
                         result[field] = annotations[field]
             result["observedAt"] = started
+            result["readDiagnostics"] = self._failure_reads()
             return result
         except Exception as exc:
             return {"known": False, "ordersComplete": False, "positionsComplete": False,
@@ -987,6 +1011,7 @@ class ProductionShortLiveReaders:
             for key in ("nativePrice", "krwPerQuote", "lotStep", "minQuantity"):
                 number(result[key], positive=True)
             number(result["feeRate"]); number(result["minNotional"])
+            result["readDiagnostics"] = self._failure_reads()
             return result
         except Exception as exc:
             return {"known": False, "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "OFFICIAL_MARKET_FEE_OR_FX_UNKNOWN"],

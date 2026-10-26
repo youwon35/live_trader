@@ -6,7 +6,7 @@ import {
   buildShortLivePrepare, exactShortLiveTarget, normalizeShortLiveCandidate,
   normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveReadyForConsent, shortLiveCoverage,
   shortLiveRuntimeMeaning, shortLiveRetirementMeaning, shortLiveSelectionSignature, shortLivePreparationMatches, shortLiveBlockerLabel,
-  shortLivePreparationWindow, shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLiveRunning,
+  shortLivePreviousSelection, shortLivePreparationWindow, shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLiveRunning,
   normalizeShortLiveFuturesPolicy, shortLiveProtectionLabel, shortLiveFuturesIncidentLabel,
 } from "../src/shortLiveTestModel.js";
 
@@ -328,4 +328,25 @@ test("daily actual signals and fills take precedence over unavailable signal cou
   assert.doesNotMatch(shortLiveRuntimeMeaning({ timeframe: "1d", signalCount: null, signal: "BUY" }), /신호 미관측/);
   assert.match(shortLiveRuntimeMeaning({ timeframe: "1d", signalCount: null, fillObservationCount: 2 }), /체결 관측 기록/);
   assert.match(shortLiveRuntimeMeaning({ timeframe: "1d", signalCount: null }), /여부 미확인/);
+});
+
+
+test("previous selections restore exact editable scope without granting start authority", () => {
+  const state = ready();
+  const restored = shortLivePreviousSelection(state.prepared, state.catalog);
+  assert.deepEqual(restored, { selection: [state.catalog[0].selectionKey], durationHours: 6, futuresPolicy: null });
+  assert.equal(shortLiveReadyForConsent(state, { fresh: true, preparedScopeMatches: true }), false);
+  assert.equal(shortLivePreviousSelection(state.prepared, []), null);
+  const changed = structuredClone(state.catalog); changed[0].instanceFileSha256 = "f".repeat(64);
+  assert.equal(shortLivePreviousSelection(state.prepared, changed), null);
+  const duplicate = structuredClone(state.prepared); duplicate.targets.push(duplicate.targets[0]);
+  assert.equal(shortLivePreviousSelection(duplicate, state.catalog), null);
+  assert.equal(shortLivePreviousSelection({ ...state.prepared, durationHours: 8 }, state.catalog), null);
+});
+
+test("stale observations identify the failed read instead of alleging an account change", () => {
+  for (const code of ["ACCOUNT_OBSERVATION_STALE", "MARKET_OBSERVATION_STALE", "SOURCE_QUOTE_OBSERVATION_STALE", "FX_OBSERVATION_STALE"]) {
+    assert.match(shortLiveBlockerLabel(code), /오래/);
+    assert.doesNotMatch(shortLiveBlockerLabel(code), /연결 계좌가 변경|보유 자산이 변경/);
+  }
 });

@@ -302,10 +302,10 @@ class ShortLiveBrokerAdapter:
                                     position_side=desired_position, source_id=row["brokerOrderId"])
         return True
 
-    def _fresh(self, value: Any, age: float = 30) -> None:
+    def _fresh(self, value: Any, age: float = 30, *, code: str = "OBSERVATION_STALE") -> None:
         delta = self.clock() - epoch(value)
         if delta < -2 or delta > age:
-            raise ShortLiveBrokerBlocked("OBSERVATION_STALE")
+            raise ShortLiveBrokerBlocked(code)
 
     def _scope(self, value: Mapping[str, Any]) -> dict[str, Any]:
         if self._manifest is None:
@@ -465,7 +465,11 @@ class ShortLiveBrokerAdapter:
             error = ShortLiveBrokerBlocked(reason or "COMPLETE_ACCOUNT_TRUTH_REQUIRED")
             error.readDiagnostics = sanitize_read_diagnostics(s.get("readDiagnostics"))
             raise error
-        self._fresh(s.get("observedAt"))
+        try:
+            self._fresh(s.get("observedAt"), code="ACCOUNT_OBSERVATION_STALE")
+        except ShortLiveBrokerBlocked as exc:
+            exc.readDiagnostics = sanitize_read_diagnostics(s.get("readDiagnostics"))
+            raise
         account = str(s.get("accountId") or "")
         if not account or (m.get("accountId") and account != m["accountId"]):
             raise ShortLiveBrokerBlocked("EXACT_ACCOUNT_REQUIRED")
@@ -548,10 +552,14 @@ class ShortLiveBrokerAdapter:
             error = ShortLiveBrokerBlocked(reason or "EXACT_MARKET_TRUTH_REQUIRED")
             error.readDiagnostics = sanitize_read_diagnostics(q.get("readDiagnostics"))
             raise error
-        self._fresh(q.get("observedAt"), 10)
-        if q.get("sourceQuoteObservedAt") is not None:
-            self._fresh(q["sourceQuoteObservedAt"], 10)
-        self._fresh(q.get("fxObservedAt"), 15)
+        try:
+            self._fresh(q.get("observedAt"), 10, code="MARKET_OBSERVATION_STALE")
+            if q.get("sourceQuoteObservedAt") is not None:
+                self._fresh(q["sourceQuoteObservedAt"], 10, code="SOURCE_QUOTE_OBSERVATION_STALE")
+            self._fresh(q.get("fxObservedAt"), 15, code="FX_OBSERVATION_STALE")
+        except ShortLiveBrokerBlocked as exc:
+            exc.readDiagnostics = sanitize_read_diagnostics(q.get("readDiagnostics"))
+            raise
         for key in ("nativePrice", "krwPerQuote", "lotStep", "minQuantity"):
             number(q.get(key), positive=True)
         if number(q.get("feeRate")) < 0 or number(q.get("feeRate")) > Decimal("0.1"):
@@ -632,10 +640,10 @@ class ShortLiveBrokerAdapter:
                        and q["symbol"].removesuffix("USDT") != q.get("commissionDiscountAsset") for q in markets):
                     raise ShortLiveBrokerBlocked("CROSS_SYMBOL_COMMISSION_ALLOCATION_UNSUPPORTED")
             for market in markets:
-                self._fresh(market["observedAt"], 10)
-                self._fresh(market["fxObservedAt"], 15)
+                self._fresh(market["observedAt"], 10, code="MARKET_OBSERVATION_STALE")
+                self._fresh(market["fxObservedAt"], 15, code="FX_OBSERVATION_STALE")
                 if market.get("sourceQuoteObservedAt") is not None:
-                    self._fresh(market["sourceQuoteObservedAt"], 10)
+                    self._fresh(market["sourceQuoteObservedAt"], 10, code="SOURCE_QUOTE_OBSERVATION_STALE")
             if self.route == "KIS_KR_CASH":
                 remaining = number(markets[0].get("sessionRemainingSeconds"))
                 available_minutes = decimal_text(max(Decimal(0), remaining - 120) / 60)

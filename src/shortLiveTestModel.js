@@ -194,6 +194,10 @@ export function shortLiveBlockerLabel(value) {
     NATIVE_FX_TIME_RESPONSE_CHANGED: "환율 관측과 공식 원본의 통화·값·시각이 일치하지 않음",
     FX_OBSERVATION_CONFLICT: "계좌와 주문 시세의 환율 관측이 일치하지 않음",
     OBSERVATION_STALE: "시세 또는 계좌 조회가 오래되어 현재 주문 조건 재확인 필요",
+    ACCOUNT_OBSERVATION_STALE: "계좌 조회가 오래됐습니다 · 계좌·시세 새로 확인을 눌러 다시 검사해 주세요",
+    MARKET_OBSERVATION_STALE: "주문 시세 조회가 오래됐습니다 · 계좌·시세 새로 확인이 필요합니다",
+    SOURCE_QUOTE_OBSERVATION_STALE: "거래소가 제공한 시세 시각이 오래됐습니다 · 최신 시세 수신 후 다시 검사해 주세요",
+    FX_OBSERVATION_STALE: "원화 환산 시세가 오래됐습니다 · 계좌·시세 새로 확인이 필요합니다",
     FRESH_CLOCK_GUARD_UNKNOWN: "현재 시각의 정확성을 확인하지 못함",
     FRESH_CLOCK_GUARD_NOT_POSITIVE: "현재 시각 검사 조건을 충족하지 못함",
     CLOCK_OFFSET_EXCEEDED: "현재 시각 오차가 허용 범위를 벗어남",
@@ -398,6 +402,7 @@ export function normalizeShortLiveSnapshot(value = {}) {
       expiresAt: text(preparation.expiresAt),
       brokerReadiness: (Array.isArray(preparation.brokerReadiness) ? preparation.brokerReadiness : []).map((row) => ({
         route: text(row.route), ready: row.ready === true, blockers: strings(row.blockers),
+        checkedAt: text(row.checkedAt),
         fundingBasis: text(row.fundingBasis), quoteCurrency: text(row.quoteCurrency),
         availableQuoteNative: amount(row.availableQuoteNative), availableKrw: amount(row.availableKrw),
         effectiveRouteBudgetKrw: amount(row.effectiveRouteBudgetKrw),
@@ -550,6 +555,15 @@ export function shortLivePreparationMatches(prepared, catalog, selectedKeys, dur
     catch { return false; }
   });
 }
+// Restores editable selections only. A new prepare call must bind start authority.
+export function shortLivePreviousSelection(prepared, catalog = []) {
+  if (!prepared || ![5, 6, 7].includes(prepared.durationHours)) return null;
+  const keys = (prepared.targets || []).map((row) => row.selectionKey);
+  if (!keys.length || new Set(keys).size !== keys.length || keys.some((key) => !key)) return null;
+  if (!shortLivePreparationMatches(prepared, catalog, keys, prepared.durationHours, prepared.futuresPolicy)) return null;
+  return { selection: keys, durationHours: prepared.durationHours, futuresPolicy: normalizeShortLiveFuturesPolicy(prepared.futuresPolicy) };
+}
+
 export function shortLiveSelectionSignature(catalog, selectedKeys, durationHours, futuresPolicy = null) {
   return JSON.stringify({ durationHours,
     futuresPolicy: futuresSelected(catalog, selectedKeys) ? {

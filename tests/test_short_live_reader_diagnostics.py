@@ -109,7 +109,7 @@ class SafeReadDiagnosticTests(unittest.TestCase):
         self.assertEqual("TIMEOUT", result["readDiagnostics"][0]["failureKind"])
         self.assertNotIn("private", json.dumps(result))
 
-    def test_inventory_market_failure_keeps_original_blocker_instead_of_keyerror(self):
+    def test_inventory_price_failure_keeps_account_unknown_and_exact_ticker_diagnostic(self):
         r = build_readers()
         def get(provider, path, *args, **kwargs):
             if path == "/api/v3/account":
@@ -123,14 +123,15 @@ class SafeReadDiagnosticTests(unittest.TestCase):
         self.assertFalse(result["known"])
         self.assertFalse(result["ordersComplete"])
         self.assertFalse(result["positionsComplete"])
-        self.assertEqual(["OFFICIAL_MARKET_FEE_OR_FX_UNKNOWN"], result["blockers"])
+        self.assertEqual(["OFFICIAL_ACCOUNT_READ_UNKNOWN"], result["blockers"])
+        self.assertEqual("/api/v3/ticker/price", result["readDiagnostics"][0]["path"])
         self.assertEqual("TIMEOUT", result["readDiagnostics"][0]["failureKind"])
 
     def test_inventory_preserves_specific_validation_blocker(self):
         r = build_readers()
-        r.market = lambda *_: {"known": False, "blockers": ["FUTURES_QUOTE_SOURCE_TIME_UNKNOWN"]}
-        with self.assertRaisesRegex(mod.ShortLiveBrokerBlocked, "^FUTURES_QUOTE_SOURCE_TIME_UNKNOWN$"):
-            r._inventory_price("BINANCE_SPOT", "SOLUSDT")
+        r._upbit = lambda *_a, **_k: [{"market": "KRW-BTC", "trade_price": 1000}]
+        with self.assertRaisesRegex(mod.ShortLiveBrokerBlocked, "^UPBIT_QUOTE_SOURCE_TIME_UNKNOWN$"):
+            r._inventory_price("UPBIT_KRW_SPOT", "KRW-BTC")
 
     def test_transport_keeps_numeric_code_and_clears_it_before_later_timeout(self):
         fake = types.ModuleType(PKG + ".read_only_account")

@@ -103,6 +103,26 @@ class Fixture:
 
 
 class ShortLiveBrokerTests(unittest.TestCase):
+    def test_freshness_failures_name_the_actual_observation_and_preserve_read_diagnostics(self):
+        for kind, field, age, code in (
+            ("account", "observedAt", 31, "ACCOUNT_OBSERVATION_STALE"),
+            ("market", "observedAt", 11, "MARKET_OBSERVATION_STALE"),
+            ("market", "sourceQuoteObservedAt", 11, "SOURCE_QUOTE_OBSERVATION_STALE"),
+            ("market", "fxObservedAt", 16, "FX_OBSERVATION_STALE"),
+        ):
+            with self.subTest(code=code):
+                f = Fixture("UPBIT_KRW_SPOT")
+                value = f.truth if kind == "account" else f.quote
+                value[field] = NOW - age
+                value["readDiagnostics"] = [{"provider": "upbit", "path": "/v1/accounts" if kind == "account" else "/v1/ticker",
+                                              "elapsedMs": 120, "status": "AVAILABLE", "secret": "never-public"}]
+                ready = f.adapter.readiness(f.manifest)
+                self.assertFalse(ready["ready"])
+                self.assertEqual([code], ready["blockers"])
+                self.assertEqual(1, len(ready["readDiagnostics"]))
+                self.assertNotIn("secret", ready["readDiagnostics"][0])
+                self.assertEqual([], f.calls)
+
     def test_market_and_account_failure_diagnostics_survive_adapter_safely(self):
         observed = {"provider": "binance", "path": "/api/v3/account",
                     "elapsedMs": 8000, "status": "UNAVAILABLE", "failureKind": "TIMEOUT"}

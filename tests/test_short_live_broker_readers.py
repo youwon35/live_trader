@@ -52,12 +52,16 @@ class ReaderTests(unittest.TestCase):
 
     def test_selected_spot_inventory_is_explicit_and_outside_coins_are_not_equity(self):
         r = self.build()
-        r.market = lambda *_: {"known": True, "nativePrice": "1000"}
+        r.market = lambda *_: self.fail("Inventory valuation must not repeat full trading-rule reads")
         def get(path, params=None, signed=True):
             if path == "/v1/accounts": return [{"currency": "KRW", "balance": "10000", "locked": "20"},
                 {"currency": "BTC", "balance": "2", "locked": ".5"},
                 {"currency": "ETH", "balance": "100", "locked": "0"}]
             if path == "/v1/orders/open": return []
+            if path == "/v1/ticker":
+                self.assertFalse(signed)
+                self.assertEqual({"markets": "KRW-BTC"}, params)
+                return [{"market": "KRW-BTC", "trade_price": "1000", "trade_timestamp": int(NOW*1000), "timestamp": int(NOW*1000)}]
             raise AssertionError(path)
         r._upbit = get
         result = r.snapshot("UPBIT_KRW_SPOT", ("KRW-BTC",))
@@ -66,6 +70,43 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual("12520.0", result["equityNative"])
         self.assertEqual({"BTC": "2.5", "ETH": "100"}, result["spotInventory"])
         self.assertEqual(["KRW-BTC"], [row["symbol"] for row in result["positions"]])
+
+    def test_inventory_native_price_needs_no_fee_filter_or_fx_but_keeps_source_freshness(self):
+        for route, symbol in (("BINANCE_SPOT", "BTCUSDT"), ("UPBIT_KRW_SPOT", "KRW-BTC")):
+            with self.subTest(route=route):
+                r = self.build(); calls = []
+                r.market = lambda *_: self.fail("No full market read for inventory valuation")
+                r.fx_reader = lambda *_: self.fail("Native valuation needs no FX")
+                def get(*args, **kwargs):
+                    calls.append((args, kwargs))
+                    if route == "BINANCE_SPOT":
+                        self.assertEqual(("binance", "/api/v3/ticker/price", {"symbol": symbol}), args)
+                        return {"symbol": symbol, "price": "1000"}
+                    self.assertEqual(("/v1/ticker", {"markets": symbol}), args)
+                    return [{"market": symbol, "trade_price": "1000", "trade_timestamp": int(NOW*1000), "timestamp": int(NOW*1000)}]
+                r._binance = r._upbit = get
+                self.assertEqual(mod.Decimal("1000"), r._inventory_price(route, symbol))
+                self.assertEqual(1, len(calls))
+                self.assertFalse(calls[0][1]["signed"])
+        r = self.build()
+        for trade_age, response_age in ((11, 0), (-3, -3)):
+            r._upbit = lambda *_a, **_k: [{"market": "KRW-BTC", "trade_price": "1000", "trade_timestamp": int((NOW-trade_age)*1000), "timestamp": int((NOW-response_age)*1000)}]
+            # Both provider times must be fresh; a fresh receive time cannot
+            # renew an older actual trade observation.
+            with self.assertRaisesRegex(mod.ShortLiveBrokerBlocked, "SOURCE_QUOTE_OBSERVATION_STALE"):
+                r._inventory_price("UPBIT_KRW_SPOT", "KRW-BTC")
+
+    def test_inventory_price_rejects_wrong_symbol_or_slow_read(self):
+        r = self.build(); now = [NOW]; r.clock = lambda: now[0]
+        r._binance = lambda *_a, **_k: {"symbol": "OTHERUSDT", "price": "1000"}
+        with self.assertRaisesRegex(mod.ShortLiveBrokerBlocked, "EXACT_MARKET_TRUTH_REQUIRED"):
+            r._inventory_price("BINANCE_SPOT", "BTCUSDT")
+        def slow(*_a, **_k):
+            now[0] += 11
+            return {"symbol": "BTCUSDT", "price": "1000"}
+        r._binance = slow
+        with self.assertRaisesRegex(mod.ShortLiveBrokerBlocked, "MARKET_OBSERVATION_STALE"):
+            r._inventory_price("BINANCE_SPOT", "BTCUSDT")
 
     def test_duplicate_negative_or_unknown_spot_balances_block_complete_truth(self):
         for holdings in ([{"currency": "ETH", "balance": "1", "locked": "0"}] * 2,

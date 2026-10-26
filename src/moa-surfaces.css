@@ -84,3 +84,54 @@
 @media (max-width: 620px) {
   :root[data-program="live-trader"] .short-live-filters { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* One-line status summaries; these elements are labels, not controls. */
+:root[data-program="live-trader"] #root :is(.live-safety-hierarchy, .functional-test-safety-strip) {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 22px;
+}
+:root[data-program="live-trader"] #root :is(.live-safety-hierarchy, .functional-test-safety-strip) > div {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
+  min-height: 0; min-width: 0; padding: 0; border: 0; border-radius: 0; background: transparent;
+}
+:root[data-program="live-trader"] #root :is(.live-safety-hierarchy, .functional-test-safety-strip) > div > span:first-child {
+  width: auto; font-size: 12px; overflow: visible; white-space: normal; color: var(--text-muted);
+}
+:root[data-program="live-trader"] #root :is(.live-safety-hierarchy, .functional-test-safety-strip) > div > span:first-child::after { content: " ·"; }
+:root[data-program="live-trader"] #root :is(.status-pill, .functional-test-status, .summary-state, .status-row-state, .level-pill):not(:is(button, a, [role="button"], [tabindex])) {
+  height: auto !important; min-height: 0 !important; padding: 0 !important;
+  border: 0 !important; border-radius: 0 !important; background: transparent !important; box-shadow: none !important;
+  font-size: 12px !important; line-height: 1.6 !important; text-align: left; overflow: visible;
+  color: var(--moa-current-status, var(--moa-status-muted)) !important;
+}
+:root[data-program="live-trader"] #root :is(.functional-test-status--running, .functional-test-status--preparing) { --moa-current-status: var(--moa-status-info); }
+:root[data-program="live-trader"] #root :is(.functional-test-status--ready, .summary-state.success, .status-row-state.success) { --moa-current-status: var(--moa-status-success); }
+:root[data-program="live-trader"] #root :is(.functional-test-status--blocked, .summary-state.warning, .status-row-state.warning, .level-pill.warning) { --moa-current-status: var(--moa-status-warning); }
+:root[data-program="live-trader"] #root :is(.functional-test-status--failed, .summary-state.danger, .status-row-state.danger, .level-pill.error) { --moa-current-status: var(--moa-status-danger); }
+:root[data-program="live-trader"] .short-live-restore { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
+
+/* Passive monitor labels use text color, while cards and controls keep their surfaces. */
+:root[data-program="live-trader"] #root :is(.live-monitor-connection, .live-monitor-signal, .live-monitor-strategies article strong small, .short-live-profile-badge, .live-monitor-event-icon) {
+  min-height: 0; padding: 0; border: 0; border-radius: 0;
+  background: transparent; box-shadow: none;
+}
+:root[data-program="live-trader"] #root :where(.live-monitor-connection, .live-monitor-signal, .live-monitor-strategies article strong small, .short-live-profile-badge, .live-monitor-event-icon) {
+  color: var(--moa-status-muted);
+}
+:root[data-program="live-trader"] #root :is(.live-monitor-connection, .live-monitor-signal, .short-live-profile-badge) {
+  height: auto; font-size: 12px; line-height: 1.6;
+}
+:root[data-program="live-trader"] #root :is(.live-monitor-connection.is-current, .live-monitor-signal.signal-BUY, .live-monitor-event-icon.is-fill, .live-monitor .is-positive) {
+  color: var(--moa-status-success);
+}
+:root[data-program="live-trader"] #root .live-monitor-connection.is-stale {
+  color: var(--moa-status-warning);
+}
+:root[data-program="live-trader"] #root :is(.live-monitor-signal.signal-SELL, .live-monitor .is-negative) {
+  color: var(--moa-status-danger);
+}
+:root[data-program="live-trader"] #root .short-live-profile-badge {
+  color: var(--moa-status-info);
+}
+:root[data-program="live-trader"] #root .live-monitor-event-icon {
+  width: 16px; height: 20px;
+}
