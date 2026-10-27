@@ -143,9 +143,11 @@
 }
 :root[data-program="live-trader"] #root .live-monitor-hero.tone-warning {
   color: var(--moa-status-warning);
-  background: color-mix(in srgb, var(--moa-status-warning) 8%, var(--panel));
+  background: var(--panel);
   border-color: color-mix(in srgb, var(--moa-status-warning) 30%, var(--border));
 }
 :root[data-program="live-trader"] #root .live-monitor-hero.tone-success {
   color: var(--moa-status-success);
 }
+
+:root[data-program="live-trader"] #root .live-monitor-hero:is(.tone-danger, .tone-warning) p { color: var(--text); }
