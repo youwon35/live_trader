@@ -97,7 +97,7 @@
   width: auto; font-size: 12px; overflow: visible; white-space: normal; color: var(--text-muted);
 }
 :root[data-program="live-trader"] #root :is(.live-safety-hierarchy, .functional-test-safety-strip) > div > span:first-child::after { content: " ·"; }
-:root[data-program="live-trader"] #root :is(.status-pill, .functional-test-status, .summary-state, .status-row-state, .level-pill):not(:is(button, a, [role="button"], [tabindex])) {
+:root[data-program="live-trader"] #root :is(.status-pill, .functional-test-status, .summary-state, .status-row-state):not(:is(button, a, [role="button"], [tabindex])) {
   height: auto !important; min-height: 0 !important; padding: 0 !important;
   border: 0 !important; border-radius: 0 !important; background: transparent !important; box-shadow: none !important;
   font-size: 12px !important; line-height: 1.6 !important; text-align: left; overflow: visible;
@@ -105,8 +105,8 @@
 }
 :root[data-program="live-trader"] #root :is(.functional-test-status--running, .functional-test-status--preparing) { --moa-current-status: var(--moa-status-info); }
 :root[data-program="live-trader"] #root :is(.functional-test-status--ready, .summary-state.success, .status-row-state.success) { --moa-current-status: var(--moa-status-success); }
-:root[data-program="live-trader"] #root :is(.functional-test-status--blocked, .summary-state.warning, .status-row-state.warning, .level-pill.warning) { --moa-current-status: var(--moa-status-warning); }
-:root[data-program="live-trader"] #root :is(.functional-test-status--failed, .summary-state.danger, .status-row-state.danger, .level-pill.error) { --moa-current-status: var(--moa-status-danger); }
+:root[data-program="live-trader"] #root :is(.functional-test-status--blocked, .summary-state.warning, .status-row-state.warning) { --moa-current-status: var(--moa-status-warning); }
+:root[data-program="live-trader"] #root :is(.functional-test-status--failed, .summary-state.danger, .status-row-state.danger) { --moa-current-status: var(--moa-status-danger); }
 :root[data-program="live-trader"] .short-live-restore { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
 
 /* Passive monitor labels use text color, while cards and controls keep their surfaces. */
@@ -134,4 +134,14 @@
 }
 :root[data-program="live-trader"] #root .live-monitor-event-icon {
   width: 16px; height: 20px;
+}
+/* Monitor titles and log details use the same MoA severity colors as the list. */
+:root[data-program="live-trader"] #root :is(.live-monitor-hero.tone-danger, .live-monitor-alert) {
+  color: var(--moa-status-danger);
+}
+:root[data-program="live-trader"] #root .live-monitor-hero.tone-warning {
+  color: var(--moa-status-warning);
+}
+:root[data-program="live-trader"] #root .live-monitor-hero.tone-success {
+  color: var(--moa-status-success);
 }

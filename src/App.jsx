@@ -6463,7 +6463,7 @@ function AuditPanel({
   const rows = audit.map((item, index) => {
     const logChannel = inferLogChannel(item);
     const rawLevel = String(item.level || "INFO").toUpperCase();
-    const normalizedLevel = item.level === "danger" || ["ERROR", "CRITICAL", "FAIL", "FAILED"].includes(rawLevel) ? "ERROR" : item.level === "warn" || ["WARN", "WARNING"].includes(rawLevel) ? "WARN" : "INFO";
+    const normalizedLevel = ["ERROR", "DANGER", "CRITICAL", "FATAL", "FAIL", "FAILED"].includes(rawLevel) ? "ERROR" : item.level === "warn" || ["WARN", "WARNING"].includes(rawLevel) ? "WARN" : "INFO";
     const displayTime = formatAuditTime(item);
     const source = item.source || item.event || item.category || "SYSTEM";
     const message = item.message || item.detail || item.reason || "-";
@@ -6544,7 +6544,7 @@ function AuditPanel({
               <OperatorNoteEditor key={row.item.operatorRecordKey || row.id} recordKey={row.item.operatorRecordKey} />
               <dl>
                 <div><dt>시각</dt><dd>{row.time}</dd></div>
-                <div><dt>범위 · 중요도</dt><dd>{row.scope} · {row.level}</dd></div>
+                <div><dt>범위 · 중요도</dt><dd><span className={`scope-pill scope-${logToken(row.scope)}`}>{row.scope}</span> · <span className={`level-pill level-${logToken(row.level)}`}>{row.level}</span></dd></div>
                 <div><dt>출처</dt><dd>{row.source}</dd></div>
                 <div><dt>실행 회차</dt><dd>{row.item.session_id || row.item.sessionId || "-"}</dd></div>
                 <div><dt>운용 배포</dt><dd>{row.item.deployment_id || row.item.deploymentId || "-"}</dd></div>
