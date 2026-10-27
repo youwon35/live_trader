@@ -183,6 +183,7 @@ class ShortLiveBrokerAdapter:
         self._claims: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._baseline_equity_native: Decimal | None = None
+        self._baseline_equity_observed_at = None
         self._fill_rows: dict[str, dict[str, Any]] = {}
         self._spot_baseline: dict[str, Decimal] | None = None
         self._spot_baseline_account: str | None = None
@@ -712,6 +713,7 @@ class ShortLiveBrokerAdapter:
                     self._spot_baseline_account = s["accountId"]
                 if self._baseline_equity_native is None:
                     self._baseline_equity_native = number(s["equityNative"])
+                    self._baseline_equity_observed_at = s["observedAt"]
             return {"ready": True, "blockers": [], "accountId": s["accountId"], **funding,
                     "availableKrw": decimal_text(available), "existingExposureKrw": "0",
                     "scopeOwnershipVerified": True, "quoteObservedAt": markets[0]["observedAt"],
@@ -1055,7 +1057,9 @@ class ShortLiveBrokerAdapter:
                     for cid in self._claims):
                 for cid in self._claims:
                     self.budget.release_terminal(self.exchange, cid)
-            return {"known": True, "ready": True, "blockers": [], "accountId": s["accountId"], "pendingOrders": deepcopy(s["openOrders"]),
+            from .short_live_monitor import public_observed_at
+            return {"known": True, "ready": True, "blockers": [], "accountId": s["accountId"],
+                    "accountObservedAt": public_observed_at(s["observedAt"]), "pendingOrders": deepcopy(s["openOrders"]),
                     "ownedOrders": deepcopy(s["openOrders"]), "positions": deepcopy(s["positions"]),
                     "ownedPositions": deepcopy([p for p in s["positions"] if number(p["quantity"]) != 0]),
                     "positionsBySymbol": positions, "realizedLossKrw": decimal_text(realized_loss),
@@ -1065,6 +1069,9 @@ class ShortLiveBrokerAdapter:
                     # Fresh FX converts both amounts, so idle FX movement is not PnL.
                     "monitorEquity": {
                         "basis": "OBSERVED_NATIVE_EQUITY_CHANGE",
+                        "baselineObservedAt": public_observed_at(self._baseline_equity_observed_at),
+                        "fxObservedAt": public_observed_at(next(iter(quotes.values())).get("fxObservedAt")),
+                        "fxBasis": "IDENTITY_KRW" if self.currency == "KRW" else "OBSERVED_FX",
                         "baselineNative": decimal_text(self._baseline_equity_native) if self._baseline_equity_native is not None else None,
                         "currentNative": decimal_text(number(s["equityNative"])),
                         "quoteCurrency": self.currency,

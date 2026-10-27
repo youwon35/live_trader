@@ -29697,3 +29697,63 @@ def _public_gap_settings_invalidator(function):
 
 stop_continuous_runtime = _public_gap_stop_invalidator(stop_continuous_runtime)
 save_environment_settings = _public_gap_settings_invalidator(save_environment_settings)
+
+
+# Batch plans bind independent ordinary deployments; all existing admission,
+# account writer leases and native KIS confirmation remain authoritative.
+_RUNTIME_BATCH_SERVICE = None
+_RUNTIME_BATCH_SERVICE_LOCK = threading.RLock()
+
+
+def _resolve_runtime_batch_member(selection):
+    scope = resolve_continuous_runtime_scope(
+        selection["profile_id"], selection["mode"], selection["portfolio_id"],
+        selection["strategy_id"], selection["deployment_id"])
+    selected = _operational_strategy(
+        strategy_rows(portfolio_rows()), deployment_id=selection["deployment_id"],
+        strategy_id=selection["strategy_id"], portfolio_id=selection["portfolio_id"])
+    if selected is None or scope is None:
+        raise ValueError("batch-exact-deployment-binding-required")
+    return {"scope": scope,
+            "manifestInputsHash": governance_sha256(_operational_manifest_inputs(selected))}
+
+
+def _start_runtime_batch_member(selection, options):
+    if "marketGapPreparationId" in options and not public_market_gap_start_note_current(
+            options["marketGapPreparationId"], selection):
+        return {"ok": False, "reason": "MARKET_GAP_PREPARATION_CHANGED_OR_EXPIRED",
+                "runtimeStarted": False, "brokerSubmissionPerformed": False}
+    # Calls the decorated entrypoint, not controller.start. KIS native-confirm,
+    # account/Paper/preflight/policy/lease/kill-switch checks cannot be bypassed.
+    return start_continuous_runtime(
+        selection["profile_id"], selection["mode"], selection["portfolio_id"],
+        selection["deployment_id"], selection["strategy_id"],
+        safety_confirmation=options.get("safety_confirmation"))
+
+
+def runtime_batch_request(action, payload=None):
+    from .runtime_batch import RuntimeBatchService, RuntimeBatchError
+    global _RUNTIME_BATCH_SERVICE
+    with _RUNTIME_BATCH_SERVICE_LOCK:
+        if _RUNTIME_BATCH_SERVICE is None:
+            _RUNTIME_BATCH_SERVICE = RuntimeBatchService(
+                APP_DATA_ROOT / "runtime-batches", resolve=_resolve_runtime_batch_member,
+                start=_start_runtime_batch_member,
+                observe=LIVE_CONTINUOUS_CONTROLLER.snapshot)
+        service = _RUNTIME_BATCH_SERVICE
+    try:
+        if action == "prepare":
+            return service.prepare(payload)
+        if action == "start-member":
+            result = service.start_member(payload)
+            result["snapshot"] = snapshot()
+            return result
+        if action == "status":
+            return service.status(payload)
+        raise RuntimeBatchError("BATCH_ACTION_INVALID")
+    except RuntimeBatchError as exc:
+        return {"ok": False, "reason": str(exc), "reasonCode": str(exc),
+                "runtimeStarted": False, "brokerSubmissionPerformed": False}
+    except Exception as exc:
+        return {"ok": False, "reason": "BATCH_OPERATION_UNAVAILABLE",
+                "reasonCode": "BATCH_OPERATION_UNAVAILABLE", "errorType": type(exc).__name__}

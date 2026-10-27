@@ -95,6 +95,7 @@ class ShortLiveTestService:
         self._wake = threading.Event()
         self._journal_sequence = 0
         self._monitor_events: list[dict[str, Any]] = []
+        self._equity_history: list[dict[str, Any]] = []
         self._catalog_cache = None
         self._catalog_cache_at = float("-inf")
         self._last_reconcile_at = float("-inf")
@@ -248,6 +249,8 @@ class ShortLiveTestService:
         from .short_live_monitor import public_feed_observation
         result["feedObservations"] = [dict(route=route, **public_feed_observation(feed))
                                       for route, feed in self._feeds.items()]
+        result["equityHistory"] = deepcopy(self._equity_history)
+        result["equityHistorySampleSeconds"] = 60
         result["ownerAlive"] = self._owner()
         result["workerAlive"] = bool(self._thread and self._thread.is_alive())
         result["recentActivity"] = [deepcopy(row) for row in self._monitor_events
@@ -266,12 +269,20 @@ class ShortLiveTestService:
         result["strategyRows"] = [
             {"instanceId": key, "pluginId": self._specs[key]["pluginId"],
              "route": self._specs[key]["route"], "symbol": self._specs[key]["symbol"],
+             "portfolioId": self._specs[key]["portfolioId"],
              "timeframe": self._specs[key]["timeframe"],
              "allocationWeight": self._specs[key]["targetWeight"],
              "sourcePositionSizePercent": self._specs[key]["sourcePositionSizePercent"],
              "positionSizeFraction": self._specs[key]["positionSizeFraction"],
              "positionQuantity": row["quantity"], "targetWeight": row["targetWeight"],
              "lastSignal": row.get("lastSignal", "NOT_OBSERVED"),
+             "lastDecisionAt": row.get("lastDecisionAt"),
+             "lastBarAt": row.get("lastBarAt"), "lastPrice": row.get("lastPrice"),
+             "averageEntryPrice": row.get("averagePrice") if row["quantity"] else None,
+             "pendingOrderCount": sum(1 for order in session["orders"].values()
+                 if order.get("status") in {"SUBMITTING", "UNKNOWN", "ACCEPTED", "PARTIAL"}
+                 and order.get("order", {}).get("route") == self._specs[key]["route"]
+                 and order.get("allocationWeights", {}).get(key, 0) > 0),
              "decisionCount": row.get("decisionCount", 0),
              "orderAttemptCount": row.get("orderAttemptCount", 0),
              "fillObservationCount": row.get("fillCount", 0),
@@ -465,6 +476,7 @@ class ShortLiveTestService:
                     for leg in contract["legs"]},
                 "routeAuthorityActive": False,
             }
+            self._equity_history = []
             self._specs = {s["strategyInstanceId"]: s for s in contract["specs"]}
             # Durable claim precedes connect/submit.  Lost replies cannot mint a
             # fresh UUID or restart this same scope.
@@ -702,6 +714,9 @@ class ShortLiveTestService:
             row = self._session["sleeves"][decision.strategy_instance_id]
             spec = self._specs[decision.strategy_instance_id]
             row["lastSignal"] = decision.signal
+            row["lastBarAt"] = bar.end_time
+            row["lastPrice"] = bar.close
+            row["lastDecisionAt"] = utc_text(self._now())
             row["decisionCount"] = row.get("decisionCount", 0) + 1
             if decision.signal == "HOLD":
                 continue
@@ -1133,10 +1148,11 @@ class ShortLiveTestService:
             losses[group] = losses.get(group, 0) + realized + unrealized
             session["brokerRows"][route] = {
                 "route": route, "ready": True, "exposureKrw": exposure,
-                "accountObservedAt": utc_text(self._now()),
+                "accountObservedAt": value.get("accountObservedAt"),
                 "monitorEquity": {key: deepcopy(value.get("monitorEquity", {}).get(key))
                                   for key in ("basis", "baselineNative", "currentNative", "quoteCurrency",
-                                              "krwPerQuote", "preservedSpotExcluded", "cashFlowAdjusted",
+                                              "krwPerQuote", "baselineObservedAt", "fxObservedAt", "fxBasis",
+                                              "preservedSpotExcluded", "cashFlowAdjusted",
                                               "realizedPnlKrw", "unrealizedPnlKrw")}
                                   if isinstance(value.get("monitorEquity"), Mapping) else None,
                 "realizedLossKrw": realized, "unrealizedLossKrw": unrealized,
@@ -1152,6 +1168,8 @@ class ShortLiveTestService:
                 **{key: deepcopy(value.get(key, [] if key != "observedFuturesSettingsBySymbol" else {}))
                    for key in ("protections", "futuresPositions", "futuresIncidents", "observedFuturesSettingsBySymbol")},
             }
+            from .short_live_monitor import append_equity_observation
+            append_equity_observation(self._equity_history, route, value)
             for incident in value.get("futuresIncidents", []):
                 code = incident.get("code") or {"LIQUIDATION": "FUTURES_LIQUIDATION_DETECTED",
                     "ADL": "FUTURES_ADL_DETECTED", "PROTECTIVE_STOP": "FUTURES_PROTECTIVE_STOP_TRIGGERED"}.get(incident.get("type"))

@@ -38,6 +38,7 @@ STRATEGY_SEARCH_PRESET_LIMIT = 30
 _FUNCTIONAL_STATUS_PATHS = frozenset(
     {
         "/api/short-live-tests/snapshot",
+        "/api/runtime/batches/status",
         "/api/short-live-tests/catalog",
         "/api/paper-candidates",
         "/api/paper-candidates/accounts",
@@ -51,6 +52,8 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
 _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
         "/api/short-live-tests/prepare",
+        "/api/runtime/batches/prepare",
+        "/api/runtime/batches/start-member",
         "/api/short-live-tests/start",
         "/api/short-live-tests/stop",
         "/api/runtime/kis-manual-start-challenge",
@@ -431,6 +434,13 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path in _FUNCTIONAL_STATUS_PATHS and not self._authorize_functional_http(
             require_origin=False
         ):
+            return
+        if parsed.path == "/api/runtime/batches/status":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if set(query) != {"batchId"} or len(query["batchId"]) != 1:
+                self.send_json({"ok": False, "reasonCode": "EXACT_BATCH_ID_REQUIRED"})
+                return
+            self.send_json(state.runtime_batch_request("status", query["batchId"][0]))
             return
         if parsed.path == "/api/short-live-tests/snapshot":
             self.send_json(state.short_live_test_request("snapshot"))
@@ -965,6 +975,12 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 str(payload.get("strategy_id", "")),
                 **({"initialization_options": payload["initializationOptions"]} if "initializationOptions" in payload else {}),
             ))
+            return
+        if parsed.path in {"/api/runtime/batches/prepare", "/api/runtime/batches/start-member"}:
+            if parsed.query or not isinstance(payload, dict):
+                self.send_json({"ok": False, "reasonCode": "EXACT_BATCH_REQUEST_REQUIRED"})
+                return
+            self.send_json(state.runtime_batch_request(parsed.path.rsplit("/", 1)[-1], payload))
             return
         if parsed.path == "/api/runtime/start":
             # An optional UI diagnostic note does not add execution authority.
