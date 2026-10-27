@@ -138,9 +138,13 @@
 /* Monitor titles and log details use the same MoA severity colors as the list. */
 :root[data-program="live-trader"] #root :is(.live-monitor-hero.tone-danger, .live-monitor-alert) {
   color: var(--moa-status-danger);
+  background: color-mix(in srgb, var(--moa-status-danger) 8%, var(--panel));
+  border-color: color-mix(in srgb, var(--moa-status-danger) 30%, var(--border));
 }
 :root[data-program="live-trader"] #root .live-monitor-hero.tone-warning {
   color: var(--moa-status-warning);
+  background: color-mix(in srgb, var(--moa-status-warning) 8%, var(--panel));
+  border-color: color-mix(in srgb, var(--moa-status-warning) 30%, var(--border));
 }
 :root[data-program="live-trader"] #root .live-monitor-hero.tone-success {
   color: var(--moa-status-success);
