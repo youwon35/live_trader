@@ -4,7 +4,9 @@ import { LIVE_WORKSPACE_ROUTE_IDS, liveNavigationRoot, liveNavigationRoute, live
 
 test('every old stored or diagnostic route remains addressable', () => {
   const legacy = ['overview', 'gate', 'functional-test', 'risk', 'automation', 'accounts', 'orders', 'incidents', 'audit', 'settings'];
-  assert.deepEqual([...LIVE_WORKSPACE_ROUTE_IDS], legacy);
+  assert.deepEqual([...LIVE_WORKSPACE_ROUTE_IDS].filter(id => id !== "monitor"), legacy);
+  assert.equal(liveNavigationRoot("monitor"), "monitor");
+  assert.equal(liveNavigationRoute("monitor"), "monitor");
   for (const route of legacy) assert.equal(liveNavigationRoute(route), route);
   assert.equal(liveNavigationRoute('unknown'), 'overview');
 });

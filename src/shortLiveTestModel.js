@@ -422,6 +422,11 @@ export function normalizeShortLiveSnapshot(value = {}) {
       newEntriesBlocked: typeof run.newEntriesBlocked === "boolean" ? run.newEntriesBlocked : null,
       unknownOrderCount: numeric(run.unknownOrderCount),
       orderCount: numeric(run.orderCount), fillCount: numeric(run.fillCount),
+      equityHistory: (Array.isArray(run.equityHistory) ? run.equityHistory : []).slice(-2880).map(row => ({
+        observedAt:text(row.observedAt), route:sanitizeShortLiveText(row.route), basis:text(row.basis),
+        baselineNative:amount(row.baselineNative), currentNative:amount(row.currentNative),
+        krwPerQuote:amount(row.krwPerQuote), quoteCurrency:sanitizeShortLiveText(row.quoteCurrency),
+      })),
       feedObservations: (Array.isArray(run.feedObservations) ? run.feedObservations : []).map(row => ({
         route: sanitizeShortLiveText(row.route),
         streams: (Array.isArray(row.streams) ? row.streams : []).map(stream => ({
@@ -473,7 +478,10 @@ export function normalizeShortLiveSnapshot(value = {}) {
         orderAttemptCount: numeric(row.orderAttemptCount), fillObservationCount: numeric(row.fillObservationCount),
         internalAllocationTransferCount: numeric(row.internalAllocationTransferCount),
         pluginId: sanitizeShortLiveText(row.pluginId), symbol: sanitizeShortLiveText(row.symbol), route: text(row.route),
-        lastObservedAt: text(row.lastObservedAt),
+        lastObservedAt: text(row.lastObservedAt), portfolioId: sanitizeShortLiveText(row.portfolioId),
+        lastPrice: amount(row.lastPrice), lastBarAt: text(row.lastBarAt), lastDecisionAt: text(row.lastDecisionAt),
+        averageEntryPrice: amount(row.averageEntryPrice), pendingOrderCount: numeric(row.pendingOrderCount),
+        positionQuantity: (typeof row.positionQuantity === "number" || (typeof row.positionQuantity === "string" && /^-?\d+(?:\.\d+)?$/.test(row.positionQuantity))) ? numeric(Number(row.positionQuantity)) : null,
       })),
     } : null,
   };

@@ -11,6 +11,9 @@ import {
 } from "./shortLiveTestModel.js";
 import "./ShortLiveTestPanel.css";
 import RealtimeMonitor from "./RealtimeMonitor.jsx";
+import ContinuousMonitor from "./ContinuousMonitor.jsx";
+import {projectRealtimeMonitor} from "./realtimeMonitorModel.js";
+import "./MonitorWorkspace.css";
 
 const defaultApi = { snapshot: getShortLiveTestSnapshot, catalog: getShortLiveTestCatalog, prepare: prepareShortLiveTest, start: startShortLiveTest, stop: stopShortLiveTest };
 const money = (value) => value === null || value === undefined ? "미확인" : `${new Intl.NumberFormat("ko-KR").format(value)}원`;
@@ -32,7 +35,7 @@ function Blockers({ values = [], label = "진행을 막는 사유" }) {
   return rows.length ? <div className="short-live-blockers" role="status" aria-label={label}><strong>{label}</strong><ul>{rows.map((row) => <li key={row}>{row}</li>)}</ul></div> : null;
 }
 
-export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, pollMs = 5000, legacyWorkspace = null }) {
+export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, pollMs = 5000, legacyWorkspace = null, viewMode = "setup", operationalSnapshot = {}, onOpenMonitor, onOpenSetup, onOpenExecution }) {
   const [snapshot, setSnapshot] = useState(() => normalizeShortLiveSnapshot(initialSnapshot));
   const [fresh, setFresh] = useState(false);
   const [receivedAt, setReceivedAt] = useState(null);
@@ -204,8 +207,9 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
       const result = await api.start({ preparationId: prepared.preparationId, scopeHash: prepared.scopeHash,
         confirmed: true, confirmationText: SHORT_LIVE_CONFIRMATION });
       acceptStatus(result);
-      setMessage("시작 요청을 보냈습니다. 실제 실행·주문·체결 상태는 아래 관측 결과로 확인합니다.");
+      setMessage("시작 요청을 보냈습니다. 실제 실행·주문·체결 상태는 실시간 감시에서 확인합니다.");
       await refresh({ forceFresh: true });
+      onOpenMonitor?.();
     } catch (failure) {
       setFresh(false); setPreparedSelection(""); setPreparedAuthority("");
       if (failure?.knownPreMutationRejection === true) {
@@ -239,8 +243,16 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     } finally { mutationPending.current = false; setBusy(""); }
   }
 
+  const monitorView = projectRealtimeMonitor(snapshot, {fresh, pollError, receivedAt, now:Date.now(), staleMs:Math.max(20000,pollMs*3)});
+  if (viewMode === "monitor") return <div className="short-live-workspace" aria-label="실시간 감시 작업공간">
+    <div className="monitor-workspace-actions"><button className="secondary-button" type="button" onClick={onOpenSetup}>시험 설정·시작·중지</button><button className="secondary-button" type="button" onClick={refresh} disabled={Boolean(busy)}><RefreshCw size={15}/> 상태 새로 확인</button></div>
+    {unknownMutation && <p role="alert" className="short-live-error">요청 결과 미확정 · 자동 재시도하지 않습니다. 시험 설정에서 동일 실행의 상태를 확인하세요.</p>}
+    {error && <p role="alert" className="short-live-error">{error}</p>}
+    <ContinuousMonitor snapshot={operationalSnapshot} onOpenExecution={onOpenExecution}/>
+    <RealtimeMonitor snapshot={snapshot} fresh={fresh} pollError={pollError} receivedAt={receivedAt} staleMs={Math.max(20000,pollMs*3)}/>
+  </div>;
   return <div className="short-live-workspace" aria-label="짧은 실거래 기능시험">
-    <RealtimeMonitor snapshot={snapshot} fresh={fresh} pollError={pollError} receivedAt={receivedAt} staleMs={Math.max(20000, pollMs * 3)} />
+    <section className="panel monitor-compact-summary"><div><span className="short-live-eyebrow">실행 관측</span><strong>{monitorView.state.title}</strong><p>{monitorView.state.detail}</p></div><button className="secondary-button" type="button" onClick={onOpenMonitor}>실시간 감시 열기</button></section>
     <section className="panel short-live-intro">
       <div className="short-live-heading"><div><p className="short-live-eyebrow">5~7시간 · 실제 주문 경로 확인</p><h2>짧은 실거래 기능시험</h2></div>
         <button type="button" className="secondary-button" onClick={refresh} disabled={Boolean(busy)}><RefreshCw size={16} /> 실행 상태 새로 확인</button></div>

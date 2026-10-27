@@ -1,7 +1,7 @@
 // Route IDs are durable UI preferences and diagnostic links, not lifecycle stages.
 // Keep legacy routes addressable while presenting fewer top-level decisions.
 export const LIVE_WORKSPACE_ROUTE_IDS = Object.freeze([
-  "overview", "gate", "functional-test", "risk", "automation", "accounts",
+  "overview", "gate", "functional-test", "monitor", "risk", "automation", "accounts",
   "orders", "incidents", "audit", "settings",
 ]);
 

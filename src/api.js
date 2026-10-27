@@ -53,6 +53,7 @@ let functionalHttpSessionGeneration = 0;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/short-live-tests/prepare", "/api/short-live-tests/start", "/api/short-live-tests/stop",
   "/api/preparation/market-gaps/begin", "/api/preparation/market-gaps/cancel",
+  "/api/runtime/batches/prepare", "/api/runtime/batches/start-member",
   "/api/runtime/kis-manual-start-challenge",
   "/api/runtime/kis-native-prepare-cancel",
   "/api/runtime/kis-stop-and-reconcile",
@@ -80,6 +81,7 @@ const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
   "/api/upbit-functional/status",
   "/api/binance-spot-functional/status",
   "/api/runtime/kis-native-prepare-status",
+  "/api/runtime/batches/status",
 ]);
 
 async function trustedFunctionalHttpHeaders(path, method, observeFlight = () => {}) {
@@ -861,7 +863,7 @@ export async function startContinuousRuntime(
   portfolioId = "",
   deploymentId = "",
   strategyId = "",
-  { accountKey = profileId, label = "한국투자증권", marketGapPreparationId = "", initializationOptions = null } = {},
+  { accountKey = profileId, label = "한국투자증권", marketGapPreparationId = "", initializationOptions = null, batchContext = null } = {},
 ) {
   const nativeKisStart = profileId === "stock" && ["SMALL_LIVE", "FULL_LIVE"].includes(mode);
   const body = {
@@ -870,7 +872,18 @@ export async function startContinuousRuntime(
   };
   if (marketGapPreparationId) body.marketGapPreparationId = marketGapPreparationId;
   if (nativeKisStart && initializationOptions !== null) body.initializationOptions = initializationOptions;
-  if (!nativeKisStart) return request("/api/runtime/start", { method: "POST", body, timeoutMs: 30000 });
+  const submitStart = async () => {
+    if (!batchContext) return request("/api/runtime/start", { method: "POST", body, timeoutMs: 30000 });
+    try {
+      return await request("/api/runtime/batches/start-member", { method: "POST", body: {...batchContext, confirmed: true, ...(body.safety_confirmation ? {safety_confirmation: body.safety_confirmation} : {}), ...(body.marketGapPreparationId ? {marketGapPreparationId: body.marketGapPreparationId} : {})}, timeoutMs: 30000 });
+    } catch (error) {
+      // The server may still own this submitted start after a lost HTTP reply.
+      const failure = error instanceof Error ? error : new Error(String(error));
+      failure.runtimeBatchSubmissionAttempted = true;
+      throw failure;
+    }
+  };
+  if (!nativeKisStart) return submitStart();
   const bridge = globalThis.window?.pywebview?.api;
   if (typeof bridge?.request_kis_operational_start_confirmation !== "function") {
     throw new ApiRequestError("KIS 실거래 시작은 네이티브 앱에서 직접 확인해야 합니다.", "KIS_NATIVE_UNAVAILABLE");
@@ -898,9 +911,16 @@ export async function startContinuousRuntime(
       }
       body.safety_confirmation = { nativeAttestation: native.attestation };
       assertCurrent(); starting();
-      return request("/api/runtime/start", { method: "POST", body, timeoutMs: 30000 });
+      return submitStart();
     },
   });
+}
+
+export function prepareRuntimeBatch(selections) {
+  return request("/api/runtime/batches/prepare", {method: "POST", body: {selections}, timeoutMs: 15000});
+}
+export function getRuntimeBatchStatus(batchId) {
+  return request(`/api/runtime/batches/status?batchId=${encodeURIComponent(batchId)}`, {timeoutMs: 10000});
 }
 
 export async function stopContinuousRuntime(profileId = "", { runtimeId = "", deploymentId = "" } = {}) {

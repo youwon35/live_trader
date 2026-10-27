@@ -1,3 +1,4 @@
+import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
 import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, ReconciliationEvidence, CapitalAllowance, DeploymentChanges, OrderInvestigation, OperatorNoteEditor } from "./OperatorInsights.jsx";
 import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
 import { runtimeRows, runtimeForDeployment, runtimeModeForDeployment, runningDeploymentIds, artifactIsRunning } from "./runtimeSelection.js";
@@ -190,6 +191,7 @@ const navItems = [
   { id: "overview", label: "시작 점검", icon: LayoutDashboard },
   { id: "gate", label: "운용 전략", icon: ListChecks },
   { id: "automation", label: "실거래 운용", icon: Power },
+  { id: "monitor", label: "실시간 감시", icon: Radio },
   { id: "accounts", label: "계좌·잔고", icon: WalletCards },
   { id: "orders", label: "주문·체결", icon: FileClock },
   { id: "incidents", label: "실행 기록", icon: FileClock },
@@ -208,6 +210,7 @@ const pageProfiles = {
     eyebrow: "DEPLOYMENT VALIDATION",
     summary: "모의 검증을 마친 전략의 제한 실거래 근거를 확인하고 실전 운용 전환을 심사합니다. 단계 통과와 현재 주문 승인은 별개입니다.",
   },
+  monitor: { title: "실시간 감시", eyebrow: "LIVE MONITOR", summary: "거래소별 수신 상태, 전략 평가, 실제 주문과 체결을 한 화면에서 확인합니다." },
   "functional-test": {
     title: "주문 연결 시험",
     eyebrow: "CONTROLLED LIVE TEST",
@@ -2121,7 +2124,7 @@ function App() {
     };
   }, [notificationsOpen]);
 
-  async function runAction(action, { allowDuringEmergency = false } = {}) {
+  async function runAction(action, { allowDuringEmergency = false, preserveSnapshotWithoutPayload = false } = {}) {
     if (emergencyActionInFlightRef.current && !allowDuringEmergency) {
       return { ok: false, busy: true, reason: "emergency-action-in-progress" };
     }
@@ -2130,7 +2133,7 @@ function App() {
     try {
       const result = await action();
       if (safetyEpoch === snapshotSafetyEpochRef.current) {
-        setSnapshot({ ...(result.snapshot ?? result), api_connected: true });
+        if (result.snapshot || !preserveSnapshotWithoutPayload) setSnapshot({ ...(result.snapshot ?? result), api_connected: true });
         setError(result.ok === false ? result.reason : result.syncWarning || "");
       }
       return result;
@@ -2146,38 +2149,39 @@ function App() {
         }
       }
       if (safetyEpoch === snapshotSafetyEpochRef.current) setError(reason);
-      return { ok: false, reason };
+      return { ok: false, reason, outcomeUnknown: err?.runtimeBatchSubmissionAttempted === true };
     } finally {
       setLoading(false);
     }
   }
 
-  async function runRuntimeStart(profileId, mode) {
-    const args = [profileId, mode, deploymentContext.portfolioId, deploymentContext.id, deploymentContext.strategyId];
+  async function runRuntimeStart(profileId, mode, selectionContext = deploymentContext, batchContext = null) {
+    const args = [profileId, mode, selectionContext.portfolioId, selectionContext.id, selectionContext.strategyId];
     if (profileId === "crypto") {
       try {
         return await prepareMarketGapsForStart({ profile_id: profileId, mode,
           portfolio_id: args[2], deployment_id: args[3], strategy_id: args[4] }, {
-          accountKey: deploymentContext.accountId || deploymentContext.id,
-          label: deploymentContext.portfolioName || deploymentContext.name || "선택한 코인 구성",
-          continueStart: (marketGapPreparationId) => runAction(() => startContinuousRuntime(...args, { marketGapPreparationId })),
+          accountKey: selectionContext.accountId || selectionContext.id,
+          label: selectionContext.portfolioName || selectionContext.name || "선택한 코인 구성",
+          continueStart: (marketGapPreparationId) => runAction(() => startContinuousRuntime(...args, { marketGapPreparationId, batchContext }), { preserveSnapshotWithoutPayload: Boolean(batchContext) }),
         });
       } catch (err) {
         if (err?.code !== "MARKET_GAP_CANCELLED") setError(err?.message || "최근 체결 공백을 확인하지 못했습니다.");
         return { ok: false };
       }
     }
-    if (profileId !== "stock" || !["SMALL_LIVE", "FULL_LIVE"].includes(mode)) return runAction(() => startContinuousRuntime(...args));
+    if (profileId !== "stock" || !["SMALL_LIVE", "FULL_LIVE"].includes(mode)) return runAction(() => startContinuousRuntime(...args, { batchContext }), { preserveSnapshotWithoutPayload: Boolean(batchContext) });
     if (emergencyActionInFlightRef.current) return { ok: false, reason: "emergency-action-in-progress" };
     const safetyEpoch = snapshotSafetyEpochRef.current;
     try {
       // This account's preparation never owns the application-wide loading state.
       const result = await startContinuousRuntime(...args, {
+        batchContext,
         initializationOptions: kisInitializationMethod === "PUBLIC_H0STCNT0"
           ? { method: "PUBLIC_H0STCNT0", cutoff: kisInitializationCutoff ? new Date(kisInitializationCutoff).toISOString() : "" }
           : { method: "REVIEWED_REST", cutoff: null },
-        accountKey: deploymentContext.accountId || "stock",
-        label: deploymentContext.portfolioName || deploymentContext.name || "한국투자증권",
+        accountKey: selectionContext.accountId || "stock",
+        label: selectionContext.portfolioName || selectionContext.name || "한국투자증권",
       });
       if (safetyEpoch === snapshotSafetyEpochRef.current) {
         if (result.snapshot) setSnapshot({ ...result.snapshot, api_connected: true });
@@ -2188,7 +2192,7 @@ function App() {
       const cancelled = ["KIS_PREPARATION_CANCELLED", "SAFETY_CONFIRMATION_CANCELLED"].includes(err?.code);
       const reason = err instanceof Error ? err.message : "KIS 시세 준비 실패";
       if (!cancelled && safetyEpoch === snapshotSafetyEpochRef.current) setError(reason);
-      return { ok: false, cancelled, reason };
+      return { ok: false, cancelled, reason, outcomeUnknown: err?.runtimeBatchSubmissionAttempted === true };
     }
   }
 
@@ -2566,7 +2570,7 @@ function App() {
           </div>
         </header>
 
-        {selectedNav === "functional-test" ? null : (
+        {["functional-test", "monitor"].includes(selectedNav) ? null : (
           <LiveEnvironmentBar
             context={deploymentContext}
             deploymentOptions={deploymentOptions}
@@ -2616,6 +2620,7 @@ function App() {
           snapshot={snapshot}
           deploymentContext={deploymentContext}
           selectedStrategy={selectedStrategy}
+          batchOptions={deploymentOptions.map(option => ({...option, context: strategyDeploymentContext(option.strategy), profileId: deploymentRuntimeProfile(strategyDeploymentContext(option.strategy)), running: runningDeploymentIds(snapshot.continuous_runtime).includes(option.id)}))}
           onDeploymentSelect={selectDeploymentContext}
           onPaperCandidateRegistered={selectImportedCandidate}
           searchQuery={searchQuery}
@@ -2822,6 +2827,7 @@ function WorkspaceContent({
   snapshot,
   deploymentContext,
   selectedStrategy,
+  batchOptions,
   onDeploymentSelect,
   onPaperCandidateRegistered,
   searchQuery,
@@ -2853,9 +2859,22 @@ function WorkspaceContent({
   changeLayoutMode,
   resetWorkspaceLayout,
 }) {
+  const monitoringPage = ["functional-test", "monitor"].includes(selectedNav);
+  const [monitorVisited, setMonitorVisited] = useState(monitoringPage);
+  useEffect(() => { if (monitoringPage) setMonitorVisited(true); }, [monitoringPage]);
+  // Keep one reader and the user's prepared selection alive across tab changes.
+  // Hiding the screen never starts, stops, or duplicates a trading runtime.
   const renderPage = (content) => (
     <PageView selectedNav={selectedNav} onNavigate={onNavigate} snapshot={snapshot} searchQuery={searchQuery}>
-      {content}
+      {(monitorVisited || monitoringPage) && <div hidden={!monitoringPage}>
+        <React.Suspense fallback={<section className="panel" role="status">실시간 감시 화면을 불러오는 중입니다.</section>}>
+          <ShortLiveTestPanel viewMode={selectedNav === "monitor" ? "monitor" : "setup"} operationalSnapshot={snapshot}
+            onOpenMonitor={() => onNavigate("monitor")} onOpenSetup={() => onNavigate("functional-test")}
+            onOpenExecution={() => onNavigate("automation")} legacyWorkspace={<FunctionalTestWorkspace snapshot={snapshot} />} />
+        </React.Suspense>
+      </div>}
+      <div hidden={selectedNav !== "automation"}><RuntimeBatchLauncher options={batchOptions} onStartMember={onRuntimeStart} onOpenMonitor={() => onNavigate("monitor")} /></div>
+      {!monitoringPage && content}
     </PageView>
   );
 
@@ -2899,19 +2918,7 @@ function WorkspaceContent({
     );
   }
 
-  if (selectedNav === "functional-test") {
-    return renderPage(
-      <React.Suspense
-        fallback={(
-          <section className="panel functional-test-loading" role="status">
-            주문 연결 시험 화면을 불러오는 중입니다.
-          </section>
-        )}
-      >
-        <ShortLiveTestPanel legacyWorkspace={<FunctionalTestWorkspace snapshot={snapshot} />} />
-      </React.Suspense>,
-    );
-  }
+  if (monitoringPage) return renderPage(null);
 
   if (selectedNav === "gate") {
     return renderPage(
@@ -4829,7 +4836,7 @@ function NotificationPanel({ items, onNavigate }) {
 }
 
 const navGroups = [
-  { id: "prepare", label: "실거래", itemIds: ["overview", "gate", "automation"] },
+  { id: "prepare", label: "실거래", itemIds: ["overview", "gate", "automation", "monitor"] },
   { id: "operate", label: "조회", itemIds: ["accounts", "orders", "incidents"] },
   { id: "manage", label: "관리", itemIds: ["settings", "functional-test"] },
 ];

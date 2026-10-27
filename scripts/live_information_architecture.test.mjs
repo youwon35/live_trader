@@ -22,6 +22,7 @@ test("operator navigation follows the live decision sequence", () => {
     "시작 점검",
     "운용 전략",
     "실거래 운용",
+    "실시간 감시",
     "계좌·잔고",
     "주문·체결",
     "실행 기록",
@@ -30,7 +31,7 @@ test("operator navigation follows the live decision sequence", () => {
   ]);
 
   const groups = between(appSource, "const navGroups = [", "function formatKeyValueMap");
-  assert.match(groups, /label: "실거래", itemIds: \["overview", "gate", "automation"\]/);
+  assert.match(groups, /label: "실거래", itemIds: \["overview", "gate", "automation", "monitor"\]/);
   assert.match(groups, /label: "조회", itemIds: \["accounts", "orders", "incidents"\]/);
   assert.match(groups, /label: "관리", itemIds: \["settings", "functional-test"\]/);
   assert.match(appSource, /aria-current=\{selectedNavRoot === item\.id \? "page" : undefined\}/);
@@ -67,7 +68,7 @@ test("persistent live hierarchy keeps every execution-critical state visible", (
 
 test("default pages prioritize decisions and move technical evidence into disclosures", () => {
   const workspace = between(appSource, "function WorkspaceContent", "function compactHash");
-  const automation = between(workspace, 'if (selectedNav === "automation")', 'if (selectedNav === "functional-test")');
+  const automation = between(workspace, 'if (selectedNav === "automation")', 'if (monitoringPage)');
   const gate = between(workspace, 'if (selectedNav === "gate")', 'if (selectedNav === "accounts")');
   const risk = between(workspace, 'if (selectedNav === "risk")', 'if (selectedNav === "incidents")');
   const settings = between(workspace, 'if (selectedNav === "settings")', "<OperationsOverviewPage");

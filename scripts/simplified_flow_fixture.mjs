@@ -130,7 +130,7 @@ try {
     });
     await page.goto(origin);
     await page.getByRole('heading', { name: '시작 점검', exact: true }).waitFor();
-    const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '계좌·잔고', '주문·체결', '실행 기록', '연결·설정', '주문 연결 시험'];
+    const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '실시간 감시', '계좌·잔고', '주문·체결', '실행 기록', '연결·설정', '주문 연결 시험'];
     assert.deepEqual(await page.locator('.nav-list .nav-item').allTextContents().then((items) => items.map((text) => text.trim())), navLabels);
     for (const label of (process.env.CARD_ACCENT_ONLY==='1'?['시작 점검']:navLabels)) {
       await page.locator('.nav-list').getByRole('button', { name: label, exact: true }).click();
@@ -255,6 +255,7 @@ try {
         assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), '실행 기록');
       }
       if (label === '주문 연결 시험') {
+        await page.getByRole('button', {name:'기존 개별 연결 시험 열기',exact:true}).click();
         await page.getByText('비승급 · promotionEligible=false', { exact: true }).waitFor();
         await page.locator('.functional-test-safety-strip').waitFor();
         await page.screenshot({ path: resolve(output, `broker-test-${viewport.width}.png`) });
