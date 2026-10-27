@@ -44,11 +44,12 @@ export default function RuntimeBatchLauncher({options=[],onStartMember,onOpenMon
         const result=await onStartMember(option.profileId,mode,option.context,
           {batchId:batch.batchId,scopeHash:batch.scopeHash,memberId:member.memberId});
         if(result?.batch){current=result.batch;setBatch(current);awaitingMember=null;}
-        if(result?.outcomeUnknown===true) {
+        if(result?.outcomeUnknown===true || typeof result?.ok!=='boolean') {
           setUncertainMember(member.memberId);
           setError('시작 응답이 확인되지 않았습니다. 동일 실행 결과를 조회하기 전에는 새 구성을 시작하지 않습니다.');
           break;
         }
+        awaitingMember=null;
         if(result?.ok!==true){setError(result?.reason || '시작 조건을 확인하지 못해 나머지 경로는 시작하지 않았습니다.');break;}
       }
       const status=await getRuntimeBatchStatus(batch.batchId);
