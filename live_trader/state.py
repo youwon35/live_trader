@@ -6019,10 +6019,11 @@ JWT_VALUE = re.compile(
 )
 
 
-def mask_secrets(value: object) -> str:
-    """Mask credentials in free-form audit text without hiding order IDs."""
-
-    text = str(value or "")
+def _sensitive_environment_values() -> tuple[str, ...]:
+    # Capture once per redaction operation, never across requests. Scanning
+    # the environment for every string in a dashboard payload is quadratic
+    # in the amount of displayed evidence and can starve the UI heartbeat.
+    values: list[str] = []
     for key, raw_value in os.environ.items():
         normalized_key = normalized_sensitive_key(key)
         is_sensitive = (
@@ -6032,7 +6033,19 @@ def mask_secrets(value: object) -> str:
         )
         secret_value = str(raw_value or "").strip()
         if is_sensitive and len(secret_value) >= 4:
-            text = text.replace(secret_value, "***")
+            values.append(secret_value)
+    return tuple(values)
+
+
+def mask_secrets(value: object) -> str:
+    """Mask credentials in free-form audit text without hiding order IDs."""
+    return _mask_secrets_with_values(value, _sensitive_environment_values())
+
+
+def _mask_secrets_with_values(value: object, secret_values: tuple[str, ...]) -> str:
+    text = str(value or "")
+    for secret_value in secret_values:
+        text = text.replace(secret_value, "***")
     text = AUTHORIZATION_BEARER.sub(
         lambda match: f"{match.group('prefix')}***",
         text,
@@ -6056,23 +6069,20 @@ def mask_secrets(value: object) -> str:
 
 
 def redact_sensitive_payload(value: object, *, key_hint: str = "") -> object:
-    normalized_key = normalized_sensitive_key(key_hint)
-    if normalized_key in SENSITIVE_SNAPSHOT_KEYS:
-        if value in (None, ""):
-            return value
-        return "***"
-    if isinstance(value, dict):
-        return {
-            str(key): redact_sensitive_payload(item, key_hint=str(key))
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [redact_sensitive_payload(item) for item in value]
-    if isinstance(value, tuple):
-        return [redact_sensitive_payload(item) for item in value]
-    if isinstance(value, str):
-        return mask_secrets(value)
-    return value
+    secret_values = _sensitive_environment_values()
+
+    def redact(item: object, hint: str = "") -> object:
+        if normalized_sensitive_key(hint) in SENSITIVE_SNAPSHOT_KEYS:
+            return item if item in (None, "") else "***"
+        if isinstance(item, dict):
+            return {str(key): redact(child, str(key)) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [redact(child) for child in item]
+        if isinstance(item, str):
+            return _mask_secrets_with_values(item, secret_values)
+        return item
+
+    return redact(value, key_hint)
 
 
 def future_text(seconds: float) -> str:
@@ -8842,6 +8852,7 @@ def positions() -> list[dict[str, str]]:
                 "unrealized_profit": safe_float(broker_row.get("unrealized_profit"), 0.0) if broker_row else None,
                 "leverage": safe_float(broker_row.get("leverage"), 0.0) if broker_row else None,
                 "valuation_basis": str(broker_row.get("valuation_basis") or "unavailable") if broker_row else "unavailable",
+                "display_valuation": dict(broker_row["display_valuation"]) if broker_row and isinstance(broker_row.get("display_valuation"), dict) else None,
                 "broker_value_display": format_money(broker_row.get("broker_value"), str(ledger_row.get("currency") or "")) if broker_row and safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
                 "average_price_display": format_money(broker_row.get("average_price"), str(ledger_row.get("currency") or "")) if broker_row and safe_float(broker_row.get("average_price"), 0.0) > 0 else "-",
                 "current_price_display": format_money(broker_row.get("current_price"), str(ledger_row.get("currency") or "")) if broker_row and safe_float(broker_row.get("current_price"), 0.0) > 0 else "-",
@@ -8883,6 +8894,7 @@ def positions() -> list[dict[str, str]]:
                 "unrealized_profit": safe_float(broker_row.get("unrealized_profit"), 0.0),
                 "leverage": safe_float(broker_row.get("leverage"), 0.0),
                 "valuation_basis": str(broker_row.get("valuation_basis") or "unavailable"),
+                "display_valuation": dict(broker_row["display_valuation"]) if isinstance(broker_row.get("display_valuation"), dict) else None,
                 "broker_value_display": format_money(broker_row.get("broker_value"), str(broker_row.get("currency") or "")) if safe_float(broker_row.get("broker_value"), 0.0) > 0 else "평가 대기",
                 "average_price_display": format_money(broker_row.get("average_price"), str(broker_row.get("currency") or "")) if safe_float(broker_row.get("average_price"), 0.0) > 0 else "-",
                 "current_price_display": format_money(broker_row.get("current_price"), str(broker_row.get("currency") or "")) if safe_float(broker_row.get("current_price"), 0.0) > 0 else "-",
@@ -11306,8 +11318,8 @@ def operational_governance_snapshot(
     try:
         workspace = OPERATIONAL_GOVERNANCE.workspace_snapshot(deployment_id)
         for incident in workspace.get("incidents", []):
-            events = OPERATIONAL_GOVERNANCE.incident_events(str(incident.get("incidentId") or ""))
-            latest = events[-1].to_dict() if events else {}
+            event = OPERATIONAL_GOVERNANCE.latest_incident_event(str(incident.get("incidentId") or ""))
+            latest = event.to_dict() if event is not None else {}
             incident["latestEvent"] = latest
             payload = latest.get("payload") if isinstance(latest.get("payload"), dict) else {}
             incident["title"] = str(payload.get("title") or incident.get("code") or "운영 사고")

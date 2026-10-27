@@ -50,3 +50,37 @@ test("KIS zero balance fallback with unpriced holdings cannot appear as an empty
   assert.equal(futures.rows[0].value, 400); assert.equal(futures.rows[0].percent, 400);
  }
 });
+
+const valuationNow = Date.parse("2026-10-28T03:00:00Z");
+const freshValuation = (currency="USDT") => ({ status: "OBSERVED", currency, current_price: 120, value: 240,
+ observed_at: new Date(valuationNow).toISOString(), expires_at: new Date(valuationNow + 60000).toISOString(), order_authority_granted: false });
+test("fresh display quote values held spot assets without changing broker cash or native cost basis", () => {
+ const accounts=[{broker_id:"binance",currency:"USDT",broker_cash_value:10,broker_equity_value:10,valuation_basis:"cash_only"}];
+ const positions=[{broker_id:"binance",symbol:"SOL",currency:"SOL",broker_qty_value:2,current_price:0,broker_value:0,valuation_basis:"unavailable",display_valuation:freshValuation()}];
+ const before=structuredClone({accounts,positions});
+ const result=allocationView(liveAllocationAccounts(accounts,positions,{nowMs:valuationNow}));
+ assert.equal(result.groups[0].total,250); assert.equal(result.rows[0].value,240); assert.equal(result.rows[0].currency,"USDT");
+ assert.deepEqual({accounts,positions},before);
+});
+test("upbit direct KRW display valuation leaves BTC purchase basis out of KRW totals", () => {
+ const accounts=[{broker_id:"upbit",currency:"KRW",broker_cash_value:100,broker_equity_value:100,valuation_basis:"cash_only"}];
+ const positions=[{broker_id:"upbit",symbol:"BTC-SOL",currency:"BTC",broker_qty_value:2,current_price:0,broker_value:0.02,valuation_basis:"cost_basis",display_valuation:freshValuation("KRW")}];
+ const result=allocationView(liveAllocationAccounts(accounts,positions,{nowMs:valuationNow}));
+ assert.equal(result.groups[0].total,340); assert.equal(result.rows[0].currency,"KRW");
+});
+test("expired, unknown, wrong-currency or unbounded display observations cannot appear fresh", () => {
+ for (const change of [{status:"UNKNOWN"},{currency:"USD"},{order_authority_granted:true},{expires_at:new Date(valuationNow).toISOString()},
+  {observed_at:new Date(valuationNow+6000).toISOString()},{expires_at:new Date(valuationNow+62000).toISOString()},
+  {current_price:"Infinity"},{current_price:null}]) {
+  const accounts=[{broker_id:"binance",currency:"USDT",broker_cash_value:10,broker_equity_value:10,valuation_basis:"cash_only"}];
+  const positions=[{broker_id:"binance",symbol:"SOL",currency:"SOL",broker_qty_value:2,current_price:999,valuation_basis:"market_value",display_valuation:{...freshValuation(),...change}}];
+  const result=allocationView(liveAllocationAccounts(accounts,positions,{nowMs:valuationNow}));
+  assert.equal(result.groups[0].total,null); assert.equal(result.rows[0].value,null);
+ }
+});
+test("spot display fields cannot change futures margin equity into leveraged notional", () => {
+ const accounts=[{broker_id:"binance-futures",currency:"USDT",broker_cash_value:80,broker_equity_value:100}];
+ const positions=[{broker_id:"binance-futures",symbol:"SOLUSDT",currency:"USDT",broker_qty_value:2,current_price:200,valuation_basis:"market_notional",position_side:"LONG",display_valuation:freshValuation()}];
+ const result=allocationView(liveAllocationAccounts(accounts,positions,{nowMs:valuationNow}));
+ assert.equal(result.groups[0].total,100); assert.equal(result.rows[0].value,400); assert.equal(result.groups[0].items.length,1);
+});

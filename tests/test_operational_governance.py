@@ -4,6 +4,7 @@ import hashlib
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -430,6 +431,48 @@ class OperationalGovernanceStoreTests(unittest.TestCase):
         self.assertTrue(integrity["ok"], integrity["issues"])
         self.assertEqual(integrity["counts"]["incidents"], 1)
         self.assertEqual(integrity["counts"]["incidentEvents"], 3)
+
+    def test_latest_incident_display_reads_one_event_and_preserves_full_history(self) -> None:
+        incident, _ = self.store.open_incident(
+            code="ACCOUNT_OBSERVATION_FAILED",
+            scope_type="GLOBAL",
+            scope_id="global",
+            severity="WARNING",
+            actor="test-observer",
+            payload={"detail": "first"},
+        )
+        for sequence in range(1, 40):
+            self.store.append_incident_event(
+                incident.incident_id,
+                event_type="INCIDENT_OBSERVED",
+                actor="test-observer",
+                severity="WARNING",
+                payload={"detail": f"observation-{sequence}"},
+                occurred_at=NOW + timedelta(seconds=sequence),
+            )
+        other, _ = self.store.open_incident(
+            code="OTHER_SCOPE",
+            scope_type="GLOBAL",
+            scope_id="global",
+            severity="WARNING",
+            actor="test-observer",
+            payload={"detail": "other incident"},
+        )
+        history = self.store.incident_events(incident.incident_id)
+        with patch.object(
+            self.store, "_incident_event_from_row", wraps=self.store._incident_event_from_row,
+        ) as decode:
+            latest = self.store.latest_incident_event(incident.incident_id)
+            self.assertEqual(latest, history[-1])
+            self.assertEqual(latest.payload["detail"], "observation-39")
+            self.assertEqual(decode.call_count, 1)
+            self.assertIsNone(self.store.latest_incident_event("missing-incident"))
+            self.assertEqual(decode.call_count, 1)
+        self.assertEqual(self.store.latest_incident_event(other.incident_id).payload["detail"], "other incident")
+        self.assertEqual(len(self.store.incident_events(incident.incident_id)), 40)
+        workspace = self.store.workspace_snapshot()
+        self.assertTrue(workspace["integrity"]["ok"], workspace["integrity"]["issues"])
+        self.assertEqual(workspace["integrity"]["counts"]["incidentEvents"], 41)
 
     def test_monitor_session_does_not_require_preflight(self) -> None:
         manifest = self.create_manifest()

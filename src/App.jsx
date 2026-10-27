@@ -1,4 +1,5 @@
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
+import { createSnapshotResponseGate, createSnapshotReadCoordinator, initialAccountRefreshState, accountRefreshResultState, accountObservationView } from "./snapshotRefreshState.js";
 import { environmentStatus, ordinaryEntryStatus, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation } from "./statusTruth.js";
 import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, ReconciliationEvidence, CapitalAllowance, DeploymentChanges, OrderInvestigation, OperatorNoteEditor } from "./OperatorInsights.jsx";
 import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
@@ -1886,7 +1887,10 @@ export function shortLiveHeaderState(snapshot = {}) {
 function App() {
   const [snapshot, setSnapshot] = useState(fallbackSnapshot);
   const [selectedNav, setSelectedNav] = useState(() => readGuidedFlowStep(LIVE_FLOW_STORAGE_KEY, LIVE_FLOW_IDS, "overview"));
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [snapshotRefreshing, setSnapshotRefreshing] = useState(false);
+  const [connectionError, setConnectionError] = useState("");
+  const [accountRefreshState, setAccountRefreshState] = useState(initialAccountRefreshState);
   const [error, setError] = useState("");
   const [emergencyFeedback, setEmergencyFeedback] = useState("");
   const [emergencyAction, setEmergencyAction] = useState("");
@@ -1904,7 +1908,11 @@ function App() {
   const [selectedDeploymentId, setSelectedDeploymentId] = useState(() => readStoredValue(DEPLOYMENT_CONTEXT_STORAGE_KEY, ""));
   const workspaceRef = useRef(null);
   const notificationRef = useRef(null);
-  const snapshotRequestInFlightRef = useRef(false);
+  const snapshotReadCoordinatorRef = useRef(null);
+  if (!snapshotReadCoordinatorRef.current) snapshotReadCoordinatorRef.current = createSnapshotReadCoordinator();
+  const snapshotResponseGateRef = useRef(null);
+  if (!snapshotResponseGateRef.current) snapshotResponseGateRef.current = createSnapshotResponseGate();
+  const accountRefreshRequestRef = useRef(null);
   const snapshotSafetyEpochRef = useRef(0);
   const emergencyActionInFlightRef = useRef("");
   const safetyConfirmationResolverRef = useRef(null);
@@ -1957,26 +1965,62 @@ function App() {
     pending.resolve(decision);
   }
 
-  async function refresh() {
-    if (snapshotRequestInFlightRef.current || emergencyActionInFlightRef.current) return;
+  function refresh() {
+    if (emergencyActionInFlightRef.current) return Promise.resolve();
+    return snapshotReadCoordinatorRef.current.runSnapshot(async () => {
+      if (emergencyActionInFlightRef.current) return;
+      const safetyEpoch = snapshotSafetyEpochRef.current;
+      const responseToken = snapshotResponseGateRef.current.begin();
+      setSnapshotRefreshing(true);
+      try {
+        const next = await getSnapshot();
+        if (safetyEpoch !== snapshotSafetyEpochRef.current || !snapshotResponseGateRef.current.accept(responseToken, next)) return;
+        setSnapshot({ ...next, api_connected: true });
+        setConnectionError("");
+        return next;
+      } catch (err) {
+        if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
+        const nativeEmergency = await getNativeEmergencyStopStatus();
+        if (safetyEpoch !== snapshotSafetyEpochRef.current || !snapshotResponseGateRef.current.acceptFailure(responseToken)) return;
+        setSnapshot((current) => disconnectedSnapshot(nativeEmergency, current));
+        setConnectionError(err instanceof Error ? err.message : "API 연결 실패");
+      } finally {
+        setSnapshotRefreshing(false);
+      }
+    });
+  }
+
+  function refreshBrokerAccounts() {
+    if (accountRefreshRequestRef.current) return accountRefreshRequestRef.current;
+    if (emergencyActionInFlightRef.current) return Promise.resolve({ ok: false, busy: true });
     const safetyEpoch = snapshotSafetyEpochRef.current;
-    snapshotRequestInFlightRef.current = true;
-    try {
-      const next = await getSnapshot();
-      if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
-      setSnapshot({ ...next, api_connected: true });
-      setError("");
-      return next;
-    } catch (err) {
-      if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
-      const nativeEmergency = await getNativeEmergencyStopStatus();
-      if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
-      setSnapshot((current) => disconnectedSnapshot(nativeEmergency, current));
-      setError(err instanceof Error ? err.message : "API 연결 실패");
-    } finally {
-      snapshotRequestInFlightRef.current = false;
-      setLoading(false);
-    }
+    setAccountRefreshState((current) => ({ ...current, pending: true,
+      waitingForSnapshot: snapshotReadCoordinatorRef.current.isSnapshotRunning(), error: "", warning: "" }));
+    accountRefreshRequestRef.current = snapshotReadCoordinatorRef.current.runAccount(async () => {
+      const responseToken = snapshotResponseGateRef.current.begin();
+      try {
+        if (safetyEpoch !== snapshotSafetyEpochRef.current || emergencyActionInFlightRef.current) return { ok: false, busy: true };
+        setAccountRefreshState((current) => ({ ...current, waitingForSnapshot: false }));
+        const result = await accountRefreshCoordinatorRef.current.run();
+        if (safetyEpoch !== snapshotSafetyEpochRef.current) return result;
+        setAccountRefreshState((current) => accountRefreshResultState(current, result));
+        if (result?.snapshot && snapshotResponseGateRef.current.accept(responseToken, result.snapshot)) {
+          setSnapshot({ ...result.snapshot, api_connected: true });
+          setConnectionError("");
+        }
+        return result;
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : "최신 계좌 상태를 확인하지 못했습니다.";
+        if (safetyEpoch === snapshotSafetyEpochRef.current) {
+          setAccountRefreshState((current) => ({ ...current, error: reason, warning: "" }));
+        }
+        return { ok: false, reason };
+      } finally {
+        accountRefreshRequestRef.current = null;
+        setAccountRefreshState((current) => ({ ...current, pending: false, waitingForSnapshot: false }));
+      }
+    });
+    return accountRefreshRequestRef.current;
   }
 
   const liveRuntimeActive = Boolean(
@@ -1984,8 +2028,9 @@ function App() {
   );
   const pollingIntervals = livePollingIntervals(liveRuntimeActive);
 
+  useEffect(() => { void refresh(); }, []);
+
   useEffect(() => {
-    refresh();
     const refreshWhenVisible = () => {
       if (document.visibilityState !== "hidden") refresh();
     };
@@ -1996,33 +2041,16 @@ function App() {
   useEffect(() => {
     if (selectedNav !== "accounts" || snapshot.api_connected !== true) return undefined;
     let stopped = false;
-    const refreshBrokerAccounts = async () => {
-      if (
-        stopped
-        || emergencyActionInFlightRef.current
-        || accountRefreshCoordinatorRef.current.isRunning()
-      ) return;
-      const safetyEpoch = snapshotSafetyEpochRef.current;
-      try {
-        const result = await accountRefreshCoordinatorRef.current.run();
-        if (!stopped && safetyEpoch === snapshotSafetyEpochRef.current && result?.snapshot) {
-          setSnapshot({ ...result.snapshot, api_connected: true });
-          setError((current) => result.ok === false || result.syncWarning
-            ? `계좌 갱신: ${result.ok === false ? result.reason : result.syncWarning}`
-            : current.startsWith("계좌 갱신: ") ? "" : current);
-        }
-      } catch (error) {
-        if (!stopped && safetyEpoch === snapshotSafetyEpochRef.current) {
-          setError(`계좌 갱신: ${error instanceof Error ? error.message : "최신 상태를 확인하지 못했습니다."}`);
-        }
-      }
+    let timer;
+    const refreshWhenVisible = async () => {
+      if (stopped) return;
+      if (document.visibilityState !== "hidden") await refreshBrokerAccounts();
+      // Wait after completion; a slow broker read must not cause an immediate
+      // second request when it happens to finish near an interval boundary.
+      if (!stopped) timer = window.setTimeout(refreshWhenVisible, ACCOUNT_REFRESH_INTERVAL_MS);
     };
-    void refreshBrokerAccounts();
-    const timer = window.setInterval(refreshBrokerAccounts, ACCOUNT_REFRESH_INTERVAL_MS);
-    return () => {
-      stopped = true;
-      window.clearInterval(timer);
-    };
+    void refreshWhenVisible();
+    return () => { stopped = true; window.clearTimeout(timer); };
   }, [selectedNav, snapshot.api_connected]);
 
   useEffect(() => {
@@ -2130,11 +2158,16 @@ function App() {
       return { ok: false, busy: true, reason: "emergency-action-in-progress" };
     }
     const safetyEpoch = snapshotSafetyEpochRef.current;
+    const responseToken = snapshotResponseGateRef.current.begin();
     setLoading(true);
     try {
       const result = await action();
       if (safetyEpoch === snapshotSafetyEpochRef.current) {
-        if (result.snapshot || !preserveSnapshotWithoutPayload) setSnapshot({ ...(result.snapshot ?? result), api_connected: true });
+        if ((result.snapshot || !preserveSnapshotWithoutPayload)
+          && snapshotResponseGateRef.current.accept(responseToken, result.snapshot ?? result)) {
+          setSnapshot({ ...(result.snapshot ?? result), api_connected: true });
+          setConnectionError("");
+        }
         setError(result.ok === false ? result.reason : result.syncWarning || "");
       }
       return result;
@@ -2145,8 +2178,9 @@ function App() {
         && (isApiConnectionFailure(err) || isApiRequestTimeout(err))
       ) {
         const nativeEmergency = await getNativeEmergencyStopStatus();
-        if (safetyEpoch === snapshotSafetyEpochRef.current) {
+        if (safetyEpoch === snapshotSafetyEpochRef.current && snapshotResponseGateRef.current.acceptFailure(responseToken)) {
           setSnapshot((current) => disconnectedSnapshot(nativeEmergency, current));
+          setConnectionError(reason);
         }
       }
       if (safetyEpoch === snapshotSafetyEpochRef.current) setError(reason);
@@ -2174,6 +2208,7 @@ function App() {
     if (profileId !== "stock" || !["SMALL_LIVE", "FULL_LIVE"].includes(mode)) return runAction(() => startContinuousRuntime(...args, { batchContext }), { preserveSnapshotWithoutPayload: Boolean(batchContext) });
     if (emergencyActionInFlightRef.current) return { ok: false, reason: "emergency-action-in-progress" };
     const safetyEpoch = snapshotSafetyEpochRef.current;
+    const responseToken = snapshotResponseGateRef.current.begin();
     try {
       // This account's preparation never owns the application-wide loading state.
       const result = await startContinuousRuntime(...args, {
@@ -2185,7 +2220,10 @@ function App() {
         label: selectionContext.portfolioName || selectionContext.name || "한국투자증권",
       });
       if (safetyEpoch === snapshotSafetyEpochRef.current) {
-        if (result.snapshot) setSnapshot({ ...result.snapshot, api_connected: true });
+        if (result.snapshot && snapshotResponseGateRef.current.accept(responseToken, result.snapshot)) {
+          setSnapshot({ ...result.snapshot, api_connected: true });
+          setConnectionError("");
+        }
         setError(result.ok === false ? result.reason : result.syncWarning || "");
       }
       return result;
@@ -2443,7 +2481,7 @@ function App() {
   const deploymentContext = strategyDeploymentContext(selectedStrategy);
   const selectedRuntimeMode = runtimeModeForDeployment(snapshot, deploymentContext);
   const shortLiveHeader = shortLiveHeaderState(snapshot);
-  const notifications = buildNotificationItems(snapshot, error);
+  const notifications = buildNotificationItems(snapshot, [connectionError, error, accountRefreshState.error && `계좌 갱신: ${accountRefreshState.error}`].filter(Boolean).join(" · "));
   const notificationKey = notificationFingerprint(notifications);
   const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
 
@@ -2580,13 +2618,13 @@ function App() {
           />
         )}
 
-        {error && snapshot.api_connected === false && (
+        {(connectionError || error) && snapshot.api_connected === false && (
           <section className="api-connection-banner ts-text-region" role="alert">
             <Network size={18} />
             <div>
               <strong>현재 운용 상태를 확인할 수 없습니다. 연결이 끊겨도 진행 중인 거래가 계속될 수 있습니다.</strong>
               <span>
-                {error} · {snapshot.emergency_stop?.active
+                {connectionError || error} · {snapshot.emergency_stop?.active
                   ? snapshot.emergency_stop?.durable
                     ? "독립 Kill 래치는 내구 저장된 상태입니다."
                     : "독립 Kill은 Fail-Closed지만 내구 저장을 확인해야 합니다."
@@ -2597,9 +2635,9 @@ function App() {
                     : "독립 Kill은 데스크톱 앱에서만 실행할 수 있습니다."}
               </span>
             </div>
-            <button className="mini-button" type="button" disabled={loading} onClick={refresh}>
+            <button className="mini-button" type="button" disabled={loading || snapshotRefreshing || accountRefreshState.pending} aria-busy={snapshotRefreshing || accountRefreshState.pending} onClick={refresh}>
               <RefreshCcw size={14} />
-              다시 연결
+              {snapshotRefreshing ? "연결 확인 중…" : accountRefreshState.pending ? "계좌 조회 완료 대기…" : "다시 연결"}
             </button>
           </section>
         )}
@@ -2648,7 +2686,8 @@ function App() {
           onCancelOrder={(orderId) => runAction(() => cancelOrder(orderId))}
           onReconcile={() => runAction(runReconciliation)}
           onPreflight={() => runAction(() => runFinalPreflight(deploymentContext.id, deploymentContext.strategyId))}
-          onAccountRefresh={() => runAction(() => accountRefreshCoordinatorRef.current.run())}
+          onAccountRefresh={refreshBrokerAccounts}
+          accountRefreshState={accountRefreshState}
           onProgramLedgerBaseline={() =>
             confirmSafetyChange(
               "현재 브로커 잔고와 포지션을 프로그램 원장의 새 기준으로 승인하시겠습니까? 외부 주문·입출금 차이가 모두 현재 값으로 재설정됩니다.",
@@ -2820,6 +2859,7 @@ function WorkspaceContent({
   onReconcile,
   onPreflight,
   onAccountRefresh,
+  accountRefreshState,
   onProgramLedgerBaseline,
   onEnvSettings,
   appearance,
@@ -2828,6 +2868,13 @@ function WorkspaceContent({
   changeLayoutMode,
   resetWorkspaceLayout,
 }) {
+  const [accountNowMs, setAccountNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (selectedNav !== "accounts") return undefined;
+    setAccountNowMs(Date.now());
+    const timer = window.setInterval(() => setAccountNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [selectedNav]);
   const monitoringPage = ["functional-test", "monitor"].includes(selectedNav);
   const [monitorVisited, setMonitorVisited] = useState(monitoringPage);
   useEffect(() => { if (monitoringPage) setMonitorVisited(true); }, [monitoringPage]);
@@ -2929,7 +2976,8 @@ function WorkspaceContent({
   if (selectedNav === "accounts") {
     return renderPage(
       <section className="accounts-page-layout ts-layout-stack">
-        <ThreeWayReconciliationPanel snapshot={snapshot} />
+        <AccountRefreshStatus snapshot={snapshot} state={accountRefreshState} nowMs={accountNowMs} />
+        <ThreeWayReconciliationPanel snapshot={snapshot} accountRefreshState={accountRefreshState} nowMs={accountNowMs} />
         <UnifiedBrokerAccountPanel
           accounts={snapshot.accounts ?? []}
           executionEvents={snapshot.execution_events}
@@ -2937,7 +2985,9 @@ function WorkspaceContent({
           onRefresh={onAccountRefresh}
           positions={snapshot.positions ?? []}
           reconciledAt={snapshot.reconciliation?.summary?.last_run}
-          refreshDisabled={snapshot.api_connected !== true}
+          refreshDisabled={snapshot.api_connected !== true || accountRefreshState.pending}
+          observation={accountObservationView(snapshot, accountRefreshState, accountNowMs)}
+          nowMs={accountNowMs}
         />
       </section>,
     );
@@ -3182,33 +3232,60 @@ function RuntimeComponentStatusPanel({ snapshot = {} }) {
   );
 }
 
-function ThreeWayReconciliationPanel({ snapshot = {} }) {
+function AccountObservationLine({ label, value, detail, tone = "warning" }) {
+  const color = `var(--moa-status-${tone}, var(--text-primary))`;
+  return <div className="account-observation-line" style={{ padding: "8px 0", minWidth: 0 }}>
+    <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "baseline" }}>
+      <strong>{label}</strong><span style={{ color, fontWeight: 700 }}>{value}</span>
+    </div>
+    <p style={{ margin: "4px 0 0", color: "var(--text-secondary)", overflowWrap: "anywhere" }}>{detail}</p>
+  </div>;
+}
+
+function accountObservationTime(value) {
+  const stamp = Date.parse(value || "");
+  return Number.isFinite(stamp) ? new Date(stamp).toLocaleString("ko-KR", { timeZone: "Asia/Seoul" }) : "미확인";
+}
+
+function AccountRefreshStatus({ snapshot, state, nowMs }) {
+  const view = accountObservationView(snapshot, state, nowMs);
+  return <section className="panel account-refresh-status" aria-label="계좌 갱신 상태" aria-busy={state.pending}>
+    <AccountObservationLine label="계좌 갱신" tone={statusTone(view.tone)} value={view.label}
+      detail={`최근 전체 조회 성공 ${state.lastSuccessAt ? accountObservationTime(state.lastSuccessAt) : "이 화면에서 확인된 성공 없음"} · 계좌 관측 ${accountObservationTime(view.observedAt)}`} />
+    {state.error && <p role="alert">계좌 갱신 실패: {state.error}</p>}
+    {state.warning && <p role="status">{state.warning}</p>}
+    <p>{view.detail}</p>
+  </section>;
+}
+
+function ThreeWayReconciliationPanel({ snapshot = {}, accountRefreshState = initialAccountRefreshState, nowMs }) {
+  const observation = accountObservationView(snapshot, accountRefreshState, nowMs);
+  if (!observation.connected) return <section className="panel three-way-reconciliation-panel">
+    <PanelHeader title="계좌·포지션 3자 대조" subtitle="연결 응답 미확인 · 계좌·원장·체결 건수를 확인할 수 없습니다." />
+    <div className="ts-panel-grid ts-panel-grid--two">{["거래소 잔고 조회", "실시간 주문·체결 기록", "앱 체결 원장", "3자 최종 대조"].map(label =>
+      <AccountObservationLine key={label} label={label} value="미확인" detail="서버 응답을 복구한 뒤 다시 확인합니다." tone="warning" />)}</div>
+  </section>;
   const summary = snapshot.reconciliation?.summary ?? {};
   const execution = snapshot.execution_events ?? {};
   const ledger = snapshot.program_ledger ?? {};
   const streams = execution.streams?.brokers ?? snapshot.execution_streams?.brokers ?? {};
   const streamConnected = Object.values(streams).some((item) => item?.connected === true);
   const reconciliationDisplay = liveReconciliationDisplay(snapshot);
-  const brokerKnown = reconciliationDisplay.brokerKnown;
+  const brokerKnown = reconciliationDisplay.brokerKnown && observation.fresh;
   const ledgerKnown = Number(ledger.cash_count || ledger.cashCount || (ledger.cash || []).length || 0) > 0
     || Number(ledger.position_count || ledger.positionCount || (ledger.positions || []).length || 0) > 0;
   const projected = projectAccountReconciliation(snapshot);
   const rows = [
     { label: "거래소 잔고 조회", status: brokerKnown ? "pass" : "warn", value: brokerKnown ? "조회됨" : "미확인", detail: `마지막 대조 ${summary.last_run || "미실행"}` },
     { label: "실시간 주문·체결 기록", status: streamConnected ? "pass" : execution.last_poll ? "warn" : "na", value: streamConnected ? "연결" : execution.last_poll ? "폴링 보조" : "해당 없음", detail: `마지막 동기화 ${execution.last_poll || "미실행"}` },
-    { label: "앱 체결 원장", status: ledgerKnown ? "pass" : "warn", value: ledgerKnown ? "원장 있음" : "기준 없음", detail: `체결 이벤트 ${(ledger.execution_events || []).length}건 · 기준 ${ledger.state?.last_baseline || "미승인"}` },
-    { label: "3자 최종 대조", status: reconciliationDisplay.status, value: reconciliationDisplay.label, detail: `불일치 ${summary.mismatch_count ?? "미확인"} · API/원장 필요 ${summary.api_required_count ?? "미확인"}` },
+    { label: "앱 체결 원장", status: ledgerKnown ? "pass" : "warn", value: ledgerKnown ? "원장 있음" : "기준 없음", detail: `체결 이벤트 ${Array.isArray(ledger.execution_events) ? ledger.execution_events.length : "미확인"}건 · 기준 ${ledger.state?.last_baseline || "미승인"}` },
+    { label: "3자 최종 대조", status: observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.status : "warn", value: observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.label : "현재 대조 미확인", detail: `불일치 ${summary.mismatch_count ?? "미확인"} · API/원장 필요 ${summary.api_required_count ?? "미확인"}` },
   ];
   return (
     <section className="panel three-way-reconciliation-panel">
-      <PanelHeader title="계좌·포지션 3자 대조" subtitle={`조회 실패는 0으로 간주하지 않습니다. 확인된 계좌 ${projected.knownAccountCount}개 · 미확인 ${projected.unknownAccountCount}개`} />
-      <div className="three-way-flow">
-        {rows.map((row, index) => (
-          <React.Fragment key={row.label}>
-            <StatusCard title={row.label} value={row.value} detail={row.detail} tone={statusTone(row.status)} />
-            {index < rows.length - 1 && <span>→</span>}
-          </React.Fragment>
-        ))}
+      <PanelHeader title="계좌·포지션 3자 대조" subtitle={`${observation.fresh ? "최근 관측 자료" : "마지막 관측 자료 · 현재 계좌 대조 미확인"} · 확인된 계좌 ${projected.knownAccountCount}개 · 미확인 ${projected.unknownAccountCount}개`} />
+      <div className="ts-panel-grid ts-panel-grid--two">
+        {rows.map(row => <AccountObservationLine key={row.label} label={row.label} value={row.value} detail={row.detail} tone={statusTone(row.status)} />)}
       </div>
       <ReconciliationEvidence snapshot={snapshot} />
     </section>
@@ -5977,14 +6054,21 @@ function UnifiedBrokerAccountPanel({
   positions,
   reconciledAt,
   refreshDisabled,
+  observation,
+  nowMs,
 }) {
-  const allocationAccounts = useMemo(() => liveAllocationAccounts(accounts, positions), [accounts, positions]);
+  const allocationAccounts = useMemo(() => liveAllocationAccounts(accounts, positions, { nowMs }), [accounts, positions, nowMs]);
   return (
     <>
-      <AllocationWorkspace accounts={allocationAccounts} title="내 실계좌 구성"
-        basis="실제 계좌의 최근 평가 기준 · 현금 포함 · 선물은 증거금만 포함"
+      {observation.connected ? <AllocationWorkspace accounts={allocationAccounts}
+        title={observation.fresh ? "내 실계좌 구성" : "내 실계좌 구성 · 이전 관측값"}
+        basis={observation.fresh ? "실제 계좌의 최근 평가 기준 · 현금 포함 · 선물은 증거금만 포함"
+          : "현재 평가 미확인 · 아래 수치는 마지막 관측값이며 주문 가능 금액을 보장하지 않습니다."}
         onRefresh={onRefresh} refreshDisabled={refreshDisabled}
         updatedAt={reconciledAt ?? executionEvents?.last_poll ?? "미조회"} />
+        : <section className="panel account-values-unavailable"><PanelHeader title="내 실계좌 구성" />
+          <p>연결 응답이 없어 현재 자산과 보유 건수를 확인할 수 없습니다. 잔고 0 또는 보유 없음으로 간주하지 않습니다.</p>
+        </section>}
       <div className="account-baseline-toolbar">
         <div>
           <strong>프로그램 기준 원장</strong>

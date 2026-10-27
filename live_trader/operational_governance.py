@@ -1836,6 +1836,21 @@ class OperationalGovernanceStore:
             ).fetchall()
         return [self._incident_event_from_row(row) for row in rows]
 
+    def latest_incident_event(self, incident_id: str) -> IncidentEvent | None:
+        """Read one display event without materializing the incident history.
+
+        Full history and hash-chain checks remain in incident_events() and
+        verify_integrity(); this projection is not an integrity verdict.
+        """
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM live_incident_events WHERE incident_id = ? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (str(incident_id),),
+            ).fetchone()
+        return self._incident_event_from_row(row) if row is not None else None
+
     @staticmethod
     def _incident_event_from_row(row: sqlite3.Row) -> IncidentEvent:
         try:

@@ -48,6 +48,7 @@ from .live_adapters import (
     build_upbit_order_detail_request,
     build_upbit_order_request,
     issue_kis_access_token,
+    http_json,
     kis_prepared_payload_hash,
     normalize_binance_futures_intent,
     normalize_binance_spot_intent,
@@ -2639,11 +2640,11 @@ def parse_binance_accounts(payload: object) -> list[dict[str, object]]:
     ]
 
 
-def parse_binance_positions(payload: object) -> list[dict[str, object]]:
+def parse_binance_positions(payload: object, *, include_other_stablecoins: bool = False) -> list[dict[str, object]]:
     data = payload if isinstance(payload, dict) else {}
     balances = data.get("balances")
     rows = balances if isinstance(balances, list) else []
-    cash_assets = {"USDT", "USDC", "BUSD", "FDUSD", "TUSD"}
+    cash_assets = {"USDT"} if include_other_stablecoins else {"USDT", "USDC", "BUSD", "FDUSD", "TUSD"}
     positions: list[dict[str, object]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -3897,6 +3898,16 @@ class LiveBrokerRouter:
             raise BrokerNotReadyError("ExecutionStreamManager를 LiveBrokerRouter에 연결해야 합니다.")
         return self.execution_stream_manager.start((broker_id,))
 
+    @staticmethod
+    def _spot_display_valuation(broker_id: str, positions: list[dict[str, object]]) -> list[dict[str, object]]:
+        from .spot_account_valuation import PUBLIC_ORIGINS, enrich_spot_display_valuation
+
+        return enrich_spot_display_valuation(
+            broker_id, positions,
+            lambda url: http_json("GET", url, body=None, headers={}, timeout_seconds=3.0),
+            configured_origin=os.getenv(f"{broker_id.upper()}_BASE_URL", "").strip() or PUBLIC_ORIGINS[broker_id],
+        )
+
     def poll_execution_events(self, broker_id: str) -> dict[str, object]:
         broker_id = broker_id.lower().strip()
         if broker_id == "kis":
@@ -3940,7 +3951,8 @@ class LiveBrokerRouter:
         if broker_id == "binance":
             payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))
             accounts = parse_binance_accounts(payload)
-            positions = parse_binance_positions(payload)
+            positions = parse_binance_positions(payload, include_other_stablecoins=True)
+            positions = self._spot_display_valuation("binance", positions)
             return {
                 "broker_id": "binance",
                 "accounts": accounts,
@@ -3976,6 +3988,7 @@ class LiveBrokerRouter:
             payload = ensure_response_ok("upbit", send_prepared_request(build_upbit_accounts_request()))
             accounts = parse_upbit_accounts(payload)
             positions = parse_upbit_positions(payload)
+            positions = self._spot_display_valuation("upbit", positions)
             return {
                 "broker_id": "upbit",
                 "accounts": accounts,
