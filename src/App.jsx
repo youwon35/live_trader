@@ -1,4 +1,5 @@
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
+import { environmentStatus, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation } from "./statusTruth.js";
 import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, ReconciliationEvidence, CapitalAllowance, DeploymentChanges, OrderInvestigation, OperatorNoteEditor } from "./OperatorInsights.jsx";
 import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
 import { runtimeRows, runtimeForDeployment, runtimeModeForDeployment, runningDeploymentIds, artifactIsRunning } from "./runtimeSelection.js";
@@ -2511,14 +2512,14 @@ function App() {
             {(selectedNav !== "functional-test" || shortLiveHeader) && <>
               <StatusPill tone={shortLiveHeader?.tone || (selectedRuntimeMode === "FULL_LIVE" ? "danger" : selectedRuntimeMode === "SMALL_LIVE" ? "warning" : "info")}
                 title={shortLiveHeader?.observedAt ? `기능시험 상태 관측 ${shortLiveHeader.observedAt}` : undefined}>
-                {shortLiveHeader?.label || liveRuntimeModeLabel(selectedRuntimeMode)}
+                {shortLiveHeader?.label || (!ordinaryRuntimeKnown(snapshot) ? "실행 상태 미확인" : ordinaryRuntimeActive(snapshot) ? liveRuntimeModeLabel(selectedRuntimeMode) : "실행 대기")}
               </StatusPill>
-              <StatusPill tone={(shortLiveHeader ? shortLiveHeader.entriesBlocked : snapshot.new_entries_blocked) ? "warning" : "success"}>
-                {shortLiveHeader?.entriesLabel || `신규 진입 ${snapshot.new_entries_blocked ? "차단" : "허용"}`}
-              </StatusPill>
+              {(shortLiveHeader || ordinaryRuntimeActive(snapshot)) && <StatusPill tone={(shortLiveHeader ? shortLiveHeader.entriesBlocked : snapshot.new_entries_blocked) ? "warning" : "success"}>
+                {shortLiveHeader?.entriesLabel || `일반 운용 신규 진입 ${snapshot.new_entries_blocked ? "차단" : "허용"}`}
+              </StatusPill>}
             </>}
             <StatusPill tone={(snapshot.order_queue?.active || 0) ? "warning" : "neutral"}>
-              {snapshot.api_connected ? (shortLiveHeader?.queueLabel || `미결 주문 ${snapshot.order_queue?.active || 0}`) : "미결 주문 미확인"}
+              {snapshot.api_connected && shortLiveHeader?.queueLabel ? shortLiveHeader.queueLabel : activeOrderCountLabel(snapshot)}
             </StatusPill>
             <div className="notification-wrap" ref={notificationRef}>
               <IconButton
@@ -2675,40 +2676,8 @@ function App() {
 }
 
 function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) {
-  const governedDeploymentId = governedDeploymentIdentity(snapshot.live_governance);
-  const contextMatchesPreflight = deploymentContextMatchesPreflight(
-    context.id,
-    snapshot.live_governance,
-  );
-  const preflightValid = snapshot.live_governance?.preflightValidity?.valid === true;
-  const launchLocked = snapshot.launch_report?.real_order_lock !== "ready"
-    || !contextMatchesPreflight
-    || !preflightValid;
-  const armed = snapshot.api_connected === true
-    && !snapshot.kill_switch
-    && snapshot.operator_confirmed
-    && !launchLocked;
-  const orderRouteEnabled = armed
-    && ordinaryExecutionView(snapshot).liveDispatchAvailable
-    && !snapshot.dry_run
-    && ["SMALL_LIVE", "FULL_LIVE"].includes(String(snapshot.mode || "").toUpperCase());
-  const sessionId = snapshot.live_governance?.activeSession?.sessionId
-    || snapshot.runtime_session?.sessionId
-    || snapshot.continuous_runtime?.sessionId
-    || "세션 없음";
-  const killStatus = snapshot.kill_switch
-    ? { value: "KILLED", tone: "danger" }
-    : snapshot.api_connected === true
-      ? { value: "NORMAL", tone: "success" }
-      : { value: "확인 불가", tone: "warning" };
-  const safety = [
-    { label: "실거래 잠금", value: armed ? "ARMED" : "LOCKED", tone: armed ? "warning" : "neutral" },
-    { label: "시작 점검", value: contextMatchesPreflight && preflightValid ? "VALID" : "REQUIRED", tone: contextMatchesPreflight && preflightValid ? "success" : "warning" },
-    { label: "신규 진입", value: snapshot.new_entries_blocked ? "BLOCKED" : "ALLOWED", tone: snapshot.new_entries_blocked ? "warning" : "success" },
-    { label: "위험 증가 주문", value: snapshot.new_entries_blocked ? "REDUCE-ONLY" : "ALLOWED", tone: snapshot.new_entries_blocked ? "warning" : "success" },
-    { label: "주문 전송", value: orderRouteEnabled ? "ENABLED" : "DISABLED", tone: orderRouteEnabled ? "danger" : "neutral" },
-    { label: "전체 긴급 정지", ...killStatus },
-  ];
+  const { items: safety, valid: currentPreflightValid } = environmentStatus(snapshot, context.id);
+  const sessionId = snapshot.live_governance?.activeSession?.sessionId || "세션 없음";
 
   return (
     <section className="live-environment-bar" aria-label="LIVE 환경 및 안전 상태">
@@ -2725,15 +2694,15 @@ function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) 
         </label>
         <div className="live-context-meta">
           <strong>{context.portfolioName}</strong>
-          <span>{context.brokerId} · 계정 {context.accountId} · {context.symbol} {context.timeframe}</span>
+          <span>{["kis", "binance", "binance-futures", "upbit"].includes(context.brokerId) ? context.brokerId : `거래소 미확인 (${context.brokerId})`} · 계정 {context.accountId} · {context.symbol} {context.timeframe}</span>
           <span>조회 배포의 최근 회차 · {snapshot.live_governance?.activeSession?.deploymentId === context.id ? sessionId : "미확인"}</span>
-          {(!contextMatchesPreflight || !preflightValid) && <span>선택 변경 또는 만료 · 이 운용 배포의 시작 점검을 다시 실행하세요.</span>}
+          {!currentPreflightValid && <span>일반 운용 배포의 점검 상태입니다. 주문 연결 시험의 준비·시작은 해당 탭에서 확인하세요.</span>}
         </div>
       </div>
       <RunningSelection snapshot={snapshot} context={context} />
       <div className="live-safety-hierarchy">
         {safety.map((item) => (
-          <div key={item.label}>
+          <div key={item.label} title={item.detail}>
             <span>{item.label}</span>
             <StatusPill tone={item.tone}>{item.value}</StatusPill>
           </div>
@@ -3163,7 +3132,7 @@ function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, on
           onPreflight={onPreflight}
           onWatchdog={onWatchdog}
         />
-        <LaunchReportPanel report={snapshot.launch_report ?? {}} />
+        <LaunchReportPanel report={snapshot.launch_report ?? {}} observed={snapshot.api_connected === true && snapshot.final_preflight?.length > 0} />
       </section>
       <CompactDisclosure
         title="시작 점검·실행 엔진 기술 근거"
@@ -4608,11 +4577,14 @@ function buildDoctorItems(snapshot = {}, selectedDeploymentId = "", now = Date.n
     (snapshot.brokers ?? []).reduce((count, broker) => count + (broker.missing_env?.length ?? 0), 0);
   const brokerConnectionErrors = snapshot.reconciliation?.errors ?? [];
   const configuredBrokerCount = (snapshot.brokers ?? []).filter((broker) => !(broker.missing_env?.length)).length;
+  const observedBrokerCount = (snapshot.brokers ?? []).filter(broker => brokerAccountObservation(snapshot, broker.broker_id, now).status === "pass").length;
+  const allBrokersObserved = configuredBrokerCount > 0 && observedBrokerCount === configuredBrokerCount;
   const missingChecklist = (snapshot.checklist ?? []).filter((item) => item.required && !item.checked);
   const riskKnown = (snapshot.risk_checks ?? []).length > 0
     && snapshot.risk_checks.every((check) => ["pass", "warn", "fail", "na"].includes(check.status));
-  const strategiesKnown = (snapshot.strategies ?? []).length > 0
-    && snapshot.strategies.every((strategy) => typeof strategy.live_allowed === "boolean");
+  const selectedStrategies = (snapshot.strategies ?? []).filter(strategy => String(strategy.deployment_id || strategy.deploymentId || strategy.strategy_id || "") === String(selectedDeploymentId || ""));
+  const strategiesKnown = Boolean(selectedDeploymentId) && selectedStrategies.length === 1
+    && selectedStrategies.every((strategy) => typeof strategy.live_allowed === "boolean");
   const riskFailures = (snapshot.risk_checks ?? []).filter((check) => check.status === "fail");
   const riskWarnings = (snapshot.risk_checks ?? []).filter((check) => check.status === "warn");
   const reconciliation = snapshot.reconciliation?.summary ?? {};
@@ -4633,22 +4605,22 @@ function buildDoctorItems(snapshot = {}, selectedDeploymentId = "", now = Date.n
     && Number.isFinite(expiresAt) && expiresAt > now;
   const finalFailures = (snapshot.final_preflight ?? []).filter((check) => check.status === "fail");
   const finalWarnings = (snapshot.final_preflight ?? []).filter((check) => check.status === "warn");
-  const strategyBlocked = (snapshot.strategies ?? []).filter((strategy) => !strategy.live_allowed);
+  const strategyBlocked = selectedStrategies.filter((strategy) => !strategy.live_allowed);
   const apiDetails = [
     ...(snapshot.brokers ?? []).map((broker) =>
       makeDetail(
         broker.name,
         broker.missing_env?.length
           ? `환경 변수 ${broker.missing_env.length}개 누락 · ${broker.missing_env.join(", ")}`
-          : "API 인증정보가 설정되어 있습니다. 실주문 승격 조건은 최종 Preflight에서 별도로 확인합니다.",
-        broker.missing_env?.length ? "fail" : reconciliationEvidence.observed ? "pass" : "warn",
+          : brokerAccountObservation(snapshot, broker.broker_id, now).detail,
+        broker.missing_env?.length ? "fail" : brokerAccountObservation(snapshot, broker.broker_id, now).status,
       ),
     ),
     ...brokerConnectionErrors.map((error) => makeDetail(`${error.broker_id ?? "브로커"} 계좌 조회`, error.detail ?? "계좌 조회 오류가 발생했습니다.", "fail")),
   ];
   const checklistDetails = (snapshot.checklist ?? []).map((item) => makeDetail(item.label, item.detail, item.checked ? "pass" : item.required ? "fail" : "warn"));
   const riskDetails = (snapshot.risk_checks ?? []).map((check) => makeDetail(check.label, `${check.detail} · ${check.value}`, riskKnown || check.status === "fail" ? check.status : "warn"));
-  const strategyDetails = (snapshot.strategies ?? []).map((strategy) =>
+  const strategyDetails = selectedStrategies.map((strategy) =>
     makeDetail(strategy.name, `${strategy.symbol} · ${strategy.block_reason || strategy.lifecycle_status}`, strategy.live_allowed ? "pass" : "warn"),
   );
   const reconciliationDetails = [
@@ -4691,9 +4663,9 @@ function buildDoctorItems(snapshot = {}, selectedDeploymentId = "", now = Date.n
         ? `API 환경 변수 ${missingBrokerEnvCount}개가 비어 있습니다.`
         : brokerConnectionErrors.length
           ? `브로커 계좌 조회 오류 ${brokerConnectionErrors.length}개를 확인하세요.`
-          : reconciliationEvidence.observed ? `${configuredBrokerCount}개 브로커의 인증정보가 설정되어 있고 계좌 조회 이력이 있습니다.` : "인증정보 설정과 실제 연결 성공은 다릅니다. 계좌 조회 결과를 확인하세요.",
-      tone: missingBrokerEnvCount || brokerConnectionErrors.length ? "danger" : reconciliationEvidence.observed ? "success" : "warning",
-      status: missingBrokerEnvCount || brokerConnectionErrors.length ? "조치" : reconciliationEvidence.observed ? "통과" : "미확인",
+          : `전체 연결 계좌: 인증정보 ${configuredBrokerCount}곳 · 최근 조회 성공 ${observedBrokerCount}곳. 계좌·잔고에서 개별 결과를 확인하세요.`,
+      tone: missingBrokerEnvCount || brokerConnectionErrors.length ? "danger" : allBrokersObserved ? "success" : "warning",
+      status: missingBrokerEnvCount || brokerConnectionErrors.length ? "조치" : allBrokersObserved ? "조회 성공" : "미확인",
       targetNav: "settings",
       details: apiDetails.length ? apiDetails : [makeDetail("API / 브로커", "API 연결 검사 결과를 확인하지 못했습니다.", "warn")],
     },
@@ -4721,7 +4693,7 @@ function buildDoctorItems(snapshot = {}, selectedDeploymentId = "", now = Date.n
       id: "doctor-strategy",
       index: 4,
       title: "전략 lifecycle eligibility",
-      detail: !strategiesKnown ? "검증할 전략과 실행 권한을 확인하지 못했습니다." : strategyBlocked.length ? `Live-Small/Live 전 전략 ${strategyBlocked.length}개를 검토해야 합니다.` : "Live-Small 이상 전략을 확인했습니다.",
+      detail: !strategiesKnown ? "검증할 전략과 실행 권한을 확인하지 못했습니다." : strategyBlocked.length ? "선택한 배포의 실거래 자격을 확인해야 합니다. 다른 저장 전략은 이 점검에 포함하지 않습니다." : "선택한 배포의 실거래 자격을 확인했습니다.",
       tone: !strategiesKnown || strategyBlocked.length ? "warning" : "success",
       status: !strategiesKnown ? "미확인" : strategyBlocked.length ? "검토" : "통과",
       targetNav: "gate",
@@ -6045,9 +6017,9 @@ function OperationsReportPanel({ report }) {
   );
 }
 
-function LaunchReportPanel({ report }) {
+function LaunchReportPanel({ report, observed = false }) {
   const items = [
-    { label: "실주문 잠금", value: report.real_order_lock, tone: statusTone(report.real_order_lock) },
+    { label: "운용 시작 조건", value: report.real_order_lock === "ready" ? "점검 충족" : report.real_order_lock === "locked" ? "점검 미충족" : "미확인", tone: statusTone(report.real_order_lock) },
     { label: "제한 실거래", value: report.small_live_status, tone: statusTone(report.small_live_status) },
     { label: "실전 운용", value: report.full_live_status, tone: statusTone(report.full_live_status) },
     { label: "Hard Stop", value: report.hard_stop_count, tone: report.hard_stop_count ? "danger" : "success" },
@@ -6055,29 +6027,29 @@ function LaunchReportPanel({ report }) {
   ];
   return (
     <section className="panel launch-report-panel">
-      <PanelHeader title="실거래 승인 패키지" subtitle={`마지막 최종 점검 ${report.last_run}`} />
+      <PanelHeader title="일반 운용 시작 조건" subtitle={observed ? `현재 진단 · 마지막 최종 점검 ${report.last_run}` : "시작 조건을 아직 확인하지 못했습니다."} />
       <div className="launch-lock">
         <ShieldAlert size={18} />
         <div>
-          <strong>{report.lock_reason}</strong>
-          <span>실제 주문 전송은 모든 hard stop과 warning 해소 후에만 검토합니다.</span>
+          <strong>{observed ? report.lock_reason : "점검 결과 미확인 · 최신 시작 점검이 필요합니다."}</strong>
+          <span>연결 설정의 주문 허용과 별개인 일반 운용 진단입니다. 주문 연결 시험은 해당 탭에서 준비 결과를 확인하세요.</span>
         </div>
       </div>
       <MetricGrid className="metric-grid">
         {items.map((item) => (
           <MetricCard
             className="metric-card"
-            detail={item.tone === "success" ? "해제 가능" : "차단"}
-            detailClassName={`summary-state ${item.tone}`}
+            detail={!observed || item.value == null ? "미확인" : item.tone === "success" ? "점검 충족" : "점검 필요"}
+            detailClassName={`summary-state ${observed && item.value != null ? item.tone : "warning"}`}
             key={item.label}
             label={item.label}
-            tone={item.tone}
-            value={item.value}
+            tone={observed && item.value != null ? item.tone : "warning"}
+            value={observed && item.value != null ? item.value : "미확인"}
           />
         ))}
       </MetricGrid>
       <div className="next-actions">
-        {report.next_actions.map((action) => (
+        {(observed ? report.next_actions || [] : []).map((action) => (
           <span key={action}>{action}</span>
         ))}
       </div>

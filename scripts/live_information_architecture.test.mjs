@@ -58,12 +58,11 @@ test("advanced one-shot diagnostics load only on explicit opening", () => {
   assert.match(appSource, /if \(nextOpen && !hasOpened\) \{[\s\S]*?onFirstOpen\?\.\(\)/);
 });
 
-test("persistent live hierarchy keeps every execution-critical state visible", () => {
+test("persistent hierarchy reads scoped status presentation, not an inferred global lock", () => {
   const environment = between(appSource, "function LiveEnvironmentBar", "function CompactDisclosure");
-  for (const label of ["실거래 잠금", "시작 점검", "신규 진입", "위험 증가 주문", "주문 전송", "전체 긴급 정지"]) {
-    assert.match(environment, new RegExp(`label: "${label}"`));
-  }
-  assert.match(environment, /snapshot\.kill_switch[\s\S]*?snapshot\.api_connected === true[\s\S]*?value: "확인 불가"/);
+  assert.match(environment, /environmentStatus\(snapshot, context.id\)/);
+  assert.match(environment, /safety.map/);
+  assert.doesNotMatch(environment, /launchLocked|orderRouteEnabled/);
 });
 
 test("default pages prioritize decisions and move technical evidence into disclosures", () => {

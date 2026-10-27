@@ -14,7 +14,7 @@ import { EMPTY_FUNCTIONAL_TEST_WORKSPACE } from '../src/functionalTestModel.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const dist = resolve(root, 'dist');
-const output = resolve(root, 'output/playwright/simplified-flow');
+const output = process.env.LIVE_OFFLINE_OUTPUT || resolve(root, 'output/playwright/simplified-flow');
 const sealedPreparation = process.env.SEALED_PREPARATION === '1' ? JSON.parse(await readFile(resolve(root,'output/live-tabs-20261012/preparation-ui-fixture.json'),'utf8')) : null;
 const candidateReview = process.env.CANDIDATE_REVIEW === '1' ? JSON.parse(await readFile(resolve(root,'output/sep11-functional-audit/candidate-ui/responses.json'),'utf8')) : null;
 const appSource = await readFile(resolve(root, 'src/App.jsx'), 'utf8');
@@ -236,7 +236,7 @@ try {
         snapshot.accounts = snapshot.accounts.map(account => account.broker_id === 'kis' ? { ...account, broker_cash_value: 0, broker_equity_value: 0 } : account);
         snapshot.positions = snapshot.positions.map(position => position.broker_id === 'kis' ? { ...position, current_price: 0, broker_value: 0 } : position);
         await allocation.getByRole('button', { name: '계좌 다시 읽기', exact: true }).click();
-        await allocation.locator('.ts-allocation-center-value').filter({ hasText: '평가 미확인' }).waitFor();
+        await allocation.getByText(/평가 정보가 부족해|조회가 완전하지|부분 조회/).first().waitFor();
         assert.equal(await allocation.getByText('보유 자산이 없습니다.', { exact: true }).count(), 0);
         assert.equal(await allocation.locator('tbody tr').count(), 2);
         assert.match(await allocation.locator('tbody tr').first().innerText(), /평가 미확인/);

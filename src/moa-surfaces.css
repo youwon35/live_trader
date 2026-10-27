@@ -151,3 +151,16 @@
 }
 
 :root[data-program="live-trader"] #root .live-monitor-hero:is(.tone-danger, .tone-warning) p { color: var(--text); }
+
+/* Keep review text readable on both themes; the selected control keeps its accent. */
+:root[data-program="live-trader"] #root .doctor-card:not(.selected) {
+  background: var(--panel-raised);
+}
+:root[data-program="live-trader"] #root .doctor-card:not(.selected) :is(strong, .ts-status-card__detail) {
+  color: var(--text);
+}
+:root[data-program="live-trader"] #root .doctor-card > .ts-status-card__badge {
+  grid-column: 2;
+  justify-self: start;
+  white-space: nowrap;
+}

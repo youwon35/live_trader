@@ -29,10 +29,11 @@ function useReview(scope, token, enabled=true) {
 }
 export function RunningSelection({ snapshot, context }) {
   const bindings = snapshot.operator_runtime_bindings;
-  const values = Array.isArray(bindings) ? bindings : [];
+  const known = snapshot.api_connected === true && Array.isArray(bindings);
+  const values = known ? bindings : [];
   return <div className="operator-insights operator-running" aria-label="실제 실행 고정 정보">
     <strong>실제 실행</strong>
-    {!values.length ? <span>{Array.isArray(bindings) ? '실행 중인 감시 없음' : '실행 정보 미확인'}</span> : values.map((row,index) => <InlineDisclosure key={row.sessionId || index}>
+    {!values.length ? <span>{known ? '실행 중인 감시 없음' : '실행 정보 미확인'}</span> : values.map((row,index) => <InlineDisclosure key={row.sessionId || index}>
       <summary>{row.deploymentId || '배포 미확인'} · {stateName(row.mode)} {row.deploymentId !== context.id ? '· 조회 선택과 다름' : '· 조회 선택과 같음'}</summary>
       <dl><div><dt>실행 전략</dt><dd>{row.manifest?.metadata?.strategyIds?.join(', ') || row.manifest?.metadata?.strategyId || '미확인'}</dd></div><div><dt>고정 버전</dt><dd title={row.manifest?.manifestHash}>{row.manifest ? `배포 ${row.manifest.revision} · ${hash(row.manifest.strategyArtifactHash)}` : '고정 구성 미확인'}</dd></div><div><dt>계좌</dt><dd title={row.manifest?.accountFingerprint}>{row.manifest?.brokerRoute || '거래 경로 미확인'} · 식별값 {hash(row.manifest?.accountFingerprint)}</dd></div><div><dt>실행 회차</dt><dd>{row.sessionId || '미확인'} · {stateName(row.lifecycle)}</dd></div></dl>
     </InlineDisclosure>)}

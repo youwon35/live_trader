@@ -2549,7 +2549,7 @@ def _validate_exact_kis_token_request(
         != KIS_LIVE_BASE_URL + KIS_TOKEN_ENDPOINT
         or str(actual["rawUrl"])
         != KIS_LIVE_BASE_URL + KIS_TOKEN_ENDPOINT
-        or env_value("KIS_ENV").lower() != "real"
+        or (env_value("KIS_ENV") or "real").lower() != "real"
         or set(normalized_headers) != {"content-type"}
         or normalized_headers.get("content-type")
         != "application/json; charset=utf-8"
@@ -2667,7 +2667,7 @@ def _guard_kis_owned_http_edge(
         if credentialed and (
             actual["official"] is not True
             or actual["configured"] is not True
-            or env_value("KIS_ENV").lower() != "real"
+            or (env_value("KIS_ENV") or "real").lower() != "real"
             or str(actual["rawUrl"]) != str(actual["canonicalUrl"])
         ):
             raise KisOrderAuthorityError(

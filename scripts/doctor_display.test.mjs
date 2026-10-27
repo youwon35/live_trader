@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { parse } from "@babel/parser";
+import { brokerAccountObservation } from "../src/statusTruth.js";
 import { recordedReconciliation } from "../src/executionAvailability.js";
 import { deploymentContextMatchesPreflight } from "../src/deploymentSelection.js";
 
@@ -17,9 +18,9 @@ const declaration = (name) => {
 const helpers = ["statusTone", "detailTone", "makeDetail", "buildDoctorItems"]
   .map((name) => { const node = declaration(name); return source.slice(node.start, node.end); }).join("\n");
 const buildDoctorItems = new Function(
-  "recordedReconciliation", "deploymentContextMatchesPreflight",
+  "recordedReconciliation", "deploymentContextMatchesPreflight", "brokerAccountObservation",
   `${helpers}\nreturn buildDoctorItems;`,
-)(recordedReconciliation, deploymentContextMatchesPreflight);
+)(recordedReconciliation, deploymentContextMatchesPreflight, brokerAccountObservation);
 const NOW = Date.parse("2026-09-06T03:00:00.000Z");
 const future = new Date(NOW + 60_000).toISOString();
 const check = (label, status = "pass") => ({ label, status, detail: "기록된 검사", value: 0 });
@@ -29,7 +30,7 @@ const validSnapshot = () => ({
   broker_diagnostics: [],
   checklist: [{ key: "risk_limits_reviewed", label: "한도 검토", required: true, checked: true }],
   risk_checks: [check("위험 한도")],
-  strategies: [{ name: "전략 A", symbol: "TEST", live_allowed: true, lifecycle_status: "live" }],
+  strategies: [{ deployment_id: "deployment-a", name: "전략 A", symbol: "TEST", live_allowed: true, lifecycle_status: "live" }],
   reconciliation: {
     summary: {
       last_run: "2026-09-06T02:59:00.000Z", status: "pass",
@@ -192,4 +193,22 @@ test("selected Deployment is passed through each actual Doctor caller", () => {
   });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].arguments[1]?.name, "selectedDeploymentId");
+});
+
+test('unselected saved strategies do not become selected deployment blockers', () => {
+  const snapshot = validSnapshot();
+  snapshot.strategies.push({ deployment_id: 'other', name: 'Not selected', live_allowed: false });
+  const row = item(inspect(snapshot), 'doctor-strategy');
+  assert.equal(row.tone, 'success'); assert.equal(row.details.length, 1);
+  unverified(item(inspect(snapshot, 'unknown'), 'doctor-strategy'));
+});
+test('one broker account success cannot make another broker API diagnosis pass', () => {
+  const snapshot = validSnapshot();
+  snapshot.brokers = [{broker_id:'kis', name:'KIS',missing_env:[]},{broker_id:'upbit',name:'Upbit',missing_env:[]}];
+  snapshot.accounts = [{broker_id:'upbit',broker_cash_value:0}];
+  snapshot.reconciliation.errors = [{broker_id:'kis',detail:'token failed'}];
+  const row=item(inspect(snapshot),'doctor-api');
+  assert.equal(row.details[0].tone,'danger');
+  assert.equal(row.details[1].tone,'success');
+  assert.equal(row.tone,'danger');
 });

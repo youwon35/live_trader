@@ -15,6 +15,7 @@ const literal=appSource.match(/const fallbackSnapshot = (\{[\s\S]*?\n\});\s*cons
 assert.ok(literal);
 const valid=JSON.parse(JSON.stringify(runInNewContext(`(${literal[1]})`,{},{timeout:500})));
 valid.generated_at='2026-10-28 01:30:00';
+valid.continuous_runtime={running:false,profiles:{}};
 const server=createServer(async(req,res)=>{
   const path=new URL(req.url,'http://localhost').pathname;
   const file=resolve(dist,`.${path==='/'?'/index.html':path}`);
@@ -44,7 +45,7 @@ try{
     await page.goto(origin);
     await page.locator('.api-connection-banner').waitFor();
     assert.equal(await page.getByRole('heading',{name:'시작 점검',exact:true}).count(),1);
-    assert.match(await page.locator('.topbar').innerText(),/신규 진입 차단/);
+    assert.match(await page.locator('.topbar').innerText(),/실행 상태 미확인/);
     assert.match(await page.locator('.sidebar-footer').innerText(),/API 끊김/);
     assert.match(await page.locator('.topbar').innerText(),/미결 주문 미확인/);
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false);
@@ -53,7 +54,7 @@ try{
     await page.getByRole('button',{name:'다시 연결',exact:true}).click();
     await page.waitForFunction(()=>!document.body.innerText.includes('현재 상태 응답이 불완전합니다.'));
     assert.match(await page.locator('.sidebar-footer').innerText(),/NORMAL|정상/);
-    assert.match(await page.locator('.topbar').innerText(),/신규 진입 차단/);
+    assert.match(await page.locator('.topbar').innerText(),/실행 대기/);
     assert.deepEqual(errors,[]);
     report.scenarios.push({name,rendered:true,invalidResponseBlocked:true,recoveredWithoutReload:true,pageErrors:errors});
     await context.close();
