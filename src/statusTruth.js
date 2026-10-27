@@ -52,3 +52,8 @@ export function activeOrderCountLabel(snapshot = {}) {
   const count=snapshot.order_queue?.active;
   return snapshot.api_connected === true && Number.isSafeInteger(count) && count >= 0 ? `미결 주문 ${count}` : '미결 주문 미확인';
 }
+
+export function ordinaryEntryStatus(snapshot = {}) {
+  const known = snapshot.api_connected === true && typeof snapshot.new_entries_blocked === 'boolean';
+  return { label: !known ? '일반 운용 신규 진입 미확인' : snapshot.new_entries_blocked ? '일반 운용 신규 진입 차단' : '일반 운용 신규 진입 허용', tone: known && snapshot.new_entries_blocked === false ? 'success' : 'warning' };
+}

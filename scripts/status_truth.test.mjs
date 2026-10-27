@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {environmentStatus, currentOrderPermission, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation} from '../src/statusTruth.js';
+import {environmentStatus, ordinaryEntryStatus, currentOrderPermission, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation} from '../src/statusTruth.js';
 const now=Date.parse('2026-10-28T00:00:00Z');
 const base=()=>({api_connected:true,kill_switch:false,new_entries_blocked:true,readiness:[{label:'실거래 라우트 환경',status:'pass'}],continuous_runtime:{profiles:{}},live_governance:{}});
 test('allowed current settings are not mislabeled locked when no preflight or worker exists',()=>{
@@ -38,4 +38,13 @@ test('missing runtime and queue counters stay unknown, aggregate running is not 
  assert.equal(ordinaryRuntimeActive(s),true);assert.equal(ordinaryRuntimeKnown(s),true);
  for(const active of [undefined,null,-1,'0'])assert.equal(activeOrderCountLabel({...s,order_queue:{active}}),'미결 주문 미확인');
  assert.equal(activeOrderCountLabel({...s,order_queue:{active:0}}),'미결 주문 0');
+});
+
+test('running header never treats missing entry guard as permission',()=>{
+ for(const value of [undefined,null,'false']){
+  const result=ordinaryEntryStatus({...base(),continuous_runtime:{running:true},new_entries_blocked:value});
+  assert.equal(result.label,'일반 운용 신규 진입 미확인');assert.equal(result.tone,'warning');
+ }
+ assert.equal(ordinaryEntryStatus({...base(),new_entries_blocked:false}).label,'일반 운용 신규 진입 허용');
+ assert.equal(ordinaryEntryStatus({...base(),api_connected:false,new_entries_blocked:false}).tone,'warning');
 });

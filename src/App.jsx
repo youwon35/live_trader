@@ -1,5 +1,5 @@
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
-import { environmentStatus, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation } from "./statusTruth.js";
+import { environmentStatus, ordinaryEntryStatus, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation } from "./statusTruth.js";
 import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, ReconciliationEvidence, CapitalAllowance, DeploymentChanges, OrderInvestigation, OperatorNoteEditor } from "./OperatorInsights.jsx";
 import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
 import { runtimeRows, runtimeForDeployment, runtimeModeForDeployment, runningDeploymentIds, artifactIsRunning } from "./runtimeSelection.js";
@@ -2485,8 +2485,8 @@ function App() {
         </nav>
         <div className="sidebar-footer">
           <span>전체 긴급 정지</span>
-          <StatusPill tone={snapshot.kill_switch ? "danger" : snapshot.api_connected ? "success" : "warning"}>
-            {snapshot.kill_switch ? "KILLED" : snapshot.api_connected ? "NORMAL" : snapshot.emergency_stop?.available ? "긴급 정지 가능" : "API 끊김"}
+          <StatusPill tone={snapshot.kill_switch === true ? "danger" : snapshot.api_connected === true && snapshot.kill_switch === false ? "success" : "warning"}>
+            {snapshot.kill_switch === true ? "KILLED" : snapshot.api_connected === true ? snapshot.kill_switch === false ? "NORMAL" : "미확인" : snapshot.emergency_stop?.available ? "긴급 정지 가능" : "API 끊김"}
           </StatusPill>
         </div>
       </aside>
@@ -2514,8 +2514,8 @@ function App() {
                 title={shortLiveHeader?.observedAt ? `기능시험 상태 관측 ${shortLiveHeader.observedAt}` : undefined}>
                 {shortLiveHeader?.label || (!ordinaryRuntimeKnown(snapshot) ? "실행 상태 미확인" : ordinaryRuntimeActive(snapshot) ? liveRuntimeModeLabel(selectedRuntimeMode) : "실행 대기")}
               </StatusPill>
-              {(shortLiveHeader || ordinaryRuntimeActive(snapshot)) && <StatusPill tone={(shortLiveHeader ? shortLiveHeader.entriesBlocked : snapshot.new_entries_blocked) ? "warning" : "success"}>
-                {shortLiveHeader?.entriesLabel || `일반 운용 신규 진입 ${snapshot.new_entries_blocked ? "차단" : "허용"}`}
+              {(shortLiveHeader || ordinaryRuntimeActive(snapshot)) && <StatusPill tone={shortLiveHeader ? (shortLiveHeader.entriesBlocked ? "warning" : "success") : ordinaryEntryStatus(snapshot).tone}>
+                {shortLiveHeader?.entriesLabel || ordinaryEntryStatus(snapshot).label}
               </StatusPill>}
             </>}
             <StatusPill tone={(snapshot.order_queue?.active || 0) ? "warning" : "neutral"}>
