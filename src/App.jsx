@@ -2518,7 +2518,7 @@ function App() {
               </StatusPill>
             </>}
             <StatusPill tone={(snapshot.order_queue?.active || 0) ? "warning" : "neutral"}>
-              {shortLiveHeader?.queueLabel || `미결 주문 ${snapshot.order_queue?.active || 0}`}
+              {snapshot.api_connected ? (shortLiveHeader?.queueLabel || `미결 주문 ${snapshot.order_queue?.active || 0}`) : "미결 주문 미확인"}
             </StatusPill>
             <div className="notification-wrap" ref={notificationRef}>
               <IconButton
@@ -2583,7 +2583,7 @@ function App() {
           <section className="api-connection-banner ts-text-region" role="alert">
             <Network size={18} />
             <div>
-              <strong>HTTP API 상태를 확인할 수 없어 거래 조회 상태을 안전 차단 상태로 전환했습니다.</strong>
+              <strong>현재 운용 상태를 확인할 수 없습니다. 연결이 끊겨도 진행 중인 거래가 계속될 수 있습니다.</strong>
               <span>
                 {error} · {snapshot.emergency_stop?.active
                   ? snapshot.emergency_stop?.durable

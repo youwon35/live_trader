@@ -330,7 +330,24 @@ export async function safetyConfirmationValuesDigest(values) {
 }
 
 export async function getSnapshot() {
-  return request("/api/snapshot");
+  const snapshot = await request("/api/snapshot");
+  const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
+  const flags = ["dry_run", "kill_switch", "new_entries_blocked", "operator_confirmed"];
+  const rows = ["readiness", "brokers", "strategies", "accounts", "orders", "positions"];
+  // Missing safety flags must never become false through UI truthiness checks.
+  // Optional capabilities remain optional for compatible server versions.
+  if (!record(snapshot) || snapshot.ok === false
+      || flags.some(key => typeof snapshot[key] !== "boolean")
+      || rows.some(key => !Array.isArray(snapshot[key]) || snapshot[key].some(item => !record(item)))
+      || !record(snapshot.summary)
+      || typeof snapshot.mode !== "string" || !snapshot.mode.trim()
+      || typeof snapshot.generated_at !== "string" || !snapshot.generated_at.trim()) {
+    throw new ApiRequestError(
+      "현재 상태 응답이 불완전합니다. 연결 상태와 주문 조건을 다시 확인하는 중입니다.",
+      "INVALID_RESPONSE",
+    );
+  }
+  return snapshot;
 }
 
 export async function getTelegramConnection() {

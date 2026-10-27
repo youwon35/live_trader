@@ -13,7 +13,7 @@
     "test:layout-contract": "node scripts/layout_slot_smoke.mjs",
     "test:layout-slot": "node scripts/layout_slot_smoke.mjs",
     "test:polling": "node scripts/polling.test.mjs",
-    "test:api-resilience": "node scripts/api_resilience.test.mjs",
+    "test:api-resilience": "node scripts/api_resilience.test.mjs && node --test scripts/snapshot_response.test.mjs",
     "test:futures-risk-ui": "node scripts/futures_risk_simulator.test.mjs",
     "test:deployment-selection": "node --test scripts/deployment_selection.test.mjs",
     "test:functional-test-ui": "node scripts/functional_test_model.test.mjs",
