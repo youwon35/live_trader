@@ -56,6 +56,35 @@ class RuntimeBatchService:
             os.fsync(stream.fileno())
 
     @staticmethod
+    def _reservation_name(selection):
+        # A new group, mode, account binding or process cannot rename an
+        # unresolved start for this deployment into a fresh attempt.
+        return "deployment-start-" + _digest(selection["deployment_id"])
+
+    def _start_blocker(self, selection, binding):
+        if (self.root / (self._reservation_name(selection) + ".json")).exists():
+            return "BATCH_DEPLOYMENT_START_PENDING_OR_UNKNOWN"
+        return self._runtime_start_blocker(selection, binding)
+
+    def _runtime_start_blocker(self, selection, binding):
+        try:
+            observed = self.observe()
+            runtimes = observed.get("runtimes") if isinstance(observed, Mapping) else None
+            if not isinstance(runtimes, Mapping):
+                return "BATCH_RUNTIME_OBSERVATION_UNAVAILABLE"
+            scope_id = binding["scope"]["runtimeScopeId"]
+            for key, row in runtimes.items():
+                if not isinstance(row, Mapping):
+                    return "BATCH_RUNTIME_OBSERVATION_UNAVAILABLE"
+                same = row.get("deploymentId") == selection["deployment_id"] or key == scope_id
+                if same and (row.get("running") is True or row.get("phase") in {
+                        "PREPARED", "STARTING", "RUNNING", "DEGRADED", "STOPPING"}):
+                    return "BATCH_DEPLOYMENT_ALREADY_ACTIVE"
+        except Exception:
+            return "BATCH_RUNTIME_OBSERVATION_UNAVAILABLE"
+        return ""
+
+    @staticmethod
     def _selection(value):
         if (not isinstance(value, dict) or set(value) - _SELECTION_KEYS
                 or value.get("profile_id") not in {"stock", "crypto"}
@@ -94,6 +123,9 @@ class RuntimeBatchService:
                             or scope.get("profileId") != selection["profile_id"]):
                         raise RuntimeBatchError("EXACT_RUNTIME_BINDING_REQUIRED")
                     member["binding"] = deepcopy(dict(binding))
+                    blocker = self._start_blocker(selection, binding)
+                    if blocker:
+                        member.update(status="BLOCKED", reasonCode=blocker)
                 except Exception as exc:
                     # Provider/error text is never echoed into the public batch.
                     member.update(status="BLOCKED", reasonCode="BATCH_MEMBER_SELECTION_BLOCKED",
@@ -164,6 +196,30 @@ class RuntimeBatchService:
                         "runtimeStarted": False, "brokerSubmissionPerformed": False}
             if self.clock() >= datetime.fromisoformat(group["expiresAt"].replace("Z", "+00:00")):
                 raise RuntimeBatchError("BATCH_PREPARATION_EXPIRED")
+            blocker = self._start_blocker(member["selection"], member["binding"])
+            if blocker:
+                member.update(status="BLOCKED", reasonCode=blocker)
+                return {"ok": False, "reason": blocker, "batch": self._public(group),
+                        "runtimeStarted": False, "brokerSubmissionPerformed": False}
+            reservation_name = self._reservation_name(member["selection"])
+            try:
+                self._write(reservation_name, {
+                    "schemaVersion": "live-deployment-start-reservation-v1",
+                    "batchId": group["batchId"], "memberId": member["memberId"],
+                    "deploymentId": member["selection"]["deployment_id"],
+                    "bindingHash": _digest(current), "reservedAt": _stamp(self.clock())})
+            except FileExistsError:
+                member.update(status="BLOCKED", reasonCode="BATCH_DEPLOYMENT_START_PENDING_OR_UNKNOWN")
+                return {"ok": False, "reason": member["reasonCode"], "batch": self._public(group),
+                        "runtimeStarted": False, "brokerSubmissionPerformed": False}
+            # Another owner may have completed between the prior observation
+            # and this atomic acquisition. It must not be started twice.
+            blocker = self._runtime_start_blocker(member["selection"], member["binding"])
+            if blocker:
+                member.update(status="BLOCKED", reasonCode=blocker)
+                (self.root / (reservation_name + ".json")).unlink()
+                return {"ok": False, "reason": blocker, "batch": self._public(group),
+                        "runtimeStarted": False, "brokerSubmissionPerformed": False}
             # Claim before calling existing authority code, outside this lock.
             # A concurrent call observes STARTING and cannot call it again.
             self._write("claim-" + group["batchId"] + "-" + member["memberId"],
@@ -176,7 +232,8 @@ class RuntimeBatchService:
                        if key in payload}
         try:
             result = self.start_runtime(selection, options)
-            if not isinstance(result, Mapping):
+            if (not isinstance(result, Mapping) or type(result.get("ok")) is not bool
+                    or (result.get("ok") is False and result.get("runtimeStarted") is True)):
                 raise RuntimeBatchError("START_RESULT_UNAVAILABLE")
             # Never persist an attestation, private account snapshot or arbitrary response.
             public_result = {key: deepcopy(result[key]) for key in (
@@ -198,6 +255,17 @@ class RuntimeBatchService:
                 member.update(status="UNKNOWN", reasonCode="BATCH_RESULT_PERSISTENCE_UNKNOWN")
             public_batch = self._public(group)
             public_member = next(row for row in public_batch["members"] if row["memberId"] == member["memberId"])
+            # Only this completed owner may retire its reservation. Read-only
+            # status or a new process never clears a missing/unknown result.
+            # Permanent claim/result history remains intact after retirement.
+            if member["status"] == "BLOCKED" or (
+                    member["status"] == "STARTED" and public_member["status"] in {"RUNNING", "STOPPED"}):
+                try:
+                    (self.root / (reservation_name + ".json")).unlink()
+                except OSError:
+                    member.update(status="UNKNOWN", reasonCode="BATCH_RESERVATION_RETIREMENT_UNKNOWN")
+                    public_batch = self._public(group)
+                    public_member = next(row for row in public_batch["members"] if row["memberId"] == member["memberId"])
             verified_running = member["status"] == "STARTED" and public_member["status"] == "RUNNING"
             return {"ok": verified_running,
                     "reason": "" if verified_running else member["reasonCode"] or "BATCH_START_NOT_OBSERVED_RUNNING",

@@ -221,6 +221,144 @@ class RuntimeBatchTests(unittest.TestCase):
         self.failure = "deployment-binance"
         result = self.service.start_member(self.payload(batch))
         self.assertEqual(result["batch"]["members"][0]["status"], "BLOCKED")
+        self.assertFalse(self.calls)
+
+    def test_two_prepared_groups_cannot_start_same_outstanding_deployment(self):
+        first, second = self.prepare("binance"), self.prepare("binance")
+        self.failure = "wait"
+        thread = threading.Thread(target=lambda: self.service.start_member(self.payload(first)))
+        thread.start()
+        self.assertTrue(self.entered.wait(2))
+        try:
+            result = self.service.start_member(self.payload(second))
+            self.assertEqual(result["reason"], "BATCH_DEPLOYMENT_START_PENDING_OR_UNKNOWN")
+            third = self.prepare("binance")
+            self.assertEqual(third["members"][0]["reasonCode"], result["reason"])
+        finally:
+            self.release.set()
+            thread.join(3)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_independent_services_race_on_create_only_deployment_reservation(self):
+        other = self.make_service()
+        first = self.prepare("binance")
+        second = other.prepare({"selections": [self.selection()]})["batch"]
+        barrier = threading.Barrier(2)
+        for service in (self.service, other):
+            original = service._write
+            def racing_write(name, value, write=original):
+                if name.startswith("deployment-start-"):
+                    barrier.wait(timeout=3)
+                write(name, value)
+            service._write = racing_write
+        self.failure = "wait"
+        results, errors = [], []
+        def run(service, batch):
+            try:
+                results.append(service.start_member(self.payload(batch)))
+            except Exception as exc:
+                errors.append(exc)
+        threads = [threading.Thread(target=run, args=item) for item in ((self.service, first), (other, second))]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(self.entered.wait(3))
+        self.release.set()
+        for thread in threads:
+            thread.join(4)
+        self.assertFalse(errors)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(sum(row["ok"] is True for row in results), 1)
+        self.assertTrue(any(row["reason"] in {
+            "BATCH_DEPLOYMENT_START_PENDING_OR_UNKNOWN", "BATCH_DEPLOYMENT_ALREADY_ACTIVE"} for row in results))
+
+    def test_runtime_is_rechecked_after_another_owner_retires_reservation(self):
+        other = self.make_service()
+        first = other.prepare({"selections": [self.selection()]})["batch"]
+        second = self.prepare("binance")
+        original = self.service._write
+        def delayed_acquire(name, value):
+            if name.startswith("deployment-start-"):
+                other.start_member(self.payload(first))
+            original(name, value)
+        self.service._write = delayed_acquire
+        result = self.service.start_member(self.payload(second))
+        self.assertEqual(result["reason"], "BATCH_DEPLOYMENT_ALREADY_ACTIVE")
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(list(self.root.glob("deployment-start-*")))
+
+    def test_unknown_claim_blocks_new_group_after_restart_and_changed_mode(self):
+        batch = self.prepare("binance")
+        self.failure = "unknown"
+        self.service.start_member(self.payload(batch))
+        self.service = self.make_service()
+        selection = {**self.selection(), "mode": "MONITOR"}
+        self.revision = "changed-account-or-source"
+        again = self.service.prepare({"selections": [selection]})
+        self.assertFalse(again["ok"])
+        self.assertEqual(again["batch"]["members"][0]["reasonCode"], "BATCH_DEPLOYMENT_START_PENDING_OR_UNKNOWN")
+        self.service.start_member(self.payload(again["batch"]))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_definite_admission_failure_can_be_prepared_again_without_automatic_retry(self):
+        self.failure = "deployment-binance"
+        result = self.service.start_member(self.payload(self.prepare("binance")))
+        self.assertFalse(result["ok"])
+        self.assertFalse(list(self.root.glob("deployment-start-*")))
+        again = self.prepare("binance")
+        self.assertEqual(again["members"][0]["status"], "PREPARED")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_running_deployment_is_blocked_but_exact_stopped_one_can_be_prepared(self):
+        first = self.prepare("binance")
+        self.service.start_member(self.payload(first))
+        self.assertFalse(list(self.root.glob("deployment-start-*")))
+        blocked = self.prepare("binance")
+        self.assertEqual(blocked["members"][0]["reasonCode"], "BATCH_DEPLOYMENT_ALREADY_ACTIVE")
+        self.runtime["runtime-binance"].update(running=False, phase="STOPPED")
+        again = self.prepare("binance")
+        self.assertEqual(again["members"][0]["status"], "PREPARED")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_success_without_runtime_observation_retains_cross_group_hold(self):
+        batch = self.prepare("binance")
+        self.service.start_runtime = lambda *_: {"ok": True}
+        self.service.start_member(self.payload(batch))
+        self.assertTrue(list(self.root.glob("deployment-start-*")))
+        self.assertEqual(self.prepare("binance")["members"][0]["reasonCode"], "BATCH_DEPLOYMENT_START_PENDING_OR_UNKNOWN")
+
+    def test_result_persistence_failure_retains_reservation(self):
+        batch = self.prepare("binance")
+        original = self.service._write
+        def fail_result(name, value):
+            if name.startswith("result-"):
+                raise OSError("offline-disk-failure")
+            original(name, value)
+        self.service._write = fail_result
+        result = self.service.start_member(self.payload(batch))
+        self.assertEqual(result["batch"]["members"][0]["status"], "UNKNOWN")
+        self.assertTrue(list(self.root.glob("deployment-start-*")))
+        self.assertEqual(self.prepare("binance")["members"][0]["reasonCode"], "BATCH_DEPLOYMENT_START_PENDING_OR_UNKNOWN")
+
+    def test_observation_failure_blocks_before_start(self):
+        batch = self.prepare("binance")
+        self.service.observe = lambda: None
+        result = self.service.start_member(self.payload(batch))
+        self.assertEqual(result["reason"], "BATCH_RUNTIME_OBSERVATION_UNAVAILABLE")
+        self.assertFalse(self.calls)
+
+    def test_malformed_start_reply_cannot_retire_unknown_reservation(self):
+        for reply in ({}, {"ok": 0}, {"ok": False, "runtimeStarted": True}):
+            with self.subTest(reply=reply):
+                with tempfile.TemporaryDirectory() as directory:
+                    service = RuntimeBatchService(Path(directory), resolve=self.resolve,
+                        start=lambda *_: reply, observe=lambda: {"runtimes": {}}, clock=lambda: self.now)
+                    batch = service.prepare({"selections": [self.selection()]})["batch"]
+                    result = service.start_member(self.payload(batch))
+                    self.assertEqual(result["batch"]["members"][0]["status"], "UNKNOWN")
+                    again = service.prepare({"selections": [self.selection()]})
+                    self.assertFalse(again["ok"])
+                    self.assertEqual(again["batch"]["members"][0]["reasonCode"], "BATCH_DEPLOYMENT_START_PENDING_OR_UNKNOWN")
 
 if __name__ == "__main__":
     unittest.main()
