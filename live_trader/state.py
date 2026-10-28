@@ -8888,6 +8888,7 @@ def positions() -> list[dict[str, str]]:
                 "status": status,
                 "status_label": status_label,
                 "program_source": str(ledger_row.get("source") or "program_ledger"),
+                "program_updated_at": str(ledger_row.get("updated_at") or ""),
                 "detail": detail,
             }
         )
@@ -8930,6 +8931,7 @@ def positions() -> list[dict[str, str]]:
                 "status": "mismatch",
                 "status_label": "불일치",
                 "program_source": "missing",
+                "program_updated_at": "",
                 "detail": (
                     "Binance Futures 포지션 side가 없어 LONG/SHORT를 구분할 "
                     "수 없습니다. 신규 진입을 차단하고 계정의 positionSide를 "
@@ -8947,17 +8949,43 @@ def positions() -> list[dict[str, str]]:
 
 def account_reconciliation_rows() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
-    live_accounts = live_account_rows()
+    # Retain the raw rows here: a broker-only dictionary silently overwrites
+    # multiple accounts/currencies and can compare unrelated balances.
+    current_rows = STATE.get("broker_reconciliation", {}).get("accounts", [])
+    current_rows = current_rows if isinstance(current_rows, list) else []
+    ledger_rows = PROGRAM_LEDGER.cash_rows()
     errors = broker_reconciliation_errors()
-    ledger_accounts = program_cash_rows()
     for item in ACCOUNT_RECONCILIATION_BOOK:
-        live_account = live_accounts.get(str(item["broker_id"]), {})
-        ledger_account = ledger_accounts.get(str(item["broker_id"]))
+        broker_id = str(item["broker_id"])
+        current_candidates = [row for row in current_rows if isinstance(row, dict) and str(row.get("broker_id")) == broker_id]
+        ledger_candidates = [row for row in ledger_rows if isinstance(row, dict) and str(row.get("broker_id")) == broker_id]
+        live_account = current_candidates[0] if len(current_candidates) == 1 else {}
+        ledger_account = ledger_candidates[0] if len(ledger_candidates) == 1 else None
+        comparison_issue = ""
+        identity_detail = ""
+        if len(current_candidates) > 1 or len(ledger_candidates) > 1:
+            comparison_issue = "ambiguous_account_scope"
+            identity_detail = "같은 거래소에 여러 계좌 또는 통화 행이 있어 비교 대상을 하나로 확정할 수 없습니다. 계좌·통화별 원본 범위를 확인해야 합니다."
+        elif live_account and ledger_account:
+            current_identity = (str(live_account.get("account") or "").strip(), str(live_account.get("currency") or "").strip().upper())
+            ledger_identity = (str(ledger_account.get("account") or "").strip(), str(ledger_account.get("currency") or "").strip().upper())
+            if not all(current_identity + ledger_identity):
+                comparison_issue = "account_scope_unverified"
+                identity_detail = "현재 조회 또는 과거 원장에 계좌·통화 식별 정보가 없어 같은 범위인지 확인할 수 없습니다."
+            elif current_identity != ledger_identity:
+                comparison_issue = "account_scope_changed"
+                identity_detail = "현재 조회와 과거 원장의 계좌 또는 통화가 다릅니다. 서로 다른 범위의 금액을 비교하지 않습니다."
         broker_cash = live_account.get("broker_cash", item["broker_cash"])
         broker_equity = live_account.get("broker_equity", broker_cash)
         program_cash = ledger_account.get("cash") if ledger_account else item["program_cash"]
         currency = str(live_account.get("currency") or item["currency"])
-        if broker_cash is None:
+        program_currency = str((ledger_account or {}).get("currency") or "")
+        if comparison_issue:
+            status = "api_required"
+            status_label = "비교 범위 확인"
+            delta_cash = "-"
+            detail = identity_detail
+        elif broker_cash is None:
             status = "api_required"
             status_label = "API 필요"
             delta_cash = "-"
@@ -8981,7 +9009,7 @@ def account_reconciliation_rows() -> list[dict[str, str]]:
                 "broker_name": str(live_account.get("broker_name") or item["broker_name"]),
                 "account": str(live_account.get("account") or item["account"]),
                 "currency": currency,
-                "program_cash": format_money(program_cash, currency) if program_cash is not None else "대조 대기",
+                "program_cash": format_money(program_cash, program_currency) if program_cash is not None else "대조 대기",
                 "broker_cash": format_money(broker_cash, currency) if broker_cash is not None else "API 필요",
                 "broker_equity": format_money(broker_equity, currency) if broker_equity is not None else "평가 대기",
                 "program_cash_value": float(program_cash) if program_cash is not None else None,
@@ -8992,6 +9020,9 @@ def account_reconciliation_rows() -> list[dict[str, str]]:
                 "status": status,
                 "status_label": status_label,
                 "program_source": str(ledger_account.get("source") if ledger_account else "missing"),
+                "program_updated_at": str((ledger_account or {}).get("updated_at") or ""),
+                "program_currency": program_currency,
+                "comparison_issue": comparison_issue,
                 "detail": detail,
             }
         )

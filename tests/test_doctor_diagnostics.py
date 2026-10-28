@@ -25,7 +25,7 @@ class DoctorDiagnosticsTests(unittest.TestCase):
         state.STATE["broker_reconciliation"] = self.original_reconciliation
         state.STATE["reconciliation_last_run"] = self.original_reconciliation_last_run
 
-    def test_route_lock_does_not_report_implemented_adapter_as_missing(self) -> None:
+    def test_configured_adapter_diagnostics_do_not_grant_runtime_order_authority(self) -> None:
         environment = {
             "LIVE_TRADER_ENABLE_REAL_ORDERS": "false",
             "KIS_APP_KEY": "configured",
@@ -37,18 +37,46 @@ class DoctorDiagnosticsTests(unittest.TestCase):
             "UPBIT_ACCESS_KEY": "configured",
             "UPBIT_SECRET_KEY": "configured",
         }
-        with patch.dict(os.environ, environment, clear=False):
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            state, "_REAL_ORDERS_PROCESS_ARMED", False,
+        ), patch.object(
+            state, "_REAL_ORDER_RUNTIME_AUTHORITIES", set(),
+        ), patch.object(
+            brokers, "_reserved_short_order_authorized", return_value=False,
+        ), patch.object(
+            brokers, "send_prepared_request",
+        ) as http_send, patch.object(
+            brokers, "send_binance_signed_request",
+        ) as binance_send, patch.object(
+            brokers, "issue_kis_access_token",
+        ) as kis_token:
             readiness = brokers.broker_readiness()
             diagnostics = brokers.broker_diagnostics()
 
-        self.assertEqual(4, len(readiness))
-        self.assertTrue(all(item.status == "disabled" for item in readiness))
-        self.assertTrue(all(item.live_order_adapter_ready for item in readiness))
-        self.assertTrue(all(item.order_ready is False for item in readiness))
-        for item in diagnostics:
-            steps = {step["key"]: step for step in item["steps"]}
-            self.assertEqual("fail", steps["live_route"]["status"])
-            self.assertEqual("pass", steps["adapter_code"]["status"])
+            self.assertEqual(4, len(readiness))
+            self.assertTrue(all(item.status == "connected" for item in readiness))
+            self.assertTrue(all(item.live_order_adapter_ready for item in readiness))
+            # This is adapter/configuration readiness, not an admitted session.
+            self.assertTrue(all(item.order_ready for item in readiness))
+            self.assertFalse(state.real_orders_enabled())
+            self.assertFalse(brokers.real_orders_enabled())
+            for item in diagnostics:
+                steps = {step["key"]: step for step in item["steps"]}
+                self.assertEqual("info", steps["live_route"]["status"])
+                self.assertEqual("pass", steps["adapter_code"]["status"])
+                self.assertEqual("info", steps["network_probe"]["status"])
+            router = brokers.LiveBrokerRouter()
+            for item in readiness:
+                with self.subTest(broker_id=item.broker_id), self.assertRaisesRegex(
+                    brokers.BrokerNotReadyError, "실행 시작 확인 또는 정확한 주문 예약 권한",
+                ):
+                    router.place_order({"broker_id": item.broker_id})
+            http_send.assert_not_called()
+            binance_send.assert_not_called()
+            kis_token.assert_not_called()
+            self.assertEqual(set(), state._REAL_ORDER_RUNTIME_AUTHORITIES)
+            self.assertFalse(state.real_orders_enabled())
+            self.assertEqual("false", os.environ["LIVE_TRADER_ENABLE_REAL_ORDERS"])
 
     def test_machine_verifiable_checklist_items_survive_restart_semantics(self) -> None:
         state.STATE["checklist"] = {
@@ -388,19 +416,21 @@ class DoctorDiagnosticsTests(unittest.TestCase):
         }
         ledger_accounts = {
             broker_id: {
+                "broker_id": broker_id,
+                "account": live_accounts[broker_id]["account"],
+                "currency": live_accounts[broker_id]["currency"],
                 "cash": 0.0,
                 "source": "broker_snapshot",
             }
             for broker_id in live_accounts
         }
-        with patch.object(
-            state,
-            "live_account_rows",
-            return_value=live_accounts,
+        with patch.dict(
+            state.STATE,
+            {"broker_reconciliation": {"accounts": list(live_accounts.values())}},
         ), patch.object(
-            state,
-            "program_cash_rows",
-            return_value=ledger_accounts,
+            state.PROGRAM_LEDGER,
+            "cash_rows",
+            return_value=list(ledger_accounts.values()),
         ), patch.object(
             state,
             "broker_reconciliation_errors",

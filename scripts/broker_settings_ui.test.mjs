@@ -103,6 +103,19 @@ function feeSettings() {
     quantityAuthorityGranted: false, orderAuthorityGranted: false, productionReady: false, financialReady: false });
   return value;
 }
+function shortLiveCostSettings() {
+  const value = settings();
+  for (const [key, amount, label] of [
+    ["SHORT_LIVE_KIS_COST_CONFIRMED", "false", "본인 KIS 비용 확인"],
+    ["SHORT_LIVE_KIS_COST_SOURCE", "본인 요율 안내 조회", "비용 확인 근거"],
+    ["SHORT_LIVE_KIS_COST_SYMBOLS", "069500", "확인 요율 적용 종목"],
+    ["SHORT_LIVE_KIS_COST_OBSERVED_AT", "2026-10-20T15:00:00+09:00", "비용 확인 시각"],
+    ["SHORT_LIVE_KIS_FEE_RATE", "0.00015", "KIS 수수료율"],
+    ["SHORT_LIVE_KIS_SELL_TAX_RATE", "0", "KIS 매도세율"],
+  ]) value.fields.push({ key, kind: key.endsWith("CONFIRMED") ? "bool" : "text", group: "kis", label,
+    detail: "fixture", configured: true, required: false, value: amount, default: "" });
+  return value;
+}
 const success = () => ({ ok: true, settings: settings() });
 const response = (payload) => ({ ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => payload });
 function setup(...responses) {
@@ -174,6 +187,9 @@ function harness(props = {}) {
     },
     saveButton() { return elements(tree, "button").find((button) => button.props.className.includes("primary-button")); },
     save() { return view.saveButton().props.onClick(); },
+    costTimeButton() {
+      return elements(tree, "button").find((button) => button.props.children === "지금 확인한 시각 입력");
+    },
     retry() {
       const button = elements(tree, "button").find((item) => item.props.children === "설정 다시 확인");
       assert.ok(button, "unknown settings must have an explicit read retry");
@@ -230,6 +246,80 @@ test("API essentials are open while fee detail stays collapsed with no data loss
     assert.match(html, /value="요율 조회"/);
     assert.equal(calls.filter(call=>call.method==="POST").length,0);
   } finally {view.unmount();}
+});
+
+test("KIS cost time is never renewed by opening, switching tabs or saving", async () => {
+  const saved = shortLiveCostSettings();
+  setup({ ok: true, settings: saved });
+  const view = harness();
+  try {
+    const html = await view.settle();
+    assert.match(html, /KIS 국내 주문 연결 시험의 필수 확인 정보/);
+    assert.match(html, /확인 시각부터 24시간 이내/);
+    assert.match(html, /Binance·Upbit 시험이나 계좌 잔고 조회에는 필요하지 않습니다/);
+    assert.doesNotMatch(html, /남기는 메모입니다/);
+    assert.match(html, /확인하지 않았다면 누르지 마세요/);
+    const observedAt = saved.fields.find((field) => field.key === "SHORT_LIVE_KIS_COST_OBSERVED_AT").value;
+    assert.equal(view.input("SHORT_LIVE_KIS_COST_OBSERVED_AT").props.value, observedAt);
+    assert.equal(view.costTimeButton().props.type, "button");
+    view.group("binance");
+    view.group("kis");
+    assert.equal(view.input("SHORT_LIVE_KIS_COST_OBSERVED_AT").props.value, observedAt);
+    assert.deepEqual(calls.map((call) => call.method), ["GET"]);
+    await view.save();
+    assert.equal(calls[1].body.values.SHORT_LIVE_KIS_COST_OBSERVED_AT, observedAt);
+    assert.equal(calls[1].body.values.SHORT_LIVE_KIS_COST_CONFIRMED, "false");
+    assert.equal(view.input("SHORT_LIVE_KIS_COST_OBSERVED_AT").props.value, observedAt);
+  } finally { view.unmount(); }
+});
+
+test("explicit KIS time button updates only its draft with a timezone and never confirms costs", async () => {
+  const saved = shortLiveCostSettings();
+  setup({ ok: true, settings: saved });
+  const view = harness();
+  let observedAt;
+  try {
+    await view.settle();
+    view.edit("SHORT_LIVE_KIS_COST_SOURCE", "직접 확인한 본인 요율 안내");
+    view.edit("SHORT_LIVE_KIS_COST_SYMBOLS", "069500,102110");
+    view.edit("SHORT_LIVE_KIS_FEE_RATE", "0.0001");
+    const before = Date.now();
+    view.costTimeButton().props.onClick();
+    view.render();
+    observedAt = view.input("SHORT_LIVE_KIS_COST_OBSERVED_AT").props.value;
+    const after = Date.now();
+    assert.match(observedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$/);
+    assert.ok(Date.parse(observedAt) >= before && Date.parse(observedAt) <= after);
+    const offset = -new Date().getTimezoneOffset();
+    const expectedOffset = `${offset >= 0 ? "+" : "-"}${String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0")}:${String(Math.abs(offset) % 60).padStart(2, "0")}`;
+    assert.ok(observedAt.endsWith(expectedOffset));
+    assert.equal(elements(view.field("SHORT_LIVE_KIS_COST_CONFIRMED"), presentation.ToggleSwitch)[0].props.checked, false);
+    assert.equal(view.input("SHORT_LIVE_KIS_COST_SOURCE").props.value, "직접 확인한 본인 요율 안내");
+    assert.equal(view.input("SHORT_LIVE_KIS_COST_SYMBOLS").props.value, "069500,102110");
+    assert.equal(view.input("SHORT_LIVE_KIS_FEE_RATE").props.value, "0.0001");
+    assert.equal(view.input("SHORT_LIVE_KIS_SELL_TAX_RATE").props.value, "0");
+    assert.deepEqual(calls.map((call) => call.method), ["GET"], "button must not persist settings or call another API");
+    respond = async (_url, options) => {
+      const posted = JSON.parse(options.body);
+      assert.equal(posted.values.SHORT_LIVE_KIS_COST_OBSERVED_AT, observedAt);
+      assert.equal(posted.values.SHORT_LIVE_KIS_COST_CONFIRMED, "false");
+      assert.equal(posted.confirmed, false);
+      saved.fields.forEach((field) => {
+        if (field.key in posted.values) field.value = posted.values[field.key];
+      });
+      return response({ ok: true, settings: saved });
+    };
+    await view.save();
+    view.render();
+    assert.equal(view.input("SHORT_LIVE_KIS_COST_OBSERVED_AT").props.value, observedAt);
+  } finally { view.unmount(); }
+  setup({ ok: true, settings: saved });
+  const reopened = harness();
+  try {
+    await reopened.settle();
+    assert.equal(reopened.input("SHORT_LIVE_KIS_COST_OBSERVED_AT").props.value, observedAt);
+    assert.equal(elements(reopened.field("SHORT_LIVE_KIS_COST_CONFIRMED"), presentation.ToggleSwitch)[0].props.checked, false);
+  } finally { reopened.unmount(); }
 });
 
 test("pending settings read never presents READY or stale broker readiness", async () => {

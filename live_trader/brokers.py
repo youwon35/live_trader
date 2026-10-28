@@ -3001,7 +3001,9 @@ class LiveBrokerRouter:
             ]
         if broker_id == "binance":
             payload = ensure_response_ok("binance", send_binance_signed_request(build_binance_account_request))
-            return parse_binance_positions(payload)
+            # Match account polling: non-USDT stablecoins are held assets, not
+            # part of the USDT cash row. Keep their native quantity/currency.
+            return parse_binance_positions(payload, include_other_stablecoins=True)
         if broker_id == "binance-futures":
             payload = ensure_response_ok(
                 "binance-futures",

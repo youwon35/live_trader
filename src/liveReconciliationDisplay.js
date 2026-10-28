@@ -84,25 +84,50 @@ export function liveLedgerDisplay(snapshot = {}) {
 export function liveReconciliationIssues(snapshot = {}) {
   const reconciliation = record(snapshot.reconciliation);
   const ledger = record(snapshot.program_ledger);
-  const findLedger = (row, kind) => rows(kind === "cash" ? ledger.cash : ledger.positions).find((item) =>
-    item?.broker_id === row.broker_id && (kind === "cash" ? item.currency === row.currency : item.symbol === row.symbol && String(item.position_side || "") === String(row.position_side || "")));
+  const findLedger = (row, kind) => {
+    const matches = rows(kind === "cash" ? ledger.cash : ledger.positions).filter((item) =>
+      item?.broker_id === row.broker_id && (kind === "cash" ? item.currency === row.currency : item.symbol === row.symbol && String(item.position_side || "") === String(row.position_side || "")));
+    return matches.length === 1 ? matches[0] : undefined;
+  };
   const issues = [];
   for (const [kind, items] of [["cash", reconciliation.accounts], ["position", reconciliation.positions]]) {
     for (const row of rows(items)) {
       if (!["mismatch", "api_required"].includes(row?.status)) continue;
-      const source = row.program_source || findLedger(row, kind)?.source;
-      const updatedAt = findLedger(row, kind)?.updated_at;
+      const observedCurrency = String(row.currency || "").trim().toUpperCase();
+      const programCurrency = String(row.program_currency || "").trim().toUpperCase();
+      const currencyChanged = kind === "cash" && observedCurrency && programCurrency && observedCurrency !== programCurrency;
+      const reportedIssue = typeof row.comparison_issue === "string" ? row.comparison_issue.trim() : "";
+      const comparisonIssue = reportedIssue || (currencyChanged ? "account_scope_changed" : "");
+      const ambiguousScope = comparisonIssue === "ambiguous_account_scope";
+      const ledgerRow = comparisonIssue ? undefined : findLedger(row, kind);
+      const source = row.program_source || ledgerRow?.source;
+      const updatedAt = ambiguousScope ? undefined : row.program_updated_at || ledgerRow?.updated_at;
       let reason = row.status === "api_required" ? "조회 또는 원장 근거 미확인" : kind === "cash" ? "현금 원장과 조회 잔고 차이" : "수량 원장과 조회 보유량 차이";
       let detail = "수수료·입출금·수동 거래 여부는 이 대조 결과만으로 확정할 수 없습니다.";
-      if (source === "missing") {
+      if (comparisonIssue) {
+        reason = ({ ambiguous_account_scope: "계좌·통화 비교 대상 중복", account_scope_unverified: "계좌·통화 비교 범위 미확인", account_scope_changed: "계좌 또는 통화 범위 변경" })[comparisonIssue] || "계좌·통화 비교 범위 확인";
+        const fallbackDetail = ambiguousScope ? "여러 계좌 또는 통화 행이 있어 비교 대상을 확정할 수 없습니다. 원본 범위를 확인해야 합니다."
+          : comparisonIssue === "account_scope_changed" ? "이전 기준과 현재 조회의 계좌 또는 통화가 다릅니다. 서로 다른 범위의 금액 차이는 계산하지 않습니다."
+            : "이전 기준과 현재 조회가 같은 계좌·통화 범위인지 확인되지 않아 금액 차이를 표시하지 않습니다.";
+        detail = reportedIssue && typeof row.detail === "string" && row.detail.trim() ? row.detail.trim() : fallbackDetail;
+      } else if (source === "missing") {
         reason = "프로그램 원장에 없는 보유 자산";
         detail = "기존 보유 또는 외부 거래 여부를 확인해야 합니다. 앱이 매수한 자산으로 간주하지 않습니다.";
         if (kind === "cash") { reason = "현금 원장 기준 없음"; detail = "조회 잔고와 비교할 현금 원장 근거가 없습니다."; }
       } else if (source === "event_poll") {
+        if (row.status === "mismatch") reason = "과거 잔고 기준과 차이";
         detail = `과거 조회값으로 만든 원장${validTime(updatedAt) ? ` (${updatedAt})` : ""}과 현재 관측값을 비교합니다. 기준 승인·실제 체결 근거는 별도 확인이 필요합니다.`;
       }
-      issues.push({ kind, brokerId: row.broker_id || "unknown", symbol: row.symbol || "", currency: row.currency || "", reason, detail,
-        delta: kind === "cash" ? row.delta_cash : row.delta_qty, status: row.status, source: source || "unknown" });
+      const amount = (value) => typeof value === "number" && Number.isFinite(value) ? value.toLocaleString("ko-KR", { maximumFractionDigits: 12 }) : "미확인";
+      const basisValue = source === "missing" && !comparisonIssue ? "없음" : amount(kind === "cash" ? row.program_cash_value : row.program_qty_value);
+      const observedValue = amount(kind === "cash" ? row.broker_cash_value : row.broker_qty_value);
+      const unit = kind === "cash" ? observedCurrency : row.asset || row.symbol || "";
+      const comparison = ambiguousScope ? "이전 기준 미확정 → 거래소 관측 미확정 · 비교 대상 확인 필요"
+        : kind === "cash" && comparisonIssue ? `이전 기준 ${basisValue} ${programCurrency || "통화 미확인"} → 거래소 관측 ${observedValue} ${observedCurrency || "통화 미확인"} · ${currencyChanged ? "통화가 달라 금액 차이를 계산하지 않습니다." : "비교 범위 확인 필요"}`
+          : `이전 기준 ${basisValue} → 거래소 관측 ${observedValue}${unit ? ` ${unit}` : ""}`;
+      issues.push({ kind, brokerId: row.broker_id || "unknown", symbol: row.symbol || "", currency: row.currency || "", reason, detail, comparison,
+        baselineAt: validTime(updatedAt) ? updatedAt : null,
+        delta: comparisonIssue ? null : kind === "cash" ? row.delta_cash : row.delta_qty, status: row.status, source: source || "unknown" });
     }
   }
   return issues;

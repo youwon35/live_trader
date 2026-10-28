@@ -3274,6 +3274,7 @@ function ThreeWayReconciliationPanel({ snapshot = {}, accountRefreshState = init
         <summary className="ts-disclosure-summary">확인할 차이 · {issues.length}개</summary>
         <div className="ts-disclosure-body">{issues.map((issue, index) => <div className="compact-row" key={`${issue.brokerId}:${issue.kind}:${issue.symbol}:${index}`}>
           <strong>{({kis:"한국투자증권",binance:"Binance 현물","binance-futures":"Binance 선물",upbit:"Upbit"})[issue.brokerId] || issue.brokerId} · {issue.symbol || issue.currency} · {issue.reason}</strong>
+          <span>{issue.comparison}</span>
           <span>{issue.detail}</span>
         </div>)}</div>
       </details>}
@@ -5066,7 +5067,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
   const visibleFields = fields.filter((field) => field.group === activeGroup);
   const fieldSections = [
     { id: "basic", title: "API 연결에 필요한 정보", fields: visibleFields.filter(field => field.kind === "secret" || field.key === "KIS_ACCOUNT_PRODUCT_CODE") },
-    { id: "fees", title: "KIS 시험 비용 상세", detail: "비용 확인 근거는 본인 계좌의 수수료·세율을 어디서 확인했는지 남기는 메모입니다. 적용 종목은 주식과 ETF의 다른 세율을 구별하며, 확인 시각은 그 정보가 오래되지 않았는지 검사합니다. KIS 주문 연결 시험을 할 때만 입력하세요. 비율 0.00015는 0.015%입니다.", fields: visibleFields.filter(field => field.key.startsWith("SHORT_LIVE_KIS_")) },
+    { id: "fees", title: "KIS 시험 비용 상세", detail: "KIS 국내 주문 연결 시험의 필수 확인 정보입니다. 본인 계좌의 수수료·세율을 어디서 확인했는지 근거(요율 안내·상담·조회 등)를 적으세요. 적용 종목에는 확인한 동일 요율이 적용되는 6자리 코드를 입력하며, 세율이 다른 주식·ETF는 섞지 않습니다. 프로그램은 확인 시각부터 24시간 이내 정보만 사용합니다. Binance·Upbit 시험이나 계좌 잔고 조회에는 필요하지 않습니다. 비율 0.00015는 0.015%입니다.", fields: visibleFields.filter(field => field.key.startsWith("SHORT_LIVE_KIS_")) },
     { id: "advanced", title: "수수료 추정·해외 결제·서버 주소", detail: "임시 수수료는 화면 계산용 참고값이며 계좌별 실제 수수료 확인을 대신하지 않습니다. 서버 주소는 연결 대상을 바꾸는 경우에만 수정하세요.", fields: visibleFields.filter(field => field.kind !== "secret" && field.key !== "KIS_ACCOUNT_PRODUCT_CODE" && !field.key.startsWith("SHORT_LIVE_KIS_")) },
   ].filter(section => section.fields.length > 0);
   const provisionalFields = visibleFields.filter(isProvisionalKisFeeField);
@@ -5087,6 +5088,16 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
     : settingsReady ? checkCount ? "warning" : "success" : "neutral";
   function updateDraft(key, value) {
     setDraft((current) => ({ ...current, [key]: value }));
+  }
+
+  function recordKisCostConfirmationTime() {
+    if (!settingsReady || saving || saveInFlight.current) return;
+    const now = new Date();
+    const offsetMinutes = -now.getTimezoneOffset();
+    const localTime = new Date(now.getTime() + offsetMinutes * 60_000).toISOString().slice(0, -1);
+    const offsetHours = String(Math.floor(Math.abs(offsetMinutes) / 60)).padStart(2, "0");
+    const offsetRemainder = String(Math.abs(offsetMinutes) % 60).padStart(2, "0");
+    updateDraft("SHORT_LIVE_KIS_COST_OBSERVED_AT", `${localTime}${offsetMinutes >= 0 ? "+" : "-"}${offsetHours}:${offsetRemainder}`);
   }
 
   async function handleSave() {
@@ -5217,6 +5228,21 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
                 <select aria-label={field.label} onChange={(event) => updateDraft(field.key, event.target.value)} value={String(value)}>
                   {field.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
+              ) : field.key === "SHORT_LIVE_KIS_COST_OBSERVED_AT" ? (
+                <div>
+                  <input
+                    aria-describedby="kis-cost-confirmation-time-help"
+                    aria-label={field.label}
+                    onChange={(event) => updateDraft(field.key, event.target.value)}
+                    placeholder="예: 2026-10-28T15:00:00+09:00"
+                    type="text"
+                    value={String(value)}
+                  />
+                  <button className="secondary-button compact-button" disabled={saving || !settingsReady} onClick={recordKisCostConfirmationTime} type="button">
+                    지금 확인한 시각 입력
+                  </button>
+                  <span id="kis-cost-confirmation-time-help">지금 실제 요율을 확인한 경우에만 누르세요. 확인하지 않았다면 누르지 마세요. 시각만 입력되며, 연결 설정 저장 전까지 적용되지 않습니다.</span>
+                </div>
               ) : (
                 <input
                   autoComplete={field.kind === "secret" ? "new-password" : undefined}

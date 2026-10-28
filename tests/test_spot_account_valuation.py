@@ -104,7 +104,7 @@ class RouterDisplayIntegrationTests(unittest.TestCase):
         functions={'numeric_value','first_numeric','parse_binance_accounts','parse_binance_positions','parse_upbit_accounts','parse_upbit_positions'}
         selected=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in functions]
         router=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='LiveBrokerRouter')
-        router.body=[n for n in router.body if isinstance(n,ast.FunctionDef) and n.name=='poll_execution_events']
+        router.body=[n for n in router.body if isinstance(n,ast.FunctionDef) and n.name in {'poll_execution_events','list_positions'}]
         selected.append(router)
         self.ns={'math':math,'now_datetime_text':lambda:'fixture',
                  'ensure_response_ok':lambda broker,response:response['json'],
@@ -127,6 +127,55 @@ class RouterDisplayIntegrationTests(unittest.TestCase):
         self.assertEqual([240,3.96],[r['display_valuation']['value'] for r in result['positions']])
         self.assertEqual(['SOL'],[r['symbol'] for r in self.ns['parse_binance_positions'](payload)])
         send.assert_called_once()
+
+    def test_binance_position_read_paths_keep_the_same_non_usdt_holdings(self):
+        payload = {'balances': [
+            {'asset': 'USDT', 'free': '10', 'locked': '2'},
+            {'asset': 'SOL', 'free': '1', 'locked': '1'},
+            {'asset': 'USDC', 'free': '4', 'locked': '0.5'},
+            {'asset': 'FDUSD', 'free': '0', 'locked': '0.93587'},
+            {'asset': 'BUSD', 'free': '0.125', 'locked': '0'},
+            {'asset': 'TUSD', 'free': '0.25', 'locked': '0'},
+            {'asset': 'ZERO', 'free': '0', 'locked': '0'},
+        ]}
+        before = copy.deepcopy(payload)
+        send = Mock(return_value={'json': payload})
+        self.ns['send_binance_signed_request'] = send
+        listed = self.router.list_positions('binance')
+        polled = self.router.poll_execution_events('binance')
+        observed = [{key: value for key, value in row.items()
+                     if key != 'display_valuation'} for row in polled['positions']]
+        self.assertEqual(observed, listed)
+        self.assertEqual(['SOL', 'USDC', 'FDUSD', 'BUSD', 'TUSD'],
+                         [row['symbol'] for row in listed])
+        self.assertEqual([2, 4.5, 0.93587, 0.125, 0.25],
+                         [row['broker_qty'] for row in listed])
+        self.assertEqual([row['symbol'] for row in listed],
+                         [row['currency'] for row in listed])
+        self.assertTrue(all(row['valuation_basis'] == 'unavailable' for row in listed))
+        self.assertTrue(all(row['broker_value'] == 0 and row['current_price'] == 0
+                            for row in listed))
+        self.assertEqual(12, polled['accounts'][0]['broker_cash'])
+        self.assertEqual(before, payload)
+        self.assertEqual(2, send.call_count)
+        for call in send.call_args_list:
+            self.assertEqual((self.ns['build_binance_account_request'],), call.args)
+            self.assertEqual({}, call.kwargs)
+
+    def test_non_usdt_stablecoin_without_market_quote_keeps_quantity_and_unknown_value(self):
+        payload = {'balances': [{'asset': 'FDUSD', 'free': '0.9', 'locked': '0.03587'}]}
+        self.ns['send_binance_signed_request'] = Mock(return_value={'json': payload})
+        listed = self.router.list_positions('binance')
+        polled = self.router.poll_execution_events('binance')['positions']
+        self.assertEqual(1, len(listed))
+        self.assertEqual('FDUSD', listed[0]['symbol'])
+        self.assertAlmostEqual(0.93587, listed[0]['broker_qty'])
+        self.assertEqual(listed[0]['broker_qty'], polled[0]['broker_qty'])
+        self.assertEqual('UNKNOWN', polled[0]['display_valuation']['status'])
+        self.assertIsNone(polled[0]['display_valuation']['value'])
+        self.assertEqual('unavailable', polled[0]['valuation_basis'])
+        self.assertEqual(0, polled[0]['broker_value'])
+        self.assertEqual(0, polled[0]['current_price'])
 
     def test_actual_upbit_poll_preserves_original_cost_in_financial_event(self):
         payload=[{'currency':'KRW','balance':'100','locked':'20'}, {'currency':'SOL','unit_currency':'KRW','balance':'1','locked':'1','avg_buy_price':'100000'}]
