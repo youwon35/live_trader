@@ -215,6 +215,7 @@ class ShortLiveTestService:
                             "capitalKrwPerBroker": manifest["capitalKrwPerBroker"],
                             "dailyLossStopKrwPerBroker": manifest["dailyLossStopKrwPerBroker"],
                             "futuresPolicy": deepcopy(manifest.get("futuresPolicy")),
+                            "executionModelBinding":deepcopy(manifest.get("executionModelBinding")),
                             "preparedAt": manifest["preparedAt"],
                             "expiresAt": prepared["expiresAt"],
                             "readyToStart": prepared["readyToStart"],
@@ -258,7 +259,7 @@ class ShortLiveTestService:
         public_keys = ("route", "ready", "exposureKrw", "realizedLossKrw",
                        "unrealizedLossKrw", "lossBasis", "actualFeeKnown",
                        "feeReconciliationStatus", "committedCapitalKrw", "notionalExposureKrw",
-                       "monitorEquity", "accountObservedAt",
+                       "monitorEquity", "accountObservedAt", "executionAccounting",
                        "protections", "futuresPositions", "futuresIncidents", "observedFuturesSettingsBySymbol")
         result["brokerRows"] = [{key: deepcopy(row.get(key)) for key in public_keys}
                                 for row in session["brokerRows"].values()]
@@ -329,7 +330,7 @@ class ShortLiveTestService:
     def _public_preparation_readiness(value: Any, route: str) -> dict[str, Any]:
         value = value if isinstance(value, Mapping) else {}
         keys = ("fundingBasis", "quoteCurrency", "availableQuoteNative", "availableKrw",
-                "effectiveRouteBudgetKrw", "preservedAssetSymbols")
+                "effectiveRouteBudgetKrw", "preservedAssetSymbols", "executionAccounting")
         result = {key: deepcopy(value[key]) for key in keys if key in value}
         result.update(route=route, ready=value.get("ready") is True,
                       blockers=deepcopy(value.get("blockers") or []),
@@ -377,6 +378,9 @@ class ShortLiveTestService:
                     or payload.get("scopeHash") != contract["scopeHash"]):
                 raise ShortLiveContractError("PREPARATION_SCOPE_MISMATCH")
             verify_contract(contract)
+            binding=contract.get("executionModelBinding") or {}
+            if binding.get("overrideRequired") and payload.get("executionModelOverrideHash")!=binding.get("bindingHash"):
+                raise ShortLiveContractError("EXECUTION_MODEL_OVERRIDE_CONFIRMATION_REQUIRED")
             if self._now() >= datetime.fromisoformat(self._prepared["expiresAt"].replace("Z", "+00:00")):
                 raise ShortLiveContractError("PREPARATION_EXPIRED")
             blockers = list(self._prepared["blockers"])
@@ -483,7 +487,8 @@ class ShortLiveTestService:
             self._write(f"session-start-{contract['sessionId']}", {
                 "contract": contract, "startedAt": utc_text(started),
                 "effectiveRouteBudgetsKrw": self._session["effectiveRouteBudgets"],
-                "purpose": PURPOSE, "promotionEligible": False})
+                "purpose": PURPOSE, "promotionEligible": False,
+                "executionModelOverrideHash":payload.get("executionModelOverrideHash")})
             try:
                 activate_short_live_routes([leg_manifest(contract, leg["route"]) for leg in contract["legs"]])
                 self._session["routeAuthorityActive"] = True
@@ -785,6 +790,8 @@ class ShortLiveTestService:
         leg = leg_manifest(contract, route)
         members = [s for s in contract["specs"] if s["route"] == route and s["symbol"] == symbol]
         all_weight = sum(s["targetWeight"] for s in contract["specs"] if s["route"] == route)
+        if route=="BINANCE_USDM_FUTURES":
+            all_weight=float(leg.get("marginBudgetAllocationDenominator",max(1.0,all_weight)))
         # Current market notional must be converted by the official adapter;
         # only a verified KRW snapshot can determine a cross-currency delta.
         row = session["brokerRows"].get(route, {})
@@ -850,6 +857,8 @@ class ShortLiveTestService:
                     "originalAllocationWeightSum": all_weight,
                     "effectiveSleeveTargets": {s["strategyInstanceId"]: session["sleeves"][s["strategyInstanceId"]]["targetWeight"]
                                                for s in members}}
+        if route=="BINANCE_USDM_FUTURES" and not reducing:
+            proposal["capitalBudgetKrw"]=abs(delta)/float(leg["futuresPolicy"]["leverage"])
         if reducing:
             proposal["closeQuantity"] = close_quantity
         sized = self._brokers[route].size_order(deepcopy(proposal))
@@ -871,7 +880,7 @@ class ShortLiveTestService:
         order = {**proposal, **{key: value for key, value in sized.items()
                               if key in {"quantity", "referencePrice", "feeKrw", "estimatedNotionalKrw", "projectedGrossExposureKrw",
                                          "observedAt", "fxObservedAt", "krwPerQuote", "positionMode", "leverage",
-                                         "requiredCapitalKrw", "projectedCommittedCapitalKrw"}}}
+                                         "requiredCapitalKrw", "projectedCommittedCapitalKrw", "executionAccounting"}}}
         order["quantity"] = quantity
         differences = exit_units if reducing else entry_weights
         denominator = sum(differences.values())
@@ -1165,6 +1174,7 @@ class ShortLiveTestService:
                 "actualFeeKnown": session["feesKnown"],
                 "feeReconciliationStatus": "KNOWN" if session["feesKnown"] else "UNVERIFIED_ACTUAL_FEE",
                 "committedCapitalKrw": committed, "notionalExposureKrw": exposure,
+                "executionAccounting":deepcopy(value.get("executionAccounting")),
                 **{key: deepcopy(value.get(key, [] if key != "observedFuturesSettingsBySymbol" else {}))
                    for key in ("protections", "futuresPositions", "futuresIncidents", "observedFuturesSettingsBySymbol")},
             }

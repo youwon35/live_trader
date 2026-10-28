@@ -243,7 +243,7 @@ class ShortLiveSessionTests(unittest.TestCase):
     def start(self, service):
         prepared = self.prepare(service)["prepared"]
         return service.start({"preparationId": prepared["preparationId"],
-                              "scopeHash": prepared["scopeHash"], "confirmed": True,
+                              "scopeHash": prepared["scopeHash"], "confirmed": True, "executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"),
                               "confirmationText": CONFIRMATION_TEXT})
 
     def first_buy(self, service, spec):
@@ -282,11 +282,11 @@ class ShortLiveSessionTests(unittest.TestCase):
             service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"]})
         with self.assertRaisesRegex(ShortLiveContractError, "SCOPE_MISMATCH"):
             service.start({"preparationId": prepared["preparationId"], "scopeHash": "wrong",
-                           "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+                           "confirmed": True, "executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"), "confirmationText": CONFIRMATION_TEXT})
         self.now += timedelta(minutes=3)
         with self.assertRaisesRegex(ShortLiveContractError, "EXPIRED"):
             service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
-                           "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+                           "confirmed": True, "executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"), "confirmationText": CONFIRMATION_TEXT})
         self.assertFalse(any(b.submits for b in brokers.values()))
 
     def test_funding_guard_owner_and_source_drift_block(self):
@@ -304,7 +304,7 @@ class ShortLiveSessionTests(unittest.TestCase):
                     self.source.write_text("changed", encoding="utf-8")
                 with self.assertRaises(ShortLiveContractError):
                     service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
-                                   "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+                                   "confirmed": True, "executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"), "confirmationText": CONFIRMATION_TEXT})
                 self.assertEqual([], brokers["BINANCE_SPOT"].submits)
                 self.guard = self.owner = True
 
@@ -700,7 +700,7 @@ class ShortLiveSessionTests(unittest.TestCase):
         self.source.write_text('{"fixture":"changed"}', encoding="utf-8")
         with self.assertRaisesRegex(ShortLiveContractError, "SOURCE_RAW_HASH_CHANGED"):
             service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
-                           "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+                           "confirmed": True, "executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"), "confirmationText": CONFIRMATION_TEXT})
         self.assertIsNone(service._session)
         self.assertEqual([], brokers["BINANCE_SPOT"].submits)
 
@@ -722,7 +722,7 @@ class ShortLiveSessionTests(unittest.TestCase):
                 digest[0] = changed
                 with self.assertRaisesRegex(ShortLiveContractError, "PRESERVED_ASSET_BASELINE_CHANGED"):
                     service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
-                                   "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+                                   "confirmed": True, "executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"), "confirmationText": CONFIRMATION_TEXT})
                 self.assertIsNone(service._session)
                 self.assertEqual([], broker.submits)
 
@@ -751,7 +751,7 @@ class ShortLiveSessionTests(unittest.TestCase):
                                          "rawAccount": "fixture-private"}], "accountId": "fixture-private"}
                 with self.assertRaisesRegex(ShortLiveContractError, "ACCOUNT_OBSERVATION_STALE"):
                     service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
-                                   "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+                                   "confirmed": True, "executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"), "confirmationText": CONFIRMATION_TEXT})
                 current = service.snapshot(include_catalog=False)["prepared"]
                 self.assertEqual([route + ":ACCOUNT_OBSERVATION_STALE"], current["blockers"])
                 public = current["brokerReadiness"][0]
@@ -775,7 +775,7 @@ class ShortLiveSessionTests(unittest.TestCase):
         broker.readiness = lambda manifest: {**original(manifest), "accountId": "fixture-different-account"}
         with self.assertRaisesRegex(ShortLiveContractError, "PREPARED_ACCOUNT_CHANGED"):
             service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
-                           "confirmed": True, "confirmationText": CONFIRMATION_TEXT})
+                           "confirmed": True, "executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"), "confirmationText": CONFIRMATION_TEXT})
         self.assertIsNone(service._session)
         self.assertEqual([], broker.submits)
 

@@ -53,7 +53,7 @@ class CrossVenuePipelineTests(unittest.TestCase):
         self.assertTrue(prepared["readyToStart"], prepared)
         self.assertFalse(any(b.submits for b in self.brokers.values()))
         snapshot = self.service.start({"preparationId": prepared["preparationId"],
-            "scopeHash": prepared["scopeHash"], "confirmed": True,
+            "scopeHash": prepared["scopeHash"], "confirmed": True, "executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"),
             "confirmationText": fixture.CONFIRMATION_TEXT})["runtime"]
         self.assertEqual(snapshot["status"], "RUNNING")
         self.assertEqual(len(self.service._engines), 8)
@@ -154,7 +154,7 @@ class CrossVenuePipelineTests(unittest.TestCase):
         adapter.readiness = lambda manifest: {**original(manifest), "accountId": "different-fixture-account"}
         with self.assertRaisesRegex(fixture.ShortLiveContractError, "ACCOUNT_CHANGED"):
             self.service.start({"preparationId": prepared["preparationId"], "scopeHash": prepared["scopeHash"],
-                "confirmed": True, "confirmationText": fixture.CONFIRMATION_TEXT})
+                "confirmed": True, "executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"), "confirmationText": fixture.CONFIRMATION_TEXT})
         self.assertFalse(any(b.submits for b in self.brokers.values()))
         self.assertFalse(any(f.connected for f in self.feeds.values()))
 

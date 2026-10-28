@@ -400,6 +400,7 @@ export function normalizeShortLiveSnapshot(value = {}) {
       budgetKrwPerBroker: numeric(preparation.budgetKrwPerBroker ?? preparation.capitalKrwPerBroker),
       lossKrwPerBroker: numeric(preparation.lossKrwPerBroker ?? preparation.dailyLossStopKrwPerBroker),
       futuresPolicy: normalizeShortLiveFuturesPolicy(preparation.futuresPolicy),
+      executionModelBinding: preparation.executionModelBinding && typeof preparation.executionModelBinding === "object" ? preparation.executionModelBinding : null,
       expiresAt: text(preparation.expiresAt),
       brokerReadiness: (Array.isArray(preparation.brokerReadiness) ? preparation.brokerReadiness : []).map((row) => ({
         route: text(row.route), ready: row.ready === true, blockers: strings(row.blockers),
@@ -407,6 +408,7 @@ export function normalizeShortLiveSnapshot(value = {}) {
         fundingBasis: text(row.fundingBasis), quoteCurrency: text(row.quoteCurrency),
         availableQuoteNative: amount(row.availableQuoteNative), availableKrw: amount(row.availableKrw),
         effectiveRouteBudgetKrw: amount(row.effectiveRouteBudgetKrw),
+        executionAccounting: row.executionAccounting && typeof row.executionAccounting === "object" ? row.executionAccounting : null,
         preservedAssetSymbols: strings(row.preservedAssetSymbols).map(sanitizeShortLiveText),
         observedFuturesSettings: row.observedFuturesSettings ? normalizeFuturesSettings(row.observedFuturesSettings) : null,
         observedFuturesSettingsBySymbol: normalizeFuturesSettingsBySymbol(row.observedFuturesSettingsBySymbol),
@@ -458,6 +460,7 @@ export function normalizeShortLiveSnapshot(value = {}) {
         } : null,
         exposureKrw: numeric(row.exposureKrw), dailyRealizedLossKrw: numeric(row.dailyRealizedLossKrw ?? row.realizedLossKrw),
         committedCapitalKrw: amount(row.committedCapitalKrw),
+        executionAccounting: row.executionAccounting && typeof row.executionAccounting === "object" ? row.executionAccounting : null,
         notionalExposureKrw: amount(row.notionalExposureKrw ?? row.exposureKrw),
         protections: (Array.isArray(row.protections) ? row.protections : []).map(normalizeFuturesProtection),
         futuresIncidents: (Array.isArray(row.futuresIncidents) ? row.futuresIncidents : []).map(normalizeFuturesIncident),

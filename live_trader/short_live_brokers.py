@@ -17,6 +17,7 @@ import re
 import threading
 import time
 from typing import Any
+from trading_runtime.futures_accounting import margin_budget
 from .short_live_futures import FuturesProtectionError, FuturesProtectionManager, policy as futures_policy
 from .short_live_read_diagnostics import sanitize_read_diagnostics
 
@@ -602,6 +603,29 @@ class ShortLiveBrokerAdapter:
                 self._protection._incident("FUTURES_SETTINGS_CHANGED_DURING_SESSION", symbol=symbol)
         return q
 
+    def _accounting_preview(self, manifest, markets, capital):
+        if self.route != "BINANCE_USDM_FUTURES": return None
+        leverage=int(futures_policy(self._futures_policy)[0])
+        specs=manifest.get("specs",[])
+        total=number(manifest.get("marginBudgetAllocationDenominator",max(Decimal(1),sum((number(spec.get("targetWeight",1)) for spec in specs),Decimal(0)))))
+        rows=[]
+        for quote in markets:
+            weight=sum((number(spec.get("targetWeight",1))*number(spec.get("positionSizeFraction",1))
+                for spec in specs if spec["symbol"]==quote["symbol"]),Decimal(0)) / total if total else Decimal(1)/len(markets)
+            budget=capital*weight
+            if budget<=0:continue
+            values=margin_budget(budget,leverage,number(quote["nativePrice"])*number(quote["krwPerQuote"]),
+                entry_fee_rate=quote["feeRate"],exit_fee_rate=quote["feeRate"],funding_reserve_rate=2*abs(number(quote["fundingRate"])))
+            rows.append({"symbol":quote["symbol"],"capitalBudgetKrw":decimal_text(budget),
+                "positionNotionalKrw":decimal_text(values["positionNotional"]),"initialMarginKrw":decimal_text(values["initialMargin"]),
+                "entryFeeEstimateKrw":decimal_text(values["entryFee"]),"costReserveKrw":decimal_text(values["costReserve"]),
+                "exchangeLeverage":quote["leverage"],
+                "exchangeSymbolMaximumLeverage":max(int(t["initialLeverage"]) for t in quote["leverageBrackets"])})
+        return {"sizingBasis":"MARGIN_BUDGET","executionLeverage":leverage,
+            "maxLeverageMultiplier":manifest.get("executionModelBinding",{}).get("maxLeverageMultiplier"),
+            "capitalBudgetKrw":decimal_text(capital),"costsOn":"NOTIONAL","previews":rows,
+            "previewBasis":"ALL_SELECTED_SLEEVES_ENTER_AT_CURRENT_PRICE_BEFORE_QUANTITY_ROUNDING"}
+
     def readiness(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
         available_minutes = None
         native_minimums = {}
@@ -726,7 +750,8 @@ class ShortLiveBrokerAdapter:
                     "minimumOrderKrwBySymbol": native_minimums,
                     "fxObservedAt": markets[0]["fxObservedAt"], "promotionEligible": False,
                     "observedFuturesSettingsBySymbol": deepcopy(self._observed_futures_by_symbol),
-                    "futuresPolicy": deepcopy(self._futures_policy)}
+                    "futuresPolicy": deepcopy(self._futures_policy),
+                    "executionAccounting": self._accounting_preview(m, markets, ceiling)}
         except Exception as exc:
             code = str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "BROKER_READINESS_UNKNOWN"
             if funding and self._observed_market_fx is not None:
@@ -786,7 +811,12 @@ class ShortLiveBrokerAdapter:
             else:
                 if self._futures_incidents or (self._protection and self._protection.incidents):
                     raise ShortLiveBrokerBlocked("FUTURES_INCIDENT_NEW_ENTRIES_BLOCKED")
-                cap = min(requested, (route_limit - committed) / (margin_factor + reserve_costs + tax),
+                requested_cap = requested
+                if self.route == "BINANCE_USDM_FUTURES" and proposal.get("capitalBudgetKrw") is not None:
+                    sleeve_budget = number(proposal["capitalBudgetKrw"], positive=True)
+                    requested_cap = min(requested_cap, margin_budget(sleeve_budget, int(leverage), price * fx,
+                        entry_fee_rate=fee, exit_fee_rate=fee, funding_reserve_rate=abs(number(q["fundingRate"])) * 2)["positionNotional"])
+                cap = min(requested_cap, (route_limit - committed) / (margin_factor + reserve_costs + tax),
                           available / (margin_factor + reserve_costs + tax))
                 if cap <= 0:
                     raise ShortLiveBrokerBlocked("AVAILABLE_BUDGET_EXHAUSTED")
@@ -833,6 +863,18 @@ class ShortLiveBrokerAdapter:
                           leverage=decimal_text(leverage), requiredCapitalKrw=decimal_text(required_capital),
                           projectedCommittedCapitalKrw=decimal_text(projected_capital),
                           positionMode=q.get("positionMode", ""), promotionEligible=False)
+            if self.route == "BINANCE_USDM_FUTURES":
+                result["executionAccounting"] = {"sizingBasis":"MARGIN_BUDGET", "executionLeverage":int(leverage),
+                    "capitalBudgetKrw":str(proposal.get("capitalBudgetKrw", required_capital)),
+                    "positionNotionalKrw":decimal_text(notional), "initialMarginKrw":decimal_text(notional/leverage),
+                    "entryFeeEstimateKrw":decimal_text(notional*fee),
+                    "exitFeeReserveKrw":decimal_text(notional*fee),
+                    "fundingReserveKrw":decimal_text(notional*abs(number(q["fundingRate"]))*2),
+                    "costReserveKrw":decimal_text(notional*(reserve_costs-fee)),
+                    "capitalRequiredKrw":decimal_text(required_capital), "costsOn":"NOTIONAL",
+                    "exchangeLeverage":q["leverage"], "maxLeverageMultiplier":m.get("executionModelBinding",{}).get("maxLeverageMultiplier"),
+                    "exchangeSymbolMaximumLeverage":max(int(row["initialLeverage"]) for row in q["leverageBrackets"]),
+                    "reducingUsesActualOwnedQuantity":reducing}
             return result
         except Exception as exc:
             return {"ready": False, "blockers": [str(exc) if isinstance(exc, (ShortLiveBrokerBlocked, FuturesProtectionError)) else "ORDER_SIZING_UNKNOWN"],
@@ -1086,6 +1128,15 @@ class ShortLiveBrokerAdapter:
                     },
                     "exposureKrw": decimal_text(exposure), "scopeOwnershipVerified": True,
                     "committedCapitalKrw": decimal_text(committed), "notionalExposureKrw": decimal_text(exposure),
+                    "executionAccounting": ({"sizingBasis":"MARGIN_BUDGET",
+                        "executionLeverage":int(futures_policy(self._futures_policy)[0]),
+                        "maxLeverageMultiplier":m.get("executionModelBinding",{}).get("maxLeverageMultiplier"),
+                        "capitalBudgetKrw":m.get("effectiveRouteBudgetKrw",m.get("routeBudgetKrw")),
+                        "initialMarginKrw":decimal_text(committed),"positionNotionalKrw":decimal_text(exposure),
+                        "costsOn":"NOTIONAL", "fundingModel":"ACTUAL_RATE_ABSOLUTE_TWO_ALLOWANCES",
+                        "costReserveKrw":decimal_text(sum((abs(number(p["quantity"]))*number(p["entryPrice"])*fx*
+                            (number(quotes[p["symbol"]]["feeRate"])+2*abs(number(quotes[p["symbol"]]["fundingRate"]))) for p in actual_positions),Decimal(0))),
+                        "exchangeLeverageBySymbol":deepcopy(self._observed_futures_by_symbol)} if self.route=="BINANCE_USDM_FUTURES" else None),
                     "protections": self._protection.public_rows() if self._protection else [],
                     "ownedProtectionOrders": deepcopy(s.get("openAlgoOrders", [])),
                     "protectionRetirementVerified": self._protection.retirement_verified() if self._protection else True,

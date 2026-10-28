@@ -309,7 +309,7 @@ class CompositionFixture:
     def start(self):
         prepared=self.prepare()
         if not prepared["readyToStart"]: raise AssertionError(prepared["blockers"])
-        return self.service.start({"preparationId":prepared["preparationId"],"scopeHash":prepared["scopeHash"],"confirmed":True,
+        return self.service.start({"preparationId":prepared["preparationId"],"scopeHash":prepared["scopeHash"],"confirmed":True,"executionModelOverrideHash":(prepared.get("executionModelBinding") or {}).get("bindingHash"),
             "confirmationText":"실제 주문 시험 시작"})
 
     def forward(self):

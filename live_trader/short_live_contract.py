@@ -5,6 +5,7 @@ does not issue a broker permission, change an account, or submit an order.
 """
 from __future__ import annotations
 
+from .leverage_accounting import model_binding
 from .futures_leverage_limits import MAX_SAFE_LEVERAGE_INTEGER, leverage_integer
 
 from copy import deepcopy
@@ -265,6 +266,7 @@ def build_contract(resolved: Mapping[str, Any], payload: Mapping[str, Any],
     routes = sorted({spec["route"] for spec in specs})
     futures_policy = (normalize_futures_policy(payload.get("futuresPolicy"))
                       if "BINANCE_USDM_FUTURES" in routes else None)
+    execution_binding = model_binding(specs, futures_policy["leverage"]) if futures_policy else None
     broker_counts = {broker: sum(ROUTES[route] == broker for route in routes)
                      for broker in set(ROUTES[route] for route in routes)}
     session_id = f"short-live-{uuid4()}"
@@ -286,6 +288,10 @@ def build_contract(resolved: Mapping[str, Any], payload: Mapping[str, Any],
         })
         if route == "BINANCE_USDM_FUTURES":
             legs[-1]["futuresPolicy"] = deepcopy(futures_policy)
+            legs[-1]["executionModelBinding"] = deepcopy(execution_binding)
+            selection_keys={spec.get("selectionKey") for spec in leg_specs}
+            legs[-1]["marginBudgetAllocationDenominator"]=(len(selection_keys) if None not in selection_keys
+                else max(1.0,sum(spec["targetWeight"] for spec in leg_specs)))
     body = {
         "schemaVersion": SCHEMA, "purpose": PURPOSE,
         "promotionEligible": False, "useAsPromotionEvidence": False,
@@ -296,6 +302,7 @@ def build_contract(resolved: Mapping[str, Any], payload: Mapping[str, Any],
         "binanceSpotAndFuturesShareBudget": True,
         "capitalBudgetBasis": "CASH_AND_FUTURES_MARGIN_WITH_COST_RESERVES",
         "futuresPolicy": deepcopy(futures_policy),
+        "executionModelBinding": deepcopy(execution_binding),
         "targets": targets, "specs": specs, "sourcePins": pins,
         "legs": legs, "automaticRestartAllowed": False,
         "realOrderStartRequiresOperatorConfirmation": True,
