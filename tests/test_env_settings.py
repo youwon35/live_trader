@@ -10,6 +10,13 @@ from live_trader import env_loader, env_settings
 
 
 class EnvSettingsSafetyTests(unittest.TestCase):
+    def test_obsolete_order_permission_is_not_a_setting_or_an_activation_path(self) -> None:
+        self.assertNotIn("LIVE_TRADER_ENABLE_REAL_ORDERS", {field.key for field in env_settings.ENV_SETTING_FIELDS})
+        with patch.object(env_settings, "read_env_file") as read:
+            with self.assertRaisesRegex(ValueError, "실행 시작"):
+                env_settings.save_env_settings({"LIVE_TRADER_ENABLE_REAL_ORDERS": True})
+            read.assert_not_called()
+
     def test_packaged_env_path_uses_persistent_local_app_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,

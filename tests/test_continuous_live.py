@@ -933,6 +933,8 @@ class LiveContinuousControllerTest(unittest.TestCase):
                     return_value=(None, "unit"),
                 ),
                 patch.object(state, "snapshot", return_value={}),
+                patch.object(state, "consume_safety_confirmation", return_value={"ok": True}),
+                patch.object(state, "_arm_real_orders_for_runtime_start"),
             ):
                 blocked = state.start_continuous_runtime(
                     "crypto",
@@ -958,6 +960,8 @@ class LiveContinuousControllerTest(unittest.TestCase):
                     return_value=(None, "unit"),
                 ),
                 patch.object(state, "snapshot", return_value={}),
+                patch.object(state, "consume_safety_confirmation", return_value={"ok": True}),
+                patch.object(state, "_arm_real_orders_for_runtime_start"),
             ):
                 started = state.start_continuous_runtime(
                     "crypto",

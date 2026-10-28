@@ -60,15 +60,7 @@ ENV_SETTING_FIELDS = (
     EnvSettingField("UPBIT_ACCESS_KEY", "Upbit access key", "Upbit Open API access key입니다.", "upbit", "secret", required=True),
     EnvSettingField("UPBIT_SECRET_KEY", "Upbit secret key", "Upbit Open API secret key입니다.", "upbit", "secret", required=True),
     EnvSettingField("UPBIT_BASE_URL", "Upbit URL", "Upbit REST base URL입니다.", "upbit", "text", UPBIT_BASE_URL),
-    EnvSettingField(
-        "LIVE_TRADER_ENABLE_REAL_ORDERS",
-        "실전 주문 라우트",
-        "true일 때만 실주문 어댑터가 활성화됩니다. 최종 점검 후에만 켜세요.",
-        "live-lock",
-        "bool",
-        "false",
-        True,
-    ),
+
 )
 
 
@@ -131,12 +123,14 @@ def env_settings_snapshot() -> dict[str, Any]:
             {"id": "kis", "label": "주식/ETF", "detail": "한국투자증권 Open API"},
             {"id": "binance", "label": "Binance", "detail": "코인 현물 · USD-M 선물"},
             {"id": "upbit", "label": "Upbit", "detail": "KRW 코인"},
-            {"id": "live-lock", "label": "실거래 잠금", "detail": "실전 주문 라우트"},
         ],
     }
 
 
 def save_env_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
+    # Settings never grant execution authority. Only exact start consent can.
+    if str(raw_values.get("LIVE_TRADER_ENABLE_REAL_ORDERS", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        raise ValueError("실거래 권한은 설정 저장이 아니라 실행 시작 시 확인합니다.")
     # Reject an invalid funding choice before any credential migration or write.
     if MODE_KEY in raw_values:
         resolve_funding_mode({MODE_KEY: raw_values[MODE_KEY]})
@@ -201,6 +195,9 @@ def write_env_file(
             output.append(raw_line)
             continue
         key = stripped.split("=", 1)[0].strip()
+        if key == "LIVE_TRADER_ENABLE_REAL_ORDERS":
+            # Remove the obsolete persisted switch during an explicit save.
+            continue
         if key in managed_keys:
             serialized = "" if field_map[key].kind == "secret" else quote_env_value(values.get(key, field_map[key].default))
             output.append(f"{key}={serialized}")

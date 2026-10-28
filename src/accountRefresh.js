@@ -1,4 +1,12 @@
-export const ACCOUNT_REFRESH_INTERVAL_MS = 10_000;
+// No periodic account API reads. A failed startup read is retried only by the user.
+export function createStartupAccountRead() {
+  let attempted = false;
+  return (connected, read) => {
+    if (!connected || attempted) return undefined;
+    attempted = true;
+    return read();
+  };
+}
 
 export function createAccountRefreshCoordinator({
   syncExecutionEvents,
@@ -25,6 +33,7 @@ export function createAccountRefreshCoordinator({
             synchronization = await syncExecutionEvents("all", {
               forceSnapshot: true,
               includeSnapshot: false,
+              displayOnly: true,
             });
             if (!synchronization || typeof synchronization !== "object"
               || Array.isArray(synchronization) || synchronization.ok !== true) {
@@ -43,6 +52,7 @@ export function createAccountRefreshCoordinator({
           const reconciled = await runReconciliation({
             refreshBrokers: Boolean(syncWarning),
             includeSnapshot: true,
+            displayOnly: true,
           });
           const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
           if (!record(reconciled) || typeof reconciled.ok !== "boolean"

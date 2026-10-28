@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { startContinuousRuntime, stopContinuousRuntime, saveEnvSettings,
-  cancelAllKisStartPreparations, registerKisPreparationPresenter } from "../src/api.js";
+  cancelAllKisStartPreparations, registerKisPreparationPresenter, registerSafetyConfirmationPresenter } from "../src/api.js";
 
 const previousWindow = globalThis.window; const previousFetch = globalThis.fetch;
 const deferred = () => { let resolve; const promise = new Promise((yes) => { resolve = yes; }); return { promise, resolve }; };
@@ -57,7 +57,14 @@ test("native cancel or changed exact target sends zero normal Start", async () =
 test("public KIS preparation does not block independent crypto normal Start", async () => {
   const hold = deferred(); const f = setup({ status: () => hold.promise });
   const pending = start().catch((e) => e); await turn();
-  const crypto = await startContinuousRuntime("crypto", "SMALL_LIVE", "crypto-portfolio", "crypto-deployment", "crypto-source");
+  const originalFetch=globalThis.fetch;
+  const unregister=registerSafetyConfirmationPresenter(async c=>({confirmed:true,typedPhrase:c.expectedPhrase}));
+  globalThis.fetch=async(path,options)=>path==='/api/safety-confirmation/challenge'
+    ? json({ok:true,challengeId:'crypto-start',token:'crypto-token',expectedPhrase:'LIVE TEST',expiresAt:new Date(Date.now()+60000).toISOString()})
+    : originalFetch(path,options);
+  let crypto;
+  try { crypto = await startContinuousRuntime("crypto", "SMALL_LIVE", "crypto-portfolio", "crypto-deployment", "crypto-source"); }
+  finally { unregister();globalThis.fetch=originalFetch; }
   assert.equal(crypto.ok, true); assert.equal(f.nativeCalls(), 0);
   const submitted = f.calls.filter((r) => r.path === "/api/runtime/start");
   assert.equal(submitted.length, 1); assert.equal(submitted[0].body.profile_id, "crypto");

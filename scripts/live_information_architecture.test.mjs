@@ -97,7 +97,8 @@ test("default pages prioritize decisions and move technical evidence into disclo
   assert.match(overview, /title="시작 점검·실행 엔진 기술 근거"/);
 
   const accounts = between(appSource, "function UnifiedBrokerAccountPanel", "function OperationsReportPanel");
-  assert.match(accounts, /현재 계좌를 기준 원장으로 승인/);
+  assert.doesNotMatch(accounts, /onBaseline|현재 계좌를 기준 원장으로 승인/);
+  assert.match(accounts, /계좌 다시 읽기는 원장을 덮어쓰지 않습니다/);
   assert.match(accounts, /title="내 실계좌 구성"/);
 });
 

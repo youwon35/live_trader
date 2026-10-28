@@ -294,248 +294,38 @@ class SafetyConfirmationStateTest(unittest.TestCase):
 
         self.assertEqual("safety-confirmation-context-changed", result["reason"])
 
-    def test_real_order_proposed_values_digest_change_blocks_before_env_write(
-        self,
-    ) -> None:
-        original_values = {"LIVE_TRADER_ENABLE_REAL_ORDERS": "true"}
-        changed_values = {"LIVE_TRADER_ENABLE_REAL_ORDERS": "1"}
-        issue_context = {
-            "settingKeys": sorted(original_values),
-            "enableRealOrders": True,
-            "valuesDigest": state.safety_confirmation_values_digest(
-                original_values
-            ),
-        }
-        with (
-            patch.object(
-                state,
-                "_safety_confirmation_identity",
-                return_value=self.deterministic_identity(),
-            ),
-            patch.object(
-                state, "_safety_environment_fingerprint", return_value="env-a"
-            ),
-            patch.object(state, "real_orders_enabled", return_value=False),
-            patch.object(state, "snapshot", return_value={}),
-            patch.object(state, "append_audit"),
-            patch(
-                "live_trader.env_settings.env_settings_snapshot",
-                return_value={"fields": []},
-            ),
-            patch("live_trader.env_settings.save_env_settings") as save_env,
-        ):
-            issued = state.issue_safety_confirmation(
-                "REAL_ORDERS_ENABLE", issue_context
-            )
-            result = state.save_environment_settings(
-                changed_values,
-                confirmed=True,
-                safety_confirmation=confirmation_payload(issued),
-            )
-
-        self.assertEqual("safety-confirmation-context-changed", result["reason"])
-        save_env.assert_not_called()
-
-    def test_persisted_true_is_disarmed_after_restart_until_new_challenge(self) -> None:
-        proposed = {"LIVE_TRADER_ENABLE_REAL_ORDERS": "true"}
-        request_context = {
-            "settingKeys": sorted(proposed),
-            "enableRealOrders": True,
-            "valuesDigest": state.safety_confirmation_values_digest(proposed),
-        }
-        settings = {
-            "fields": [
-                {
-                    "key": "LIVE_TRADER_ENABLE_REAL_ORDERS",
-                    "kind": "bool",
-                    "value": "false",
-                    "configured": True,
-                }
-            ]
-        }
-        with (
-            patch.dict(
-                state.os.environ,
-                {"LIVE_TRADER_ENABLE_REAL_ORDERS": "true"},
-                clear=False,
-            ),
-            patch.object(
-                state,
-                "_safety_confirmation_identity",
-                return_value=self.deterministic_identity(),
-            ),
-            patch.object(
-                state, "_safety_environment_fingerprint", return_value="env-a"
-            ),
-            patch.object(state, "snapshot", return_value={}),
-            patch.object(state, "append_audit"),
-            patch(
-                "live_trader.env_settings.env_settings_snapshot",
-                return_value=settings,
-            ),
-            patch(
-                "live_trader.env_settings.save_env_settings",
-                return_value=settings,
-            ),
-        ):
+    def test_settings_cannot_arm_orders_even_with_legacy_confirmation(self) -> None:
+        with patch.object(state, "snapshot", return_value={}), patch.object(state, "append_audit"), \
+                patch("live_trader.env_settings.env_settings_snapshot", return_value={"fields": []}), \
+                patch("live_trader.env_settings.save_env_settings") as save_env:
+            for value in (True, "true", "1", False):
+                result = state.save_environment_settings({"LIVE_TRADER_ENABLE_REAL_ORDERS": value},
+                    confirmed=True, safety_confirmation={"token": "obsolete"})
+                self.assertFalse(result["ok"])
             self.assertFalse(state.real_orders_enabled())
-            issued = state.issue_safety_confirmation(
-                "REAL_ORDERS_ENABLE", request_context
-            )
-            result = state.save_environment_settings(
-                proposed,
-                confirmed=True,
-                safety_confirmation=confirmation_payload(issued),
-            )
-            self.assertTrue(result["ok"])
+            save_env.assert_not_called()
+
+    def test_persisted_true_is_disarmed_after_restart_and_old_action_is_gone(self) -> None:
+        with patch.dict(state.os.environ, {"LIVE_TRADER_ENABLE_REAL_ORDERS": "true"}):
+            state.disarm_real_orders_for_process_start()
+            self.assertFalse(state.real_orders_enabled())
+        self.assertNotIn("REAL_ORDERS_ENABLE", state.SAFETY_CONFIRMATION_ACTIONS)
+
+    def test_credential_rotation_revokes_all_admitted_runtime_arms(self) -> None:
+        from types import SimpleNamespace
+        session = SimpleNamespace(session_id="offline-admitted", mode="SMALL_LIVE", lifecycle="STARTING")
+        with patch.dict(state.os.environ, {"LIVE_TRADER_ENABLE_REAL_ORDERS": "false"}), \
+                patch.object(state, "snapshot", return_value={}), patch.object(state, "append_audit"), \
+                patch.object(state, "live_exposure_active", return_value=False), \
+                patch("live_trader.env_settings.env_settings_snapshot", return_value={"fields": []}), \
+                patch("live_trader.env_settings.save_env_settings", return_value={"fields": []}) as save_env:
+            state._arm_real_orders_for_runtime_start(session)
             self.assertTrue(state.real_orders_enabled())
-
-    def test_env_rotation_cannot_interleave_after_challenge_consume(self) -> None:
-        proposed = {"LIVE_TRADER_ENABLE_REAL_ORDERS": "true"}
-        request_context = {
-            "settingKeys": sorted(proposed),
-            "enableRealOrders": True,
-            "valuesDigest": state.safety_confirmation_values_digest(proposed),
-        }
-        first_save_entered = threading.Event()
-        release_first_save = threading.Event()
-        saved_payloads: list[dict[str, object]] = []
-
-        def settings_snapshot() -> dict[str, object]:
-            return {
-                "fields": [
-                    {
-                        "key": "BINANCE_API_KEY",
-                        "kind": "secret",
-                        "value": "",
-                        "configured": True,
-                    },
-                    {
-                        "key": "LIVE_TRADER_ENABLE_REAL_ORDERS",
-                        "kind": "bool",
-                        "value": state.os.environ.get(
-                            "LIVE_TRADER_ENABLE_REAL_ORDERS", "false"
-                        ),
-                        "configured": True,
-                    },
-                ]
-            }
-
-        def save(values: dict[str, object]) -> dict[str, object]:
-            saved_payloads.append(dict(values))
-            if len(saved_payloads) == 1:
-                first_save_entered.set()
-                self.assertTrue(release_first_save.wait(timeout=5))
-            if "LIVE_TRADER_ENABLE_REAL_ORDERS" in values:
-                state.os.environ["LIVE_TRADER_ENABLE_REAL_ORDERS"] = (
-                    "true"
-                    if values["LIVE_TRADER_ENABLE_REAL_ORDERS"] in {True, "true"}
-                    else "false"
-                )
-            return settings_snapshot()
-
-        with (
-            patch.dict(
-                state.os.environ,
-                {"LIVE_TRADER_ENABLE_REAL_ORDERS": "false"},
-                clear=False,
-            ),
-            patch.object(
-                state,
-                "_safety_confirmation_identity",
-                return_value=self.deterministic_identity(),
-            ),
-            patch.object(
-                state, "_safety_environment_fingerprint", return_value="env-a"
-            ),
-            patch.object(state, "snapshot", return_value={}),
-            patch.object(state, "append_audit"),
-            patch(
-                "live_trader.env_settings.env_settings_snapshot",
-                side_effect=settings_snapshot,
-            ),
-            patch(
-                "live_trader.env_settings.save_env_settings",
-                side_effect=save,
-            ),
-        ):
-            issued = state.issue_safety_confirmation(
-                "REAL_ORDERS_ENABLE", request_context
-            )
-            results: list[dict[str, object]] = []
-            enable_thread = threading.Thread(
-                target=lambda: results.append(
-                    state.save_environment_settings(
-                        proposed,
-                        confirmed=True,
-                        safety_confirmation=confirmation_payload(issued),
-                    )
-                )
-            )
-            enable_thread.start()
-            self.assertTrue(first_save_entered.wait(timeout=5))
-            rotate_thread = threading.Thread(
-                target=lambda: results.append(
-                    state.save_environment_settings(
-                        {"BINANCE_API_KEY": "rotated-key"}
-                    )
-                )
-            )
-            rotate_thread.start()
-            self.assertEqual(1, len(saved_payloads))
-            release_first_save.set()
-            enable_thread.join(timeout=5)
-            rotate_thread.join(timeout=5)
-
-        self.assertFalse(enable_thread.is_alive())
-        self.assertFalse(rotate_thread.is_alive())
-        self.assertEqual(2, len(saved_payloads))
-        self.assertIs(
-            False,
-            saved_payloads[1]["LIVE_TRADER_ENABLE_REAL_ORDERS"],
-        )
-        self.assertFalse(state._REAL_ORDERS_PROCESS_ARMED)
-
-    def test_credential_rotation_invalidates_real_order_enable_challenge(
-        self,
-    ) -> None:
-        proposed = {"LIVE_TRADER_ENABLE_REAL_ORDERS": "true"}
-        request_context = {
-            "settingKeys": sorted(proposed),
-            "enableRealOrders": True,
-            "valuesDigest": state.safety_confirmation_values_digest(proposed),
-        }
-        with (
-            patch.object(
-                state,
-                "_safety_confirmation_identity",
-                return_value=self.deterministic_identity(),
-            ),
-            patch.object(
-                state,
-                "_safety_environment_fingerprint",
-                side_effect=["credentials-before", "credentials-after"],
-            ),
-            patch.object(state, "real_orders_enabled", return_value=False),
-            patch.object(state, "snapshot", return_value={}),
-            patch.object(state, "append_audit"),
-            patch(
-                "live_trader.env_settings.env_settings_snapshot",
-                return_value={"fields": []},
-            ),
-            patch("live_trader.env_settings.save_env_settings") as save_env,
-        ):
-            issued = state.issue_safety_confirmation(
-                "REAL_ORDERS_ENABLE", request_context
-            )
-            result = state.save_environment_settings(
-                proposed,
-                confirmed=True,
-                safety_confirmation=confirmation_payload(issued),
-            )
-
-        self.assertEqual("safety-confirmation-context-changed", result["reason"])
-        save_env.assert_not_called()
+            result = state.save_environment_settings({"BINANCE_API_KEY": "offline-rotated-key"})
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["real_orders_forced_disabled"])
+            self.assertFalse(state.real_orders_enabled())
+            self.assertNotIn("LIVE_TRADER_ENABLE_REAL_ORDERS", save_env.call_args.args[0])
 
     def test_selected_provider_account_change_invalidates_challenge(self) -> None:
         state.STATE["selected_strategy_id"] = "strategy-kis"

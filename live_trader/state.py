@@ -327,6 +327,7 @@ _KIS_CONTROL_SUPERSEDED_IDS: set[str] = set()
 RUNTIME_MODE_RANK = {"MONITOR": 0, "SMALL_LIVE": 1, "FULL_LIVE": 2}
 PROFESSIONAL_PROMOTION_POLICY = PromotionPolicy()
 _REAL_ORDERS_PROCESS_ARMED = False
+_REAL_ORDER_RUNTIME_AUTHORITIES: set[str] = set()
 _REAL_ORDERS_PROCESS_ARM_LOCK = threading.RLock()
 
 # A persisted/env true value is configuration, never authority. Every fresh
@@ -705,12 +706,36 @@ def real_orders_enabled() -> bool:
         )
 
 
+
+def _arm_real_orders_for_runtime_start(session: object) -> None:
+    """Called only after exact consent and the normal governance admission."""
+    session_id = str(getattr(session, "session_id", "") or "")
+    if (not session_id or getattr(session, "mode", "") not in {"SMALL_LIVE", "FULL_LIVE"}
+            or getattr(session, "lifecycle", "") not in {"STARTING", "RUNNING"}):
+        raise ValueError("exact-admitted-live-session-required")
+    global _REAL_ORDERS_PROCESS_ARMED
+    with _REAL_ORDERS_PROCESS_ARM_LOCK:
+        _REAL_ORDER_RUNTIME_AUTHORITIES.add(session_id)
+        _REAL_ORDERS_PROCESS_ARMED = True
+        os.environ["LIVE_TRADER_ENABLE_REAL_ORDERS"] = "true"
+
+
+def _revoke_runtime_order_authority(session_id: str) -> None:
+    """A failed/stopped start cannot revoke another admitted account session."""
+    global _REAL_ORDERS_PROCESS_ARMED
+    with _REAL_ORDERS_PROCESS_ARM_LOCK:
+        _REAL_ORDER_RUNTIME_AUTHORITIES.discard(str(session_id or ""))
+        _REAL_ORDERS_PROCESS_ARMED = bool(_REAL_ORDER_RUNTIME_AUTHORITIES)
+        os.environ["LIVE_TRADER_ENABLE_REAL_ORDERS"] = "true" if _REAL_ORDERS_PROCESS_ARMED else "false"
+
+
 def disarm_real_orders_for_process_start(*, persist: bool = False) -> dict[str, Any]:
     """Make persisted true non-authoritative across every process restart."""
 
     global _REAL_ORDERS_PROCESS_ARMED
     with _REAL_ORDERS_PROCESS_ARM_LOCK:
         _REAL_ORDERS_PROCESS_ARMED = False
+        _REAL_ORDER_RUNTIME_AUTHORITIES.clear()
         os.environ["LIVE_TRADER_ENABLE_REAL_ORDERS"] = "false"
         if persist:
             from . import env_settings
@@ -4138,6 +4163,7 @@ def _prepare_kis_native_runtime_start(profile_id, mode, portfolio_id, deployment
             _revoke_kis_scoped_operational_authority("exact-native-start-replacement", _keep_native_preparation=entry)
             session, _reason = _prepare_operational_runtime_session(profile_id, mode, portfolio_id, deployment_id, strategy_id)
             _reserve_kis_scoped_manual_start(session, context, preflight)
+            _arm_real_orders_for_runtime_start(session)
             session_id = str(session.session_id)
             def activation_reader():
                 value = registry.activation(entry)
@@ -4207,6 +4233,7 @@ def _start_kis_prepared_native_runtime(profile_id, mode, portfolio_id, deploymen
             KIS_NATIVE_START_REGISTRY.invalidate(entry)
         session_id = str(result.get("runtime_session_id") or "")
         if session_id:
+            _revoke_runtime_order_authority(session_id)
             with SAFETY_CONFIRMATION_MUTATION_LOCK, kis_route_authority_serialization():
                 _kis_scoped_store().revoke(session_id=session_id, reason="native-start-not-activated")
                 STATE["new_entries_blocked"] = True
@@ -4677,6 +4704,7 @@ def _finish_kis_owned_stop_cleanup(plan):
             _kis_cleanup_store().finish(cleanup_id, terminal_truth=truth, owned_capital_settled=True, reconciliation_passed=passed)
             OPERATIONAL_GOVERNANCE.transition_runtime_session(plan["sessionId"], "STOPPED", actor="live_trader.kis_scoped.cleanup",
                 event_type="KIS_OWNED_STOP_CLEANUP_TERMINAL_RECONCILED", payload={"runtimeId": plan["runtimeScopeId"]})
+            _revoke_runtime_order_authority(plan["sessionId"])
             active = STATE.setdefault("active_runtime_session_ids", {})
             if active.get(plan["runtimeScopeId"]) == plan["sessionId"]:
                 active.pop(plan["runtimeScopeId"], None)
@@ -7674,9 +7702,9 @@ def readiness_checks(
             "Dry Run이 켜져 있어 주문은 브로커로 전송되지 않습니다." if STATE["dry_run"] else "Dry Run이 꺼져 있습니다. 실제 주문 전송 게이트가 더 엄격하게 적용됩니다.",
         ),
         Check(
-            "실거래 라우트 환경",
-            "pass" if real_orders_enabled() else "fail",
-            "LIVE_TRADER_ENABLE_REAL_ORDERS=true가 필요합니다." if not real_orders_enabled() else "실거래 라우트 환경 변수가 켜져 있습니다.",
+            "실거래 시작 확인",
+            "info",
+            "별도 잠금 설정 없이 실제 실행 시작 시 한 번 확인합니다. 준비 검사는 주문 권한을 부여하지 않습니다.",
         ),
         Check(
             "운영 체크리스트",
@@ -9898,9 +9926,9 @@ def final_preflight_checks(
     )
     return [
         {
-            "label": "실거래 환경 변수",
-            "status": "pass" if real_orders_enabled() else "fail",
-            "detail": "LIVE_TRADER_ENABLE_REAL_ORDERS=true가 설정되어야 실거래 라우트 검토가 가능합니다.",
+            "label": "실거래 시작 확인",
+            "status": "pass",
+            "detail": "시작 시 선택한 배포의 주문 실행을 확인합니다. 이 점검 자체는 주문 권한을 부여하지 않습니다.",
         },
         {
             "label": "브로커 API 키",
@@ -11213,7 +11241,7 @@ def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
             "portfolioArtifact": portfolio_reference,
             "riskPolicyHash": risk_policy_hash,
             "retryPolicy": STATE.get("retry_policy", {}),
-            "realOrdersEnabled": real_orders_enabled(),
+            "executionConsentPolicy": "EXACT_START_SESSION_V1",
             "checklist": STATE.get("checklist", {}),
         }
     )
@@ -12306,6 +12334,7 @@ def stop_operational_runtime_sessions_for_kill(
                 )
             terminal = session.lifecycle in {"STOPPED", "FAILED"}
             if terminal:
+                _revoke_runtime_order_authority(session_id)
                 STATE.setdefault("active_runtime_session_ids", {}).pop(profile_id, None)
             outcomes.append(
                 {"profile_id": profile_id, "session_id": session_id, "lifecycle": session.lifecycle, "ok": terminal}
@@ -12328,7 +12357,7 @@ SAFETY_CONFIRMATION_ACTIONS = {
     "KILL_SWITCH_OFF",
     "DRY_RUN_OFF",
     "NEW_ENTRIES_BLOCKED_OFF",
-    "REAL_ORDERS_ENABLE",
+    "RUNTIME_START",
     "FUNCTIONAL_TEST_START",
     "UPBIT_FUNCTIONAL_START",
     "UPBIT_FUNCTIONAL_STOP",
@@ -12356,28 +12385,9 @@ def _safety_confirmation_request_context(
             "NEW_ENTRIES_BLOCKED_OFF": "new_entries_blocked",
         }[action]
         return {"name": expected_name, "value": False}
-    if action == "REAL_ORDERS_ENABLE":
-        keys = values.get("settingKeys") or values.get("setting_keys") or []
-        if not isinstance(keys, list):
-            keys = []
-        proposed_digest = str(
-            values.get("valuesDigest")
-            or values.get("values_digest")
-            or ""
-        ).strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{64}", proposed_digest):
-            proposed_digest = "invalid"
-        return {
-            "settingKeys": sorted(
-                {
-                    str(item).strip()
-                    for item in keys
-                    if str(item).strip()
-                }
-            ),
-            "enableRealOrders": True,
-            "proposedValuesDigest": proposed_digest,
-        }
+    if action == "RUNTIME_START":
+        return {key: str(values.get(key) or "").strip() for key in
+                ("profile_id", "mode", "portfolio_id", "deployment_id", "strategy_id")}
     if action == "FUNCTIONAL_TEST_START":
         return {
             "targetKey": str(
@@ -12705,9 +12715,31 @@ def safety_confirmation_authoritative_context(
         context["currentControl"] = {
             "newEntriesBlocked": bool(STATE.get("new_entries_blocked"))
         }
-    elif normalized_action == "REAL_ORDERS_ENABLE":
-        context["environmentFingerprint"] = _safety_environment_fingerprint()
-        context["currentControl"] = {"realOrdersEnabled": real_orders_enabled()}
+    elif normalized_action == "RUNTIME_START":
+        if (request["profile_id"] != "crypto" or request["mode"] not in {"SMALL_LIVE", "FULL_LIVE"}
+                or not request["deployment_id"] or not request["strategy_id"]):
+            raise ValueError("exact-crypto-runtime-start-selection-required")
+        strategy = _operational_strategy(strategy_rows(portfolio_rows()),
+            deployment_id=request["deployment_id"], strategy_id=request["strategy_id"], portfolio_id=request["portfolio_id"])
+        if strategy is None or strategy_broker_id(strategy) not in {"upbit", "binance", "binance-futures"}:
+            raise ValueError("runtime-start-deployment-unavailable")
+        scope = resolve_continuous_runtime_scope(request["profile_id"], request["mode"],
+            request["portfolio_id"], request["strategy_id"], request["deployment_id"])
+        preflight = OPERATIONAL_GOVERNANCE.latest_preflight_for_deployment(request["deployment_id"])
+        if (not scope or preflight is None or OPERATIONAL_GOVERNANCE.preflight_validity(preflight.snapshot_id).get("valid") is not True):
+            raise ValueError("runtime-start-fresh-preflight-required")
+        context["runtimeStart"] = {"scope": scope,
+            "manifestInputsHash": governance_sha256(_operational_manifest_inputs(strategy)),
+            "preflightId": preflight.snapshot_id, "environmentFingerprint": _safety_environment_fingerprint()}
+        context["selectedDeploymentId"] = request["deployment_id"]
+        context["selectedStrategyId"] = request["strategy_id"]
+        # The confirmation describes the requested account, not a different
+        # deployment that happens to be selected in the surrounding dashboard.
+        identity = {"provider": strategy_broker_id(strategy).upper(),
+                    "fingerprint": str(scope["accountFingerprint"]),
+                    "suffix": str(scope["accountFingerprint"])[-4:].upper()}
+        context["accountFingerprint"] = identity["fingerprint"]
+        context.pop("selectedAuthorityFingerprint", None)
     elif normalized_action == "FUNCTIONAL_TEST_START":
         authority: dict[str, Any]
         try:
@@ -12948,15 +12980,6 @@ def issue_safety_confirmation(
         return {
             "ok": False,
             "reason": f"safety-confirmation-issue-failed:{type(exc).__name__}",
-        }
-    if (
-        str(action or "").strip().upper() == "REAL_ORDERS_ENABLE"
-        and (context.get("request") or {}).get("proposedValuesDigest")
-        == "invalid"
-    ):
-        return {
-            "ok": False,
-            "reason": "safety-confirmation-values-digest-required",
         }
     if (
         str(action or "").strip().upper() == "FUNCTIONAL_TEST_START"
@@ -13598,82 +13621,12 @@ def save_environment_settings(
     real_orders_forced_disabled = bool(
         real_orders_enabled() and planned_identity_changes
     )
-    if real_orders_forced_disabled:
-        # Credential/account/endpoint rotation can never inherit the previous
-        # real-order authority. Persist OFF in the same atomic settings write
-        # and require a fresh identity-bound challenge afterward.
-        submitted["LIVE_TRADER_ENABLE_REAL_ORDERS"] = False
-    requests_enable = str(
-        submitted.get("LIVE_TRADER_ENABLE_REAL_ORDERS", "")
-    ).strip().lower() in {"true", "1", "yes", "on"}
-    enabling_real_orders = requests_enable and not real_orders_enabled()
-    if enabling_real_orders:
-        simultaneous_changes: list[str] = []
-        for raw_key, raw_value in submitted.items():
-            key = str(raw_key)
-            if key == "LIVE_TRADER_ENABLE_REAL_ORDERS" or key not in fields:
-                continue
-            field = fields[key]
-            if field.kind == "secret":
-                if str(raw_value or "").strip():
-                    simultaneous_changes.append(key)
-            elif str(raw_value or "").strip() != str(
-                before.get(key, {}).get("value") or field.default
-            ).strip():
-                simultaneous_changes.append(key)
-        if simultaneous_changes:
-            return {
-                "ok": False,
-                "reason": (
-                    "실전 주문 활성화와 계정/브로커 설정 변경을 한 번에 수행할 수 "
-                    "없습니다. 설정을 먼저 저장한 뒤 새 2단계 확인을 발급하세요."
-                ),
-                "changed_keys": [],
-                "settings": env_settings.env_settings_snapshot(),
-                "snapshot": snapshot(),
-            }
-        if confirmed is not True:
-            return {
-                "ok": False,
-                "reason": "실전 주문 활성화는 명시 확인과 2단계 확인이 필요합니다.",
-                "changed_keys": [],
-                "settings": env_settings.env_settings_snapshot(),
-                "snapshot": snapshot(),
-            }
-        challenge = consume_safety_confirmation(
-            "REAL_ORDERS_ENABLE",
-            safety_confirmation,
-            {
-                "settingKeys": sorted(str(key) for key in submitted),
-                "enableRealOrders": True,
-                "valuesDigest": safety_confirmation_values_digest(submitted),
-            },
-        )
-        if challenge.get("ok") is not True:
-            reason = str(
-                challenge.get("reason") or "safety-confirmation-required"
-            )
-            append_audit(
-                "warn",
-                "실전 주문 활성화 2단계 확인 거부",
-                reason,
-            )
-            return {
-                "ok": False,
-                "reason": reason,
-                "changed_keys": [],
-                "settings": env_settings.env_settings_snapshot(),
-                "snapshot": snapshot(),
-            }
-    settings = env_settings.save_env_settings(submitted)
     if "LIVE_TRADER_ENABLE_REAL_ORDERS" in submitted:
-        requested_after_save = str(
-            submitted.get("LIVE_TRADER_ENABLE_REAL_ORDERS") or ""
-        ).strip().lower() in {"true", "1", "yes", "on"}
-        global _REAL_ORDERS_PROCESS_ARMED
-        with _REAL_ORDERS_PROCESS_ARM_LOCK:
-            # Reaching true here necessarily passed the challenge above.
-            _REAL_ORDERS_PROCESS_ARMED = bool(requested_after_save)
+        return {"ok": False, "reason": "실거래 권한은 설정 저장이 아니라 실행 시작 시 확인합니다.",
+                "changed_keys": [], "settings": env_settings.env_settings_snapshot(), "snapshot": snapshot()}
+    if real_orders_forced_disabled:
+        disarm_real_orders_for_process_start()
+    settings = env_settings.save_env_settings(submitted)
     after = {
         str(item.get("key") or ""): item
         for item in settings.get("fields", [])
@@ -15858,6 +15811,7 @@ def mark_broker_snapshot_success(
         **previous,
         "last_attempt_monotonic": now_monotonic,
         "last_success_monotonic": now_monotonic,
+        "last_success_at": datetime.now(timezone.utc).isoformat(),
         "next_allowed_monotonic": now_monotonic + interval_seconds,
         "failure_count": 0,
         "last_error": "",
@@ -16326,6 +16280,7 @@ def _poll_execution_events_unlocked(
     *,
     force_snapshot: bool | None = None,
     include_snapshot: bool = True,
+    display_only: bool = False,
 ) -> dict[str, Any]:
     broker_ids = (
         "kis",
@@ -16567,7 +16522,7 @@ def _poll_execution_events_unlocked(
         )
     automatic_results = (
         automatic_live_promotion_sweep(fresh_broker_ids=set(successful_snapshot_brokers))
-        if new_event_count
+        if new_event_count and not display_only
         else []
     )
     return {
@@ -16596,6 +16551,7 @@ def poll_execution_events(
     *,
     force_snapshot: bool | None = None,
     include_snapshot: bool = True,
+    display_only: bool = False,
 ) -> dict[str, Any]:
     """Coalesce overlapping UI, daemon, and runtime broker polls.
 
@@ -16620,6 +16576,7 @@ def poll_execution_events(
             broker_id,
             force_snapshot=force_snapshot,
             include_snapshot=include_snapshot,
+            display_only=display_only,
         )
     finally:
         BROKER_POLL_LOCK.release()
@@ -16941,8 +16898,7 @@ def preview_binance_futures_order_risk(
 def _binance_futures_settings_mutation_hold_reason() -> str:
     """Keep ordinary Futures settings outside every functional lifecycle."""
 
-    if not real_orders_enabled():
-        return "binance-futures-settings-real-orders-disabled"
+    # Settings use their exact one-use preview/confirmation, not order authority.
     if _binance_functional_durable_authority_open():
         return "binance-functional-authority-blocks-futures-settings"
     try:
@@ -19095,6 +19051,7 @@ def _run_reconciliation_without_public_fence(
     *,
     refresh_brokers: bool = True,
     include_snapshot: bool = True,
+    display_only: bool = False,
 ) -> dict[str, Any]:
     STATE["reconciliation_last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     broker_data = (
@@ -19112,7 +19069,8 @@ def _run_reconciliation_without_public_fence(
     if STATE["broker_truth_blocked"]:
         STATE["new_entries_blocked"] = True
     elif (
-        was_broker_blocked
+        not display_only
+        and was_broker_blocked
         and not STATE.get("kill_switch")
         and not STATE.get("kill_switch_rearm_required")
         and not STATE.get("manual_new_entries_blocked")
@@ -19158,7 +19116,7 @@ def _run_reconciliation_without_public_fence(
         ),
     )
     continuous_dispatch_reconciliation: dict[str, Any] = {}
-    if refresh_brokers and not reconciliation_blocked:
+    if refresh_brokers and not reconciliation_blocked and not display_only:
         try:
             result = LIVE_CONTINUOUS_CONTROLLER.reconcile_deferred_dispatches(
                 PROGRAM_LEDGER.order_dispatch_rows(1_000_000)
@@ -19170,7 +19128,7 @@ def _run_reconciliation_without_public_fence(
         except (OSError, sqlite3.Error, ValueError, RuntimeError):
             STATE["new_entries_blocked"] = True
             continuous_dispatch_reconciliation = {"reconciliationRequired": True}
-    automatic_results = automatic_live_promotion_sweep()
+    automatic_results = [] if display_only else automatic_live_promotion_sweep()
     return {
         "ok": True,
         "continuous_dispatch_reconciliation": continuous_dispatch_reconciliation,
@@ -19188,6 +19146,7 @@ def run_reconciliation(
     *,
     refresh_brokers: bool = True,
     include_snapshot: bool = True,
+    display_only: bool = False,
 ) -> dict[str, Any]:
     """Publish a KIS control reservation around broker-truth mutation.
 
@@ -19199,6 +19158,7 @@ def run_reconciliation(
     return _run_reconciliation_without_public_fence(
         refresh_brokers=refresh_brokers,
         include_snapshot=include_snapshot,
+        display_only=display_only,
     )
 
 
@@ -25556,7 +25516,7 @@ def _functional_test_manifest_values(
             "riskPolicyHash": risk_policy_hash,
             "retryPolicy": STATE.get("retry_policy", {}),
             "checklist": STATE.get("checklist", {}),
-            "realOrdersEnabled": real_orders_enabled(),
+            "executionConsentPolicy": "EXACT_START_SESSION_V1",
         }
     )
     return {
@@ -26924,8 +26884,6 @@ def _prepare_functional_test_runtime_session(
         raise ValueError("FUNCTIONAL_TEST runtime 시작 전 운용자 확인이 필요합니다.")
     if STATE.get("dry_run"):
         raise ValueError("FUNCTIONAL_TEST 실주문 runtime에서는 Dry Run을 해제해야 합니다.")
-    if not real_orders_enabled():
-        raise ValueError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 필요합니다.")
     control = durable_control_snapshot()
     if STATE.get("kill_switch") or control.get("halted") is True:
         raise ValueError("Kill/Risk 제어가 활성화되어 FUNCTIONAL_TEST를 시작할 수 없습니다.")
@@ -27292,8 +27250,6 @@ def _prepare_operational_runtime_session(
     )
     preflight_id = latest_preflight.snapshot_id if latest_preflight is not None else ""
     if mode in {"SMALL_LIVE", "FULL_LIVE"}:
-        if not real_orders_enabled():
-            raise ValueError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 필요합니다.")
         if not preflight_id:
             raise ValueError("현재 Deployment의 Preflight Snapshot을 먼저 실행하세요.")
         validity = OPERATIONAL_GOVERNANCE.preflight_validity(preflight_id)
@@ -27375,6 +27331,8 @@ def _finish_operational_runtime_start(session: object | None, ok: bool, reason: 
     session_id = str(getattr(session, "session_id", "") or "")
     if not session_id:
         return
+    if not ok:
+        _revoke_runtime_order_authority(session_id)
     try:
         OPERATIONAL_GOVERNANCE.transition_runtime_session(
             session_id,
@@ -27384,6 +27342,7 @@ def _finish_operational_runtime_start(session: object | None, ok: bool, reason: 
             payload={"detail": str(reason or "")[:500]},
         )
     except (OSError, sqlite3.Error, ValueError):
+        _revoke_runtime_order_authority(session_id)
         STATE["new_entries_blocked"] = True
 
 
@@ -27405,7 +27364,10 @@ def _retire_superseded_runtime_session(previous_id: str, current_session: object
                     event_type="RUNTIME_SESSION_SUPERSEDED",
                     payload={"runtimeId": key, "successorSessionId": current_session.session_id},
                 )
-        return previous.lifecycle in {"STOPPED", "FAILED"}
+        retired = previous.lifecycle in {"STOPPED", "FAILED"}
+        if retired:
+            _revoke_runtime_order_authority(previous_id)
+        return retired
     except (OSError, sqlite3.Error, ValueError, AttributeError):
         STATE["new_entries_blocked"] = True
         return False
@@ -27640,6 +27602,9 @@ def start_continuous_runtime(
             "brokerSubmissionPerformed": False,
             "snapshot": snapshot(),
         }
+    if _binance_functional_durable_authority_open():
+        return {"ok": False, "reason": "binance-functional-session-closes-ordinary-runtime-route",
+                "runtimeStarted": False, "brokerSubmissionPerformed": False, "snapshot": snapshot()}
     if normalized_purpose not in {"", FUNCTIONAL_TEST_EXECUTION_PURPOSE}:
         return {
             "ok": False,
@@ -27685,6 +27650,13 @@ def start_continuous_runtime(
             _revoke_kis_scoped_operational_authority("exact-native-start-replacement")
         except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
             return {"ok": False, "reason": str(exc), "runtimeStarted": False, "brokerSubmissionPerformed": False}
+    if normalized_profile == "crypto" and normalized_mode in {"SMALL_LIVE", "FULL_LIVE"} and not normalized_purpose:
+        start_confirmation = consume_safety_confirmation("RUNTIME_START", safety_confirmation, {
+            "profile_id": normalized_profile, "mode": normalized_mode, "portfolio_id": portfolio_id,
+            "deployment_id": deployment_id, "strategy_id": strategy_id})
+        if start_confirmation.get("ok") is not True:
+            return {"ok": False, "reason": str(start_confirmation.get("reason") or "runtime-start-confirmation-required"),
+                    "runtimeStarted": False, "brokerSubmissionPerformed": False}
     governance_session: object | None = None
     previous_session_id = str((STATE.get("active_runtime_session_ids") or {}).get(normalized_profile) or "")
     try:
@@ -27709,6 +27681,8 @@ def start_continuous_runtime(
             )
         if kis_manual_context is not None:
             _reserve_kis_scoped_manual_start(governance_session, kis_manual_context, kis_manual_preflight)
+        if normalized_mode in {"SMALL_LIVE", "FULL_LIVE"}:
+            _arm_real_orders_for_runtime_start(governance_session)
     except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
         if governance_session is not None:
             _kis_scoped_store().revoke(session_id=str(governance_session.session_id), reason="start-reservation-failed")
@@ -28157,6 +28131,10 @@ def stop_continuous_runtime(
             stopped = (per_runtime.get(key) or result).get("ok") is True
             stop_plan = getattr(_CONTINUOUS_STOP_SCOPE, "plan", {})
             cleanup_pending = key in stop_plan.get("cleanupKeys", set())
+            # A failed drain must not leave ordinary dispatch armed. The exact
+            # KIS cleanup path retains authority only until its terminal proof.
+            if not cleanup_pending:
+                _revoke_runtime_order_authority(session_id)
             try:
                 session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
                 if session is not None and session.lifecycle == "STOPPING" and not cleanup_pending:

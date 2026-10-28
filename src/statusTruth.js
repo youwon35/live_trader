@@ -2,9 +2,8 @@
 import { deploymentContextMatchesPreflight } from './deploymentSelection.js';
 import { runtimeRows } from './runtimeSelection.js';
 export function currentOrderPermission(snapshot = {}) {
-  const check = (snapshot.readiness || []).find(row => row.label === '실거래 라우트 환경');
-  return snapshot.api_connected === true && ['pass', 'fail'].includes(check?.status)
-    ? check.status === 'pass' : null;
+  // Exact execution consent is deliberately not a persistent app switch.
+  return snapshot.api_connected === true ? 'confirm-at-start' : null;
 }
 export function ordinaryRuntimeActive(snapshot = {}) {
   return snapshot.api_connected === true && (snapshot.continuous_runtime?.running === true || runtimeRows(snapshot.continuous_runtime || {}).some(row => row.running === true));
@@ -21,7 +20,7 @@ export function environmentStatus(snapshot = {}, selectedId = '', now = Date.now
     && String(preflight.status || preflight.result || '').toUpperCase() === 'PASS'
     && Number.isFinite(expires) && expires > now;
   const items = [
-    { label: '현재 앱 주문 허용', value: permission === null ? '미확인' : permission ? '허용' : '꺼짐', tone: permission === null ? 'warning' : permission ? 'success' : 'neutral', detail: '연결·설정의 현재 앱 허용 상태입니다. 배포 점검이나 실행 시작을 뜻하지 않습니다.' },
+    { label: '실거래 확인', value: permission === null ? '미확인' : '시작 시 한 번', tone: permission === null ? 'warning' : 'info', detail: '별도 잠금 설정은 없습니다. 실제 주문은 선택한 실행의 시작 확인과 준비 조건을 통과해야 전송됩니다.' },
     { label: '선택 배포 점검', value: !known ? '미확인' : !selectedId ? '배포 선택 필요' : valid ? '유효' : '점검 필요', tone: valid ? 'success' : 'warning', detail: '일반 운용 배포의 시작 점검입니다. 주문 연결 시험은 해당 탭의 준비 결과를 사용합니다.' },
   ];
   if (ordinaryRuntimeActive(snapshot)) items.push({ label: '일반 운용 신규 진입', value: typeof snapshot.new_entries_blocked !== 'boolean' ? '미확인' : snapshot.new_entries_blocked ? '차단' : '허용', tone: snapshot.new_entries_blocked === false ? 'success' : 'warning' });

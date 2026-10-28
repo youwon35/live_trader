@@ -82,7 +82,7 @@ class FuturesSettingsStateTests(unittest.TestCase):
         self.router = FakeFuturesSettingsRouter()
         state.BINANCE_FUTURES_SETTINGS_ROUTER_FACTORY = lambda: self.router
         self.real_orders_patcher = patch.object(
-            state, "real_orders_enabled", return_value=True
+            state, "real_orders_enabled", return_value=False
         )
         self.coordinator_status_patcher = patch.object(
             state,
@@ -213,48 +213,28 @@ class FuturesSettingsStateTests(unittest.TestCase):
         self.assertEqual(before, state.BINANCE_FUTURES_SETTINGS_INTERNAL)
         self.assertEqual([], self.router.configure_calls)
 
-    def test_real_orders_false_blocks_preview_before_get_and_token(self) -> None:
-        before = copy.deepcopy(state.BINANCE_FUTURES_SETTINGS_INTERNAL)
-        self.real_orders_mock.return_value = False
-
-        result = state.preview_binance_futures_settings(
-            "ETHUSDT", "ISOLATED", 1
-        )
-
-        self.assertFalse(result["ok"])
-        self.assertEqual(
-            "binance-futures-settings-real-orders-disabled",
-            result["reason"],
-        )
-        self.assertEqual({}, result["authorization"])
-        self.assertEqual([], self.router.observation_calls)
+    def test_settings_preview_does_not_need_order_runtime_authority(self) -> None:
+        result = state.preview_binance_futures_settings("ETHUSDT", "ISOLATED", 1)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["authorization"]["confirmation_token"])
+        self.assertEqual(["ETHUSDT"], self.router.observation_calls)
         self.assertEqual([], self.router.configure_calls)
-        self.assertEqual(before, state.BINANCE_FUTURES_SETTINGS_INTERNAL)
+        self.assertFalse(state.real_orders_enabled())
 
-    def test_real_orders_false_blocks_apply_before_token_consumption(self) -> None:
-        preview = state.preview_binance_futures_settings(
-            "ETHUSDT", "ISOLATED", 1
-        )
+    def test_settings_apply_needs_exact_confirmation_without_order_arm(self) -> None:
+        preview = state.preview_binance_futures_settings("ETHUSDT", "ISOLATED", 1)
         token = preview["authorization"]["confirmation_token"]
-        self.real_orders_mock.return_value = False
-        observations_before = list(self.router.observation_calls)
-
-        result = state.apply_binance_futures_settings(
-            token, confirmed=True
-        )
-
-        self.assertFalse(result["ok"])
-        self.assertEqual(
-            "binance-futures-settings-real-orders-disabled",
-            result["reason"],
-        )
-        self.assertFalse(
-            state.BINANCE_FUTURES_SETTINGS_INTERNAL["confirmation_used"]
-        )
-        self.assertEqual(
-            observations_before, self.router.observation_calls
-        )
+        refused = state.apply_binance_futures_settings(token, confirmed=False)
+        self.assertFalse(refused["ok"])
         self.assertEqual([], self.router.configure_calls)
+        result = state.apply_binance_futures_settings(token, confirmed=True)
+        self.assertTrue(result["ok"])
+        self.assertTrue(state.BINANCE_FUTURES_SETTINGS_INTERNAL["confirmation_used"])
+        self.assertGreaterEqual(len(self.router.observation_calls), 3)
+        self.assertEqual(1, len(self.router.configure_calls))
+        self.assertFalse(state.apply_binance_futures_settings(token, confirmed=True)["ok"])
+        self.assertEqual(1, len(self.router.configure_calls))
+        self.assertFalse(state.real_orders_enabled())
 
     def test_phase_race_blocks_immediate_pre_mutation_send(self) -> None:
         preview = state.preview_binance_futures_settings(

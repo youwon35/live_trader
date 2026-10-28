@@ -303,6 +303,13 @@ def real_orders_enabled() -> bool:
     return os.getenv("LIVE_TRADER_ENABLE_REAL_ORDERS", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+
+def _reserved_short_order_authorized(broker_id: str, operation: str) -> bool:
+    from .short_live_order_authority import check_short_live_authority
+    exchange = {"kis": "KIS", "upbit": "UPBIT", "binance": "BINANCE", "binance-futures": "BINANCE"}.get(str(broker_id).lower())
+    return bool(exchange and check_short_live_authority(exchange, operation=operation))
+
+
 def mask_env_value(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -345,15 +352,12 @@ def broker_readiness() -> list[BrokerReadiness]:
         if missing:
             status: BrokerStatus = "missing_credentials"
             detail = "실거래 API 키/계좌 환경 변수가 비어 있습니다."
-        elif not adapter_enabled:
-            status = "disabled"
-            detail = "주문 어댑터는 구현되어 있지만 LIVE_TRADER_ENABLE_REAL_ORDERS 잠금이 꺼져 있습니다."
         elif not adapter_implemented:
             status = "adapter_required"
             detail = "실주문 서명/전송 어댑터 구현이 필요합니다."
         else:
             status = "connected"
-            detail = "주문 요청 생성 어댑터가 준비되었습니다. 계좌/포지션 대조와 운영 게이트를 통과해야 전송됩니다."
+            detail = "인증정보와 주문 어댑터가 준비되었습니다. 실제 계좌 연결은 조회로 확인하며 주문은 실행 시작 확인과 운영 게이트를 통과해야 전송됩니다."
         rows.append(
             BrokerReadiness(
                 broker_id=str(spec["broker_id"]),
@@ -406,8 +410,8 @@ def broker_diagnostics(broker_id: str | None = None) -> list[dict[str, Any]]:
             {
                 "key": "live_route",
                 "label": "실거래 라우트",
-                "status": "pass" if adapter_enabled else "fail",
-                "detail": "LIVE_TRADER_ENABLE_REAL_ORDERS=true" if adapter_enabled else "LIVE_TRADER_ENABLE_REAL_ORDERS=true가 필요합니다.",
+                "status": "info",
+                "detail": "별도 허용 스위치 없이 실행 시작 시 한 번 확인합니다. 준비 검사는 주문을 보내지 않습니다.",
             },
             {
                 "key": "adapter_code",
@@ -430,8 +434,6 @@ def broker_diagnostics(broker_id: str | None = None) -> list[dict[str, Any]]:
             else "adapter_required"
             if not adapter_implemented
             else "connected"
-            if adapter_enabled
-            else "disabled"
         )
         rows.append(
             {
@@ -459,8 +461,7 @@ def broker_next_actions(missing: list[str], adapter_enabled: bool) -> list[str]:
     actions: list[str] = []
     if missing:
         actions.append(f"환경 변수 입력 필요: {', '.join(missing)}")
-    if not adapter_enabled:
-        actions.append("LIVE_TRADER_ENABLE_REAL_ORDERS=true 설정 필요")
+    actions.append("실제 주문은 해당 실행의 시작 확인 후에만 허용됩니다.")
     actions.append("공식 API 샌드박스/소액 주문으로 별도 테스트 필요")
     actions.append("소액 Dry Run/Shadow 검증 후 Small Live 승인 필요")
     return actions
@@ -2951,7 +2952,7 @@ class LiveBrokerRouter:
     """Provider-specific live broker boundary.
 
     The router can build signed official API requests, but order submission is
-    still gated by LIVE_TRADER_ENABLE_REAL_ORDERS and the state-layer risk checks.
+    gated by consumed runtime start consent or an exact scoped reservation, and state-layer risk checks.
     """
 
     def __init__(self, execution_stream_manager: Any | None = None) -> None:
@@ -3018,8 +3019,9 @@ class LiveBrokerRouter:
     def place_order(self, intent: dict[str, object]) -> dict[str, object]:
         from .short_live_order_authority import validate_short_live_native_payload, validate_short_live_normalized_payload, validate_short_live_prepared_request
         validate_short_live_native_payload(intent)
-        if not real_orders_enabled():
-            raise BrokerNotReadyError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 아니므로 실주문 전송을 차단했습니다.")
+        if not real_orders_enabled() and not _reserved_short_order_authorized(
+                str(intent.get("broker_id") or intent.get("broker") or ""), "PLACE_ORDER"):
+            raise BrokerNotReadyError("실행 시작 확인 또는 정확한 주문 예약 권한이 필요합니다.")
         broker_id = str(intent.get("broker_id") or intent.get("broker") or "").lower()
         if broker_id == "kis":
             try:
@@ -3172,8 +3174,8 @@ class LiveBrokerRouter:
         if not short_live_dispatch_present():
             raise BrokerNotReadyError("SCOPED_PROTECTION_RESERVATION_REQUIRED")
         validate_short_live_native_payload(intent)
-        if not real_orders_enabled():
-            raise BrokerNotReadyError("REAL_ORDERS_DISABLED")
+        if not _reserved_short_order_authorized("binance-futures", "FUTURES_PROTECT"):
+            raise BrokerNotReadyError("SCOPED_PROTECTION_RESERVATION_REQUIRED")
         mode = ensure_response_ok("binance-futures", send_binance_signed_request(
             build_binance_futures_position_mode_request, futures=True))
         if (not isinstance(mode, dict) or type(mode.get("dualSidePosition")) is not bool
@@ -3211,8 +3213,8 @@ class LiveBrokerRouter:
         if not short_live_dispatch_present():
             raise BrokerNotReadyError("SCOPED_PROTECTION_RESERVATION_REQUIRED")
         validate_short_live_native_payload(intent)
-        if not real_orders_enabled():
-            raise BrokerNotReadyError("REAL_ORDERS_DISABLED")
+        if not _reserved_short_order_authorized("binance-futures", "FUTURES_CANCEL_PROTECTION"):
+            raise BrokerNotReadyError("SCOPED_PROTECTION_RESERVATION_REQUIRED")
         self.get_futures_protection(str(intent.get("symbol") or ""),
             algo_id=str(intent.get("algo_id") or ""), client_algo_id=str(intent.get("client_algo_id") or ""))
         try:
@@ -3748,8 +3750,8 @@ class LiveBrokerRouter:
     def cancel_order(self, broker_id: str, broker_order_id: str, **context: object) -> dict[str, object]:
         from .short_live_order_authority import validate_short_live_native_payload, validate_short_live_prepared_request
         validate_short_live_native_payload({"broker_id": broker_id, "broker_order_id": broker_order_id, **context})
-        if not real_orders_enabled():
-            raise BrokerNotReadyError("LIVE_TRADER_ENABLE_REAL_ORDERS=true가 아니므로 실제 주문 취소 전송을 차단했습니다.")
+        if not real_orders_enabled() and not _reserved_short_order_authorized(broker_id, "CANCEL_ORDER"):
+            raise BrokerNotReadyError("실행 시작 확인 또는 정확한 주문 취소 예약 권한이 필요합니다.")
         broker_id = broker_id.lower().strip()
         if broker_id == "kis":
             sealed_kill_intent = context.pop(

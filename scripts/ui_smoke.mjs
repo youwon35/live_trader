@@ -195,11 +195,11 @@ try {
         if (!await page.getByRole("button", { name: /자본 배분·포지션 노출/ }).count()) {
           issues.push(`${viewport.name}/${tab.label}: account allocation disclosure is missing`);
         }
-        if (!await page.getByText("10초 자동 갱신·대조", { exact: true }).count()) {
-          issues.push(`${viewport.name}/${tab.label}: automatic refresh/reconciliation label is missing`);
+        if (await page.getByText("10초 자동 갱신·대조", { exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: obsolete automatic account refresh is visible`);
         }
-        if (!await page.getByRole("button", { name: "현재 계좌를 기준 원장으로 승인", exact: true }).count()) {
-          issues.push(`${viewport.name}/${tab.label}: explicit program-ledger baseline action is missing`);
+        if (await page.getByRole("button", { name: "현재 계좌를 기준 원장으로 승인", exact: true }).count()) {
+          issues.push(`${viewport.name}/${tab.label}: disabled wholesale baseline action is still visible`);
         }
       }
       if (tab.label === "주문·체결") {

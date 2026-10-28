@@ -121,7 +121,7 @@ def _ordinary_snapshot() -> dict[str, Any]:
         raise UpbitOrderAuthorityError(
             "ordinary-upbit-mutation-application-lease-required"
         )
-    if snapshot["ordinaryMutationEnabled"] is not True:
+    if not short_scope and snapshot["ordinaryMutationEnabled"] is not True:
         raise UpbitOrderAuthorityError(
             "ordinary-upbit-mutation-real-orders-disabled"
         )

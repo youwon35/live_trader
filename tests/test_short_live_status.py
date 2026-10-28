@@ -118,7 +118,7 @@ class ShortLiveStatusTests(unittest.TestCase):
             self.assertIn("OTHER_FUNCTIONAL_AUTHORITY_ACTIVE",runtime._controls())
             state._upbit_order_authority_snapshot=lambda:{"functionalAuthorityOpen":False}
             runtime.request_global_stop(); self.assertIn("GLOBAL_MONITOR_STOP_REQUESTED",runtime._controls())
-            state.real_orders_enabled=lambda:False; self.assertIn("REAL_ORDERS_DISABLED",runtime._controls())
+            state.real_orders_enabled=lambda:False; self.assertNotIn("REAL_ORDERS_DISABLED",runtime._controls())
 
     def test_explicit_safety_reductions_stop_short_lane_without_service_lock(self):
         state = {"operator_confirmed": False}

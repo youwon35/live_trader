@@ -734,6 +734,7 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 state.run_reconciliation(
                     refresh_brokers=payload.get("refresh_brokers") is not False,
                     include_snapshot=payload.get("include_snapshot") is not False,
+                    display_only=payload.get("display_only") is True,
                 )
             )
             return
@@ -759,6 +760,7 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                     str(payload.get("broker_id", "all")),
                     force_snapshot=force_snapshot if isinstance(force_snapshot, bool) else None,
                     include_snapshot=payload.get("include_snapshot") is not False,
+                    display_only=payload.get("display_only") is True,
                 )
             )
             return

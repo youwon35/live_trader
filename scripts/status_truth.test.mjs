@@ -4,7 +4,7 @@ import {environmentStatus, ordinaryEntryStatus, currentOrderPermission, ordinary
 const now=Date.parse('2026-10-28T00:00:00Z');
 const base=()=>({api_connected:true,kill_switch:false,new_entries_blocked:true,readiness:[{label:'실거래 라우트 환경',status:'pass'}],continuous_runtime:{profiles:{}},live_governance:{}});
 test('allowed current settings are not mislabeled locked when no preflight or worker exists',()=>{
- const result=environmentStatus(base(),'a',now); assert.equal(result.items[0].value,'허용');
+ const result=environmentStatus(base(),'a',now); assert.equal(result.items[0].value,'시작 시 한 번');assert.equal(result.items[0].label,'실거래 확인');
  assert.equal(result.items[1].value,'점검 필요');assert.equal(result.items.length,3);
  assert.equal(ordinaryRuntimeActive(base()),false);assert.equal(result.valid,false);
 });

@@ -1,7 +1,7 @@
 // Adapter for the read-only reconciliation snapshot. Displayed strings are never parsed as money.
 import { allocationNumber } from "../../../packages/design/allocation-model.js";
 const labels = { kis: "KIS 국내", binance: "Binance 현물", "binance-futures": "Binance 선물", upbit: "Upbit 현물" };
-function positionRow(position, currency, futures = false, nowMs = Date.now()) {
+function positionRow(position, currency, futures = false, nowMs = Date.now(), preserveObserved = false) {
   const quantity = allocationNumber(position.broker_qty_value);
   const spot = ["binance", "upbit"].includes(String(position.broker_id || ""));
   const display = spot && position.display_valuation && typeof position.display_valuation === "object" ? position.display_valuation : null;
@@ -11,7 +11,7 @@ function positionRow(position, currency, futures = false, nowMs = Date.now()) {
   const expires = display ? Date.parse(display.expires_at || "") : NaN;
   const quoteReady = display ? display.status === "OBSERVED" && display.order_authority_granted === false
     && display.currency === expectedCurrency && Number.isFinite(observed) && Number.isFinite(expires)
-    && observed <= nowMs + 5000 && expires > nowMs && expires > observed && expires - observed <= 61000
+    && observed <= nowMs + 5000 && (preserveObserved || expires > nowMs) && expires > observed && expires - observed <= 61000
     : ["market_value", "market_notional"].includes(position.valuation_basis);
   // A display-only quote never changes broker cash, equity, cost basis or order authority.
   const evaluated = quantity !== null && price !== null && price > 0 ? Math.abs(quantity) * price : null;
@@ -22,14 +22,14 @@ function positionRow(position, currency, futures = false, nowMs = Date.now()) {
     value, priced: value !== null, observedAt: display?.observed_at || null,
     side: futures ? (["LONG", "SHORT"].includes(side) ? side : "UNKNOWN") : "SPOT" };
 }
-export function liveAllocationAccounts(accounts = [], positions = [], { nowMs = Date.now() } = {}) {
+export function liveAllocationAccounts(accounts = [], positions = [], { nowMs = Date.now(), preserveObserved = false } = {}) {
   const held = positions.filter(position => allocationNumber(position.broker_qty_value) !== 0);
   const result = accounts.map((account) => {
     const provider = String(account.broker_id || "");
     const currency = String(account.currency || "UNKNOWN").toUpperCase();
     const items = held.filter(position => String(position.broker_id || "") === provider)
       .filter(position => provider !== "kis" || String(position.currency || "").toUpperCase() === currency)
-      .map(position => positionRow(position, currency, provider === "binance-futures", nowMs));
+      .map(position => positionRow(position, currency, provider === "binance-futures", nowMs, preserveObserved));
     return { id: provider, label: provider === "kis" && currency === "USD" ? "KIS 미국" : labels[provider] || account.broker_name || provider,
       currency: /^[A-Z]{3,5}$/.test(currency) ? currency : "UNKNOWN",
       cash: allocationNumber(account.broker_cash_value), equity: allocationNumber(account.broker_equity_value),
@@ -44,7 +44,7 @@ export function liveAllocationAccounts(accounts = [], positions = [], { nowMs = 
     const currency = String(position.currency || "UNKNOWN").toUpperCase();
     if (accounts.some(account => String(account.broker_id) === provider && (provider !== "kis" || String(account.currency).toUpperCase() === currency))) continue;
     const id = provider === "kis" ? `kis-${currency.toLowerCase()}` : provider;
-    const row = positionRow(position, currency, provider === "binance-futures", nowMs);
+    const row = positionRow(position, currency, provider === "binance-futures", nowMs, preserveObserved);
     const unmatched = result.find(account => account.id === id);
     if (unmatched) { unmatched.positions.push(row); continue; }
     result.push({ id, label: provider === "kis" ? (currency === "USD" ? "KIS 미국" : `KIS 해외 ${currency}`) : position.broker_name || "계좌 미확인",

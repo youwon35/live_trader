@@ -203,45 +203,33 @@ function harness(props = {}) {
   return view;
 }
 
-test("stored permission and unsaved draft do not claim current process order authority", async () => {
+test("obsolete live-lock settings are absent and reading never enables trading", async () => {
   const saved = settings();
-  saved.groups.push({ id: "live-lock", label: "실거래 잠금" });
-  saved.fields.push({ key: "LIVE_TRADER_ENABLE_REAL_ORDERS", kind: "bool", group: "live-lock",
-    label: "실전 주문 라우트", detail: "fixture", configured: true, value: "true", default: "false" });
-  setup({ ok: true, settings: saved });
-  const view = harness({ runtimeSnapshot: { api_connected: true,
-    readiness: [{ label: "실거래 라우트 환경", status: "fail" }],
-    operator_confirmed: false, dry_run: true, new_entries_blocked: true } });
+  saved.groups.push({id:"live-lock",label:"실거래 잠금"});
+  saved.fields.push({key:"LIVE_TRADER_ENABLE_REAL_ORDERS",kind:"bool",group:"live-lock",label:"실전 주문 라우트",detail:"legacy",configured:true,value:"true",default:"false"});
+  setup({ok:true,settings:saved});
+  const view=harness();
   try {
     await view.settle();
-    const html = view.group("live-lock");
-    assert.match(html, /저장된 실전 주문 라우트: 허용/);
-    assert.match(html, /현재 앱의 실전 주문 허용: 차단됨/);
-    assert.match(html, /앱을 다시 열면 실전 주문 허용이 해제/);
-    assert.match(html, /운용자 확인 필요 · 주문 전송 없이 점검 켜짐 · 신규 진입 차단/);
-    elements(view.field("LIVE_TRADER_ENABLE_REAL_ORDERS"), presentation.ToggleSwitch)[0].props.onChange(false);
-    assert.match(view.render(), /저장된 실전 주문 라우트: 허용/, "editing alone cannot change saved status");
-    assert.equal(calls.filter((call) => call.method === "POST").length, 0, "reading controls must never arm the process");
-  } finally { view.unmount(); }
+    assert.doesNotMatch(view.render(), /실거래 잠금|실전 주문 라우트|앱을 다시 열면 실전 주문 허용이 해제/);
+    assert.equal(calls.filter(call=>call.method==="POST").length,0);
+  } finally {view.unmount();}
 });
 
-test("current order authority remains unknown after disconnect or without a verified control response", async () => {
-  for (const runtimeSnapshot of [
-    { api_connected: false, readiness: [{ label: "실거래 라우트 환경", status: "pass" }] },
-    { api_connected: true, readiness: [] },
-    { api_connected: true, readiness: [{ label: "실거래 라우트 환경", status: "warn" }] },
-    { api_connected: true, readiness: {} },
-  ]) {
-    setup();
-    const view = harness({ runtimeSnapshot });
-    try {
-      await view.settle();
-      const html = view.group("live-lock");
-      assert.match(html, /현재 앱의 실전 주문 허용: 미확인/);
-      assert.doesNotMatch(html, /현재 앱의 실전 주문 허용: 확인됨/);
-      assert.equal(calls.filter((call) => call.method === "POST").length, 0);
-    } finally { view.unmount(); }
-  }
+test("API essentials are open while fee detail stays collapsed with no data loss", async () => {
+  const saved=settings();
+  saved.fields.push({key:"SHORT_LIVE_KIS_COST_SOURCE",kind:"text",group:"kis",label:"비용 확인 근거",detail:"확인 메모",configured:true,value:"요율 조회",default:""});
+  setup({ok:true,settings:saved});
+  const view=harness();
+  try {
+    await view.settle();
+    const html=view.render();
+    assert.match(html, /<details class="ts-disclosure" open=""><summary class="ts-disclosure-summary">API 연결에 필요한 정보/);
+    assert.match(html, /<details class="ts-disclosure"><summary class="ts-disclosure-summary">KIS 시험 비용 상세/);
+    assert.match(html, /본인 계좌의 수수료·세율을 어디서 확인했는지/);
+    assert.match(html, /value="요율 조회"/);
+    assert.equal(calls.filter(call=>call.method==="POST").length,0);
+  } finally {view.unmount();}
 });
 
 test("pending settings read never presents READY or stale broker readiness", async () => {
@@ -268,8 +256,8 @@ test("filled official fee defaults stay amber and unconfirmed despite stale brok
   const html = await view.settle();
   assert.match(html, /공식 기본표 참고 임시값 · 본인 적용 수수료 확인 필요/);
   assert.match(html, /수수료 확인 필요/);
-  assert.match(html, /최소수수료·제세금·자동환전 요율·환전 및 정산 비용은 미확인/);
-  assert.match(html, /실제 주문은 계속 차단/);
+  assert.match(html, /KIS 시험 비용 상세/);
+  assert.match(html, /다른 거래소의 연결 상태와 별개/);
   assert.doesNotMatch(html, /READY|설정 확인<\/span>/);
   for (const field of feeSettings().fields.filter((item) => item.key.startsWith("KIS_ESTIMATED_"))) {
     assert.equal(view.input(field.key).props.value, field.default, "default must be a real editable value");

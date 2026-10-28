@@ -84,3 +84,13 @@ test("spot display fields cannot change futures margin equity into leveraged not
  const result=allocationView(liveAllocationAccounts(accounts,positions,{nowMs:valuationNow}));
  assert.equal(result.groups[0].total,100); assert.equal(result.rows[0].value,400); assert.equal(result.groups[0].items.length,1);
 });
+
+test("manual account view retains valid past observations without presenting them as fresh quotes", () => {
+ const accounts=[{broker_id:"binance",currency:"USDT",broker_cash_value:10,broker_equity_value:10,valuation_basis:"cash_only"}];
+ const positions=[{broker_id:"binance",symbol:"SOL",broker_qty_value:2,display_valuation:freshValuation()}];
+ const nowMs=valuationNow+3600000;
+ assert.equal(liveAllocationAccounts(accounts,positions,{nowMs})[0].positions[0].value,null);
+ assert.equal(liveAllocationAccounts(accounts,positions,{nowMs,preserveObserved:true})[0].positions[0].value,240);
+ positions[0].display_valuation.status="UNKNOWN";
+ assert.equal(liveAllocationAccounts(accounts,positions,{nowMs,preserveObserved:true})[0].positions[0].value,null);
+});

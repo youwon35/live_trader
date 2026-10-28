@@ -115,6 +115,10 @@ class AuthorityTests(unittest.TestCase):
             snapshot["ordinaryMutationEnabled"] = False
             with auth.short_live_dispatch(self.order, self.native, lambda _: True):
                 auth.validate_short_live_native_payload(self.native)
+                with upbit.ordinary_upbit_final_mutation_boundary(operation="PLACE_ORDER"): pass
+            snapshot["applicationInstanceLeaseHeld"] = False
+            with auth.short_live_dispatch(self.order, self.native, lambda _: True):
+                auth.validate_short_live_native_payload(self.native)
                 with self.assertRaises(upbit.UpbitOrderAuthorityError):
                     with upbit.ordinary_upbit_final_mutation_boundary(operation="PLACE_ORDER"): pass
 
@@ -202,6 +206,32 @@ class AuthorityTests(unittest.TestCase):
         request = namespace["build_binance_spot_order_request"](self.native)
         parsed = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(request.url).query))
         self.assertEqual(self.order["clientOrderId"], parsed["newClientOrderId"])
+
+    def test_real_router_accepts_only_exact_short_reservation_with_global_switch_off(self):
+        tree = ast.parse((ROOT / "brokers.py").read_text(encoding="utf-8"))
+        helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_reserved_short_order_authorized")
+        router = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "LiveBrokerRouter")
+        place = next(n for n in router.body if isinstance(n, ast.FunctionDef) and n.name == "place_order")
+        sent = []
+        self.activate("UPBIT_KRW_SPOT")
+        request = self.prepared(provider="upbit", endpoint="/v1/orders", url="https://api.upbit.com/v1/orders",
+            body={"market": self.order["symbol"], "side": "bid", "ord_type": "limit", "identifier": self.order["clientOrderId"],
+                  "volume": self.order["quantity"], "price": self.order["referencePrice"]})
+        namespace = {"__package__": PKG, "real_orders_enabled": lambda: False, "BrokerNotReadyError": RuntimeError,
+            "build_upbit_order_request": lambda _: request, "ordinary_upbit_final_mutation_boundary": upbit.ordinary_upbit_final_mutation_boundary,
+            "UpbitOrderAuthorityError": upbit.UpbitOrderAuthorityError, "send_prepared_request": lambda value: sent.append(value) or {"ok": True}}
+        exec(compile(ast.Module(body=[helper, place], type_ignores=[]), "real-router-offline", "exec"), namespace)
+        snapshot = {"applicationInstanceLeaseHeld": True, "functionalAuthorityOpen": False,
+                    "ordinaryRoutesClosed": True, "ordinaryMutationEnabled": False}
+        with patch.object(upbit, "_snapshot", return_value=snapshot):
+            with self.assertRaises(auth.ShortLiveAuthorityError):
+                namespace["place_order"](None, self.native)
+            with auth.short_live_dispatch(self.order, self.native, lambda _: True):
+                self.assertTrue(namespace["place_order"](None, self.native)["ok"])
+            with auth.short_live_dispatch(self.order, self.native, lambda _: True):
+                with self.assertRaises(auth.ShortLiveAuthorityError):
+                    namespace["place_order"](None, {**self.native, "quantity": "99"})
+        self.assertEqual([request], sent)
 
     def test_domestic_wire_endpoint_and_native_code_are_required(self):
         self.activate("KIS_KR_CASH")

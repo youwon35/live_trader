@@ -89,7 +89,6 @@ import {
   setRiskSetting,
   saveUiSettings,
   saveSharedSearchPresets,
-  seedProgramLedgerBaseline,
   updateArtifactMetadata,
   saveEnvSettings,
   submitTestIntent,
@@ -105,7 +104,7 @@ import { executionApprovalLabel, strategyLifecycleRank } from "../../../packages
 import { readArtifactLifecycle } from "../../../packages/design/artifact-lifecycle.js";
 import { buildLiveStrategyProgress, liveDeploymentLifecycleLabel, liveStrategyLifecycleStage, liveStrategyValidationStage, liveStrategyPhaseFilter, liveStrategyPhaseId, liveStrategyPhaseLabel, liveStrategyPhaseOptions, liveStrategyProgressLabel, liveRuntimeModeLabel } from "./strategyProgressDisplay.js";
 import { LIVE_WORKSPACE_ROUTE_IDS, liveNavigationRoot, liveNavigationRoute, liveSectionTabs } from "./liveNavigation.js";
-import { liveReconciliationDisplay } from "./liveReconciliationDisplay.js";
+import { liveReconciliationDisplay, liveExecutionDisplay, liveLedgerDisplay, liveReconciliationIssues } from "./liveReconciliationDisplay.js";
 import {
   buildRetryMatrix,
   projectAccountReconciliation,
@@ -113,7 +112,7 @@ import {
   projectOrderTimeline,
 } from "./liveWorkspaceModel";
 import {
-  ACCOUNT_REFRESH_INTERVAL_MS,
+  createStartupAccountRead,
   createAccountRefreshCoordinator,
 } from "./accountRefresh";
 import {
@@ -415,6 +414,7 @@ const SAFETY_CONFIRMATION_ACTION_LABELS = {
   DRY_RUN_OFF: "Dry Run 보호 해제",
   NEW_ENTRIES_BLOCKED_OFF: "신규 진입 차단 해제",
   REAL_ORDERS_ENABLE: "실전 주문 라우트 활성화",
+  RUNTIME_START: "실거래 실행 시작",
   FUNCTIONAL_TEST_START: "KIS 실전 기능시험 시작",
   UPBIT_SUPERVISED_PREPARE: "Upbit 감독형 사전 준비",
   UPBIT_FUNCTIONAL_START: "Upbit 2시간 기능시험 시작",
@@ -1913,6 +1913,8 @@ function App() {
   const snapshotResponseGateRef = useRef(null);
   if (!snapshotResponseGateRef.current) snapshotResponseGateRef.current = createSnapshotResponseGate();
   const accountRefreshRequestRef = useRef(null);
+  const startupAccountReadRef = useRef(null);
+  if (!startupAccountReadRef.current) startupAccountReadRef.current = createStartupAccountRead();
   const snapshotSafetyEpochRef = useRef(0);
   const emergencyActionInFlightRef = useRef("");
   const safetyConfirmationResolverRef = useRef(null);
@@ -2039,19 +2041,8 @@ function App() {
   }, [pollingIntervals.snapshotMs]);
 
   useEffect(() => {
-    if (selectedNav !== "accounts" || snapshot.api_connected !== true) return undefined;
-    let stopped = false;
-    let timer;
-    const refreshWhenVisible = async () => {
-      if (stopped) return;
-      if (document.visibilityState !== "hidden") await refreshBrokerAccounts();
-      // Wait after completion; a slow broker read must not cause an immediate
-      // second request when it happens to finish near an interval boundary.
-      if (!stopped) timer = window.setTimeout(refreshWhenVisible, ACCOUNT_REFRESH_INTERVAL_MS);
-    };
-    void refreshWhenVisible();
-    return () => { stopped = true; window.clearTimeout(timer); };
-  }, [selectedNav, snapshot.api_connected]);
+    void startupAccountReadRef.current(snapshot.api_connected === true, refreshBrokerAccounts);
+  }, [snapshot.api_connected]);
 
   useEffect(() => {
     applyAppearance(appearance);
@@ -2688,12 +2679,6 @@ function App() {
           onPreflight={() => runAction(() => runFinalPreflight(deploymentContext.id, deploymentContext.strategyId))}
           onAccountRefresh={refreshBrokerAccounts}
           accountRefreshState={accountRefreshState}
-          onProgramLedgerBaseline={() =>
-            confirmSafetyChange(
-              "현재 브로커 잔고와 포지션을 프로그램 원장의 새 기준으로 승인하시겠습니까? 외부 주문·입출금 차이가 모두 현재 값으로 재설정됩니다.",
-              () => seedProgramLedgerBaseline(true),
-            )
-          }
           onEnvSettings={(values, confirmed) => runAction(() => saveEnvSettings(values, confirmed))}
           appearance={appearance}
           updateAppearance={updateAppearance}
@@ -2860,7 +2845,6 @@ function WorkspaceContent({
   onPreflight,
   onAccountRefresh,
   accountRefreshState,
-  onProgramLedgerBaseline,
   onEnvSettings,
   appearance,
   updateAppearance,
@@ -2981,7 +2965,6 @@ function WorkspaceContent({
         <UnifiedBrokerAccountPanel
           accounts={snapshot.accounts ?? []}
           executionEvents={snapshot.execution_events}
-          onBaseline={onProgramLedgerBaseline}
           onRefresh={onAccountRefresh}
           positions={snapshot.positions ?? []}
           reconciledAt={snapshot.reconciliation?.summary?.last_run}
@@ -3255,6 +3238,7 @@ function AccountRefreshStatus({ snapshot, state, nowMs }) {
     {state.error && <p role="alert">계좌 갱신 실패: {state.error}</p>}
     {state.warning && <p role="status">{state.warning}</p>}
     <p>{view.detail}</p>
+    <p>계좌는 앱 시작 시 한 번 읽습니다. 최신 잔고는 ‘계좌 다시 읽기’로 확인하세요. 실행 중 주문·체결 확인은 별도로 계속됩니다.</p>
   </section>;
 }
 
@@ -3268,17 +3252,16 @@ function ThreeWayReconciliationPanel({ snapshot = {}, accountRefreshState = init
   const summary = snapshot.reconciliation?.summary ?? {};
   const execution = snapshot.execution_events ?? {};
   const ledger = snapshot.program_ledger ?? {};
-  const streams = execution.streams?.brokers ?? snapshot.execution_streams?.brokers ?? {};
-  const streamConnected = Object.values(streams).some((item) => item?.connected === true);
   const reconciliationDisplay = liveReconciliationDisplay(snapshot);
   const brokerKnown = reconciliationDisplay.brokerKnown && observation.fresh;
-  const ledgerKnown = Number(ledger.cash_count || ledger.cashCount || (ledger.cash || []).length || 0) > 0
-    || Number(ledger.position_count || ledger.positionCount || (ledger.positions || []).length || 0) > 0;
+  const executionDisplay = liveExecutionDisplay(snapshot, { nowMs });
+  const ledgerDisplay = liveLedgerDisplay(snapshot);
+  const issues = liveReconciliationIssues(snapshot);
   const projected = projectAccountReconciliation(snapshot);
   const rows = [
     { label: "거래소 잔고 조회", status: brokerKnown ? "pass" : "warn", value: brokerKnown ? "조회됨" : "미확인", detail: `마지막 대조 ${summary.last_run || "미실행"}` },
-    { label: "실시간 주문·체결 기록", status: streamConnected ? "pass" : execution.last_poll ? "warn" : "na", value: streamConnected ? "연결" : execution.last_poll ? "폴링 보조" : "해당 없음", detail: `마지막 동기화 ${execution.last_poll || "미실행"}` },
-    { label: "앱 체결 원장", status: ledgerKnown ? "pass" : "warn", value: ledgerKnown ? "원장 있음" : "기준 없음", detail: `체결 이벤트 ${Array.isArray(ledger.execution_events) ? ledger.execution_events.length : "미확인"}건 · 기준 ${ledger.state?.last_baseline || "미승인"}` },
+    { label: "주문·체결 확인 방식", ...executionDisplay },
+    { label: "프로그램 원장", ...ledgerDisplay },
     { label: "3자 최종 대조", status: observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.status : "warn", value: observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.label : "현재 대조 미확인", detail: `불일치 ${summary.mismatch_count ?? "미확인"} · API/원장 필요 ${summary.api_required_count ?? "미확인"}` },
   ];
   return (
@@ -3287,6 +3270,14 @@ function ThreeWayReconciliationPanel({ snapshot = {}, accountRefreshState = init
       <div className="ts-panel-grid ts-panel-grid--two">
         {rows.map(row => <AccountObservationLine key={row.label} label={row.label} value={row.value} detail={row.detail} tone={statusTone(row.status)} />)}
       </div>
+      {issues.length > 0 && <details className="ts-disclosure" open>
+        <summary className="ts-disclosure-summary">확인할 차이 · {issues.length}개</summary>
+        <div className="ts-disclosure-body">{issues.map((issue, index) => <div className="compact-row" key={`${issue.brokerId}:${issue.kind}:${issue.symbol}:${index}`}>
+          <strong>{({kis:"한국투자증권",binance:"Binance 현물","binance-futures":"Binance 선물",upbit:"Upbit"})[issue.brokerId] || issue.brokerId} · {issue.symbol || issue.currency} · {issue.reason}</strong>
+          <span>{issue.detail}</span>
+        </div>)}</div>
+      </details>}
+      <p className="workflow-copy">REST는 API로 직접 읽는 방식입니다. 실시간 연결이 없어도 조회할 수 있으며, 조회 성공이 실제 체결이나 원장 일치를 뜻하지는 않습니다.</p>
       <ReconciliationEvidence snapshot={snapshot} />
     </section>
   );
@@ -3914,7 +3905,7 @@ const FUTURES_FILL_SOAK_BLOCKER_LABELS = {
   "initial-equity-invalid": "USD-M Futures 계좌 equity를 확인할 수 없습니다.",
   "minimum-order-exceeds-available-usdt": "거래소 최소 주문 금액보다 Futures 가용 USDT가 적습니다.",
   "minimum-order-derivation-failed": "현재 종목은 5~10 USDT 안전 주문 범위로 수량을 만들 수 없습니다.",
-  "real-orders-disabled": "실주문 환경 잠금이 비활성화되어 있습니다.",
+  "real-orders-disabled": "이 실행에 대한 실주문 시작 확인이 필요합니다.",
   "immutable-report-path-unavailable": "덮어쓰기 방지 리포트 경로를 준비할 수 없습니다.",
   "preview-observation-failed": "실계좌 읽기 전용 조회에 실패했습니다.",
 };
@@ -5066,14 +5057,18 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
     });
   }, [settings]);
 
-  const groups = settings?.groups?.length ? settings.groups : [
+  const groups = (settings?.groups?.length ? settings.groups : [
     { id: "kis", label: "주식/ETF", detail: "한국투자증권 Open API" },
     { id: "binance", label: "Binance", detail: "코인 현물" },
     { id: "upbit", label: "Upbit", detail: "KRW 코인" },
-    { id: "live-lock", label: "실거래 잠금", detail: "실전 주문 라우트" },
-  ];
-  const fields = settings?.fields ?? [];
+  ]).filter(group => group.id !== "live-lock");
+  const fields = (settings?.fields ?? []).filter(field => field.group !== "live-lock");
   const visibleFields = fields.filter((field) => field.group === activeGroup);
+  const fieldSections = [
+    { id: "basic", title: "API 연결에 필요한 정보", fields: visibleFields.filter(field => field.kind === "secret" || field.key === "KIS_ACCOUNT_PRODUCT_CODE") },
+    { id: "fees", title: "KIS 시험 비용 상세", detail: "비용 확인 근거는 본인 계좌의 수수료·세율을 어디서 확인했는지 남기는 메모입니다. 적용 종목은 주식과 ETF의 다른 세율을 구별하며, 확인 시각은 그 정보가 오래되지 않았는지 검사합니다. KIS 주문 연결 시험을 할 때만 입력하세요. 비율 0.00015는 0.015%입니다.", fields: visibleFields.filter(field => field.key.startsWith("SHORT_LIVE_KIS_")) },
+    { id: "advanced", title: "수수료 추정·해외 결제·서버 주소", detail: "임시 수수료는 화면 계산용 참고값이며 계좌별 실제 수수료 확인을 대신하지 않습니다. 서버 주소는 연결 대상을 바꾸는 경우에만 수정하세요.", fields: visibleFields.filter(field => field.kind !== "secret" && field.key !== "KIS_ACCOUNT_PRODUCT_CODE" && !field.key.startsWith("SHORT_LIVE_KIS_")) },
+  ].filter(section => section.fields.length > 0);
   const provisionalFields = visibleFields.filter(isProvisionalKisFeeField);
   const confirmationRequired = provisionalFields.length > 0;
   const broker = brokers.find((item) => item.broker_id === activeGroup);
@@ -5090,14 +5085,6 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
           : checkCount ? `${checkCount} CHECK` : "설정 확인";
   const settingsTone = settingsStatus === "error" ? "danger"
     : settingsReady ? checkCount ? "warning" : "success" : "neutral";
-  const storedPermission = fields.find((field) => field.key === "LIVE_TRADER_ENABLE_REAL_ORDERS");
-  const permissionCheck = (Array.isArray(runtimeSnapshot.readiness) ? runtimeSnapshot.readiness : [])
-    .find((check) => check?.label === "실거래 라우트 환경");
-  const currentPermission = runtimeSnapshot.api_connected === true && ["pass", "fail"].includes(permissionCheck?.status)
-    ? permissionCheck.status === "pass" : null;
-  const currentControl = (name, enabled, disabled) => runtimeSnapshot.api_connected === true && typeof runtimeSnapshot[name] === "boolean"
-    ? runtimeSnapshot[name] ? enabled : disabled : "미확인";
-
   function updateDraft(key, value) {
     setDraft((current) => ({ ...current, [key]: value }));
   }
@@ -5111,12 +5098,11 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
       values[field.key] = value ?? "";
     });
     if (!Object.keys(values).length) return;
-    const enablingRealOrders = String(values.LIVE_TRADER_ENABLE_REAL_ORDERS || "").toLowerCase() === "true";
     saveInFlight.current = true;
     setSaving(true);
     setMessage("");
     try {
-      const result = await onSave(values, enablingRealOrders);
+      const result = await onSave(values, false);
       const saved = responseSettings(result);
       if (!saved || visibleFields.some((field) => !saved.fields.some((next) =>
         next.key === field.key && next.group === field.group && next.kind === field.kind))) {
@@ -5158,16 +5144,6 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
         variant="cards"
         value={activeGroup}
       />
-      {activeGroup === "live-lock" && (
-        <div {...semanticSurfaceProps(currentPermission === true ? "success" : "warning", "live-assistant-provisional-note")} role="note">
-          <strong>저장 설정과 현재 앱의 주문 허용</strong>
-          <p>저장된 실전 주문 라우트: {settingsStatus === "ready" && storedPermission
-            ? settingsBooleanValue(storedPermission.value) ? "허용" : "차단" : "미확인"} · 현재 앱의 실전 주문 허용: {currentPermission === true ? "확인됨" : currentPermission === false ? "차단됨" : "미확인"}</p>
-          <p>운용자 확인 {currentControl("operator_confirmed", "완료", "필요")} · 주문 전송 없이 점검 {currentControl("dry_run", "켜짐", "꺼짐")} · 신규 진입 {currentControl("new_entries_blocked", "차단", "허용")}</p>
-          <p>앱을 다시 열면 실전 주문 허용이 해제됩니다. 이 화면에서 설정을 저장하고 새 확인을 완료해야 현재 앱에 반영됩니다. 위 상태는 마지막 서버 조회 기준이며, 시작할 때 다시 검사합니다.</p>
-          <p>운용자 확인과 주문 차단 설정은 ‘한도·안전장치’에서 확인하세요. 주문 라우트를 허용해도 전략 시험은 시작되지 않으며, 무주문 준비 검사 후 실거래 시작을 별도로 눌러야 합니다.</p>
-        </div>
-      )}
       {settingsReady && broker && (
         <div
           {...semanticSurfaceProps(
@@ -5184,7 +5160,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
         <div {...semanticSurfaceProps("warning", "live-assistant-provisional-note")} role="note">
           <strong>공식 기본표 참고 임시값 · 본인 적용 수수료 확인 필요</strong>
           <p>국내 주식·ETF와 미국 주식의 수수료 추정값입니다. 값을 저장하거나 수정해도 본인 계좌의 실제 요율 확인이 완료되지는 않습니다.</p>
-          <p>최소수수료·제세금·자동환전 요율·환전 및 정산 비용은 미확인입니다. 실제 주문은 계속 차단됩니다.</p>
+          <p>본인 계좌 요율은 ‘KIS 시험 비용 상세’에서 확인합니다. 다른 거래소의 연결 상태와 별개입니다.</p>
         </div>
       )}
       {settingsReady && diagnostic && (
@@ -5200,19 +5176,20 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
           설정 다시 확인
         </button>
       )}
-      <details className="ts-disclosure live-connection-fields-disclosure" key={activeGroup} open={activeGroup === "live-lock"}>
+      <details className="ts-disclosure live-connection-fields-disclosure" key={activeGroup}>
         <summary className="ts-disclosure-summary">
           <span className="ts-disclosure-copy">
-            <strong className="ts-disclosure-title">{activeGroup === "live-lock" ? "실전 주문 라우트 설정" : "API·계좌 설정 더보기"}</strong>
-            <span className="ts-disclosure-hint">{activeGroup === "live-lock"
-              ? "현재 앱의 주문 허용은 여기에서 확인합니다. 설정 저장만으로 거래가 시작되지는 않습니다."
-              : settingsStatus === "error" ? "설정을 읽지 못했습니다. 다시 확인한 뒤 연결 정보를 점검하세요."
+            <strong className="ts-disclosure-title">API·계좌 설정 더보기</strong>
+            <span className="ts-disclosure-hint">{settingsStatus === "error" ? "설정을 읽지 못했습니다. 다시 확인한 뒤 연결 정보를 점검하세요."
                 : settingsReady ? `${visibleFields.length}개 설정 · ${checkCount ? `확인 필요 ${checkCount}개` : "저장 설정 확인됨"}${dirtyCount ? ` · 저장 전 변경 ${dirtyCount}개` : ""} · 연결 정보를 바꿀 때만 여세요.` : "설정 정보를 기다리는 중입니다."}</span>
           </span>
         </summary>
         <div className="ts-disclosure-body">
-      <div className="live-assistant-field-grid">
-        {visibleFields.map((field) => {
+      {fieldSections.map(section => <details className="ts-disclosure" key={section.id} open={section.id === "basic"}>
+        <summary className="ts-disclosure-summary">{section.title} · {section.fields.length}개</summary>
+        {section.detail && <p className="workflow-copy">{section.detail}</p>}
+        <div className="live-assistant-field-grid">
+        {section.fields.map((field) => {
           const value = draft[field.key] ?? "";
           const status = assistantFieldStatus(field, value);
           const fieldTone = status === "done" ? "success" : status === "block" ? "danger" : status === "confirm" ? "warning" : "neutral";
@@ -5227,7 +5204,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
             >
               <div>
                 <strong>{field.label}</strong>
-                {(field.kind === "select" || isProvisionalKisFeeField(field)) && field.detail && <span>{field.detail}</span>}
+                {field.detail && <span>{field.detail}</span>}
                 {isProvisionalKisFeeField(field) && <em>임시값 · 단위 % · 확인 필요</em>}
               </div>
               {field.kind === "bool" ? (
@@ -5254,6 +5231,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
           );
         })}
       </div>
+      </details>)}
       <div className="live-assistant-save-row">
         <button className="primary-button compact-button" disabled={saving || !settingsReady || typeof onSave !== "function"} onClick={handleSave} type="button">
           <Save size={16} />
@@ -5322,7 +5300,6 @@ function TelegramConnectionPanel() {
 function assistantFieldStatus(field, value) {
   const hasDraftValue = String(value ?? "").trim().length > 0;
   const configured = field.kind === "secret" ? Boolean(field.configured || hasDraftValue) : hasDraftValue;
-  if (field.key === "LIVE_TRADER_ENABLE_REAL_ORDERS" && String(value).toLowerCase() !== "true") return "wait";
   if (field.required && !configured) return "block";
   if (isProvisionalKisFeeField(field) || field.confirmationRequired === true || field.estimateOnly === true) return "confirm";
   if (!configured) return "wait";
@@ -6049,7 +6026,6 @@ function compactAllocationValue(value, currency) {
 function UnifiedBrokerAccountPanel({
   accounts,
   executionEvents,
-  onBaseline,
   onRefresh,
   positions,
   reconciledAt,
@@ -6057,13 +6033,12 @@ function UnifiedBrokerAccountPanel({
   observation,
   nowMs,
 }) {
-  const allocationAccounts = useMemo(() => liveAllocationAccounts(accounts, positions, { nowMs }), [accounts, positions, nowMs]);
+  const allocationAccounts = useMemo(() => liveAllocationAccounts(accounts, positions, { nowMs, preserveObserved: true }), [accounts, positions, nowMs]);
   return (
     <>
       {observation.connected ? <AllocationWorkspace accounts={allocationAccounts}
         title={observation.fresh ? "내 실계좌 구성" : "내 실계좌 구성 · 이전 관측값"}
-        basis={observation.fresh ? "실제 계좌의 최근 평가 기준 · 현금 포함 · 선물은 증거금만 포함"
-          : "현재 평가 미확인 · 아래 수치는 마지막 관측값이며 주문 가능 금액을 보장하지 않습니다."}
+        basis="마지막 계좌 조회 시점의 수량·시세 평가 · 실시간 평가가 아닙니다 · 현금 포함 · 선물은 증거금만 포함"
         onRefresh={onRefresh} refreshDisabled={refreshDisabled}
         updatedAt={reconciledAt ?? executionEvents?.last_poll ?? "미조회"} />
         : <section className="panel account-values-unavailable"><PanelHeader title="내 실계좌 구성" />
@@ -6072,12 +6047,8 @@ function UnifiedBrokerAccountPanel({
       <div className="account-baseline-toolbar">
         <div>
           <strong>프로그램 기준 원장</strong>
-          <span>자동 갱신은 원장을 덮어쓰지 않습니다. 확인한 현재 계좌를 새 기준으로 삼을 때만 승인하세요.</span>
+          <span>계좌 다시 읽기는 원장을 덮어쓰지 않습니다. 차이가 있으면 위의 ‘확인할 차이’에서 거래·입출금 기록과 대조하세요.</span>
         </div>
-        <button className="secondary-button" disabled={refreshDisabled} onClick={onBaseline} type="button">
-          <ShieldCheck size={15} />
-          현재 계좌를 기준 원장으로 승인
-        </button>
       </div>
 
     </>
@@ -6116,7 +6087,7 @@ function LaunchReportPanel({ report, observed = false }) {
         <ShieldAlert size={18} />
         <div>
           <strong>{observed ? report.lock_reason : "점검 결과 미확인 · 최신 시작 점검이 필요합니다."}</strong>
-          <span>연결 설정의 주문 허용과 별개인 일반 운용 진단입니다. 주문 연결 시험은 해당 탭에서 준비 결과를 확인하세요.</span>
+          <span>일반 운용의 실행 조건을 확인하는 진단입니다. 주문 연결 시험은 해당 탭에서 준비 결과를 확인하세요.</span>
         </div>
       </div>
       <MetricGrid className="metric-grid">

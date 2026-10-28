@@ -346,21 +346,10 @@ try {
     return jsonResponse({ ok: true, settings: {} });
   };
   await saveEnvSettings(realOrderValues, true);
-  assert.deepEqual(safetyRequests[0].body, {
-    action: "REAL_ORDERS_ENABLE",
-    context: {
-      settingKeys: Object.keys(realOrderValues).sort(),
-      enableRealOrders: true,
-      valuesDigest: expectedValuesDigest,
-    },
-  });
-  assert.equal(
-    JSON.stringify(safetyRequests[0].body).includes(realOrderValues.KIS_APP_KEY),
-    false,
-    "challenge request must not contain raw credentials",
-  );
-  assert.deepEqual(safetyRequests[1].body.values, realOrderValues);
-  assert.equal(safetyRequests[1].body.safety_confirmation.challengeId, "challenge-real-orders");
+  assert.deepEqual(safetyRequests.map(row => row.path), ["/api/env-settings"]);
+  assert.deepEqual(safetyRequests[0].body.values, realOrderValues);
+  assert.equal(safetyRequests[0].body.safety_confirmation, undefined,
+    "settings cannot issue execution permission; backend rejects the obsolete flag");
 
   const postSafetyFetch = globalThis.fetch;
   const cryptoRequests = [];
@@ -492,7 +481,9 @@ try {
   assert.equal(preflightResult.preflight_snapshot.deployment_id, "DEPLOY-20260801-01");
 
   let runtimeRequest = null;
+  unregisterSafetyPresenter = registerSafetyConfirmationPresenter(async (challenge) => ({confirmed: true, typedPhrase: challenge.expectedPhrase}));
   globalThis.fetch = async (path, options) => {
+    if (path === "/api/safety-confirmation/challenge") return jsonResponse({ok: true, challengeId: "runtime-challenge", token: "runtime-token", expectedPhrase: "LIVE 1234", expiresAt: challengeExpiry()});
     runtimeRequest = { path, options };
     return {
       ok: true,
@@ -508,7 +499,10 @@ try {
     portfolio_id: "PORTFOLIO-01",
     deployment_id: "DEPLOYMENT-01",
     strategy_id: "STRATEGY-01",
+    safety_confirmation: {challengeId: "runtime-challenge", token: "runtime-token", typedPhrase: "LIVE 1234"},
   });
+
+  unregisterSafetyPresenter();
 
   let incidentRequest = null;
   globalThis.fetch = async (path, options) => {

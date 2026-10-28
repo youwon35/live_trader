@@ -9,7 +9,7 @@ export const SAFETY_CONFIRMATION_ACTIONS = Object.freeze({
   KILL_SWITCH_OFF: "KILL_SWITCH_OFF",
   DRY_RUN_OFF: "DRY_RUN_OFF",
   NEW_ENTRIES_BLOCKED_OFF: "NEW_ENTRIES_BLOCKED_OFF",
-  REAL_ORDERS_ENABLE: "REAL_ORDERS_ENABLE",
+  RUNTIME_START: "RUNTIME_START",
   FUNCTIONAL_TEST_START: "FUNCTIONAL_TEST_START",
   UPBIT_FUNCTIONAL_START: "UPBIT_FUNCTIONAL_START",
   UPBIT_FUNCTIONAL_STOP: "UPBIT_FUNCTIONAL_STOP",
@@ -385,23 +385,9 @@ export async function getEnvSettings() {
 export async function saveEnvSettings(values, confirmed = false) {
   void cancelAllMarketGapPreparations();
   void cancelAllKisStartPreparations();
-  const mutation = (confirmation) => request("/api/env-settings", {
-    method: "POST",
-    body: { values, confirmed, ...safetyConfirmationPayload(confirmation) },
+  return request("/api/env-settings", {
+    method: "POST", body: { values, confirmed },
   });
-  const enableRealOrders = String(values?.LIVE_TRADER_ENABLE_REAL_ORDERS || "").toLowerCase() === "true";
-  if (!enableRealOrders) return mutation(null);
-  const settingKeys = Object.keys(values || {}).sort();
-  const valuesDigest = await safetyConfirmationValuesDigest(values);
-  return runWithSafetyConfirmation(
-    SAFETY_CONFIRMATION_ACTIONS.REAL_ORDERS_ENABLE,
-    {
-      settingKeys,
-      enableRealOrders: true,
-      valuesDigest,
-    },
-    mutation,
-  );
 }
 
 export async function setMode(mode) {
@@ -540,6 +526,7 @@ export async function runReconciliation(options = {}) {
     body: {
       refresh_brokers: options.refreshBrokers !== false,
       include_snapshot: options.includeSnapshot !== false,
+      display_only: options.displayOnly === true,
     },
     timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
   });
@@ -556,6 +543,7 @@ export async function syncExecutionEvents(brokerId = "all", options = {}) {
       broker_id: brokerId,
       force_snapshot: options.forceSnapshot,
       include_snapshot: options.includeSnapshot !== false,
+      display_only: options.displayOnly === true,
     },
     timeoutMs: BROKER_REFRESH_TIMEOUT_MS,
   });
@@ -900,7 +888,15 @@ export async function startContinuousRuntime(
       throw failure;
     }
   };
-  if (!nativeKisStart) return submitStart();
+  if (!nativeKisStart) {
+    if (!["SMALL_LIVE", "FULL_LIVE"].includes(mode)) return submitStart();
+    const selection = { profile_id: profileId, mode, portfolio_id: portfolioId,
+      deployment_id: deploymentId, strategy_id: strategyId };
+    return runWithSafetyConfirmation(SAFETY_CONFIRMATION_ACTIONS.RUNTIME_START, selection, async (confirmation) => {
+      body.safety_confirmation = confirmation;
+      return submitStart();
+    });
+  }
   const bridge = globalThis.window?.pywebview?.api;
   if (typeof bridge?.request_kis_operational_start_confirmation !== "function") {
     throw new ApiRequestError("KIS 실거래 시작은 네이티브 앱에서 직접 확인해야 합니다.", "KIS_NATIVE_UNAVAILABLE");

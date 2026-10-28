@@ -65,9 +65,9 @@ export function accountObservationView(snapshot, state = initialAccountRefreshSt
   const fresh = connected && !state.error && Number.isFinite(stamp) && stamp <= now + 5000 && now - stamp <= 300000;
   return { connected, fresh, observedAt: Number.isFinite(stamp) ? observedAt : "",
     tone: state.pending ? "info" : state.error ? "fail" : fresh ? "pass" : "warn",
-    label: state.pending ? state.waitingForSnapshot ? "전체 상태 조회 완료 대기" : "계좌·체결 읽는 중" : state.error ? "갱신 실패" : !connected ? "서버 연결 미확인" : fresh ? "최근 관측값 표시 중" : "현재 평가 미확인",
+    label: state.pending ? state.waitingForSnapshot ? "전체 상태 조회 완료 대기" : "계좌·체결 읽는 중" : state.error ? "갱신 실패" : !connected ? "서버 연결 미확인" : fresh ? "최근 관측값 표시 중" : Number.isFinite(stamp) ? "마지막 조회값 표시 중" : "계좌 조회 필요",
     detail: !connected ? "전체 응답을 받지 못했습니다. 실제 잔고나 실행 중인 거래의 종료를 뜻하지 않습니다."
       : fresh ? "표시된 관측 시각의 계좌 자료입니다. 주문 허용과 시작 점검은 별도로 확인합니다."
-        : "계좌 갱신이 완료되기 전에는 마지막 관측값만 참고하세요. 미확인을 0으로 처리하지 않습니다.",
+        : "자동 반복 조회는 하지 않습니다. 최신 잔고·평가는 계좌 다시 읽기로 확인하세요. 미확인을 0으로 처리하지 않습니다.",
   };
 }

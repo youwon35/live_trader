@@ -505,6 +505,8 @@ class RuntimeContextBindingTest(unittest.TestCase):
                     "start",
                     return_value={"ok": False, "reason": "context blocked"},
                 ) as start,
+                patch.object(state, "consume_safety_confirmation", return_value={"ok": True}),
+                patch.object(state, "_arm_real_orders_for_runtime_start"),
                 patch.object(state, "_finish_operational_runtime_start") as finish,
                 patch.object(state, "snapshot", return_value={}),
             ):

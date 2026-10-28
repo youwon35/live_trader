@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
 
 import {
-  ACCOUNT_REFRESH_INTERVAL_MS,
+  createStartupAccountRead,
   createAccountRefreshCoordinator,
 } from "../src/accountRefresh.js";
 
-assert.equal(ACCOUNT_REFRESH_INTERVAL_MS, 10_000);
+const startup = createStartupAccountRead();
+let startupReads = 0;
+const readOnce = () => { startupReads++; return Promise.resolve(); };
+startup(false, readOnce); assert.equal(startupReads, 0);
+await startup(true, readOnce);
+for (let i = 0; i < 10; i++) { startup(false, readOnce); startup(true, readOnce); }
+assert.equal(startupReads, 1, "reconnect/navigation/status refresh must not repeat startup account reads");
+const failedStartup = createStartupAccountRead();
+await assert.rejects(failedStartup(true, async () => { throw Error('offline'); }), /offline/);
+failedStartup(true, readOnce); assert.equal(startupReads, 1, "failure does not auto retry");
 
 function successfulResult(extraSnapshot = {}) {
   return {
@@ -58,8 +67,8 @@ assert.deepEqual(await automaticTimerTick, successfulResult({ reconciled: true }
 assert.deepEqual(order, ["sync:all", "reconcile"]);
 assert.equal(syncCalls, 1);
 assert.equal(reconciliationCalls, 1);
-assert.deepEqual(syncOptions[0], { forceSnapshot: true, includeSnapshot: false });
-assert.deepEqual(reconciliationOptions[0], { refreshBrokers: false, includeSnapshot: true });
+assert.deepEqual(syncOptions[0], { forceSnapshot: true, includeSnapshot: false, displayOnly: true });
+assert.deepEqual(reconciliationOptions[0], { refreshBrokers: false, includeSnapshot: true, displayOnly: true });
 assert.equal(coordinator.isRunning(), false);
 
 await coordinator.run();
@@ -87,7 +96,7 @@ for (const syncExecutionEvents of failedSynchronizations) {
     },
   });
   const result = await refreshing.run();
-  assert.deepEqual(requests, [{ refreshBrokers: true, includeSnapshot: true }]);
+  assert.deepEqual(requests, [{ refreshBrokers: true, includeSnapshot: true, displayOnly: true }]);
   assert.equal(result.snapshot.observation, "fresh-broker-read");
   assert.match(result.syncWarning, /새로 조회해 대조/);
   assert.equal(refreshing.isRunning(), false);

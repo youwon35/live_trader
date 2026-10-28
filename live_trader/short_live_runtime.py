@@ -230,8 +230,6 @@ def _controls() -> list[str]:
     from . import state
     from .emergency_stop import emergency_stop_active
     reasons = []
-    if not state.real_orders_enabled():
-        reasons.append("REAL_ORDERS_DISABLED")
     # A bounded short session receives exact manual consent in service.start().
     # Ordinary dry-run/operator/aggregate entry flags are not its authority:
     # fresh selected-route readiness and session reconciliation enforce the

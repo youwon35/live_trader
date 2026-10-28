@@ -2647,11 +2647,49 @@ class ProgramLedger:
         with self.connection() as conn:
             cash = conn.execute("SELECT COUNT(*) AS count, MAX(updated_at) AS updated_at FROM cash_balances").fetchone()
             positions = conn.execute("SELECT COUNT(*) AS count, MAX(updated_at) AS updated_at FROM positions").fetchone()
-            events = conn.execute("SELECT COUNT(*) AS count, MAX(occurred_at) AS updated_at FROM execution_events").fetchone()
+            # Historical account/position observations were once stored as
+            # UNKNOWN execution events. Preserve those records while making
+            # their display count distinct from observed order fills.
+            events = conn.execute(
+                """
+                WITH classified AS (
+                    SELECT occurred_at,
+                        CASE
+                            WHEN lower(state) IN ('account_snapshot', 'position_snapshot')
+                                OR lower(json_extract(
+                                    CASE WHEN json_valid(raw_json) THEN raw_json ELSE '{}' END,
+                                    '$.raw.state'
+                                )) IN ('account_snapshot', 'position_snapshot')
+                                OR lower(json_extract(
+                                    CASE WHEN json_valid(raw_json) THEN raw_json ELSE '{}' END,
+                                    '$.state'
+                                )) IN ('account_snapshot', 'position_snapshot')
+                            THEN 'snapshot'
+                            WHEN lower(state) IN ('filled', 'partially_filled', 'trade')
+                                AND quantity > 0
+                                AND upper(side) IN ('BUY', 'SELL')
+                                AND trim(coalesce(broker_order_id, '')) NOT IN ('', '-')
+                            THEN 'fill'
+                            ELSE 'other'
+                        END AS event_kind
+                    FROM execution_events
+                )
+                SELECT COUNT(*) AS count, MAX(occurred_at) AS updated_at,
+                    SUM(event_kind = 'fill') AS fill_count,
+                    SUM(event_kind = 'snapshot') AS snapshot_count,
+                    SUM(event_kind = 'other') AS other_count,
+                    MAX(CASE WHEN event_kind = 'fill' THEN occurred_at END) AS last_fill
+                FROM classified
+                """
+            ).fetchone()
         return {
             "cash_count": int(cash["count"] or 0),
             "position_count": int(positions["count"] or 0),
             "execution_event_count": int(events["count"] or 0),
+            "fill_event_count": int(events["fill_count"] or 0),
+            "snapshot_event_count": int(events["snapshot_count"] or 0),
+            "other_event_count": int(events["other_count"] or 0),
+            "last_fill_event": events["last_fill"] or None,
             "last_cash_update": cash["updated_at"] or "-",
             "last_position_update": positions["updated_at"] or "-",
             "last_execution_event": events["updated_at"] or "-",

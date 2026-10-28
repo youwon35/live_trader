@@ -39,10 +39,10 @@ try{
    await fulfill(route,snapshot(snapshotCount>=4?30000:0));return;
   }
   if(url.pathname==='/api/execution-events'){
-   syncCount++;if(syncCount===1){heldSync=route;return;}await fulfill(route,{ok:true});return;
+   assert.equal(request.postDataJSON().display_only,true);syncCount++;if(syncCount===1){heldSync=route;return;}await fulfill(route,{ok:true});return;
   }
   if(url.pathname==='/api/reconcile'){
-   reconcileCount++;if(reconcileFails){await fulfill(route,{error:'오프라인 합성 계좌 응답 실패'},503);return;}
+   assert.equal(request.postDataJSON().display_only,true);reconcileCount++;if(reconcileFails){await fulfill(route,{error:'오프라인 합성 계좌 응답 실패'},503);return;}
    await fulfill(route,{ok:true,snapshot:snapshot(30000)});return;
   }
   if(request.method()!=='GET'){report.unexpectedMutations.push(url.pathname);await route.abort();return;}
@@ -50,49 +50,49 @@ try{
  });
  await page.goto(origin);
  await page.waitForFunction(()=>document.querySelector('.sidebar-footer')?.textContent.includes('정상'));
- await page.clock.runFor(15001);
- assert.equal(snapshotCount,2);
  await page.getByRole('button',{name:'계좌·잔고',exact:true}).click();
- await page.waitForFunction(()=>document.querySelector('.account-refresh-status')?.textContent.includes('전체 상태 조회 완료 대기'));
- assert.equal(syncCount,0,'account read must wait for the in-flight general snapshot');
- assert.equal(await page.getByRole('button',{name:'계좌 다시 읽기',exact:true}).isDisabled(),true);
- await page.clock.runFor(15000);await page.locator('.api-connection-banner').waitFor();
  await page.waitForFunction(()=>document.querySelector('.account-refresh-status')?.textContent.includes('계좌·체결 읽는 중'));
- assert.equal(syncCount,1);assert.equal(snapshotCount,2);
- assert.match(await page.locator('.api-connection-banner').innerText(),/15초/);
- assert.equal(await page.getByRole('button',{name:'계좌 조회 완료 대기…',exact:true}).isDisabled(),true);
- const unknown=await page.locator('.three-way-reconciliation-panel').innerText();
- assert.doesNotMatch(unknown,/0건|0개|기준 없음/);assert.match(unknown,/원장·체결 건수를 확인할 수 없습니다/);
- assert.equal(await page.locator('.ts-allocation-workspace').count(),0);
- await page.screenshot({path:resolve(output,'snapshot-timeout.png')});
- report.checks.push('account read waits for a 15s snapshot timeout, then owns the read; reconnect cannot overlap it');
+ assert.equal(syncCount,1,'startup makes one account read');
+ await page.clock.runFor(15001);
+ assert.equal(snapshotCount,1,'regular status reads cannot overlap the startup account read');
  await fulfill(heldSync,{ok:true});
  await page.waitForFunction(()=>document.querySelector('.account-refresh-status')?.textContent.includes('갱신 실패'));
+ await page.clock.runFor(15001);assert.equal(snapshotCount,2);
+ await page.getByRole('button',{name:'계좌 다시 읽기',exact:true}).click();
+ await page.waitForFunction(()=>document.querySelector('.account-refresh-status')?.textContent.includes('전체 상태 조회 완료 대기'));
+ assert.equal(syncCount,1);
+ await page.clock.runFor(15001);
+ await page.locator('.api-connection-banner').waitFor();
+ await page.waitForFunction(()=>document.querySelector('.account-refresh-status')?.textContent.includes('갱신 실패'));
+ assert.equal(syncCount,2);
+ const unknown=await page.locator('.three-way-reconciliation-panel').innerText();
+ assert.doesNotMatch(unknown,/0건|0개|기준 없음/);
+ assert.equal(await page.locator('.ts-allocation-workspace').count(),0);
+ await page.screenshot({path:resolve(output,'snapshot-timeout.png')});
+ report.checks.push('startup once, status/account reads serialized, failed read never auto retries');
  await page.getByRole('button',{name:'다시 연결',exact:true}).click();
  await page.waitForFunction(()=>document.querySelector('.api-connection-banner button')?.textContent.includes('연결 확인 중'));
- assert.equal(await page.getByRole('button',{name:'연결 확인 중…',exact:true}).isDisabled(),true);
- await page.locator('.api-connection-banner button').evaluate(button=>button.click());
  assert.equal(snapshotCount,3);
- // Pause auto account refresh to inspect whether a general recovery erases its error.
- await page.evaluate(()=>Object.defineProperty(document,'visibilityState',{configurable:true,get:()=> 'hidden'}));
  await fulfill(heldSnapshots.get(3),snapshot(32000));
  await page.waitForFunction(()=>!document.querySelector('.api-connection-banner'));
- assert.equal(syncCount,1);
+ assert.equal(syncCount,2,'reconnect must not refresh accounts');
  assert.match(await page.locator('.account-refresh-status').innerText(),/갱신 실패/);
- assert.match(await page.locator('.ts-allocation-workspace').innerText(),/이전 관측값|현재 평가 미확인/);
- await page.screenshot({path:resolve(output,'account-error.png')});
- report.checks.push('reconnect is single-flight with progress; successful general polling does not erase account error');
  reconcileFails=false;
  await page.getByRole('button',{name:'계좌 다시 읽기',exact:true}).click();
  await page.waitForFunction(()=>document.querySelector('.account-refresh-status')?.textContent.includes('최근 전체 조회 성공 2026. 10. 28. 오후 1:00:30'));
- assert.equal(syncCount,2);assert.equal(reconcileCount,2);
+ assert.equal(syncCount,3);assert.equal(reconcileCount,3);
  assert.doesNotMatch(await page.locator('.account-refresh-status').innerText(),/갱신 실패/);
- await page.screenshot({path:resolve(output,'account-recovered.png')});
- await page.clock.runFor(31000);assert.equal(syncCount,2,'hidden account page does not poll broker reads');
- assert.match(await page.locator('.ts-allocation-workspace').innerText(),/부분 조회·평가 미확인/);
- assert.equal(await page.locator('.ts-allocation-donut').count(),0,'expired display quote is invalidated by UI clock without a snapshot');
- await page.screenshot({path:resolve(output,'quote-expired.png')});
- report.checks.push('manual retry records observation time; hidden page does not read brokers; display quote expires without another snapshot');
+ await page.screenshot({path:resolve(output,'manual-account-recovered.png')});
+ await page.clock.runFor(120001);
+ assert.equal(syncCount,3,'visible account tab must not perform periodic broker reads');
+ assert.match(await page.locator('.ts-allocation-workspace').innerText(),/실시간 평가가 아닙니다/);
+ assert.ok(await page.locator('.ts-allocation-donut').count()>0,'last observed valuation remains visible with its historical label');
+ await page.getByRole('button',{name:'실시간 감시',exact:true}).click();
+ await page.getByRole('button',{name:'계좌·잔고',exact:true}).click();
+ assert.equal(syncCount,3,'navigation must not read accounts again');
+ await page.screenshot({path:resolve(output,'manual-observation-retained.png')});
+ report.checks.push('manual retry records observation time; reconnect, navigation and two minutes visible do not repeat account reads');
+ report.checks.push('past valuation remains visibly labelled historical, never silently becomes zero');
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false);
  await context.close();
  assert.deepEqual(report.externalRequests,[]);assert.deepEqual(report.unexpectedMutations,[]);assert.deepEqual(report.pageErrors,[]);
