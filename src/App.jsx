@@ -4273,7 +4273,7 @@ function FuturesSettingsPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
         <strong>레버리지 {leverage}x</strong>
         <span>
           10 USDT 증거금 기준 최대 명목 노출은 약 {10 * Number(leverage)} USDT입니다.
-          거래당 위험률은 손절 거리와 주문 크기로 별도 제한해야 합니다.
+          거래당 위험률은 손절 거리와 주문 크기로 별도 제한해야 합니다. 이 설정 보조는 1·2·3·5배만 제공합니다. 10배 등은 Binance에서 직접 설정한 뒤 주문 연결 시험에 같은 배율을 입력해 준비 검사를 실행하세요.
         </span>
       </div>
       {preview.symbol && (
