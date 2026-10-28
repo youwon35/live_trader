@@ -67,7 +67,30 @@ def stop_price(order, market, frozen_policy):
     bracket = candidates[0]
     if leverage > numeric(bracket.get("initialLeverage"), positive=True):
         raise FuturesProtectionError("FUTURES_LEVERAGE_BRACKET_EXCEEDED")
-    maintenance = numeric(bracket.get("maintMarginRatio"))
+    # Price changes the position's notional before the stop can trigger.
+    # Cover every tier on that adverse path; a short may enter a higher MMR
+    # tier even though its entry still fits the lower one. Ignore deductions.
+    low, high = sorted((notional, notional * trigger / price))
+    path_tiers = []
+    for row in brackets:
+        floor = numeric(row.get("notionalFloor"))
+        cap = numeric(row.get("notionalCap"), positive=True)
+        rate = numeric(row.get("maintMarginRatio"))
+        if floor < 0 or cap <= floor or not 0 <= rate < 1:
+            raise FuturesProtectionError("FUTURES_MAINTENANCE_BRACKETS_UNKNOWN")
+        if cap > low and floor <= high:
+            path_tiers.append((floor, cap, rate))
+    path_tiers.sort(key=lambda row: row[0])
+    if not path_tiers or not path_tiers[0][0] <= low < path_tiers[0][1]:
+        raise FuturesProtectionError("FUTURES_STOP_NOTIONAL_PATH_UNKNOWN")
+    covered_until = path_tiers[0][1]
+    for floor, cap, _ in path_tiers[1:]:
+        if floor != covered_until:
+            raise FuturesProtectionError("FUTURES_STOP_NOTIONAL_PATH_UNKNOWN")
+        covered_until = cap
+    if high >= covered_until:
+        raise FuturesProtectionError("FUTURES_STOP_NOTIONAL_PATH_UNKNOWN")
+    maintenance = max(row[2] for row in path_tiers)
     fee = numeric(market.get("feeRate"))
     funding = abs(numeric(market.get("fundingRate")))
     # Do not spend maintenance, two commissions and one funding allowance on

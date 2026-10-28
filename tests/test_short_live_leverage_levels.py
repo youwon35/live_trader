@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import test_short_live_brokers as base
 import test_short_live_futures_integration as integration
+import test_short_live_futures_protection as protection
 
 
 class FuturesLeverageLevelsTests(unittest.TestCase):
@@ -112,6 +113,62 @@ class FuturesLeverageLevelsTests(unittest.TestCase):
         self.assertIn("FUTURES_STOP_AT_OR_BEYOND_MAINTENANCE_BUFFER", ready["blockers"])
         self.assertEqual([], f.calls)
         self.assertEqual([], f.protection_calls)
+
+
+    def path_fixture(self, *, direction="short", stop="9.35", notional="99"):
+        f = protection.ProtectionFixture(direction)
+        f.order.update(quantity=str(Decimal(notional)/100), projectedGrossExposureKrw=notional,
+                       estimatedNotionalKrw=notional)
+        f.policy.update(leverage=10, stopLossPercent=stop)
+        f.market.update(feeRate=".0004", fundingRate=".0001", leverageBrackets=[
+            {"notionalFloor":"0", "notionalCap":"100", "initialLeverage":"20", "maintMarginRatio":".005", "cum":"0"},
+            {"notionalFloor":"100", "notionalCap":"1000", "initialLeverage":"20", "maintMarginRatio":".02", "cum":"1.5"}])
+        return f
+
+    def test_short_crossing_higher_maintenance_tier_blocks_stop_beyond_piecewise_liquidation(self):
+        f = self.path_fixture()
+        # Both tiers are continuous at 100. Even ignoring commissions/funding,
+        # the actual short equity reaches maintenance at 109.32858, before the
+        # old entry-tier-only guard's accepted stop at 109.35.
+        liquidation = (Decimal("9.9") + 99 + Decimal("1.5")) / (Decimal(".99") * Decimal("1.02"))
+        self.assertLess(liquidation, Decimal("109.35"))
+        self.assertGreater(liquidation * Decimal(".99"), 100)
+        with self.assertRaisesRegex(protection.mod.FuturesProtectionError, "MAINTENANCE_BUFFER"):
+            f.ensure()
+        self.assertEqual(f.calls, [])
+
+    def test_short_crossing_higher_tier_with_nearby_stop_remains_valid(self):
+        f = self.path_fixture(stop="2")
+        self.assertEqual(protection.mod.stop_price(f.order, f.market, f.policy), "102.00")
+        self.assertEqual(f.calls, [])
+
+    def test_long_stops_keep_current_tier_bound_even_when_notional_falls_to_lower_tier(self):
+        for notional, stop, expected in (("99", "9.35", "90.65"), ("101", "2", "98.00")):
+            with self.subTest(notional=notional):
+                f = self.path_fixture(direction="long", stop=stop, notional=notional)
+                self.assertEqual(protection.mod.stop_price(f.order, f.market, f.policy), expected)
+                self.assertEqual(f.calls, [])
+
+    def test_stop_path_rejects_gaps_overlaps_and_uncovered_adverse_notional_before_post(self):
+        for field, value in (("notionalFloor", "100.5"), ("notionalFloor", "99.5"), ("notionalCap", "105")):
+            with self.subTest(field=field, value=value):
+                f = self.path_fixture()
+                f.market["leverageBrackets"][1][field] = value
+                with self.assertRaisesRegex(protection.mod.FuturesProtectionError, "NOTIONAL_PATH_UNKNOWN"):
+                    f.ensure()
+                self.assertEqual(f.calls, [])
+
+    def test_stop_at_exact_notional_cap_requires_coverage_of_endpoint_tier(self):
+        f = self.path_fixture(stop="2")
+        endpoint = Decimal("99") * Decimal("1.02")
+        f.market["leverageBrackets"] = [{"notionalFloor":"0", "notionalCap":str(endpoint),
+            "initialLeverage":"20", "maintMarginRatio":".005", "cum":"0"}]
+        with self.assertRaisesRegex(protection.mod.FuturesProtectionError, "NOTIONAL_PATH_UNKNOWN"):
+            f.ensure()
+        self.assertEqual(f.calls, [])
+        f.market["leverageBrackets"].append({"notionalFloor":str(endpoint), "notionalCap":"1000",
+            "initialLeverage":"20", "maintMarginRatio":".005", "cum":"0"})
+        self.assertEqual(protection.mod.stop_price(f.order, f.market, f.policy), "102.00")
 
 
 if __name__ == "__main__":
