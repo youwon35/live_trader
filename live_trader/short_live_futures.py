@@ -4,6 +4,7 @@ No network or mutation runs at import. A service-owned durable reservation is
 required before each write. A lost reply is queried by its original client ID;
 it never creates a second POST. Entry and stop are not an atomic transaction.
 """
+from .futures_leverage_limits import MAX_SAFE_LEVERAGE_INTEGER
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 import hashlib
@@ -31,7 +32,7 @@ def policy(value):
         raise FuturesProtectionError("FUTURES_PROTECTION_POLICY_REQUIRED")
     leverage = numeric(value.get("leverage"), positive=True)
     stop = numeric(value.get("stopLossPercent"), positive=True)
-    if leverage != leverage.to_integral_value() or not 1 <= leverage <= 125:
+    if leverage != leverage.to_integral_value() or not 1 <= leverage <= MAX_SAFE_LEVERAGE_INTEGER:
         raise FuturesProtectionError("FUTURES_LEVERAGE_INVALID")
     if value.get("marginMode") != "ISOLATED" or stop >= 100 / leverage:
         raise FuturesProtectionError("FUTURES_PROTECTION_POLICY_INVALID")

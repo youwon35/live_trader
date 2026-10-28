@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import unittest
 from contextlib import nullcontext
 from decimal import Decimal
@@ -502,7 +503,8 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
                 "markPrice": "100",
                 "indexPrice": "99.5",
                 "lastFundingRate": "0.0001",
-                "nextFundingTime": 123,
+                "nextFundingTime": int(time.time()*1000)+3600000,
+                "time": int(time.time()*1000),
             },
             "text": "",
         }
@@ -571,7 +573,7 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
         premium_response = {
             "ok": True,
             "status": 200,
-            "json": {"markPrice": "100", "indexPrice": "100"},
+            "json": {"symbol":"BTCUSDT", "markPrice": "100", "indexPrice": "100", "lastFundingRate":"0", "time":int(time.time()*1000), "nextFundingTime":int(time.time()*1000)+3600000},
             "text": "",
         }
         signed_responses = [
@@ -590,6 +592,7 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
                 "ok": True,
                 "status": 200,
                 "json": {
+                    "symbol": "BTCUSDT",
                     "makerCommissionRate": "0.0002",
                     "takerCommissionRate": "0.0005",
                 },
@@ -631,6 +634,7 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
                 "ok": True,
                 "status": 200,
                 "json": {
+                    "symbol": "BTCUSDT",
                     "makerCommissionRate": "0.0002",
                     "takerCommissionRate": "0.0005",
                 },
@@ -643,7 +647,7 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
                 return_value={
                     "ok": True,
                     "status": 200,
-                    "json": {"markPrice": "100", "indexPrice": "100"},
+                    "json": {"symbol":"BTCUSDT", "markPrice": "100", "indexPrice": "100", "lastFundingRate":"0", "time":int(time.time()*1000), "nextFundingTime":int(time.time()*1000)+3600000},
                     "text": "",
                 },
             ),
@@ -675,6 +679,7 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
                 "ok": True,
                 "status": 200,
                 "json": {
+                    "symbol": "BTCUSDT",
                     "makerCommissionRate": "0.0002",
                     "takerCommissionRate": "0.0005",
                 },
@@ -687,7 +692,7 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
                 return_value={
                     "ok": True,
                     "status": 200,
-                    "json": {"markPrice": "100", "indexPrice": "100"},
+                    "json": {"symbol":"BTCUSDT", "markPrice": "100", "indexPrice": "100", "lastFundingRate":"0", "time":int(time.time()*1000), "nextFundingTime":int(time.time()*1000)+3600000},
                     "text": "",
                 },
             ),
@@ -730,7 +735,8 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
                         "ok": True,
                         "status": 200,
                         "json": {
-                            "makerCommissionRate": "0.0002",
+                            "symbol": "BTCUSDT",
+                    "makerCommissionRate": "0.0002",
                             "takerCommissionRate": "0.0005",
                         },
                         "text": "",
@@ -743,8 +749,8 @@ class BinanceFuturesAdapterTests(unittest.TestCase):
                             "ok": True,
                             "status": 200,
                             "json": {
-                                "markPrice": "100",
-                                "indexPrice": "100",
+                                "symbol":"BTCUSDT", "markPrice": "100",
+                                "indexPrice": "100", "lastFundingRate":"0", "time":int(time.time()*1000), "nextFundingTime":int(time.time()*1000)+3600000,
                             },
                             "text": "",
                         },

@@ -95,7 +95,7 @@ test("futures preparation requires explicit valid protection policy and preserve
   assert.throws(() => buildShortLivePrepare([row], [row.selectionKey], limits), /손절/);
   for (const bad of [null, { ...policy, stopLossPercent: "" }, { ...policy, stopLossPercent: 0 },
     { ...policy, stopLossPercent: 20 }, { ...policy, leverage: true }, { ...policy, leverage: 5.5 },
-    { ...policy, leverage: 126 }, { ...policy, marginMode: "CROSSED" }]) {
+    { ...policy, leverage: Number.MAX_SAFE_INTEGER + 1 }, { ...policy, marginMode: "CROSSED" }]) {
     assert.equal(normalizeShortLiveFuturesPolicy(bad), null);
     assert.throws(() => buildShortLivePrepare([row], [row.selectionKey], { ...limits, futuresPolicy: bad }));
   }
@@ -348,5 +348,12 @@ test("stale observations identify the failed read instead of alleging an account
   for (const code of ["ACCOUNT_OBSERVATION_STALE", "MARKET_OBSERVATION_STALE", "SOURCE_QUOTE_OBSERVATION_STALE", "FX_OBSERVATION_STALE"]) {
     assert.match(shortLiveBlockerLabel(code), /오래/);
     assert.doesNotMatch(shortLiveBlockerLabel(code), /연결 계좌가 변경|보유 자산이 변경/);
+  }
+});
+
+test("futures multiplier has no fixed125 cap; exact exchange bracket remains backend authority", () => {
+  for (const leverage of [7, 17, 37, 75, 125, 150]) {
+    const result = normalizeShortLiveFuturesPolicy({leverage, marginMode:"ISOLATED", stopLossPercent:0.001});
+    assert.equal(result.leverage, leverage);
   }
 });

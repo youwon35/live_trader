@@ -1,4 +1,9 @@
-export const FUTURES_RISK_HARD_MAX_LEVERAGE = 5;
+export const FUTURES_LEVERAGE_INTEGER_LIMIT = Number.MAX_SAFE_INTEGER;
+
+export function futuresRiskLeverageMaximum(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 1 ? number : 1;
+}
 
 export function isFuturesRiskStrategy(strategy = {}) {
   const brokerId = String(strategy?.broker_id || "").trim().toLowerCase();
@@ -13,12 +18,7 @@ export function futuresRiskStrategyDefaults(strategy = {}) {
   const rawPolicyLeverage = Number(
     strategy?.futures_execution_policy?.maxLeverageMultiplier,
   );
-  const policyLeverage = Number.isFinite(rawPolicyLeverage)
-    ? Math.min(
-      FUTURES_RISK_HARD_MAX_LEVERAGE,
-      Math.max(1, Math.floor(rawPolicyLeverage)),
-    )
-    : 1;
+  const policyLeverage = futuresRiskLeverageMaximum(rawPolicyLeverage);
   return {
     symbol: rawSymbol.replace(/[^A-Z0-9]/g, "") || "ETHUSDT",
     direction: rawDirection === "short" ? "SHORT" : "LONG",
@@ -28,26 +28,4 @@ export function futuresRiskStrategyDefaults(strategy = {}) {
 
 export function shouldHydrateRiskStrategy(previousStrategyId, nextStrategyId) {
   return String(previousStrategyId ?? "") !== String(nextStrategyId ?? "");
-}
-
-export function futuresRiskLeverageOptions(policyMaxLeverage, currentLeverage) {
-  const rawPolicyMax = Number(policyMaxLeverage);
-  const policyMax = Number.isFinite(rawPolicyMax)
-    ? Math.min(
-      FUTURES_RISK_HARD_MAX_LEVERAGE,
-      Math.max(1, Math.floor(rawPolicyMax)),
-    )
-    : 1;
-  const values = Array.from({ length: policyMax }, (_, index) => index + 1);
-  const selected = Number(currentLeverage);
-  if (
-    Number.isInteger(selected)
-    && selected >= 1
-    && selected <= FUTURES_RISK_HARD_MAX_LEVERAGE
-    && !values.includes(selected)
-  ) {
-    values.push(selected);
-    values.sort((left, right) => left - right);
-  }
-  return values;
 }

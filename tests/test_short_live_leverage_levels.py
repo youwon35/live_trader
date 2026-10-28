@@ -19,8 +19,8 @@ class FuturesLeverageLevelsTests(unittest.TestCase):
     def fixture(self, leverage=10, *, entry=False, direction="long"):
         return integration.FuturesIntegrationTests().fixture(leverage, entry=entry, direction=direction)
 
-    def test_one_two_five_ten_use_collateral_plus_cost_reserve_without_multiplying_cash(self):
-        expected_quantities = {1: Decimal(99), 2: Decimal(199), 5: Decimal(494), 10: Decimal(978)}
+    def test_one_two_five_use_collateral_plus_cost_reserve_without_multiplying_cash(self):
+        expected_quantities = {1: Decimal(99), 2: Decimal(199), 5: Decimal(494)}
         for leverage, expected in expected_quantities.items():
             with self.subTest(leverage=leverage):
                 f = self.fixture(leverage)
@@ -40,8 +40,8 @@ class FuturesLeverageLevelsTests(unittest.TestCase):
                 self.assertEqual([], f.calls)
                 self.assertEqual([], f.protection_calls)
 
-    def test_two_and_ten_restrict_small_cash_to_real_collateral(self):
-        for leverage, expected in ((2, "1"), (10, "9")):
+    def test_two_and_five_restrict_small_cash_to_real_collateral(self):
+        for leverage, expected in ((2, "1"), (5, "4")):
             with self.subTest(leverage=leverage):
                 f = self.fixture(leverage)
                 f.truth["availableNative"] = "1000"
@@ -52,8 +52,8 @@ class FuturesLeverageLevelsTests(unittest.TestCase):
                 self.assertEqual(f.truth["availableNative"], "1000")
                 self.assertEqual([], f.calls)
 
-    def test_two_and_ten_keep_long_short_direction_and_protection_before_entry(self):
-        for leverage in (2, 10):
+    def test_two_and_five_keep_long_short_direction_and_protection_before_entry(self):
+        for leverage in (2, 5):
             for direction in ("long", "short"):
                 with self.subTest(leverage=leverage, direction=direction):
                     f = self.fixture(leverage, entry=True, direction=direction)
@@ -70,15 +70,15 @@ class FuturesLeverageLevelsTests(unittest.TestCase):
                     self.assertEqual(base.mod.number(state["notionalExposureKrw"]), Decimal(10000))
                     self.assertEqual(base.mod.number(state["committedCapitalKrw"]), Decimal(10000)/leverage)
 
-    def test_mismatch_between_selected_ten_and_actual_two_blocks_new_entry(self):
-        f = self.fixture(10)
+    def test_mismatch_between_selected_five_and_actual_two_blocks_new_entry(self):
+        f = self.fixture(5)
         f.quote["leverage"] = "2"
         ready = f.adapter.readiness(f.manifest)
         self.assertFalse(ready["ready"], ready)
         self.assertIn("FUTURES_SETTINGS_DIFFER_FROM_PREPARED_POLICY", ready["blockers"])
         self.assertEqual([], f.calls)
         self.assertEqual([], f.protection_calls)
-        self.assertEqual(f.manifest["futuresPolicy"]["leverage"], 10)
+        self.assertEqual(f.manifest["futuresPolicy"]["leverage"], 5)
         self.assertEqual(f.quote["leverage"], "2")
 
     def test_previous_fifty_percent_stop_is_rejected_without_silent_clamping(self):
@@ -93,21 +93,21 @@ class FuturesLeverageLevelsTests(unittest.TestCase):
                 self.assertEqual([], f.calls)
                 self.assertEqual([], f.protection_calls)
 
-    def test_ten_requires_actual_bracket_allowance_even_when_contract_range_accepts_it(self):
+    def test_five_requires_actual_bracket_allowance_even_when_contract_range_accepts_it(self):
         f = base.Fixture("BINANCE_USDM_FUTURES")
-        f.manifest["futuresPolicy"]["leverage"] = 10
-        f.quote["leverage"] = "10"
-        f.quote["leverageBrackets"][0]["initialLeverage"] = "5"
+        f.manifest["futuresPolicy"]["leverage"] = 5
+        f.quote["leverage"] = "5"
+        f.quote["leverageBrackets"][0]["initialLeverage"] = "3"
         ready = f.adapter.readiness(f.manifest)
         self.assertFalse(ready["ready"], ready)
         self.assertIn("FUTURES_LEVERAGE_BRACKET_EXCEEDED", ready["blockers"])
         self.assertEqual([], f.calls)
         self.assertEqual([], f.protection_calls)
 
-    def test_ten_stop_inside_simple_ten_percent_bound_still_respects_maintenance_and_cost(self):
+    def test_five_stop_inside_simple_twenty_percent_bound_still_respects_maintenance_and_cost(self):
         f = base.Fixture("BINANCE_USDM_FUTURES")
-        f.manifest["futuresPolicy"].update(leverage=10, stopLossPercent=9.9)
-        f.quote["leverage"] = "10"
+        f.manifest["futuresPolicy"].update(leverage=5, stopLossPercent=19.9)
+        f.quote["leverage"] = "5"
         ready = f.adapter.readiness(f.manifest)
         self.assertFalse(ready["ready"], ready)
         self.assertIn("FUTURES_STOP_AT_OR_BEYOND_MAINTENANCE_BUFFER", ready["blockers"])

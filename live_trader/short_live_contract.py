@@ -5,6 +5,8 @@ does not issue a broker permission, change an account, or submit an order.
 """
 from __future__ import annotations
 
+from .futures_leverage_limits import MAX_SAFE_LEVERAGE_INTEGER, leverage_integer
+
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
@@ -93,9 +95,10 @@ def normalize_futures_policy(value: Any) -> dict[str, Any]:
         raise ShortLiveContractError("FUTURES_PROTECTION_POLICY_REQUIRED")
     if set(value) - ({"leverage", "marginMode", "stopLossPercent"} | constants.keys()):
         raise ShortLiveContractError("FUTURES_PROTECTION_POLICY_INVALID")
-    leverage = finite(value.get("leverage"), "FUTURES_LEVERAGE", minimum=1, maximum=125)
-    if not leverage.is_integer():
-        raise ShortLiveContractError("FUTURES_LEVERAGE_INTEGER_REQUIRED")
+    try:
+        leverage = leverage_integer(value.get("leverage"))
+    except ValueError as error:
+        raise ShortLiveContractError("FUTURES_LEVERAGE_INTEGER_REQUIRED") from error
     if value.get("marginMode") != "ISOLATED":
         raise ShortLiveContractError("FUTURES_ISOLATED_MARGIN_REQUIRED")
     stop = finite(value.get("stopLossPercent"), "FUTURES_STOP_LOSS_PERCENT", positive=True)

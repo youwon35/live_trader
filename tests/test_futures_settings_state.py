@@ -19,6 +19,8 @@ class FakeFuturesSettingsRouter:
         self.configure_calls: list[dict[str, object]] = []
         self.observation_calls: list[str] = []
         self.fail_configure = False
+        self.maximum_leverage = 150
+        self.limit_calls = []
 
     def get_binance_futures_canary_observation(
         self,
@@ -40,6 +42,10 @@ class FakeFuturesSettingsRouter:
             "position_count": self.position_count,
             "open_order_count": self.open_order_count,
         }
+
+    def get_binance_futures_leverage_limits(self, symbol):
+        self.limit_calls.append(symbol)
+        return {"symbol": symbol, "maximum_leverage": self.maximum_leverage}
 
     def configure_binance_futures_symbol(
         self,
@@ -168,19 +174,37 @@ class FuturesSettingsStateTests(unittest.TestCase):
         self.assertEqual([], self.router.configure_calls)
         self.assertEqual("FAILED", result["settings"]["status"])
 
-    def test_unsafe_leverage_is_blocked_before_broker_query(self) -> None:
+    def test_non_integer_leverage_is_blocked_before_broker_query(self) -> None:
         result = state.preview_binance_futures_settings(
             "ETHUSDT",
             "ISOLATED",
-            20,
+            20.5,
         )
 
         self.assertFalse(result["ok"])
         self.assertEqual("BLOCKED", result["settings"]["status"])
         self.assertIn(
-            "leverage-outside-safe-presets",
+            "leverage-integer-required",
             result["settings"]["preview"]["blockers"],
         )
+
+    def test_all_nonpreset_and_above_125_integers_use_actual_account_bracket(self):
+        for multiplier in (7, 17, 37, 75, 125, 150):
+            with self.subTest(multiplier=multiplier):
+                result = state.preview_binance_futures_settings("ETHUSDT", "ISOLATED", multiplier)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["settings"]["preview"]["symbol_leverage_limit"], 150)
+                self.assertEqual(self.router.configure_calls, [])
+        refused = state.preview_binance_futures_settings("ETHUSDT", "ISOLATED", 151)
+        self.assertFalse(refused["ok"])
+        self.assertIn("leverage-exceeds-symbol-bracket", refused["settings"]["preview"]["blockers"])
+
+    def test_limit_drift_after_preview_blocks_before_any_setting_mutation(self):
+        preview = state.preview_binance_futures_settings("ETHUSDT", "ISOLATED", 37)
+        self.router.maximum_leverage = 20
+        result = state.apply_binance_futures_settings(preview["authorization"]["confirmation_token"], confirmed=True)
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.router.configure_calls, [])
 
     def test_failed_mutation_is_not_automatically_retried(self) -> None:
         preview = state.preview_binance_futures_settings(

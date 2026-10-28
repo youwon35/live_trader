@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 import {
-  futuresRiskLeverageOptions,
+  futuresRiskLeverageMaximum,
   futuresRiskStrategyDefaults,
   isFuturesRiskStrategy,
   shouldHydrateRiskStrategy,
@@ -20,13 +20,11 @@ assert.deepEqual(
   { symbol: "ETHUSDT", direction: "SHORT", leverage: "4" },
 );
 
-assert.deepEqual(futuresRiskLeverageOptions(4, "4"), [1, 2, 3, 4]);
-assert.deepEqual(futuresRiskLeverageOptions(5, "5"), [1, 2, 3, 4, 5]);
-assert.deepEqual(
-  futuresRiskLeverageOptions(3, "4"),
-  [1, 2, 3, 4],
-  "A refreshed lower policy must not silently rewrite the operator's current input.",
-);
+assert.equal(futuresRiskLeverageMaximum(4), 4);
+assert.equal(futuresRiskLeverageMaximum(150), 150);
+assert.equal(futuresRiskLeverageMaximum(1.5), 1);
+assert.equal(futuresRiskLeverageMaximum(Number.MAX_SAFE_INTEGER+1), 1);
+assert.deepEqual(futuresRiskStrategyDefaults({futures_execution_policy:{maxLeverageMultiplier:150}}).leverage,"150");
 
 assert.equal(
   shouldHydrateRiskStrategy("strategy-1", "strategy-1"),

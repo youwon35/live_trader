@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .futures_leverage_limits import MAX_SAFE_LEVERAGE_INTEGER, leverage_integer
+
 import hashlib
 import json
 import math
@@ -3118,6 +3120,11 @@ class LiveBrokerRouter:
                 if isinstance(position_mode_payload, dict)
                 else {}
             )
+            if type(position_mode.get("dualSidePosition")) is not bool:
+                raise BrokerNotReadyError("FUTURES_POSITION_MODE_UNKNOWN")
+            if normalized_intent.get("risk_reducing") is True:
+                self._verify_futures_exit_position(normalized_intent,
+                    hedge_mode=position_mode["dualSidePosition"])
             from .short_live_order_authority import short_live_dispatch_present
             if short_live_dispatch_present():
                 actual_mode = position_mode.get("dualSidePosition")
@@ -3133,13 +3140,9 @@ class LiveBrokerRouter:
                     futures=True,
                 ),
             )
-            validate_binance_futures_execution_policy(
-                normalized_intent,
-                normalize_binance_futures_symbol_config(
-                    symbol_config_payload,
-                    symbol,
-                ),
-            )
+            symbol_config = normalize_binance_futures_symbol_config(symbol_config_payload, symbol)
+            validate_binance_futures_execution_policy(normalized_intent, symbol_config)
+            self._verify_futures_entry_bracket(normalized_intent, symbol_config)
             try:
                 with ordinary_binance_final_mutation_boundary(
                     operation="FUTURES_PLACE_ORDER"
@@ -3422,12 +3425,75 @@ class LiveBrokerRouter:
             "open_order_count": len(open_orders),
         }
 
+    def get_binance_futures_leverage_limits(self, symbol):
+        """Fresh account-specific first bracket; no fixed trading multiplier."""
+        normalized = str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
+        if not normalized:
+            raise BrokerNotReadyError("정확한 선물 종목이 필요합니다.")
+        payload = ensure_response_ok("binance-futures", send_binance_signed_request(
+            lambda: build_binance_futures_leverage_bracket_request(normalized), futures=True))
+        documents = payload if isinstance(payload, list) else [payload]
+        matches = [row for row in documents if isinstance(row, dict) and row.get("symbol") == normalized]
+        if len(matches) != 1:
+            raise BrokerNotReadyError("FUTURES_EXACT_SYMBOL_BRACKETS_REQUIRED")
+        first = _select_futures_maintenance_bracket(matches[0], combined_notional_usdt=0)
+        maximum = leverage_integer(first["initial_leverage_limit"])
+        return {"symbol": normalized, "maximum_leverage": maximum,
+            "first_notional_cap": first["notional_cap"], "source": "BINANCE_USER_LEVERAGE_BRACKET"}
+
+    def _verify_futures_exit_position(self, intent, *, hedge_mode):
+        """A reduce flag is not proof: read the exact live side and quantity."""
+        short = intent.get("position_direction") == "short"
+        if intent.get("side") != ("BUY" if short else "SELL"):
+            raise BrokerNotReadyError("FUTURES_REDUCTION_SIDE_INVALID")
+        symbol = str(intent.get("symbol") or "")
+        position_side = ("SHORT" if short else "LONG") if hedge_mode else "BOTH"
+        payload = ensure_response_ok("binance-futures", send_binance_signed_request(
+            build_binance_futures_positions_request, futures=True))
+        if not isinstance(payload, list):
+            raise BrokerNotReadyError("FUTURES_REDUCTION_POSITION_UNKNOWN")
+        rows = [row for row in payload if isinstance(row, dict) and row.get("symbol") == symbol
+                and str(row.get("positionSide") or "BOTH").upper() == position_side]
+        if len(rows) != 1:
+            raise BrokerNotReadyError("FUTURES_REDUCTION_POSITION_UNKNOWN")
+        current = _strict_finite_number(rows[0].get("positionAmt"), label="현재 선물 포지션 수량")
+        requested = _strict_finite_number(intent.get("quantity"), label="축소 수량", strictly_positive=True)
+        if current == 0 or (current < 0) != short or requested > abs(current):
+            raise BrokerNotReadyError("FUTURES_REDUCTION_EXCEEDS_EXACT_POSITION")
+
+    def _verify_futures_entry_bracket(self, intent, symbol_config):
+        """Fresh account-specific tier is mandatory at the actual entry edge."""
+        if intent.get("risk_reducing") is True:
+            return  # A lookup outage must never prevent an exact owned exit.
+        if intent.get("position_direction") not in {"long", "short"} or intent.get("side") != ("SELL" if intent.get("position_direction") == "short" else "BUY"):
+            raise BrokerNotReadyError("FUTURES_ENTRY_DIRECTION_SIDE_INVALID")
+        symbol = str(intent.get("symbol") or "")
+        quantity = _strict_finite_number(intent.get("quantity"), label="선물 진입 수량", strictly_positive=True)
+        limit_price = _strict_finite_number(intent.get("price") or 0, label="선물 진입 가격", minimum=0)
+        market = self.get_binance_futures_risk_inputs(symbol,
+            notional_usdt=quantity * limit_price, requested_quantity=quantity)
+        if not isinstance(market, dict) or market.get("symbol") != symbol:
+            raise BrokerNotReadyError("FUTURES_ENTRY_BRACKET_UNKNOWN")
+        leverage = _strict_finite_number(symbol_config.get("leverage"), label="실제 선물 배율", strictly_positive=True)
+        maximum = _strict_finite_number(market.get("initial_leverage_limit"), label="실제 구간 허용 배율", strictly_positive=True)
+        combined = _strict_finite_number(market.get("combined_notional_usdt"), label="동일 종목 합산 명목가", minimum=0)
+        floor = _strict_finite_number(market.get("notional_floor"), label="실제 구간 하한", minimum=0)
+        cap = _strict_finite_number(market.get("notional_cap"), label="실제 구간 상한", strictly_positive=True)
+        if (not leverage.is_integer() or not maximum.is_integer()
+                or max(leverage, maximum) > MAX_SAFE_LEVERAGE_INTEGER or leverage > maximum
+                or not floor <= combined < cap or combined < quantity * limit_price):
+            raise BrokerNotReadyError("FUTURES_ENTRY_BRACKET_OR_LEVERAGE_EXCEEDED")
+        account_cap = _strict_finite_number(symbol_config.get("max_notional") or 0, label="계정 명목 상한", minimum=0)
+        if account_cap > 0 and combined > account_cap:
+            raise BrokerNotReadyError("FUTURES_ENTRY_ACCOUNT_NOTIONAL_EXCEEDED")
+
     def get_binance_futures_risk_inputs(
         self,
         symbol: str,
         *,
         notional_usdt: object = 0,
         existing_position_notional_usdt: object | None = None,
+        requested_quantity: object | None = None,
     ) -> dict[str, object]:
         """Read mark/funding, maintenance bracket and commission facts.
 
@@ -3498,6 +3564,19 @@ class LiveBrokerRouter:
             raise BrokerNotReadyError(
                 "Binance Futures commission 응답 형식이 올바르지 않습니다."
             )
+        if premium.get("symbol") != normalized_symbol or commission.get("symbol") != normalized_symbol:
+            raise BrokerNotReadyError("FUTURES_RISK_INPUT_SYMBOL_MISMATCH")
+        mark_price = _strict_finite_number(premium.get("markPrice"), label="markPrice", strictly_positive=True)
+        index_price = _strict_finite_number(premium.get("indexPrice"), label="indexPrice", strictly_positive=True)
+        funding_rate = _strict_finite_number(premium.get("lastFundingRate"), label="lastFundingRate")
+        maker_fee = _strict_finite_number(commission.get("makerCommissionRate"), label="makerCommissionRate", minimum=-1)
+        taker_fee = _strict_finite_number(commission.get("takerCommissionRate"), label="takerCommissionRate", minimum=0)
+        premium_time = _strict_finite_number(premium.get("time"), label="premium time", strictly_positive=True)
+        next_funding = _strict_finite_number(premium.get("nextFundingTime"), label="nextFundingTime", strictly_positive=True)
+        age = datetime.now(timezone.utc).timestamp() - premium_time / 1000
+        if (not premium_time.is_integer() or not next_funding.is_integer() or not -2 <= age <= 30
+                or next_funding <= datetime.now(timezone.utc).timestamp() * 1000 or abs(funding_rate) >= 1 or max(maker_fee, taker_fee) >= 1):
+            raise BrokerNotReadyError("FUTURES_RISK_INPUT_TIME_OR_COST_UNKNOWN")
         bracket_rows = (
             brackets_payload
             if isinstance(brackets_payload, list)
@@ -3505,26 +3584,19 @@ class LiveBrokerRouter:
             if isinstance(brackets_payload, dict)
             else []
         )
-        symbol_brackets = next(
-            (
-                item
-                for item in bracket_rows
-                if isinstance(item, dict)
-                and str(item.get("symbol") or "").upper()
-                == normalized_symbol
-            ),
-            {},
-        )
-        if not symbol_brackets:
-            raise BrokerNotReadyError(
-                "Binance Futures 요청 종목의 유지증거금 bracket을 "
-                "찾을 수 없습니다."
-            )
+        matches = [row for row in bracket_rows if isinstance(row, dict) and row.get("symbol") == normalized_symbol]
+        if len(matches) != 1:
+            raise BrokerNotReadyError("FUTURES_EXACT_SYMBOL_BRACKETS_REQUIRED")
+        symbol_brackets = matches[0]
         requested_notional = _strict_finite_number(
             notional_usdt,
             label="신규 주문 명목금액",
             minimum=0.0,
         )
+        if requested_quantity is not None:
+            quantity = _strict_finite_number(requested_quantity, label="신규 주문 수량", strictly_positive=True)
+            mark = _strict_finite_number(premium.get("markPrice"), label="신규 주문 마크가격", strictly_positive=True)
+            requested_notional = max(requested_notional, quantity * mark)
         combined_notional = existing_notional + requested_notional
         selected_bracket = _select_futures_maintenance_bracket(
             symbol_brackets,
@@ -3532,12 +3604,10 @@ class LiveBrokerRouter:
         )
         return {
             "symbol": normalized_symbol,
-            "mark_price": numeric_value(premium.get("markPrice"), 0.0),
-            "index_price": numeric_value(premium.get("indexPrice"), 0.0),
-            "funding_rate": numeric_value(
-                premium.get("lastFundingRate"),
-                0.0,
-            ),
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "funding_rate": funding_rate,
+            "premium_time_ms": premium_time,
             "next_funding_time": str(premium.get("nextFundingTime") or ""),
             "requested_notional_usdt": requested_notional,
             "existing_position_notional_usdt": existing_notional,
@@ -3557,14 +3627,8 @@ class LiveBrokerRouter:
             "initial_leverage_limit": selected_bracket[
                 "initial_leverage_limit"
             ],
-            "maker_fee_rate": numeric_value(
-                commission.get("makerCommissionRate"),
-                0.0,
-            ),
-            "taker_fee_rate": numeric_value(
-                commission.get("takerCommissionRate"),
-                0.0,
-            ),
+            "maker_fee_rate": max(0.0, maker_fee),
+            "taker_fee_rate": taker_fee,
         }
 
     def configure_binance_futures_symbol(
@@ -3591,13 +3655,14 @@ class LiveBrokerRouter:
             .replace("-", "")
         )
         normalized_margin_type = str(margin_type or "").strip().upper()
-        normalized_leverage = int(leverage)
+        normalized_leverage = leverage_integer(leverage)
         if not normalized_symbol:
             raise BrokerNotReadyError("Binance Futures symbol이 필요합니다.")
         if normalized_margin_type not in {"ISOLATED", "CROSSED"}:
             raise BrokerNotReadyError("지원하지 않는 Binance Futures 마진 방식입니다.")
-        if normalized_leverage < 1 or normalized_leverage > 125:
-            raise BrokerNotReadyError("Binance Futures 레버리지는 1~125배여야 합니다.")
+        limits = self.get_binance_futures_leverage_limits(normalized_symbol)
+        if normalized_leverage > limits["maximum_leverage"]:
+            raise BrokerNotReadyError("현재 종목·계좌의 실제 허용 레버리지를 초과했습니다.")
 
         applied: list[str] = []
         if change_margin_type:

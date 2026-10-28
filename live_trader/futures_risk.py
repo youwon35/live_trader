@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .futures_leverage_limits import MAX_SAFE_LEVERAGE_INTEGER, leverage_integer
+
 import math
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -150,7 +152,7 @@ def normalize_futures_risk_inputs(payload: Mapping[str, Any]) -> FuturesRiskInpu
                 _first_present(payload, ("notional_usdt", "notionalUsdt"))
             ),
         ),
-        leverage=_bounded(payload.get("leverage"), minimum=1.0, maximum=125.0, default=1.0),
+        leverage=max(1.0, _number(payload.get("leverage"), 1.0)),
         maintenance_margin_rate=_bounded(
             _first_present(
                 payload,
@@ -573,11 +575,13 @@ def simulate_futures_order_risk(
     if inputs.available_usdt <= 0:
         blockers.append("available-usdt-invalid")
     if raw_leverage_value is not None and (
-        not parsed_leverage_valid or parsed_leverage <= 0
+        not parsed_leverage_valid or isinstance(raw_leverage_value, bool)
+        or parsed_leverage != int(parsed_leverage) or not 1 <= parsed_leverage <= MAX_SAFE_LEVERAGE_INTEGER
     ):
         blockers.append("leverage-invalid")
     if raw_max_leverage_value is not None and (
-        not parsed_max_leverage_valid or parsed_max_leverage <= 0
+        not parsed_max_leverage_valid or isinstance(raw_max_leverage_value, bool)
+        or parsed_max_leverage != int(parsed_max_leverage) or not 1 <= parsed_max_leverage <= MAX_SAFE_LEVERAGE_INTEGER
     ):
         blockers.append("max-leverage-policy-invalid")
     if required_cash > inputs.available_usdt + 1e-9:

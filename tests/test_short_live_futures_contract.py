@@ -56,7 +56,7 @@ class FuturesContractTests(unittest.TestCase):
             self.contract(None)
 
     def test_futures_policy_rejects_invalid_and_conflicting_values(self):
-        for changes in ({"leverage": True}, {"leverage": 0}, {"leverage": 126}, {"leverage": 5.5},
+        for changes in ({"leverage": True}, {"leverage": 0}, {"leverage": 9007199254740992}, {"leverage": 5.5},
                         {"leverage": "NaN"}, {"stopLossPercent": 0}, {"stopLossPercent": 20},
                         {"stopLossPercent": float("nan")}, {"stopLossPercent": True},
                         {"marginMode": "CROSSED"}, {"closePosition": False},

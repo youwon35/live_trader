@@ -256,6 +256,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     <section className="panel short-live-intro">
       <div className="short-live-heading"><div><p className="short-live-eyebrow">5~7시간 · 실제 주문 경로 확인</p><h2>짧은 실거래 기능시험</h2></div>
         <button type="button" className="secondary-button" onClick={refresh} disabled={Boolean(busy)}><RefreshCw size={16} /> 실행 상태 새로 확인</button></div>
+      <p>같은 계좌·종목은 Live Trader와 GPT Trader 중 한 앱에서만 운용하세요. 두 앱의 동시 주문 소유권은 공유되지 않습니다.</p>
       <p>단일·복수 전략을 인스턴스와 포트폴리오로 연결하고 실제 신호 → 주문 → 체결 → 정상 종료를 확인합니다. 수익성이나 30일 검증을 통과했다는 의미는 아닙니다.</p>
       <div className="short-live-notice"><ShieldAlert size={19} /><span>준비 버튼은 주문을 보내지 않습니다. 실제 API 주문은 준비 결과를 확인하고 아래 시작 버튼을 직접 누른 뒤에만 요청합니다.</span></div>
       {snapshot.fixture && <p className="short-live-fixture" role="note">오프라인 화면 검사 · 표시 자료는 fixture이며 실계좌 조회·실주문 결과가 아닙니다.</p>}
@@ -321,7 +322,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
       {hasFutures && <fieldset className="short-live-futures-policy" disabled={locked}>
         <legend>선물 레버리지·거래소 보호 손절</legend>
         <div className="short-live-futures-fields">
-          <label>Binance에서 설정한 레버리지<input type="number" min="1" max="125" step="1" value={futuresLeverage} aria-label="선물 기대 레버리지" onChange={(event) => { setFuturesLeverage(event.target.value); setPreparedSelection(""); }} /><small>선택한 모든 선물 종목의 실제 설정과 같아야 합니다.</small></label>
+          <label>Binance에서 설정한 레버리지<input type="number" min="1" max={Number.MAX_SAFE_INTEGER} step="1" value={futuresLeverage} aria-label="선물 기대 레버리지" onChange={(event) => { setFuturesLeverage(event.target.value); setPreparedSelection(""); }} /><small>정수로 입력하세요. 실제 종목·계좌 한도와 별도로 공통 실주문 정책이 현재 최대 5배이므로, 그보다 높으면 시험 진입은 차단됩니다.</small></label>
           <label>보호 손절 가격 거리 (%)<input type="number" min="0" step="any" value={futuresStopLossPercent} placeholder="직접 입력" aria-label="선물 보호 손절 가격 거리 퍼센트" onChange={(event) => { setFuturesStopLossPercent(event.target.value); setPreparedSelection(""); }} /><small>진입 주문 기준 가격의 변동폭이며 증거금 손실률이 아닙니다.</small></label>
         </div>
         <p>격리(ISOLATED) 방식만 지원합니다. 이 화면은 거래소의 레버리지·증거금 설정을 변경하지 않습니다. 2배·10배도 입력할 수 있으며 Binance에 설정된 실제 값과 같아야 합니다. 실제 설정이 준비 결과와 달라지면 신규 진입을 막습니다.</p>

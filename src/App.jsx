@@ -94,7 +94,7 @@ import {
   submitTestIntent,
 } from "./api";
 import {
-  futuresRiskLeverageOptions,
+  futuresRiskLeverageMaximum,
   futuresRiskStrategyDefaults,
   isFuturesRiskStrategy,
   shouldHydrateRiskStrategy,
@@ -4052,9 +4052,8 @@ function FuturesRiskSimulatorPanel({ strategies = [] }) {
   const selectedStrategy = futuresStrategies.find(
     (item) => item.strategy_id === strategyId,
   );
-  const leverageOptions = futuresRiskLeverageOptions(
+  const leverageMaximum = futuresRiskLeverageMaximum(
     selectedStrategy?.futures_execution_policy?.maxLeverageMultiplier,
-    leverage,
   );
 
   async function calculateRisk() {
@@ -4094,7 +4093,7 @@ function FuturesRiskSimulatorPanel({ strategies = [] }) {
         <label><span>종목</span><input value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))} /></label>
         <label><span>방향</span><select value={direction} onChange={(event) => setDirection(event.target.value)}><option value="LONG">매수 포지션</option><option value="SHORT">매도 포지션</option></select></label>
         <label><span>명목금액 (USDT)</span><input type="number" min="0" step="0.1" value={notional} onChange={(event) => setNotional(event.target.value)} /></label>
-        <label><span>계산 레버리지 (x)</span><select value={leverage} onChange={(event) => setLeverage(event.target.value)}>{leverageOptions.map((value) => <option key={value} value={value}>{value}x</option>)}</select></label>
+        <label><span>계산 레버리지 (x)</span><input type="number" min="1" max={leverageMaximum} step="1" value={leverage} onChange={(event) => setLeverage(event.target.value)} /><small>전략 허용 상한 {leverageMaximum}배 · 실제 계좌·명목 구간 별도 확인</small></label>
         <label><span>보호 손절가</span><input type="number" min="0" step="any" value={stopPrice} onChange={(event) => setStopPrice(event.target.value)} placeholder="필수" /></label>
         <label><span>예상 펀딩 횟수</span><input type="number" min="0" max="90" value={fundingIntervals} onChange={(event) => setFundingIntervals(event.target.value)} /></label>
       </div>
@@ -4139,7 +4138,8 @@ const FUTURES_SETTINGS_BLOCKER_LABELS = {
   "leverage-unknown": "현재 레버리지를 확인할 수 없습니다.",
   "symbol-invalid": "유효한 USD-M 선물 종목을 입력하세요.",
   "only-isolated-supported": "안전 설정 화면에서는 격리(ISOLATED) 마진만 지원합니다.",
-  "leverage-outside-safe-presets": "초기 안전 프리셋 1x·2x·3x·5x 중 하나를 선택하세요.",
+  "leverage-integer-required": "레버리지는 양의 정수로 입력하세요.",
+  "leverage-exceeds-symbol-bracket": "선택한 배율이 현재 종목·계좌의 거래소 한도를 초과합니다.",
   "observation-failed": "Binance 실계좌 설정 조회에 실패했습니다.",
 };
 
@@ -4255,30 +4255,23 @@ function FuturesSettingsPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
           </select>
         </label>
         <label>
-          <span>초기 레버리지</span>
-          <select
-            value={leverage}
-            onChange={(event) => {
-              setLeverage(Number(event.target.value));
-              setAuthorizationToken("");
-            }}
-          >
-            {[1, 2, 3, 5].map((value) => (
-              <option key={value} value={value}>{value}x</option>
-            ))}
-          </select>
+          <span>변경할 레버리지</span>
+          <input type="number" min="1" max={Number.MAX_SAFE_INTEGER} step="1" value={leverage}
+            onChange={(event) => { setLeverage(event.target.value); setAuthorizationToken(""); }} />
+          <small>정수 입력 · 현재 종목·계좌의 실제 허용 상한을 사전점검과 적용 직전에 다시 확인합니다.</small>
         </label>
       </div>
       <div className="futures-settings-explainer">
         <strong>레버리지 {leverage}x</strong>
         <span>
           10 USDT 증거금 기준 최대 명목 노출은 약 {10 * Number(leverage)} USDT입니다.
-          거래당 위험률은 손절 거리와 주문 크기로 별도 제한해야 합니다. 이 설정 보조는 1·2·3·5배만 제공합니다. 10배 등은 Binance에서 직접 설정한 뒤 주문 연결 시험에 같은 배율을 입력해 준비 검사를 실행하세요.
+          거래당 위험률은 손절 거리와 주문 크기로 별도 제한해야 합니다. 특정 배율 프리셋 없이 정수를 입력하며, 실제 종목·계좌가 허용하는 배율만 적용합니다. 계좌 설정과 실주문 승인은 별개이며 현재 프로그램 공통 실진입 정책은 최대 5배입니다. 설정 변경은 포지션과 미체결 주문이 없을 때 별도 동의 후 한 번만 실행합니다.
         </span>
       </div>
       {preview.symbol && (
         <div className="futures-fill-soak-observation">
           <span>현재 <strong>{preview.margin_type || "-"} · {preview.leverage ?? "-"}x</strong></span>
+          {preview.symbol_leverage_limit && <span>거래소 허용 <strong>1~{preview.symbol_leverage_limit}x</strong></span>}
           <span>목표 <strong>{preview.target_margin_type || "ISOLATED"} · {preview.target_leverage ?? leverage}x</strong></span>
           <span>가용 <strong>{preview.available_usdt ?? "-"} USDT</strong></span>
           <span>포지션/미체결 <strong>{preview.position_count ?? 0}/{preview.open_order_count ?? 0}</strong></span>

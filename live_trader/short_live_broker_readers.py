@@ -6,6 +6,8 @@ The sole POST is the existing KIS OAuth authentication boundary.
 """
 from __future__ import annotations
 
+from .futures_leverage_limits import MAX_SAFE_LEVERAGE_INTEGER, leverage_integer
+
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -297,7 +299,7 @@ class ProductionShortLiveReaders:
         row = matches[0]
         leverage = number(row.get("leverage"), positive=True)
         margin = str(row.get("marginType") or "").upper()
-        if leverage != leverage.to_integral_value() or not 1 <= leverage <= 125 or margin not in {"ISOLATED", "CROSSED"}:
+        if leverage != leverage.to_integral_value() or not 1 <= leverage <= MAX_SAFE_LEVERAGE_INTEGER or margin not in {"ISOLATED", "CROSSED"}:
             raise ShortLiveBrokerBlocked("FUTURES_CONFIG_UNKNOWN")
         result = {"leverage": decimal_text(leverage), "marginMode": margin}
         if row.get("maxNotionalValue") is not None:
@@ -349,7 +351,7 @@ class ProductionShortLiveReaders:
                 bracket[key] *= coefficient
             if (bracket["notionalFloor"] < 0 or bracket["notionalCap"] <= bracket["notionalFloor"]
                     or not 0 < bracket["maintMarginRatio"] < 1 or bracket["cum"] < 0
-                    or not 1 <= bracket["initialLeverage"] <= 125
+                    or not 1 <= bracket["initialLeverage"] <= MAX_SAFE_LEVERAGE_INTEGER
                     or bracket["initialLeverage"] != bracket["initialLeverage"].to_integral_value()):
                 raise ShortLiveBrokerBlocked("FUTURES_LEVERAGE_BRACKET_INVALID")
             brackets.append(bracket)

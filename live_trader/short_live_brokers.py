@@ -612,7 +612,10 @@ class ShortLiveBrokerAdapter:
             m = deepcopy(dict(manifest))
             if self.route == "BINANCE_USDM_FUTURES":
                 self._futures_policy = deepcopy(m.get("futuresPolicy"))
-                futures_policy(self._futures_policy)
+                selected_leverage, _ = futures_policy(self._futures_policy)
+                from trading_runtime.futures_execution_policy import SAFE_MAX_LEVERAGE_MULTIPLIER
+                if selected_leverage > SAFE_MAX_LEVERAGE_MULTIPLIER:
+                    raise ShortLiveBrokerBlocked("FUTURES_SHARED_POLICY_LEVERAGE_EXCEEDED")
                 if self._protection is None:
                     raise ShortLiveBrokerBlocked("FUTURES_PROTECTION_TRANSPORT_UNAVAILABLE")
             if self._manifest is not None and self._manifest != m:
@@ -765,7 +768,7 @@ class ShortLiveBrokerAdapter:
             exposure = sum((abs(number(r["quantity"])) * number(r.get("markPrice"), positive=True) * fx for r in positions), Decimal(0))
             committed = self._capital_committed(positions, fx)
             margin_factor, reserve_costs = self._cost_factor(q)
-            leverage = Decimal(1) / margin_factor
+            leverage = futures_policy(self._futures_policy)[0] if self.route == "BINANCE_USDM_FUTURES" else Decimal(1)
             reducing = proposal.get("riskReducing") is True
             matching = [r for r in positions if r.get("symbol") == symbol]
             direction = str(proposal.get("positionDirection") or "long").lower()

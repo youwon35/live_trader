@@ -73,7 +73,8 @@ broker_globals = {"__package__": PKG, "re": re, "Decimal": Decimal, "InvalidOper
     "compare_futures_policy_to_broker": lambda *_: {"compliant": True},
     "numeric_value": lambda value, default=0: float(value if value is not None else default)}
 policy_function = next(n for n in broker_tree.body if isinstance(n, ast.FunctionDef) and n.name == "validate_binance_futures_execution_policy")
-exec(compile(ast.fix_missing_locations(ast.Module(body=[router_ast, policy_function], type_ignores=[])),
+reservation_function = next(n for n in broker_tree.body if isinstance(n, ast.FunctionDef) and n.name == "_reserved_short_order_authorized")
+exec(compile(ast.fix_missing_locations(ast.Module(body=[router_ast, policy_function, reservation_function], type_ignores=[])),
              str(ROOT / "brokers.py"), "exec"), broker_globals)
 FixtureRouter = broker_globals["FixtureRouter"]
 
@@ -313,7 +314,7 @@ class ProtectionTests(unittest.TestCase):
             def send(builder, **_):
                 req = builder(); calls.append(req.method)
                 return {"dualSidePosition": dual}
-            with patch.dict(broker_globals, {"real_orders_enabled": lambda: enabled, "send_binance_signed_request": send}):
+            with patch.dict(broker_globals, {"_reserved_short_order_authorized": lambda *a: enabled and auth.check_short_live_authority("BINANCE", operation="FUTURES_PROTECT"), "send_binance_signed_request": send}):
                 with auth.short_live_dispatch(row, native, lambda _: True), self.assertRaises(RuntimeError):
                     router.place_futures_protection(native)
             self.assertNotIn("POST", calls)

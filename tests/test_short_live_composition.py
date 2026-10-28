@@ -222,6 +222,13 @@ class CompositionFixture:
                 payload={"symbols":[{"symbol":"BTCUSDT","filters":[{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"},{"filterType":"MARKET_LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"},{"filterType":"MIN_NOTIONAL","minNotional":"1"}]}]}
             elif parsed.path.endswith("/positionSide/dual"): payload={"dualSidePosition":False}
             elif parsed.path.endswith("/symbolConfig"): payload=[{"symbol":"BTCUSDT","marginType":"ISOLATED","leverage":self.futures_policy["leverage"]}]
+            elif parsed.path.endswith("/premiumIndex"): payload={"symbol":"BTCUSDT","markPrice":"1000","indexPrice":"1000",
+                "lastFundingRate":"0.0002","time":int(self.now.timestamp()*1000),"nextFundingTime":int(self.now.timestamp()*1000)+3600000}
+            elif parsed.path.endswith("/leverageBracket"): payload=[{"symbol":"BTCUSDT","brackets":[{
+                "notionalFloor":"0","notionalCap":"1000000","initialLeverage":125,"maintMarginRatio":"0.004","cum":"0"}]}]
+            elif parsed.path.endswith("/commissionRate"): payload={"symbol":"BTCUSDT","makerCommissionRate":"0.001","takerCommissionRate":"0.001"}
+            elif parsed.path.endswith("/positionRisk"): payload=[{"symbol":"BTCUSDT","positionSide":"BOTH",
+                "positionAmt":str(self.position),"notional":str(self.position*1000),"markPrice":"1000"}]
             elif parsed.path=="/fapi/v1/algoOrder":
                 if self.unknown_protection_read: raise TimeoutError("SYNTHETIC PROTECTION READ UNKNOWN")
                 matches=[row for row in self.algos.values() if
@@ -304,6 +311,12 @@ class ShortLiveCompositionTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent); self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name); self.fixture=None
+        owner = self
+        class FixtureDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return owner.fixture.now if owner.fixture is not None else NOW
+        self.enter(patch.object(router_module,"datetime",FixtureDateTime))
         self.environ={"KIS_APP_KEY":"SYNTHETIC-ONLY-KEY","KIS_APP_SECRET":"SYNTHETIC-ONLY-SECRET",
             "KIS_ACCOUNT_NO":"12345678","KIS_ACCOUNT_PRODUCT_CODE":"01","KIS_ENV":"real","LIVE_TRADER_ENABLE_REAL_ORDERS":"true",
             "BINANCE_API_KEY":"SYNTHETIC-ONLY-KEY","BINANCE_API_SECRET":"SYNTHETIC-ONLY-SECRET",

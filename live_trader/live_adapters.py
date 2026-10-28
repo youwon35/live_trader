@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .futures_leverage_limits import MAX_SAFE_LEVERAGE_INTEGER, leverage_integer
+
 import hashlib
 import hmac
 import copy
@@ -1349,13 +1351,13 @@ def build_binance_futures_leverage_change_request(
         str(symbol or "").strip().upper().removesuffix(".PERP").replace("-", "")
     )
     try:
-        normalized_leverage = int(str(leverage).strip())
+        normalized_leverage = leverage_integer(leverage)
     except (TypeError, ValueError):
         normalized_leverage = 0
     blocked: list[str] = []
     if not normalized_symbol:
         blocked.append("symbol")
-    if normalized_leverage < 1 or normalized_leverage > 125:
+    if normalized_leverage < 1:
         blocked.append("leverage")
     return _build_binance_futures_signed_request(
         "POST",

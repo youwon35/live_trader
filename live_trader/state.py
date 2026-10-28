@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .futures_leverage_limits import MAX_SAFE_LEVERAGE_INTEGER, leverage_integer
+
 from .operator_review import OperatorReviewStore, record_key
 from .continuous_dispatch import (
     begin_control as begin_continuous_control,
@@ -16620,7 +16622,7 @@ BINANCE_SMOKE_MAX_USDT = 10.0
 BINANCE_SMOKE_PREVIEW_TTL_SECONDS = 600
 BINANCE_FUTURES_CANARY_TEST_TTL_SECONDS = 300
 BINANCE_FUTURES_SETTINGS_TTL_SECONDS = 300
-BINANCE_FUTURES_SAFE_LEVERAGE_PRESETS = (1, 2, 3, 5)
+BINANCE_FUTURES_LEVERAGE_INTEGER_LIMIT = MAX_SAFE_LEVERAGE_INTEGER
 BINANCE_FUTURES_FILL_SOAK_TTL_SECONDS = 300
 BINANCE_FUTURES_FILL_SOAK_DURATION_SECONDS = 5 * 60 * 60
 BINANCE_FUTURES_FILL_SOAK_NOTIONAL_USDT = 5.0
@@ -16631,7 +16633,7 @@ BINANCE_FUTURES_SETTINGS_INTERNAL: dict[str, Any] = {
     "symbol": "ETHUSDT",
     "target_margin_type": "ISOLATED",
     "target_leverage": 1,
-    "safe_leverage_presets": list(BINANCE_FUTURES_SAFE_LEVERAGE_PRESETS),
+    "leverage_integer_limit": BINANCE_FUTURES_LEVERAGE_INTEGER_LIMIT,
     "confirmation_token_hash": "",
     "confirmation_expires_epoch": 0.0,
     "confirmation_used": False,
@@ -16967,7 +16969,7 @@ def preview_binance_futures_settings(
     normalized_symbol = normalize_usdm_symbol(symbol)
     normalized_margin_type = str(margin_type or "").strip().upper()
     try:
-        normalized_leverage = int(str(leverage).strip())
+        normalized_leverage = leverage_integer(leverage)
     except (TypeError, ValueError):
         normalized_leverage = 0
     validation_errors: list[str] = []
@@ -16975,8 +16977,8 @@ def preview_binance_futures_settings(
         validation_errors.append("symbol-invalid")
     if normalized_margin_type != "ISOLATED":
         validation_errors.append("only-isolated-supported")
-    if normalized_leverage not in BINANCE_FUTURES_SAFE_LEVERAGE_PRESETS:
-        validation_errors.append("leverage-outside-safe-presets")
+    if normalized_leverage < 1:
+        validation_errors.append("leverage-integer-required")
 
     with BINANCE_FUTURES_SETTINGS_LOCK:
         BINANCE_FUTURES_SETTINGS_INTERNAL.update(
@@ -16999,11 +17001,17 @@ def preview_binance_futures_settings(
         blockers = validation_errors
     else:
         try:
-            observation = _binance_futures_settings_summary(
-                BINANCE_FUTURES_SETTINGS_ROUTER_FACTORY()
-                .get_binance_futures_canary_observation(normalized_symbol)
-            )
+            router = BINANCE_FUTURES_SETTINGS_ROUTER_FACTORY()
+            observation = _binance_futures_settings_summary(router.get_binance_futures_canary_observation(normalized_symbol))
             blockers = _binance_futures_settings_blockers(observation)
+            if not blockers:
+                limits = router.get_binance_futures_leverage_limits(normalized_symbol)
+                maximum = leverage_integer(limits.get("maximum_leverage"))
+                if limits.get("symbol") != normalized_symbol:
+                    raise BrokerNotReadyError("정확한 종목의 배율 한도를 확인하지 못했습니다.")
+                observation["symbol_leverage_limit"] = maximum
+                if normalized_leverage > maximum:
+                    blockers.append("leverage-exceeds-symbol-bracket")
         except (BrokerNotReadyError, RuntimeError, ValueError) as exc:
             observation = {"error": str(exc)[:240]}
             blockers = ["observation-failed"]
@@ -17162,6 +17170,9 @@ def apply_binance_futures_settings(
             raise BrokerNotReadyError(
                 "적용 직전 안전검사 차단: " + ", ".join(blockers)
             )
+        limits = router.get_binance_futures_leverage_limits(symbol)
+        if limits.get("symbol") != symbol or target_leverage > leverage_integer(limits.get("maximum_leverage")):
+            raise BrokerNotReadyError("적용 직전 종목·계좌 허용 레버리지가 변경되어 차단했습니다.")
         mutation_hold = _binance_futures_settings_mutation_hold_reason()
         if mutation_hold:
             raise BrokerNotReadyError(mutation_hold)

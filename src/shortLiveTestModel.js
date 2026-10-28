@@ -64,8 +64,9 @@ export function shortLiveBlockerLabel(value) {
     FUTURES_SETTINGS_REQUIRE_1X_ISOLATED: "선물 계좌의 1배 레버리지·격리 방식 확인 필요 · 자동 변경하지 않음",
     FUTURES_PROTECTION_POLICY_REQUIRED: "선물 기대 레버리지와 보호 손절 가격 거리를 직접 입력해야 함",
     FUTURES_PROTECTION_POLICY_INVALID: "선물 보호 손절 정책을 확인하지 못함",
-    FUTURES_LEVERAGE_INTEGER_REQUIRED: "선물 레버리지는 1~125 사이의 정수로 입력해야 함",
-    FUTURES_LEVERAGE_INVALID: "선물 레버리지는 1~125 사이의 정수로 입력해야 함",
+    FUTURES_LEVERAGE_INTEGER_REQUIRED: "선물 레버리지는 양의 정수로 입력해야 하며 실제 종목·계좌 허용 범위는 준비 시 확인함",
+    FUTURES_LEVERAGE_INVALID: "선물 레버리지는 양의 정수로 입력해야 하며 실제 종목·계좌 허용 범위는 준비 시 확인함",
+    FUTURES_SHARED_POLICY_LEVERAGE_EXCEEDED: "공통 실주문 정책의 최대 5배를 초과해 실제 시험 진입을 차단함 · 계좌 설정·계산 허용과 실진입 승인은 별도",
     FUTURES_LEVERAGE_EXCEEDS_LIMIT: "선물 레버리지가 지원 상한을 초과함",
     FUTURES_ISOLATED_MARGIN_REQUIRED: "선물 계좌의 격리 방식을 확인해야 함 · 자동 변경하지 않음",
     FUTURES_STOP_DISTANCE_EXCEEDS_MARGIN: "보호 손절 가격 거리가 레버리지에 따른 증거금 범위를 벗어남",
@@ -280,7 +281,7 @@ export function normalizeShortLiveFuturesPolicy(value) {
   if (Object.entries(constants).some(([key, expected]) => key in value && value[key] !== expected)
     || Object.keys(value).some((key) => !["leverage", "marginMode", "stopLossPercent", ...Object.keys(constants)].includes(key))) return null;
   const leverage = amount(value.leverage), stopLossPercent = amount(value.stopLossPercent);
-  if (!Number.isInteger(leverage) || leverage < 1 || leverage > 125
+  if (!Number.isSafeInteger(leverage) || leverage < 1
     || stopLossPercent === null || stopLossPercent <= 0 || stopLossPercent >= 100 / leverage) return null;
   return { leverage, marginMode: "ISOLATED", stopLossPercent };
 }
@@ -512,7 +513,7 @@ export function buildShortLivePrepare(catalog, selectedKeys, limits = SHORT_LIVE
   const payload = { selections: targets, durationHours, capitalKrwPerBroker: 100000, dailyLossStopKrwPerBroker: 50000 };
   if (futuresSelected(catalog, selectedKeys)) {
     const policy = normalizeShortLiveFuturesPolicy(limits.futuresPolicy);
-    if (!policy) throw new Error("선물 계좌의 실제 레버리지(1~125 정수)와 보호 손절 가격 거리(0% 초과, 100÷레버리지% 미만)를 입력해 주세요.");
+    if (!policy) throw new Error("선물 계좌의 실제 레버리지(양의 정수; 종목·계좌 한도 별도 확인)와 보호 손절 가격 거리(0% 초과, 100÷레버리지% 미만)를 입력해 주세요.");
     payload.futuresPolicy = policy;
   }
   return payload;
