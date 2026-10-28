@@ -220,7 +220,7 @@ class FuturesProtectionLifecycleTests(unittest.TestCase):
 
     def test_actual_liquidation_price_breach_and_missing_stop_are_incidents(self):
         f = ProtectionFixture(); f.ensure()
-        f.manager.check_positions([{"symbol": "SOLUSDT", "quantity": "1", "markPrice": "100", "liquidationPrice": "99"}])
+        f.manager.check_positions([{"symbol": "SOLUSDT", "quantity": "1", "positionSide":"BOTH", "markPrice": "100", "liquidationPrice": "99"}])
         self.assertEqual("FUTURES_ACTUAL_LIQUIDATION_BUFFER_BREACHED", f.manager.incidents[0]["code"])
         f.manager.active_by_symbol.clear()
         f.manager.check_positions([{"symbol": "SOLUSDT", "quantity": "1"}])

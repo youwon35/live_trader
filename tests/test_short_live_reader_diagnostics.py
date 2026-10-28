@@ -203,7 +203,7 @@ class QuoteReadOrderingTests(unittest.TestCase):
                 return {"symbols": [{"symbol": "SOLUSDT", "status": "TRADING", "quoteAsset": "USDT", "filters": filters}]}
             if path.endswith("commissionRate"):
                 current[0] += 11
-                return {"takerCommissionRate": "0.001"}
+                return {"symbol": "SOLUSDT", "takerCommissionRate": "0.001"}
             if path.endswith("symbolConfig"):
                 return [{"symbol": "SOLUSDT", "leverage": 1, "marginType": "ISOLATED", "isAutoAddMargin": False}]
             if path.endswith("positionSide/dual"): return {"dualSidePosition": False}
@@ -211,7 +211,7 @@ class QuoteReadOrderingTests(unittest.TestCase):
                 return [{"symbol": "SOLUSDT", "brackets": [{"notionalFloor": "0", "notionalCap": "1000000",
                     "maintMarginRatio": "0.005", "cum": "0", "initialLeverage": 20}]}]
             if path.endswith("premiumIndex"):
-                return {"markPrice": "100", "time": int(current[0] * 1000), "lastFundingRate": "0.0001"}
+                return {"symbol": "SOLUSDT", "markPrice": "100", "time": int(current[0] * 1000), "lastFundingRate": "0.0001"}
             if path.endswith("account/commission"):
                 current[0] += 11
                 return {k: {"taker": "0.001", "buyer": "0", "seller": "0"}

@@ -930,6 +930,8 @@ class ProductionShortLiveReaders:
                                  marketQuantityStepSource=("LOT_SIZE_FOR_ZERO_MARKET_STEP"
                                      if raw_market_step == 0 else "MARKET_LOT_SIZE"))
                     commission = self._binance(provider, "/fapi/v1/commissionRate", {"symbol": symbol})
+                    if not isinstance(commission, Mapping) or commission.get("symbol") != symbol:
+                        raise ShortLiveBrokerBlocked("FUTURES_COMMISSION_SYMBOL_MISMATCH")
                     fee = commission.get("takerCommissionRate")
                     config = self._binance(provider, "/fapi/v1/symbolConfig", {"symbol": symbol})
                     mode = self._binance(provider, "/fapi/v1/positionSide/dual")
@@ -939,6 +941,8 @@ class ProductionShortLiveReaders:
                         self._binance(provider, "/fapi/v1/leverageBracket", {"symbol": symbol}), symbol)
                     premium = self._binance(provider, "/fapi/v1/premiumIndex", {"symbol": symbol}, signed=False)
                     quote_received = self._now()
+                    if not isinstance(premium, Mapping) or premium.get("symbol") != symbol:
+                        raise ShortLiveBrokerBlocked("FUTURES_QUOTE_SYMBOL_MISMATCH")
                     price = premium.get("markPrice")
                     if type(premium.get("time")) is not int:
                         raise ShortLiveBrokerBlocked("FUTURES_QUOTE_SOURCE_TIME_UNKNOWN")

@@ -77,11 +77,15 @@ class FinalFakePostTests(unittest.TestCase):
         self.assertEqual(self.posts[0]["query"]["side"],"SELL")
         self.assertNotIn("reduceOnly",self.posts[0]["query"])
         self.assertIn("brackets",self.reads);self.assertIn("positions",self.reads)
-    def test_actual_shared_validator_blocks_above5_even_when_exchange_bracket_allows150(self):
-        for multiplier in (7,37,125,150):
+    def test_actual_shared_validator_permits_explicit_nonpreset_integers_only_inside_actual_tier(self):
+        for multiplier in (7,17,37,125,150):
             self.setUp();self.multiplier=multiplier;self.intent["max_leverage"]=multiplier
-            with self.subTest(multiplier=multiplier),self.assertRaises(BoundaryError):self.router.place_order(self.intent)
-            self.assertEqual(self.posts,[])
+            self.router.place_order(self.intent)
+            self.assertEqual(len(self.posts),1)
+            self.assertEqual(self.posts[0]["query"]["positionSide"],"SHORT")
+        self.setUp();self.multiplier=151;self.intent["max_leverage"]=151
+        with self.assertRaises(BoundaryError):self.router.place_order(self.intent)
+        self.assertEqual(self.posts,[])
     def test_ordinary_new_entry_direction_mismatch_cannot_open_opposite_position(self):
         self.intent["position_direction"]="long"
         with self.assertRaises(BoundaryError):self.router.place_order(self.intent)

@@ -66,7 +66,7 @@ export function shortLiveBlockerLabel(value) {
     FUTURES_PROTECTION_POLICY_INVALID: "선물 보호 손절 정책을 확인하지 못함",
     FUTURES_LEVERAGE_INTEGER_REQUIRED: "선물 레버리지는 양의 정수로 입력해야 하며 실제 종목·계좌 허용 범위는 준비 시 확인함",
     FUTURES_LEVERAGE_INVALID: "선물 레버리지는 양의 정수로 입력해야 하며 실제 종목·계좌 허용 범위는 준비 시 확인함",
-    FUTURES_SHARED_POLICY_LEVERAGE_EXCEEDED: "공통 실주문 정책의 최대 5배를 초과해 실제 시험 진입을 차단함 · 계좌 설정·계산 허용과 실진입 승인은 별도",
+    FUTURES_SHARED_POLICY_LEVERAGE_EXCEEDED: "레버리지 정수 표현 범위를 초과함 · 실제 종목·계좌·명목 구간의 허용 배율은 서버가 별도 확인함",
     FUTURES_LEVERAGE_EXCEEDS_LIMIT: "선물 레버리지가 지원 상한을 초과함",
     FUTURES_ISOLATED_MARGIN_REQUIRED: "선물 계좌의 격리 방식을 확인해야 함 · 자동 변경하지 않음",
     FUTURES_STOP_DISTANCE_EXCEEDS_MARGIN: "보호 손절 가격 거리가 레버리지에 따른 증거금 범위를 벗어남",

@@ -215,7 +215,8 @@ class FuturesProtectionManager:
                     raise FuturesProtectionError("FUTURES_PROTECTIVE_EXECUTION_UNKNOWN")
                 if (str(actual.get("brokerOrderId")) != str(observed["actualOrderId"])
                         or actual.get("symbol") != claim["symbol"]
-                        or actual.get("side") != claim["side"]):
+                        or actual.get("side") != claim["side"]
+                        or actual.get("positionSide") != (claim["positionDirection"].upper() if claim["positionMode"] == "HEDGE" else "BOTH")):
                     raise FuturesProtectionError("FUTURES_PROTECTIVE_EXECUTION_IDENTITY_CHANGED")
                 executions.append({"claim": deepcopy(claim), "order": deepcopy(actual)})
                 self._incident("FUTURES_PROTECTIVE_STOP_TRIGGERED", symbol=claim["symbol"],
@@ -248,12 +249,30 @@ class FuturesProtectionManager:
             if current.get("status") != "NEW":
                 self._incident("FUTURES_POSITION_UNPROTECTED", symbol=symbol)
                 continue
+            expected_side = claim["positionDirection"].upper() if claim["positionMode"] == "HEDGE" else "BOTH"
+            if claim.get("lastReadVerified") is not True or position.get("positionSide") != expected_side:
+                self._incident("FUTURES_POSITION_PROTECTION_UNVERIFIED", symbol=symbol)
+                continue
             mark = numeric(position.get("markPrice"), positive=True)
             liquidation = numeric(position.get("liquidationPrice"))
             trigger = numeric(claim["triggerPrice"], positive=True)
             long = numeric(position["quantity"]) > 0
             if liquidation < 0:
                 raise FuturesProtectionError("FUTURES_LIQUIDATION_PRICE_UNKNOWN")
+            if liquidation == 0:
+                # Zero is not a generic safe liquidation distance. Only an
+                # exactly observed fully collateralized isolated long can
+                # explain it; future fees/funding and gaps remain risks.
+                try:
+                    covered = (long and position.get("marginMode") == "ISOLATED"
+                        and claim["positionDirection"] == "long"
+                        and numeric(position.get("isolatedWallet")) >=
+                            abs(numeric(position["quantity"])) * numeric(position.get("entryPrice"), positive=True))
+                except FuturesProtectionError:
+                    covered = False
+                if not covered:
+                    self._incident("FUTURES_LIQUIDATION_PRICE_UNVERIFIED", symbol=symbol)
+                    continue
             if (liquidation > 0 and (not liquidation < trigger < mark if long else not mark < trigger < liquidation)):
                 self._incident("FUTURES_ACTUAL_LIQUIDATION_BUFFER_BREACHED", symbol=symbol,
                                liquidationPrice=str(liquidation), markPrice=str(mark), triggerPrice=str(trigger))

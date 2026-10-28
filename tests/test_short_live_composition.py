@@ -87,14 +87,16 @@ class CandleSocketFixture:
 
 
 class CompositionFixture:
-    def __init__(self,root,route,*,count=1,portfolio=False,timing="signal-close"):
+    def __init__(self,root,route,*,count=1,portfolio=False,timing="signal-close",futures_leverage=5,direction=None,position_mode="ONE_WAY"):
         self.root,self.route=root,route
         root.mkdir(parents=True)
         self.now=NOW; self.mono=10.0; self.alive=True
         self.calls=[]; self.mutations=[]; self.rows={}; self.position=Decimal(0)
         self.protection_mutations=[]; self.algos={}
         self.unknown_protection_read=False; self.protection_cancel_unconfirmed=False
-        self.futures_policy={"leverage":5,"marginMode":"ISOLATED","stopLossPercent":2}
+        self.futures_policy={"leverage":futures_leverage,"marginMode":"ISOLATED","stopLossPercent":.01 if futures_leverage>5 else 2}
+        self.direction=direction or "long"; self.position_mode=position_mode
+        self.synthetic_high_leverage=futures_leverage>5
         self.quote_balance=Decimal("200000"); self.external_assets={}
         self.accept_only=False; self.lose_reply=False; self.unknown_cleanup=False; self.unknown_read=False
         self.error_1021=False; self.wire_defects=[]; self.wire_errors=[]
@@ -109,16 +111,23 @@ class CompositionFixture:
         members=[]
         for index in range(count):
             parameters={"shortMa":index+1,"longMa":index+3,"executionTiming":timing}
+            plugin="moving_average_cross"
+            if direction is not None:
+                plugin="strategy_builder_custom"
+                parameters={"executionTiming":timing,"customStrategyDefinition":{
+                    "positionDirection":direction,
+                    "entryRules":[{"left":"close","operator":"below","right":"value","rightValue":1006.5}],
+                    "exitRules":[{"left":"close","operator":"above","right":"value","rightValue":1006.5}]}}
             source=seal_strategy_artifact({"id":f"fixture-source-{index}","strategy_id":f"fixture-source-{index}",
                 "artifact_schema_version":"strategy-artifact-v2","name":"SYNTHETIC COMPOSITION FIXTURE ONLY",
-                "asset":asset,"symbol":symbol,"timeframe":"5m","plugin":"moving_average_cross",
+                "asset":asset,"symbol":symbol,"timeframe":"5m","plugin":plugin,
                 "brokerId":broker,"marketDataProvider":provider,"parameters":parameters,
                 "finalTest":{"status":"PASS"},"executionPurpose":"FUNCTIONAL_TEST",
                 "promotionEligible":False,"useAsPromotionEvidence":False})
             instance=seal_strategy_instance({"schemaVersion":"strategy-instance-template-v1","instanceId":f"fixture-instance-{index}",
                 "sourceStrategyId":source["id"],"sourceArtifactHash":compute_strategy_artifact_hash(source),
                 "qualifiedSymbol":symbol,"qualifiedTimeframe":"5m","brokerId":broker,"marketDataProvider":provider,
-                "asset":asset,"pluginId":"moving_average_cross","parameters":parameters})
+                "asset":asset,"pluginId":plugin,"parameters":parameters})
             (self.catalog_root/(source["id"]+".json")).write_text(json.dumps(source),encoding="utf-8")
             (self.catalog_root/"strategy-instances"/(instance["instanceId"]+".json")).write_text(json.dumps(instance),encoding="utf-8")
             members.append({**instance,"templateInstanceId":instance["instanceId"],"strategyId":source["id"],
@@ -166,7 +175,9 @@ class CompositionFixture:
         if route=="BINANCE_USDM_FUTURES":
             for row in positions:
                 row.update(entryPrice="1000",isolatedWallet=str(abs(self.position)*1000/self.futures_policy["leverage"]),
-                           liquidationPrice="800",leverage=str(self.futures_policy["leverage"]),positionSide="BOTH")
+                           liquidationPrice=str(Decimal(1000)*(1+Decimal(1)/self.futures_policy["leverage"] if self.position<0 else 1-Decimal(1)/self.futures_policy["leverage"])),
+                           marginMode="ISOLATED",leverage=str(self.futures_policy["leverage"]),
+                           positionSide=self.direction.upper() if self.position_mode=="HEDGE" else "BOTH")
         spot = route in {"BINANCE_SPOT", "UPBIT_KRW_SPOT"}
         locked_quote = sum((Decimal(row["quantity"])*Decimal("1000") for row in self.rows.values()
                             if row["status"]=="ACCEPTED" and row["side"]=="BUY"), Decimal(0)) if spot else Decimal(0)
@@ -187,12 +198,12 @@ class CompositionFixture:
 
     def market(self,route,symbol):
         return {"known":True,"symbol":symbol,"nativePrice":"1000","quoteCurrency":self.currency,"krwPerQuote":"1",
-            "fxObservedAt":self.now.timestamp(),"observedAt":self.now.timestamp(),"feeRate":"0.001","sellTaxRate":"0",
-            "lotStep":"1","minQuantity":"1","minNotional":"1","priceTick":"1","sessionOpen":True,
+            "fxObservedAt":self.now.timestamp(),"observedAt":self.now.timestamp(),"feeRate":"0.0001" if self.synthetic_high_leverage else "0.001","sellTaxRate":"0",
+            "lotStep":"1","minQuantity":"1","minNotional":"1","priceTick":"0.01" if self.synthetic_high_leverage else "1","sessionOpen":True,
             "marketQuantityStep":"1","marketMinQuantity":"1","marketMaxQuantity":"1000000",
-            "sessionRemainingSeconds":19800,"marginMode":"ISOLATED","leverage":str(self.futures_policy["leverage"]),"positionMode":"ONE_WAY",
-            "fundingRate":"0.0001","markPrice":"1000","isAutoAddMargin":False,"maxNotionalValue":"1000000",
-            "leverageBrackets":[{"notionalFloor":"0","notionalCap":"1000000","initialLeverage":125,"maintMarginRatio":"0.004","cum":"0"}]}
+            "sessionRemainingSeconds":19800,"marginMode":"ISOLATED","leverage":str(self.futures_policy["leverage"]),"positionMode":self.position_mode,
+            "fundingRate":"0.0001","markPrice":"1000","isAutoAddMargin":False,"maxNotionalValue":"100000000",
+            "leverageBrackets":[{"notionalFloor":"0","notionalCap":"100000000","initialLeverage":150,"maintMarginRatio":"0.001","cum":"0"}]}
 
     def read_order(self,route,claim):
         if self.unknown_read: return {"known":False}
@@ -220,14 +231,14 @@ class CompositionFixture:
         if method=="GET":
             if parsed.path.endswith("/exchangeInfo"):
                 payload={"symbols":[{"symbol":"BTCUSDT","filters":[{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"},{"filterType":"MARKET_LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"},{"filterType":"MIN_NOTIONAL","minNotional":"1"}]}]}
-            elif parsed.path.endswith("/positionSide/dual"): payload={"dualSidePosition":False}
+            elif parsed.path.endswith("/positionSide/dual"): payload={"dualSidePosition":self.position_mode=="HEDGE"}
             elif parsed.path.endswith("/symbolConfig"): payload=[{"symbol":"BTCUSDT","marginType":"ISOLATED","leverage":self.futures_policy["leverage"]}]
             elif parsed.path.endswith("/premiumIndex"): payload={"symbol":"BTCUSDT","markPrice":"1000","indexPrice":"1000",
                 "lastFundingRate":"0.0002","time":int(self.now.timestamp()*1000),"nextFundingTime":int(self.now.timestamp()*1000)+3600000}
             elif parsed.path.endswith("/leverageBracket"): payload=[{"symbol":"BTCUSDT","brackets":[{
-                "notionalFloor":"0","notionalCap":"1000000","initialLeverage":125,"maintMarginRatio":"0.004","cum":"0"}]}]
-            elif parsed.path.endswith("/commissionRate"): payload={"symbol":"BTCUSDT","makerCommissionRate":"0.001","takerCommissionRate":"0.001"}
-            elif parsed.path.endswith("/positionRisk"): payload=[{"symbol":"BTCUSDT","positionSide":"BOTH",
+                "notionalFloor":"0","notionalCap":"100000000","initialLeverage":150,"maintMarginRatio":"0.001","cum":"0"}]}]
+            elif parsed.path.endswith("/commissionRate"): payload={"symbol":"BTCUSDT","makerCommissionRate":"0.0001" if self.synthetic_high_leverage else "0.001","takerCommissionRate":"0.0001" if self.synthetic_high_leverage else "0.001"}
+            elif parsed.path.endswith("/positionRisk"): payload=[{"symbol":"BTCUSDT","positionSide":self.direction.upper() if self.position_mode=="HEDGE" else "BOTH",
                 "positionAmt":str(self.position),"notional":str(self.position*1000),"markPrice":"1000"}]
             elif parsed.path=="/fapi/v1/algoOrder":
                 if self.unknown_protection_read: raise TimeoutError("SYNTHETIC PROTECTION READ UNKNOWN")
@@ -280,7 +291,7 @@ class CompositionFixture:
         if self.lose_reply or (self.unknown_cleanup and order["riskReducing"]): raise TimeoutError("SYNTHETIC LOST REPLY")
         oid=str(len(self.mutations))
         row={"known":True,"brokerOrderId":oid,"clientOrderId":order["clientOrderId"],"symbol":self.symbol,
-            "status":"ACCEPTED","side":order["side"],"positionSide":"BOTH","quantity":str(order["quantity"]),"filledQuantity":"0",
+            "status":"ACCEPTED","side":order["side"],"positionSide":order.get("positionDirection","long").upper() if order.get("positionMode")=="HEDGE" else "BOTH","quantity":str(order["quantity"]),"filledQuantity":"0",
             "remainingQuantity":str(order["quantity"]),"fillPrice":"1000","feeNative":"0",
             "baseCommissionKnown":True,"baseCommissionQuantity":"0","observedAt":self.now.timestamp(),
             "orderDate":"20261022","organizationNo":"00001"}

@@ -59,7 +59,9 @@ class Fixture:
                 if previous + delta:
                     owner.truth["positions"] = [{"symbol": owner.symbol, "quantity": str(previous + delta), "markPrice": "1000",
                         "entryPrice": "1000", "isolatedWallet": str(abs(previous + delta)*1000/mod.number(owner.quote["leverage"])),
-                        "liquidationPrice": "0" if previous + delta > 0 else "2000",
+                        "liquidationPrice": ("0" if mod.number(owner.quote["leverage"]) == 1 else str(
+                            mod.Decimal(1000) * (1-mod.Decimal(1)/mod.number(owner.quote["leverage"])))) if previous + delta > 0 else "2000",
+                        "marginMode": "ISOLATED",
                         "positionSide": ("LONG" if previous+delta > 0 else "SHORT") if owner.quote["positionMode"] == "HEDGE" else "BOTH"}]
                 else: owner.truth["positions"] = []
                 owner.rows[oid] = {"known": True, "brokerOrderId": oid, "clientOrderId": order["identifier"],

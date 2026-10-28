@@ -32,7 +32,7 @@ class AllIntegerFuturesTests(unittest.TestCase):
         return f
 
     def test_currently_admitted_integers_long_short_oneway_hedge_round_trip(self):
-        for multiplier in (1,2,3,5):
+        for multiplier in (1,2,3,5,7,17,37,75,125,150):
             for direction in ("long","short"):
                 for mode in ("ONE_WAY","HEDGE"):
                     with self.subTest(multiplier=multiplier,direction=direction,mode=mode):
@@ -66,12 +66,11 @@ class AllIntegerFuturesTests(unittest.TestCase):
                         self.assertEqual(f.truth["openAlgoOrders"],[])
                         self.assertEqual(len(f.calls),2)
 
-    def test_formal_common_policy_blocks_above5_before_any_real_session_entry(self):
-        for multiplier in (7,17,37,75,125,150,151):
-            f=self.futures(multiplier,"short","HEDGE")
-            ready=f.adapter.readiness(f.manifest);self.assertFalse(ready["ready"])
-            self.assertIn("FUTURES_SHARED_POLICY_LEVERAGE_EXCEEDED",ready["blockers"])
-            self.assertEqual(f.calls,[]);self.assertEqual(f.protection_calls,[])
+    def test_actual_symbol_limit_still_blocks_151_when_fresh_exchange_maximum_is150(self):
+        f=self.futures(151,"short","HEDGE")
+        ready=f.adapter.readiness(f.manifest);self.assertFalse(ready["ready"])
+        self.assertIn("FUTURES_LEVERAGE_BRACKET_EXCEEDED",ready["blockers"])
+        self.assertEqual(f.calls,[]);self.assertEqual(f.protection_calls,[])
 
     def test_readers_and_contract_preserve_actual150_without_claiming_real_exchange_support(self):
         parsed=contract.normalize_futures_policy({"leverage":150,"marginMode":"ISOLATED","stopLossPercent":"0.01"})

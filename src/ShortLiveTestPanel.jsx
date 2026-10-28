@@ -322,13 +322,13 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
       {hasFutures && <fieldset className="short-live-futures-policy" disabled={locked}>
         <legend>선물 레버리지·거래소 보호 손절</legend>
         <div className="short-live-futures-fields">
-          <label>Binance에서 설정한 레버리지<input type="number" min="1" max={Number.MAX_SAFE_INTEGER} step="1" value={futuresLeverage} aria-label="선물 기대 레버리지" onChange={(event) => { setFuturesLeverage(event.target.value); setPreparedSelection(""); }} /><small>정수로 입력하세요. 실제 종목·계좌 한도와 별도로 공통 실주문 정책이 현재 최대 5배이므로, 그보다 높으면 시험 진입은 차단됩니다.</small></label>
+          <label>Binance에서 설정한 레버리지<input type="number" min="1" max={Number.MAX_SAFE_INTEGER} step="1" value={futuresLeverage} aria-label="선물 기대 레버리지" onChange={(event) => { setFuturesLeverage(event.target.value); setPreparedSelection(""); }} /><small>정수로 입력하세요. 선택한 모든 종목의 실제 계좌 설정과 같아야 하며, 종목·명목 구간별 거래소 허용 배율과 담보·비용·보호 조건을 다시 검사합니다.</small></label>
           <label>보호 손절 가격 거리 (%)<input type="number" min="0" step="any" value={futuresStopLossPercent} placeholder="직접 입력" aria-label="선물 보호 손절 가격 거리 퍼센트" onChange={(event) => { setFuturesStopLossPercent(event.target.value); setPreparedSelection(""); }} /><small>진입 주문 기준 가격의 변동폭이며 증거금 손실률이 아닙니다.</small></label>
         </div>
         <p>격리(ISOLATED) 방식만 지원합니다. 이 화면은 거래소의 레버리지·증거금 설정을 변경하지 않습니다. 2배·10배도 입력할 수 있으며 Binance에 설정된 실제 값과 같아야 합니다. 실제 설정이 준비 결과와 달라지면 신규 진입을 막습니다.</p>
         <p>자본 한도 안에서 포지션 투입 증거금을 배정하고, 명목 포지션 규모는 레버리지를 반영해 계산합니다. 비용 예비금은 주문 가능액 계산 시 별도로 차감합니다. 증거금 1만원이면 2배는 최대 약 2만원, 10배는 최대 약 10만원의 명목 포지션입니다. 실제 잔고가 늘어나는 뜻은 아닙니다.</p>
         <p className="short-live-meta">이 선물 설정과 보호는 이 화면의 5~7시간 기능시험에 적용됩니다.</p>
-        <p className="short-live-meta">보호 손절은 Mark Price 기준의 거래소 STOP_MARKET 주문입니다. 보호 주문을 확인한 뒤 진입하며, 정상 종료 중에도 포지션이 남아 있으면 보호를 유지합니다. 손절 가격과 실제 체결 가격은 다를 수 있습니다.</p>
+        <p className="short-live-meta">보호 손절은 Mark Price 기준의 거래소 STOP_MARKET 주문입니다. 보호 주문을 확인한 뒤 진입하며, 정상 종료 중에도 포지션이 남아 있으면 보호를 유지합니다. 손절 가격과 실제 체결 가격은 다를 수 있습니다. 급변·시장 갭·거래소 지연이나 장애 때는 손절이 청산보다 먼저 체결된다고 보장할 수 없습니다.</p>
         {!futuresPolicyValid && <p className="short-live-error" role="status">레버리지와 보호 손절 가격 거리를 입력해 주세요. 손절 거리는 0%보다 크고 100÷레버리지%보다 작아야 하며, 실제 청산가·증거금 조건은 서버가 추가 검사합니다. 기존 50% 손절은 2배·10배에서 사용할 수 없으며 자동으로 다른 값으로 바꾸지 않습니다.</p>}
       </fieldset>}
       <p>선택 {selection.length}개 · {durationHours}시간 · 자동 재시도 없음</p>
