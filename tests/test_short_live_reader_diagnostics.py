@@ -252,7 +252,7 @@ class QuoteReadOrderingTests(unittest.TestCase):
         self.assertFalse(result["known"])
         self.assertEqual(1, calls.count("FX"))
         self.assertEqual("upbit", result["readDiagnostics"][-1]["provider"])
-        self.assertEqual("/v1/ticker", result["readDiagnostics"][-1]["path"])
+        self.assertEqual("/v1/orderbook", result["readDiagnostics"][-1]["path"])
         self.assertEqual("TIMEOUT", result["readDiagnostics"][-1]["failureKind"])
 
     def test_exact_fx_validation_codes_remain_blocked_with_the_original_reason(self):

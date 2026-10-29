@@ -85,3 +85,16 @@ test('snapshot failure releases a waiting account read; account failure releases
  await assert.rejects(coordinator.runAccount(async()=>{throw new Error('account failed');}),/account failed/);
  assert.equal(await coordinator.runSnapshot(async()=> 'fresh'),'fresh');
 });
+
+test('fully classified historical references do not become an account read failure; explicit errors and active mismatch remain failures',()=>{
+ const current=snap();current.continuous_runtime={running:false,profiles:{},runtimes:{}};current.short_live_test_status={active:false};current.orders=[];current.order_queue={active:0};
+ current.program_ledger={state:{last_baseline:null,last_baseline_source:null},fill_event_count:0,other_event_count:0,snapshot_event_count:1,positions:[]};
+ const row={broker_id:'upbit',currency:'KRW',program_currency:'KRW',program_source:'event_poll',program_updated_at:'2026-07-30T00:00:00Z',program_cash_value:100,broker_cash_value:120,status:'mismatch'};
+ current.reconciliation={summary:{...current.reconciliation.summary,account_count:1,position_count:0,mismatch_count:1,blocking_count:1,capability_gap_count:0,status:'fail'},accounts:[row],positions:[],errors:[]};
+ const result={ok:false,snapshot:current};const view=accountRefreshResultState(initialAccountRefreshState,result);
+ assert.equal(view.error,'');assert.match(view.warning,/과거 조회 기준/);assert.equal(view.lastSuccessAt,current.reconciliation.summary.last_run);
+ assert.equal(result.ok,false);assert.equal(current.reconciliation.summary.status,'fail');assert.equal(row.program_cash_value,100);
+ assert.match(accountRefreshResultState(initialAccountRefreshState,{...result,reason:'read failed'}).error,/read failed/);
+ current.continuous_runtime.running=true;
+ assert.notEqual(accountRefreshResultState(initialAccountRefreshState,result).error,'');
+});

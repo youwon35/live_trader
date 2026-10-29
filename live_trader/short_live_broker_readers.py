@@ -24,6 +24,7 @@ from typing import Any
 from .short_live_brokers import ROUTES, ShortLiveBrokerBlocked, number, decimal_text
 from .short_live_read_diagnostics import DIAGNOSTIC_PATHS, sanitize_read_diagnostics
 from .short_live_upbit_quote import UpbitQuoteObservationError, validate_upbit_quote_observation
+from .native_fx_observation import sanitize_fx_observation
 
 
 # Exact codes produced by account_currency_limits.py. Arbitrary ValueError
@@ -39,6 +40,9 @@ _FX_VALIDATION_CODES = frozenset({
     "NATIVE_FX_OFFICIAL_RESPONSE_BINDING_CHANGED", "NATIVE_FX_OFFICIAL_RESPONSE_SCOPE_CHANGED",
     "NATIVE_FX_RATE_RESPONSE_CHANGED", "NATIVE_FX_TIME_RESPONSE_CHANGED",
     "NATIVE_FX_OBSERVATION_STALE_OR_FUTURE",
+    "NATIVE_FX_ORDERBOOK_SCOPE_INVALID", "NATIVE_FX_ORDERBOOK_PRICE_INVALID",
+    "NATIVE_FX_ORDERBOOK_SIZE_INVALID", "NATIVE_FX_ORDERBOOK_TIMESTAMP_INVALID",
+    "NATIVE_FX_CURRENT_OBSERVATION_REQUIRED",
 })
 
 
@@ -170,12 +174,17 @@ class ProductionShortLiveReaders:
             if value.get("known") is not True:
                 raise ShortLiveBrokerBlocked("FRESH_FX_REQUIRED")
         except Exception as exc:
-            # The production USDT conversion reader has this exact endpoint.
-            self._record_read("upbit", "/v1/ticker", started, exc=exc)
+            self._record_read("upbit", "/v1/orderbook", started, exc=exc)
+            evidence = sanitize_fx_observation(getattr(exc, "fxObservation", None))
+            if evidence is not None:
+                self._read_diagnostics[-1].update(failureKind="FX_VALIDATION", fxObservation=evidence)
             if isinstance(exc, ValueError) and str(exc) in _FX_VALIDATION_CODES:
                 raise ShortLiveBrokerBlocked(str(exc)) from None
             raise
-        self._record_read("upbit", "/v1/ticker", started)
+        self._record_read("upbit", "/v1/orderbook", started)
+        evidence = sanitize_fx_observation(value.get("fxObservation"))
+        if evidence is not None:
+            self._read_diagnostics[-1]["fxObservation"] = evidence
         return value
 
     def _failure_reads(self):
@@ -389,13 +398,14 @@ class ProductionShortLiveReaders:
     def _official_fx(self, currency: str) -> dict[str, Any]:
         if currency != "USDT":
             return {"known": False}
-        from .account_currency_limits import observe_upbit_usdt_krw, validate_conversion_observation
+        from .account_currency_limits import observe_upbit_usdt_krw, validate_conversion_observation, conversion_observation_diagnostic
         observation = observe_upbit_usdt_krw(self.reader)
         now = datetime.fromtimestamp(self.clock(), timezone.utc)
         verified = validate_conversion_observation(observation, native_currency="USDT", now=now)
         return {"known": True, "krwPerQuote": verified["krwPerNativeCurrency"],
-                "observedAt": verified["rateAsOf"], "source": "OFFICIAL_UPBIT_KRW_USDT",
-                "contentHash": verified["contentHash"]}
+                "observedAt": verified["rateAsOf"], "source": "OFFICIAL_UPBIT_KRW_USDT_ORDERBOOK",
+                "contentHash": verified["contentHash"],
+                "fxObservation": conversion_observation_diagnostic(verified, now=now)}
 
     def _configured_kis_costs(self, route: str, symbol: str) -> dict[str, Any]:
         """No personal KIS tariff producer exists in the legacy application.
@@ -1035,7 +1045,8 @@ class ProductionShortLiveReaders:
             if fx.get("known") is not True:
                 raise ShortLiveBrokerBlocked("FRESH_FX_REQUIRED")
             result = {"known": True, "symbol": symbol, "nativePrice": str(price), "quoteCurrency": currency,
-                      "krwPerQuote": str(fx["krwPerQuote"]), "fxObservedAt": fx["observedAt"], "feeRate": str(fee),
+                      "krwPerQuote": str(fx["krwPerQuote"]), "fxObservedAt": fx["observedAt"],
+                      "fxObservation": sanitize_fx_observation(fx.get("fxObservation")), "feeRate": str(fee),
                       "lotStep": str(step), "minQuantity": str(min_qty), "minNotional": str(min_notional),
                       "maxQuantity": None if max_qty is None else str(max_qty), "observedAt": quote_received, **extra}
             for key in ("nativePrice", "krwPerQuote", "lotStep", "minQuantity"):
@@ -1058,13 +1069,14 @@ def production_fx_reader(reader, *, clock=time.time):
     def observe(currency):
         if currency != "USDT":
             return {"known": False}
-        from .account_currency_limits import observe_upbit_usdt_krw, validate_conversion_observation
+        from .account_currency_limits import observe_upbit_usdt_krw, validate_conversion_observation, conversion_observation_diagnostic
         raw = observe_upbit_usdt_krw(reader)
         now = datetime.fromtimestamp(clock(), timezone.utc)
         verified = validate_conversion_observation(raw, native_currency="USDT", now=now)
         return {"known": True, "krwPerQuote": verified["krwPerNativeCurrency"],
                 "observedAt": verified["rateAsOf"], "contentHash": verified["contentHash"],
-                "source": "OFFICIAL_UPBIT_KRW_USDT"}
+                "source": "OFFICIAL_UPBIT_KRW_USDT_ORDERBOOK",
+                "fxObservation": conversion_observation_diagnostic(verified, now=now)}
     return observe
 
 

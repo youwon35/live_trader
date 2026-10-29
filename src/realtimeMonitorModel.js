@@ -16,11 +16,11 @@ export const monitorEventLabels = {
 
 export function monitorFailureDiagnostic(row) {
   const providerLabel = ({ binance: 'Binance 현물', 'binance-futures': 'Binance USDT 선물', upbit: 'Upbit', kis: '한국투자증권' })[row.provider] || '거래소 미확인';
-  const kind = row.quoteObservation?.status === 'BLOCKED' ? 'QUOTE_VALIDATION' : row.failureKind || row.status;
+  const kind = row.fxObservation?.status === 'BLOCKED' ? 'FX_VALIDATION' : row.quoteObservation?.status === 'BLOCKED' ? 'QUOTE_VALIDATION' : row.failureKind || row.status;
   const kindLabel = ({ TIMEOUT: '응답 시간 초과', HTTP_ERROR: 'HTTP 오류', CONNECTION_ERROR: '연결 오류',
     INVALID_RESPONSE: '응답 형식 오류', READ_BOUNDARY: '조회 조건 확인 실패', READ_REJECTED: '조회 요청 거절',
     READ_UNAVAILABLE: '자료 조회 불가', UNEXPECTED_ERROR: '예상하지 못한 조회 오류',
-    QUOTE_VALIDATION: '시세 시각 검증 차단', AVAILABLE: 'HTTP 조회 완료', BLOCKED: '조회 차단', UNAVAILABLE: '자료 조회 불가', REJECTED: '요청 거절' })[kind];
+    FX_VALIDATION: '원화·USDT 환산 관측 검증 차단', QUOTE_VALIDATION: '시세 시각 검증 차단', AVAILABLE: 'HTTP 조회 완료', BLOCKED: '조회 차단', UNAVAILABLE: '자료 조회 불가', REJECTED: '요청 거절' })[kind];
   const resultLabel = [row.httpStatus !== null ? `HTTP ${row.httpStatus}` : '', kindLabel ? `${kindLabel} (${kind})` : kind || '원인 미확인'].filter(Boolean).join(' · ');
   return { ...row, providerLabel, resultLabel, elapsedLabel: known(row.elapsedMs) ? row.elapsedMs < 1000 ? `${row.elapsedMs.toFixed(1)}ms` : `${(row.elapsedMs / 1000).toFixed(1)}초` : '소요 시간 미기록' };
 }

@@ -34,6 +34,13 @@ export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt
         <strong>{row.providerLabel}</strong> · {row.resultLabel} · {row.elapsedLabel}
         {row.path && <><br/><code style={{overflowWrap:'anywhere'}}>{row.path}</code></>}
         {row.brokerCode && <small> · 거래소 코드 {row.brokerCode}</small>}
+        {row.fxObservation && <dl className="live-monitor-quote-observation">
+          <div><dt>환산 기준</dt><dd>Upbit KRW-USDT 현재 최우선 매도 호가 · 원화 예산 보수적 환산</dd></div>
+          <div><dt>거래소 호가 조회 시각</dt><dd>{date(row.fxObservation.sourceObservedAt)} · 로컬 경과 {row.fxObservation.sourceAgeSeconds === null ? '미기록' : `${number(row.fxObservation.sourceAgeSeconds)}초`}</dd></div>
+          <div><dt>HTTP 시각 보수 상한</dt><dd>{row.fxObservation.sourceAgeUpperSeconds === null ? '미기록' : `${number(row.fxObservation.sourceAgeUpperSeconds)}초`} · 허용 15초</dd></div>
+          <div><dt>수신·실제 검사 시각</dt><dd>{date(row.fxObservation.receivedAt)} / {date(row.fxObservation.checkedAt)}</dd></div>
+          <div><dt>응답·검증</dt><dd>요청 {row.fxObservation.readElapsedSeconds === null ? '미기록' : `${number(row.fxObservation.readElapsedSeconds)}초`} · {row.fxObservation.validationCode}</dd></div>
+        </dl>}
         {row.quoteObservation && <dl className="live-monitor-quote-observation">
           <div><dt>검사 대상</dt><dd>{row.quoteObservation.symbol} · {row.quoteObservation.purpose === 'INVENTORY_VALUATION' ? '기존 보유 자산 평가' : '주문 시세 검사'}</dd></div>
           <div><dt>현재가 정보 반영 시각</dt><dd>{date(row.quoteObservation.sourceObservedAt)} · 경과 {row.quoteObservation.sourceAgeSeconds === null ? '미기록' : `${number(row.quoteObservation.sourceAgeSeconds)}초`}</dd></div>
@@ -43,7 +50,7 @@ export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt
         </dl>}
 
       </li>)}</ul> : <p>이 기록에는 세부 API 오류가 남아 있지 않습니다. 정확한 요청 경로나 통신 원인을 추정하지 않습니다.</p>}
-      {!view.failureDiagnostics.some(row=>row.quoteObservation) && <p>이 기록에는 시세 원본 시각이 저장되지 않았습니다. 당시 어떤 시각이 몇 초 오래됐는지는 추측하지 않습니다. HTTP 조회가 성공해도 응답 내용의 시세 검사는 실패할 수 있습니다.</p>}
+      {!view.failureDiagnostics.some(row=>row.quoteObservation || row.fxObservation) && <p>이 기록에는 시세 원본 시각이 저장되지 않았습니다. 당시 어떤 시각이 몇 초 오래됐는지는 추측하지 않습니다. HTTP 조회가 성공해도 응답 내용의 시세 검사는 실패할 수 있습니다.</p>}
       <small>최초 실패 당시의 관측입니다. 이후 종료 정리가 완료되어도 이 오류는 보존됩니다.</small>
     </details>}
     <div className="live-monitor-freshness"><span>마지막 갱신 <strong>{date(receivedAt ? new Date(receivedAt).toISOString() : null)}</strong></span><span>서버 관측 {date(snapshot?.observedAt)}</span><span>시세 수신: {view.terminalReported ? "종료 기록" : view.feedsRecent && view.responseCurrent ? "최근 프레임 관측" : "확인 필요"}</span></div>

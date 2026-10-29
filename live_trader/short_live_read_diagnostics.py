@@ -2,6 +2,7 @@
 from collections.abc import Mapping
 import math
 from .short_live_upbit_quote import sanitize_quote_observation
+from .native_fx_observation import sanitize_fx_observation
 
 # Diagnostic identities are fixed routes only. Never retain a signed URL,
 # query, request/response body, credentials or an arbitrary exception message.
@@ -18,7 +19,7 @@ DIAGNOSTIC_PATHS = {
         "/fapi/v1/leverageBracket", "/fapi/v1/order", "/fapi/v1/userTrades",
         "/fapi/v1/algoOrder", "/fapi/v1/forceOrders"}),
     "upbit": frozenset({"/v1/accounts", "/v1/orders/open", "/v1/order",
-        "/v1/orders/chance", "/v1/ticker", "/v1/orderbook/instruments"}),
+        "/v1/orders/chance", "/v1/ticker", "/v1/orderbook", "/v1/orderbook/instruments"}),
     "kis": frozenset({"/uapi/domestic-stock/v1/trading/inquire-balance",
         "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"}),
 }
@@ -26,7 +27,7 @@ DIAGNOSTIC_PATHS = {
 
 READ_STATUSES = frozenset({"AVAILABLE", "BLOCKED", "UNAVAILABLE", "REJECTED"})
 FAILURE_KINDS = frozenset({"TIMEOUT", "HTTP_ERROR", "CONNECTION_ERROR", "INVALID_RESPONSE",
-    "READ_BOUNDARY", "READ_REJECTED", "READ_UNAVAILABLE", "UNEXPECTED_ERROR"})
+    "READ_BOUNDARY", "READ_REJECTED", "READ_UNAVAILABLE", "UNEXPECTED_ERROR", "FX_VALIDATION"})
 
 
 def sanitize_read_diagnostics(value):
@@ -61,5 +62,9 @@ def sanitize_read_diagnostics(value):
             observation = sanitize_quote_observation(row.get("quoteObservation"))
             if observation is not None:
                 safe["quoteObservation"] = observation
+        if provider == "upbit" and path == "/v1/orderbook":
+            evidence = sanitize_fx_observation(row.get("fxObservation"))
+            if evidence is not None:
+                safe["fxObservation"] = evidence
         result.append(safe)
     return result

@@ -1,3 +1,4 @@
+import { reconciliationReferenceView, reconciliationReferenceKind } from './reconciliationReferenceView.js';
 // Presentation only: an empty/error-free summary is not proof of a broker read.
 export function liveReconciliationDisplay(snapshot = {}) {
   const summary = snapshot.reconciliation?.summary ?? {};
@@ -11,10 +12,17 @@ export function liveReconciliationDisplay(snapshot = {}) {
   const failed = Number(summary.mismatch_count) > 0
     || Number(summary.error_count) > 0
     || ["fail", "failed", "blocked", "error"].includes(String(summary.status ?? "").toLowerCase());
+  const reference = reconciliationReferenceView(snapshot);
+  const rawStatus = failed ? "fail" : brokerKnown ? summary.status || "warn" : "warn";
   return {
     brokerKnown,
-    status: failed ? "fail" : brokerKnown ? summary.status || "warn" : "warn",
-    label: failed ? summary.status_label || "대조 실패" : brokerKnown ? summary.status_label || "확인 필요" : "대조 미확인",
+    status: reference.referenceOnly ? "info" : rawStatus,
+    label: reference.referenceOnly ? "과거 기준 차이 · 참고" : failed ? summary.status_label || "대조 실패" : brokerKnown ? summary.status_label || "확인 필요" : "대조 미확인",
+    rawStatus,
+    referenceCount: reference.classificationEnabled ? reference.referenceCount : 0,
+    actionableCount: reference.classificationEnabled ? reference.actionableCount : null,
+    referenceOnly: reference.referenceOnly,
+    detail: reference.referenceOnly ? "과거 조회 기준과 현재 잔고의 변화입니다. 현재 운용 손익·주문·포지션 대조 통과를 뜻하지 않습니다." : "",
   };
 }
 
@@ -71,10 +79,11 @@ export function liveLedgerDisplay(snapshot = {}) {
   const historyText = snapshotCount === null ? "" : ` · 과거 잔고 기록 ${snapshotCount}건`;
   const otherText = otherCount ? ` · 기타 상태 기록 ${otherCount}건` : "";
   const updated = [ledger.last_cash_update, ledger.last_position_update].filter(validTime).sort().at(-1);
+  const referenceOnly = reconciliationReferenceView(snapshot).referenceOnly;
   return {
-    status: "warn",
-    value: !exists ? "원장 없음" : legacy ? "과거 잔고 기준" : baselineRecorded ? "기준 기록 있음" : "기준 미확인",
-    detail: `${countText}${historyText}${otherText} · 원장 변경 ${updated || "미확인"} · ${baselineRecorded ? `기준 기록 ${baseline}` : "기준 승인 근거 미확인"}`,
+    status: referenceOnly ? "info" : "warn",
+    value: !exists ? "원장 없음" : legacy && referenceOnly ? "과거 조회 참고" : legacy ? "과거 잔고 기준" : baselineRecorded ? "기준 기록 있음" : "기준 미확인",
+    detail: `${countText}${historyText}${otherText} · 원장 변경 ${updated || "미확인"} · ${referenceOnly ? "과거 조회 참고 · 현재 운용 원장과 별도" : baselineRecorded ? `기준 기록 ${baseline}` : "기준 승인 근거 미확인"}`,
     baselineRecorded, legacy, fillCount, snapshotCount, otherCount,
   };
 }
@@ -89,6 +98,7 @@ export function liveReconciliationIssues(snapshot = {}) {
       item?.broker_id === row.broker_id && (kind === "cash" ? item.currency === row.currency : item.symbol === row.symbol && String(item.position_side || "") === String(row.position_side || "")));
     return matches.length === 1 ? matches[0] : undefined;
   };
+  const referenceView = reconciliationReferenceView(snapshot);
   const issues = [];
   for (const [kind, items] of [["cash", reconciliation.accounts], ["position", reconciliation.positions]]) {
     for (const row of rows(items)) {
@@ -125,7 +135,15 @@ export function liveReconciliationIssues(snapshot = {}) {
       const comparison = ambiguousScope ? "이전 기준 미확정 → 거래소 관측 미확정 · 비교 대상 확인 필요"
         : kind === "cash" && comparisonIssue ? `이전 기준 ${basisValue} ${programCurrency || "통화 미확인"} → 거래소 관측 ${observedValue} ${observedCurrency || "통화 미확인"} · ${currencyChanged ? "통화가 달라 금액 차이를 계산하지 않습니다." : "비교 범위 확인 필요"}`
           : `이전 기준 ${basisValue} → 거래소 관측 ${observedValue}${unit ? ` ${unit}` : ""}`;
-      issues.push({ kind, brokerId: row.broker_id || "unknown", symbol: row.symbol || "", currency: row.currency || "", reason, detail, comparison,
+      const referenceKind = reconciliationReferenceKind(row, kind, snapshot);
+      const presentationOnlyReference = referenceView.classificationEnabled && referenceKind !== null;
+      if (presentationOnlyReference) {
+        reason = referenceKind === 'HISTORICAL_BALANCE_REFERENCE' ? '과거 조회와 잔고 변화 · 참고' : '앱 원장에 없는 기존 보유 · 참고';
+        detail = referenceKind === 'HISTORICAL_BALANCE_REFERENCE'
+          ? '입출금·수동 거래·수수료 등으로 잔고가 달라질 수 있습니다. 이 차이만으로 원인을 확정하거나 현재 운용 손실로 계산하지 않습니다. 실제 운용의 주문·포지션 대조와 구분합니다.'
+          : '조회된 보유분을 앱이 매수한 자산이나 수익으로 간주하지 않습니다. 현재 운용에 자동 편입하지 않으며, 실제 주문·포지션 원장과 구분해 보존합니다.';
+      }
+      issues.push({ referenceKind, presentationOnlyReference, displayTone: presentationOnlyReference ? 'info' : 'danger', cashFlowCauseVerified: false, kind, brokerId: row.broker_id || "unknown", symbol: row.symbol || "", currency: row.currency || "", reason, detail, comparison,
         baselineAt: validTime(updatedAt) ? updatedAt : null,
         delta: comparisonIssue ? null : kind === "cash" ? row.delta_cash : row.delta_qty, status: row.status, source: source || "unknown" });
     }

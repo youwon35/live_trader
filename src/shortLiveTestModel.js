@@ -1,3 +1,4 @@
+import { normalizeFxObservation } from "./fxObservation.js";
 import { normalizeUpbitQuoteObservation } from './quoteObservation.js';
 export const SHORT_LIVE_ROUTES = Object.freeze([
   { id: "KIS_KR_CASH", label: "한국투자증권 국내 현금" },
@@ -176,6 +177,11 @@ export function shortLiveBlockerLabel(value) {
     FRESH_FX_REQUIRED: "원화 예산 환산에 사용할 최신 환율 확인 필요",
     FIRST_FAILURE_JOURNAL_WRITE_FAILED: "최초 오류 기록을 파일에 저장하지 못함 · 신규 진입 차단 유지",
     NATIVE_FX_TIME_INVALID: "환율 자료의 시각 형식을 확인하지 못함",
+    NATIVE_FX_ORDERBOOK_SCOPE_INVALID: "현재 원화·USDT 호가의 조회 범위가 맞지 않음",
+    NATIVE_FX_ORDERBOOK_PRICE_INVALID: "환율 호가 가격 또는 매수·매도 순서를 확인하지 못함",
+    NATIVE_FX_ORDERBOOK_SIZE_INVALID: "환율 호가의 실제 주문 잔량을 확인하지 못함",
+    NATIVE_FX_ORDERBOOK_TIMESTAMP_INVALID: "환율 호가의 거래소 시각을 확인하지 못함",
+    NATIVE_FX_CURRENT_OBSERVATION_REQUIRED: "새 현재 호가 기준의 원화·USDT 관측이 필요함",
     NATIVE_FX_EXACT_USDT_MARKET_REQUIRED: "환율 환산에 필요한 정확한 KRW-USDT 응답이 아님",
     NATIVE_FX_EXACT_USDT_TRADE_TIME_REQUIRED: "환율 원본의 실제 체결 시각을 확인하지 못함",
     NATIVE_FX_CACHED_HTTP_RESPONSE_REJECTED: "저장된 과거 환율 응답이 반환됨 · 최신 응답 필요",
@@ -360,6 +366,7 @@ export function normalizeShortLiveFailureDiagnostics(value) {
     "upbit": [
         "/v1/accounts",
         "/v1/order",
+        "/v1/orderbook",
         "/v1/orderbook/instruments",
         "/v1/orders/chance",
         "/v1/orders/open",
@@ -371,11 +378,12 @@ export function normalizeShortLiveFailureDiagnostics(value) {
     ]
 };
   const statuses = new Set(["AVAILABLE", "BLOCKED", "REJECTED", "UNAVAILABLE"]);
-  const kinds = new Set(["CONNECTION_ERROR", "HTTP_ERROR", "INVALID_RESPONSE", "READ_BOUNDARY", "READ_REJECTED", "READ_UNAVAILABLE", "TIMEOUT", "UNEXPECTED_ERROR"]);
+  const kinds = new Set(["CONNECTION_ERROR", "FX_VALIDATION", "HTTP_ERROR", "INVALID_RESPONSE", "READ_BOUNDARY", "READ_REJECTED", "READ_UNAVAILABLE", "TIMEOUT", "UNEXPECTED_ERROR"]);
   return (Array.isArray(value) ? value : []).slice(-32).filter(row => row && typeof row === "object"
     && Object.hasOwn(paths, row.provider) && paths[row.provider].includes(row.path) && statuses.has(row.status)
     && typeof row.elapsedMs === "number" && Number.isFinite(row.elapsedMs) && row.elapsedMs >= 0).map(row => ({
     provider: row.provider, path: row.path, elapsedMs: row.elapsedMs, status: row.status,
+    fxObservation: row.provider === 'upbit' && row.path === '/v1/orderbook' ? normalizeFxObservation(row.fxObservation) : null,
     quoteObservation: row.provider === 'upbit' && row.path === '/v1/ticker' ? normalizeUpbitQuoteObservation(row.quoteObservation) : null,
     failureKind: kinds.has(row.failureKind) ? row.failureKind : "",
     httpStatus: Number.isInteger(row.httpStatus) && row.httpStatus >= 100 && row.httpStatus <= 599 ? row.httpStatus : null,
@@ -439,7 +447,7 @@ export function normalizeShortLiveSnapshot(value = {}) {
           lastFrameAt: text(stream.lastFrameAt),
         })),
       })),
-      firstFailure: sanitizeShortLiveText(run.firstFailure), stopReason: sanitizeShortLiveText(run.stopReason),
+      firstFailure: sanitizeShortLiveText(run.firstFailure), firstFailureAt: text(run.firstFailureAt), stopReason: sanitizeShortLiveText(run.stopReason),
       firstFailureDiagnostics: normalizeShortLiveFailureDiagnostics(run.firstFailureDiagnostics),
       recentActivity: (Array.isArray(run.recentActivity) ? run.recentActivity : []).slice(-60).map((event) => ({
         sequence: numeric(event.sequence), kind: sanitizeShortLiveText(event.kind), observedAt: text(event.observedAt),

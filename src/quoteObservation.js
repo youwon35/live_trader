@@ -45,9 +45,13 @@ export function normalizeUpbitQuoteObservation(value) {
 export function failureTiming(run = {}, endedAt = null, now = Date.now()) {
   const started=stamp(run.startedAt),ended=stamp(endedAt);
   const rows=(Array.isArray(run.recentActivity) ? run.recentActivity : []).filter(row=>row.kind === 'FIRST_FAILURE');
-  const first=rows.length === 1 ? stamp(rows[0].observedAt) : null;
-  const valid=started !== null && first !== null && first >= started && first <= now+5000 && (ended === null || first <= ended);
-  return { firstFailureAt: valid ? rows[0].observedAt : null,
+  const direct = typeof run.firstFailureAt === 'string' && run.firstFailureAt.trim() ? run.firstFailureAt : null;
+  const recorded = rows.length === 1 ? stamp(rows[0].observedAt) : null;
+  const first = direct !== null ? stamp(direct) : recorded;
+  // firstFailureAt is the decision boundary; observedAt is later journal publication.
+  const coherent = rows.length <= 1 && (rows.length === 0 || (recorded !== null && recorded <= now+5000 && (ended === null || recorded <= ended) && (direct === null || (first !== null && first <= recorded))));
+  const valid=coherent && started !== null && first !== null && first >= started && first <= now+5000 && (ended === null || first <= ended);
+  return { firstFailureAt: valid ? (direct || rows[0].observedAt) : null,
     firstFailureSeconds:valid ? (first-started)/1000 : null,
     cleanupSeconds:valid && ended !== null && ended >= first ? (ended-first)/1000 : null };
 }

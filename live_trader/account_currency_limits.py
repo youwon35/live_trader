@@ -15,9 +15,11 @@ from time import monotonic_ns
 from trading_runtime.artifact_governance import stable_sha256
 from .native_spot_quantity import decimal_value
 
-SCHEMA = "native-krw-conversion-observation-v1"
+LEGACY_SCHEMA = "native-krw-conversion-observation-v1"
+SCHEMA = "native-krw-conversion-orderbook-v2"
 MAX_AGE_SECONDS = 15
-UPBIT_REFERENCE = "https://docs.upbit.com/kr/reference/list-tickers"
+LEGACY_REFERENCE = "https://docs.upbit.com/kr/reference/list-tickers"
+UPBIT_REFERENCE = "https://docs.upbit.com/kr/reference/list-orderbooks"
 _CACHE = {}
 _CACHE_LOCK = threading.RLock()
 _PRODUCER_LOCK = threading.Lock()
@@ -35,34 +37,90 @@ def _seal(body):
     return {**body, "contentHash": stable_sha256(body)}
 
 
+class CurrentFxObservationError(ValueError):
+    def __init__(self, code, observation=None):
+        super().__init__(code)
+        self.fxObservation = observation
+
+
+def conversion_observation_diagnostic(observation, *, now, code="NONE"):
+    from .native_fx_observation import fx_clock_observation
+    body = observation if isinstance(observation, Mapping) else {}
+    raw = body.get("officialResponse")
+    row = raw[0] if isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], Mapping) else {}
+    clock = body.get("httpClock") if isinstance(body.get("httpClock"), Mapping) else {}
+    return fx_clock_observation(source_ms=row.get("timestamp"), started=body.get("requestStartedAt"),
+        received=body.get("receivedAt"), checked=now, date_header=clock.get("dateHeader"),
+        age_header=clock.get("ageHeader"), round_trip_ns=clock.get("roundTripNanoseconds"),
+        validation_code=code)
+
+
 def observe_upbit_usdt_krw(reader, *, now=None):
-    """One official public GET through the existing read-only transport."""
+    """One public current-book GET, independent of recent trade activity.
+
+    Best ask overstates KRW per USDT relative to best bid: KRW ceilings buy
+    fewer native units and native losses convert upward. This is a market
+    risk conversion, never an actual conversion or a presumed fiat USD peg.
+    """
     started = now or datetime.now(timezone.utc)
     tick = monotonic_ns()
-    response, headers = reader._get("upbit", "/v1/ticker", query={"markets": "KRW-USDT"})
+    query = {"markets": "KRW-USDT", "count": 1, "level": "0"}
+    response, headers = reader._get("upbit", "/v1/orderbook", query=query)
     round_trip = monotonic_ns() - tick
     received = now or datetime.now(timezone.utc)
-    if not isinstance(response, list) or len(response) != 1 or not isinstance(response[0], Mapping):
-        raise ValueError("NATIVE_FX_EXACT_USDT_MARKET_REQUIRED")
-    row = response[0]
-    trade_ms, update_ms = row.get("trade_timestamp"), row.get("timestamp")
-    if row.get("market") != "KRW-USDT" or type(trade_ms) is not int or type(update_ms) is not int:
-        raise ValueError("NATIVE_FX_EXACT_USDT_TRADE_TIME_REQUIRED")
-    price = decimal_value(row.get("trade_price"), "KRW per USDT", positive=True)
-    observation = _seal({"schemaVersion": SCHEMA, "provider": "upbit", "nativeCurrency": "USDT",
-        "counterCurrency": "KRW", "krwPerNativeCurrency": str(price), "symbol": "KRW-USDT",
-        "endpoint": "/v1/ticker", "requestStartedAt": started.isoformat(), "receivedAt": received.isoformat(),
-        "rateAsOf": datetime.fromtimestamp(trade_ms / 1000, timezone.utc).isoformat(),
-        "sourceUpdateAsOf": datetime.fromtimestamp(update_ms / 1000, timezone.utc).isoformat(),
+    raw = {"schemaVersion": SCHEMA, "provider": "upbit", "nativeCurrency": "USDT",
+        "counterCurrency": "KRW", "symbol": "KRW-USDT", "endpoint": "/v1/orderbook",
+        "requestQuery": query, "requestStartedAt": started.isoformat(), "receivedAt": received.isoformat(),
         "httpClock": {"version":"upbit-http-date-clock-interval-v1", "dateHeader":headers.get("date"),
-                      "ageHeader":headers.get("age"), "datePrecisionSeconds":1,
-                      "requestStartedAt":started.isoformat(), "receivedAt":received.isoformat(),
-                      "roundTripNanoseconds":round_trip,
-                      "headersHash":stable_sha256({"date":headers.get("date"),"age":headers.get("age")})},
+            "ageHeader":headers.get("age"), "datePrecisionSeconds":1,
+            "requestStartedAt":started.isoformat(), "receivedAt":received.isoformat(),
+            "roundTripNanoseconds":round_trip,
+            "headersHash":stable_sha256({"date":headers.get("date"),"age":headers.get("age")})},
         "officialResponse": response, "officialResponseHash": stable_sha256(response),
-        "reference": UPBIT_REFERENCE, "rateRole": "OBSERVED_MARKET_TRADE_NOT_USD_PEG", "orderAuthorityGranted": False})
-    validate_conversion_observation(observation, native_currency="USDT", now=received)
-    return observation
+        "reference": UPBIT_REFERENCE, "rateRole": "OBSERVED_BEST_ASK_NOT_USD_PEG",
+        "orderAuthorityGranted": False}
+    try:
+        row, ask = _orderbook_fields(raw)
+        at = datetime.fromtimestamp(row["timestamp"] / 1000, timezone.utc).isoformat()
+        raw.update(krwPerNativeCurrency=str(ask), rateAsOf=at, sourceUpdateAsOf=at,
+            sourceTimeBasis="UPBIT_ORDERBOOK_REQUEST_TIMESTAMP")
+        observation = _seal(raw)
+        return validate_conversion_observation(observation, native_currency="USDT", now=received)
+    except CurrentFxObservationError:
+        raise
+    except (ValueError, TypeError, KeyError, ArithmeticError, OverflowError, OSError) as exc:
+        code = str(exc) if str(exc).startswith("NATIVE_FX_") else "NATIVE_FX_ORDERBOOK_SCOPE_INVALID"
+        raise CurrentFxObservationError(code, conversion_observation_diagnostic(raw, now=received, code=code)) from None
+
+
+def _orderbook_fields(body):
+    raw = body.get("officialResponse")
+    if not isinstance(raw, list) or len(raw) != 1 or not isinstance(raw[0], Mapping):
+        raise ValueError("NATIVE_FX_ORDERBOOK_SCOPE_INVALID")
+    row = raw[0]
+    if (row.get("market") != "KRW-USDT" or type(row.get("level")) not in (int, float)
+            or row["level"] != 0 or not isinstance(row.get("orderbook_units"), list)
+            or len(row["orderbook_units"]) != 1 or not isinstance(row["orderbook_units"][0], Mapping)):
+        raise ValueError("NATIVE_FX_ORDERBOOK_SCOPE_INVALID")
+    stamp = row.get("timestamp")
+    if type(stamp) is not int or not 0 < stamp <= 253402300799999:
+        raise ValueError("NATIVE_FX_ORDERBOOK_TIMESTAMP_INVALID")
+    unit = row["orderbook_units"][0]
+    try:
+        ask = decimal_value(unit.get("ask_price"), "best ask", positive=True)
+        bid = decimal_value(unit.get("bid_price"), "best bid", positive=True)
+        if ask < bid: raise ValueError()
+    except (ValueError, ArithmeticError):
+        raise ValueError("NATIVE_FX_ORDERBOOK_PRICE_INVALID") from None
+    try:
+        ask_size = decimal_value(unit.get("ask_size"), "ask size", positive=True)
+        bid_size = decimal_value(unit.get("bid_size"), "bid size", positive=True)
+        total_ask = decimal_value(row.get("total_ask_size"), "total ask", positive=True)
+        total_bid = decimal_value(row.get("total_bid_size"), "total bid", positive=True)
+        if ask_size > total_ask or bid_size > total_bid: raise ValueError()
+    except (ValueError, ArithmeticError):
+        raise ValueError("NATIVE_FX_ORDERBOOK_SIZE_INVALID") from None
+    return row, ask
 
 
 def _validate_http_clock(clock, *, started, received, current):
@@ -93,7 +151,7 @@ def _validate_http_clock(clock, *, started, received, current):
     return upper, rtt
 
 
-def validate_conversion_observation(observation, *, native_currency, now=None):
+def _validate_legacy_conversion_observation(observation, *, native_currency, now=None):
     """Only an implemented official producer may attest a conversion route.
 
     No KIS USD rate producer has yet supplied a timestamped authoritative
@@ -104,10 +162,10 @@ def validate_conversion_observation(observation, *, native_currency, now=None):
     if not isinstance(observation, Mapping):
         raise ValueError("NATIVE_FX_OBSERVATION_MISSING")
     body = {key: value for key, value in observation.items() if key != "contentHash"}
-    if observation.get("contentHash") != stable_sha256(body) or body.get("schemaVersion") != SCHEMA:
+    if observation.get("contentHash") != stable_sha256(body) or body.get("schemaVersion") != LEGACY_SCHEMA:
         raise ValueError("NATIVE_FX_OBSERVATION_SEAL_INVALID")
     expected = {"provider": "upbit", "nativeCurrency": "USDT", "counterCurrency": "KRW", "symbol": "KRW-USDT",
-                "endpoint": "/v1/ticker", "reference": UPBIT_REFERENCE, "rateRole": "OBSERVED_MARKET_TRADE_NOT_USD_PEG", "orderAuthorityGranted": False}
+                "endpoint": "/v1/ticker", "reference": LEGACY_REFERENCE, "rateRole": "OBSERVED_MARKET_TRADE_NOT_USD_PEG", "orderAuthorityGranted": False}
     if any(body.get(key) != value for key, value in expected.items()):
         raise ValueError("NATIVE_FX_OBSERVATION_CURRENCY_OR_ROUTE_MISMATCH")
     raw = body.get("officialResponse")
@@ -130,6 +188,49 @@ def validate_conversion_observation(observation, *, native_currency, now=None):
         or any(not 0 <= (server_upper-at).total_seconds()+rtt+(current-received).total_seconds() <= MAX_AGE_SECONDS or at > server_upper for at in (rate_at,update_at))):
         raise ValueError("NATIVE_FX_OBSERVATION_STALE_OR_FUTURE")
     return dict(observation)
+
+
+def validate_conversion_observation(observation, *, native_currency, now=None, allow_legacy=False):
+    """Current execution consumes v2 only; explicit v1 reads are historical."""
+    if isinstance(observation, Mapping) and observation.get("schemaVersion") == LEGACY_SCHEMA:
+        if allow_legacy is True:
+            return _validate_legacy_conversion_observation(observation, native_currency=native_currency, now=now)
+        raise ValueError("NATIVE_FX_CURRENT_OBSERVATION_REQUIRED")
+    current = now or datetime.now(timezone.utc)
+    try:
+        if native_currency != "USDT": raise ValueError("NATIVE_FX_OFFICIAL_CURRENCY_ROUTE_UNAVAILABLE")
+        if not isinstance(observation, Mapping): raise ValueError("NATIVE_FX_OBSERVATION_MISSING")
+        body = {key:value for key,value in observation.items() if key != "contentHash"}
+        if observation.get("contentHash") != stable_sha256(body) or body.get("schemaVersion") != SCHEMA:
+            raise ValueError("NATIVE_FX_OBSERVATION_SEAL_INVALID")
+        expected = {"provider":"upbit", "nativeCurrency":"USDT", "counterCurrency":"KRW",
+            "symbol":"KRW-USDT", "endpoint":"/v1/orderbook", "reference":UPBIT_REFERENCE,
+            "rateRole":"OBSERVED_BEST_ASK_NOT_USD_PEG", "orderAuthorityGranted":False,
+            "sourceTimeBasis":"UPBIT_ORDERBOOK_REQUEST_TIMESTAMP",
+            "requestQuery":{"markets":"KRW-USDT", "count":1, "level":"0"}}
+        query = body.get("requestQuery")
+        if (any(body.get(key) != value for key,value in expected.items())
+                or not isinstance(query, Mapping) or type(query.get("count")) is not int
+                or type(body.get("orderAuthorityGranted")) is not bool):
+            raise ValueError("NATIVE_FX_OBSERVATION_CURRENCY_OR_ROUTE_MISMATCH")
+        row, ask = _orderbook_fields(body)
+        if body.get("officialResponseHash") != stable_sha256(body["officialResponse"]):
+            raise ValueError("NATIVE_FX_OFFICIAL_RESPONSE_BINDING_CHANGED")
+        if decimal_value(body.get("krwPerNativeCurrency"), "KRW per USDT", positive=True) != ask:
+            raise ValueError("NATIVE_FX_RATE_RESPONSE_CHANGED")
+        source_at = datetime.fromtimestamp(row["timestamp"] / 1000, timezone.utc)
+        if any(_timestamp(body.get(key)) != source_at for key in ("rateAsOf", "sourceUpdateAsOf")):
+            raise ValueError("NATIVE_FX_TIME_RESPONSE_CHANGED")
+        started, received = _timestamp(body.get("requestStartedAt")), _timestamp(body.get("receivedAt"))
+        _validate_http_clock(body.get("httpClock"), started=started, received=received, current=current)
+        evidence = conversion_observation_diagnostic(observation, now=current)
+        if evidence["validationCode"] != "NONE": raise ValueError(evidence["validationCode"])
+        return dict(observation)
+    except CurrentFxObservationError:
+        raise
+    except (ValueError, TypeError, KeyError, ArithmeticError, OverflowError, OSError) as exc:
+        code = str(exc) if str(exc).startswith("NATIVE_FX_") else "NATIVE_FX_ORDERBOOK_SCOPE_INVALID"
+        raise CurrentFxObservationError(code, conversion_observation_diagnostic(observation, now=current, code=code)) from None
 
 
 def latest_conversion_observation(native_currency, broker_id, *, now=None):

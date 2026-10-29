@@ -1,5 +1,8 @@
 import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel, diagnosticSafetyContext, preflightCheckPresentation, ordinarySafetyPresentation } from "./diagnosticPresentation.js";
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
+import ReconciliationChanges from "./ReconciliationChanges.jsx";
+import StartupProgress, { useStartupProgress } from "./StartupProgress.jsx";
+import { startupAccountObservation } from "./startupProgressModel.js";
 import { createSnapshotResponseGate, createSnapshotReadCoordinator, initialAccountRefreshState, accountRefreshResultState, accountObservationView } from "./snapshotRefreshState.js";
 import { environmentStatus, ordinaryEntryStatus, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation } from "./statusTruth.js";
 import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, ReconciliationEvidence, CapitalAllowance, DeploymentChanges, OrderInvestigation, OperatorNoteEditor } from "./OperatorInsights.jsx";
@@ -1886,6 +1889,8 @@ export function shortLiveHeaderState(snapshot = {}) {
 }
 
 function App() {
+  const startup = useStartupProgress();
+  const [preferencesAttempt, setPreferencesAttempt] = useState(0);
   const [snapshot, setSnapshot] = useState(fallbackSnapshot);
   const [selectedNav, setSelectedNav] = useState(() => readGuidedFlowStep(LIVE_FLOW_STORAGE_KEY, LIVE_FLOW_IDS, "overview"));
   const [loading, setLoading] = useState(false);
@@ -1975,11 +1980,13 @@ function App() {
       const safetyEpoch = snapshotSafetyEpochRef.current;
       const responseToken = snapshotResponseGateRef.current.begin();
       setSnapshotRefreshing(true);
+      startup.begin("connection");
       try {
         const next = await getSnapshot();
         if (safetyEpoch !== snapshotSafetyEpochRef.current || !snapshotResponseGateRef.current.accept(responseToken, next)) return;
         setSnapshot({ ...next, api_connected: true });
         setConnectionError("");
+        startup.finish("connection", true, "프로그램 서버 응답을 받았습니다. 실제 주문을 시작하지 않습니다.");
         return next;
       } catch (err) {
         if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
@@ -1987,6 +1994,7 @@ function App() {
         if (safetyEpoch !== snapshotSafetyEpochRef.current || !snapshotResponseGateRef.current.acceptFailure(responseToken)) return;
         setSnapshot((current) => disconnectedSnapshot(nativeEmergency, current));
         setConnectionError(err instanceof Error ? err.message : "API 연결 실패");
+        startup.finish("connection", false, "프로그램 서버 응답을 확인하지 못했습니다. 다시 읽거나 연결 상태를 확인하세요.");
       } finally {
         setSnapshotRefreshing(false);
       }
@@ -1997,6 +2005,7 @@ function App() {
     if (accountRefreshRequestRef.current) return accountRefreshRequestRef.current;
     if (emergencyActionInFlightRef.current) return Promise.resolve({ ok: false, busy: true });
     const safetyEpoch = snapshotSafetyEpochRef.current;
+    startup.begin("accounts");
     setAccountRefreshState((current) => ({ ...current, pending: true,
       waitingForSnapshot: snapshotReadCoordinatorRef.current.isSnapshotRunning(), error: "", warning: "" }));
     accountRefreshRequestRef.current = snapshotReadCoordinatorRef.current.runAccount(async () => {
@@ -2007,6 +2016,8 @@ function App() {
         const result = await accountRefreshCoordinatorRef.current.run();
         if (safetyEpoch !== snapshotSafetyEpochRef.current) return result;
         setAccountRefreshState((current) => accountRefreshResultState(current, result));
+        const startupRead = startupAccountObservation(result);
+        startup.finish("accounts", startupRead.ok, startupRead.detail);
         if (result?.snapshot && snapshotResponseGateRef.current.accept(responseToken, result.snapshot)) {
           setSnapshot({ ...result.snapshot, api_connected: true });
           setConnectionError("");
@@ -2016,6 +2027,7 @@ function App() {
         const reason = err instanceof Error ? err.message : "최신 계좌 상태를 확인하지 못했습니다.";
         if (safetyEpoch === snapshotSafetyEpochRef.current) {
           setAccountRefreshState((current) => ({ ...current, error: reason, warning: "" }));
+          startup.finish("accounts", false, "계좌 자료 읽기를 완료하지 못했습니다. 개별 계좌 결과를 확인한 뒤 다시 읽으세요.");
         }
         return { ok: false, reason };
       } finally {
@@ -2068,9 +2080,14 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    startup.begin("preferences");
     getUiSettings()
       .then((result) => {
-        if (cancelled || !result?.settings) return;
+        if (cancelled) return;
+        if (!result?.settings || typeof result.settings !== "object" || Array.isArray(result.settings)) {
+          startup.finish("preferences", false, "저장된 화면 설정 응답을 확인하지 못했습니다.");
+          return;
+        }
         const applyStockAccentBaseline = stockAccentBaselinePending();
         restoreUiSettings(result.settings);
         const savedAppearance = result.settings.appearance ?? readAppearance();
@@ -2088,12 +2105,13 @@ function App() {
         setLayoutMode(readLayoutMode());
         setSidebarCollapsed(readSidebarCollapsed());
         window.dispatchEvent(new Event(LAYOUT_RESTORE_EVENT));
+        startup.finish("preferences", true, "저장된 표시 설정을 적용했습니다.");
       })
-      .catch(() => {});
+      .catch(() => { if (!cancelled) startup.finish("preferences", false, "화면 설정을 읽지 못했습니다. 기본 표시를 유지합니다."); });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [preferencesAttempt]);
 
   useEffect(() => {
     applyLayoutMode(layoutMode);
@@ -2601,6 +2619,7 @@ function App() {
           </div>
         </header>
 
+        <StartupProgress view={startup} onRetryConnection={refresh} onRetryPreferences={() => setPreferencesAttempt(value => value + 1)} onRetryAccounts={refreshBrokerAccounts} />
         {["functional-test", "monitor"].includes(selectedNav) ? null : (
           <LiveEnvironmentBar
             context={deploymentContext}
@@ -3265,22 +3284,15 @@ function ThreeWayReconciliationPanel({ snapshot = {}, accountRefreshState = init
     { label: "거래소 잔고 조회", status: brokerKnown ? "pass" : "warn", value: brokerKnown ? "조회됨" : "미확인", detail: `마지막 대조 ${summary.last_run || "미실행"}` },
     { label: "주문·체결 확인 방식", ...executionDisplay },
     { label: "프로그램 원장", ...ledgerDisplay },
-    { label: "3자 최종 대조", status: observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.status : "warn", value: observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.label : "현재 대조 미확인", detail: `불일치 ${summary.mismatch_count ?? "미확인"} · API/원장 필요 ${summary.api_required_count ?? "미확인"}` },
+    { label: "3자 최종 대조", status: reconciliationDisplay.referenceOnly || observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.status : "warn", value: reconciliationDisplay.referenceOnly || observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.label : "현재 대조 미확인", detail: reconciliationDisplay.referenceOnly ? `과거 참고 ${reconciliationDisplay.referenceCount}건 · 운용 대조 통과 아님` : `확인할 운용 차이 ${reconciliationDisplay.actionableCount ?? summary.mismatch_count ?? "미확인"} · 과거 참고 ${reconciliationDisplay.referenceCount} · API/원장 필요 ${summary.api_required_count ?? "미확인"}` },
   ];
   return (
     <section className="panel three-way-reconciliation-panel">
       <PanelHeader title="계좌·포지션 3자 대조" subtitle={`${observation.fresh ? "최근 관측 자료" : "마지막 관측 자료 · 현재 계좌 대조 미확인"} · 확인된 계좌 ${projected.knownAccountCount}개 · 미확인 ${projected.unknownAccountCount}개`} />
       <div className="ts-panel-grid ts-panel-grid--two">
-        {rows.map(row => <AccountObservationLine key={row.label} label={row.label} value={row.value} detail={row.detail} tone={statusTone(row.status)} />)}
+        {rows.map(row => <AccountObservationLine key={row.label} label={row.label} value={row.value} detail={row.detail} tone={row.status === "info" ? "info" : statusTone(row.status)} />)}
       </div>
-      {issues.length > 0 && <details className="ts-disclosure" open>
-        <summary className="ts-disclosure-summary">확인할 차이 · {issues.length}개</summary>
-        <div className="ts-disclosure-body">{issues.map((issue, index) => <div className="compact-row" key={`${issue.brokerId}:${issue.kind}:${issue.symbol}:${index}`}>
-          <strong>{({kis:"한국투자증권",binance:"Binance 현물","binance-futures":"Binance 선물",upbit:"Upbit"})[issue.brokerId] || issue.brokerId} · {issue.symbol || issue.currency} · {issue.reason}</strong>
-          <span>{issue.comparison}</span>
-          <span>{issue.detail}</span>
-        </div>)}</div>
-      </details>}
+      <ReconciliationChanges issues={issues} />
       <p className="workflow-copy">REST는 API로 직접 읽는 방식입니다. 실시간 연결이 없어도 조회할 수 있으며, 조회 성공이 실제 체결이나 원장 일치를 뜻하지는 않습니다.</p>
       <ReconciliationEvidence snapshot={snapshot} />
     </section>

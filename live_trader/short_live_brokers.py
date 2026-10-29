@@ -560,7 +560,10 @@ class ShortLiveBrokerAdapter:
                 self._fresh(q["sourceQuoteObservedAt"], 10, code="SOURCE_QUOTE_OBSERVATION_STALE")
             self._fresh(q.get("fxObservedAt"), 15, code="FX_OBSERVATION_STALE")
         except ShortLiveBrokerBlocked as exc:
-            exc.readDiagnostics = sanitize_read_diagnostics(q.get("readDiagnostics"))
+            from .native_fx_observation import recheck_fx_diagnostics
+            exc.readDiagnostics = recheck_fx_diagnostics(
+                sanitize_read_diagnostics(q.get("readDiagnostics")),
+                checked_at=datetime.fromtimestamp(self.clock(), timezone.utc))
             raise
         for key in ("nativePrice", "krwPerQuote", "lotStep", "minQuantity"):
             number(q.get(key), positive=True)

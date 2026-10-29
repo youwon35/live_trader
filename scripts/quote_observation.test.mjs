@@ -29,3 +29,17 @@ test('HTTP AVAILABLE context remains visible when source validation fails and te
  const snap={observedAt:iso(now),runtime:{status:'TERMINATED',sessionId:'synthetic',firstFailure:'UPBIT_KRW_SPOT:SOURCE_QUOTE_OBSERVATION_STALE',startedAt:iso(now-60000),terminatedAt:iso(now-1000),normalCleanupConfirmed:true,naturalExitObserved:true,firstFailureDiagnostics:[{provider:'upbit',path:'/v1/accounts',elapsedMs:49.079,status:'AVAILABLE'},{provider:'upbit',path:'/v1/ticker',elapsedMs:33.448,status:'AVAILABLE',quoteObservation:observation()}],brokers:[],strategies:[],recentActivity:[{kind:'FIRST_FAILURE',observedAt:iso(now-40000)}]}};
  const view=projectRealtimeMonitor(snap,{fresh:true,receivedAt:now,now});assert.equal(view.failureDiagnostics.length,2);assert.match(view.failureDiagnostics[1].resultLabel,/시세 시각 검증 차단/);assert.match(view.failureDiagnostics[0].elapsedLabel,/ms/);assert.equal(view.resultHasIssue,true);assert.equal(view.timing.firstFailureSeconds,20);
 });
+
+test('direct actual firstFailureAt survives publication and contradictory event time stays unknown',()=>{
+ const startedAt=iso(now-60000),firstFailureAt=iso(now-35000),endedAt=iso(now-10000);
+ const direct=failureTiming({startedAt,firstFailureAt,recentActivity:[]},endedAt,now);
+ assert.equal(direct.firstFailureAt,firstFailureAt);assert.equal(direct.firstFailureSeconds,25);assert.equal(direct.cleanupSeconds,25);
+ assert.equal(failureTiming({startedAt,firstFailureAt,recentActivity:[{kind:'FIRST_FAILURE',observedAt:iso(now-34997)}]},endedAt,now).firstFailureSeconds,25);
+ for(const run of [
+   {startedAt,firstFailureAt:'broken',recentActivity:[{kind:'FIRST_FAILURE',observedAt:firstFailureAt}]},
+   {startedAt,firstFailureAt,recentActivity:[{kind:'FIRST_FAILURE',observedAt:iso(now-36000)}]},
+   {startedAt,firstFailureAt:iso(now+6000),recentActivity:[]},
+   {startedAt,firstFailureAt:iso(now-61000),recentActivity:[]},
+   {startedAt,firstFailureAt,recentActivity:[{kind:'FIRST_FAILURE',observedAt:firstFailureAt},{kind:'FIRST_FAILURE',observedAt:firstFailureAt}]},
+ ]) assert.equal(failureTiming(run,endedAt,now).firstFailureAt,null);
+});

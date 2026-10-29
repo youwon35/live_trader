@@ -198,6 +198,7 @@ class ReaderTests(unittest.TestCase):
             return receipt
         fx.observe_upbit_usdt_krw = observe
         fx.validate_conversion_observation = lambda row, **kwargs: row
+        fx.conversion_observation_diagnostic = lambda row, **kwargs: {}
         with patch.dict(sys.modules, {fx.__name__: fx}):
             value = readers.production_fx_reader(object(), clock=lambda: NOW)("USDT")
         self.assertEqual([{}], calls)

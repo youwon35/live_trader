@@ -1,3 +1,4 @@
+import { reconciliationReferenceView } from "./reconciliationReferenceView.js";
 // Presentation ordering only; this module never grants execution permission.
 export function createSnapshotResponseGate() {
   let issued = 0;
@@ -48,12 +49,15 @@ export function createSnapshotReadCoordinator() {
 export const initialAccountRefreshState = { pending: false, waitingForSnapshot: false, error: "", warning: "", lastSuccessAt: "" };
 export function accountRefreshResultState(previous, result) {
   const summary = result?.snapshot?.reconciliation?.summary || {};
-  const complete = result?.ok === true && Number(summary.account_count) > 0
+  // A valid HTTP read can report an unapproved historical baseline difference.
+  // Explicit read errors remain failures; this does not alter raw reconciliation.
+  const referenceOnly = result?.ok === false && !result.reason && reconciliationReferenceView({ ...result.snapshot, api_connected: true }).referenceOnly;
+  const complete = (result?.ok === true || referenceOnly) && Number(summary.account_count) > 0
     && summary.error_count === 0 && summary.api_required_count === 0
     && Number.isFinite(Date.parse(summary.last_run || ""));
   return { ...previous, pending: false,
-    error: result?.ok === false ? result.reason || "계좌·포지션 대조를 완료하지 못했습니다." : "",
-    warning: result?.syncWarning || (!complete && result?.ok === true ? "일부 계좌 조회가 미확인입니다. 계좌별 결과를 확인하세요." : ""),
+    error: result?.ok === false && !referenceOnly ? result.reason || "계좌·포지션 대조를 완료하지 못했습니다." : "",
+    warning: result?.syncWarning || (referenceOnly ? "계좌 조회는 완료했습니다. 과거 조회 기준과의 잔고 변화는 참고 영역에서 확인하세요. 운용 대조 통과를 뜻하지 않습니다." : "") || (!complete && result?.ok === true ? "일부 계좌 조회가 미확인입니다. 계좌별 결과를 확인하세요." : ""),
     lastSuccessAt: complete ? summary.last_run : previous.lastSuccessAt,
   };
 }

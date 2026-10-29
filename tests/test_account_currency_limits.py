@@ -23,7 +23,7 @@ class AccountCurrencyLimitsTests(unittest.TestCase):
     def reader(self, *, price='1475.5', age=0, market='KRW-USDT'):
         stamp = int((self.now-timedelta(seconds=age)).timestamp()*1000)
         reader = Mock()
-        reader._get.return_value = ([{'market':market, 'trade_price':price, 'trade_timestamp':stamp, 'timestamp':stamp}], {'date':format_datetime(self.now.replace(microsecond=0),usegmt=True)})
+        reader._get.return_value = ([{'market':market, 'timestamp':stamp, 'level':0, 'total_ask_size':'10', 'total_bid_size':'10', 'orderbook_units':[{'ask_price':price, 'bid_price':price, 'ask_size':'1', 'bid_size':'1'}]}], {'date':format_datetime(self.now.replace(microsecond=0),usegmt=True)})
         return reader
 
     def receipt(self, **kwargs):
@@ -46,7 +46,7 @@ class AccountCurrencyLimitsTests(unittest.TestCase):
         self.assertLessEqual(Fraction.from_float(float(result['maxOrderValue'])),oracle)
         self.assertLess(Decimal(result['maxOrderValue']),Decimal('20000000'))
         self.assertEqual(receipt['contentHash'],result['conversionObservationHash'])
-        self.assertEqual('OBSERVED_MARKET_TRADE_NOT_USD_PEG',receipt['rateRole'])
+        self.assertEqual('OBSERVED_BEST_ASK_NOT_USD_PEG',receipt['rateRole'])
         self.assertTrue(result['sourcePolicyUnchanged'])
 
     def test_missing_or_unimplemented_usd_conversion_cannot_mix_krw_and_usd(self):
@@ -59,7 +59,7 @@ class AccountCurrencyLimitsTests(unittest.TestCase):
     def test_upbit_producer_is_public_only_and_does_not_read_credentials(self):
         reader=self.reader()
         receipt=fx.observe_upbit_usdt_krw(reader,now=self.now)
-        reader._get.assert_called_once_with('upbit','/v1/ticker',query={'markets':'KRW-USDT'})
+        reader._get.assert_called_once_with('upbit','/v1/orderbook',query={'markets':'KRW-USDT','count':1,'level':'0'})
         reader._credentials.assert_not_called()
         self.assertNotIn('accountFingerprint',receipt)
 
@@ -68,7 +68,7 @@ class AccountCurrencyLimitsTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs),self.assertRaises(ValueError):
                 self.receipt(**kwargs)
         reader=self.reader()
-        reader._get.return_value[0][0]['trade_timestamp']=True
+        reader._get.return_value[0][0]['timestamp']=True
         with self.assertRaises(ValueError):fx.observe_upbit_usdt_krw(reader,now=self.now)
 
     def test_receipt_payload_rate_currency_and_timestamp_are_exactly_bound(self):
@@ -77,7 +77,7 @@ class AccountCurrencyLimitsTests(unittest.TestCase):
             changed=deepcopy(receipt)
             if name=='rate':changed['krwPerNativeCurrency']='1'
             elif name=='currency':changed['nativeCurrency']='USD'
-            elif name=='payload':changed['officialResponse'][0]['trade_price']='1'
+            elif name=='payload':changed['officialResponse'][0]['orderbook_units'][0]['ask_price']='1'
             else:changed['rateAsOf']=self.now.isoformat()
             changed=fx._seal(changed)
             with self.subTest(name=name),self.assertRaises(ValueError):
@@ -152,7 +152,7 @@ class AccountCurrencyLimitsTests(unittest.TestCase):
             elif name=='cached':headers['age']='1'
             elif name=='invalid-age':headers['age']='-1'
             elif name=='skew':headers['date']=format_datetime((self.now+timedelta(seconds=16)).replace(microsecond=0),usegmt=True)
-            elif name=='server-future':reader._get.return_value[0][0]['trade_timestamp']+=2000;reader._get.return_value[0][0]['timestamp']+=2000
+            elif name=='server-future':reader._get.return_value[0][0]['timestamp']+=2000
             if name=='rtt':
                 changed=self.receipt()
                 changed['httpClock']['roundTripNanoseconds']=15_000_000_001

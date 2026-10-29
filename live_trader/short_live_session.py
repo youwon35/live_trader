@@ -135,7 +135,7 @@ class ShortLiveTestService:
                      "promotionEligible": False, **values})
         # A bounded, public projection of already journaled events. No private
         # account, broker reply, order identifier or arbitrary nested payload.
-        if kind in {"STARTED", "BAR_EVALUATED", "NEXT_OPEN_OBSERVED",
+        if kind in {"STARTED", "FIRST_FAILURE", "BAR_EVALUATED", "NEXT_OPEN_OBSERVED",
                     "ORDER_DEFERRED_PENDING_FILL", "ORDER_INTENT_BEFORE_SUBMIT",
                     "ORDER_REPLY", "ACTUAL_FILL_INCREMENT", "INTERNAL_ALLOCATION_TRANSFER",
                     "CLEANUP_INTENT_ONCE", "CLEANUP_ORDER_OBSERVED",
@@ -244,7 +244,7 @@ class ShortLiveTestService:
         session = self._session
         keys = ("sessionId", "status", "startedAt", "endsAt", "newEntriesBlocked",
                 "terminalVerified", "naturalExitObserved", "stopReason", "firstFailure",
-                "terminatedAt", "firstFailureDiagnostics", "blockers", "unknownOrderCount", "orderCount", "fillCount", "scopeHash", "internalTransferCount",
+                "terminatedAt", "firstFailureAt", "firstFailureDiagnostics", "blockers", "unknownOrderCount", "orderCount", "fillCount", "scopeHash", "internalTransferCount",
                 "workerRetirementRequired", "workerLaunchState")
         result = {key: deepcopy(session.get(key)) for key in keys}
         from .short_live_monitor import public_feed_observation
@@ -458,7 +458,7 @@ class ShortLiveTestService:
                 "endsAt": utc_text(started + timedelta(seconds=contract["durationSeconds"])),
                 "startedMonotonic": self.monotonic(), "readiness": readiness,
                 "newEntriesBlocked": True, "terminalVerified": False,
-                "naturalExitObserved": False, "firstFailure": None, "firstFailureDiagnostics": [],
+                "naturalExitObserved": False, "firstFailure": None, "firstFailureAt": None, "firstFailureDiagnostics": [],
                 "stopReason": "", "blockers": [], "unknownOrderCount": 0,
                 "orderCount": 0, "fillCount": 0, "orders": {},
                 "internalTransfers": {}, "internalTransferCount": 0, "startupHistoryReceipts": {},
@@ -1469,6 +1469,7 @@ class ShortLiveTestService:
             self._session["blockers"].append(reason)
         if self._session["firstFailure"] is None:
             self._session["firstFailure"] = reason
+            self._session["firstFailureAt"] = utc_text(self._now())
             diagnostics = sanitize_read_diagnostics(read_diagnostics)
             self._session["firstFailureDiagnostics"] = diagnostics
             # Create-only first-cause evidence survives later cleanup failures.
@@ -1622,6 +1623,7 @@ class ShortLiveTestService:
             "workerLaunchState": session["workerLaunchState"],
             "naturalExitObserved": session["naturalExitObserved"],
             "firstFailure": session["firstFailure"],
+            "firstFailureAt": session.get("firstFailureAt"),
             "firstFailureDiagnostics": sanitize_read_diagnostics(session.get("firstFailureDiagnostics")),
             "actualFeeKnown": session["feesKnown"],
             "feeReconciliationStatus": "KNOWN" if session["feesKnown"] else "UNVERIFIED_ACTUAL_FEE",

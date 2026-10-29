@@ -24,7 +24,7 @@ ORIGINS = {"binance": "https://api.binance.com", "binance-futures": "https://fap
 READ_PATHS = {
  "binance": {"/api/v3/time", "/api/v3/account", "/api/v3/openOrders", "/api/v3/exchangeInfo", "/api/v3/account/commission", "/api/v3/avgPrice", "/api/v3/ticker/price", "/api/v3/myTrades", "/api/v3/order"},
  "binance-futures": {"/fapi/v1/time", "/fapi/v3/account", "/fapi/v1/openOrders", "/fapi/v1/exchangeInfo"},
- "upbit": {"/v1/accounts", "/v1/orders/chance", "/v1/orders/open", "/v1/ticker", "/v1/order"},
+ "upbit": {"/v1/accounts", "/v1/orders/chance", "/v1/orders/open", "/v1/ticker", "/v1/orderbook", "/v1/order"},
  "kis": {"/uapi/domestic-stock/v1/trading/intgr-margin",
          "/uapi/domestic-stock/v1/trading/order-resv-ccnl",
          "/uapi/overseas-stock/v1/trading/order-resv-list",

@@ -495,6 +495,13 @@ class ShortLiveSessionTests(unittest.TestCase):
         runtime = service.snapshot(include_catalog=False)["runtime"]
         self.assertEqual("BINANCE_SPOT:OFFICIAL_ACCOUNT_READ_UNKNOWN", runtime["firstFailure"])
         self.assertEqual([safe], runtime["firstFailureDiagnostics"])
+        failed_at = runtime["firstFailureAt"]
+        self.assertEqual(self.now, datetime.fromisoformat(failed_at.replace("Z", "+00:00")))
+        public_failures = [event for event in runtime["recentActivity"] if event["kind"] == "FIRST_FAILURE"]
+        self.assertEqual(1, len(public_failures))
+        self.assertEqual(failed_at, public_failures[0]["observedAt"])
+        self.assertNotIn("readDiagnostics", public_failures[0])
+        self.assertNotIn("reason", public_failures[0])
         service._failure("CLEANUP_LATER_FAILURE", read_diagnostics=[{
             **safe, "failureKind": "HTTP_ERROR", "httpStatus": 429}])
         self.now += timedelta(seconds=70)
@@ -505,6 +512,8 @@ class ShortLiveSessionTests(unittest.TestCase):
         self.assertEqual([safe], terminal_runtime["firstFailureDiagnostics"])
         terminal = json.loads(next(service.store_root.glob("session-terminal-*.json")).read_text(encoding="utf-8"))
         self.assertEqual([safe], terminal["firstFailureDiagnostics"])
+        self.assertEqual(failed_at, terminal["firstFailureAt"])
+        self.assertEqual(failed_at, terminal_runtime["firstFailureAt"])
         self.assertFalse(terminal["functionalPass"])
         events = [json.loads(p.read_text(encoding="utf-8")) for p in service.store_root.glob("event-*.json")]
         failures = [e for e in events if e["kind"] == "FIRST_FAILURE"]
