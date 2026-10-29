@@ -1,3 +1,4 @@
+import { failureTiming } from './quoteObservation.js';
 import { SHORT_LIVE_ROUTES, shortLiveBlockerLabel, normalizeShortLiveFailureDiagnostics } from './shortLiveTestModel.js';
 
 const known = value => typeof value === 'number' && Number.isFinite(value);
@@ -5,7 +6,7 @@ const stamp = value => typeof value === 'string' && Number.isFinite(Date.parse(v
 const sumKnown = values => values.length > 0 && values.every(known) ? values.reduce((a, b) => a + b, 0) : null;
 export const monitorRoute = route => SHORT_LIVE_ROUTES.find(row => row.id === route)?.label || route || '경로 미확인';
 export const monitorEventLabels = {
-  STARTED: '시험 시작 기록', BAR_EVALUATED: '완성봉 평가', NEXT_OPEN_OBSERVED: '다음 봉 시작 관측',
+  FIRST_FAILURE: '최초 중단 원인 기록', STARTED: '시험 시작 기록', BAR_EVALUATED: '완성봉 평가', NEXT_OPEN_OBSERVED: '다음 봉 시작 관측',
   ORDER_DEFERRED_PENDING_FILL: '앞선 주문 체결 대기', ORDER_INTENT_BEFORE_SUBMIT: '주문 제출 시도',
   ORDER_REPLY: '거래소 주문 응답', ACTUAL_FILL_INCREMENT: '추가 체결 관측',
   INTERNAL_ALLOCATION_TRANSFER: '전략 간 내부 배분', CLEANUP_INTENT_ONCE: '종료 대조 시작',
@@ -15,13 +16,13 @@ export const monitorEventLabels = {
 
 export function monitorFailureDiagnostic(row) {
   const providerLabel = ({ binance: 'Binance 현물', 'binance-futures': 'Binance USDT 선물', upbit: 'Upbit', kis: '한국투자증권' })[row.provider] || '거래소 미확인';
-  const kind = row.failureKind || row.status;
+  const kind = row.quoteObservation?.status === 'BLOCKED' ? 'QUOTE_VALIDATION' : row.failureKind || row.status;
   const kindLabel = ({ TIMEOUT: '응답 시간 초과', HTTP_ERROR: 'HTTP 오류', CONNECTION_ERROR: '연결 오류',
     INVALID_RESPONSE: '응답 형식 오류', READ_BOUNDARY: '조회 조건 확인 실패', READ_REJECTED: '조회 요청 거절',
     READ_UNAVAILABLE: '자료 조회 불가', UNEXPECTED_ERROR: '예상하지 못한 조회 오류',
-    AVAILABLE: '조회 완료', BLOCKED: '조회 차단', UNAVAILABLE: '자료 조회 불가', REJECTED: '요청 거절' })[kind];
+    QUOTE_VALIDATION: '시세 시각 검증 차단', AVAILABLE: 'HTTP 조회 완료', BLOCKED: '조회 차단', UNAVAILABLE: '자료 조회 불가', REJECTED: '요청 거절' })[kind];
   const resultLabel = [row.httpStatus !== null ? `HTTP ${row.httpStatus}` : '', kindLabel ? `${kindLabel} (${kind})` : kind || '원인 미확인'].filter(Boolean).join(' · ');
-  return { ...row, providerLabel, resultLabel, elapsedLabel: known(row.elapsedMs) ? `${(row.elapsedMs / 1000).toFixed(1)}초` : '소요 시간 미기록' };
+  return { ...row, providerLabel, resultLabel, elapsedLabel: known(row.elapsedMs) ? row.elapsedMs < 1000 ? `${row.elapsedMs.toFixed(1)}ms` : `${(row.elapsedMs / 1000).toFixed(1)}초` : '소요 시간 미기록' };
 }
 
 export function projectRealtimeMonitor(snapshot, { fresh = false, pollError = '', receivedAt = null, now = Date.now(), staleMs = 20000 } = {}) {
@@ -103,11 +104,12 @@ export function projectRealtimeMonitor(snapshot, { fresh = false, pollError = ''
   });
   const activity = [...(run?.recentActivity || [])].filter(event => monitorEventLabels[event.kind] && stamp(event.observedAt) !== null && stamp(event.observedAt) - now <= 5000)
     .sort((a,b) => stamp(b.observedAt)-stamp(a.observedAt) || (b.sequence || 0)-(a.sequence || 0)).slice(0, 30);
-  return { state, resultHasIssue, responseCurrent, receivedAt, ageMs, terminal, blockers, counts, progress, elapsedSeconds, terminalReported, terminatedAt: ended === null ? null : new Date(ended).toISOString(), feeds, feedsRecent,
+  const timing = failureTiming(run || {}, ended === null ? null : new Date(ended).toISOString(), now);
+  return { timing, state, resultHasIssue, responseCurrent, receivedAt, ageMs, terminal, blockers, counts, progress, elapsedSeconds, terminalReported, terminatedAt: ended === null ? null : new Date(ended).toISOString(), feeds, feedsRecent,
     allAccountsCurrent: coversExpectedRoutes(routes.map(row => row.broker)) && routes.every(row => row.accountCurrent),
     routes, strategies, activity, startedAt: run?.startedAt, endsAt: run?.endsAt,
     runStatus: run?.status, sessionId: run?.sessionId,
     totalChangeKrw: coversExpectedRoutes(routes.map(row => row.broker)) ? sumKnown(routes.map(row => row.changeKrw)) : null,
-    failureDiagnostics: run?.firstFailure ? normalizeShortLiveFailureDiagnostics(run.firstFailureDiagnostics).filter(row => row.status !== 'AVAILABLE').map(monitorFailureDiagnostic) : [],
+    failureDiagnostics: run?.firstFailure ? normalizeShortLiveFailureDiagnostics(run.firstFailureDiagnostics).map(monitorFailureDiagnostic) : [],
     firstFailure: run?.firstFailure ? shortLiveBlockerLabel(run.firstFailure) : null };
 }

@@ -1,3 +1,4 @@
+import { normalizeUpbitQuoteObservation } from './quoteObservation.js';
 export const SHORT_LIVE_ROUTES = Object.freeze([
   { id: "KIS_KR_CASH", label: "한국투자증권 국내 현금" },
   { id: "BINANCE_SPOT", label: "Binance 현물" },
@@ -375,6 +376,7 @@ export function normalizeShortLiveFailureDiagnostics(value) {
     && Object.hasOwn(paths, row.provider) && paths[row.provider].includes(row.path) && statuses.has(row.status)
     && typeof row.elapsedMs === "number" && Number.isFinite(row.elapsedMs) && row.elapsedMs >= 0).map(row => ({
     provider: row.provider, path: row.path, elapsedMs: row.elapsedMs, status: row.status,
+    quoteObservation: row.provider === 'upbit' && row.path === '/v1/ticker' ? normalizeUpbitQuoteObservation(row.quoteObservation) : null,
     failureKind: kinds.has(row.failureKind) ? row.failureKind : "",
     httpStatus: Number.isInteger(row.httpStatus) && row.httpStatus >= 100 && row.httpStatus <= 599 ? row.httpStatus : null,
     brokerCode: Number.isInteger(row.brokerCode) && row.brokerCode >= -2147483648 && row.brokerCode < 0 ? row.brokerCode : null,

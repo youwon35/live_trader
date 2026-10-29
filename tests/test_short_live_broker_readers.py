@@ -89,10 +89,13 @@ class ReaderTests(unittest.TestCase):
                 self.assertEqual(1, len(calls))
                 self.assertFalse(calls[0][1]["signed"])
         r = self.build()
-        for trade_age, response_age in ((11, 0), (-3, -3)):
+        # A fresh ticker snapshot need not contain a trade in the last ten
+        # seconds. The official information timestamp, not trade frequency,
+        # is the unchanged source-freshness boundary.
+        r._upbit = lambda *_a, **_k: [{"market": "KRW-BTC", "trade_price": "1000", "trade_timestamp": int((NOW-11)*1000), "timestamp": int(NOW*1000)}]
+        self.assertEqual(mod.Decimal("1000"), r._inventory_price("UPBIT_KRW_SPOT", "KRW-BTC"))
+        for trade_age, response_age in ((11, 11), (-3, -3)):
             r._upbit = lambda *_a, **_k: [{"market": "KRW-BTC", "trade_price": "1000", "trade_timestamp": int((NOW-trade_age)*1000), "timestamp": int((NOW-response_age)*1000)}]
-            # Both provider times must be fresh; a fresh receive time cannot
-            # renew an older actual trade observation.
             with self.assertRaisesRegex(mod.ShortLiveBrokerBlocked, "SOURCE_QUOTE_OBSERVATION_STALE"):
                 r._inventory_price("UPBIT_KRW_SPOT", "KRW-BTC")
 
@@ -209,11 +212,17 @@ class ReaderTests(unittest.TestCase):
                 current[0] += 11
                 return [{"market": "KRW-BTC", "tick_size": "1000"}]
             raise AssertionError(path)
-        r._upbit = get
+        # Exercise the actual instrumented reader: invalid source time now
+        # fails at parsing and still carries the original safe timing values.
+        r.reader._get = lambda provider, path, **kwargs: (get(path, kwargs.get("query")), {})
+        r._upbit = lambda path, params=None, signed=True: r._read("upbit", path, query=params)[0]
         result = r.market("UPBIT_KRW_SPOT", "KRW-BTC")
-        self.assertTrue(result["known"])
-        self.assertEqual(NOW + 11, mod.epoch(result["observedAt"]))
-        self.assertEqual(NOW, mod.epoch(result["sourceQuoteObservedAt"]))
+        self.assertFalse(result["known"])
+        self.assertEqual(["SOURCE_QUOTE_OBSERVATION_STALE"], result["blockers"])
+        observation = result["readDiagnostics"][-1]["quoteObservation"]
+        self.assertEqual(NOW + 11, mod.epoch(observation["receivedAt"]))
+        self.assertEqual(NOW, mod.epoch(observation["sourceObservedAt"]))
+        self.assertEqual(11, observation["sourceAgeSeconds"])
         adapter = mod.ShortLiveBrokerAdapter("UPBIT_KRW_SPOT", snapshot_reader=lambda *_: {}, market_reader=lambda *_: result,
                                              transport=None, authority_guard=lambda _: False, clock=lambda: current[0])
         with self.assertRaisesRegex(mod.ShortLiveBrokerBlocked, "OBSERVATION_STALE"):

@@ -1,4 +1,4 @@
-import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel } from "./diagnosticPresentation.js";
+import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel, diagnosticSafetyContext, preflightCheckPresentation, ordinarySafetyPresentation } from "./diagnosticPresentation.js";
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
 import { createSnapshotResponseGate, createSnapshotReadCoordinator, initialAccountRefreshState, accountRefreshResultState, accountObservationView } from "./snapshotRefreshState.js";
 import { environmentStatus, ordinaryEntryStatus, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation } from "./statusTruth.js";
@@ -2992,7 +2992,7 @@ function WorkspaceContent({
     return renderPage(
       <section className="ts-panel-grid ts-panel-grid--two risk-page-layout">
         <RiskUsagePanel snapshot={snapshot} context={deploymentContext} />
-        <OperationalSafeguardsPanel
+        <OperationalSafeguardsPanel snapshot={snapshot}
           apiConnected={snapshot.api_connected === true}
           dryRun={snapshot.dry_run}
           newEntriesBlocked={snapshot.new_entries_blocked}
@@ -3107,8 +3107,8 @@ function DeploymentManifestPanel({ governance = {} }) {
 }
 
 function PreflightScopePanel({ snapshot = {}, selectedDeploymentId = "", onPreflight }) {
-  const checks = snapshot.final_preflight ?? [];
-  const deploymentLabels = new Set(["포지션·계좌 대조", "대조 증거 신선도", "전략 승인", "필수 운영 체크리스트", "운용자 확인", "신규 진입 차단"]);
+  const checks = (snapshot.final_preflight ?? []).map(check => preflightCheckPresentation(check, diagnosticSafetyContext(snapshot)));
+  const deploymentLabels = new Set(["포지션·계좌 대조", "대조 증거 신선도", "전략 승인", "필수 운영 체크리스트", "시작 시 실제 주문 동의", "일반 운용 시작 전 주문 대기", "일반 운용 엔진의 신규 주문 보류"]);
   const deploymentChecks = checks.filter((check) => deploymentLabels.has(check.label));
   const globalChecks = checks.filter((check) => !deploymentLabels.has(check.label) && check.label !== "전략 승인");
   const governance = snapshot.live_governance ?? {};
@@ -3168,7 +3168,7 @@ function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, on
           onPreflight={onPreflight}
           onWatchdog={onWatchdog}
         />
-        <LaunchReportPanel report={snapshot.launch_report ?? {}} observed={snapshot.api_connected === true && snapshot.final_preflight?.length > 0} onNavigate={onNavigate} />
+        <LaunchReportPanel snapshot={snapshot} report={snapshot.launch_report ?? {}} observed={snapshot.api_connected === true && snapshot.final_preflight?.length > 0} onNavigate={onNavigate} />
       </section>
       <CompactDisclosure
         title="시작 점검·실행 엔진 기술 근거"
@@ -3881,7 +3881,7 @@ function LivePreparationPanel({
             />
           </CompactDisclosure>
           {!deploymentOnly && (
-            <OperationalSafeguardsPanel
+            <OperationalSafeguardsPanel snapshot={snapshot}
               apiConnected={snapshot.api_connected === true}
               dryRun={snapshot.dry_run}
               newEntriesBlocked={snapshot.new_entries_blocked}
@@ -4474,17 +4474,31 @@ function FuturesFillSoakPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
   );
 }
 
-function OperationalSafeguardsPanel({ apiConnected, dryRun, newEntriesBlocked, killSwitch, operatorConfirmed, onConfirm, onDryRun, onEntryBlock, onTestIntent }) {
+function OperationalSafeguardsPanel({ snapshot = {}, ...legacyControls }) {
+  const view = ordinarySafetyPresentation(snapshot);
+  return <section className="panel operational-safeguards-panel">
+    <PanelHeader title="실행 확인 · 일반 운용 안전 상태" />
+    <p className="diagnostic-explanation">주문 연결 시험은 해당 시작 화면의 동의를 사용합니다. 아래는 일반 운용 엔진의 상태이며, 일반 운용의 단계 승인·호환 제어는 고급 영역에 별도로 있습니다.</p>
+    <div className="status-list">{view.rows.map(row => <StatusRow key={row.label} label={row.label} status={row.status} detail={row.detail} />)}</div>
+    <CompactDisclosure title="일반 운용 호환 제어 · 고급" description="주문 연결 시험과 별개입니다. 일반 운용의 단계 승인·기존 운영 경로가 실제로 사용하는 제어를 보존합니다. 시세 오류를 이곳의 토글로 해결하지 마세요.">
+      <LegacyOperationalSafeguardsControls {...legacyControls} apiConnected={snapshot.api_connected === true}
+        dryRun={snapshot.dry_run} newEntriesBlocked={snapshot.new_entries_blocked} killSwitch={snapshot.kill_switch} operatorConfirmed={snapshot.operator_confirmed} />
+    </CompactDisclosure>
+  </section>;
+}
+
+function LegacyOperationalSafeguardsControls({ apiConnected, dryRun, newEntriesBlocked, killSwitch, operatorConfirmed, onConfirm, onDryRun, onEntryBlock, onTestIntent }) {
   return (
     <section className="panel operational-safeguards-panel">
-      <PanelHeader title="운영 차단 설정" />
+      <PanelHeader title="일반 운용 호환 제어" />
+      <p className="diagnostic-explanation">시험 주문 요청은 Dry Run 해제 상태에서는 실제 주문을 전송할 수 있습니다. 시세 확인용 버튼이 아닙니다.</p>
       <div className="operator-actions">
         <ActionButton
           active={operatorConfirmed}
           className="secondary-button"
           disabled={!apiConnected}
           icon={<BadgeCheck size={16} />}
-          label="운용자 확인"
+          label="일반 운용 승인 확인"
           onClick={onConfirm}
           status={operatorConfirmed ? "success" : undefined}
         />
@@ -4501,7 +4515,7 @@ function OperationalSafeguardsPanel({ apiConnected, dryRun, newEntriesBlocked, k
           className="secondary-button"
           disabled={!apiConnected}
           icon={<ShieldCheck size={16} />}
-          label="신규 진입 차단"
+          label="일반 운용 신규 주문 보류"
           onClick={onEntryBlock}
           status={apiConnected && newEntriesBlocked ? "success" : undefined}
         />
@@ -4509,7 +4523,7 @@ function OperationalSafeguardsPanel({ apiConnected, dryRun, newEntriesBlocked, k
           className="primary-button"
           disabled={!apiConnected}
           icon={<TerminalSquare size={16} />}
-          label="테스트 주문 게이트"
+          label="일반 운용 시험 주문 요청"
           onClick={onTestIntent}
           pendingLabel="확인 중"
           variant="primary"
@@ -6106,8 +6120,8 @@ function OperationsReportPanel({ report }) {
   );
 }
 
-function LaunchReportPanel({ report, observed = false, onNavigate }) {
-  const view = launchConditionPresentation(report, observed);
+function LaunchReportPanel({ report, observed = false, onNavigate, snapshot = {} }) {
+  const view = launchConditionPresentation(report, observed, diagnosticSafetyContext(snapshot));
   const items = [
     { label: "미충족 시작 조건", value: view.blocked, tone: view.blocked ? "danger" : view.known ? "success" : "warning" },
     { label: "검토할 조건", value: view.warnings, tone: view.warnings ? "warning" : view.known ? "success" : "warning" },
@@ -6127,7 +6141,11 @@ function LaunchReportPanel({ report, observed = false, onNavigate }) {
       {view.conditions.length ? <div className="launch-condition-list">{view.conditions.map((condition,index)=><article key={`${condition.label}-${index}`}>
         <strong className={`summary-state ${condition.tone}`}>{condition.label} · {condition.statusLabel}</strong>
         <p>{condition.detail}</p>
+        {condition.meaning && <p className="diagnostic-explanation">{condition.meaning}</p>}
+        {condition.action && <p className="diagnostic-action"><strong>확인할 일</strong> · {condition.action}</p>}
+        {condition.destination && onNavigate && <button type="button" className="secondary-button" onClick={()=>onNavigate(condition.destination)}>관련 화면 열기</button>}
       </article>)}</div> : null}
+      {view.standbyInformation.length > 0 && <details className="doctor-history-record"><summary>일반 운용 시작 전 기본 상태 {view.informationCount}건 · 주문 연결 시험과 별도</summary>{view.standbyInformation.map(row=><p key={row.sourceLabel}><strong>{row.label}</strong> · {row.detail}</p>)}</details>}
       {onNavigate ? <div className="panel-action-line"><button className="secondary-button" type="button" onClick={()=>onNavigate("functional-test")}>주문 연결 시험 준비로 이동</button></div> : null}
     </section>
   );

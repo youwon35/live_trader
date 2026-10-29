@@ -117,7 +117,7 @@ test('API diagnostic fields reject URLs, queries, raw messages and invalid numbe
     assert.deepEqual(project({firstFailure:'OFFICIAL_READ_REJECTED',firstFailureDiagnostics:[{...valid,...change}]}).failureDiagnostics,[]);
   }
   assert.equal(project({firstFailure:'OFFICIAL_READ_REJECTED',firstFailureDiagnostics:Array.from({length:40},()=>valid)}).failureDiagnostics.length,32);
-  assert.deepEqual(project({firstFailure:'OFFICIAL_READ_REJECTED',firstFailureDiagnostics:[{...valid,status:'AVAILABLE'}]}).failureDiagnostics,[]);
+  const context=project({firstFailure:'OFFICIAL_READ_REJECTED',firstFailureDiagnostics:[{...valid,status:'AVAILABLE'}]}).failureDiagnostics;assert.equal(context.length,1);assert.equal(context[0].status,'AVAILABLE');assert.match(context[0].resultLabel,/HTTP 조회 완료/);
 });
 
 test('missing or duplicated selected route never becomes a complete equity or feed aggregate',()=>{

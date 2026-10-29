@@ -45,3 +45,10 @@
 
 .panel.live-monitor { background:var(--panel); color:var(--text); border-color:var(--border); }
 .live-monitor-feed-strip strong,.live-monitor-equity-head strong,.live-monitor-equity p { color:var(--text); }
+
+.live-monitor-quote-observation { display: grid; gap: 7px; margin: 10px 0; }
+.live-monitor-quote-observation > div { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(0, 3fr); gap: 10px; }
+.live-monitor-quote-observation dt { color: var(--muted); }
+.live-monitor-quote-observation dd { margin: 0; overflow-wrap: anywhere; }
+.live-monitor-failure-timing p { margin: 7px 0; }
+@media (max-width: 800px) { .live-monitor-quote-observation > div { grid-template-columns: 1fr; gap: 3px; } }

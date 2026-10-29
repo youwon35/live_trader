@@ -1,6 +1,7 @@
 """Pure allowlist for public short-Live read diagnostics; no runtime imports."""
 from collections.abc import Mapping
 import math
+from .short_live_upbit_quote import sanitize_quote_observation
 
 # Diagnostic identities are fixed routes only. Never retain a signed URL,
 # query, request/response body, credentials or an arbitrary exception message.
@@ -56,5 +57,9 @@ def sanitize_read_diagnostics(value):
             safe["httpStatus"] = http
         if type(code) is int and -2147483648 <= code < 0:
             safe["brokerCode"] = code
+        if provider == "upbit" and path == "/v1/ticker":
+            observation = sanitize_quote_observation(row.get("quoteObservation"))
+            if observation is not None:
+                safe["quoteObservation"] = observation
         result.append(safe)
     return result

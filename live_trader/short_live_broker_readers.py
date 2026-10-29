@@ -23,6 +23,7 @@ from typing import Any
 
 from .short_live_brokers import ROUTES, ShortLiveBrokerBlocked, number, decimal_text
 from .short_live_read_diagnostics import DIAGNOSTIC_PATHS, sanitize_read_diagnostics
+from .short_live_upbit_quote import UpbitQuoteObservationError, validate_upbit_quote_observation
 
 
 # Exact codes produced by account_currency_limits.py. Arbitrary ValueError
@@ -180,6 +181,24 @@ class ProductionShortLiveReaders:
     def _failure_reads(self):
         return sanitize_read_diagnostics(self._read_diagnostics)
 
+    def _upbit_quote_observation(self, row, symbol, *, purpose, started, received, previous_read):
+        """Retain only current ticker timing evidence, never a full response."""
+        def retain(observation):
+            if (observation is not None and self._read_diagnostics
+                    and self._read_diagnostics[-1] is not previous_read
+                    and self._read_diagnostics[-1].get("provider") == "upbit"
+                    and self._read_diagnostics[-1].get("path") == "/v1/ticker"
+                    and self._read_diagnostics[-1].get("status") == "AVAILABLE"):
+                self._read_diagnostics[-1]["quoteObservation"] = dict(observation)
+        try:
+            observation = validate_upbit_quote_observation(row, symbol, purpose=purpose,
+                request_started=started, received_at=received, checked_at=self.clock())
+        except UpbitQuoteObservationError as exc:
+            retain(exc.observation)
+            raise ShortLiveBrokerBlocked(str(exc)) from None
+        retain(observation)
+        return observation
+
     def _inventory_price(self, route, symbol):
         """Value existing spot units with one exact public native-price read.
 
@@ -195,15 +214,15 @@ class ProductionShortLiveReaders:
                 raise ShortLiveBrokerBlocked("EXACT_MARKET_TRUTH_REQUIRED")
             price = quote.get("price")
         elif route == "UPBIT_KRW_SPOT":
+            previous_read = self._read_diagnostics[-1] if self._read_diagnostics else None
+            quote_started = self.clock()
             rows = self._upbit("/v1/ticker", {"markets": symbol}, signed=False)
+            quote_received = self.clock()
             if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping) or rows[0].get("market") != symbol:
                 raise ShortLiveBrokerBlocked("EXACT_MARKET_TRUTH_REQUIRED")
             quote = rows[0]
-            if type(quote.get("trade_timestamp")) is not int or type(quote.get("timestamp")) is not int:
-                raise ShortLiveBrokerBlocked("UPBIT_QUOTE_SOURCE_TIME_UNKNOWN")
-            age = self.clock() - min(quote["trade_timestamp"], quote["timestamp"]) / 1000
-            if age < -2 or age > 10:
-                raise ShortLiveBrokerBlocked("SOURCE_QUOTE_OBSERVATION_STALE")
+            self._upbit_quote_observation(quote, symbol, purpose="INVENTORY_VALUATION",
+                started=quote_started, received=quote_received, previous_read=previous_read)
             price = quote.get("trade_price")
         else:
             raise ShortLiveBrokerBlocked("EXACT_SPOT_ROUTE_REQUIRED")
@@ -976,15 +995,20 @@ class ProductionShortLiveReaders:
                 if not isinstance(instruments, list) or len(instruments) != 1 or instruments[0].get("market") != symbol:
                     raise ShortLiveBrokerBlocked("UPBIT_PRICE_TICK_UNKNOWN")
                 extra["priceTick"] = str(number(instruments[0].get("tick_size"), positive=True))
+                previous_read = self._read_diagnostics[-1] if self._read_diagnostics else None
+                quote_started = self.clock()
                 ticker = self._upbit("/v1/ticker", {"markets": symbol}, signed=False)
-                quote_received = self._now()
+                quote_received_epoch = self.clock()
                 market = chance.get("market", {})
                 if market.get("state") != "active" or not isinstance(ticker, list) or len(ticker) != 1 or ticker[0].get("market") != symbol:
                     raise ShortLiveBrokerBlocked("UPBIT_MARKET_UNKNOWN")
                 price = ticker[0].get("trade_price")
-                if type(ticker[0].get("trade_timestamp")) is not int or type(ticker[0].get("timestamp")) is not int:
-                    raise ShortLiveBrokerBlocked("UPBIT_QUOTE_SOURCE_TIME_UNKNOWN")
-                extra["sourceQuoteObservedAt"] = datetime.fromtimestamp(min(ticker[0]["trade_timestamp"], ticker[0]["timestamp"]) / 1000, timezone.utc).isoformat()
+                observation = self._upbit_quote_observation(ticker[0], symbol, purpose="ORDER_MARKET",
+                    started=quote_started, received=quote_received_epoch, previous_read=previous_read)
+                quote_received = observation["receivedAt"]
+                extra.update(sourceQuoteObservedAt=observation["sourceObservedAt"],
+                    lastTradeObservedAt=observation["lastTradeObservedAt"], quoteReceivedAt=observation["receivedAt"],
+                    quoteTimeBasis="UPBIT_TICKER_RECORDED_AT")
                 fee = max(number(chance.get("bid_fee")), number(chance.get("ask_fee")))
                 min_notional = max(number(market.get("bid", {}).get("min_total")), number(market.get("ask", {}).get("min_total")))
                 step, min_qty, max_qty = "0.00000001", "0.00000001", None

@@ -22,6 +22,11 @@ export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt
   return <section className="panel live-monitor" aria-label="실시간 모니터">
     <header className="live-monitor-heading"><div><span className="live-monitor-eyebrow">LIVE TRADER · 5~7시간 실제 주문 시험</span><h2>주문 연결 시험 · 실시간 감시</h2></div><span className={`live-monitor-connection ${view.responseCurrent ? 'is-current' : 'is-stale'}`}><Radio size={14}/>{view.responseCurrent ? '화면 응답 수신' : '화면 상태 미확인'}</span></header>
     <div className={`live-monitor-hero tone-${view.state.tone}`} role="status"><StateIcon size={27}/><div><span>현재 상황</span><h3>{view.state.title}</h3><p>{view.state.detail}</p></div></div>
+    {view.firstFailure && <div className="live-monitor-alert live-monitor-failure-timing">
+      <strong>중단까지의 실제 진행</strong>
+      <p>{view.timing.firstFailureSeconds === null ? '최초 실패 시각이 기록되지 않아 중단까지 걸린 시간을 확인할 수 없습니다.' : `시작 후 ${number(view.timing.firstFailureSeconds)}초에 최초 중단 조건이 발생했습니다.`}{view.timing.cleanupSeconds !== null && ` 이후 종료·대조에 ${number(view.timing.cleanupSeconds)}초가 걸렸습니다.`}</p>
+      <small>6시간은 예정 운용 시간입니다. 필수 조건이 깨지면 새 주문을 보류하고 먼저 종료·대조를 진행합니다. 시작 동의가 6시간 동안의 무조건 실행을 뜻하지 않습니다.</small>
+    </div>}
     {view.firstFailure && <details className="live-monitor-alert">
       <summary>최초 오류 상세{view.failureDiagnostics[0] && ` · ${view.failureDiagnostics[0].providerLabel} · ${view.failureDiagnostics[0].resultLabel}`}</summary>
       <p>{view.firstFailure}</p>
@@ -29,7 +34,16 @@ export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt
         <strong>{row.providerLabel}</strong> · {row.resultLabel} · {row.elapsedLabel}
         {row.path && <><br/><code style={{overflowWrap:'anywhere'}}>{row.path}</code></>}
         {row.brokerCode && <small> · 거래소 코드 {row.brokerCode}</small>}
+        {row.quoteObservation && <dl className="live-monitor-quote-observation">
+          <div><dt>검사 대상</dt><dd>{row.quoteObservation.symbol} · {row.quoteObservation.purpose === 'INVENTORY_VALUATION' ? '기존 보유 자산 평가' : '주문 시세 검사'}</dd></div>
+          <div><dt>현재가 정보 반영 시각</dt><dd>{date(row.quoteObservation.sourceObservedAt)} · 경과 {row.quoteObservation.sourceAgeSeconds === null ? '미기록' : `${number(row.quoteObservation.sourceAgeSeconds)}초`}</dd></div>
+          <div><dt>마지막 실제 체결 시각</dt><dd>{date(row.quoteObservation.lastTradeObservedAt)} · 현재가 정보 시각과 구분</dd></div>
+          <div><dt>실제 수신 시각</dt><dd>{date(row.quoteObservation.receivedAt)} · 요청 소요 {row.quoteObservation.readElapsedSeconds === null ? '미기록' : `${number(row.quoteObservation.readElapsedSeconds)}초`}</dd></div>
+          <div><dt>적용 기준</dt><dd>정보·수신 10초 이내 · 미래 2초 이내 · {row.quoteObservation.issue}</dd></div>
+        </dl>}
+
       </li>)}</ul> : <p>이 기록에는 세부 API 오류가 남아 있지 않습니다. 정확한 요청 경로나 통신 원인을 추정하지 않습니다.</p>}
+      {!view.failureDiagnostics.some(row=>row.quoteObservation) && <p>이 기록에는 시세 원본 시각이 저장되지 않았습니다. 당시 어떤 시각이 몇 초 오래됐는지는 추측하지 않습니다. HTTP 조회가 성공해도 응답 내용의 시세 검사는 실패할 수 있습니다.</p>}
       <small>최초 실패 당시의 관측입니다. 이후 종료 정리가 완료되어도 이 오류는 보존됩니다.</small>
     </details>}
     <div className="live-monitor-freshness"><span>마지막 갱신 <strong>{date(receivedAt ? new Date(receivedAt).toISOString() : null)}</strong></span><span>서버 관측 {date(snapshot?.observedAt)}</span><span>시세 수신: {view.terminalReported ? "종료 기록" : view.feedsRecent && view.responseCurrent ? "최근 프레임 관측" : "확인 필요"}</span></div>
