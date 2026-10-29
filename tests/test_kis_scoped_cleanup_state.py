@@ -73,7 +73,8 @@ class ScopedStopSelectionTests(unittest.TestCase):
             'begin_continuous_control':lambda:self.events.append('control-begin') or 'token',
             'end_continuous_control':lambda token:self.events.append('control-end'),
             'sync_runtime_profile_mode':Mock(),'normalize_runtime_mode':lambda mode:mode,
-            'RUNTIME_MODE_RANK':{'MONITOR':0,'SMALL_LIVE':1,'FULL_LIVE':2},'stop_functional_test_runtime_guard':Mock(return_value={})}
+            'RUNTIME_MODE_RANK':{'MONITOR':0,'SMALL_LIVE':1,'FULL_LIVE':2},'stop_functional_test_runtime_guard':Mock(return_value={}),
+            '_revoke_runtime_order_authority':Mock()}
         names=['_advance_kis_route_state_revision','_kis_control_reservation_hash','_two_phase_kis_route_control',
             '_continuous_exact_stop_plan','_continuous_stop_requires_kis_route','_continuous_stop_control','stop_continuous_runtime']
         exec(compile(functions(names),'<exact STOP source>','exec'),self.ns)
@@ -262,6 +263,17 @@ class CleanupTerminalOrchestrationTests(unittest.TestCase):
         self.observer=Observer(working,history)
         self.native=SimpleNamespace(scope=lambda:deepcopy(self.scope),observer=self.observer,sync_owned_fills=Mock(return_value=1))
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        # Real read-only original-principal/source adapter is exercised by the
+        # actual AST cleanup function; this is a synthetic C-only store.
+        from live_trader.kis_owned_capital import KisOwnedCapitalStore
+        from test_kis_equity_operational import fixture as source_fixture
+        source_spec, _contract, _source_context = source_fixture('KRX')
+        original_store = KisOwnedCapitalStore(Path(self.temp.name) / 'original-principal.sqlite3')
+        original_store.initialize(self.scope, {'currency':'KRW','profileId':self.scope['accountProfileId'],
+            'accountFingerprint':self.scope['accountFingerprint'],'credentialConfigurationHash':self.scope['credentialConfigurationHash'],
+            'openOrders':'NONE_OBSERVED_COMPLETE_ACCOUNT_CURRENCY_SCOPE','asOf':NOW.isoformat(),'availableCash':'100000'}, now=NOW)
+        self.native.store = original_store
+        self.native.specs = [source_spec]
         ops=KisScopedOperationalAuthority(Path(self.temp.name)/'authority.sqlite3',clock=lambda:NOW.timestamp(),monotonic=lambda:1000.)
         ctx=context();ctx.update(runtimeScopeId='runtime-1',deploymentId='deployment',capitalCurrency='KRW',
             accountFingerprint=self.owned['accountFingerprint'],credentialConfigurationHash=self.owned['credentialConfigurationHash'])
@@ -291,7 +303,7 @@ class CleanupTerminalOrchestrationTests(unittest.TestCase):
             '_kis_cleanup_current_owner':lambda *a,**kw:(object(),self.controller),
             '_recover_kis_cleanup_owned_identities':lambda *a:[deepcopy(self.owned)],'_kis_cleanup_store':lambda:self.store,
             'LiveBrokerRouter':lambda:self.router,'LIVE_CONTINUOUS_CONTROLLER':self.manager,
-            'OPERATIONAL_GOVERNANCE':SimpleNamespace(transition_runtime_session=Mock()),
+            'OPERATIONAL_GOVERNANCE':SimpleNamespace(transition_runtime_session=Mock()), '_revoke_runtime_order_authority':Mock(),
             'refresh_preflight_reconciliation':Mock(return_value={'poll':{'ok':True,'coalesced':False,'error_count':0},
                 'summary':{'status':'pass','fresh':True,'three_way_verified':True,'error_count':0,'blocking_count':0},'errors':[]})}
         exec(compile(functions(['_finish_kis_owned_stop_cleanup']),'<terminal STOP cleanup source>','exec'),self.ns)
@@ -308,6 +320,9 @@ class CleanupTerminalOrchestrationTests(unittest.TestCase):
         result=self.finish();self.assertTrue(result['ok'],result)
         self.assertEqual(len(self.cancel_calls),1);self.assertEqual(len(self.observer.calls),4)
         self.native.sync_owned_fills.assert_called_once();self.manager.complete_cleanup_writer.assert_called_once_with('runtime-1')
+        passed_source = self.ns['refresh_preflight_reconciliation'].call_args.args[0]
+        self.assertEqual('KRX', passed_source['exchange'])
+        self.assertEqual(self.scope['scopeHash'], passed_source['cleanup_source_scope_hash'])
         self.assertEqual(self.store.public_status()['status'],'CLEAN')
         self.assertNotIn('runtime-1',self.ns['STATE']['active_runtime_session_ids'])
 

@@ -205,7 +205,7 @@ test('unselected saved strategies do not become selected deployment blockers', (
 test('one broker account success cannot make another broker API diagnosis pass', () => {
   const snapshot = validSnapshot();
   snapshot.brokers = [{broker_id:'kis', name:'KIS',missing_env:[]},{broker_id:'upbit',name:'Upbit',missing_env:[]}];
-  snapshot.accounts = [{broker_id:'upbit',broker_cash_value:0}];
+  snapshot.accounts = [{broker_id:'upbit',broker_cash_value:0,lookup_status:'success',observed_at:new Date(NOW).toISOString(),account_observation_fresh:true,observation_max_age_seconds:60}];
   snapshot.reconciliation.errors = [{broker_id:'kis',detail:'token failed'}];
   const row=item(inspect(snapshot),'doctor-api');
   assert.equal(row.details[0].tone,'danger');

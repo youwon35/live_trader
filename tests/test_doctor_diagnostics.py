@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -79,13 +80,16 @@ class DoctorDiagnosticsTests(unittest.TestCase):
             self.assertEqual("false", os.environ["LIVE_TRADER_ENABLE_REAL_ORDERS"])
 
     def test_machine_verifiable_checklist_items_survive_restart_semantics(self) -> None:
+        observed_at = datetime.now().isoformat(sep=" ")
+        broker_ids = ["kis", "binance", "binance-futures", "upbit"]
         state.STATE["checklist"] = {
             str(item["key"]): False
             for item in state.CHECKLIST_ITEMS
         }
         state.STATE["broker_reconciliation"] = {
-            "fetched_at": "2026-07-30 12:00:00",
-            "accounts": [],
+            "fetched_at": observed_at,
+            "accounts": [{"broker_id": bid} for bid in broker_ids],
+            "account_observations": {bid: {"observedAt": observed_at} for bid in broker_ids},
             "positions": [],
             "errors": [],
             "successful_account_brokers": [
@@ -101,16 +105,21 @@ class DoctorDiagnosticsTests(unittest.TestCase):
                 "upbit",
             ],
         }
-        broker = Mock()
-        broker.to_dict.return_value = {"missing_env": []}
+        readiness = []
+        for bid in broker_ids:
+            broker = Mock()
+            broker.to_dict.return_value = {"broker_id": bid, "missing_env": []}
+            readiness.append(broker)
         reconciliation = {
             "summary": {
                 "status": "pass",
                 "blocking_count": 0,
-                "last_run": "2026-07-30 12:00:00",
+                "fresh": True,
+                "three_way_verified": True,
+                "last_run": observed_at,
             }
         }
-        with patch.object(state, "broker_readiness", return_value=[broker]), patch.object(
+        with patch.object(state, "broker_readiness", return_value=readiness), patch.object(
             state,
             "reconciliation_snapshot",
             return_value=reconciliation,

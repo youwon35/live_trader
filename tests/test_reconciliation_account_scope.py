@@ -8,6 +8,8 @@ import unittest
 from unittest.mock import Mock
 
 
+from live_trader.status_observation import broker_account_observation
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -27,6 +29,8 @@ class ReconciliationAccountScopeTests(unittest.TestCase):
         self.ledger = [{'broker_id': 'binance', 'account': 'Binance Spot', 'currency': 'USDT', 'cash': 0.0, 'source': 'event_poll', 'updated_at': '2026-07-30 02:30:36'}]
         self.ns = {
             'STATE': {'broker_reconciliation': {'accounts': self.current}},
+            'broker_account_observation': broker_account_observation,
+            'PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS': 60,
             'PROGRAM_LEDGER': SimpleNamespace(cash_rows=Mock(side_effect=lambda: self.ledger)),
             'ACCOUNT_RECONCILIATION_BOOK': ({'broker_id': 'binance', 'broker_name': 'Binance', 'account': 'Binance Spot', 'currency': 'USDT', 'broker_cash': None, 'program_cash': None, 'detail': 'account read required'},),
             'broker_reconciliation_errors': lambda: {},

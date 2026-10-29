@@ -41,6 +41,39 @@ def original_owned_cleanup_scope(native_runtime, context):
     return deepcopy(scope)
 
 
+def cleanup_reconciliation_strategy(native_runtime, context):
+    """Carry the original owned members' explicit source venue into status checks.
+
+    Currency, a flat account and an order symbol do not establish a venue.
+    Original principal/member pins and sealed source quantity contracts do.
+    This adapter neither restores entry authority nor creates a new baseline.
+    """
+    from .native_spot_quantity import sizing_from_artifact
+
+    scope = original_owned_cleanup_scope(native_runtime, context)
+    contracts = []
+    for spec in native_runtime.specs:
+        sizing = sizing_from_artifact(getattr(spec, "artifact", None))
+        contract = (sizing or {}).get("quantityContract") or {}
+        if (contract.get("schemaVersion") != "native-equity-quantity-v1"
+                or contract.get("provider") != "kis"
+                or contract.get("symbol") != spec.symbol
+                or contract.get("quoteCurrency") != scope["quoteCurrency"]
+                or contract.get("exchange") not in {"KRX", "NASD", "NYSE", "AMEX"}):
+            raise ValueError("KIS_CLEANUP_ORIGINAL_SOURCE_VENUE_CONTRACT_REQUIRED")
+        if (contract["exchange"] == "KRX") != (contract["quoteCurrency"] == "KRW"):
+            raise ValueError("KIS_CLEANUP_ORIGINAL_SOURCE_VENUE_CURRENCY_CONFLICT")
+        contracts.append({"sourceArtifactHash": spec.artifact_hash, "strategyInstanceId": spec.strategy_instance_id,
+                          "quantityContractHash": contract["contractHash"], "exchange": contract["exchange"]})
+    venues = sorted({row["exchange"] for row in contracts})
+    if not venues:
+        raise ValueError("KIS_CLEANUP_ORIGINAL_SOURCE_VENUE_CONTRACT_REQUIRED")
+    return {"broker_id": "kis", "exchange": venues[0] if len(venues) == 1 else "MIXED",
+            "currency": scope["quoteCurrency"], "cleanup_source_scope_hash": scope["scopeHash"],
+            "cleanup_source_venue_contracts": contracts,
+            "observation_scope_source": "ORIGINAL_OWNED_PRINCIPAL_AND_SEALED_SOURCE_QUANTITY_CONTRACTS"}
+
+
 def cleanup_read_runtime(native_runtime, context):
     """Narrow observer/scope facade: has no submit, cancel or initialize method."""
     def scope():

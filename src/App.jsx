@@ -1,3 +1,4 @@
+import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel } from "./diagnosticPresentation.js";
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
 import { createSnapshotResponseGate, createSnapshotReadCoordinator, initialAccountRefreshState, accountRefreshResultState, accountObservationView } from "./snapshotRefreshState.js";
 import { environmentStatus, ordinaryEntryStatus, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation } from "./statusTruth.js";
@@ -2718,7 +2719,7 @@ function LiveEnvironmentBar({ context, deploymentOptions, onSelect, snapshot }) 
         </label>
         <div className="live-context-meta">
           <strong>{context.portfolioName}</strong>
-          <span>{["kis", "binance", "binance-futures", "upbit"].includes(context.brokerId) ? context.brokerId : `거래소 미확인 (${context.brokerId})`} · 계정 {context.accountId} · {context.symbol} {context.timeframe}</span>
+          <span>{deploymentMetadataLabel(context)} · {context.symbol} {context.timeframe}</span>
           <span>조회 배포의 최근 회차 · {snapshot.live_governance?.activeSession?.deploymentId === context.id ? sessionId : "미확인"}</span>
           {!currentPreflightValid && <span>일반 운용 배포의 점검 상태입니다. 주문 연결 시험의 준비·시작은 해당 탭에서 확인하세요.</span>}
         </div>
@@ -3105,7 +3106,7 @@ function DeploymentManifestPanel({ governance = {} }) {
   );
 }
 
-function PreflightScopePanel({ snapshot = {}, onPreflight }) {
+function PreflightScopePanel({ snapshot = {}, selectedDeploymentId = "", onPreflight }) {
   const checks = snapshot.final_preflight ?? [];
   const deploymentLabels = new Set(["포지션·계좌 대조", "대조 증거 신선도", "전략 승인", "필수 운영 체크리스트", "운용자 확인", "신규 진입 차단"]);
   const deploymentChecks = checks.filter((check) => deploymentLabels.has(check.label));
@@ -3115,7 +3116,9 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
   const validity = governance.preflightValidity || governance.preflight_validity || {};
   const expiresAt = latest.expiresAt || latest.expires_at || "";
   const remainingSeconds = expiresAt ? Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000)) : null;
-  const snapshotValid = validity.valid === true
+  const snapshotValid = deploymentContextMatchesPreflight(selectedDeploymentId, governance)
+    && String(latest.deploymentId || latest.deployment_id || "") === String(selectedDeploymentId || "")
+    && validity.valid === true
     && String(latest.status || latest.result || "").toUpperCase() === "PASS"
     && remainingSeconds > 0;
   const snapshotTone = snapshotValid ? "success" : latest.snapshotId ? "warning" : "neutral";
@@ -3127,18 +3130,18 @@ function PreflightScopePanel({ snapshot = {}, onPreflight }) {
       />
       <div className="preflight-scope-grid">
         <article>
-          <header><strong>전역 시스템 검사</strong><StatusPill tone={globalChecks.some((item) => item.status === "fail") ? "danger" : "success"}>{globalChecks.filter((item) => item.status === "fail").length} HARD</StatusPill></header>
+          <header><strong>전역 시스템 검사</strong><StatusPill tone={!globalChecks.length ? "neutral" : globalChecks.some((item) => item.status === "fail") ? "danger" : globalChecks.some((item) => item.status === "warn") ? "warning" : "success"}>{globalChecks.length ? `${globalChecks.filter((item) => item.status === "fail").length}건 미충족` : "미확인"}</StatusPill></header>
           {globalChecks.slice(0, 5).map((item) => <StatusRow key={item.label} label={item.label} status={item.status} detail={item.detail} />)}
           {!globalChecks.length && <EmptyRow text="전역 검사 결과가 없습니다." />}
         </article>
         <article>
-          <header><strong>현재 운용 배포 검사</strong><StatusPill tone={deploymentChecks.some((item) => item.status === "fail") ? "danger" : "success"}>{deploymentChecks.filter((item) => item.status === "fail").length} HARD</StatusPill></header>
+          <header><strong>현재 운용 배포 검사</strong><StatusPill tone={!deploymentChecks.length ? "neutral" : deploymentChecks.some((item) => item.status === "fail") ? "danger" : deploymentChecks.some((item) => item.status === "warn") ? "warning" : "success"}>{deploymentChecks.length ? `${deploymentChecks.filter((item) => item.status === "fail").length}건 미충족` : "미확인"}</StatusPill></header>
           {deploymentChecks.slice(0, 5).map((item) => <StatusRow key={item.label} label={item.label} status={item.status} detail={item.detail} />)}
           {!deploymentChecks.length && <EmptyRow text="Deployment 검사 결과가 없습니다." />}
         </article>
       </div>
       <div className="panel-action-line">
-        <span>{latest.snapshotId ? `Snapshot ${latest.snapshotId}` : "실거래 테스트: 운용자 확인 → Dry Run 해제 → 신규 진입 허용 → 새 Preflight → Canary"}</span>
+        <span>{latest.snapshotId ? `Snapshot ${latest.snapshotId}` : "일반 운용은 선택 배포의 새 시작 점검이 필요합니다. 주문 연결 시험은 해당 탭에서 준비 결과를 사용합니다."}</span>
         <button className="primary-button" type="button" onClick={onPreflight}><BadgeCheck size={15} />새 시작 점검 실행</button>
       </div>
     </section>
@@ -3165,14 +3168,14 @@ function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, on
           onPreflight={onPreflight}
           onWatchdog={onWatchdog}
         />
-        <LaunchReportPanel report={snapshot.launch_report ?? {}} observed={snapshot.api_connected === true && snapshot.final_preflight?.length > 0} />
+        <LaunchReportPanel report={snapshot.launch_report ?? {}} observed={snapshot.api_connected === true && snapshot.final_preflight?.length > 0} onNavigate={onNavigate} />
       </section>
       <CompactDisclosure
         title="시작 점검·실행 엔진 기술 근거"
         description="전체 통과 항목과 실행 엔진 구성 요소는 장애 분석이나 상세 검증이 필요할 때만 확인합니다."
       >
         <section className="ts-panel-grid ts-panel-grid--two live-secondary-panel-grid">
-          <PreflightScopePanel snapshot={snapshot} onPreflight={onPreflight} />
+          <PreflightScopePanel snapshot={snapshot} selectedDeploymentId={selectedDeploymentId} onPreflight={onPreflight} />
           {snapshot.operation_report?.sections?.length > 0 && <OperationsReportPanel report={snapshot.operation_report} />}
           <RuntimeComponentStatusPanel snapshot={snapshot} />
           <OrderQueueSummaryPanel summary={snapshot.order_queue ?? {}} />
@@ -3599,15 +3602,26 @@ function IncidentAuditWorkspace({ snapshot = {} }) {
 }
 
 function DoctorHistoryPanel({ diagnostics = {}, onNavigate }) {
-  const latest = diagnostics?.latest ?? {};
-  const issues = latest.issues ?? [];
+  const record = doctorHistoryPresentation(diagnostics);
+  const date = Date.parse(record.timestamp);
+  const recordedAt = Number.isFinite(date) ? new Date(date).toLocaleString("ko-KR") : "미실행";
   return (
     <section className="panel doctor-history-panel">
-      <PanelHeader title="설정·실행 자체 검사" subtitle={`최근 진단 ${latest.generated_at || "미실행"}`} suffix={<StatusPill tone={latest.summary?.hard_stop_count ? "danger" : latest.summary?.warning_count ? "warning" : latest.run_id ? "success" : "neutral"}>{latest.summary?.status || "미실행"}</StatusPill>} />
-      <div className="compact-list">
-        {issues.slice(0, 12).map((issue) => <button className="compact-row doctor-history-row" type="button" key={issue.issue_code} onClick={() => onNavigate(issue.related_tab || "overview")}><strong>{issue.problem}</strong><span>{issue.remediation}</span><StatusPill tone={issue.severity === "hard_stop" ? "danger" : "warning"}>{issue.severity === "hard_stop" ? "차단" : "주의"}</StatusPill></button>)}
-        {!issues.length && <EmptyRow text="저장된 진단 이슈가 없습니다." />}
-      </div>
+      <PanelHeader title="저장된 일반 운용 진단" subtitle={`기록 시각 ${recordedAt}`} suffix={<StatusPill tone="neutral">검사 이력</StatusPill>} />
+      <p>{record.detail}</p>
+      {record.exists ? <details className="doctor-history-record">
+        <summary>{record.label} · 세부 기록 보기</summary>
+        <div className="compact-list">
+          {record.issues.map((issue, index) => <article className="doctor-record-issue" key={`${issue.issue_code}-${index}`}>
+            <strong>{issue.problem}</strong>
+            {issue.evidence ? <p>{typeof issue.evidence === "string" ? issue.evidence : "상세 진단 근거가 기록되어 있습니다."}</p> : null}
+            <p>{issue.remediation}</p>
+            <button className="text-button" type="button" onClick={() => onNavigate(issue.related_tab || "overview")}>관련 항목 보기</button>
+          </article>)}
+          {!record.issues.length && <EmptyRow text="기록 당시 미충족 항목이 없었습니다. 현재 실행 준비는 별도 점검합니다." />}
+        </div>
+      </details> : <EmptyRow text="저장된 일반 운용 진단이 없습니다." />}
+      <div className="panel-action-line"><button className="secondary-button" type="button" onClick={() => onNavigate("overview")}>현재 일반 운용 조건 보기</button><button className="secondary-button" type="button" onClick={() => onNavigate("functional-test")}>주문 연결 시험 준비로 이동</button></div>
     </section>
   );
 }
@@ -4513,6 +4527,7 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
   const [hasRun, setHasRun] = useState(false);
   const [selectedDoctorId, setSelectedDoctorId] = useState(null);
   const items = buildDoctorItems(snapshot, selectedDeploymentId);
+  const categorySummary = doctorCategorySummary(items);
   const problemCount = items.filter((item) => item.tone !== "success").length;
   const failCount = items.filter((item) => item.tone === "danger").length;
   const warnCount = items.filter((item) => item.tone === "warning").length;
@@ -4537,8 +4552,8 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
       <div className="doctor-hero">
         <div>
           <span>점검 결과</span>
-          <strong>{hasRun ? (problemCount ? "조치 필요" : "통과") : "대기"}</strong>
-          <p>{hasRun ? `hard stop ${failCount}개, warning ${warnCount}개를 확인했습니다.` : "점검 실행 버튼을 눌러 API, 리스크, 체크리스트, 대조 상태를 검사하세요."}</p>
+          <strong>{hasRun ? categorySummary.label : "일반 운용 점검 대기"}</strong>
+          <p>{hasRun ? categorySummary.detail : "계좌/API 연결과 일반 운용의 실행 조건을 분야별로 확인합니다. 주문 연결 시험은 해당 탭에서 별도로 준비하세요."}</p>
         </div>
         <ActionButton
           className="primary-button doctor-run-button"
@@ -4548,7 +4563,7 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
           onClick={runDoctor}
           pending={running}
           pendingLabel="점검 중"
-          status={running ? "pending" : hasRun ? (problemCount ? "error" : "success") : undefined}
+          status={running ? "pending" : hasRun ? (failCount ? "error" : problemCount ? undefined : "success") : undefined}
           variant="primary"
         />
       </div>
@@ -4637,7 +4652,7 @@ function buildDoctorItems(snapshot = {}, selectedDeploymentId = "", now = Date.n
   const missingBrokerEnvCount =
     brokerDiagnostics.reduce((count, broker) => count + (broker.env ?? []).filter((item) => !item.present).length, 0) ||
     (snapshot.brokers ?? []).reduce((count, broker) => count + (broker.missing_env?.length ?? 0), 0);
-  const brokerConnectionErrors = snapshot.reconciliation?.errors ?? [];
+  const brokerConnectionErrors = (snapshot.reconciliation?.errors ?? []).filter(error => !["positions", "position", "execution-events", "executions"].includes(error.scope));
   const configuredBrokerCount = (snapshot.brokers ?? []).filter((broker) => !(broker.missing_env?.length)).length;
   const observedBrokerCount = (snapshot.brokers ?? []).filter(broker => brokerAccountObservation(snapshot, broker.broker_id, now).status === "pass").length;
   const allBrokersObserved = configuredBrokerCount > 0 && observedBrokerCount === configuredBrokerCount;
@@ -6055,7 +6070,7 @@ function UnifiedBrokerAccountPanel({
   const allocationAccounts = useMemo(() => liveAllocationAccounts(accounts, positions, { nowMs, preserveObserved: true }), [accounts, positions, nowMs]);
   return (
     <>
-      {observation.connected ? <AllocationWorkspace accounts={allocationAccounts}
+      {observation.connected ? <AllocationWorkspace accounts={allocationAccounts} groupBy="account"
         title={observation.fresh ? "내 실계좌 구성" : "내 실계좌 구성 · 이전 관측값"}
         basis="마지막 계좌 조회 시점의 수량·시세 평가 · 실시간 평가가 아닙니다 · 현금 포함 · 선물은 증거금만 포함"
         onRefresh={onRefresh} refreshDisabled={refreshDisabled}
@@ -6091,42 +6106,29 @@ function OperationsReportPanel({ report }) {
   );
 }
 
-function LaunchReportPanel({ report, observed = false }) {
+function LaunchReportPanel({ report, observed = false, onNavigate }) {
+  const view = launchConditionPresentation(report, observed);
   const items = [
-    { label: "운용 시작 조건", value: report.real_order_lock === "ready" ? "점검 충족" : report.real_order_lock === "locked" ? "점검 미충족" : "미확인", tone: statusTone(report.real_order_lock) },
-    { label: "제한 실거래", value: report.small_live_status, tone: statusTone(report.small_live_status) },
-    { label: "실전 운용", value: report.full_live_status, tone: statusTone(report.full_live_status) },
-    { label: "Hard Stop", value: report.hard_stop_count, tone: report.hard_stop_count ? "danger" : "success" },
-    { label: "Warning", value: report.warning_count, tone: report.warning_count ? "warning" : "success" },
+    { label: "미충족 시작 조건", value: view.blocked, tone: view.blocked ? "danger" : view.known ? "success" : "warning" },
+    { label: "검토할 조건", value: view.warnings, tone: view.warnings ? "warning" : view.known ? "success" : "warning" },
   ];
   return (
     <section className="panel launch-report-panel">
-      <PanelHeader title="일반 운용 시작 조건" subtitle={observed ? `현재 진단 · 마지막 최종 점검 ${report.last_run}` : "시작 조건을 아직 확인하지 못했습니다."} />
-      <div className="launch-lock">
+      <PanelHeader title="일반 운용 · 조건별 진단" subtitle={`현재 저장 자료 기준 · 실제 시작 점검 이력 ${report.last_run || "미실행"}`} />
+      <div {...semanticSurfaceProps(view.tone, "launch-lock")}>
         <ShieldAlert size={18} />
-        <div>
-          <strong>{observed ? report.lock_reason : "점검 결과 미확인 · 최신 시작 점검이 필요합니다."}</strong>
-          <span>일반 운용의 실행 조건을 확인하는 진단입니다. 주문 연결 시험은 해당 탭에서 준비 결과를 확인하세요.</span>
-        </div>
+        <div><strong>{view.label}</strong><span>{view.detail}</span></div>
       </div>
       <MetricGrid className="metric-grid">
-        {items.map((item) => (
-          <MetricCard
-            className="metric-card"
-            detail={!observed || item.value == null ? "미확인" : item.tone === "success" ? "점검 충족" : "점검 필요"}
-            detailClassName={`summary-state ${observed && item.value != null ? item.tone : "warning"}`}
-            key={item.label}
-            label={item.label}
-            tone={observed && item.value != null ? item.tone : "warning"}
-            value={observed && item.value != null ? item.value : "미확인"}
-          />
-        ))}
+        {items.map(item => <MetricCard className="metric-card" key={item.label} label={item.label}
+          tone={item.tone} value={item.value == null ? "미확인" : `${item.value}건`}
+          detail="아래 세부 조건 기준" detailClassName={`summary-state ${item.tone}`} />)}
       </MetricGrid>
-      <div className="next-actions">
-        {(observed ? report.next_actions || [] : []).map((action) => (
-          <span key={action}>{action}</span>
-        ))}
-      </div>
+      {view.conditions.length ? <div className="launch-condition-list">{view.conditions.map((condition,index)=><article key={`${condition.label}-${index}`}>
+        <strong className={`summary-state ${condition.tone}`}>{condition.label} · {condition.statusLabel}</strong>
+        <p>{condition.detail}</p>
+      </article>)}</div> : null}
+      {onNavigate ? <div className="panel-action-line"><button className="secondary-button" type="button" onClick={()=>onNavigate("functional-test")}>주문 연결 시험 준비로 이동</button></div> : null}
     </section>
   );
 }

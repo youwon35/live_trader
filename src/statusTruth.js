@@ -27,18 +27,26 @@ export function environmentStatus(snapshot = {}, selectedId = '', now = Date.now
   items.push({ label: '전체 긴급 정지', value: snapshot.kill_switch === true ? '작동 중' : known && snapshot.kill_switch === false ? '정상' : '미확인', tone: snapshot.kill_switch === true ? 'danger' : known && snapshot.kill_switch === false ? 'success' : 'warning' });
   return { items, valid };
 }
-export function brokerAccountObservation(snapshot, brokerId, now = Date.now()) {
-  if (!brokerId) return { status: 'warn', detail: '거래소 식별자를 확인하지 못했습니다.' };
-  const errors = (snapshot.reconciliation?.errors || []).filter(row => row.broker_id === brokerId);
-  if (errors.length) return { status: 'fail', detail: '계좌 조회 실패 · 계좌·잔고에서 오류 원인을 확인하세요.' };
+export function brokerAccountObservation(snapshot = {}, brokerId, now = Date.now()) {
+  if (!brokerId) return { status: 'warn', detail: '배포 기록의 거래소는 미지정입니다. 실행 준비에서 실제 계좌를 확인하세요.' };
+  const accountErrors = (snapshot.reconciliation?.errors || []).filter(row => row.broker_id === brokerId
+    && !['positions', 'position', 'execution-events', 'executions'].includes(row.scope));
   const accounts = (snapshot.accounts || []).filter(row => row.broker_id === brokerId);
+  if (accountErrors.length || accounts.some(row => row.lookup_status === 'error')) {
+    return { status: 'fail', detail: '계좌 조회 실패 · 계좌·잔고에서 해당 거래소 오류를 확인하세요.' };
+  }
   const number = value => typeof value === 'number' && Number.isFinite(value);
   const found = accounts.length > 0 && accounts.every(row => number(row.broker_cash_value) || number(row.broker_equity_value));
-  const stamp = Date.parse(snapshot.reconciliation?.summary?.last_run || '');
-  const fresh = snapshot.api_connected === true && Number.isFinite(stamp) && now >= stamp && now - stamp <= 300000;
   if (!found) return { status: 'warn', detail: '인증정보 저장됨 · 실제 계좌 조회는 미확인입니다.' };
+  const fresh = snapshot.api_connected === true && accounts.every(row => {
+    const stamp = Date.parse(row.observed_at || '');
+    const maximum = row.observation_max_age_seconds;
+    return row.lookup_status === 'success' && row.account_observation_fresh === true
+      && Number.isFinite(stamp) && now >= stamp
+      && number(maximum) && maximum > 0 && now - stamp <= maximum * 1000;
+  });
   return fresh ? { status: 'pass', detail: '최근 계좌 조회 성공 · 주문 권한과 원장 대조는 별도 점검합니다.' }
-    : { status: 'warn', detail: '과거 계좌 조회값 · 현재 연결은 계좌 다시 읽기로 확인하세요.' };
+    : { status: 'warn', detail: '계좌 조회 기록 있음 · 지난 관측값입니다. 인증 실패를 뜻하지 않으며 실행 준비 시 다시 확인합니다.' };
 }
 
 export function ordinaryRuntimeKnown(snapshot = {}) {

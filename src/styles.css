@@ -9178,3 +9178,19 @@ body {
     white-space: normal;
   }
 }
+
+/* Recorded diagnostics are history; current condition details remain readable. */
+.doctor-history-panel > p { color: var(--muted); line-height: 1.65; }
+.doctor-history-record summary { cursor: pointer; padding: 10px 0; font-weight: 600; }
+.doctor-record-issue, .launch-condition-list > article { padding: 12px 0; border-top: 1px solid var(--border); min-width: 0; }
+.doctor-record-issue p, .launch-condition-list p { white-space: normal; overflow-wrap: anywhere; line-height: 1.65; margin: 6px 0; }
+.doctor-record-issue .text-button { color: var(--primary); }
+.launch-report-panel .launch-lock { background: var(--panel); color: var(--text); align-items: start; }
+.launch-report-panel .launch-lock span, .launch-report-panel .launch-lock strong { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+.launch-report-panel .launch-lock span { color: var(--muted); line-height: 1.65; }
+.launch-report-panel .launch-lock[data-tone="danger"] { background: var(--danger-surface); }
+.launch-report-panel .launch-lock[data-tone="warning"] { background: var(--warning-surface); }
+.launch-report-panel .launch-lock[data-tone="success"] { background: var(--success-surface); }
+.launch-condition-list { margin-top: 12px; }
+
+.launch-report-panel .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

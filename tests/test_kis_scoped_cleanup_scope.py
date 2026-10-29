@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from live_trader.kis_owned_capital import KisOwnedCapitalStore
-from live_trader.kis_scoped_cleanup_scope import cleanup_read_runtime, original_owned_cleanup_scope, cached_cleanup_terminal_is_complete
+from live_trader.kis_scoped_cleanup_scope import cleanup_read_runtime, original_owned_cleanup_scope, cached_cleanup_terminal_is_complete, cleanup_reconciliation_strategy
 from test_kis_scoped_cleanup_truth import fixture, Observer, NOW
 
 
@@ -20,8 +20,10 @@ class OriginalCleanupScopeTests(unittest.TestCase):
             'accountFingerprint':self.scope['accountFingerprint'],'credentialConfigurationHash':self.scope['credentialConfigurationHash'],
             'openOrders':'NONE_OBSERVED_COMPLETE_ACCOUNT_CURRENCY_SCOPE','asOf':NOW.isoformat(),'availableCash':'100000'},now=NOW)
         member=self.scope['members'][0]
+        from test_kis_equity_operational import fixture as source_fixture
+        source_spec, _contract, _context = source_fixture('KRX')
         self.spec=SimpleNamespace(strategy_instance_id=member['strategyInstanceId'],artifact_hash=member['sourceArtifactHash'],
-            portfolio_hash=member['portfolioHash'],symbol=member['symbol'])
+            portfolio_hash=member['portfolioHash'],symbol=member['symbol'],artifact=source_spec.artifact)
         def expired():raise ValueError('ENTRY_OR_FEE_POLICY_EXPIRED')
         self.native=SimpleNamespace(store=self.store,specs=[self.spec],observer=Observer(working,history),scope=expired)
         self.context={'deploymentId':self.scope['deploymentId'],'accountFingerprint':self.scope['accountFingerprint'],
@@ -35,6 +37,43 @@ class OriginalCleanupScopeTests(unittest.TestCase):
             self.assertFalse(hasattr(observer,method))
         returned=observer.scope();returned['members'][0]['symbol']='tampered'
         self.assertEqual(observer.scope(),self.scope)
+
+    def test_cleanup_reconciliation_carries_original_pinned_source_venue_without_entry_policy_or_new_authority(self):
+        from live_trader.status_observation import strategy_execution_observation_scope
+        strategy = cleanup_reconciliation_strategy(self.native, self.context)
+        self.assertEqual('KRX', strategy['exchange'])
+        self.assertEqual(self.scope['scopeHash'], strategy['cleanup_source_scope_hash'])
+        self.assertEqual(self.spec.artifact_hash, strategy['cleanup_source_venue_contracts'][0]['sourceArtifactHash'])
+        self.assertEqual('KIS_DOMESTIC_ONLY', strategy_execution_observation_scope(strategy))
+        self.assertNotIn('authority_granted', strategy)
+        with self.assertRaisesRegex(ValueError, 'POLICY_EXPIRED'):
+            self.native.scope()
+
+    def test_cleanup_never_infers_venue_from_krw_or_symbol_when_original_source_contract_is_missing_or_changed(self):
+        original = deepcopy(self.spec.artifact)
+        self.spec.artifact = {}
+        with self.assertRaisesRegex(ValueError, 'SOURCE_VENUE_CONTRACT_REQUIRED'):
+            cleanup_reconciliation_strategy(self.native, self.context)
+        self.spec.artifact = original
+        self.spec.artifact['executionSizing']['quantityContract']['exchange'] = 'NYSE'
+        with self.assertRaisesRegex(ValueError, 'hash mismatch'):
+            cleanup_reconciliation_strategy(self.native, self.context)
+
+    def test_usd_cleanup_preserves_actual_overseas_source_and_cannot_borrow_domestic_coverage(self):
+        from test_kis_equity_operational import fixture as source_fixture
+        from live_trader.status_observation import strategy_execution_observation_scope
+        scope, _owned, working, history = fixture('NASD')
+        store = KisOwnedCapitalStore(Path(self.temp.name) / 'overseas-original.sqlite3')
+        store.initialize(scope, {'currency':'USD','profileId':scope['accountProfileId'],
+            'accountFingerprint':scope['accountFingerprint'],'credentialConfigurationHash':scope['credentialConfigurationHash'],
+            'openOrders':'NONE_OBSERVED_COMPLETE_ACCOUNT_CURRENCY_SCOPE','asOf':NOW.isoformat(),'availableCash':'10000'}, now=NOW)
+        spec, _contract, _context = source_fixture('NASD')
+        native = SimpleNamespace(store=store, specs=[spec])
+        context = {**self.context, 'capitalCurrency':'USD'}
+        strategy = cleanup_reconciliation_strategy(native, context)
+        self.assertEqual('NASD', strategy['exchange'])
+        self.assertEqual('USD', strategy['currency'])
+        self.assertEqual('UNVERIFIED', strategy_execution_observation_scope(strategy))
 
     def test_changed_account_credentials_currency_deployment_or_source_never_reuses_principal(self):
         for key,value in [('accountFingerprint','f'*64),('credentialConfigurationHash','e'*64),('capitalCurrency','USD'),('deploymentId','different')]:

@@ -13,6 +13,8 @@ import unittest
 from unittest.mock import Mock
 from urllib.parse import urlparse
 
+from live_trader.status_observation import completed_broker_poll_observations, broker_execution_read_coverage
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -97,7 +99,8 @@ class DisplayOnlyRefreshTests(unittest.TestCase):
         self.assertFalse(ns["STATE"]["new_entries_blocked"])
 
     def test_poll_records_observation_without_promoting_even_with_new_fill(self):
-        ns = {"datetime": datetime, "time": time, "hashlib": hashlib, "json": json,
+        ns = {"datetime": datetime, "timezone": timezone, "time": time, "hashlib": hashlib, "json": json,
+              "completed_broker_poll_observations": completed_broker_poll_observations, "broker_execution_read_coverage": broker_execution_read_coverage,
               "STATE": {"program_ledger": {}}, "LiveBrokerRouter": Mock(),
               "LIVE_EXECUTION_STREAMS": Mock(), "PROGRAM_LEDGER": Mock()}
         ns["LIVE_EXECUTION_STREAMS"].drain.return_value = []

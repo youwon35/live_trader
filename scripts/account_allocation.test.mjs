@@ -94,3 +94,33 @@ test("manual account view retains valid past observations without presenting the
  positions[0].display_valuation.status="UNKNOWN";
  assert.equal(liveAllocationAccounts(accounts,positions,{nowMs,preserveObserved:true})[0].positions[0].value,null);
 });
+
+
+test("Live four routes keep KIS and Upbit KRW plus Binance spot and futures USDT separate",()=>{
+ const accounts=[{broker_id:"kis",currency:"KRW",broker_cash_value:100,broker_equity_value:200},{broker_id:"upbit",currency:"KRW",broker_cash_value:50,valuation_basis:"cash_only"},{broker_id:"binance",currency:"USDT",broker_cash_value:10,valuation_basis:"cash_only"},{broker_id:"binance-futures",currency:"USDT",broker_cash_value:80,broker_equity_value:100}];
+ const positions=[{broker_id:"kis",symbol:"005930",currency:"KRW",broker_qty_value:1,current_price:100,valuation_basis:"market_value"},{broker_id:"upbit",symbol:"KRW-BTC",currency:"KRW",broker_qty_value:1,display_valuation:{...freshValuation("KRW"),current_price:50}},{broker_id:"binance",symbol:"SOL",broker_qty_value:1,display_valuation:{...freshValuation(),current_price:20}},{broker_id:"binance-futures",symbol:"SOLUSDT",currency:"USDT",broker_qty_value:2,current_price:200,valuation_basis:"market_notional",position_side:"LONG"}];
+ const source=structuredClone({accounts,positions});const view=allocationView(liveAllocationAccounts(accounts,positions,{nowMs:valuationNow}),{groupBy:"account"});
+ assert.deepEqual(view.groups.map(g=>g.total),[200,100,30,100]);assert.equal(view.groups.length,4);assert.equal(view.rows.find(r=>r.accountId==="upbit").percent,50);assert.equal(view.rows.find(r=>r.accountId==="binance-futures").percent,400);assert.deepEqual({accounts,positions},source);
+ accounts[0].lookup_status="error";const partial=allocationView(liveAllocationAccounts(accounts,positions,{nowMs:valuationNow}),{groupBy:"account"});assert.equal(partial.groups.find(g=>g.accountId==="kis").total,null);assert.equal(partial.groups.find(g=>g.accountId==="upbit").total,100);
+});
+test("cash asset is counted only in cash while quote currency and other stablecoins stay held assets",()=>{
+ const accounts=[{broker_id:"binance",currency:"USDT",broker_cash_value:10,valuation_basis:"cash_only"},{broker_id:"upbit",currency:"KRW",broker_cash_value:100,valuation_basis:"cash_only"}];
+ const positions=[{broker_id:"binance",symbol:"USDT",currency:"USDT",broker_qty_value:10,current_price:1,valuation_basis:"market_value"},{broker_id:"binance",symbol:"BTC",currency:"USDT",broker_qty_value:1,display_valuation:{...freshValuation(),current_price:20}},{broker_id:"binance",symbol:"USDC",currency:"USDT",broker_qty_value:5,display_valuation:{...freshValuation(),current_price:1}},{broker_id:"upbit",symbol:"KRW",currency:"KRW",broker_qty_value:100,current_price:1,valuation_basis:"market_value"},{broker_id:"upbit",symbol:"KRW-BTC",currency:"KRW",broker_qty_value:1,display_valuation:{...freshValuation("KRW"),current_price:50}}];
+ const view=allocationView(liveAllocationAccounts(accounts,positions,{nowMs:valuationNow}),{groupBy:"account"});assert.equal(view.groups.find(g=>g.accountId==="binance").total,35);assert.equal(view.groups.find(g=>g.accountId==="upbit").total,150);assert.deepEqual(view.rows.map(r=>r.symbol).sort(),["BTC","KRW-BTC","USDC"]);
+});
+test("same broker multiple accounts bind positions by exact scope and never duplicate unscoped holdings",()=>{
+ const accounts=[{broker_id:"binance",account_id:"A",currency:"USDT",broker_cash_value:10,valuation_basis:"cash_only"},{broker_id:"binance",account_id:"B",currency:"USDT",broker_cash_value:100,valuation_basis:"cash_only"}];
+ const positions=[{broker_id:"binance",account_id:"A",symbol:"BTC",broker_qty_value:1,display_valuation:{...freshValuation(),current_price:20}},{broker_id:"binance",account_id:"B",symbol:"SOL",broker_qty_value:1,display_valuation:{...freshValuation(),current_price:30}}];
+ const normalized=liveAllocationAccounts(accounts,positions,{nowMs:valuationNow}),view=allocationView(normalized,{groupBy:"account"});assert.equal(new Set(normalized.map(a=>a.id)).size,2);assert.deepEqual(view.groups.map(g=>g.total),[30,130]);assert.deepEqual(normalized.map(a=>a.positions.length),[1,1]);
+ delete positions[0].account_id;const ambiguous=liveAllocationAccounts(accounts,positions,{nowMs:valuationNow});assert.equal(ambiguous.length,3);assert.ok(ambiguous.every(a=>a.ready===false));assert.equal(ambiguous.flatMap(a=>a.positions).filter(p=>p.symbol==="BTC").length,1);assert.ok(allocationView(ambiguous,{groupBy:"account"}).groups.every(g=>g.total===null));
+});
+test("negative spot quantity cannot become a positive asset while genuine signed futures remain notional",()=>{
+ const accounts=[{broker_id:"binance",currency:"USDT",broker_cash_value:10,valuation_basis:"cash_only"}];const positions=[{broker_id:"binance",symbol:"BTC",broker_qty_value:-1,display_valuation:freshValuation()}];
+ const view=allocationView(liveAllocationAccounts(accounts,positions,{nowMs:valuationNow}),{groupBy:"account"});assert.equal(view.groups[0].total,null);assert.equal(view.rows[0].value,null);assert.equal(view.rows[0].quantity,-1);
+});
+
+
+test("Live observed_at remains account source time; attempts and global refresh are never replacements",()=>{
+ const accounts=[{broker_id:"kis",currency:"KRW",broker_cash_value:10,broker_equity_value:10,observed_at:"2026-10-28T03:00:00Z",lookup_status:"stale"},{broker_id:"upbit",currency:"KRW",broker_cash_value:20,broker_equity_value:20,last_attempt_at:"2026-10-29T03:00:00Z",last_success_at:"2026-10-29T03:00:00Z",lookup_status:"error"}];
+ const normalized=liveAllocationAccounts(accounts,[],{nowMs:valuationNow});assert.equal(normalized[0].observedAt,accounts[0].observed_at);assert.equal(normalized[0].lookupStatus,"stale");assert.equal(normalized[1].observedAt,null);assert.equal(normalized[1].ready,false);assert.equal(normalized[1].lookupStatus,"error");const view=allocationView(normalized,{groupBy:"account"});assert.equal(view.groups.find(g=>g.accountId==="upbit").observedAt,null);
+});

@@ -24,7 +24,7 @@ test('preflight must belong to selected deployment and not be expired or non-PAS
  assert.equal(environmentStatus(s,'a',now+1).valid,false);s.live_governance.latestPreflight.status='FAIL';assert.equal(environmentStatus(s,'a',now).valid,false);
 });
 test('API key entry and another account observation never establish this account success',()=>{
- const s={...base(), accounts:[{broker_id:'upbit',broker_cash_value:0}],reconciliation:{summary:{last_run:new Date(now).toISOString()},errors:[]}};
+ const s={...base(), accounts:[{broker_id:'upbit',broker_cash_value:0,lookup_status:'success',observed_at:new Date(now).toISOString(),account_observation_fresh:true,observation_max_age_seconds:60}],reconciliation:{summary:{last_run:new Date(now).toISOString()},errors:[]}};
  assert.equal(brokerAccountObservation(s,'upbit',now).status,'pass');
  assert.equal(brokerAccountObservation(s,'kis',now).status,'warn');
  s.reconciliation.errors=[{broker_id:'upbit'}];assert.equal(brokerAccountObservation(s,'upbit',now).status,'fail');
@@ -47,4 +47,17 @@ test('running header never treats missing entry guard as permission',()=>{
  }
  assert.equal(ordinaryEntryStatus({...base(),new_entries_blocked:false}).label,'일반 운용 신규 진입 허용');
  assert.equal(ordinaryEntryStatus({...base(),api_connected:false,new_entries_blocked:false}).tone,'warning');
+});
+
+test('another broker refresh never renews an old or undated account observation',()=>{
+ const s={...base(),accounts:[{broker_id:'binance',broker_cash_value:10,lookup_status:'success',observed_at:new Date(now-61000).toISOString(),account_observation_fresh:true,observation_max_age_seconds:60}],reconciliation:{summary:{last_run:new Date(now).toISOString()},errors:[]}};
+ assert.equal(brokerAccountObservation(s,'binance',now).status,'warn');
+ delete s.accounts[0].observed_at;assert.equal(brokerAccountObservation(s,'binance',now).status,'warn');
+ s.accounts[0].observed_at=new Date(now).toISOString();s.accounts[0].lookup_status='unknown';assert.equal(brokerAccountObservation(s,'binance',now).status,'warn');
+});
+test('a position-query failure does not mislabel a successful account lookup as failed API authentication',()=>{
+ const account={broker_id:'upbit',broker_cash_value:0,lookup_status:'success',observed_at:new Date(now).toISOString(),account_observation_fresh:true,observation_max_age_seconds:60};
+ const s={...base(),accounts:[account],reconciliation:{errors:[{broker_id:'upbit',scope:'positions'}]}};
+ assert.equal(brokerAccountObservation(s,'upbit',now).status,'pass');
+ s.accounts[0].lookup_status='error';assert.equal(brokerAccountObservation(s,'upbit',now).status,'fail');
 });

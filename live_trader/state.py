@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .futures_leverage_limits import MAX_SAFE_LEVERAGE_INTEGER, leverage_integer
+from .status_observation import BROKER_IDS, DeploymentContextError, broker_account_observation, cached_preflight_reconciliation, completed_broker_poll_observations, explicit_strategy_broker_id, broker_execution_read_coverage, strategy_execution_observation_scope, reconciliation_for_execution_scope
 
 from .operator_review import OperatorReviewStore, record_key
 from .continuous_dispatch import (
@@ -4658,7 +4659,7 @@ register_kis_scoped_cleanup_reader(_kis_scoped_cleanup_dispatch_authority)
 def _finish_kis_owned_stop_cleanup(plan):
     from .kis_scoped_cleanup_truth import collect_cleanup_truth, validate_cleanup_truth
     from .kis_scoped_cleanup_authority import dispatch_ownership_hash
-    from .kis_scoped_cleanup_scope import cleanup_read_runtime
+    from .kis_scoped_cleanup_scope import cleanup_read_runtime, cleanup_reconciliation_strategy
     cleanup_id = plan["cleanupId"]
     try:
         # No SAFETY/ROUTE/RUNTIME/control/manager lock may surround these GETs.
@@ -4690,7 +4691,8 @@ def _finish_kis_owned_stop_cleanup(plan):
         # Re-apply sealed history receipts idempotently even when all orders
         # were already terminal-cached before STOP. A cache is not a cash book.
         controller._native_runtime.sync_owned_fills(reader.scope())
-        refreshed = refresh_preflight_reconciliation({"broker_id": "kis"})
+        reconciliation_strategy = cleanup_reconciliation_strategy(controller._native_runtime, plan["context"])
+        refreshed = refresh_preflight_reconciliation(reconciliation_strategy)
         if plan["context"]["capitalCurrency"] == "USD":
             from .kis_native_usd_reconciliation import require_native_usd_reconciliation
             require_native_usd_reconciliation(operation="CLEAN",
@@ -5849,6 +5851,7 @@ STATE: dict[str, Any] = {
         "successful_account_brokers": [],
         "successful_position_brokers": [],
         "position_observations": {},
+        "account_observations": {},
     },
     "program_ledger": {
         "last_baseline": None,
@@ -7680,7 +7683,7 @@ def market_sessions() -> list[dict[str, str]]:
         {"label": "KRX", "state": str(krx["state"]), "time": "KST", "detail": str(krx["detail"])},
         {"label": "NYSE", "state": str(nyse["state"]), "time": "ET", "detail": str(nyse["detail"])},
         {"label": "Binance", "state": "open", "time": "24/7", "detail": "레이트 리밋/급변동 감시"},
-        {"label": "Risk Engine", "state": "blocked", "time": "LIVE GATE", "detail": "API/권한 준비 전 차단"},
+        {"label": "Risk Engine", "state": "unknown", "time": "실행별 확인", "detail": "개별 실행 조건 별도 확인"},
     ]
 
 
@@ -7957,6 +7960,8 @@ def execution_event_snapshot() -> dict[str, Any]:
     state = STATE.get("execution_events", {})
     return {
         "last_poll": state.get("last_poll"),
+        "broker_observations": dict(state.get("broker_observations") or {}),
+        "read_coverage": dict(state.get("read_coverage") or {}),
         "errors": list(state.get("errors", [])),
         "event_count": int(state.get("event_count", 0)),
         "recorded_count": int(state.get("recorded_count", 0)),
@@ -8949,7 +8954,7 @@ def positions() -> list[dict[str, str]]:
     return rows
 
 
-def account_reconciliation_rows() -> list[dict[str, str]]:
+def account_reconciliation_rows() -> list[dict[str, Any]]:
     rows: list[dict[str, str]] = []
     # Retain the raw rows here: a broker-only dictionary silently overwrites
     # multiple accounts/currencies and can compare unrelated balances.
@@ -9018,6 +9023,8 @@ def account_reconciliation_rows() -> list[dict[str, str]]:
                 "broker_cash_value": float(broker_cash) if broker_cash is not None else None,
                 "broker_equity_value": float(broker_equity) if broker_equity is not None else None,
                 "valuation_basis": str(live_account.get("valuation_basis") or "cash_only"),
+                **broker_account_observation(STATE.get("broker_reconciliation", {}), broker_id,
+                                             maximum_age_seconds=PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS),
                 "delta_cash": delta_cash,
                 "status": status,
                 "status_label": status_label,
@@ -9043,7 +9050,7 @@ def reconciliation_snapshot() -> dict[str, Any]:
     blocking_count = api_required_count + mismatch_count
     status = "fail" if mismatch_count else "warn" if api_required_count or capability_gap_count else "pass"
     status_label = "불일치" if mismatch_count else "API 필요" if api_required_count else "일부 미지원" if capability_gap_count else "정상"
-    return {
+    result = {
         "summary": {
             "status": status,
             "status_label": status_label,
@@ -9062,6 +9069,15 @@ def reconciliation_snapshot() -> dict[str, Any]:
         "errors": errors,
         "next_actions": reconciliation_next_actions(api_required_count, mismatch_count, capability_gap_count),
     }
+    # Cache projection does not perform a broker read or grant execution authority.
+    cached = [cached_preflight_reconciliation(broker_id, result, STATE.get("broker_reconciliation", {}),
+              STATE.get("execution_events", {}), STATE.get("program_ledger", {}),
+              maximum_age_seconds=PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS) for broker_id in BROKER_IDS]
+    result["summary"]["fresh"] = all(row["summary"]["fresh"] for row in cached)
+    result["summary"]["three_way_verified"] = all(row["summary"]["three_way_verified"] for row in cached)
+    result["summary"]["observation_only"] = True
+    result["summary"]["authority_granted"] = False
+    return result
 
 
 def _reconciliation_summary_for_broker_snapshot(
@@ -9150,81 +9166,42 @@ def risk_setting_rows() -> list[dict[str, object]]:
 
 def automatic_checklist_evidence(
     reconciliation_summary: dict[str, Any] | None = None,
+    *, broker_ids: list[str] | None = None,
 ) -> dict[str, tuple[bool, str]]:
-    """Return objective checklist facts that can be verified by the runtime.
-
-    Human acknowledgements (risk-plan review and manual takeover readiness)
-    intentionally remain manual.  API/account and reconciliation checks are
-    derived from fresh broker evidence so a restart cannot turn a completed
-    machine-verifiable check red.
-    """
-
+    """Only fresh machine facts may check objective items; human items stay manual."""
+    required = set(BROKER_IDS if broker_ids is None else broker_ids)
+    required = {str(item).strip().lower() for item in required if str(item).strip()}
     broker_rows = [broker.to_dict() for broker in broker_readiness()]
-    credentials_ready = bool(broker_rows) and all(
-        not broker.get("missing_env")
-        for broker in broker_rows
-    )
-    broker_cache = STATE.get("broker_reconciliation", {})
-    successful_accounts = {
-        str(item)
-        for item in (
-            broker_cache.get("successful_account_brokers", [])
-            if isinstance(broker_cache, dict)
-            else []
-        )
-    }
-    expected_accounts = {"kis", "binance", "binance-futures", "upbit"}
-    account_errors = [
-        item
-        for item in (
-            broker_cache.get("errors", [])
-            if isinstance(broker_cache, dict)
-            and isinstance(broker_cache.get("errors"), list)
-            else []
-        )
-        if str(item.get("scope") or "") in {"account", "snapshot"}
-    ]
-    account_verified = (
-        credentials_ready
-        and expected_accounts.issubset(successful_accounts)
-        and not account_errors
-    )
-
-    summary = (
-        reconciliation_summary
-        if isinstance(reconciliation_summary, dict)
-        else reconciliation_snapshot().get("summary", {})
-    )
-    reconciliation_verified = (
-        str(summary.get("status")) == "pass"
-        and int(summary.get("blocking_count") or 0) == 0
-        and str(summary.get("last_run") or "") not in {"", "미실행"}
-    )
+    selected = {str(row.get("broker_id") or "").lower(): row for row in broker_rows
+                if str(row.get("broker_id") or "").lower() in required}
+    credentials_ready = bool(required) and required == set(selected) and all(not row.get("missing_env") for row in selected.values())
+    cache = STATE.get("broker_reconciliation", {})
+    observations = [broker_account_observation(cache, broker_id,
+                    maximum_age_seconds=PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS) for broker_id in sorted(required)]
+    account_verified = credentials_ready and all(item["lookup_status"] == "success" for item in observations)
+    summary = reconciliation_summary if isinstance(reconciliation_summary, dict) else reconciliation_snapshot().get("summary", {})
+    summary_broker = str(summary.get("broker_id") or "").lower()
+    scope_matches = (not summary_broker and broker_ids is None) or required == {summary_broker}
+    reconciliation_verified = bool(scope_matches and summary.get("status") == "pass"
+        and int(summary.get("blocking_count") or 0) == 0 and summary.get("fresh") is True
+        and summary.get("three_way_verified") is True and str(summary.get("last_run") or "") not in {"", "미실행"})
+    scope_label = " · ".join(sorted(required)) or "거래소 범위 미확인"
     return {
-        "api_keys_reviewed": (
-            account_verified,
-            (
-                "필수 인증정보와 KIS·Binance Spot/Futures·Upbit 실계좌 조회를 확인했습니다."
-                if account_verified
-                else "필수 인증정보와 4개 실계좌 조회가 모두 성공해야 자동 확인됩니다."
-            ),
-        ),
-        "position_reconcile_reviewed": (
-            reconciliation_verified,
-            (
-                f"최근 자동 대조가 정상입니다: {summary.get('last_run')}."
-                if reconciliation_verified
-                else "최근 계좌·포지션 자동 대조가 정상이어야 자동 확인됩니다."
-            ),
-        ),
+        "api_keys_reviewed": (account_verified,
+            f"{scope_label} 인증정보와 최근 실계좌 관측을 확인했습니다." if account_verified
+            else f"{scope_label} 인증정보와 거래소별 {PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS}초 이내 계좌 관측이 필요합니다. 오래된 잔고를 새 조회로 간주하지 않습니다."),
+        "position_reconcile_reviewed": (reconciliation_verified,
+            f"{scope_label} 최근 계좌·포지션·체결·원장 관측이 정상입니다: {summary.get('last_run')}." if reconciliation_verified
+            else f"{scope_label} 범위의 최근 계좌·포지션·체결·원장 관측이 모두 확인되어야 자동 확인됩니다."),
     }
 
 
 def checklist_rows(
     reconciliation_summary: dict[str, Any] | None = None,
+    *, broker_ids: list[str] | None = None,
 ) -> list[dict[str, object]]:
     values = STATE["checklist"]
-    automatic = automatic_checklist_evidence(reconciliation_summary)
+    automatic = automatic_checklist_evidence(reconciliation_summary, broker_ids=broker_ids)
     rows: list[dict[str, object]] = []
     for item in CHECKLIST_ITEMS:
         key = str(item["key"])
@@ -9937,12 +9914,12 @@ def final_preflight_checks(
     current_strategy: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     reconcile_summary = reconciliation["summary"]
-    checklist = checklist_rows(reconcile_summary)
+    current_broker_id = strategy_broker_id(current_strategy) if current_strategy is not None else ""
+    checklist = checklist_rows(reconcile_summary, broker_ids=[current_broker_id] if current_broker_id else None)
     checklist_missing = [item for item in checklist if item["required"] and not item["checked"]]
     scoped_strategies = [current_strategy] if current_strategy is not None else strategies
     live_ready_count = sum(1 for strategy in scoped_strategies if strategy.get("live_allowed") is True)
     full_live_ready_count = sum(1 for strategy in scoped_strategies if strategy.get("live_eligible") is True)
-    current_broker_id = strategy_broker_id(current_strategy) if current_strategy is not None else ""
     scoped_brokers = [
         broker
         for broker in brokers
@@ -10107,9 +10084,9 @@ DOCTOR_ISSUE_META: dict[tuple[str, str], tuple[str, str, str]] = {
         "첫 실주문 전 운용 범위와 손실 한도를 확인하고 운용자 확인을 완료하세요.",
     ),
     ("preflight", "Dry Run 보호"): (
-        "PREFLIGHT_DRY_RUN_DISABLED",
+        "PREFLIGHT_DRY_RUN_ACTIVE",
         "gate",
-        "실제 제출이 필요하지 않은 점검 중에는 Dry Run을 유지하세요.",
+        "현재 모의 실행 설정이 적용되어 실주문 Runtime 승인 대상이 아닙니다. 무주문 점검 결과와 실제 시작 조건을 구분해 확인하세요.",
     ),
     ("preflight", "주문 큐 잔여"): (
         "PREFLIGHT_RETRYABLE_ORDERS_PENDING",
@@ -10304,6 +10281,8 @@ def build_doctor_diagnostic_snapshot(data: dict[str, Any]) -> dict[str, Any]:
             "real_orders_enabled": real_orders_enabled(),
             "reconciliation_status": str(reconciliation_summary.get("status") or "unknown"),
             "reconciliation_last_run": str(reconciliation_summary.get("last_run") or "미실행"),
+            "preflight_scope": dict(data.get("preflight_scope") or {}),
+            "diagnostic_purpose": "HISTORICAL_DIAGNOSTIC_REPORT_NOT_EXECUTION_AUTHORITY",
             "live_strategy_count": int(data.get("summary", {}).get("live_strategy_count") or 0),
             "full_live_strategy_count": int(data.get("summary", {}).get("full_live_strategy_count") or 0),
         },
@@ -11361,7 +11340,10 @@ def _operational_manifest_matches_inputs(
 
 
 def ensure_operational_deployment_manifest(strategy: dict[str, Any]):
-    values = _operational_manifest_inputs(strategy)
+    try:
+        values = _operational_manifest_inputs(strategy)
+    except ValueError as exc:
+        raise DeploymentContextError(str(exc)) from exc
     current = OPERATIONAL_GOVERNANCE.get_deployment_manifest(values["deployment_id"])
     if current is not None and _operational_manifest_matches_inputs(
         current,
@@ -11654,12 +11636,37 @@ def snapshot() -> dict[str, Any]:
         if STATE.get("selected_deployment_id") or STATE.get("selected_strategy_id")
         else None
     )
+    # The selected row uses the same broker scope as forced preflight, but
+    # only projects existing observations here. Actual admission still rereads.
+    selected_scope_matches = selected_preflight_strategy is not None and (
+        not STATE.get("selected_deployment_id") or str(selected_preflight_strategy.get("deployment_id") or "") == str(STATE["selected_deployment_id"])) and (
+        not STATE.get("selected_strategy_id") or str(selected_preflight_strategy.get("strategy_id") or "") == str(STATE["selected_strategy_id"]))
+    unresolved_selection = bool(STATE.get("selected_deployment_id") or STATE.get("selected_strategy_id")) and not selected_scope_matches
+    if not selected_scope_matches:
+        selected_preflight_strategy = None
+    selected_observation_broker = explicit_strategy_broker_id(selected_preflight_strategy or {})
+    preflight_reconciliation = cached_preflight_reconciliation(
+        selected_observation_broker, reconciliation, STATE.get("broker_reconciliation", {}),
+        STATE.get("execution_events", {}), STATE.get("program_ledger", {}),
+        maximum_age_seconds=PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS,
+        required_execution_scope=strategy_execution_observation_scope(selected_preflight_strategy),
+    ) if selected_preflight_strategy is not None else reconciliation
     preflight = final_preflight_checks(
-        strategies,
-        brokers,
-        reconciliation,
-        current_strategy=selected_preflight_strategy,
+        strategies, brokers, preflight_reconciliation, current_strategy=selected_preflight_strategy,
     )
+    if unresolved_selection:
+        preflight.append({"label": "Deployment 실행 컨텍스트", "status": "fail",
+                          "detail": "선택한 배포·전략과 정확히 일치하는 현재 원본이 없습니다. 다른 배포의 결과를 대신 사용하지 않습니다."})
+    preflight_scope = {"kind": "UNRESOLVED_SELECTION" if unresolved_selection else "SELECTED_DEPLOYMENT" if selected_preflight_strategy else "GLOBAL",
+        "deployment_id": str((selected_preflight_strategy or {}).get("deployment_id") or ""),
+        "strategy_id": str((selected_preflight_strategy or {}).get("strategy_id") or ""),
+        "broker_id": selected_observation_broker,
+        "route_resolution": "EXPLICIT_SUPPORTED_ROUTE" if selected_observation_broker else "UNVERIFIED",
+        "execution_read_scope": str((STATE.get("execution_events", {}).get("read_coverage", {}).get(selected_observation_broker) or {}).get("scope") or "UNVERIFIED"),
+        "requested_execution_scope": strategy_execution_observation_scope(selected_preflight_strategy or {}),
+        "observation_source": "CACHED_OBSERVATION_ONLY", "authority_granted": False,
+        "requires_fresh_read_for_admission": True,
+        "maximum_age_seconds": PREFLIGHT_RECONCILIATION_MAX_AGE_SECONDS}
     report = operation_report(reconciliation, checks, preflight, watchdog)
     launch = launch_report(preflight)
     blockers = [check for check in checks if check.status == "fail"]
@@ -11766,6 +11773,7 @@ def snapshot() -> dict[str, Any]:
         "positions": reconciliation["positions"],
         "operation_report": report,
         "final_preflight": preflight,
+        "preflight_scope": preflight_scope,
         "launch_report": launch,
         "live_governance": governance,
         "incidents": governance.get("incidents", []),
@@ -14741,6 +14749,7 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
         "successful_account_brokers": [],
         "successful_position_brokers": [],
         "position_observations": {},
+        "account_observations": {},
     }
     for broker_id, result in fetch_broker_snapshots(router, broker_ids).items():
         if isinstance(result, Exception):
@@ -14752,6 +14761,8 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
         if isinstance(accounts, list):
             data["accounts"].extend(item for item in accounts if isinstance(item, dict))
             data["successful_account_brokers"].append(broker_id)
+            data["account_observations"][broker_id] = {"observedAt": data["fetched_at"],
+                "lastSuccessAt": data["fetched_at"], "lastAttemptAt": data["fetched_at"]}
         if isinstance(positions_snapshot, list):
             data["positions"].extend(item for item in positions_snapshot if isinstance(item, dict))
             data["successful_position_brokers"].append(broker_id)
@@ -15881,62 +15892,41 @@ def mark_broker_snapshot_failure(
 
 
 def merge_broker_reconciliation_cache(
-    accounts: list[dict[str, Any]],
-    positions_data: list[dict[str, Any]],
-    successful_brokers: set[str],
-    errors: list[dict[str, str]],
+    accounts: list[dict[str, Any]], positions_data: list[dict[str, Any]],
+    successful_brokers: set[str], errors: list[dict[str, str]], *,
+    successful_account_brokers: set[str] | None = None,
+    successful_position_brokers: set[str] | None = None,
 ) -> None:
     if not successful_brokers and not errors:
         return
     cache = STATE.setdefault("broker_reconciliation", {})
+    account_success = set(successful_brokers if successful_account_brokers is None else successful_account_brokers)
+    position_success = set(successful_brokers if successful_position_brokers is None else successful_position_brokers)
+    failed = {str(item.get("broker_id") or "") for item in errors}
+    touched = set(successful_brokers) | failed
     previous_accounts = cache.get("accounts", []) if isinstance(cache.get("accounts"), list) else []
     previous_positions = cache.get("positions", []) if isinstance(cache.get("positions"), list) else []
     previous_errors = cache.get("errors", []) if isinstance(cache.get("errors"), list) else []
-    touched = set(successful_brokers) | {str(item.get("broker_id") or "") for item in errors}
-    cache["accounts"] = [
-        item for item in previous_accounts
-        if str(item.get("broker_id") or "") not in touched
-    ] + list(accounts)
-    cache["positions"] = [
-        item for item in previous_positions
-        if str(item.get("broker_id") or "") not in touched
-    ] + list(positions_data)
-    cache["errors"] = [
-        item for item in previous_errors
-        if str(item.get("broker_id") or "") not in touched
-    ] + [
-        {"broker_id": item["broker_id"], "scope": "snapshot", "detail": item["detail"]}
-        for item in errors
-    ]
-    failed_brokers = {str(item.get("broker_id") or "") for item in errors}
-    account_success = (
-        set(cache.get("successful_account_brokers", [])) - failed_brokers
-    ) | set(successful_brokers)
-    position_success = (
-        set(cache.get("successful_position_brokers", [])) - failed_brokers
-    ) | set(successful_brokers)
-    cache["successful_account_brokers"] = sorted(account_success)
-    cache["successful_position_brokers"] = sorted(position_success)
-    observed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    observations = (
-        dict(cache.get("position_observations"))
-        if isinstance(cache.get("position_observations"), dict)
-        else {}
-    )
-    for broker_id in successful_brokers:
-        observations[str(broker_id).strip().lower()] = {
-            "observedAt": observed_at,
-        }
-    cache["position_observations"] = observations
-    cache["fetched_at"] = observed_at
+    cache["accounts"] = [row for row in previous_accounts if str(row.get("broker_id") or "") not in account_success | failed] + list(accounts)
+    cache["positions"] = [row for row in previous_positions if str(row.get("broker_id") or "") not in position_success | failed] + list(positions_data)
+    cache["errors"] = [row for row in previous_errors if str(row.get("broker_id") or "") not in touched] + [
+        {"broker_id": row["broker_id"], "scope": "snapshot", "detail": row["detail"]} for row in errors]
+    cache["successful_account_brokers"] = sorted((set(cache.get("successful_account_brokers", [])) - failed) | account_success)
+    cache["successful_position_brokers"] = sorted((set(cache.get("successful_position_brokers", [])) - failed) | position_success)
+    observed_at = datetime.now(timezone.utc).isoformat()
+    positions_observed = dict(cache.get("position_observations") or {})
+    account_observed = dict(cache.get("account_observations") or {})
+    for broker_id in position_success:
+        positions_observed[broker_id] = {"observedAt": observed_at}
+    for broker_id in account_success:
+        account_observed[broker_id] = {"observedAt": observed_at, "lastSuccessAt": observed_at, "lastAttemptAt": observed_at}
+    for broker_id in failed:
+        account_observed[broker_id] = {**account_observed.get(broker_id, {}), "lastAttemptAt": observed_at}
+    cache["position_observations"] = positions_observed
+    cache["account_observations"] = account_observed
+    cache["fetched_at"] = observed_at  # Aggregate refresh time is never an account-specific success.
     if accounts:
-        refresh_account_risk_budget(
-            [
-                item
-                for item in cache["accounts"]
-                if isinstance(item, dict)
-            ]
-        )
+        refresh_account_risk_budget([row for row in cache["accounts"] if isinstance(row, dict)])
 
 
 def should_append_execution_sync_audit(
@@ -16330,6 +16320,10 @@ def _poll_execution_events_unlocked(
     snapshot_accounts: list[dict[str, Any]] = []
     snapshot_positions: list[dict[str, Any]] = []
     successful_snapshot_brokers: set[str] = set()
+    successful_account_snapshot_brokers: set[str] = set()
+    successful_position_snapshot_brokers: set[str] = set()
+    completed_event_snapshot_brokers: set[str] = set()
+    execution_read_coverage = dict(STATE.get("execution_events", {}).get("read_coverage") or {})
     changed_snapshot_brokers: set[str] = set()
     skipped_snapshot_brokers: set[str] = set()
     attempted_snapshot_brokers: set[str] = set()
@@ -16396,11 +16390,13 @@ def _poll_execution_events_unlocked(
             record_connectivity_state("broker_api", selected_broker, healthy=False)
             continue
 
+        validated_kis_order_truth = False
         if selected_broker == "kis":
             try:
-                record_complete_kis_order_truth(
+                truth_read = record_complete_kis_order_truth(
                     result.get("execution_truth")
                 )
+                validated_kis_order_truth = truth_read.get("complete") is True and truth_read.get("fresh") is True
             except (TypeError, ValueError) as exc:
                 detail = f"KIS order truth: {type(exc).__name__}: {exc}"[:500]
                 errors.append({"broker_id": selected_broker, "detail": detail})
@@ -16418,6 +16414,9 @@ def _poll_execution_events_unlocked(
                 )
                 continue
 
+        execution_read_coverage[selected_broker] = broker_execution_read_coverage(
+            selected_broker, result, validated_kis_order_truth=validated_kis_order_truth,
+        )
         rows = result.get("events", [])
         if isinstance(rows, list):
             for row in rows:
@@ -16447,7 +16446,25 @@ def _poll_execution_events_unlocked(
         position_rows = [item for item in positions_data if isinstance(item, dict)] if isinstance(positions_data, list) else []
         snapshot_accounts.extend(account_rows)
         snapshot_positions.extend(position_rows)
-        received_snapshot = "accounts" in result or "positions" in result
+        account_snapshot_received = "accounts" in result and isinstance(result.get("accounts"), list)
+        position_snapshot_received = "positions" in result and isinstance(result.get("positions"), list)
+        # A partial snapshot or absent events key is not an event/ledger read.
+        # Empty event lists are valid completed polls; missing/malformed rows are not.
+        full_poll_received = bool(
+            account_snapshot_received and position_snapshot_received
+            and account_rows and len(account_rows) == len(accounts)
+            and len(position_rows) == len(positions_data)
+            and "events" in result and isinstance(result.get("events"), list)
+            and all(isinstance(row, dict) for row in result["events"])
+            and all(str(row.get("broker_id") or "").lower() == selected_broker for row in account_rows + position_rows)
+        )
+        if full_poll_received and execution_read_coverage[selected_broker]["status"] == "success":
+            completed_event_snapshot_brokers.add(selected_broker)
+        if account_snapshot_received:
+            successful_account_snapshot_brokers.add(selected_broker)
+        if position_snapshot_received:
+            successful_position_snapshot_brokers.add(selected_broker)
+        received_snapshot = account_snapshot_received or position_snapshot_received
         if received_snapshot:
             successful_snapshot_brokers.add(selected_broker)
             digest = stable_broker_snapshot_digest(selected_broker, account_rows, position_rows)
@@ -16504,10 +16521,30 @@ def _poll_execution_events_unlocked(
         snapshot_positions,
         successful_snapshot_brokers,
         errors,
+        successful_account_brokers=successful_account_snapshot_brokers,
+        successful_position_brokers=successful_position_snapshot_brokers,
     )
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Record exact-broker success only after real event-ledger processing above.
+    # These volatile read observations never seed or approve a program baseline.
+    observed_at = datetime.now(timezone.utc).isoformat()
+    event_observations = completed_broker_poll_observations(
+        STATE.get("broker_reconciliation", {}), completed_event_snapshot_brokers,
+        STATE.get("execution_events", {}).get("broker_observations", {}), errors,
+        observed_at=observed_at, execution_reads=execution_read_coverage,
+    )
+    ledger_observations = completed_broker_poll_observations(
+        STATE.get("broker_reconciliation", {}), completed_event_snapshot_brokers,
+        STATE.get("program_ledger", {}).get("broker_observations", {}), errors,
+        observed_at=observed_at, execution_reads=execution_read_coverage,
+    )
+    for error in errors:
+        failed_broker = str(error.get("broker_id") or "")
+        execution_read_coverage[failed_broker] = {"status": "error", "coverage": "UNVERIFIED", "source": "", "detail": "주문·체결 읽기를 확인하지 못했습니다."}
     STATE["execution_events"] = {
         "last_poll": now,
+        "broker_observations": event_observations,
+        "read_coverage": execution_read_coverage,
         "errors": errors,
         "event_count": len(events),
         "recorded_count": recorded,
@@ -16521,6 +16558,7 @@ def _poll_execution_events_unlocked(
         "kis_order_truth": kis_order_truth_snapshot(),
     }
     STATE["program_ledger"]["last_event_sync"] = now
+    STATE["program_ledger"]["broker_observations"] = ledger_observations
     telegram_fill_count = notify_new_live_fills(events, existing_event_ids)
     new_event_count = len(new_events)
     audit_signature = hashlib.sha256(
@@ -16554,7 +16592,7 @@ def _poll_execution_events_unlocked(
             ),
         )
     automatic_results = (
-        automatic_live_promotion_sweep(fresh_broker_ids=set(successful_snapshot_brokers))
+        automatic_live_promotion_sweep(fresh_broker_ids=successful_account_snapshot_brokers & successful_position_snapshot_brokers)
         if new_event_count and not display_only
         else []
     )
@@ -19255,7 +19293,8 @@ def refresh_preflight_reconciliation(
             "%Y-%m-%d %H:%M:%S"
         )
 
-    reconciliation = reconciliation_snapshot()
+    required_execution_scope = strategy_execution_observation_scope(strategy)
+    reconciliation = reconciliation_for_execution_scope(reconciliation_snapshot(), broker_id, required_execution_scope)
     scoped_summary = _reconciliation_summary_for_broker_snapshot(
         reconciliation,
         broker_id,
@@ -19305,6 +19344,7 @@ def refresh_preflight_reconciliation(
         else {}
     )
     evidence_times = {
+        "account_snapshot": (broker_cache.get("account_observations") or {}).get(broker_id, {}).get("observedAt"),
         "broker_snapshot": broker_observation.get("observedAt")
         or broker_observation.get("observed_at"),
         "execution_event": execution_state.get("last_poll"),
@@ -19340,6 +19380,9 @@ def refresh_preflight_reconciliation(
         )
     if broker_id not in successful_accounts:
         evidence_issues.append("broker-account-snapshot-unverified")
+    account_observation = broker_account_observation(broker_cache, broker_id, maximum_age_seconds=maximum_age)
+    if account_observation["lookup_status"] != "success":
+        evidence_issues.append("broker-account-observation-" + account_observation["lookup_status"])
     if broker_id not in successful_positions:
         evidence_issues.append("broker-position-snapshot-unverified")
     if scoped_errors or execution_errors:
@@ -19360,6 +19403,15 @@ def refresh_preflight_reconciliation(
         evidence_issues.append("broker-event-ledger-mismatch-or-unverified")
     if not three_way_verified and int(scoped_summary.get("row_count") or 0) == 0:
         evidence_issues.append("broker-scoped-reconciliation-rows-missing")
+    cached_facts = cached_preflight_reconciliation(
+        broker_id, reconciliation, broker_cache, execution_state, program_state,
+        maximum_age_seconds=maximum_age,
+        required_execution_scope=required_execution_scope,
+    )["summary"]
+    if cached_facts.get("fresh") is not True or cached_facts.get("three_way_verified") is not True:
+        fresh = False
+        three_way_verified = False
+        evidence_issues.append(str(cached_facts.get("freshness_detail") or "exact-broker-observation-unverified"))
     evidence_issues = list(dict.fromkeys(evidence_issues))
     freshness_detail = (
         "Fresh Broker REST Snapshot·Execution Event·Local Ledger 3자 대조를 "
@@ -19454,6 +19506,11 @@ def run_final_preflight(
         data = {
             **data,
             "reconciliation": refresh_preflight_reconciliation(selected),
+            "preflight_scope": {"kind": "SELECTED_DEPLOYMENT",
+                "deployment_id": str(selected.get("deployment_id") or ""),
+                "strategy_id": str(selected.get("strategy_id") or ""),
+                "broker_id": strategy_broker_id(selected),
+                "observation_source": "FORCED_READ_PREFLIGHT", "authority_granted": False},
         }
     scoped_checks = (
         final_preflight_checks(
@@ -19523,9 +19580,9 @@ def run_final_preflight(
             scoped_checks = [
                 *scoped_checks,
                 {
-                    "label": "운영 거버넌스 저장소",
+                    "label": "배포 실행 범위·승인 조건" if isinstance(exc, DeploymentContextError) else "운영 거버넌스 저장소",
                     "status": "fail",
-                    "detail": f"Preflight Snapshot 저장 실패: {type(exc).__name__}",
+                    "detail": f"Preflight 조건 확인 실패: {type(exc).__name__}: {audit_clip(str(exc), 240)}",
                 },
             ]
             scoped_launch = launch_report(scoped_checks)

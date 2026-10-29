@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from live_trader.status_observation import completed_broker_poll_observations
+
 import copy
 import os
 import tempfile
@@ -1258,7 +1260,8 @@ class LiveSafetyCompletionTests(unittest.TestCase):
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             state.STATE["broker_reconciliation"] = {
                 "fetched_at": now,
-                "accounts": [],
+                "accounts": [{"broker_id": "binance", "account": "SYNTHETIC", "currency": "USDT", "broker_cash": 100.0}],
+                "account_observations": {"binance": {"observedAt": now}},
                 "positions": [],
                 "errors": [],
                 "successful_account_brokers": ["binance"],
@@ -1271,6 +1274,11 @@ class LiveSafetyCompletionTests(unittest.TestCase):
                 {"last_poll": now, "errors": []}
             )
             state.STATE["program_ledger"]["last_event_sync"] = now
+            proof = completed_broker_poll_observations(state.STATE["broker_reconciliation"], {"binance"}, {}, [], observed_at=now, execution_reads={"binance": {"status": "success", "coverage": "COMPLETE_ORDER_EXECUTION_READ", "source": "SYNTHETIC_EXACT_EXECUTION_READER"}})
+            state.STATE["execution_events"]["broker_observations"] = proof
+            state.STATE["program_ledger"]["broker_observations"] = proof
+            for account_row in reconciliation["accounts"]:
+                account_row.update(program_source="synthetic_execution_ledger", program_updated_at=now)
             return {"ok": True, "errors": []}
 
         with TemporaryDirectory() as directory:
