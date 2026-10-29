@@ -12,6 +12,11 @@ def entrypoint() -> int:
     args = parser.parse_args()
     instance = hold_live_trader_instance_lease()
     if instance.get("acquired") is not True:
+        if not args.daemon:
+            from trading_runtime.desktop_tray import restore_existing_window
+
+            if restore_existing_window("live-trader"):
+                return 0
         print(
             "Live Trader가 이미 실행 중이거나 단일 인스턴스 잠금을 "
             f"획득하지 못했습니다: {instance.get('reason') or 'unknown'}"

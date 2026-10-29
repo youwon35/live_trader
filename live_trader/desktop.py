@@ -5,6 +5,8 @@ import time
 import webbrowser
 from pathlib import Path
 
+from trading_runtime.desktop_tray import DesktopTrayController
+
 from .emergency_stop import DesktopEmergencyStopBridge
 from .server import start_in_thread
 from .env_loader import default_runtime_data_root
@@ -30,6 +32,7 @@ def main() -> None:
     webview_started_at: float | None = None
     window_was_visible = False
     shutdown_requested = False
+    tray: DesktopTrayController | None = None
     try:
         import webview
 
@@ -56,8 +59,16 @@ def main() -> None:
             min_size=(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT),
         )
 
-        def remember_window_state(*_args: object) -> None:
+        tray = DesktopTrayController(window, app_id="live-trader", title="Live Trader")
+        tray.start()
+
+        def remember_window_state(*_args: object) -> bool | None:
             nonlocal shutdown_requested
+            # X only hides the genuine native owner. Do not stop its service,
+            # release its process lease or replace it with a browser owner.
+            if tray.on_closing(*_args) is False:
+                _save_window_state(window)
+                return False
             shutdown_requested = True
             from .short_live_runtime import desktop_window_closing
             desktop_window_closing()
@@ -94,6 +105,11 @@ def main() -> None:
         else:
             print(f"WebView 종료 중 예외가 발생해 서버를 정리합니다: {exc}")
     finally:
+        if tray is not None:
+            try:
+                tray.stop()
+            except Exception:
+                pass
         from .short_live_runtime import desktop_window_closing
         desktop_window_closing()
         server.shutdown()
