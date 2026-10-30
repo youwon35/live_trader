@@ -690,7 +690,9 @@ class LiveContinuousController:
             if not native_prepared_required:
                 from trading_runtime.observed_candle_archive import ArchivingClosedBarFeed, PROVIDERS as ARCHIVE_PROVIDERS
                 feeds = [ArchivingClosedBarFeed(feed) if feed.provider_id in ARCHIVE_PROVIDERS else feed for feed in feeds]
+            from trading_runtime.market_data_hub import set_history_consumer
             for feed in (() if native_prepared_required else feeds):
+                set_history_consumer(feed, "live_trader")
                 feed.connect()
             warmup: dict[str, int] = prepared_warmup or {}
             for spec in (() if native_prepared_required else specs):

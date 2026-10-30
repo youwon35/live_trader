@@ -125,6 +125,9 @@ class NativeFeed:
             kis_websocket_app_key_id=key_id,
             kis_websocket_owner_id="short-live:" + owner,
         )
+        from trading_runtime.market_data_hub import set_history_consumer
+        for child in self.children:
+            set_history_consumer(child, "live_trader")
         if len(self.children) != 1:
             raise ValueError("EXACT_ROUTE_FEED_REQUIRED")
         self._archive = CandleArchiveWriter() if self.route in {"BINANCE_SPOT", "BINANCE_USDM_FUTURES", "UPBIT_KRW_SPOT"} else None
