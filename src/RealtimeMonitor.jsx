@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import {historyReadinessLabel} from './historyReadiness.js';
 import { Activity, AlertTriangle, ArrowDownLeft, ArrowUpRight, CheckCircle2, Clock3, Radio, TrendingUp, WifiOff } from 'lucide-react';
 import { projectRealtimeMonitor, monitorEventLabels, monitorRoute } from './realtimeMonitorModel.js';
 import './RealtimeMonitor.css';
@@ -67,6 +68,7 @@ export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt
       {view.strategies.length === 0 ? <p className="live-monitor-empty">실행을 시작하면 선택한 전략의 진행이 표시됩니다.</p> : <div className="live-monitor-strategies">{view.strategies.map((row,index)=><article key={row.selectionKey || index}>
         <div><strong>{row.symbol || '종목 미확인'} <small>{row.timeframe}</small></strong><span>{monitorRoute(row.route)} · {row.pluginId || row.label || '전략 미확인'}</span></div>
         <b className={`live-monitor-signal signal-${row.signal}`}>{signalLabel(row.signal)}</b>
+        {!view.terminal && <small>{historyReadinessLabel(snapshot?.runtime?.historyObservations, row, now)}</small>}
         <ol aria-label={`${row.symbol} 진행 횟수`}><li><span>봉 평가</span><strong>{number(row.decisionCount)}</strong></li><li><span>주문 시도</span><strong>{number(row.orderAttemptCount)}</strong></li><li><span>체결 관측</span><strong>{number(row.fillObservationCount)}</strong></li></ol>
         <small>{view.terminal ? row.decisionCount === 0 ? '종료 전 완성봉 평가 기록이 없습니다.' : '종료 당시 마지막 평가 기록입니다.' : row.decisionCount === 0 ? '첫 완성봉 평가를 기다립니다.' : row.signal === 'HOLD' ? '최근 평가는 유지 신호입니다. 조건이 충족돼야 주문합니다.' : '최근 신호입니다. 주문과 체결은 위 횟수로 따로 확인하세요.'}{!view.responseCurrent && ' · 마지막 수신값'}</small>
       </article>)}</div>}

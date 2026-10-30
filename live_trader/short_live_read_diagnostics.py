@@ -3,6 +3,7 @@ from collections.abc import Mapping
 import math
 from .short_live_upbit_quote import sanitize_quote_observation
 from .native_fx_observation import sanitize_fx_observation
+from .short_live_fx_recovery import sanitize_fx_recovery
 
 # Diagnostic identities are fixed routes only. Never retain a signed URL,
 # query, request/response body, credentials or an arbitrary exception message.
@@ -66,5 +67,8 @@ def sanitize_read_diagnostics(value):
             evidence = sanitize_fx_observation(row.get("fxObservation"))
             if evidence is not None:
                 safe["fxObservation"] = evidence
+            recovery = sanitize_fx_recovery(row.get("fxRecovery"))
+            if recovery is not None:
+                safe["fxRecovery"] = recovery
         result.append(safe)
     return result

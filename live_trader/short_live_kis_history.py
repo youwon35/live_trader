@@ -244,7 +244,7 @@ def _read_intervals(spec, intervals, timeframe, settings, fetcher, clock, object
 
 def get_warmup(spec: Any, limit: int, settings: Mapping[str, Any], *,
                fetcher: Callable[..., Any] | None = None, clock: Callable[[], float] = time.time,
-               calendar_objects: Mapping[str, bytes] | None = None) -> list[ClosedBar]:
+               calendar_objects: Mapping[str, bytes] | None = None, through: int | None = None) -> list[ClosedBar]:
     """Exact native closed bars only; no account mutation, persistence or fallback.
 
     Tests inject public response fixtures and clock. Production reads start only
@@ -255,7 +255,10 @@ def get_warmup(spec: Any, limit: int, settings: Mapping[str, Any], *,
         raise NativeKisHistoryBlocked("KIS_HISTORY_LIMIT_INVALID")
     objects = dict(calendar_objects) if calendar_objects is not None else native.calendar_objects()
     calendar = native.calendar_scope(objects)
-    intervals = _intervals(calendar, float(clock()), timeframe, limit)
+    observed_now = float(clock())
+    if through is not None and (type(through) is not int or through <= 0 or through > observed_now):
+        raise NativeKisHistoryBlocked("KIS_HISTORY_WINDOW_INVALID")
+    intervals = _intervals(calendar, observed_now if through is None else through, timeframe, limit)
     bars, _ = _read_intervals(spec, intervals, timeframe, settings, fetcher, clock, objects)
     return bars
 

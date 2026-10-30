@@ -40,6 +40,8 @@ class ShortLiveTestService(_ShortLiveTestService):
         if runtime is not None:
             runtime["marketDataArchive"] = {route: feed.archive_status() for route, feed in getattr(self, "_feeds", {}).items()
                                            if callable(getattr(feed, "archive_status", None))}
+            runtime["historyObservations"] = {route: feed.history_status() for route, feed in getattr(self, "_feeds", {}).items()
+                                               if isinstance(feed, NativeFeed)}
         global _PUBLIC_STATUS
         if runtime is None:
             public = {"known": True, "active": False, "status": "DISABLED", "pendingOrderCount": 0}
@@ -136,10 +138,21 @@ class NativeFeed:
         for child in self.children:
             child.connect()
 
+    def history_status(self):
+        # Concrete feed implementations project cached observations only.
+        return [child.observation_snapshot() for child in self.children
+                if callable(getattr(child, "observation_snapshot", None))]
+
+    def set_history_window(self, through):
+        from trading_runtime.market_data_hub import set_history_window
+        self.history_through = through
+        for child in self.children:
+            set_history_window(child, through)
+
     def warmup(self, spec, limit):
         if self.route == "KIS_KR_CASH":
             from .short_live_kis_history import get_warmup
-            bars = get_warmup(spec, limit, self.settings)
+            bars = get_warmup(spec, limit, self.settings, through=getattr(self, "history_through", None))
             self.children[0].mark_emitted(bars)
             if bars:
                 child = self.children[0]
@@ -278,6 +291,7 @@ def get_service() -> ShortLiveTestService:
         if _SERVICE is None:
             from .short_live_brokers import SharedExchangeBudget, create_production_short_live_broker
             from .short_live_broker_readers import production_fx_reader, production_cost_reader
+            from .short_live_fx_recovery import public_reader
             from .read_only_account import ReadOnlyBrokerReader
             settings = _settings()
             reader = ReadOnlyBrokerReader(settings)
@@ -301,7 +315,9 @@ def get_service() -> ShortLiveTestService:
                 return create_production_short_live_broker(
                     route, settings=current,
                     authority_guard=lambda order: _settings_hash(_settings()) == digest and authority(order),
-                    fx_reader=production_fx_reader(current_reader), cost_reader=production_cost_reader(current),
+                    fx_reader=production_fx_reader(current_reader, reader_factory=public_reader,
+                        can_continue=lambda: not _GLOBAL_STOP.is_set() and not _NATIVE_WINDOW_CLOSING),
+                    cost_reader=production_cost_reader(current),
                     budget=budget,
                     reserve_cleanup_order=lambda order: bool(_SERVICE and _SERVICE.reserve_cleanup_order(order)),
                     reserve_cleanup_cancel=lambda order: bool(_SERVICE and _SERVICE.reserve_cleanup_cancel(order)),
@@ -315,8 +331,31 @@ def get_service() -> ShortLiveTestService:
                 lambda manifest: NativeFeed(manifest, _settings()),
                 default_runtime_data_root()/"short-live-tests", clock_guard=FreshClock(reader, _controls),
                 owner_is_alive=genuine_owner_alive,
+                history_preparer=_prepare_history,
             )
         return _SERVICE
+
+
+def _prepare_history(specs, through):
+    from trading_runtime.history_preparation import prepare_history_streams
+    from trading_runtime.portfolio_runtime import required_warmup_bars
+    from .short_live_kis_history import get_warmup
+    # This reads public data only. No feed/strategy/order owner is started.
+    common = [spec for spec in specs if spec.provider != "kis" or spec.timeframe == "1d"]
+    native = [spec for spec in specs if spec.provider == "kis" and spec.timeframe != "1d"]
+    result = prepare_history_streams(common, consumer="live_trader", through=through, timeout_seconds=25) if common else {
+        "schemaVersion": "history-preparation-v1", "streams": [], "executionEvidence": False, "published": False}
+    settings = _settings() if native else {}
+    for spec in native:
+        required = required_warmup_bars(spec)
+        bars = get_warmup(spec, required, settings, through=through)
+        result["streams"].append({"provider": spec.provider, "symbol": spec.symbol, "timeframe": spec.timeframe,
+            "requiredBars": required, "observedBars": len(bars),
+            "status": "COMPLETE" if len(bars) >= required else "UNAVAILABLE",
+            "sourceCounts": {"KIS_NATIVE_HISTORY": len(bars)}})
+    result["ready"] = bool(result["streams"]) and all(row["status"] == "COMPLETE" for row in result["streams"])
+    result["status"] = "COMPLETE" if result["ready"] else "UNAVAILABLE"
+    return result
 
 
 def request(action: str, payload=None):

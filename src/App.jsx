@@ -2,6 +2,7 @@ import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresen
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
 import ReconciliationChanges from "./ReconciliationChanges.jsx";
 import { submitReconciliationReview } from "./reconciliationReviewApi.js";
+import CoordinationRetirementNote from "./CoordinationRetirementNote.jsx";
 import StartupProgress, { useStartupProgress } from "./StartupProgress.jsx";
 import { startupAccountObservation } from "./startupProgressModel.js";
 import { createSnapshotResponseGate, createSnapshotReadCoordinator, initialAccountRefreshState, accountRefreshResultState, accountObservationView } from "./snapshotRefreshState.js";
@@ -2985,6 +2986,7 @@ function WorkspaceContent({
       <section className="accounts-page-layout ts-layout-stack">
         <CompactDisclosure title="계좌 갱신" description="마지막 계좌 조회 시각과 갱신 결과를 확인합니다." className="account-observation-disclosure">
           <AccountRefreshStatus snapshot={snapshot} state={accountRefreshState} nowMs={accountNowMs} />
+          <CoordinationRetirementNote snapshot={snapshot} />
         </CompactDisclosure>
         <CompactDisclosure title="계좌·포지션 3자 대조" description="거래소 잔고, 주문·체결, 원장의 비교 근거를 확인합니다." className="account-observation-disclosure">
           <ThreeWayReconciliationPanel snapshot={snapshot} accountRefreshState={accountRefreshState} nowMs={accountNowMs} onReview={onReconciliationReview} />

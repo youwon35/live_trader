@@ -82,7 +82,7 @@ try {
   await page.getByText("최근 조회 성공", { exact: false }).waitFor();
   await page.getByText("전략 목록 미확인", { exact: false }).waitFor();
   assert.equal(await page.getByText("이 조건에 정확히 연결된 후보가 없습니다.", { exact: false }).count(), 0);
-  assert.equal(await page.getByRole("button", { name: "계좌·시세 새로 확인 (무주문 준비 검사)", exact: true }).isDisabled(), true);
+  assert.equal(await page.getByRole("button", { name: "자료·계좌 준비 검사 (주문 없음)", exact: true }).isDisabled(), true);
   await page.evaluate(() => window.__shortLiveFixture.releaseCatalog());
   await page.getByRole("button", { name: "전략 목록 새로 확인", exact: true }).waitFor();
   report.checks.push("catalog discovery is separate from fresh status; recovery clears only the polling error");
@@ -113,7 +113,7 @@ try {
   await page.evaluate(() => window.__shortLiveFixture.holdNextSnapshot());
   await page.getByRole("button", { name: "실행 상태 새로 확인", exact: true }).click();
   await page.waitForFunction(() => window.__shortLiveFixture.snapshotHeld());
-  await page.getByRole("button", { name: "계좌·시세 새로 확인 (무주문 준비 검사)", exact: true }).click();
+  await page.getByRole("button", { name: "자료·계좌 준비 검사 (주문 없음)", exact: true }).click();
   await page.waitForFunction(() => window.__shortLiveFixture.calls.some(row => row.method === "prepare"));
   assert.equal(await start.isDisabled(), true);
   await page.evaluate(() => window.__shortLiveFixture.releaseSnapshot());
@@ -139,7 +139,7 @@ try {
   await page.getByLabel("실거래 시험 시간").selectOption("7");
   assert.equal(await start.isDisabled(), true);
   report.checks.push("duration change invalidates prepared authority before consent");
-  await page.getByRole("button", { name: "계좌·시세 새로 확인 (무주문 준비 검사)", exact: true }).click();
+  await page.getByRole("button", { name: "자료·계좌 준비 검사 (주문 없음)", exact: true }).click();
   await page.getByText("서버의 현재 준비 조건 충족", { exact: false }).waitFor();
   await page.waitForFunction(() => !document.querySelector('.short-live-real-start')?.disabled);
   await page.evaluate(() => window.__shortLiveFixture.setBlocked());
@@ -170,7 +170,7 @@ try {
   await page.screenshot({ path: join(output, "mobile.png"), fullPage: true }); report.screenshots.push("mobile.png");
   await page.reload();
   await page.getByRole("checkbox", { name: "시험 대상 화면검사 전용 전략", exact: true }).check();
-  await page.getByRole("button", { name: "계좌·시세 새로 확인 (무주문 준비 검사)", exact: true }).click();
+  await page.getByRole("button", { name: "자료·계좌 준비 검사 (주문 없음)", exact: true }).click();
   await page.getByText("서버의 현재 준비 조건 충족", { exact: false }).waitFor();
   await page.waitForFunction(() => !document.querySelector('.short-live-real-start')?.disabled);
   await page.evaluate(() => window.__shortLiveFixture.failStart()); await start.click();

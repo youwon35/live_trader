@@ -38,6 +38,8 @@ export function shortLiveBlockerLabel(value) {
     if (code.startsWith(prefix)) return code.slice(prefix.length).split(",").map(shortLiveBlockerLabel).join(" · ");
   }
   const labels = {
+    HISTORY_PREPARATION_INCOMPLETE: '전략에 필요한 과거 봉이 부족합니다. 자료 준비 결과를 확인해 주세요.',
+    HISTORY_PREPARATION_UNAVAILABLE: '과거 자료 준비를 완료하지 못했습니다. 주문 없이 중단했습니다.',
     "insufficient-balance": "사용 가능한 잔고 부족",
     "minimum-order-not-met": "거래소 최소 주문 금액·수량 미달",
     "market-closed": "현재 시장이 닫혀 있음",
@@ -416,7 +418,9 @@ export function normalizeShortLiveSnapshot(value = {}) {
     catalog: (Array.isArray(source.catalog) ? source.catalog : Array.isArray(source.catalog?.candidates)
       ? source.catalog.candidates : Array.isArray(source.candidates) ? source.candidates : []).map(normalizeShortLiveCandidate),
     blockers: Array.isArray(source.blockers) ? source.blockers : [],
+    savedProfile: source.savedProfile?.schemaVersion === 'operating-profile-v1' ? source.savedProfile : null,
     prepared: preparation ? {
+      historyPreparation: preparation.historyPreparation?.schemaVersion === 'history-preparation-v1' ? preparation.historyPreparation : null,
       preparationId: text(preparation.preparationId), scopeHash: text(preparation.scopeHash),
       readyToStart: preparation.readyToStart === true,
       blockers: Array.isArray(preparation.blockers) ? preparation.blockers : [],
@@ -440,6 +444,8 @@ export function normalizeShortLiveSnapshot(value = {}) {
       })),
     } : null,
     runtime: run ? {
+      historyObservations: run.historyObservations && typeof run.historyObservations === 'object' ? run.historyObservations : {},
+      completionReport: run.status === 'TERMINATED' && run.terminalVerified === true && run.completionReport?.schemaVersion === 'short-live-report-v1' ? run.completionReport : null,
       marketDataArchive: normalizeMarketDataArchive(run.marketDataArchive),
       sessionId: text(run.sessionId), status: text(run.status) || "UNKNOWN", startedAt: text(run.startedAt), endsAt: text(run.endsAt), terminatedAt: text(run.terminatedAt),
       terminalVerified: run.terminalVerified === true,

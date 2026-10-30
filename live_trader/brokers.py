@@ -2957,8 +2957,78 @@ class LiveBrokerRouter:
     gated by consumed runtime start consent or an exact scoped reservation, and state-layer risk checks.
     """
 
-    def __init__(self, execution_stream_manager: Any | None = None) -> None:
+    def __init__(self, execution_stream_manager: Any | None = None, *,
+                 coordination_owner_id: str | None = None, order_coordinator=None,
+                 coordination_funds_reader=None) -> None:
         self.execution_stream_manager = execution_stream_manager
+        from .order_coordination import LiveOrderCoordination, read_dispatch_funds
+        self.coordination_owner_id = coordination_owner_id
+        self._order_coordination = LiveOrderCoordination(order_coordinator)
+        self._coordination_funds_reader = coordination_funds_reader or read_dispatch_funds
+
+    def _coordinated_send(self, intent, submit, *, protection=False):
+        from .order_coordination import current_coordination_context
+        from trading_runtime.order_coordination import CoordinationError
+        context = current_coordination_context()
+        owner_id = self.coordination_owner_id or context.get("ownerId")
+        route = str(intent.get("broker_id") or intent.get("broker") or ("binance-futures" if protection else ""))
+        try:
+            return self._order_coordination.dispatch(owner_id=owner_id,
+                route=route,
+                intent=intent, submit=submit, budget_evidence=context.get("budgetEvidence"),
+                funds_reader=self._coordination_funds_reader,
+                reducing_only=protection or intent.get("risk_reducing") is True)
+        except CoordinationError as exc:
+            raise BrokerNotReadyError(exc.code) from exc
+
+    @staticmethod
+    def _binance_coordination_intent(normalized_intent, *, hedge_mode=None):
+        """Bind the journal to the wire identity without changing authority input.
+
+        Reject an ID the futures builder would truncate. A different transmitted
+        ID would make duplicate protection and later exact reconciliation unsafe.
+        """
+        identity = dict(normalized_intent)
+        client_id = str(identity.get("identifier") or identity.get("new_client_order_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,36}", client_id):
+            raise BrokerNotReadyError("COORDINATION_EXACT_CLIENT_ORDER_ID_REQUIRED")
+        identity["identifier"] = client_id
+        if hedge_mode is not None:
+            direction = str(identity.get("position_direction") or identity.get("positionDirection") or "").strip().lower()
+            identity["position_side"] = ("SHORT" if direction == "short" else "LONG") if hedge_mode else "BOTH"
+        return identity
+
+    @staticmethod
+    def _prepared_coordination_intent(intent, prepared):
+        from .live_adapters import normalize_side
+        identity = dict(intent)
+        body = prepared.body
+        if not isinstance(body, dict):
+            raise BrokerNotReadyError("COORDINATION_EXACT_WIRE_IDENTITY_REQUIRED")
+        if prepared.provider == "upbit":
+            if not body.get("identifier") or body.get("side") not in {"bid", "ask"} or not body.get("market"):
+                raise BrokerNotReadyError("COORDINATION_EXACT_WIRE_IDENTITY_REQUIRED")
+            identity.update(symbol=body["market"], side="BUY" if body["side"] == "bid" else "SELL",
+                            identifier=body["identifier"])
+            if body.get("volume") is not None:
+                identity.update(quantity=body["volume"], qty=body["volume"])
+        elif prepared.provider == "kis":
+            if not body.get("PDNO") or not body.get("ORD_QTY"):
+                raise BrokerNotReadyError("COORDINATION_EXACT_WIRE_IDENTITY_REQUIRED")
+            identity.update(symbol=body["PDNO"], quantity=body["ORD_QTY"], qty=body["ORD_QTY"],
+                            side=normalize_side(intent.get("side")))
+        else:
+            raise BrokerNotReadyError("COORDINATION_EXACT_WIRE_IDENTITY_REQUIRED")
+        return identity
+
+    def _assert_coordination_owner(self, route, symbol):
+        from .order_coordination import current_coordination_context
+        from trading_runtime.order_coordination import CoordinationError
+        owner = self.coordination_owner_id or current_coordination_context().get("ownerId")
+        try:
+            self._order_coordination._owned_scope(owner, route, symbol)
+        except CoordinationError as exc:
+            raise BrokerNotReadyError(exc.code) from exc
 
     def health_check(self, broker_id: str) -> dict[str, object]:
         return {"broker_id": broker_id, "diagnostics": broker_diagnostics(broker_id)}
@@ -3050,7 +3120,7 @@ class LiveBrokerRouter:
                     with final_boundary(
                         operation="PLACE_ORDER", intent=authority_intent, **final_options
                     ):
-                        response = send_prepared_request(prepared)
+                        response = self._coordinated_send(self._prepared_coordination_intent(intent, prepared), lambda: send_prepared_request(prepared))
                     body = (
                         prepared.body
                         if isinstance(prepared.body, dict)
@@ -3093,11 +3163,8 @@ class LiveBrokerRouter:
                 with ordinary_binance_final_mutation_boundary(
                     operation="SPOT_PLACE_ORDER"
                 ):
-                    return send_binance_signed_request(
-                        lambda: build_binance_spot_order_request(
-                            normalized_intent
-                        )
-                    )
+                    return self._coordinated_send(self._binance_coordination_intent(normalized_intent), lambda: send_binance_signed_request(
+                        lambda: build_binance_spot_order_request(normalized_intent)))
             except BinanceOrderAuthorityError as exc:
                 raise BrokerNotReadyError(str(exc)) from exc
         if broker_id == "binance-futures":
@@ -3147,15 +3214,10 @@ class LiveBrokerRouter:
                 with ordinary_binance_final_mutation_boundary(
                     operation="FUTURES_PLACE_ORDER"
                 ):
-                    return send_binance_signed_request(
-                        lambda: build_binance_futures_order_request(
-                            normalized_intent,
-                            hedge_mode=position_mode.get(
-                                "dualSidePosition"
-                            ) is True,
-                        ),
-                        futures=True,
-                    )
+                    return self._coordinated_send(self._binance_coordination_intent(normalized_intent,
+                        hedge_mode=position_mode["dualSidePosition"]), lambda: send_binance_signed_request(
+                        lambda: build_binance_futures_order_request(normalized_intent,
+                            hedge_mode=position_mode.get("dualSidePosition") is True), futures=True))
             except BinanceOrderAuthorityError as exc:
                 raise BrokerNotReadyError(str(exc)) from exc
         if broker_id == "upbit":
@@ -3165,7 +3227,7 @@ class LiveBrokerRouter:
                 with ordinary_upbit_final_mutation_boundary(
                     operation="PLACE_ORDER"
                 ):
-                    return send_prepared_request(prepared)
+                    return self._coordinated_send(self._prepared_coordination_intent(intent, prepared), lambda: send_prepared_request(prepared))
             except UpbitOrderAuthorityError as exc:
                 raise BrokerNotReadyError(str(exc)) from exc
         raise BrokerNotReadyError(f"지원하지 않는 broker_id입니다: {broker_id}")
@@ -3188,8 +3250,10 @@ class LiveBrokerRouter:
             raise BrokerNotReadyError("SHORT_LIVE_FUTURES_POSITION_MODE_CHANGED")
         try:
             with ordinary_binance_final_mutation_boundary(operation="FUTURES_PROTECT"):
-                return send_binance_signed_request(
-                    lambda: build_binance_futures_protection_request(intent), futures=True)
+                coordination_intent = {**intent, "position_side": (
+                    str(intent.get("position_direction")).upper() if mode["dualSidePosition"] else "BOTH")}
+                return self._coordinated_send(coordination_intent, lambda: send_binance_signed_request(
+                    lambda: build_binance_futures_protection_request(intent), futures=True), protection=True)
         except BinanceOrderAuthorityError as exc:
             raise BrokerNotReadyError(str(exc)) from exc
 
@@ -3224,6 +3288,7 @@ class LiveBrokerRouter:
             algo_id=str(intent.get("algo_id") or ""), client_algo_id=str(intent.get("client_algo_id") or ""))
         try:
             with ordinary_binance_final_mutation_boundary(operation="FUTURES_CANCEL_PROTECTION"):
+                self._assert_coordination_owner("binance-futures", str(intent.get("symbol") or ""))
                 return send_binance_signed_request(lambda: build_binance_futures_protection_lookup_request(
                     algo_id=str(intent.get("algo_id") or ""), cancel=True), futures=True)
         except BinanceOrderAuthorityError as exc:
@@ -3820,6 +3885,9 @@ class LiveBrokerRouter:
         if not real_orders_enabled() and not _reserved_short_order_authorized(broker_id, "CANCEL_ORDER"):
             raise BrokerNotReadyError("실행 시작 확인 또는 정확한 주문 취소 예약 권한이 필요합니다.")
         broker_id = broker_id.lower().strip()
+        from .order_coordination import current_coordination_context
+        if self.coordination_owner_id or current_coordination_context().get("ownerId"):
+            self._assert_coordination_owner(broker_id, str(context.get("symbol") or ""))
         if broker_id == "kis":
             sealed_kill_intent = context.pop(
                 "_kis_kill_authority_intent", None

@@ -191,6 +191,7 @@ class ReaderTests(unittest.TestCase):
 
     def test_fx_factory_does_not_freeze_real_request_observation_clock(self):
         fx = types.ModuleType(PKG + ".account_currency_limits")
+        fx.CurrentFxObservationError = type("CurrentFxObservationError", (ValueError,), {})
         calls = []
         receipt = {"krwPerNativeCurrency": "1399.8", "rateAsOf": NOW, "contentHash": "a" * 64}
         def observe(reader, **kwargs):

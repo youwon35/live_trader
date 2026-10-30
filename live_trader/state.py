@@ -12,6 +12,7 @@ from .continuous_dispatch import (
 )
 
 import os
+from copy import deepcopy
 import csv
 import html
 import hashlib
@@ -11720,6 +11721,7 @@ def snapshot() -> dict[str, Any]:
         "broker_adapter_contract": broker_adapter_contract(),
         "automation_profiles": automations,
         "continuous_runtime": continuous_runtime,
+        "order_coordination_retirement": deepcopy(STATE.get("order_coordination_retirement", {})),
         "kis_scoped_operational_authority": _kis_scoped_authority_status(),
         "kis_scoped_cleanup": _kis_cleanup_status(),
         "kis_manual_start_support": {"schemaVersion": "kis-scoped-manual-start-support/v1", "supported": True,
@@ -19155,6 +19157,7 @@ def _run_reconciliation_without_public_fence(
     refresh_brokers: bool = True,
     include_snapshot: bool = True,
     display_only: bool = False,
+    reconcile_stopped_owners: bool = False,
 ) -> dict[str, Any]:
     STATE["reconciliation_last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     broker_data = (
@@ -19231,10 +19234,16 @@ def _run_reconciliation_without_public_fence(
         except (OSError, sqlite3.Error, ValueError, RuntimeError):
             STATE["new_entries_blocked"] = True
             continuous_dispatch_reconciliation = {"reconciliationRequired": True}
+    coordination_results = {}
+    if reconcile_stopped_owners and refresh_brokers:
+        from .order_coordination import LiveOrderCoordination
+        coordination_results = LiveOrderCoordination().reconcile_retained_stopped()
+        STATE["order_coordination_retirement"] = coordination_results
     automatic_results = [] if display_only else automatic_live_promotion_sweep()
     return {
         "ok": True,
         "continuous_dispatch_reconciliation": continuous_dispatch_reconciliation,
+        "orderCoordination": coordination_results,
         "reason": f"대조 완료: {summary['status_label']} 상태",
         "reconciliation": reconciliation,
         "broker_position_truth": broker_truth,
@@ -19250,6 +19259,7 @@ def run_reconciliation(
     refresh_brokers: bool = True,
     include_snapshot: bool = True,
     display_only: bool = False,
+    reconcile_stopped_owners: bool = False,
 ) -> dict[str, Any]:
     """Publish a KIS control reservation around broker-truth mutation.
 
@@ -19262,6 +19272,7 @@ def run_reconciliation(
         refresh_brokers=refresh_brokers,
         include_snapshot=include_snapshot,
         display_only=display_only,
+        reconcile_stopped_owners=reconcile_stopped_owners,
     )
 
 
@@ -24352,12 +24363,15 @@ def dispatch_live_order_with_checkpoint(
                         "SUBMITTING",
                         "broker request dispatch",
                     )
+                    coordination_session = governance_authorization.get("session")
+                    coordination_session_id = str(coordination_session.get("sessionId") or "") if isinstance(coordination_session, dict) else ""
+                    coordination_owner_id = "live-runtime:" + coordination_session_id if coordination_session_id else ""
                     if broker_id == "kis" and not functional_execution:
                         from .kis_order_authority import kis_scoped_operational_dispatch_boundary
                         with kis_scoped_operational_dispatch_boundary(intent, broker_payload):
-                            broker_response = LiveBrokerRouter().place_order(broker_payload)
+                            broker_response = LiveBrokerRouter(coordination_owner_id=coordination_owner_id).place_order(broker_payload)
                     else:
-                        broker_response = LiveBrokerRouter().place_order(broker_payload)
+                        broker_response = LiveBrokerRouter(coordination_owner_id=coordination_owner_id).place_order(broker_payload)
                     if broker_id == "kis":
                         response_dict = (
                             dict(broker_response)
@@ -28233,6 +28247,8 @@ def stop_continuous_runtime(
             except (OSError, sqlite3.Error, ValueError):
                 STATE["new_entries_blocked"] = True
         # No mode lock across worker join: the worker drains outside RUNTIME.
+        from .order_coordination_retirement import capture_ordinary_worker, ordinary_worker_stopped
+        coordination_workers = {key: capture_ordinary_worker(LIVE_CONTINUOUS_CONTROLLER, key) for key, _ in sessions}
         result = LIVE_CONTINUOUS_CONTROLLER.stop(
             profile_id, runtime_id=runtime_id, deployment_id=deployment_id,
         ) if runtime_id or deployment_id else LIVE_CONTINUOUS_CONTROLLER.stop(profile_id)
@@ -28248,9 +28264,15 @@ def stop_continuous_runtime(
                 sync_runtime_profile_mode(profile, remaining_mode,
                     action="계좌별 실행 중지 후 남은 실행 모드 동기화")
         per_runtime = result.get("results") or {}
+        coordination_retirement = {}
         for key, original in sessions:
             session_id = original.session_id
-            stopped = (per_runtime.get(key) or result).get("ok") is True
+            exact_stop = per_runtime.get(key)
+            if exact_stop is None and result.get("runtimeId") == key:
+                exact_stop = result
+            if exact_stop is None and key in {"stock", "crypto"} and profile_id == key and not per_runtime:
+                exact_stop = result
+            stopped = ordinary_worker_stopped(coordination_workers.get(key), exact_stop)
             stop_plan = getattr(_CONTINUOUS_STOP_SCOPE, "plan", {})
             cleanup_pending = key in stop_plan.get("cleanupKeys", set())
             # A failed drain must not leave ordinary dispatch armed. The exact
@@ -28259,18 +28281,33 @@ def stop_continuous_runtime(
                 _revoke_runtime_order_authority(session_id)
             try:
                 session = OPERATIONAL_GOVERNANCE.get_runtime_session(session_id)
-                if session is not None and session.lifecycle == "STOPPING" and not cleanup_pending:
+                if session is not None and session.lifecycle == "STOPPING" and not cleanup_pending and stopped:
                     OPERATIONAL_GOVERNANCE.transition_runtime_session(
-                        session_id, "STOPPED" if stopped else "FAILED", actor="live_trader.desktop",
-                        event_type="RUNTIME_STOPPED" if stopped else "RUNTIME_STOP_FAILED",
+                        session_id, "STOPPED", actor="live_trader.desktop",
+                        event_type="RUNTIME_STOPPED",
                         payload={"runtimeId": key, "detail": str(result.get("reason") or "")[:500]},
                     )
-                if stopped and not cleanup_pending:
+                if not cleanup_pending:
+                    # The supervisor has joined this exact worker and authority
+                    # is revoked. Read broker truth now; only exact terminal
+                    # orders and flat exposure can release the shared owner.
+                    from .order_coordination import LiveOrderCoordination
+                    coordination = LiveOrderCoordination()
+                    if stopped:
+                        coordination_retirement[key] = coordination.reconcile_stopped(
+                            "live-runtime:" + session_id, worker_stopped=True)
+                    else:
+                        coordination_retirement[key] = {**coordination.retirement_status("live-runtime:" + session_id),
+                            "stopVerified": False, "reason": "COORDINATION_EXACT_WORKER_STOP_UNVERIFIED"}
+                        result["ok"] = False
+                        result["reason"] = "runtime-stop-worker-unverified"
+                    STATE.setdefault("order_coordination_retirement", {})[key] = coordination_retirement[key]
                     active = STATE.setdefault("active_runtime_session_ids", {})
-                    if active.get(key) == session_id:
+                    if stopped and active.get(key) == session_id:
                         active.pop(key, None)
             except (OSError, sqlite3.Error, ValueError):
                 STATE["new_entries_blocked"] = True
+        result["orderCoordination"] = coordination_retirement
         result["snapshot"] = snapshot()
         return result
 

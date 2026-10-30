@@ -12,6 +12,8 @@ import {
 import "./ShortLiveTestPanel.css";
 import RealtimeMonitor from "./RealtimeMonitor.jsx";
 import ContinuousMonitor from "./ContinuousMonitor.jsx";
+import OperatingSummary from "./OperatingSummary.jsx";
+import {restoreOperatingProfile} from "./operatingProfile.js";
 import {projectRealtimeMonitor} from "./realtimeMonitorModel.js";
 import "./MonitorWorkspace.css";
 import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
@@ -96,6 +98,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const displayCatalog = useRef(snapshot.catalog);
   const snapshotVersion = useRef(0);
   const mutationPending = useRef(false);
+  const profileRestored = useRef(false);
   const futuresPolicy = { leverage: futuresLeverage, marginMode: "ISOLATED", stopLossPercent: futuresStopLossPercent };
   const selectionSignature = shortLiveSelectionSignature(snapshot.catalog, selection, durationHours, futuresPolicy);
   const active = shortLiveRunning(snapshot);
@@ -183,6 +186,22 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [snapshot.prepared?.expiresAt, active]);
+
+  useEffect(() => {
+    if (profileRestored.current || !fresh || !catalogReady) return;
+    profileRestored.current = true;
+    const profile = snapshot.savedProfile;
+    if (active || selection.length || !profile || !Array.isArray(profile.selections)) return;
+    const restored = restoreOperatingProfile(profile, snapshot.catalog);
+    if (!restored) {
+      setMessage('저장된 설정의 전략 원본이 바뀌었습니다. 현재 목록에서 다시 선택해 주세요.');
+      return;
+    }
+    setSelection(restored.selection); setDurationHours(restored.durationHours);
+    setFuturesLeverage(String(profile.futuresPolicy?.leverage ?? 1));
+    setFuturesStopLossPercent(profile.futuresPolicy ? String(profile.futuresPolicy.stopLossPercent) : '');
+    setMessage('저장된 시험 설정을 불러왔습니다. 준비 검사는 현재 자료로 다시 진행합니다.');
+  }, [fresh, catalogReady, snapshot.savedProfile, snapshot.catalog, active, selection.length]);
 
   function changeSelection(key) {
     if (locked) return;
@@ -287,6 +306,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
       {error && <p role="alert" className="short-live-error">{error}</p>}
       <RealtimeMonitor snapshot={snapshot} fresh={fresh} pollError={pollError} receivedAt={receivedAt} staleMs={Math.max(20000,pollMs*3)}/>
       <MarketDataArchiveStatus value={snapshot.runtime?.marketDataArchive}/>
+      <OperatingSummary report={snapshot.runtime?.completionReport}/>
     </section>
   </div>;
   return <div className="short-live-workspace" aria-label="짧은 실거래 기능시험">
@@ -294,7 +314,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     <section className="panel short-live-intro">
       <div className="short-live-heading"><div><p className="short-live-eyebrow">5~7시간 · 실제 주문 경로 확인</p><h2>짧은 실거래 기능시험</h2></div>
         <button type="button" className="secondary-button" onClick={refresh} disabled={Boolean(busy)}><RefreshCw size={16} /> 실행 상태 새로 확인</button></div>
-      <p>같은 계좌·종목은 Live Trader와 GPT Trader 중 한 앱에서만 운용하세요. 두 앱의 동시 주문 소유권은 공유되지 않습니다.</p>
+      <p>Live Trader와 GPT Trader가 같은 거래소·시장·종목의 주문 권한과 사용 예정 자금을 함께 확인합니다.</p>
       <p>단일·복수 전략을 인스턴스와 포트폴리오로 연결하고 실제 신호 → 주문 → 체결 → 정상 종료를 확인합니다. 수익성이나 30일 검증을 통과했다는 의미는 아닙니다.</p>
       <div className="short-live-notice"><ShieldAlert size={19} /><span>준비 버튼은 주문을 보내지 않습니다. 실제 API 주문은 준비 결과를 확인하고 아래 시작 버튼을 직접 누른 뒤에만 요청합니다.</span></div>
       {snapshot.fixture && <p className="short-live-fixture" role="note">오프라인 화면 검사 · 표시 자료는 fixture이며 실계좌 조회·실주문 결과가 아닙니다.</p>}
@@ -307,6 +327,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     </section>
 
     <section className="panel"><h3>1. 거래소·시간봉·시험 대상 선택</h3>
+      <p className="short-live-meta">준비 검사한 설정은 다음 실행에도 기억합니다. 동의와 실거래 시작은 저장하지 않습니다.</p>
       <button type="button" className="secondary-button" onClick={refreshCatalog} disabled={locked}><RefreshCw size={16} /> {catalogLoading ? "전략 원본 목록 확인 중…" : "전략 목록 새로 확인"}</button>
       {snapshot.prepared && <div className="short-live-restore">
         <button type="button" className="secondary-button" onClick={restorePreviousSelection} disabled={locked || !previousSelection}>이전 시험 설정 다시 선택</button>
@@ -370,7 +391,8 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
         {!futuresPolicyValid && <p className="short-live-error" role="status">레버리지와 보호 손절 가격 거리를 입력해 주세요. 손절 거리는 0%보다 크고 100÷레버리지%보다 작아야 하며, 실제 청산가·증거금 조건은 서버가 추가 검사합니다. 기존 50% 손절은 2배·10배에서 사용할 수 없으며 자동으로 다른 값으로 바꾸지 않습니다.</p>}
       </fieldset>}
       <p>선택 {selection.length}개 · {durationHours}시간 · 자동 재시도 없음</p>
-      <button type="button" className="primary-button" onClick={prepare} disabled={locked || !fresh || !catalogReady || selection.length === 0 || !futuresPolicyValid}>{busy === "prepare" ? "무주문 준비 확인 중…" : "계좌·시세 새로 확인 (무주문 준비 검사)"}</button>
+      <button type="button" className="primary-button" onClick={prepare} disabled={locked || !fresh || !catalogReady || selection.length === 0 || !futuresPolicyValid}>{busy === "prepare" ? "과거 자료·계좌·시세 준비 중…" : "자료·계좌 준비 검사 (주문 없음)"}</button>
+      {snapshot.prepared?.historyPreparation && <details className="ts-disclosure"><summary className="ts-disclosure-summary">과거 자료 준비 · {snapshot.prepared.historyPreparation.ready ? '완료' : '확인 필요'}</summary><div className="ts-disclosure-body"><ul>{snapshot.prepared.historyPreparation.streams?.map(row => <li key={`${row.provider}:${row.symbol}:${row.timeframe}`}>{row.symbol} · {row.timeframe} · {row.observedBars}/{row.requiredBars}봉 · {row.status === 'COMPLETE' ? '준비됨' : '자료 부족'}</li>)}</ul><p className="short-live-meta">공유 자료를 먼저 사용하고 부족한 구간만 수집합니다. 과거 자료를 실시간 평가 횟수로 계산하지 않습니다.</p></div></details>}
       <p className="short-live-meta">선택한 거래소 API에서 현재 잔고·보유 자산·미체결·시세를 다시 읽습니다. 주문이나 자금 이동은 하지 않습니다.</p>
       {snapshot.prepared && !preparedScopeMatches && <p className="short-live-meta" role="status">아래는 마지막 준비 범위의 결과입니다. 현재 선택과 다르므로, 이전 설정을 다시 선택하거나 현재 범위로 새로 검사해 주세요.</p>}
       <Blockers values={snapshot.prepared?.blockers} label={preparedScopeMatches ? "선택한 시험의 준비 차단 사유" : "마지막 준비 범위의 차단 사유"} />

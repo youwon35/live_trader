@@ -33,6 +33,8 @@ from .short_live_contract import (
 from .short_live_order_authority import activate_short_live_routes, release_short_live_routes
 from .portfolio_execution import SleeveDelta, _split_internal_and_external_allocations
 from .short_live_read_diagnostics import sanitize_read_diagnostics
+from .operating_profile import load_profile, save_profile
+from .session_report import terminal_report
 
 
 def _spec(value: Mapping[str, Any]) -> RuntimeStrategySpec:
@@ -67,10 +69,12 @@ class ShortLiveTestService:
                  background: bool = True, poll_seconds: float = 0.5,
                  preparation_ttl_seconds: float = 180,
                  account_poll_seconds: float = 5, catalog_display_ttl_seconds: float = 10,
-                 order_timeout_seconds: float = 60) -> None:
+                 order_timeout_seconds: float = 60,
+                 history_preparer: Callable | None = None) -> None:
         self.catalog_provider = catalog_provider
         self.broker_provider = broker_provider
         self.feed_provider = feed_provider
+        self.history_preparer = history_preparer
         self.store_root = Path(store_root)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.monotonic = monotonic
@@ -100,6 +104,7 @@ class ShortLiveTestService:
         self._catalog_cache_at = float("-inf")
         self._last_reconcile_at = float("-inf")
         self._boot_blockers = self._previous_sessions()
+        self._saved_profile = load_profile(self.store_root)
 
     def _now(self) -> datetime:
         return utc(self.clock())
@@ -220,6 +225,7 @@ class ShortLiveTestService:
                             "expiresAt": prepared["expiresAt"],
                             "readyToStart": prepared["readyToStart"],
                             "brokerReadiness": deepcopy(prepared.get("publicReadiness", [])),
+                            "historyPreparation": deepcopy(prepared.get("historyPreparation")),
                             "blockers": prepared["blockers"]}
                 if self._now() >= datetime.fromisoformat(prepared["expiresAt"].replace("Z", "+00:00")):
                     prepared["readyToStart"] = False
@@ -233,6 +239,7 @@ class ShortLiveTestService:
                     "candidates": catalog.get("candidates", []),
                     "coverage": catalog.get("coverage", []),
                     "prepared": prepared, "runtime": runtime,
+                    "savedProfile": deepcopy(self._saved_profile),
                     "observedAt": utc_text(self._now()),
                     "blockers": [*self._boot_blockers, *catalog_error],
                     "confirmationText": CONFIRMATION_TEXT,
@@ -247,6 +254,7 @@ class ShortLiveTestService:
                 "terminatedAt", "firstFailureAt", "firstFailureDiagnostics", "blockers", "unknownOrderCount", "orderCount", "fillCount", "scopeHash", "internalTransferCount",
                 "workerRetirementRequired", "workerLaunchState")
         result = {key: deepcopy(session.get(key)) for key in keys}
+        result["completionReport"] = deepcopy(session.get("completionReport"))
         from .short_live_monitor import public_feed_observation
         result["feedObservations"] = [dict(route=route, **public_feed_observation(feed))
                                       for route, feed in self._feeds.items()]
@@ -300,9 +308,18 @@ class ShortLiveTestService:
                 raise ShortLiveContractError("EXACT_SELECTIONS_REQUIRED")
             resolved = self.catalog_provider.resolve(deepcopy(selections))
             contract = build_contract(resolved, payload, now=self._now())
+            self._saved_profile = save_profile(self.store_root, contract, selections)
             blockers = list(self._boot_blockers)
             if not self._owner():
                 blockers.append("GENUINE_UI_OWNER_UNAVAILABLE")
+            history = None
+            if self.history_preparer is not None and not blockers:
+                try:
+                    history = self.history_preparer([_spec(row) for row in contract["specs"]], int(self._now().timestamp()))
+                    if not isinstance(history, Mapping) or history.get("ready") is not True:
+                        blockers.append("HISTORY_PREPARATION_INCOMPLETE")
+                except Exception:
+                    blockers.append("HISTORY_PREPARATION_UNAVAILABLE")
             blockers += self._guard(contract)
             readiness: dict[str, Any] = {}
             public_readiness = []
@@ -322,6 +339,7 @@ class ShortLiveTestService:
                               "blockers": list(dict.fromkeys(blockers)),
                               "readiness": readiness,
                               "publicReadiness": public_readiness,
+                              "historyPreparation": history,
                               "expiresAt": utc_text(self._now() + timedelta(seconds=self.preparation_ttl_seconds))}
             self._write(f"preparation-{contract['preparationId']}", self._prepared)
             return self.snapshot(include_catalog=False)
@@ -490,6 +508,20 @@ class ShortLiveTestService:
                 "purpose": PURPOSE, "promotionEligible": False,
                 "executionModelOverrideHash":payload.get("executionModelOverrideHash")})
             try:
+                claimed_adapters = []
+                try:
+                    for leg in contract["legs"]:
+                        adapter = self._brokers[leg["route"]]
+                        claim = getattr(adapter, "claim_coordination", None)
+                        if callable(claim):
+                            claim(leg_manifest(contract, leg["route"]))
+                            claimed_adapters.append(adapter)
+                except Exception:
+                    for adapter in reversed(claimed_adapters):
+                        rollback = getattr(adapter, "rollback_unsubmitted_coordination", None)
+                        if callable(rollback):
+                            rollback()  # Only empty claims; any intent forbids this rollback.
+                    raise
                 activate_short_live_routes([leg_manifest(contract, leg["route"]) for leg in contract["legs"]])
                 self._session["routeAuthorityActive"] = True
                 self._make_engines(contract)
@@ -497,7 +529,14 @@ class ShortLiveTestService:
                     route = leg["route"]
                     feed = self.feed_provider(leg_manifest(contract, route))
                     self._feeds[route] = feed
+                    window = getattr(feed, "set_history_window", None)
+                    if callable(window):
+                        window(int(started.timestamp()))
                     feed.connect()
+                # Establish every route before any slow historical read. All
+                # seeds share the start cutoff, so a later route cannot consume
+                # a newly closed candle as history while an earlier one evaluates it.
+                for route, feed in self._feeds.items():
                     self._seed(route, feed)
                 self._session["status"] = "RUNNING"
                 self._session["newEntriesBlocked"] = False
@@ -1607,6 +1646,15 @@ class ShortLiveTestService:
             return
         if self.background and not never_started and (self._thread is None or self._thread.is_alive()):
             return
+        try:
+            for route, adapter in self._brokers.items():
+                release = getattr(adapter, "release_coordination", None)
+                if callable(release) and release(leg_manifest(session["contract"], route)) is not True:
+                    raise ShortLiveContractError("COORDINATION_RETIREMENT_UNVERIFIED")
+        except Exception:
+            self._failure("COORDINATION_RETIREMENT_UNVERIFIED")
+            session["status"] = "BLOCKED"
+            return
         session["terminalVerified"] = True
         session["status"] = "TERMINATED"
         session["terminatedAt"] = utc_text(self._now())
@@ -1629,6 +1677,8 @@ class ShortLiveTestService:
             "feeReconciliationStatus": "KNOWN" if session["feesKnown"] else "UNVERIFIED_ACTUAL_FEE",
             "functionalPass": False,
             "note": "Retirement alone does not prove strategy order/fill coverage or profitability."})
+        session["completionReport"] = terminal_report(session)
+        self._write(f"session-report-{session['sessionId']}", session["completionReport"])
 
     def close(self) -> dict[str, Any]:
         """Called by the genuine UI owner on shutdown; never kills a worker."""

@@ -25,6 +25,7 @@ from .short_live_brokers import ROUTES, ShortLiveBrokerBlocked, number, decimal_
 from .short_live_read_diagnostics import DIAGNOSTIC_PATHS, sanitize_read_diagnostics
 from .short_live_upbit_quote import UpbitQuoteObservationError, validate_upbit_quote_observation
 from .native_fx_observation import sanitize_fx_observation
+from .short_live_fx_recovery import sanitize_fx_recovery
 
 
 # Exact codes produced by account_currency_limits.py. Arbitrary ValueError
@@ -178,6 +179,9 @@ class ProductionShortLiveReaders:
             evidence = sanitize_fx_observation(getattr(exc, "fxObservation", None))
             if evidence is not None:
                 self._read_diagnostics[-1].update(failureKind="FX_VALIDATION", fxObservation=evidence)
+            recovery = sanitize_fx_recovery(getattr(exc, "fxRecovery", None))
+            if recovery is not None:
+                self._read_diagnostics[-1]["fxRecovery"] = recovery
             if isinstance(exc, ValueError) and str(exc) in _FX_VALIDATION_CODES:
                 raise ShortLiveBrokerBlocked(str(exc)) from None
             raise
@@ -185,6 +189,9 @@ class ProductionShortLiveReaders:
         evidence = sanitize_fx_observation(value.get("fxObservation"))
         if evidence is not None:
             self._read_diagnostics[-1]["fxObservation"] = evidence
+        recovery = sanitize_fx_recovery(value.get("fxRecovery"))
+        if recovery is not None:
+            self._read_diagnostics[-1]["fxRecovery"] = recovery
         return value
 
     def _failure_reads(self):
@@ -396,16 +403,8 @@ class ProductionShortLiveReaders:
         return [{key: decimal_text(value) for key, value in row.items()} for row in brackets], decimal_text(coefficient)
 
     def _official_fx(self, currency: str) -> dict[str, Any]:
-        if currency != "USDT":
-            return {"known": False}
-        from .account_currency_limits import observe_upbit_usdt_krw, validate_conversion_observation, conversion_observation_diagnostic
-        observation = observe_upbit_usdt_krw(self.reader)
-        now = datetime.fromtimestamp(self.clock(), timezone.utc)
-        verified = validate_conversion_observation(observation, native_currency="USDT", now=now)
-        return {"known": True, "krwPerQuote": verified["krwPerNativeCurrency"],
-                "observedAt": verified["rateAsOf"], "source": "OFFICIAL_UPBIT_KRW_USDT_ORDERBOOK",
-                "contentHash": verified["contentHash"],
-                "fxObservation": conversion_observation_diagnostic(verified, now=now)}
+        from .short_live_fx_recovery import public_reader
+        return production_fx_reader(self.reader, clock=self.clock, reader_factory=public_reader)(currency)
 
     def _configured_kis_costs(self, route: str, symbol: str) -> dict[str, Any]:
         """No personal KIS tariff producer exists in the legacy application.
@@ -1040,7 +1039,8 @@ class ProductionShortLiveReaders:
                 extra["sessionClosesAt"] = closed.isoformat()
                 step, min_qty, max_qty, min_notional = "1", "1", None, "0"
             # Metadata/fee/settings reads can be slow. Observe quote and FX at
-            # the end without caching, retrying, or relabeling their timestamps.
+            # the end. Only a strictly aged public FX book may be re-observed
+            # within a small budget; private calls and orders are not retried.
             fx = {"known": True, "krwPerQuote": "1", "observedAt": self._now()} if currency == "KRW" else self._fx(currency)
             if fx.get("known") is not True:
                 raise ShortLiveBrokerBlocked("FRESH_FX_REQUIRED")
@@ -1064,19 +1064,26 @@ def deepcopy_rows(value: Mapping[str, Any]) -> dict[str, Any]:
     return {key: [dict(row) for row in value[key]] for key in ("positions", "openOrders")}
 
 
-def production_fx_reader(reader, *, clock=time.time):
-    """Use the real official KRW/USDT observation; no assumed USD peg."""
+def production_fx_reader(reader, *, clock=time.time, reader_factory=None,
+                         monotonic=time.monotonic, sleeper=time.sleep, can_continue=lambda: True):
+    """Use fresh official KRW/USDT; bounded public reads, never order retries.
+
+    Production supplies the separate deadline-bounded public reader factory.
+    The injected reader path remains available for offline transport fixtures.
+    """
     def observe(currency):
         if currency != "USDT":
             return {"known": False}
-        from .account_currency_limits import observe_upbit_usdt_krw, validate_conversion_observation, conversion_observation_diagnostic
-        raw = observe_upbit_usdt_krw(reader)
+        from .account_currency_limits import conversion_observation_diagnostic
+        from .short_live_fx_recovery import observe_with_recovery
+        verified, recovery = observe_with_recovery(reader_factory or (lambda remaining: reader),
+            clock=clock, monotonic=monotonic, sleeper=sleeper, can_continue=can_continue)
         now = datetime.fromtimestamp(clock(), timezone.utc)
-        verified = validate_conversion_observation(raw, native_currency="USDT", now=now)
         return {"known": True, "krwPerQuote": verified["krwPerNativeCurrency"],
                 "observedAt": verified["rateAsOf"], "contentHash": verified["contentHash"],
                 "source": "OFFICIAL_UPBIT_KRW_USDT_ORDERBOOK",
-                "fxObservation": conversion_observation_diagnostic(verified, now=now)}
+                "fxObservation": conversion_observation_diagnostic(verified, now=now),
+                "fxRecovery": recovery}
     return observe
 
 

@@ -35,6 +35,6 @@ export async function getShortLiveTestCatalog() {
   }
   return value;
 }
-export const prepareShortLiveTest = async (body) => verifyShortLiveResponse(await request("/api/short-live-tests/prepare", { method: "POST", body, timeoutMs: 45000 }), "prepare");
+export const prepareShortLiveTest = async (body) => verifyShortLiveResponse(await request("/api/short-live-tests/prepare", { method: "POST", body, timeoutMs: 90000 }), "prepare");
 export const startShortLiveTest = async (body) => verifyShortLiveResponse(await request("/api/short-live-tests/start", { method: "POST", body, timeoutMs: 45000 }), "start");
 export const stopShortLiveTest = async (body) => verifyShortLiveResponse(await request("/api/short-live-tests/stop", { method: "POST", body, timeoutMs: 45000 }), "stop");

@@ -742,6 +742,7 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                     refresh_brokers=payload.get("refresh_brokers") is not False,
                     include_snapshot=payload.get("include_snapshot") is not False,
                     display_only=payload.get("display_only") is True,
+                    reconcile_stopped_owners=True,
                 )
             )
             return

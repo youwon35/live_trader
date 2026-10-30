@@ -13,6 +13,7 @@ await mkdir(output,{recursive:true});
 const entry=`import React from 'react';import {createRoot} from 'react-dom/client';
 import RealtimeMonitor from './src/RealtimeMonitor.jsx';import {normalizeShortLiveSnapshot} from './src/shortLiveTestModel.js';import './src/styles.css';import '../../packages/design/moa-theme.css';import './src/moa-surfaces.css';
 const now=Date.now(),at=(delta)=>new Date(now+delta).toISOString();
+import OperatingSummary from './src/OperatingSummary.jsx';
 const routeNames=['BINANCE_SPOT','BINANCE_USDM_FUTURES','UPBIT_KRW_SPOT'];
 const raw={fixture:true,observedAt:at(0),runtime:{sessionId:'synthetic-session',status:'RUNNING',ownerAlive:true,workerAlive:true,newEntriesBlocked:false,unknownOrderCount:0,startedAt:at(-7200000),endsAt:at(14400000),fillCount:2,
 strategyRows:routeNames.map((route,i)=>({instanceId:'synthetic-'+i,route,symbol:['BTCUSDT','SOLUSDT','KRW-BTC'][i],pluginId:'moving_average_cross',timeframe:'1h',lastSignal:i===0?'BUY':'HOLD',decisionCount:2,orderAttemptCount:i===0?1:0,fillObservationCount:i===0?2:0,lastPrice:[110000,185,160000000][i],lastBarAt:at(-60000),lastDecisionAt:at(-2000),positionQuantity:i===0?.0002:0,averageEntryPrice:i===0?109900:null,pendingOrderCount:0})),
@@ -21,6 +22,7 @@ equityHistory:routeNames.flatMap((route,i)=>Array.from({length:30},(_,j)=>({rout
 feedObservations:routeNames.map(route=>({route,streams:[{socketPresent:true,lastFrameAt:at(-3000)}]})),
 recentActivity:[{sequence:1,kind:'STARTED',observedAt:at(-7200000)},{sequence:2,kind:'BAR_EVALUATED',route:'BINANCE_SPOT',observedAt:at(-3600000)},{sequence:3,kind:'ORDER_INTENT_BEFORE_SUBMIT',route:'BINANCE_SPOT',symbol:'BTCUSDT',side:'BUY',observedAt:at(-3599000)},{sequence:4,kind:'ORDER_REPLY',route:'BINANCE_SPOT',symbol:'BTCUSDT',status:'PARTIAL',observedAt:at(-3598000)},{sequence:5,kind:'ACTUAL_FILL_INCREMENT',route:'BINANCE_SPOT',symbol:'BTCUSDT',side:'BUY',incrementalQuantity:.0002,observedAt:at(-3597000)},{sequence:6,kind:'BAR_EVALUATED',route:'UPBIT_KRW_SPOT',observedAt:at(-2000)}]}};
 const renderer=createRoot(document.getElementById('root'));window.renderMonitor=(scenario='running')=>{const data=structuredClone(raw);let fresh=true,receivedAt=now;
+data.runtime.historyObservations=Object.fromEntries(routeNames.map((route,i)=>[route,[{streams:[{symbol:['BTCUSDT','SOLUSDT','KRW-BTC'][i],timeframe:'1h',history:{observedBars:12},firstEligibleCloseAt:at(1800000),initialPartialExcluded:i===2}]}]]));
 if(scenario==='disconnected'){fresh=false;receivedAt=now-90000;}
 if(scenario==='feed-lag'){data.runtime.feedObservations[1].streams[0].lastFrameAt=at(-90000);}
 if(scenario==='waiting'){data.runtime.strategyRows.forEach(row=>{row.decisionCount=0;row.orderAttemptCount=0;row.fillObservationCount=0;row.lastSignal='NOT_OBSERVED';});data.runtime.fillCount=0;data.runtime.recentActivity=[];}
@@ -34,7 +36,8 @@ if(scenario==='terminal'){
   data.runtime.feedObservations.forEach(row=>{row.streams[0].lastFrameAt=at(-7134000);});
   data.runtime.recentActivity=[{sequence:1,kind:'STARTED',observedAt:at(-7200000)},{sequence:2,kind:'CLEANUP_INTENT_ONCE',observedAt:at(-7153000)},{sequence:3,kind:'WORKER_EXIT_INTENT',observedAt:at(-7131000)},{sequence:4,kind:'WORKER_DEATH_OBSERVED',observedAt:at(-7130000)}];
 }
-renderer.render(<main style={{maxWidth:1420,margin:'0 auto',padding:24}}><p style={{color:'#64766f',fontSize:12}}>오프라인 화면 검사 · 합성 자료 · 실계좌/실주문 없음</p><RealtimeMonitor snapshot={normalizeShortLiveSnapshot(data)} fresh={fresh} receivedAt={receivedAt}/></main>);};window.renderMonitor();`;
+const report=scenario==='terminal'?{schemaVersion:'short-live-report-v1',retirementVerified:true,firstFailure:'OFFICIAL_READ_REJECTED',orderAttempts:0,fillObservations:0,feesKnown:true,strategies:routeNames.map((route,i)=>({instanceId:'test-'+i,route,symbol:['BTCUSDT','SOLUSDT','KRW-BTC'][i],evaluations:0,outcome:'NOT_EVALUATED'}))}:null;
+renderer.render(<main style={{maxWidth:1420,margin:'0 auto',padding:24}}><p style={{color:'#64766f',fontSize:12}}>오프라인 화면 검사 · 합성 자료 · 실계좌/실주문 없음</p><RealtimeMonitor snapshot={normalizeShortLiveSnapshot(data)} fresh={fresh} receivedAt={receivedAt}/><OperatingSummary report={report}/></main>);};window.renderMonitor();`;
 await build({stdin:{contents:entry,resolveDir:root,loader:'jsx'},bundle:true,format:'esm',outfile:join(output,'fixture.js'),loader:{'.css':'css','.woff2':'file','.woff':'file','.svg':'file'},define:{'process.env.NODE_ENV':'"test"'},logLevel:'silent'});
 await writeFile(join(output,'index.html'),'<!doctype html><html lang="ko" data-ui-theme="light" data-program="live-trader"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Offline Live monitor</title><link rel="stylesheet" href="/fixture.css"><div id="root"></div><script type="module" src="/fixture.js"></script></html>');
 let forbidden=0;

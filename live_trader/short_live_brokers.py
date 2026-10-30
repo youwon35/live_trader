@@ -16,6 +16,7 @@ import json
 import re
 import threading
 import time
+from contextlib import nullcontext
 from typing import Any
 from trading_runtime.futures_accounting import margin_budget
 from .short_live_futures import FuturesProtectionError, FuturesProtectionManager, policy as futures_policy
@@ -171,7 +172,8 @@ class ShortLiveBrokerAdapter:
                  observe_cleanup_order: Callable[..., bool] | None = None,
                  protection_reader=None, protection_transport=None, force_order_reader=None,
                  reserve_protection=None, record_protection=None,
-                 budget: SharedExchangeBudget | None = None, clock: Callable[[], float] = time.time) -> None:
+                 budget: SharedExchangeBudget | None = None, clock: Callable[[], float] = time.time,
+                 coordination=None, coordination_settings=None) -> None:
         if route not in ROUTES:
             raise ShortLiveBrokerBlocked("ROUTE_UNSUPPORTED")
         self.route, self.provider, self.exchange, self.currency = route, *ROUTES[route]
@@ -200,10 +202,91 @@ class ShortLiveBrokerAdapter:
         self._session_start_ms = int(clock() * 1000)
         self._first_entry_ms = None
         self._cancel_attempts = set()
+        self._coordination = coordination
+        self._coordination_settings = dict(coordination_settings or {})
+        self._coordination_owner = ""
+        self._coordination_claims = []
+        self._coordination_rejections = {}
         self._protection = (FuturesProtectionManager(clock=clock, reader=protection_reader,
             transport=protection_transport, guard=authority_guard, reserve=reserve_protection,
             record=record_protection) if route == "BINANCE_USDM_FUTURES" and all(callable(x) for x in (protection_reader, reserve_protection, record_protection))
             and protection_transport is not None else None)
+
+    def claim_coordination(self, manifest):
+        """Called only after genuine user start, before any feed or order."""
+        if self._coordination is None:
+            return []  # Explicit injected simulation adapters have no live registry.
+        m = self._scope(manifest)
+        owner = "live-short:" + str(m["sessionId"])
+        self._coordination_claims = self._coordination.claim(owner, self.route, m["symbols"], self._coordination_settings)
+        self._coordination_owner = owner
+        return list(self._coordination_claims)
+
+    def rollback_unsubmitted_coordination(self):
+        if self._coordination is not None and self._coordination_claims:
+            self._coordination.rollback_unsubmitted(self._coordination_owner, self._coordination_claims)
+            self._coordination_claims = []
+            self._coordination_owner = ""
+
+    def _coordination_context(self, funds=None):
+        if self._coordination is None:
+            return nullcontext()
+        if not self._coordination_owner or not self._coordination_claims:
+            raise ShortLiveBrokerBlocked("COORDINATION_SESSION_NOT_CLAIMED")
+        return self._coordination.dispatch_context(self._coordination_owner, budget_evidence=funds)
+
+    def _settle_coordination(self, snapshot, *, release=False):
+        if self._coordination is None or not self._coordination_claims:
+            return
+        if (snapshot["openOrders"] or snapshot.get("openAlgoOrders")
+                or any(number(p["quantity"]) != 0 for p in snapshot["positions"])
+                or self._protection and not self._protection.retirement_verified()):
+            if release:
+                raise ShortLiveBrokerBlocked("COORDINATION_EXPOSURE_NOT_FLAT")
+            return
+        terminal, observed_times = {}, [epoch(snapshot["observedAt"])]
+        for client, row in self._coordination_rejections.items():
+            # An explicit broker rejection has no broker order to GET later.
+            # Preserve its immutable response hash; the fresh account snapshot
+            # proves flat now. UNKNOWN/no-response never enters this mapping.
+            terminal[client] = "REJECTED"
+        for client, row in self._fill_rows.items():
+            if self._claims.get(client, {}).get("externalExecution"):
+                continue
+            if row.get("known") is not True:
+                raise ShortLiveBrokerBlocked("COORDINATION_ORDER_TRUTH_REQUIRED")
+            status = str(row.get("status") or "").upper().replace("CANCELLED", "CANCELED")
+            if status not in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                if release:
+                    raise ShortLiveBrokerBlocked("COORDINATION_ORDER_NOT_TERMINAL")
+                return
+            terminal[client] = status
+            observed_times.append(epoch(row["observedAt"]))
+        if self._protection:
+            for client, claim in self._protection.claims.items():
+                row = claim.get("observation", {})
+                if claim.get("lastReadVerified") is not True or row.get("known") is not True:
+                    raise ShortLiveBrokerBlocked("COORDINATION_PROTECTION_TRUTH_REQUIRED")
+                status = str(row.get("status") or "").upper().replace("CANCELLED", "CANCELED")
+                terminal[client] = "FILLED" if status == "FINISHED" else status
+                observed_times.append(epoch(row["observedAt"]))
+        truth = {"observedAt": min(observed_times), "ownedPositionFlat": True,
+                 "pendingOrderCount": 0, "terminalOrders": terminal,
+                 "evidenceHash": hashlib.sha256(json.dumps({"snapshot": snapshot,
+                    "orders": self._fill_rows, "rejections": self._coordination_rejections,
+                    "protections": self._protection.claims if self._protection else {}},
+                    sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()}
+        self._coordination.reconcile_release(self._coordination_owner, self.route,
+            self._manifest["symbols"], truth, release_scope=release)
+        if release:
+            self._coordination_claims = []
+
+    def release_coordination(self, session):
+        if self._coordination is not None and self._coordination_claims:
+            # Independent current observation after trusted worker retirement;
+            # never claim flat from elapsed time or a previous terminal flag.
+            self._settle_coordination(self._snapshot(self._scope(session)), release=True)
+        return True
 
     def _capital_committed(self, positions, fx):
         if self.route != "BINANCE_USDM_FUTURES":
@@ -773,7 +856,7 @@ class ShortLiveBrokerAdapter:
                     "availableSessionMinutes": available_minutes, "minimumOrderKrwBySymbol": native_minimums,
                     "promotionEligible": False}
 
-    def size_order(self, proposal: Mapping[str, Any]) -> dict[str, Any]:
+    def size_order(self, proposal: Mapping[str, Any], *, _coordination_capture=None) -> dict[str, Any]:
         try:
             m = self._scope(proposal)
             symbol, side = str(proposal.get("symbol") or ""), str(proposal.get("side") or "").upper()
@@ -851,6 +934,9 @@ class ShortLiveBrokerAdapter:
             notional = qty * price * fx
             cost = notional * (fee + tax)
             required_capital = notional * (margin_factor + reserve_costs + tax)
+            if _coordination_capture is not None:
+                _coordination_capture.update(currency=self.currency, required=decimal_text(required_capital / fx),
+                    available=decimal_text(number(s["availableNative"])), observedAt=s["observedAt"], unitScale=8)
             if not reducing and required_capital > available:
                 raise ShortLiveBrokerBlocked("AVAILABLE_BUDGET_EXHAUSTED")
             projected = max(Decimal(0), exposure - notional) if reducing else exposure + notional + cost
@@ -898,6 +984,9 @@ class ShortLiveBrokerAdapter:
             return {"status": "REJECTED"}
         if body.get("code") is not None and number(body["code"]) < 0:
             return {"status": "UNKNOWN" if number(body["code"]) in {-1006, -1007} else "REJECTED"}
+        from .order_coordination import explicit_upbit_order_rejection
+        if explicit_upbit_order_rejection(body):
+            return {"status": "REJECTED"}
         if response.get("ok") is False:
             return {"status": "UNKNOWN"}
         output = body.get("output") if isinstance(body.get("output"), Mapping) else {}
@@ -935,9 +1024,10 @@ class ShortLiveBrokerAdapter:
                 self._fresh(order.get("observedAt"), 10)
                 self._fresh(order.get("fxObservedAt"), 15)
                 reserved_notional = order.get("estimatedNotionalKrw", order.get("notionalKrw"))
+                coordination_funds = {}
                 checked = self.size_order({**dict(order), "notionalKrw": reserved_notional,
                                            "deltaKrw": reserved_notional, "_reservedLimitPrice": order.get("referencePrice"),
-                                           "_reservedQuantity": order.get("quantity")})
+                                           "_reservedQuantity": order.get("quantity")}, _coordination_capture=coordination_funds)
                 if checked.get("ready") is not True:
                     error = ShortLiveBrokerBlocked(str((checked.get("blockers") or ["ORDER_RECHECK_FAILED"])[0]))
                     error.readDiagnostics = sanitize_read_diagnostics(checked.get("readDiagnostics"))
@@ -952,9 +1042,12 @@ class ShortLiveBrokerAdapter:
                     truth = self._snapshot(self._scope(order))
                     if (self._claims and not truth["openOrders"] and
                             not any(number(p["quantity"]) for p in truth["positions"])):
-                        self._protection.finish_flat()
-                    self._protection.ensure({**dict(order), "positionMode": checked["positionMode"]},
-                        self._market(order["symbol"]), self._futures_policy)
+                        with self._coordination_context():
+                            self._protection.finish_flat()
+                        self._settle_coordination(self._snapshot(self._scope(order)))
+                    with self._coordination_context(coordination_funds):
+                        self._protection.ensure({**dict(order), "positionMode": checked["positionMode"]},
+                            self._market(order["symbol"]), self._futures_policy)
                 self.budget.reserve(self.exchange, client_id, reserve, Decimal(0))
                 claim = {"status": "UNKNOWN", "clientOrderId": client_id, "symbol": order["symbol"],
                          "quantity": str(order["quantity"]), "side": order["side"], "brokerOrderId": ""}
@@ -976,11 +1069,20 @@ class ShortLiveBrokerAdapter:
                 if self.provider == "kis":
                     native.update(asset="KR_STOCK", asset_class="KR_STOCK", order_type="00")
                 sender = getattr(self.transport, "submit_authorized", None)
-                response = sender(self.route, native, dict(order), self.authority_guard) if callable(sender) else self.transport.submit(self.route, native)
+                with self._coordination_context(coordination_funds):
+                    response = sender(self.route, native, dict(order), self.authority_guard) if callable(sender) else self.transport.submit(self.route, native)
                 result = self._normalize_reply(response, order, number(checked["krwPerQuote"]))
                 result = {**claim, **result, "promotionEligible": False}
                 self._claims[client_id] = result
                 if result["status"] == "REJECTED":
+                    if self._coordination is not None:
+                        receipt = self._coordination.coordinator.find_intent(
+                            owner_id=self._coordination_owner, intent_key=client_id)
+                        if receipt and receipt["state"] == "REJECTED":
+                            self._coordination_rejections[client_id] = {
+                                "observedAt": self.clock(), "status": "REJECTED",
+                                "responseHash": hashlib.sha256(json.dumps(response, sort_keys=True,
+                                    default=str, separators=(",", ":")).encode()).hexdigest()}
                     self.budget.release_terminal(self.exchange, client_id)
                 elif result.get("brokerOrderId"):
                     # Exactly one observational read; never resubmit or invent
@@ -1105,6 +1207,7 @@ class ShortLiveBrokerAdapter:
                     for cid in self._claims):
                 for cid in self._claims:
                     self.budget.release_terminal(self.exchange, cid)
+            self._settle_coordination(s)
             from .short_live_monitor import public_observed_at
             return {"known": True, "ready": True, "blockers": [], "accountId": s["accountId"],
                     "accountObservedAt": public_observed_at(s["observedAt"]), "pendingOrders": deepcopy(s["openOrders"]),
@@ -1177,8 +1280,9 @@ class ShortLiveBrokerAdapter:
                         raise ShortLiveBrokerBlocked("CLEANUP_AUTHORITY_REQUIRED")
                     self._cancel_attempts.add(cancel_key)
                     cancel = getattr(self.transport, "cancel_authorized", None)
-                    if callable(cancel): cancel(self.route, str(row["brokerOrderId"]), row, auth, self.authority_guard)
-                    else: self.transport.cancel(self.route, str(row["brokerOrderId"]), row)
+                    with self._coordination_context():
+                        if callable(cancel): cancel(self.route, str(row["brokerOrderId"]), row, auth, self.authority_guard)
+                        else: self.transport.cancel(self.route, str(row["brokerOrderId"]), row)
             # Cancellation is only an acknowledgement. Re-read before flatten.
             current = self.reconcile(session)
             if current.get("known") is not True or current.get("pendingOrders"):
@@ -1215,7 +1319,8 @@ class ShortLiveBrokerAdapter:
             final = self.reconcile(session)
             if (self._protection and final.get("known") is True and not final.get("pendingOrders")
                     and not final.get("positionsBySymbol")):
-                self._protection.finish_flat()
+                with self._coordination_context():
+                    self._protection.finish_flat()
                 final = self.reconcile(session)
             complete = (final.get("known") is True and not final.get("pendingOrders") and not final.get("positionsBySymbol")
                         and final.get("protectionRetirementVerified") is True)
@@ -1229,7 +1334,8 @@ class ShortLiveBrokerAdapter:
         if current.get("known") is not True or current.get("pendingOrders") or current.get("ownedPositions"):
             return False
         if self._protection:
-            self._protection.finish_flat()
+            with self._coordination_context():
+                self._protection.finish_flat()
         final = self.reconcile(session)
         return (final.get("known") is True and not final.get("ownedProtectionOrders")
                 and not final.get("pendingOrders") and not final.get("ownedPositions")
@@ -1253,6 +1359,7 @@ def create_production_short_live_broker(route: str, *, settings: Mapping[str, An
                                       router: Any = None, clock: Callable[[], float] = time.time) -> ShortLiveBrokerAdapter:
     from .short_live_broker_readers import ProductionShortLiveReaders
     from .futures_protection_transport import FuturesProtectionTransport
+    from .order_coordination import LiveOrderCoordination
     readers = ProductionShortLiveReaders(settings=settings, fx_reader=fx_reader,
                                         ownership_reader=ownership_reader, cost_reader=cost_reader, clock=clock)
     return ShortLiveBrokerAdapter(route, snapshot_reader=readers.snapshot, market_reader=readers.market,
@@ -1263,4 +1370,5 @@ def create_production_short_live_broker(route: str, *, settings: Mapping[str, An
                                   protection_transport=FuturesProtectionTransport(router),
                                   force_order_reader=readers.futures_force_orders,
                                   reserve_protection=reserve_protection, record_protection=record_protection,
-                                  budget=budget, clock=clock)
+                                  budget=budget, clock=clock, coordination=LiveOrderCoordination(),
+                                  coordination_settings=settings)

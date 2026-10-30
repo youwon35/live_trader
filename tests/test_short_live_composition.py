@@ -141,9 +141,11 @@ class CompositionFixture:
         self.selections=[{key:row[key] for key in ("selectionKey","artifactFileSha256","instanceFileSha256")} for row in rows]
         if not rows or any(row["blockers"] for row in rows): raise AssertionError(rows)
         self.budget=adapter_module.SharedExchangeBudget()
+        from trading_runtime.order_coordination import OrderCoordinator
+        self.coordinator=OrderCoordinator(root/"order-coordination.sqlite3",clock=lambda:self.now.timestamp())
         def broker_factory(selected):
             if selected!=route: raise AssertionError(selected)
-            router=router_module.LiveBrokerRouter()
+            router=router_module.LiveBrokerRouter(order_coordinator=self.coordinator)
             transport=adapter_module.OfficialBrokerTransport(router,enabled_reader=lambda:True,order_reader=self.read_order)
             protection_transport=protection_module.FuturesProtectionTransport(router,clock=lambda:self.now.timestamp())
             original_submit=transport.submit_authorized
@@ -162,7 +164,8 @@ class CompositionFixture:
                 force_order_reader=lambda symbol,since:{"known":True,"events":[],"observedAt":self.now.timestamp()},
                 reserve_protection=lambda order:self.service.reserve_protection(order),
                 record_protection=lambda event,detail:self.service.record_protection(event,detail),
-                budget=self.budget,clock=lambda:self.now.timestamp())
+                budget=self.budget,clock=lambda:self.now.timestamp(),
+                coordination=router._order_coordination,coordination_settings=dict(os.environ))
             self.adapters.append(edge); return edge
         self.service=session_module.ShortLiveTestService(self.catalog,broker_factory,
             lambda manifest:native_module.NativeFeed(manifest,{}),root/"session-store",clock=lambda:self.now,
@@ -350,7 +353,7 @@ class ShortLiveCompositionTests(unittest.TestCase):
         self.enter(patch.object(adapters.urllib.request,"build_opener",side_effect=lambda *_:types.SimpleNamespace(open=lambda request,**kw:self.fixture.open(request,**kw))))
         self.enter(patch.object(native_module,"feeds_for_specs",side_effect=lambda specs,**kw:self.fixture.socket_factory(specs,**kw)))
         history=importlib.import_module(PKG+".short_live_kis_history")
-        self.enter(patch.object(history,"get_warmup",side_effect=lambda spec,limit,_:CandleSocketFixture((spec,)).history(spec,limit)))
+        self.enter(patch.object(history,"get_warmup",side_effect=lambda spec,limit,_,**kw:CandleSocketFixture((spec,)).history(spec,limit)))
         adapters._BINANCE_SYMBOL_RULE_CACHE.clear(); adapters._clear_binance_time_offset_cache(); adapters._clear_kis_access_token_cache()
 
     def enter(self,manager): value=manager.start(); self.addCleanup(manager.stop); return value

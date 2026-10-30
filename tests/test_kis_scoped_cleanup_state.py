@@ -101,7 +101,7 @@ class ScopedStopSelectionTests(unittest.TestCase):
         for key,row in self.rows.items():
             if (not runtime_id or key==runtime_id) and (not deployment_id or row['deploymentId']==deployment_id) and (not profile or row['profileId']==profile):
                 row['running']=False;row['mode']='MONITOR'
-        return {'ok':True,'runtime':{'phase':'STOPPED','running':False}}
+        return {'ok':True,'runtimeId':runtime_id,'runtime':{'phase':'STOPPED','running':False}}
 
     def test_unknown_exact_id_never_revokes_or_supersedes_other_start(self):
         self.ns['_KIS_CONTROL_RESERVATION']={'reservationId':'someone-start','reservationKind':'START'}
@@ -114,7 +114,10 @@ class ScopedStopSelectionTests(unittest.TestCase):
     def test_exact_crypto_stop_preserves_kis_consent_and_start_reservation(self):
         self.ns['_KIS_CONTROL_RESERVATION']={'reservationId':'kis-start-in-progress','reservationKind':'START'}
         before=deepcopy(self.ns['_KIS_CONTROL_RESERVATION'])
-        result=self.ns['stop_continuous_runtime']('crypto',runtime_id='runtime-crypto',deployment_id='deployment-crypto')
+        worker=threading.Thread(target=lambda:None);worker.start();worker.join()
+        self.manager.runtimes['runtime-crypto'].supervisor=SimpleNamespace(_thread=worker)
+        with patch('live_trader.order_coordination.LiveOrderCoordination'):
+            result=self.ns['stop_continuous_runtime']('crypto',runtime_id='runtime-crypto',deployment_id='deployment-crypto')
         self.assertTrue(result['ok']);self.assertTrue(result['runtimeStopped']);self.assertTrue(self.rows['runtime-kis']['running'])
         self.assertEqual(before,self.ns['_KIS_CONTROL_RESERVATION'])
         self.ops.authorize_consent('session-kis',context=self.context)

@@ -4,6 +4,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
+import threading
 from live_trader import state
 
 class AccountRuntimeStateTest(unittest.TestCase):
@@ -86,8 +87,11 @@ class AccountRuntimeStateTest(unittest.TestCase):
             "runtime-u":{"running":True,"profileId":"crypto","deploymentId":"dep-u","mode":"FULL_LIVE"},
         }}
         after=deepcopy(before); after["runtimes"]["runtime-b"]["running"]=False
-        manager=Mock(); manager.snapshot.side_effect=[before,after]; manager.stop.return_value={"ok":True}
-        with patch.object(state,"LIVE_CONTINUOUS_CONTROLLER",manager):
+        thread=threading.Thread(target=lambda: None);thread.start();thread.join()
+        controller=SimpleNamespace(supervisor=SimpleNamespace(_thread=thread))
+        manager=SimpleNamespace(runtimes={"runtime-b":controller},controllers={},snapshot=Mock(side_effect=[before,after]),
+            stop=Mock(return_value={"ok":True,"runtimeId":"runtime-b","runtime":{"phase":"STOPPED","running":False}}))
+        with patch.object(state,"LIVE_CONTINUOUS_CONTROLLER",manager),patch("live_trader.order_coordination.LiveOrderCoordination"):
             result=self.stop("crypto",runtime_id="runtime-b",deployment_id="dep-b")
         self.assertTrue(result["ok"])
         manager.stop.assert_called_once_with("crypto",runtime_id="runtime-b",deployment_id="dep-b")
@@ -102,5 +106,33 @@ class AccountRuntimeStateTest(unittest.TestCase):
             self.assertFalse(self.stop("crypto")["ok"])
         manager.stop.assert_not_called()
         self.governance.transition_runtime_session.assert_not_called()
+
+    def test_aggregate_stop_success_cannot_verify_missing_owner_worker(self):
+        thread=threading.Thread(target=lambda: None);thread.start();thread.join()
+        controller=SimpleNamespace(supervisor=SimpleNamespace(_thread=thread))
+        before={"runtimes":{"runtime-b":{"running":True,"profileId":"crypto","deploymentId":"dep-b","mode":"SMALL_LIVE"}}}
+        after=deepcopy(before);after["runtimes"]["runtime-b"].update(running=False,phase="STOPPED")
+        manager=SimpleNamespace(runtimes={"runtime-b":controller},controllers={},snapshot=Mock(side_effect=[before,after]),
+                                stop=Mock(return_value={"ok":True,"results":{}}))
+        helper=Mock();helper.retirement_status.return_value={"retained":True}
+        with patch.object(state,"LIVE_CONTINUOUS_CONTROLLER",manager),patch("live_trader.order_coordination.LiveOrderCoordination",return_value=helper):
+            result=self.stop("crypto")
+        helper.reconcile_stopped.assert_not_called()
+        self.assertFalse(result["orderCoordination"]["runtime-b"]["stopVerified"])
+        self.assertFalse(result["ok"])
+        self.assertEqual("session-b",state.STATE["active_runtime_session_ids"]["runtime-b"])
+        self.assertEqual("STOPPING",self.sessions["session-b"].lifecycle)
+
+    def test_exact_worker_stop_requests_readonly_retirement_for_matching_session(self):
+        thread=threading.Thread(target=lambda: None);thread.start();thread.join()
+        controller=SimpleNamespace(supervisor=SimpleNamespace(_thread=thread))
+        before={"runtimes":{"runtime-b":{"running":True,"profileId":"crypto","deploymentId":"dep-b","mode":"SMALL_LIVE"}}}
+        after=deepcopy(before);after["runtimes"]["runtime-b"].update(running=False,phase="STOPPED")
+        manager=SimpleNamespace(runtimes={"runtime-b":controller},controllers={},snapshot=Mock(side_effect=[before,after]),
+            stop=Mock(return_value={"ok":True,"runtimeId":"runtime-b","runtime":{"phase":"STOPPED","running":False}}))
+        helper=Mock();helper.reconcile_stopped.return_value={"retained":False}
+        with patch.object(state,"LIVE_CONTINUOUS_CONTROLLER",manager),patch("live_trader.order_coordination.LiveOrderCoordination",return_value=helper):
+            self.stop("crypto",runtime_id="runtime-b",deployment_id="dep-b")
+        helper.reconcile_stopped.assert_called_once_with("live-runtime:session-b",worker_stopped=True)
 
 if __name__=="__main__": unittest.main()
