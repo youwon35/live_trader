@@ -30,3 +30,7 @@
 @media(max-width:1000px){.monitor-main-grid{grid-template-columns:1fr}.monitor-strategy-column .live-monitor-strategies{max-height:none}.monitor-chart-header h3{white-space:normal}}
 
 .continuous-strategy-observations{display:grid;gap:12px;margin:16px 0}.continuous-strategy-observations section{padding-top:12px;border-top:1px solid var(--border)}.continuous-strategy-observations p{margin:8px 0}
+
+.monitor-view-tabs{margin-bottom:18px;max-width:100%;flex-wrap:wrap}.monitor-view-tabs .ts-nested-tabs__tab{min-width:0;white-space:normal}.monitor-view-tabs .ts-nested-tabs__label{overflow-wrap:anywhere}.short-live-workspace>[role="tabpanel"][hidden]{display:none!important}.short-live-workspace>[role="tabpanel"]{min-width:0}.account-observation-disclosure .panel{border:0;box-shadow:none;margin:0}.account-observation-disclosure .live-compact-disclosure__content{padding-top:0}
+
+.market-data-archive-status{margin-top:16px}.market-data-archive-status summary{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.market-data-archive-status ul{list-style:none;padding:0;margin:0;display:grid;gap:12px}.market-data-archive-status li{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.market-data-archive-status small{color:var(--muted)}

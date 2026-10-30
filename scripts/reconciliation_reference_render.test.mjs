@@ -10,7 +10,7 @@ const module={exports:{}};runInNewContext(compiled,{module,exports:module.export
 const issue=changes=>({brokerId:'upbit',currency:'KRW',kind:'cash',reason:'과거 조회와 잔고 변화 · 참고',comparison:'과거 100 → 현재 110',detail:'원인 미분류',...changes});
 test('the actual component puts reference-only changes in a closed informational disclosure',()=>{
  const html=renderToStaticMarkup(React.createElement(Component,{issues:[issue({presentationOnlyReference:true})]}));
- assert.match(html,/과거 조회·기존 보유 · 참고 1개/);assert.match(html,/입출금 내역을 확인한 결과는 아니며/);assert.match(html,/var\(--moa-status-info/);
+ assert.match(html,/과거 조회·기존 보유 · 확인할 항목 1개/);assert.match(html,/API 입출금 증빙이나 운용 대조 통과로 처리하지 않으며/);assert.match(html,/var\(--moa-status-info/);
  assert.doesNotMatch(html,/<details[^>]*open/);assert.doesNotMatch(html,/확인할 운용 차이/);assert.match(html,/과거 100/);
 });
 test('a genuine managed-position failure remains open beside a closed historical reference',()=>{

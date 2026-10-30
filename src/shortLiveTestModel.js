@@ -391,6 +391,21 @@ export function normalizeShortLiveFailureDiagnostics(value) {
   }));
 }
 
+export function normalizeMarketDataArchive(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const count = input => Number.isSafeInteger(input) && input >= 0 ? input : null;
+  const entries = SHORT_LIVE_ROUTES.flatMap(({ id }) => {
+    if (!Array.isArray(value[id])) return [];
+    return [[id, value[id].slice(0, 100).filter(row => row && typeof row === "object" && !Array.isArray(row)).map(row => ({
+      saved: count(row.saved), failed: count(row.failed), dropped: count(row.dropped), pending: count(row.pending),
+      lastError: row.lastError ? "ARCHIVE_ERROR_REPORTED" : "",
+      executionEvidence: row.executionEvidence === false ? false : null,
+      published: row.published === false ? false : null,
+    }))]];
+  });
+  return entries.length ? Object.fromEntries(entries) : null;
+}
+
 export function normalizeShortLiveSnapshot(value = {}) {
   const source = value.snapshot && typeof value.snapshot === "object" ? value.snapshot : value;
   const preparation = source.prepared && typeof source.prepared === "object" ? source.prepared : null;
@@ -425,6 +440,7 @@ export function normalizeShortLiveSnapshot(value = {}) {
       })),
     } : null,
     runtime: run ? {
+      marketDataArchive: normalizeMarketDataArchive(run.marketDataArchive),
       sessionId: text(run.sessionId), status: text(run.status) || "UNKNOWN", startedAt: text(run.startedAt), endsAt: text(run.endsAt), terminatedAt: text(run.terminatedAt),
       terminalVerified: run.terminalVerified === true,
       ownerAlive: typeof run.ownerAlive === "boolean" ? run.ownerAlive : null,

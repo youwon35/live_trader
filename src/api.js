@@ -52,6 +52,7 @@ export function prepareMarketGapsForStart(selection, { accountKey, label, contin
 let functionalHttpSessionFlight = null;
 let functionalHttpSessionGeneration = 0;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
+  "/api/reconciliation/review",
   "/api/short-live-tests/prepare", "/api/short-live-tests/start", "/api/short-live-tests/stop",
   "/api/preparation/market-gaps/begin", "/api/preparation/market-gaps/cancel",
   "/api/runtime/batches/prepare", "/api/runtime/batches/start-member",

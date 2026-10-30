@@ -11787,6 +11787,10 @@ def snapshot() -> dict[str, Any]:
     payload["operator_runtime_bindings"] = operator_runtime_bindings(continuous_runtime)
     payload["operator_review_error"] = STATE.get("operator_review_error", "")
     payload["operator_review_revision"] = STATE.get("operator_review_revision", "")
+    from .reconciliation_review import review_document, configured_review_scopes
+    payload["reconciliation_review"] = review_document(
+        reconciliation_review_context(payload["reconciliation"], payload["program_ledger"]),
+        configured_review_scopes(os.environ), OPERATOR_REVIEW_STORE)
     return redact_sensitive_payload(payload)  # type: ignore[return-value]
 
 
@@ -14739,6 +14743,8 @@ def fetch_broker_snapshots(
 
 
 def refresh_broker_reconciliation() -> dict[str, Any]:
+    from .reconciliation_review import configured_review_scopes
+    review_scopes = configured_review_scopes(os.environ)
     router = LiveBrokerRouter()
     broker_ids = ("kis", "binance", "binance-futures", "upbit")
     data: dict[str, Any] = {
@@ -14750,6 +14756,7 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
         "successful_position_brokers": [],
         "position_observations": {},
         "account_observations": {},
+        "account_review_scopes": review_scopes,
     }
     for broker_id, result in fetch_broker_snapshots(router, broker_ids).items():
         if isinstance(result, Exception):
@@ -15896,6 +15903,7 @@ def merge_broker_reconciliation_cache(
     successful_brokers: set[str], errors: list[dict[str, str]], *,
     successful_account_brokers: set[str] | None = None,
     successful_position_brokers: set[str] | None = None,
+    account_review_scopes: dict[str, str] | None = None,
 ) -> None:
     if not successful_brokers and not errors:
         return
@@ -15911,6 +15919,17 @@ def merge_broker_reconciliation_cache(
     cache["positions"] = [row for row in previous_positions if str(row.get("broker_id") or "") not in position_success | failed] + list(positions_data)
     cache["errors"] = [row for row in previous_errors if str(row.get("broker_id") or "") not in touched] + [
         {"broker_id": row["broker_id"], "scope": "snapshot", "detail": row["detail"]} for row in errors]
+    # Review identity belongs to the request which produced this account
+    # observation. Never attach the current environment after the fetch.
+    previous_review_scopes = cache.get("account_review_scopes")
+    review_scopes = dict(previous_review_scopes) if isinstance(previous_review_scopes, dict) else {}
+    for review_broker in account_success | failed:
+        review_scopes.pop(review_broker, None)
+    for review_broker in account_success - failed:
+        value = (account_review_scopes or {}).get(review_broker)
+        if isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value):
+            review_scopes[review_broker] = value
+    cache["account_review_scopes"] = review_scopes
     cache["successful_account_brokers"] = sorted((set(cache.get("successful_account_brokers", [])) - failed) | account_success)
     cache["successful_position_brokers"] = sorted((set(cache.get("successful_position_brokers", [])) - failed) | position_success)
     observed_at = datetime.now(timezone.utc).isoformat()
@@ -16314,6 +16333,9 @@ def _poll_execution_events_unlocked(
         broker_id.strip().lower(),
     )
     force = len(broker_ids) == 1 if force_snapshot is None else bool(force_snapshot)
+    from live_trader.reconciliation_review import configured_review_scopes
+    from os import environ as review_environment
+    review_scopes = configured_review_scopes(review_environment)
     router = LiveBrokerRouter()
     events: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -16523,6 +16545,7 @@ def _poll_execution_events_unlocked(
         errors,
         successful_account_brokers=successful_account_snapshot_brokers,
         successful_position_brokers=successful_position_snapshot_brokers,
+        account_review_scopes=review_scopes,
     )
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # Record exact-broker success only after real event-ledger processing above.
@@ -29696,6 +29719,32 @@ def operator_review_document(deployment_id):
             error = "선택 배포의 현재 고정 구성을 검증하지 못했습니다. 저장된 버전만 비교합니다."
     baseline = previous or current
     return {"ok": True, "scope": scope, "history": history, "before": operator_manifest_view(baseline), "after": proposed or operator_manifest_view(current), "comparisonBasis": "실행 중 고정 버전" if running else "직전 저장 버전" if previous else "현재 저장 버전", "comparisonError": error}
+
+
+
+def reconciliation_review_context(reconciliation=None, ledger=None):
+    # Private, read-only evidence bundle: keep unredacted row identity on the
+    # server and never synthesize renderer connectivity or broker success.
+    import copy
+    cache = STATE.get("broker_reconciliation", {})
+    return {"reconciliation": reconciliation if reconciliation is not None else reconciliation_snapshot(),
+            "program_ledger": ledger if ledger is not None else program_ledger_snapshot(),
+            "broker_observations": copy.deepcopy({key: cache.get(key) for key in
+                ("position_observations", "successful_position_brokers", "positions", "account_review_scopes")})}
+
+
+def review_reconciliation_difference(payload):
+    from .reconciliation_review import acknowledge_review, configured_review_scopes
+    # Review consumes only the current cached observation. It never polls a
+    # broker, adjusts the ledger, clears a latch, or retries a trading action.
+    try:
+        current = reconciliation_review_context()
+        review = acknowledge_review(payload, current, configured_review_scopes(os.environ), OPERATOR_REVIEW_STORE)
+        return {"ok": True, "review": review, "executionAuthorityGranted": False,
+                "cashFlowVerified": False, "snapshot": snapshot()}
+    except (ValueError, OSError, sqlite3.Error, RuntimeError) as exc:
+        return {"ok": False, "reason": str(exc) if isinstance(exc, ValueError) else "확인 기록 저장을 완료하지 못했습니다. 현재 항목을 다시 확인하세요.",
+                "executionAuthorityGranted": False, "cashFlowVerified": False}
 
 
 def operator_note_document(key, payload=None):

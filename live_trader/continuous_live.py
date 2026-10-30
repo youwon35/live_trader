@@ -686,6 +686,10 @@ class LiveContinuousController:
                 ),
                 **latency_kwargs,
             )
+            # Passive public archive is never attached to sealed native feeds.
+            if not native_prepared_required:
+                from trading_runtime.observed_candle_archive import ArchivingClosedBarFeed, PROVIDERS as ARCHIVE_PROVIDERS
+                feeds = [ArchivingClosedBarFeed(feed) if feed.provider_id in ARCHIVE_PROVIDERS else feed for feed in feeds]
             for feed in (() if native_prepared_required else feeds):
                 feed.connect()
             warmup: dict[str, int] = prepared_warmup or {}

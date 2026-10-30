@@ -31,6 +31,7 @@ class OperatorReviewStore:
                 db.execute("CREATE TABLE IF NOT EXISTS notes (record_key TEXT PRIMARY KEY, text TEXT NOT NULL, revision INTEGER NOT NULL, updated_at TEXT NOT NULL)")
                 db.execute("CREATE TABLE IF NOT EXISTS note_history (id INTEGER PRIMARY KEY, record_key TEXT NOT NULL, text TEXT NOT NULL, revision INTEGER NOT NULL, updated_at TEXT NOT NULL)")
                 db.execute("CREATE TABLE IF NOT EXISTS preflights (id INTEGER PRIMARY KEY, scope TEXT NOT NULL, recorded_at TEXT NOT NULL, manifest_hash TEXT NOT NULL, payload TEXT NOT NULL)")
+                db.execute("CREATE TABLE IF NOT EXISTS balance_reviews (id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL, recorded_at TEXT NOT NULL, payload TEXT NOT NULL)")
                 yield db
         finally:
             db.close()
@@ -39,6 +40,39 @@ class OperatorReviewStore:
     def validate_key(key):
         if not isinstance(key,str) or not re.fullmatch(r"[0-9a-f]{64}",key):
             raise ValueError("실행 기록 식별값을 확인할 수 없습니다.")
+
+
+    def balance_reviews(self):
+        # A snapshot does not create a database, table, or write transaction.
+        if not self.path.exists():
+            return []
+        db = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("PRAGMA query_only=ON")
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='balance_reviews'").fetchone():
+                return []
+            rows = db.execute("SELECT fingerprint,action,reason,recorded_at FROM balance_reviews WHERE id IN (SELECT MAX(id) FROM balance_reviews GROUP BY fingerprint)").fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            db.close()
+
+    def save_balance_review(self, candidate, reason, action):
+        from .reconciliation_review import REASONS, SCHEMA
+        fingerprint = candidate.get("fingerprint")
+        self.validate_key(fingerprint)
+        if candidate.get("schema") != SCHEMA or reason not in REASONS or action not in {"ACKNOWLEDGE", "REOPEN"}:
+            raise ValueError("확인할 과거 차이와 사유를 다시 선택하세요.")
+        payload = json.dumps(candidate, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            last = db.execute("SELECT action,reason,recorded_at FROM balance_reviews WHERE fingerprint=? ORDER BY id DESC LIMIT 1", (fingerprint,)).fetchone()
+            if last and last["action"] == action and last["reason"] == reason:
+                return {"fingerprint": fingerprint, **dict(last), "idempotent": True}
+            db.execute("INSERT INTO balance_reviews(fingerprint,action,reason,recorded_at,payload) VALUES (?,?,?,?,?)",
+                       (fingerprint, action, reason, now, payload))
+        return {"fingerprint": fingerprint, "action": action, "reason": reason, "recorded_at": now, "idempotent": False}
 
     def note(self, key):
         self.validate_key(key)

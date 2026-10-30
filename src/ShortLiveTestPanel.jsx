@@ -14,6 +14,13 @@ import RealtimeMonitor from "./RealtimeMonitor.jsx";
 import ContinuousMonitor from "./ContinuousMonitor.jsx";
 import {projectRealtimeMonitor} from "./realtimeMonitorModel.js";
 import "./MonitorWorkspace.css";
+import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
+
+const MonitorTabs = createNestedTabs(React);
+const MONITOR_TABS = Object.freeze([
+  { id: "ordinary", label: "실행 중인 전략과 거래소" },
+  { id: "trial", label: "주문 연결 시험" },
+]);
 
 const defaultApi = { snapshot: getShortLiveTestSnapshot, catalog: getShortLiveTestCatalog, prepare: prepareShortLiveTest, start: startShortLiveTest, stop: stopShortLiveTest };
 const money = (value) => value === null || value === undefined ? "미확인" : `${new Intl.NumberFormat("ko-KR").format(value)}원`;
@@ -33,6 +40,28 @@ const preparedTargetText = (target) => [
 function Blockers({ values = [], label = "진행을 막는 사유" }) {
   const rows = [...new Set(values.map(shortLiveBlockerLabel))];
   return rows.length ? <div className="short-live-blockers" role="status" aria-label={label}><strong>{label}</strong><ul>{rows.map((row) => <li key={row}>{row}</li>)}</ul></div> : null;
+}
+
+function MarketDataArchiveStatus({ value }) {
+  const routes = SHORT_LIVE_ROUTES.map(route => {
+    const samples = Array.isArray(value?.[route.id]) ? value[route.id] : [];
+    if (!samples.length) return null;
+    const count = key => samples.every(row => Number.isSafeInteger(row?.[key]) && row[key] >= 0)
+      ? samples.reduce((total, row) => total + row[key], 0) : null;
+    const saved = count("saved"), failed = count("failed"), dropped = count("dropped"), pending = count("pending");
+    const needsReview = samples.some(row => row?.failed > 0 || row?.dropped > 0 || Boolean(row?.lastError));
+    return { ...route, routeLabel: route.label, saved, failed, dropped, pending, needsReview,
+      label: needsReview ? "봉 보관 확인 필요" : pending > 0 ? "저장 대기" : saved > 0 ? `${saved.toLocaleString("ko-KR")}개 보관` : saved === 0 ? "아직 보관 없음" : "보관 상태 미확인" };
+  }).filter(Boolean);
+  if (!routes.length) return null;
+  const needsReview = routes.some(route => route.needsReview);
+  return <details className="ts-disclosure market-data-archive-status">
+    <summary className="ts-disclosure-summary"><span>수집 봉 보관</span><span className={needsReview ? "monitor-tone-warning" : "monitor-tone-neutral"}>{needsReview ? "봉 보관 확인 필요" : "보관 내역 보기"}</span></summary>
+    <div className="ts-disclosure-body">
+      <p className="workflow-copy">수신한 공개 완성봉의 보관 상태입니다. 거래 성공이나 검증 데이터 발행을 뜻하지 않습니다.</p>
+      <ul>{routes.map(route => <li key={route.id}><strong>{route.routeLabel}</strong><span className={route.needsReview ? "monitor-tone-warning" : "monitor-tone-neutral"}>{route.label}</span><small>보관 {route.saved ?? "미확인"} · 대기 {route.pending ?? "미확인"} · 실패 {route.failed ?? "미확인"} · 누락 {route.dropped ?? "미확인"}</small></li>)}</ul>
+    </div>
+  </details>;
 }
 
 export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, pollMs = 5000, legacyWorkspace = null, viewMode = "setup", operationalSnapshot = {}, onOpenMonitor, onOpenSetup, onOpenExecution }) {
@@ -59,6 +88,8 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const [preparedAuthority, setPreparedAuthority] = useState("");
   const [unknownMutation, setUnknownMutation] = useState("");
   const [showLegacy, setShowLegacy] = useState(false);
+  const [monitorTab, setMonitorTab] = useState("trial");
+  const monitorPanelId = React.useId();
   const mounted = useRef(false);
   const pollFlight = useRef(null);
   const catalogFlight = useRef(null);
@@ -246,11 +277,17 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
 
   const monitorView = projectRealtimeMonitor(snapshot, {fresh, pollError, receivedAt, now:Date.now(), staleMs:Math.max(20000,pollMs*3)});
   if (viewMode === "monitor") return <div className="short-live-workspace" aria-label="실시간 감시 작업공간">
-    <div className="monitor-workspace-actions"><button className="secondary-button" type="button" onClick={onOpenSetup}>시험 설정·시작·중지</button><button className="secondary-button" type="button" onClick={refresh} disabled={Boolean(busy)}><RefreshCw size={15}/> 상태 새로 확인</button></div>
-    {unknownMutation && <p role="alert" className="short-live-error">요청 결과 미확정 · 자동 재시도하지 않습니다. 시험 설정에서 동일 실행의 상태를 확인하세요.</p>}
-    {error && <p role="alert" className="short-live-error">{error}</p>}
-    <ContinuousMonitor snapshot={operationalSnapshot} onOpenExecution={onOpenExecution}/>
-    <RealtimeMonitor snapshot={snapshot} fresh={fresh} pollError={pollError} receivedAt={receivedAt} staleMs={Math.max(20000,pollMs*3)}/>
+    <MonitorTabs ariaLabel="실시간 감시 종류" className="monitor-view-tabs" value={monitorTab} options={MONITOR_TABS} onChange={setMonitorTab} panelIdPrefix={monitorPanelId} variant="compact" />
+    <section role="tabpanel" id={monitorPanelId + "-ordinary"} aria-labelledby={monitorPanelId + "-tab-ordinary"} hidden={monitorTab !== "ordinary"} tabIndex={0}>
+      <ContinuousMonitor snapshot={operationalSnapshot} onOpenExecution={onOpenExecution}/>
+    </section>
+    <section role="tabpanel" id={monitorPanelId + "-trial"} aria-labelledby={monitorPanelId + "-tab-trial"} hidden={monitorTab !== "trial"} tabIndex={0}>
+      <div className="monitor-workspace-actions"><button className="secondary-button" type="button" onClick={onOpenSetup}>시험 설정·시작·중지</button><button className="secondary-button" type="button" onClick={refresh} disabled={Boolean(busy)}><RefreshCw size={15}/> 상태 새로 확인</button></div>
+      {unknownMutation && <p role="alert" className="short-live-error">요청 결과 미확정 · 자동 재시도하지 않습니다. 시험 설정에서 동일 실행의 상태를 확인하세요.</p>}
+      {error && <p role="alert" className="short-live-error">{error}</p>}
+      <RealtimeMonitor snapshot={snapshot} fresh={fresh} pollError={pollError} receivedAt={receivedAt} staleMs={Math.max(20000,pollMs*3)}/>
+      <MarketDataArchiveStatus value={snapshot.runtime?.marketDataArchive}/>
+    </section>
   </div>;
   return <div className="short-live-workspace" aria-label="짧은 실거래 기능시험">
     <section className="panel monitor-compact-summary"><div><span className="short-live-eyebrow">실행 관측</span><strong>{monitorView.state.title}</strong><p>{monitorView.state.detail}</p></div><button className="secondary-button" type="button" onClick={onOpenMonitor}>실시간 감시 열기</button></section>

@@ -29,7 +29,7 @@ test('a poll attempt alone never claims successful REST or real-time observation
 test('actual recent REST success is distinct from a connected private stream', () => {
   const snapshot = { execution_events: { snapshot_poll: { brokers: { upbit: { last_status: 'unchanged', last_success_at: '2026-10-28T09:00:00Z' } } } } };
   assert.equal(liveExecutionDisplay(snapshot, { nowMs: Date.parse('2026-10-28T09:00:10Z') }).value, 'REST 조회 완료');
-  assert.equal(liveExecutionDisplay(snapshot, { nowMs: Date.parse('2026-10-28T09:10:00Z') }).value, '체결 감시 미시작');
+  assert.equal(liveExecutionDisplay(snapshot, { nowMs: Date.parse('2026-10-28T09:10:00Z') }).value, '마지막 REST 조회 보관');
   assert.equal(liveExecutionDisplay(snapshot, { nowMs: Date.parse('2026-10-28T08:00:00Z') }).value, '체결 감시 미시작');
   snapshot.execution_events.errors = [{ broker_id: 'upbit' }];
   assert.equal(liveExecutionDisplay(snapshot, { nowMs: Date.parse('2026-10-28T09:00:10Z') }).value, '조회 오류 확인');
@@ -41,7 +41,7 @@ test('one connected stream does not imply every broker is connected', () => {
 });
 test('legacy balance observations cannot become fills or baseline approval', () => {
   const view = liveLedgerDisplay({ program_ledger: { cash: [{ source: 'event_poll' }], fill_event_count: 0, snapshot_event_count: 91468, other_event_count: 0, last_cash_update: '2026-07-30 02:30:36', execution_events: Array(20).fill({ state: 'UNKNOWN' }) } });
-  assert.equal(view.value, '과거 잔고 기준');
+  assert.equal(view.value, '과거 조회 기록');
   assert.equal(view.fillCount, 0);
   assert.equal(view.baselineRecorded, false);
   assert.equal(view.status, 'warn');

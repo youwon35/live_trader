@@ -14,16 +14,31 @@ export function liveReconciliationDisplay(snapshot = {}) {
     || ["fail", "failed", "blocked", "error"].includes(String(summary.status ?? "").toLowerCase());
   const reference = reconciliationReferenceView(snapshot);
   const rawStatus = failed ? "fail" : brokerKnown ? summary.status || "warn" : "warn";
+  const issues = liveReconciliationIssues(snapshot);
+  const reviewedCount = issues.filter(row => row.reviewed === true).length;
+  const mismatchCount = Number.isSafeInteger(summary.mismatch_count) ? summary.mismatch_count : null;
+  const allReviewedHistory = snapshot.api_connected === true && reviewedCount > 0 && mismatchCount === reviewedCount
+    && Number(summary.api_required_count) === 0 && Number(summary.error_count) === 0;
+
   return {
     brokerKnown,
-    status: reference.referenceOnly ? "info" : rawStatus,
-    label: reference.referenceOnly ? "과거 기준 차이 · 참고" : failed ? summary.status_label || "대조 실패" : brokerKnown ? summary.status_label || "확인 필요" : "대조 미확인",
-    rawStatus,
+    status: allReviewedHistory || reference.referenceOnly ? "info" : rawStatus,
+    label: allReviewedHistory ? "과거 차이 · 사용자 확인" : reference.referenceOnly ? "과거 기준 차이 · 참고" : failed ? summary.status_label || "대조 실패" : brokerKnown ? summary.status_label || "확인 필요" : "대조 미확인",
+    rawStatus, reviewedCount, unreviewedCount: mismatchCount === null ? null : Math.max(0,mismatchCount-reviewedCount),
     referenceCount: reference.classificationEnabled ? reference.referenceCount : 0,
     actionableCount: reference.classificationEnabled ? reference.actionableCount : null,
     referenceOnly: reference.referenceOnly,
     detail: reference.referenceOnly ? "과거 조회 기준과 현재 잔고의 변화입니다. 현재 운용 손익·주문·포지션 대조 통과를 뜻하지 않습니다." : "",
   };
+}
+
+export function liveBrokerBalanceDisplay(snapshot = {}, {fresh = false} = {}) {
+  const view = liveReconciliationDisplay(snapshot);
+  const last = snapshot.reconciliation?.summary?.last_run;
+  if (view.brokerKnown) return {status: fresh ? "pass" : "info", value: fresh ? "조회됨" : "마지막 조회값 보관",
+    detail: "마지막 계좌 조회 " + last + (fresh ? "" : " · 자동 반복 조회하지 않음 · 최신 값은 계좌 다시 읽기")};
+  return {status:"warn",value:snapshot.api_connected === true ? "조회 결과 확인 필요" : "서버 연결 미확인",
+    detail:"마지막 대조 " + (last || "미실행") + " · 조회 시각과 계좌별 오류를 확인하세요."};
 }
 
 const rows = (value) => Array.isArray(value) ? value : [];
@@ -46,6 +61,9 @@ export function liveExecutionDisplay(snapshot = {}, { nowMs = Date.now(), maxAge
     return Number.isFinite(nowMs) && age >= 0 && age <= maxAgeMs;
   }).length;
   const attempt = validTime(execution.last_poll) ? execution.last_poll : null;
+  const recordedSuccesses = polls.filter(item => validTime(item?.last_success_at)
+    && Number.isFinite(nowMs) && Date.parse(item.last_success_at) <= nowMs);
+  const lastSuccess = recordedSuccesses.map(item => item.last_success_at).sort().at(-1);
   if (connected) return {
     status: connected === streams.length && !failures ? "pass" : "warn",
     value: connected === streams.length ? "실시간 연결" : "일부 실시간 연결",
@@ -58,6 +76,10 @@ export function liveExecutionDisplay(snapshot = {}, { nowMs = Date.now(), maxAge
   if (recentSuccesses) return {
     status: "warn", value: "REST 조회 완료",
     detail: `최근 REST 조회 성공 ${recentSuccesses}곳 · 실시간 체결 감시 ${running ? "연결 대기" : "미시작"}`,
+  };
+  if (recordedSuccesses.length) return {
+    status:"info",value:"마지막 REST 조회 보관",
+    detail:"마지막 조회 성공 " + lastSuccess + " · 현재 실시간 체결 감시 " + (running ? "연결 대기" : "미시작") + " · 새 조회는 계좌 다시 읽기",
   };
   return {
     status: "warn", value: attempt ? "최근 조회 미확인" : "체결 감시 미시작",
@@ -82,7 +104,7 @@ export function liveLedgerDisplay(snapshot = {}) {
   const referenceOnly = reconciliationReferenceView(snapshot).referenceOnly;
   return {
     status: referenceOnly ? "info" : "warn",
-    value: !exists ? "원장 없음" : legacy && referenceOnly ? "과거 조회 참고" : legacy ? "과거 잔고 기준" : baselineRecorded ? "기준 기록 있음" : "기준 미확인",
+    value: !exists ? "원장 없음" : fillCount > 0 ? "실제 체결 기록" : legacy ? (referenceOnly ? "과거 조회 참고" : "과거 조회 기록") : baselineRecorded ? "기준 기록 있음" : "기준 미확인",
     detail: `${countText}${historyText}${otherText} · 원장 변경 ${updated || "미확인"} · ${referenceOnly ? "과거 조회 참고 · 현재 운용 원장과 별도" : baselineRecorded ? `기준 기록 ${baseline}` : "기준 승인 근거 미확인"}`,
     baselineRecorded, legacy, fillCount, snapshotCount, otherCount,
   };
@@ -143,10 +165,25 @@ export function liveReconciliationIssues(snapshot = {}) {
           ? '입출금·수동 거래·수수료 등으로 잔고가 달라질 수 있습니다. 이 차이만으로 원인을 확정하거나 현재 운용 손실로 계산하지 않습니다. 실제 운용의 주문·포지션 대조와 구분합니다.'
           : '조회된 보유분을 앱이 매수한 자산이나 수익으로 간주하지 않습니다. 현재 운용에 자동 편입하지 않으며, 실제 주문·포지션 원장과 구분해 보존합니다.';
       }
-      issues.push({ referenceKind, presentationOnlyReference, displayTone: presentationOnlyReference ? 'info' : 'danger', cashFlowCauseVerified: false, kind, brokerId: row.broker_id || "unknown", symbol: row.symbol || "", currency: row.currency || "", reason, detail, comparison,
+      issues.push({ referenceKind, presentationOnlyReference, displayTone: presentationOnlyReference ? 'info' : 'danger', cashFlowCauseVerified: false, kind, brokerId: row.broker_id || "unknown", symbol: row.symbol || "", currency: row.currency || "", side:String(row.position_side || ""), reason, detail, comparison,
+        before:kind === "cash" ? row.program_cash_value : row.program_qty_value,
+        after:kind === "cash" ? row.broker_cash_value : row.broker_qty_value,
         baselineAt: validTime(updatedAt) ? updatedAt : null,
         delta: comparisonIssue ? null : kind === "cash" ? row.delta_cash : row.delta_qty, status: row.status, source: source || "unknown" });
     }
   }
-  return issues;
+  const reviews = snapshot.api_connected === true ? rows(snapshot.reconciliation_review?.items) : [];
+  return issues.map(issue => {
+    const matches=reviews.filter(review=>review?.kind===issue.kind && review?.brokerId===issue.brokerId
+      && review?.currency===issue.currency && review?.symbol===issue.symbol && review?.side===issue.side
+      && review?.programSource===issue.source && review?.baselineAt===(issue.baselineAt || "")
+      && review?.before===issue.before && review?.after===issue.after
+      && ['HISTORICAL_BALANCE_REFERENCE','UNMANAGED_SPOT_INVENTORY'].includes(review?.classification)
+      && issue.status==='mismatch' && typeof review.fingerprint==='string' && /^[0-9a-f]{64}$/.test(review.fingerprint));
+    if (matches.length!==1) return issue;
+    const review=matches[0];
+    return {...issue,reviewFingerprint:review.fingerprint,reviewed:review.acknowledged===true,
+      reviewedAt:review.reviewedAt,reviewReason:review.reviewReason,reviewReasonLabel:review.reviewReasonLabel,
+      displayTone:review.acknowledged===true ? 'info' : issue.displayTone};
+  });
 }

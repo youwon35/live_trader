@@ -4,7 +4,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import {
   buildShortLivePrepare, exactShortLiveTarget, normalizeShortLiveCandidate,
-  normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveReadyForConsent, shortLiveCoverage,
+  normalizeMarketDataArchive, normalizeShortLiveSnapshot, mergeShortLiveSnapshot, sanitizeShortLiveText, shortLiveReadyForConsent, shortLiveCoverage,
   shortLiveRuntimeMeaning, shortLiveRetirementMeaning, shortLiveSelectionSignature, shortLivePreparationMatches, shortLiveBlockerLabel,
   shortLivePreviousSelection, shortLivePreparationWindow, shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLiveRunning,
   normalizeShortLiveFuturesPolicy, shortLiveProtectionLabel, shortLiveFuturesIncidentLabel,
@@ -262,7 +262,7 @@ test("actual backend blocker codes describe account funding, KIS session/cost an
   assert.equal(shortLiveBlockerLabel("선택한 범위를 다시 확인하세요."),"선택한 범위를 다시 확인하세요.");
 });
 test("panel mutates only from explicit event handlers and never retries unknown starts", () => {
-  const panel = readFileSync(new URL("../src/ShortLiveTestPanel.jsx", import.meta.url), "utf8");
+  const panel = readFileSync(new URL("../src/ShortLiveTestPanel.jsx", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   assert.match(panel, /onClick=\{prepare\}/); assert.match(panel, /onClick=\{start\}/); assert.match(panel, /onClick=\{stop\}/);
   assert.match(panel, /setUnknownMutation\("start"\)/); assert.match(panel, /setUnknownMutation\("stop"\)/);
   const effect = panel.match(/useEffect\(\(\) => \{\n    mounted\.current = true;([\s\S]*?)\n  \}, \[refresh, refreshCatalog, pollMs\]\);/)?.[1];
@@ -278,7 +278,7 @@ test("source position percentages remain explicit, including old 5 percent and n
   assert.deepEqual(normalizeShortLiveCandidate(instance({ positionSizePercents: [100, 100] })).positionSizePercents, [100]);
   assert.deepEqual(normalizeShortLiveCandidate(instance({ positionSizePercents: [false, "100", null, -1, 101, NaN] })).positionSizePercents, []);
   assert.deepEqual(normalizeShortLiveCandidate(instance()).positionSizePercents, []);
-  const panel = readFileSync(new URL("../src/ShortLiveTestPanel.jsx", import.meta.url), "utf8");
+  const panel = readFileSync(new URL("../src/ShortLiveTestPanel.jsx", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   assert.match(panel, /원래 5% 후보는 5% 그대로/);
 });
 
@@ -356,4 +356,20 @@ test("futures multiplier has no fixed125 cap; exact exchange bracket remains bac
     const result = normalizeShortLiveFuturesPolicy({leverage, marginMode:"ISOLATED", stopLossPercent:0.001});
     assert.equal(result.leverage, leverage);
   }
+});
+
+
+test("archive diagnostics preserve unknown counts and never grant execution or publication evidence", () => {
+  assert.equal(normalizeMarketDataArchive(undefined), null);
+  assert.equal(normalizeMarketDataArchive({}), null);
+  const value=normalizeShortLiveSnapshot({runtime:{marketDataArchive:{
+    BINANCE_SPOT:[{saved:24,failed:0,dropped:0,pending:1,lastError:"",executionEvidence:false,published:false}],
+    UPBIT_KRW_SPOT:[{saved:"10",failed:-1,dropped:Infinity,pending:true,lastError:"private diagnostic text",executionEvidence:true,published:true}],
+    KIS_KR_CASH:[], privateAccount:[{saved:100}],
+  }}}).runtime.marketDataArchive;
+  assert.deepEqual(value.BINANCE_SPOT,[{saved:24,failed:0,dropped:0,pending:1,lastError:"",executionEvidence:false,published:false}]);
+  assert.deepEqual(value.UPBIT_KRW_SPOT,[{saved:null,failed:null,dropped:null,pending:null,lastError:"ARCHIVE_ERROR_REPORTED",executionEvidence:null,published:null}]);
+  assert.deepEqual(value.KIS_KR_CASH,[]);
+  assert.equal(Object.hasOwn(value,"privateAccount"),false);
+  assert.doesNotMatch(JSON.stringify(value),/private diagnostic text/);
 });

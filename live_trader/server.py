@@ -51,6 +51,7 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
 )
 _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
+        "/api/reconciliation/review",
         "/api/short-live-tests/prepare",
         "/api/runtime/batches/prepare",
         "/api/runtime/batches/start-member",
@@ -631,13 +632,19 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             require_origin=True
         ):
             return
-        if parsed.path == "/api/operator-note":
+        if parsed.path in {"/api/operator-note", "/api/reconciliation/review"}:
             origin = self.headers.get("Origin", "")
             expected = "http://" + self.headers.get("Host", "")
             if origin != expected or not self.headers.get("Content-Type", "").lower().startswith("application/json"):
-                self.send_json({"ok": False, "reason": "현재 앱 화면에서만 메모를 저장할 수 있습니다."})
+                self.send_json({"ok": False, "reason": "현재 앱 화면에서만 확인 기록을 저장할 수 있습니다."})
                 return
         payload = self.read_json()
+        if parsed.path == "/api/reconciliation/review":
+            if parsed.query or not self.path.startswith("/") or parsed.scheme or parsed.netloc or not isinstance(payload, dict):
+                self.send_json({"ok": False, "reason": "정확한 현재 항목으로 다시 확인하세요."})
+                return
+            self.send_json(state.review_reconciliation_difference(payload))
+            return
         if parsed.path in {"/api/short-live-tests/prepare", "/api/short-live-tests/start", "/api/short-live-tests/stop"}:
             if parsed.query or not isinstance(payload, dict):
                 self.send_json({"ok": False, "reasonCode": "EXACT_SHORT_LIVE_REQUEST_REQUIRED"})

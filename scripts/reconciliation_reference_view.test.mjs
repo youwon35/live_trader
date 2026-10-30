@@ -56,7 +56,7 @@ test('future or impossible historical timestamps and inconsistent blocking count
 });
 test('only verified reference-only history changes the ledger presentation, never its original fields',()=>{
  const s=snapshot(),before=structuredClone(s.program_ledger),display=liveLedgerDisplay(s);assert.equal(display.value,'과거 조회 참고');assert.equal(display.status,'info');assert.equal(display.baselineRecorded,false);assert.match(display.detail,/현재 운용 원장과 별도/);assert.deepEqual(s.program_ledger,before);
- s.continuous_runtime.running=true;assert.equal(liveLedgerDisplay(s).value,'과거 잔고 기준');assert.equal(liveLedgerDisplay(s).status,'warn');
+ s.continuous_runtime.running=true;assert.equal(liveLedgerDisplay(s).value,'과거 조회 기록');assert.equal(liveLedgerDisplay(s).status,'warn');
 });
 test('an unknown backend summary failure status is not reclassified as a healthy reference-only state',()=>{
  const s=snapshot();s.reconciliation.summary.status='error';assert.equal(reconciliationReferenceView(s).referenceOnly,false);assert.equal(liveReconciliationDisplay(s).status,'fail');

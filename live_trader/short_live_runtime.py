@@ -15,6 +15,7 @@ import time
 from typing import Any, Mapping
 
 from trading_runtime.realtime_feeds import FeedSubscription, feeds_for_specs
+from trading_runtime.observed_candle_archive import CandleArchiveWriter
 from .env_loader import default_runtime_data_root
 from .process_safety import live_trader_instance_lease_status
 from .short_live_catalog import ShortLiveCatalogues
@@ -36,6 +37,9 @@ class ShortLiveTestService(_ShortLiveTestService):
         # small view; the ordinary dashboard must never wait for this lock,
         # construct a service, or perform broker reads just to show its header.
         runtime = super()._public_runtime()
+        if runtime is not None:
+            runtime["marketDataArchive"] = {route: feed.archive_status() for route, feed in getattr(self, "_feeds", {}).items()
+                                           if callable(getattr(feed, "archive_status", None))}
         global _PUBLIC_STATUS
         if runtime is None:
             public = {"known": True, "active": False, "status": "DISABLED", "pendingOrderCount": 0}
@@ -123,6 +127,7 @@ class NativeFeed:
         )
         if len(self.children) != 1:
             raise ValueError("EXACT_ROUTE_FEED_REQUIRED")
+        self._archive = CandleArchiveWriter() if self.route in {"BINANCE_SPOT", "BINANCE_USDM_FUTURES", "UPBIT_KRW_SPOT"} else None
 
     def connect(self):
         for child in self.children:
@@ -143,9 +148,15 @@ class NativeFeed:
         if self.route == "UPBIT_KRW_SPOT":
             from .short_live_upbit_history import record_seed_anchor
             record_seed_anchor(self.children[0], spec, bars)
+        if getattr(self, "_archive", None) is not None:
+            self._archive.record(bars, "HISTORICAL_WARMUP")
         return bars
 
     def configure_warmup_bridge(self, specs, callback):
+        def retain_history(members, bars, receipt):
+            callback(members, bars, receipt)
+            if getattr(self, "_archive", None) is not None:
+                self._archive.record(bars, "HISTORICAL_WARMUP")
         if self.route not in {"KIS_KR_CASH", "UPBIT_KRW_SPOT"}:
             return
         def configure(child):
@@ -162,10 +173,10 @@ class NativeFeed:
                 return
             if self.route == "KIS_KR_CASH":
                 from .short_live_kis_history import configure_feed_bridge
-                configure_feed_bridge(child, matching, self.settings, callback)
+                configure_feed_bridge(child, matching, self.settings, retain_history)
             else:
                 from .short_live_upbit_history import configure_feed_bridge
-                configure_feed_bridge(child, matching, callback)
+                configure_feed_bridge(child, matching, retain_history)
         for child in self.children:
             configure(child)
 
@@ -179,7 +190,12 @@ class NativeFeed:
                 from trading_runtime.market_clock_integrity import validate_market_clock_integrity
                 if validate_market_clock_integrity(body):
                     raise ValueError("NATIVE_FEED_CLOCK_INTEGRITY_FAILED")
+        if getattr(self, "_archive", None) is not None:
+            self._archive.record(events, "FORWARD_OBSERVED")
         return events
+
+    def archive_status(self):
+        return [self._archive.snapshot()] if self._archive is not None else []
 
     def close(self):
         errors = []
@@ -188,6 +204,8 @@ class NativeFeed:
                 child.disconnect()
             except Exception as exc:
                 errors.append(type(exc).__name__)
+        if getattr(self, "_archive", None) is not None:
+            self._archive.close()
         if errors:
             raise RuntimeError("NATIVE_FEED_RETIREMENT_UNVERIFIED")
 

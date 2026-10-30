@@ -10,7 +10,7 @@ export default function ContinuousMonitor({snapshot={},onOpenExecution}) {
   return <section className="panel continuous-monitor" aria-label="일반 운용 실시간 감시">
     <header className="monitor-workspace-header"><div><span className="live-monitor-eyebrow">LIVE TRADER · 일반 운용</span><h2><Activity size={22}/> 실행 중인 전략과 거래소</h2></div><button className="secondary-button" onClick={onOpenExecution}>운용 설정 <ArrowUpRight size={15}/></button></header>
     <div className="monitor-runtime-summary"><strong>{view.connected ? view.active ? `${view.active}개 운용 실행 중` : '실행 중인 일반 운용이 없습니다' : '현재 실행 상태를 확인할 수 없습니다'}</strong><span>{view.issueCount?`${view.issueCount}개 경로 확인 필요`:'경로별 엔진 응답과 봉 수신 시각을 확인하세요'}</span></div>
-    {!view.rows.length?<p className="live-monitor-empty">운용 전략을 시작하면 거래소와 종목이 자동으로 이 화면에 모입니다. 주문 연결 시험은 아래 별도 영역에서 확인할 수 있습니다.</p>:<div className="monitor-runtime-grid">{view.rows.map((row,i)=><article key={row.runtimeId||i}>
+    {!view.rows.length?<p className="live-monitor-empty">운용 전략을 시작하면 거래소와 종목이 자동으로 이 화면에 모입니다. 주문 연결 시험은 위의 ‘주문 연결 시험’ 탭에서 확인할 수 있습니다.</p>:<div className="monitor-runtime-grid">{view.rows.map((row,i)=><article key={row.runtimeId||i}>
       <div className="monitor-runtime-title"><strong>{row.brokerLabel}</strong><span className={`monitor-tone-${row.tone}`}><Radio size={13}/> {row.state}</span></div>
       <p>{row.portfolioId || row.requestedStrategyId || row.deploymentId || '전략 식별 정보 미확인'}</p><small>{row.mode==='MONITOR'?'관찰 · 주문 없음':row.mode==='SMALL_LIVE'?'제한 실거래':row.mode==='FULL_LIVE'?'실전 운용':'모드 미확인'}</small>
       <dl><div><dt>완성봉</dt><dd>{n(row.bars)}</dd></div><div><dt>전략 평가</dt><dd>{n(row.decisions)}</dd></div><div><dt>관측 종목</dt><dd>{row.symbols.length || '—'}</dd></div></dl>

@@ -1,6 +1,7 @@
 import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel, diagnosticSafetyContext, preflightCheckPresentation, ordinarySafetyPresentation } from "./diagnosticPresentation.js";
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
 import ReconciliationChanges from "./ReconciliationChanges.jsx";
+import { submitReconciliationReview } from "./reconciliationReviewApi.js";
 import StartupProgress, { useStartupProgress } from "./StartupProgress.jsx";
 import { startupAccountObservation } from "./startupProgressModel.js";
 import { createSnapshotResponseGate, createSnapshotReadCoordinator, initialAccountRefreshState, accountRefreshResultState, accountObservationView } from "./snapshotRefreshState.js";
@@ -108,7 +109,7 @@ import { executionApprovalLabel, strategyLifecycleRank } from "../../../packages
 import { readArtifactLifecycle } from "../../../packages/design/artifact-lifecycle.js";
 import { buildLiveStrategyProgress, liveDeploymentLifecycleLabel, liveStrategyLifecycleStage, liveStrategyValidationStage, liveStrategyPhaseFilter, liveStrategyPhaseId, liveStrategyPhaseLabel, liveStrategyPhaseOptions, liveStrategyProgressLabel, liveRuntimeModeLabel } from "./strategyProgressDisplay.js";
 import { LIVE_WORKSPACE_ROUTE_IDS, liveNavigationRoot, liveNavigationRoute, liveSectionTabs } from "./liveNavigation.js";
-import { liveReconciliationDisplay, liveExecutionDisplay, liveLedgerDisplay, liveReconciliationIssues } from "./liveReconciliationDisplay.js";
+import { liveReconciliationDisplay, liveExecutionDisplay, liveLedgerDisplay, liveReconciliationIssues, liveBrokerBalanceDisplay } from "./liveReconciliationDisplay.js";
 import {
   buildRetryMatrix,
   projectAccountReconciliation,
@@ -2619,7 +2620,7 @@ function App() {
           </div>
         </header>
 
-        <StartupProgress view={startup} onRetryConnection={refresh} onRetryPreferences={() => setPreferencesAttempt(value => value + 1)} onRetryAccounts={refreshBrokerAccounts} />
+        {selectedNav === "overview" && <StartupProgress view={startup} onRetryConnection={refresh} onRetryPreferences={() => setPreferencesAttempt(value => value + 1)} onRetryAccounts={refreshBrokerAccounts} />}
         {["functional-test", "monitor"].includes(selectedNav) ? null : (
           <LiveEnvironmentBar
             context={deploymentContext}
@@ -2699,6 +2700,7 @@ function App() {
           onPreflight={() => runAction(() => runFinalPreflight(deploymentContext.id, deploymentContext.strategyId))}
           onAccountRefresh={refreshBrokerAccounts}
           accountRefreshState={accountRefreshState}
+          onReconciliationReview={(payload) => runAction(() => submitReconciliationReview(payload), { preserveSnapshotWithoutPayload: true })}
           onEnvSettings={(values, confirmed) => runAction(() => saveEnvSettings(values, confirmed))}
           appearance={appearance}
           updateAppearance={updateAppearance}
@@ -2865,6 +2867,7 @@ function WorkspaceContent({
   onPreflight,
   onAccountRefresh,
   accountRefreshState,
+  onReconciliationReview,
   onEnvSettings,
   appearance,
   updateAppearance,
@@ -2980,8 +2983,12 @@ function WorkspaceContent({
   if (selectedNav === "accounts") {
     return renderPage(
       <section className="accounts-page-layout ts-layout-stack">
-        <AccountRefreshStatus snapshot={snapshot} state={accountRefreshState} nowMs={accountNowMs} />
-        <ThreeWayReconciliationPanel snapshot={snapshot} accountRefreshState={accountRefreshState} nowMs={accountNowMs} />
+        <CompactDisclosure title="계좌 갱신" description="마지막 계좌 조회 시각과 갱신 결과를 확인합니다." className="account-observation-disclosure">
+          <AccountRefreshStatus snapshot={snapshot} state={accountRefreshState} nowMs={accountNowMs} />
+        </CompactDisclosure>
+        <CompactDisclosure title="계좌·포지션 3자 대조" description="거래소 잔고, 주문·체결, 원장의 비교 근거를 확인합니다." className="account-observation-disclosure">
+          <ThreeWayReconciliationPanel snapshot={snapshot} accountRefreshState={accountRefreshState} nowMs={accountNowMs} onReview={onReconciliationReview} />
+        </CompactDisclosure>
         <UnifiedBrokerAccountPanel
           accounts={snapshot.accounts ?? []}
           executionEvents={snapshot.execution_events}
@@ -3264,7 +3271,7 @@ function AccountRefreshStatus({ snapshot, state, nowMs }) {
   </section>;
 }
 
-function ThreeWayReconciliationPanel({ snapshot = {}, accountRefreshState = initialAccountRefreshState, nowMs }) {
+function ThreeWayReconciliationPanel({ snapshot = {}, accountRefreshState = initialAccountRefreshState, nowMs, onReview }) {
   const observation = accountObservationView(snapshot, accountRefreshState, nowMs);
   if (!observation.connected) return <section className="panel three-way-reconciliation-panel">
     <PanelHeader title="계좌·포지션 3자 대조" subtitle="연결 응답 미확인 · 계좌·원장·체결 건수를 확인할 수 없습니다." />
@@ -3275,16 +3282,16 @@ function ThreeWayReconciliationPanel({ snapshot = {}, accountRefreshState = init
   const execution = snapshot.execution_events ?? {};
   const ledger = snapshot.program_ledger ?? {};
   const reconciliationDisplay = liveReconciliationDisplay(snapshot);
-  const brokerKnown = reconciliationDisplay.brokerKnown && observation.fresh;
+  const brokerDisplay = liveBrokerBalanceDisplay(snapshot, { fresh: observation.fresh });
   const executionDisplay = liveExecutionDisplay(snapshot, { nowMs });
   const ledgerDisplay = liveLedgerDisplay(snapshot);
   const issues = liveReconciliationIssues(snapshot);
   const projected = projectAccountReconciliation(snapshot);
   const rows = [
-    { label: "거래소 잔고 조회", status: brokerKnown ? "pass" : "warn", value: brokerKnown ? "조회됨" : "미확인", detail: `마지막 대조 ${summary.last_run || "미실행"}` },
+    { label: "거래소 잔고 조회", ...brokerDisplay },
     { label: "주문·체결 확인 방식", ...executionDisplay },
     { label: "프로그램 원장", ...ledgerDisplay },
-    { label: "3자 최종 대조", status: reconciliationDisplay.referenceOnly || observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.status : "warn", value: reconciliationDisplay.referenceOnly || observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.label : "현재 대조 미확인", detail: reconciliationDisplay.referenceOnly ? `과거 참고 ${reconciliationDisplay.referenceCount}건 · 운용 대조 통과 아님` : `확인할 운용 차이 ${reconciliationDisplay.actionableCount ?? summary.mismatch_count ?? "미확인"} · 과거 참고 ${reconciliationDisplay.referenceCount} · API/원장 필요 ${summary.api_required_count ?? "미확인"}` },
+    { label: "3자 최종 대조", status: reconciliationDisplay.referenceOnly || observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.status : "warn", value: reconciliationDisplay.referenceOnly || observation.fresh || reconciliationDisplay.status === "fail" ? reconciliationDisplay.label : "현재 대조 미확인", detail: reconciliationDisplay.referenceOnly ? `과거 참고 ${reconciliationDisplay.referenceCount}건 · 사용자 확인 ${reconciliationDisplay.reviewedCount ?? 0}건 · 운용 대조 통과 아님` : `확인할 운용 차이 ${reconciliationDisplay.unreviewedCount ?? reconciliationDisplay.actionableCount ?? summary.mismatch_count ?? "미확인"} · 사용자 확인 ${reconciliationDisplay.reviewedCount ?? 0}건 · API/원장 필요 ${summary.api_required_count ?? "미확인"}` },
   ];
   return (
     <section className="panel three-way-reconciliation-panel">
@@ -3292,7 +3299,7 @@ function ThreeWayReconciliationPanel({ snapshot = {}, accountRefreshState = init
       <div className="ts-panel-grid ts-panel-grid--two">
         {rows.map(row => <AccountObservationLine key={row.label} label={row.label} value={row.value} detail={row.detail} tone={row.status === "info" ? "info" : statusTone(row.status)} />)}
       </div>
-      <ReconciliationChanges issues={issues} />
+      <ReconciliationChanges issues={issues} onReview={onReview} />
       <p className="workflow-copy">REST는 API로 직접 읽는 방식입니다. 실시간 연결이 없어도 조회할 수 있으며, 조회 성공이 실제 체결이나 원장 일치를 뜻하지는 않습니다.</p>
       <ReconciliationEvidence snapshot={snapshot} />
     </section>
