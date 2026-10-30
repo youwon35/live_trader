@@ -1,3 +1,4 @@
+import { installTaskNotifications } from "../../../packages/design/task-notifications.js";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App.jsx";
@@ -17,6 +18,8 @@ import "./moa-surfaces.css";
 import { installLayoutEditingSupport } from "../../../packages/design/layout-editing.js";
 
 installLayoutEditingSupport({ program: "live-trader" });
+
+installTaskNotifications({ id: "live_trader", title: "Live Trader", location: "작업 상태·실행 기록에서 상세 결과를 확인하세요." });
 
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>

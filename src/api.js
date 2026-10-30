@@ -1,3 +1,4 @@
+import { observeTaskResponse, observeTaskError } from "../../../packages/design/task-notifications.js";
 import { createMarketGapCoordinator } from "./marketGapPreparation.js";
 import { createKisPreparationCoordinator } from "./kisNativePreparation.js";
 
@@ -968,6 +969,7 @@ export async function transitionIncident(incidentId, action, note = "") {
 }
 
 export async function request(path, options = {}) {
+  const taskStarted = Date.now();
   const controller = new AbortController();
   const timeoutMs = options.timeoutMs ?? API_DEFAULT_TIMEOUT_MS;
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -1008,8 +1010,10 @@ export async function request(path, options = {}) {
     if (!result) {
       throw new ApiRequestError("API가 올바른 JSON 응답을 반환하지 않았습니다.", "INVALID_RESPONSE");
     }
+    observeTaskResponse(path, options, result, taskStarted);
     return result;
   } catch (error) {
+    observeTaskError(path, options, taskStarted);
     if (error?.name === "AbortError") {
       const seconds = Math.max(1, Math.round(timeoutMs / 1000));
       throw new ApiRequestError(`API 응답 시간이 ${seconds}초를 초과했습니다.`, "TIMEOUT", { cause: error });

@@ -61,6 +61,7 @@ def main() -> None:
 
         tray = DesktopTrayController(window, app_id="live-trader", title="Live Trader")
         tray.start()
+        getattr(tray, "expose_task_notifications", lambda: None)()
 
         def remember_window_state(*_args: object) -> bool | None:
             nonlocal shutdown_requested
