@@ -29,7 +29,7 @@ export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt
       <small>6시간은 예정 운용 시간입니다. 필수 조건이 깨지면 새 주문을 보류하고 먼저 종료·대조를 진행합니다. 시작 동의가 6시간 동안의 무조건 실행을 뜻하지 않습니다.</small>
     </div>}
     {view.firstFailure && <details className="live-monitor-alert">
-      <summary>최초 오류 상세{view.failureDiagnostics[0] && ` · ${view.failureDiagnostics[0].providerLabel} · ${view.failureDiagnostics[0].resultLabel}`}</summary>
+      <summary>최초 오류 상세 · {view.firstFailure}</summary>
       <p>{view.firstFailure}</p>
       {view.failureDiagnostics.length > 0 ? <ul>{view.failureDiagnostics.map((row, index) => <li key={index}>
         <strong>{row.providerLabel}</strong> · {row.resultLabel} · {row.elapsedLabel}
