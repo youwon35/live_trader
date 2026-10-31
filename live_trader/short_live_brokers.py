@@ -172,12 +172,14 @@ class ShortLiveBrokerAdapter:
                  observe_cleanup_order: Callable[..., bool] | None = None,
                  protection_reader=None, protection_transport=None, force_order_reader=None,
                  reserve_protection=None, record_protection=None,
+                 conversion_reader: Callable[..., Mapping[str, Any]] | None = None,
                  budget: SharedExchangeBudget | None = None, clock: Callable[[], float] = time.time,
                  coordination=None, coordination_settings=None) -> None:
         if route not in ROUTES:
             raise ShortLiveBrokerBlocked("ROUTE_UNSUPPORTED")
         self.route, self.provider, self.exchange, self.currency = route, *ROUTES[route]
         self.snapshot_reader, self.market_reader = snapshot_reader, market_reader
+        self.conversion_reader = conversion_reader
         self.transport, self.authority_guard = transport, authority_guard
         self.reserve_cleanup_order, self.reserve_cleanup_cancel = reserve_cleanup_order, reserve_cleanup_cancel
         self.observe_cleanup_order = observe_cleanup_order
@@ -689,6 +691,26 @@ class ShortLiveBrokerAdapter:
                 self._protection._incident("FUTURES_SETTINGS_CHANGED_DURING_SESSION", symbol=symbol)
         return q
 
+    def _reconciliation_conversion(self) -> dict[str, Any]:
+        """Fresh currency conversion only; never authorizes or sizes an order."""
+        q = dict(self.conversion_reader(self.route))
+        if q.get("known") is not True or q.get("quoteCurrency") != self.currency:
+            reason = next((r for r in q.get("blockers", []) if isinstance(r, str)
+                           and re.fullmatch(r"[A-Z][A-Z0-9_]{2,100}", r)), None)
+            error = ShortLiveBrokerBlocked(reason or "FRESH_FX_REQUIRED")
+            error.readDiagnostics = sanitize_read_diagnostics(q.get("readDiagnostics"))
+            raise error
+        try:
+            self._fresh(q.get("fxObservedAt"), 15, code="FX_OBSERVATION_STALE")
+            number(q.get("krwPerQuote"), positive=True)
+        except ShortLiveBrokerBlocked as exc:
+            from .native_fx_observation import recheck_fx_diagnostics
+            exc.readDiagnostics = recheck_fx_diagnostics(
+                sanitize_read_diagnostics(q.get("readDiagnostics")),
+                checked_at=datetime.fromtimestamp(self.clock(), timezone.utc))
+            raise
+        return q
+
     def _accounting_preview(self, manifest, markets, capital):
         if self.route != "BINANCE_USDM_FUTURES": return None
         leverage=int(futures_policy(self._futures_policy)[0])
@@ -1178,9 +1200,20 @@ class ShortLiveBrokerAdapter:
             m = self._scope(session)
             s = self._snapshot(m)
             actual_positions = [p for p in s["positions"] if number(p["quantity"]) != 0]
-            quotes = ({symbol: {"krwPerQuote": "1", "nativePrice": "0"} for symbol in m["symbols"]}
-                      if self.currency == "KRW" and not actual_positions else
-                      {symbol: self._market(symbol, allow_setting_drift=True) for symbol in m["symbols"]})
+            settled_flat = (not actual_positions and not s["openOrders"] and not s.get("openAlgoOrders")
+                and all(str(self._fill_rows.get(cid, {}).get("status")) in
+                    {"FILLED", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED"} for cid in self._claims))
+            if self.currency == "KRW" and not actual_positions:
+                quotes = {symbol: {"krwPerQuote": "1", "nativePrice": "0"} for symbol in m["symbols"]}
+            elif settled_flat and callable(self.conversion_reader):
+                # The fresh account truth above proves there is no exposure or
+                # outstanding intent. Fees, filters, price and leverage metadata
+                # are irrelevant to idle-cash loss conversion. Re-read FX with its
+                # original timestamp; readiness/size/submit still use _market.
+                conversion = self._reconciliation_conversion()
+                quotes = {symbol: conversion for symbol in m["symbols"]}
+            else:
+                quotes = {symbol: self._market(symbol, allow_setting_drift=True) for symbol in m["symbols"]}
             fx = number(next(iter(quotes.values()))["krwPerQuote"])
             committed = self._capital_committed(actual_positions, fx)
             equity = number(s["equityNative"]) * fx
@@ -1363,6 +1396,7 @@ def create_production_short_live_broker(route: str, *, settings: Mapping[str, An
     readers = ProductionShortLiveReaders(settings=settings, fx_reader=fx_reader,
                                         ownership_reader=ownership_reader, cost_reader=cost_reader, clock=clock)
     return ShortLiveBrokerAdapter(route, snapshot_reader=readers.snapshot, market_reader=readers.market,
+                                  conversion_reader=readers.conversion,
                                   transport=OfficialBrokerTransport(router, order_reader=readers.get_order), authority_guard=authority_guard,
                                   reserve_cleanup_order=reserve_cleanup_order, reserve_cleanup_cancel=reserve_cleanup_cancel,
                                   observe_cleanup_order=observe_cleanup_order,

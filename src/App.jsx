@@ -2892,7 +2892,7 @@ function WorkspaceContent({
     <PageView selectedNav={selectedNav} onNavigate={onNavigate} snapshot={snapshot} searchQuery={searchQuery}>
       {(monitorVisited || monitoringPage) && <div hidden={!monitoringPage}>
         <React.Suspense fallback={<section className="panel" role="status">실시간 감시 화면을 불러오는 중입니다.</section>}>
-          <ShortLiveTestPanel viewMode={selectedNav === "monitor" ? "monitor" : "setup"} operationalSnapshot={snapshot}
+          <ShortLiveTestPanel activeView={monitoringPage} viewMode={selectedNav === "monitor" ? "monitor" : "setup"} operationalSnapshot={snapshot}
             onOpenMonitor={() => onNavigate("monitor")} onOpenSetup={() => onNavigate("functional-test")}
             onOpenExecution={() => onNavigate("automation")} legacyWorkspace={<FunctionalTestWorkspace snapshot={snapshot} />} />
         </React.Suspense>

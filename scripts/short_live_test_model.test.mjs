@@ -265,8 +265,10 @@ test("panel mutates only from explicit event handlers and never retries unknown 
   const panel = readFileSync(new URL("../src/ShortLiveTestPanel.jsx", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   assert.match(panel, /onClick=\{prepare\}/); assert.match(panel, /onClick=\{start\}/); assert.match(panel, /onClick=\{stop\}/);
   assert.match(panel, /setUnknownMutation\("start"\)/); assert.match(panel, /setUnknownMutation\("stop"\)/);
-  const effect = panel.match(/useEffect\(\(\) => \{\n    mounted\.current = true;([\s\S]*?)\n  \}, \[refresh, refreshCatalog, pollMs\]\);/)?.[1];
-  assert.ok(effect); assert.doesNotMatch(effect, /api\.(start|stop|prepare)/);
+  const effects = [...panel.matchAll(/useEffect\(\(\) => \{([\s\S]*?)\n  \}, \[[^\]]*\]\);/g)].map(match => match[1]);
+  assert.ok(effects.some(effect => effect.includes("mounted.current = true")));
+  assert.ok(effects.some(effect => effect.includes("createVisibleStatusPoll")));
+  for (const effect of effects) assert.doesNotMatch(effect, /api\.(start|stop|prepare)/);
   assert.doesNotMatch(panel, /window\.confirm|submitTestIntent|setFlag|applyBinanceFuturesSettings|releaseDryRun|short-live-ack|setAcknowledged/);
   assert.match(panel, /동의하고 실거래 시작/);
   assert.match(panel, /confirmed: true, confirmationText: SHORT_LIVE_CONFIRMATION/);

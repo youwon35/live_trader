@@ -17,6 +17,7 @@ import {restoreOperatingProfile} from "./operatingProfile.js";
 import {projectRealtimeMonitor} from "./realtimeMonitorModel.js";
 import "./MonitorWorkspace.css";
 import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
+import { createVisibleStatusPoll } from "./visibleStatusPoll.js";
 
 const MonitorTabs = createNestedTabs(React);
 const MONITOR_TABS = Object.freeze([
@@ -66,7 +67,7 @@ function MarketDataArchiveStatus({ value }) {
   </details>;
 }
 
-export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, pollMs = 5000, legacyWorkspace = null, viewMode = "setup", operationalSnapshot = {}, onOpenMonitor, onOpenSetup, onOpenExecution }) {
+export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, pollMs = 5000, activeView = true, legacyWorkspace = null, viewMode = "setup", operationalSnapshot = {}, onOpenMonitor, onOpenSetup, onOpenExecution }) {
   const [snapshot, setSnapshot] = useState(() => normalizeShortLiveSnapshot(initialSnapshot));
   const [fresh, setFresh] = useState(false);
   const [receivedAt, setReceivedAt] = useState(null);
@@ -94,6 +95,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const monitorPanelId = React.useId();
   const mounted = useRef(false);
   const pollFlight = useRef(null);
+  const visiblePoll = useRef(null);
   const catalogFlight = useRef(null);
   const displayCatalog = useRef(snapshot.catalog);
   const snapshotVersion = useRef(0);
@@ -102,6 +104,9 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const futuresPolicy = { leverage: futuresLeverage, marginMode: "ISOLATED", stopLossPercent: futuresStopLossPercent };
   const selectionSignature = shortLiveSelectionSignature(snapshot.catalog, selection, durationHours, futuresPolicy);
   const active = shortLiveRunning(snapshot);
+  // The status reader observes a drained worker's natural exit. Keep it even
+  // off-screen until a verified terminal result, including uncertain replies.
+  const observationRequired = active || Boolean(busy || unknownMutation || pollError);
   const locked = Boolean(busy) || catalogLoading || active || unknownMutation;
   const coverage = useMemo(() => shortLiveCoverage(snapshot.catalog), [snapshot.catalog]);
   const visibleCandidates = useMemo(() => shortLiveFilterCandidates(snapshot.catalog, {
@@ -175,10 +180,21 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   }, [api, acceptStatus]);
 
   useEffect(() => {
-    mounted.current = true; refresh(); refreshCatalog();
-    const timer = setInterval(refresh, Math.max(1000, pollMs));
-    return () => { mounted.current = false; clearInterval(timer); };
-  }, [refresh, refreshCatalog, pollMs]);
+    mounted.current = true;
+    refreshCatalog();
+    return () => { mounted.current = false; };
+  }, [refreshCatalog]);
+
+  useEffect(() => {
+    const observer = createVisibleStatusPoll({ refresh, intervalMs: pollMs,
+      activeView, observationRequired, invalidate: () => setFresh(false) });
+    visiblePoll.current = observer;
+    return () => { observer.dispose(); visiblePoll.current = null; };
+  }, [refresh, pollMs]);
+
+  useEffect(() => {
+    visiblePoll.current?.update({ activeView, observationRequired });
+  }, [activeView, observationRequired]);
 
   useEffect(() => {
     if (!snapshot.prepared || active) return;

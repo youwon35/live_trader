@@ -921,6 +921,29 @@ class ProductionShortLiveReaders:
             return {"known": False, "events": events, "observedAt": observed,
                     "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "OFFICIAL_FORCE_ORDER_UNKNOWN"]}
 
+    def conversion(self, route: str) -> dict[str, Any]:
+        """Observe only the conversion needed by a verified flat account.
+
+        This is an independent fresh public read, not a market-readiness cache.
+        No symbol settings, fees, account endpoint or mutation is requested.
+        """
+        self._read_diagnostics = []
+        try:
+            if route not in ROUTES:
+                raise ShortLiveBrokerBlocked("ROUTE_UNSUPPORTED")
+            currency = ROUTES[route][2]
+            fx = ({"known": True, "krwPerQuote": "1", "observedAt": self._now()}
+                  if currency == "KRW" else self._fx(currency))
+            return {"known": True, "quoteCurrency": currency,
+                    "krwPerQuote": str(number(fx["krwPerQuote"], positive=True)),
+                    "fxObservedAt": fx["observedAt"],
+                    "fxObservation": sanitize_fx_observation(fx.get("fxObservation")),
+                    "readDiagnostics": self._failure_reads()}
+        except Exception as exc:
+            return {"known": False,
+                    "blockers": [str(exc) if isinstance(exc, ShortLiveBrokerBlocked) else "FRESH_FX_REQUIRED"],
+                    "readDiagnostics": self._failure_reads()}
+
     def market(self, route: str, symbol: str) -> dict[str, Any]:
         self._read_diagnostics = []
         try:
