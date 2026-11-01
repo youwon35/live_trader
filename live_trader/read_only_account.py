@@ -1,7 +1,8 @@
-"""Credential-scoped account reads. No order transport, global monkeypatch or disk cache.
+"""Credential-scoped account reads. No order transport or private disk cache.
 
 Only exact official read endpoints are reachable. OAuth tokenP authenticates reads;
-it cannot mint a trading permit. Responses and credentials stay in memory.
+it cannot mint a trading permit. Private responses and credentials stay in memory;
+allowlisted unauthenticated public JSON may use the shared short-lived cache.
 """
 from __future__ import annotations
 from datetime import datetime, timezone
@@ -14,6 +15,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from trading_runtime.public_request_manager import (
+    public_request_policy, shared_public_json, critical_request_scope,
+    remaining_request_seconds, PublicRequestUnavailable,
+)
 
 from .live_adapters import build_upbit_authorization, sign_binance_query, split_kis_account
 from .kis_overseas_funding import DEFAULT_MODE, MODE_KEY, funding_policy, parse_orderable_funding, resolve_funding_mode
@@ -94,9 +100,19 @@ class ReadOnlyTransport:
     def __init__(self, *, timeout=8):
         self.timeout = timeout
         self.events = []
+        self._public_receipts = threading.local()
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
+    @property
+    def last_public_observation(self):
+        return getattr(self._public_receipts, "value", None)
+
+    @last_public_observation.setter
+    def last_public_observation(self, value):
+        self._public_receipts.value = value
+
     def request(self, provider, method, path, *, query=None, headers=None, body=None):
+        self.last_public_observation = None
         oauth = provider == "kis" and method == "POST" and path == "/oauth2/tokenP"
         if not oauth and (method != "GET" or path not in READ_PATHS.get(provider, set()) or body is not None):
             raise ReadBoundaryError("READ_ONLY_ENDPOINT_BLOCKED")
@@ -113,8 +129,8 @@ class ReadOnlyTransport:
                                      headers=headers or {}, method=method)
         event = {"provider": provider, "method": method, "path": path, "status": "UNKNOWN"}
         self.events.append(event)
-        try:
-            with self.opener.open(req, timeout=self.timeout) as response:
+        def load():
+            with self.opener.open(req, timeout=remaining_request_seconds(self.timeout)) as response:
                 if response.status < 200 or response.status >= 300:
                     raise ReadFailure("HTTP_ERROR")
                 # Defense even for an injected opener which did not use NoRedirect.
@@ -152,12 +168,26 @@ class ReadOnlyTransport:
                     payload = decode_inventory_response(raw)
                 else:
                     payload = json.loads(raw)
-                event["status"] = "AVAILABLE"
                 return payload, {str(k).lower(): str(v) for k, v in response.headers.items()}
+        self.last_public_observation = None
+        try:
+            # The sealed FX HTTP clock proof needs its own physical response.
+            # Authenticated/account requests never enter the public cache.
+            if (method == "GET" and body is None and path != "/v1/orderbook"
+                    and public_request_policy(url, headers)):
+                observation = shared_public_json(url, headers or {}, load,
+                    priority="ORDER", max_age_seconds=0.5, timeout_seconds=self.timeout)
+                self.last_public_observation = observation
+                result = observation.payload, dict(observation.response_headers)
+            else:
+                with critical_request_scope(provider, purpose="PROTECTION", timeout_seconds=self.timeout):
+                    result = load()
+            event["status"] = "AVAILABLE"
+            return result
         except ReadFailure:
             event["status"] = "BLOCKED"
             raise
-        except (OSError, ValueError, urllib.error.URLError):
+        except (OSError, ValueError, urllib.error.URLError, PublicRequestUnavailable):
             event["status"] = "UNAVAILABLE"
             raise ReadFailure("READ_UNAVAILABLE") from None
 

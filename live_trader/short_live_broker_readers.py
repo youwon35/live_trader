@@ -21,6 +21,11 @@ import urllib.request
 from zoneinfo import ZoneInfo
 from typing import Any
 
+from trading_runtime.public_request_manager import (
+    public_request_policy, shared_public_json, critical_request_scope, remaining_request_seconds,
+    PublicRequestUnavailable,
+)
+
 from .short_live_brokers import ROUTES, ShortLiveBrokerBlocked, number, decimal_text
 from .short_live_read_diagnostics import DIAGNOSTIC_PATHS, sanitize_read_diagnostics
 from .short_live_upbit_quote import UpbitQuoteObservationError, validate_upbit_quote_observation
@@ -75,6 +80,8 @@ def _safe_read_failure(exc):
         result = {"status": "UNAVAILABLE", "failureKind": "TIMEOUT"}
     elif http is not None:
         result = {"status": "REJECTED", "failureKind": "HTTP_ERROR", "httpStatus": http}
+    elif any(isinstance(item, PublicRequestUnavailable) for item in chain):
+        result = {"status": "UNAVAILABLE", "failureKind": "READ_UNAVAILABLE"}
     elif any(isinstance(item, (urllib.error.URLError, ConnectionError, OSError)) for item in chain):
         result = {"status": "UNAVAILABLE", "failureKind": "CONNECTION_ERROR"}
     elif any(isinstance(item, (json.JSONDecodeError, ValueError, TypeError, KeyError)) for item in chain):
@@ -111,6 +118,7 @@ class ProductionShortLiveReaders:
                          "/fapi/v1/order", "/fapi/v1/openAlgoOrders", "/fapi/v1/userTrades",
                          "/fapi/v1/algoOrder", "/fapi/v1/forceOrders", "/fapi/v1/leverageBracket"}
                 def request(self, provider, method, path, *, query=None, headers=None, body=None):
+                    self.last_public_observation = None
                     self.last_broker_code = None
                     extra_allowed = ((provider == "binance-futures" and path in self.EXTRA)
                                      or (provider == "upbit" and path == "/v1/orderbook/instruments"))
@@ -123,15 +131,25 @@ class ProductionShortLiveReaders:
                     encoded = query if isinstance(query, str) else urllib.parse.urlencode(query or {})
                     url = ORIGINS[provider] + path + ("?" + encoded if encoded else "")
                     req = urllib.request.Request(url, headers=headers or {}, method="GET")
-                    with self.opener.open(req, timeout=self.timeout) as response:
-                        if response.geturl() != url or not 200 <= response.status < 300:
-                            raise ShortLiveBrokerBlocked("OFFICIAL_READ_REJECTED")
-                        raw = response.read(4 * 1024 * 1024 + 1)
-                        if len(raw) > 4 * 1024 * 1024:
-                            raise ShortLiveBrokerBlocked("OFFICIAL_READ_TOO_LARGE")
-                        payload = json.loads(raw)
-                        self.last_broker_code = _safe_broker_code(payload)
-                        return payload, dict(response.headers)
+                    self.last_public_observation = None
+                    def load():
+                        with self.opener.open(req, timeout=remaining_request_seconds(self.timeout)) as response:
+                            if response.geturl() != url or not 200 <= response.status < 300:
+                                raise ShortLiveBrokerBlocked("OFFICIAL_READ_REJECTED")
+                            raw = response.read(4 * 1024 * 1024 + 1)
+                            if len(raw) > 4 * 1024 * 1024:
+                                raise ShortLiveBrokerBlocked("OFFICIAL_READ_TOO_LARGE")
+                            return json.loads(raw), dict(response.headers)
+                    if public_request_policy(url, headers):
+                        observation = shared_public_json(url, headers or {}, load,
+                            priority="ORDER", max_age_seconds=0.5, timeout_seconds=self.timeout)
+                        self.last_public_observation = observation
+                        result = observation.payload, dict(observation.response_headers)
+                    else:
+                        with critical_request_scope(provider, purpose="PROTECTION", timeout_seconds=self.timeout):
+                            result = load()
+                    self.last_broker_code = _safe_broker_code(result[0])
+                    return result
             reader = ReadOnlyBrokerReader(self.settings, transport=ExtendedReadTransport())
         self.reader = reader
         self.fx_reader = fx_reader or self._official_fx
@@ -197,8 +215,19 @@ class ProductionShortLiveReaders:
     def _failure_reads(self):
         return sanitize_read_diagnostics(self._read_diagnostics)
 
+    def _public_receipt_times(self, started, received):
+        observation = getattr(getattr(self.reader, "transport", None), "last_public_observation", None)
+        if observation is not None:
+            return float(observation.request_started_at), float(observation.received_at)
+        return started, received
+
+    def _public_received_iso(self):
+        _, received = self._public_receipt_times(self.clock(), self.clock())
+        return datetime.fromtimestamp(received, timezone.utc).isoformat()
+
     def _upbit_quote_observation(self, row, symbol, *, purpose, started, received, previous_read):
-        """Retain only current ticker timing evidence, never a full response."""
+        """Retain the original public receipt, including shared observations."""
+        started, received = self._public_receipt_times(started, received)
         def retain(observation):
             if (observation is not None and self._read_diagnostics
                     and self._read_diagnostics[-1] is not previous_read
@@ -242,6 +271,7 @@ class ProductionShortLiveReaders:
             price = quote.get("trade_price")
         else:
             raise ShortLiveBrokerBlocked("EXACT_SPOT_ROUTE_REQUIRED")
+        started, _ = self._public_receipt_times(started, self.clock())
         if not -2 <= self.clock() - started <= 10:
             raise ShortLiveBrokerBlocked("MARKET_OBSERVATION_STALE")
         return number(price, positive=True)
@@ -991,7 +1021,7 @@ class ProductionShortLiveReaders:
                     brackets, coefficient = self._leverage_brackets(
                         self._binance(provider, "/fapi/v1/leverageBracket", {"symbol": symbol}), symbol)
                     premium = self._binance(provider, "/fapi/v1/premiumIndex", {"symbol": symbol}, signed=False)
-                    quote_received = self._now()
+                    quote_received = self._public_received_iso()
                     if not isinstance(premium, Mapping) or premium.get("symbol") != symbol:
                         raise ShortLiveBrokerBlocked("FUTURES_QUOTE_SYMBOL_MISMATCH")
                     price = premium.get("markPrice")
@@ -1018,7 +1048,7 @@ class ProductionShortLiveReaders:
                     fee = sum((number(group.get("taker")) + max(number(group.get("buyer", 0)), number(group.get("seller", 0)))
                                for group in (standard, special, tax)), Decimal(0))
                     ticker = self._binance(provider, "/api/v3/ticker/price", {"symbol": symbol}, signed=False)
-                    quote_received = self._now()
+                    quote_received = self._public_received_iso()
                     price = ticker.get("price")
                 step, min_qty, max_qty = lot.get("stepSize"), lot.get("minQty"), lot.get("maxQty")
             elif provider == "upbit":

@@ -2890,7 +2890,14 @@ def http_json(
             headers=frozen_headers,
         )
     try:
-        with opener(request, timeout=timeout_seconds) as response:  # noqa: S310 - exact broker URL checked above.
+        from trading_runtime.public_request_manager import critical_request_scope
+        # Publish priority only; never cache, retry, sign or modify this request.
+        priority_provider = "kis" if kis_request else {
+            "api.binance.com": "binance",
+            "fapi.binance.com": "binance-futures",
+            "api.upbit.com": "upbit",
+        }.get(urllib.parse.urlsplit(url).hostname or "", "")
+        with critical_request_scope(priority_provider, purpose="ORDER", timeout_seconds=timeout_seconds), opener(request, timeout=timeout_seconds) as response:  # noqa: S310 - exact broker URL checked above.
             status_code = int(response.status)
             effective_url = str(response.geturl())
             if effective_url != url or 300 <= status_code <= 399:

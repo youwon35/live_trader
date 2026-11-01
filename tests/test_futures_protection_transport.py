@@ -61,7 +61,7 @@ sys.modules[adapters.__name__] = adapters
 
 broker_tree = ast.parse((ROOT / "brokers.py").read_text(encoding="utf-8-sig"))
 broker_class = next(n for n in broker_tree.body if isinstance(n, ast.ClassDef) and n.name == "LiveBrokerRouter")
-router_methods = {"place_futures_protection", "get_futures_protection", "cancel_futures_protection"}
+router_methods = {"place_futures_protection", "get_futures_protection", "cancel_futures_protection", "_coordinated_send"}
 router_ast = ast.ClassDef(name="FixtureRouter", bases=[], keywords=[], decorator_list=[],
     body=[n for n in broker_class.body if isinstance(n, ast.FunctionDef) and n.name in router_methods])
 broker_globals = {"__package__": PKG, "re": re, "Decimal": Decimal, "InvalidOperation": InvalidOperation,
@@ -297,12 +297,26 @@ class ProtectionTests(unittest.TestCase):
             if req.endpoint == "/fapi/v1/positionSide/dual": return {"dualSidePosition": False}
             auth.validate_short_live_prepared_request(req, consume=True)
             return {"json": observation()}
-        edge = transport.FuturesProtectionTransport(FixtureRouter())
+        # Exercise the real coordination wrapper, replacing only the persisted
+        # journal/funds boundary. A protection submit remains reducing-only.
+        router = FixtureRouter()
+        router.coordination_owner_id = "fixture-owner"
+        router._coordination_funds_reader = lambda *_: self.fail("protection must not require fixture funds")
+        coordinated = []
+        def dispatch(**kwargs):
+            coordinated.append(kwargs)
+            return kwargs["submit"]()
+        router._order_coordination = types.SimpleNamespace(dispatch=dispatch)
+        edge = transport.FuturesProtectionTransport(router)
         with patch.dict(broker_globals, {"send_binance_signed_request": send}), patch.object(binance, "_snapshot", return_value={
                 "applicationInstanceLeaseHeld": True, "functionalAuthorityOpen": False}):
             result = edge.protect(row, lambda _: True)
         self.assertEqual(123, result["json"]["algoId"])
         self.assertEqual([("GET", "/fapi/v1/positionSide/dual"), ("POST", "/fapi/v1/algoOrder")], calls)
+        self.assertEqual(len(coordinated), 1)
+        self.assertEqual(coordinated[0]["owner_id"], "fixture-owner")
+        self.assertEqual(coordinated[0]["route"], "binance-futures")
+        self.assertTrue(coordinated[0]["reducing_only"])
 
     def test_real_router_refuses_unscoped_disabled_or_changed_position_mode(self):
         router = FixtureRouter(); row = claim(); native = transport.protection_native(row)
