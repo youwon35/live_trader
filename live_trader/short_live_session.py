@@ -179,10 +179,11 @@ class ShortLiveTestService:
                 "catalog": value.get("candidates", []), "coverage": value.get("coverage", []),
                 "readOnly": True, "authorityGranted": False, "promotionEligible": False}
 
-    def _guard(self, manifest: Mapping[str, Any]) -> list[str]:
+    def _guard(self, manifest: Mapping[str, Any], *, preparing: bool = False) -> list[str]:
         if not callable(self.clock_guard):
             return ["FRESH_NATIVE_CLOCK_GUARD_NOT_CONFIGURED"]
-        value = self.clock_guard(deepcopy(dict(manifest)))
+        verifier = getattr(self.clock_guard, "verify_preparation", None) if preparing else None
+        value = (verifier if callable(verifier) else self.clock_guard)(deepcopy(dict(manifest)))
         if not isinstance(value, Mapping) or value.get("ready") is not True:
             return list(value.get("blockers") or ["FRESH_CLOCK_GUARD_NOT_POSITIVE"]) if isinstance(value, Mapping) else ["FRESH_CLOCK_GUARD_UNKNOWN"]
         return []
@@ -320,7 +321,7 @@ class ShortLiveTestService:
                         blockers.append("HISTORY_PREPARATION_INCOMPLETE")
                 except Exception:
                     blockers.append("HISTORY_PREPARATION_UNAVAILABLE")
-            blockers += self._guard(contract)
+            blockers += self._guard(contract, preparing=True)
             readiness: dict[str, Any] = {}
             public_readiness = []
             for leg in contract["legs"]:

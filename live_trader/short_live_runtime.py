@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from copy import deepcopy
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -230,30 +231,54 @@ class FreshClock:
     """Read-only exchange time and wall/monotonic continuity; no OS changes."""
     def __init__(self, reader, controls):
         self.reader, self.controls = reader, controls
-        self.wall, self.mono = time.time(), time.monotonic()
+        # Opening the catalog is not a clock observation. Anchor only after
+        # an independently bounded exchange-time response, then renew that
+        # anchor after each positive proof instead of accumulating OS slew
+        # across the entire lifetime of the desktop service.
+        self.wall = self.mono = None
+        self._last_observed_mono = None
         self.last_positive = None
         self.failure = None
+        self._lock = threading.RLock()
 
     def __call__(self, manifest):
-        blockers = self.controls()
+        with self._lock:
+            return self._check(manifest, preparing=False)
+
+    def verify_preparation(self, manifest):
+        # The service calls this only after refusing an active session. An
+        # unobserved idle interval requires a new independent proof, not a
+        # comparison to an arbitrarily old app-lifetime wall-clock anchor.
+        # A previously observed failure remains latched even here.
+        with self._lock:
+            return self._check(manifest, preparing=True)
+
+    def _check(self, manifest, *, preparing):
+        blockers = list(self.controls())
         wall, mono = time.time(), time.monotonic()
-        if abs((wall-self.wall)-(mono-self.mono)) > .25:
+        if (not math.isfinite(wall) or not math.isfinite(mono)
+                or (self._last_observed_mono is not None and mono < self._last_observed_mono)
+                or (not preparing and self.wall is not None
+                    and abs((wall-self.wall)-(mono-self.mono)) > .25)):
             self.failure = "WALL_MONOTONIC_CONTINUITY_FAILED"
+        self._last_observed_mono = mono
         if self.failure:
             blockers.append(self.failure)
-        if not blockers and (self.last_positive is None or mono-self.last_positive > 10):
+        if not blockers and (preparing or self.last_positive is None or mono-self.last_positive > 10):
             try:
-                started = time.time()
-                tick = time.monotonic()
                 body, _ = self.reader._get("binance", "/api/v3/time")
                 received = time.time()
-                elapsed = time.monotonic()-tick
+                finished = time.monotonic()
+                elapsed = finished-mono
                 ms = body.get("serverTime") if isinstance(body, dict) else None
-                if type(ms) is not int or elapsed > 2 or abs((received-started)-elapsed) > .25:
+                if (type(ms) is not int or not math.isfinite(received) or not math.isfinite(finished)
+                        or elapsed < 0 or elapsed > 2 or abs((received-wall)-elapsed) > .25):
                     raise ValueError("CLOCK_RESPONSE_UNBOUNDED")
-                if max(abs(ms/1000-started), abs(ms/1000-received)) > 2:
+                if max(abs(ms/1000-wall), abs(ms/1000-received)) > 2:
                     raise ValueError("CLOCK_OFFSET_EXCEEDED")
-                self.last_positive = time.monotonic()
+                self.wall, self.mono = received, finished
+                self.last_positive = finished
+                self._last_observed_mono = finished
             except Exception:
                 self.failure = "FRESH_EXCHANGE_CLOCK_UNVERIFIED"
                 blockers.append(self.failure)
