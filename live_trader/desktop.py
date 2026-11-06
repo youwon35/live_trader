@@ -73,6 +73,10 @@ def main() -> None:
             shutdown_requested = True
             from .short_live_runtime import desktop_window_closing
             desktop_window_closing()
+            from .server import shutdown_toss_cash_operation
+            if not shutdown_toss_cash_operation():
+                shutdown_requested = False
+                return False
             _save_window_state(window)
 
         def mark_window_visible(*_args: object) -> None:
@@ -113,6 +117,8 @@ def main() -> None:
                 pass
         from .short_live_runtime import desktop_window_closing
         desktop_window_closing()
+        from .server import shutdown_toss_cash_operation
+        shutdown_toss_cash_operation()
         server.shutdown()
 
 

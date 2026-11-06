@@ -37,6 +37,23 @@ STRATEGY_SEARCH_PRESET_SCHEMA = "strategy-search-presets-v1"
 STRATEGY_SEARCH_PRESET_LIMIT = 30
 _TRADINGVIEW_RESEARCH = None
 _TRADINGVIEW_LOCK = threading.Lock()
+_TOSS_OPERATION = None
+_TOSS_OPERATION_LOCK = threading.Lock()
+
+
+def toss_cash_operation():
+    global _TOSS_OPERATION
+    with _TOSS_OPERATION_LOCK:
+        if _TOSS_OPERATION is None:
+            from .toss_cash_operation import TossCashOperation
+            _TOSS_OPERATION = TossCashOperation(SETTINGS_DIR / "toss-cash-operation")
+        return _TOSS_OPERATION
+
+
+def shutdown_toss_cash_operation():
+    # Closing a hidden tray window does not reach this function. Explicit app
+    # exit requests cleanup, never a guessed process kill or a new run.
+    return _TOSS_OPERATION.shutdown() if _TOSS_OPERATION is not None else True
 
 
 def tradingview_research():
@@ -51,6 +68,7 @@ def tradingview_research():
 _FUNCTIONAL_STATUS_PATHS = frozenset(
     {
         "/api/tradingview/status",
+        "/api/toss/operation/status", "/api/toss/operation/catalog", "/api/toss/operation/preferences",
         "/api/short-live-tests/snapshot",
         "/api/runtime/batches/status",
         "/api/short-live-tests/catalog",
@@ -66,7 +84,8 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
 _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
         "/api/tradingview/connect", "/api/tradingview/disconnect", "/api/tradingview/analyze", "/api/tradingview/chart",
-        "/api/toss/prepare",
+        "/api/toss/prepare", "/api/toss/accounts",
+        "/api/toss/operation/prepare", "/api/toss/operation/start", "/api/toss/operation/stop", "/api/toss/operation/recover", "/api/toss/operation/close_owned", "/api/toss/operation/preferences",
         "/api/reconciliation/review",
         "/api/short-live-tests/prepare",
         "/api/runtime/batches/prepare",
@@ -459,6 +478,22 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(state.runtime_batch_request("status", query["batchId"][0]))
             return
+        if parsed.path in {"/api/toss/operation/status", "/api/toss/operation/catalog", "/api/toss/operation/preferences"}:
+            if parsed.query:
+                self.send_json({"ok": False, "reason": "TOSS_EXACT_REQUEST_REQUIRED"})
+                return
+            try:
+                if parsed.path.endswith("/catalog"):
+                    from .toss_cash_sources import source_catalog
+                    result = source_catalog()
+                elif parsed.path.endswith("/preferences"):
+                    result = toss_cash_operation().preferences()
+                else:
+                    result = toss_cash_operation().status()
+                self.send_json({"ok": True, **result})
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_json({"ok": False, "reason": str(getattr(exc,"code",type(exc).__name__))})
+            return
         if parsed.path == "/api/tradingview/status":
             self.send_json({"ok": True, **tradingview_research().status()})
             return
@@ -658,12 +693,28 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "reason": "현재 앱 화면에서만 확인 기록을 저장할 수 있습니다."})
                 return
         payload = self.read_json()
-        if parsed.path.startswith("/api/tradingview/") or parsed.path == "/api/toss/prepare":
+        if parsed.path in {"/api/toss/operation/prepare", "/api/toss/operation/start", "/api/toss/operation/stop", "/api/toss/operation/recover", "/api/toss/operation/close_owned", "/api/toss/operation/preferences"}:
+            if parsed.query or not isinstance(payload, dict):
+                self.send_json({"ok": False, "reason": "TOSS_EXACT_REQUEST_REQUIRED"})
+                return
+            try:
+                action = parsed.path.rsplit("/", 1)[1]
+                result = getattr(toss_cash_operation(), "begin_prepare" if action == "prepare" else action)(payload)
+                self.send_json(result)
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_json({"ok": False, "reason": str(getattr(exc,"code",str(exc))), "retryOrders": False})
+            return
+        if parsed.path.startswith("/api/tradingview/") or parsed.path in {"/api/toss/prepare", "/api/toss/accounts"}:
             if parsed.query or not isinstance(payload, dict):
                 self.send_json({"ok": False, "reason": "현재 화면에서 정확한 요청으로 다시 확인하세요."})
                 return
             try:
-                if parsed.path == "/api/toss/prepare":
+                if parsed.path == "/api/toss/accounts":
+                    if payload:
+                        raise ValueError("TOSS_ACCOUNT_DISCOVERY_EXACT_REQUEST_REQUIRED")
+                    from .toss_adapter import account_choices
+                    result = account_choices()
+                elif parsed.path == "/api/toss/prepare":
                     from .toss_adapter import prepare_read_only
                     result = prepare_read_only(symbol=str(payload.get("symbol") or "").strip().upper(),
                         market_country=str(payload.get("marketCountry") or "").strip().upper())
@@ -1154,21 +1205,11 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
-            self.send_json(
-                state.save_environment_settings(
-                    (
-                        payload.get("values", {})
-                        if isinstance(payload.get("values"), dict)
-                        else payload
-                    ),
-                    confirmed=payload.get("confirmed") is True,
-                    safety_confirmation=(
-                        dict(payload.get("safety_confirmation"))
-                        if isinstance(payload.get("safety_confirmation"), dict)
-                        else None
-                    ),
-                )
-            )
+            values = payload.get("values", {}) if isinstance(payload.get("values"), dict) else payload
+            self.send_json(toss_cash_operation().save_settings(values, lambda: state.save_environment_settings(
+                values, confirmed=payload.get("confirmed") is True,
+                safety_confirmation=dict(payload["safety_confirmation"]) if isinstance(payload.get("safety_confirmation"), dict) else None,
+            )))
             return
         self.send_error(404, "Unknown API endpoint")
 

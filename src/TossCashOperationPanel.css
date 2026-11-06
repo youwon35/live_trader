@@ -1,0 +1,18 @@
+.toss-cash-panel { padding: 24px; margin-bottom: 20px; min-width: 0; }
+.toss-cash-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
+.toss-cash-heading h2 { margin: 6px 0 0; }
+.toss-cash-fields { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 12px; margin: 16px 0; }
+.toss-cash-fields label { display: grid; gap: 6px; }
+.toss-cash-fields input { width: 100%; min-width: 0; }
+.toss-cash-options { border-top: 1px solid var(--border,#dfe7e8); padding-top: 16px; margin-top: 16px; }
+.toss-cash-options summary { cursor: pointer; font-weight: 600; }
+.toss-cash-targets { max-height: 260px; overflow: auto; margin: 16px 0; }
+.toss-cash-check { display: flex; align-items: flex-start; gap: 10px; margin: 12px 0; line-height: 1.5; }
+.toss-cash-check input { flex: 0 0 auto; margin-top: 4px; width: 18px; height: 18px; }
+.toss-cash-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+.toss-cash-start { padding: 16px; margin-top: 16px; background: var(--surface-subtle,#eef5f2); border-radius: 12px; }
+.toss-cash-stats { display: flex; flex-wrap: wrap; gap: 16px; margin: 16px 0; }
+.toss-cash-stats b { margin-left: 6px; }
+.toss-cash-good { color: var(--success-text,#218376); }
+.toss-cash-error { color: var(--danger-text,#dc3545); overflow-wrap: anywhere; }
+.toss-cash-panel button { min-height: 40px; }

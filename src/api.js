@@ -52,7 +52,8 @@ export function prepareMarketGapsForStart(selection, { accountKey, label, contin
 let functionalHttpSessionFlight = null;
 let functionalHttpSessionGeneration = 0;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
-  "/api/tradingview/connect", "/api/tradingview/disconnect", "/api/tradingview/analyze", "/api/tradingview/chart", "/api/toss/prepare",
+  "/api/toss/operation/prepare", "/api/toss/operation/start", "/api/toss/operation/stop", "/api/toss/operation/recover", "/api/toss/operation/close_owned", "/api/toss/operation/preferences",
+  "/api/tradingview/connect", "/api/tradingview/disconnect", "/api/tradingview/analyze", "/api/tradingview/chart", "/api/toss/prepare", "/api/toss/accounts",
   "/api/reconciliation/review",
   "/api/short-live-tests/prepare", "/api/short-live-tests/start", "/api/short-live-tests/stop",
   "/api/preparation/market-gaps/begin", "/api/preparation/market-gaps/cancel",
@@ -74,6 +75,7 @@ const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/crypto-first-live/reprepare",
 ]);
 const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
+  "/api/toss/operation/status", "/api/toss/operation/catalog", "/api/toss/operation/preferences",
   "/api/tradingview/status",
   "/api/short-live-tests/snapshot",
   "/api/short-live-tests/catalog",

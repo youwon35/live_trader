@@ -38,7 +38,7 @@ class EnvSettingField:
 ENV_SETTING_FIELDS = (
     EnvSettingField("TOSS_CLIENT_ID", "토스증권 Client ID", "토스증권 Open API에서 발급한 Client ID입니다.", "toss", "secret", required=True),
     EnvSettingField("TOSS_CLIENT_SECRET", "토스증권 Client Secret", "Windows 보안 저장소에 보관합니다. 화면에 다시 표시하지 않습니다.", "toss", "secret", required=True),
-    EnvSettingField("TOSS_ACCOUNT_SEQ", "토스증권 계좌 순번", "토스증권 API의 accountSeq입니다. 계좌번호와 다르며 조회 시 실제 계좌와 대조합니다.", "toss", "secret", required=True),
+    EnvSettingField("TOSS_ACCOUNT_SEQ", "토스 공식 API 계좌 식별값 (Account Seq)", "일반 계좌번호가 아닙니다. Client ID와 Secret만 먼저 저장한 뒤 아래 토스증권 연결 확인에서 계좌 목록을 조회해 선택하세요.", "toss", "secret"),
     EnvSettingField("DEFAULT_STOCK_BROKER", "새 주식 연결의 기본 증권사", "새 연결을 만들 때만 제안합니다. 저장된 KIS 전략이나 실행 중인 계좌는 바뀌지 않습니다.", "toss", "select", "toss", True, (("toss", "토스증권"), ("kis", "한국투자증권"))),
     EnvSettingField("SHORT_LIVE_KIS_COST_CONFIRMED", "짧은 시험: 본인 KIS 비용 확인", "본인 계좌의 실제 적용 수수료와 매도세율을 확인한 경우에만 켜세요. 공개 임시 요율을 실제 요율로 취급하지 않습니다.", "kis", "bool", "false"),
     EnvSettingField("SHORT_LIVE_KIS_COST_SOURCE", "짧은 시험: KIS 비용 확인 근거", "본인 계좌 요율을 확인한 문서·상담·조회 근거를 적습니다. 계좌번호나 인증정보는 넣지 마세요.", "kis", "text"),

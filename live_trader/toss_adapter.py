@@ -104,6 +104,29 @@ def verified_account(api, settings=None):
             "maskedAccount": "••••" + str(selected[0]["accountNo"])[-4:]}
 
 
+def account_choices(api=None, settings=None):
+    """Only explicit account discovery; never selects or persists an account."""
+    settings = os.environ if settings is None else settings
+    api = api or client(read_only=True)
+    rows = api.accounts()
+    if not isinstance(rows, list):
+        raise TossAdapterError("TOSS_ACCOUNT_RESPONSE_INVALID")
+    choices = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or row.get("accountType") != "BROKERAGE":
+            continue
+        seq = str(row.get("accountSeq") or "")
+        account = str(row.get("accountNo") or "")
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", seq) or not account or seq in seen:
+            raise TossAdapterError("TOSS_ACCOUNT_RESPONSE_INVALID")
+        seen.add(seq)
+        choices.append({"accountSeq": seq, "label": "토스증권 · ••••" + account[-4:],
+                        "selected": seq == str(settings.get("TOSS_ACCOUNT_SEQ") or "")})
+    return {"accounts": choices, "readOnly": True, "ordersSubmitted": 0,
+            "detail": "공식 API 계좌 목록입니다. 사용할 계좌를 직접 선택해 저장하세요. 일반 계좌번호를 입력하지 않습니다."}
+
+
 def positions(payload):
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
         raise TossAdapterError("TOSS_HOLDINGS_RESPONSE_INVALID")
@@ -183,6 +206,8 @@ def exact_owned_order(payload, proof):
         raise TossAdapterError("TOSS_OWNED_ORDER_CURRENCY_MISMATCH")
     if row.get("orderType") != "LIMIT" or row.get("timeInForce") != "DAY":
         raise TossAdapterError("TOSS_OWNED_ORDER_STYLE_MISMATCH")
+    if proof.get("price") is not None and number(row.get("price"), positive=True) != number(proof["price"], positive=True):
+        raise TossAdapterError("TOSS_OWNED_ORDER_PRICE_MISMATCH")
     if number(row["filled_quantity"]) > number(row["quantity"]):
         raise TossAdapterError("TOSS_OWNED_FILL_QUANTITY_INVALID")
     return row
@@ -255,7 +280,7 @@ def dispatch_funds(intent, api=None):
     if stock.get("symbol") != normalized["symbol"] or stock.get("currency") != currency or stock.get("status") != "ACTIVE":
         raise TossAdapterError("TOSS_STOCK_METADATA_MISMATCH")
     venues = {"KOSPI", "KOSDAQ", "KONEX"} if currency == "KRW" else {"NASDAQ", "NYSE", "AMEX"}
-    if stock.get("market") not in venues or stock.get("securityType") not in {"STOCK", "ETF"}:
+    if stock.get("market") not in venues or stock.get("securityType") not in ({"STOCK", "ETF"} if currency == "KRW" else {"STOCK", "FOREIGN_STOCK", "ETF", "FOREIGN_ETF"}):
         raise TossAdapterError("TOSS_STOCK_MARKET_UNSUPPORTED")
     kr = stock.get("koreanMarketDetail") or {}
     if kr.get("liquidationTrading") or kr.get("krxTradingSuspended"):

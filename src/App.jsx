@@ -1,6 +1,7 @@
 import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel, diagnosticSafetyContext, preflightCheckPresentation, ordinarySafetyPresentation } from "./diagnosticPresentation.js";
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
 import ExternalResearchPanel, { TossConnectionCheck } from "./ExternalResearchPanel.jsx";
+import TossCashOperationPanel from "./TossCashOperationPanel.jsx";
 import ReconciliationChanges from "./ReconciliationChanges.jsx";
 import { submitReconciliationReview } from "./reconciliationReviewApi.js";
 import CoordinationRetirementNote from "./CoordinationRetirementNote.jsx";
@@ -2668,6 +2669,8 @@ function App() {
           </>}
         </section>}
         <KisNativePreparationPanel views={kisPreparationViews} onCancel={(key) => { void cancelKisStartPreparation(key); }} />
+        {selectedNav === "automation" && <TossCashOperationPanel />}
+        {selectedNav === "monitor" && <TossCashOperationPanel monitorOnly />}
         <WorkspaceContent
           selectedNav={selectedNav}
           onNavigate={navigateWorkspace}
@@ -3072,7 +3075,7 @@ function WorkspaceContent({
     return renderPage(
       <section className="settings-page-layout ts-layout-stack">
         <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} runtimeSnapshot={snapshot} onSave={onEnvSettings} />
-        <TossConnectionCheck />
+        <TossConnectionCheck onSave={onEnvSettings} />
         <ExternalResearchPanel />
         <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
         <CompactDisclosure
@@ -5111,7 +5114,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
     { id: "upbit", label: "Upbit", detail: "KRW 코인" },
   ]).filter(group => group.id !== "live-lock");
   const fields = (settings?.fields ?? []).filter(field => field.group !== "live-lock");
-  const visibleFields = fields.filter((field) => field.group === activeGroup);
+  const visibleFields = fields.filter((field) => field.group === activeGroup && field.key !== "TOSS_ACCOUNT_SEQ");
   const fieldSections = [
     { id: "basic", title: "API 연결에 필요한 정보", fields: visibleFields.filter(field => field.kind === "secret" || field.key === "KIS_ACCOUNT_PRODUCT_CODE") },
     { id: "fees", title: "KIS 시험 비용 상세", detail: "KIS 국내 주문 연결 시험의 필수 확인 정보입니다. 본인 계좌의 수수료·세율을 어디서 확인했는지 근거(요율 안내·상담·조회 등)를 적으세요. 적용 종목에는 확인한 동일 요율이 적용되는 6자리 코드를 입력하며, 세율이 다른 주식·ETF는 섞지 않습니다. 프로그램은 확인 시각부터 24시간 이내 정보만 사용합니다. Binance·Upbit 시험이나 계좌 잔고 조회에는 필요하지 않습니다. 비율 0.00015는 0.015%입니다.", fields: visibleFields.filter(field => field.key.startsWith("SHORT_LIVE_KIS_")) },

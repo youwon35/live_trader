@@ -83,7 +83,13 @@ class OwnedCapitalStore:
                 return self.project(scope,{})
             # Existing allocations reserve principal until an explicit audited release
             # exists. Never silently reuse all cash for another deployment.
-            reserved=sum((decimal_value(row[0],"reserved principal") for row in db.execute("SELECT principal FROM principals WHERE account_key=?",(scope["accountFingerprint"],))),Decimal(0))
+            reserved=Decimal(0)
+            for existing_json,existing_principal in db.execute("SELECT scope_json,principal FROM principals WHERE account_key=?",(scope["accountFingerprint"],)):
+                existing_scope=json.loads(existing_json)
+                if not existing_scope.get("quoteCurrency"):
+                    raise ValueError("OWNED_CAPITAL_RESERVATION_CURRENCY_UNKNOWN")
+                if existing_scope["quoteCurrency"]==scope["quoteCurrency"]:
+                    reserved+=decimal_value(existing_principal,"reserved principal")
             if reserved+principal>available:
                 raise ValueError("OWNED_CAPITAL_ALREADY_RESERVED_FOR_ANOTHER_DEPLOYMENT")
             body={"scope":scope,"principal":str(principal),"occurredAt":now.isoformat()}
