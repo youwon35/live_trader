@@ -35,8 +35,22 @@ SHARED_SETTINGS_DIR = Path(os.getenv("APPDATA") or Path.home()) / "trading_progr
 STRATEGY_SEARCH_PRESETS_FILE = SHARED_SETTINGS_DIR / "strategy-search-presets.json"
 STRATEGY_SEARCH_PRESET_SCHEMA = "strategy-search-presets-v1"
 STRATEGY_SEARCH_PRESET_LIMIT = 30
+_TRADINGVIEW_RESEARCH = None
+_TRADINGVIEW_LOCK = threading.Lock()
+
+
+def tradingview_research():
+    global _TRADINGVIEW_RESEARCH
+    with _TRADINGVIEW_LOCK:
+        if _TRADINGVIEW_RESEARCH is None:
+            from trading_runtime.tradingview_research import TradingViewResearch
+            _TRADINGVIEW_RESEARCH = TradingViewResearch(SETTINGS_DIR / "tradingview-research")
+        return _TRADINGVIEW_RESEARCH
+
+
 _FUNCTIONAL_STATUS_PATHS = frozenset(
     {
+        "/api/tradingview/status",
         "/api/short-live-tests/snapshot",
         "/api/runtime/batches/status",
         "/api/short-live-tests/catalog",
@@ -51,6 +65,8 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
 )
 _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
+        "/api/tradingview/connect", "/api/tradingview/disconnect", "/api/tradingview/analyze", "/api/tradingview/chart",
+        "/api/toss/prepare",
         "/api/reconciliation/review",
         "/api/short-live-tests/prepare",
         "/api/runtime/batches/prepare",
@@ -443,6 +459,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(state.runtime_batch_request("status", query["batchId"][0]))
             return
+        if parsed.path == "/api/tradingview/status":
+            self.send_json({"ok": True, **tradingview_research().status()})
+            return
         if parsed.path == "/api/short-live-tests/snapshot":
             self.send_json(state.short_live_test_request("snapshot"))
             return
@@ -639,6 +658,33 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "reason": "현재 앱 화면에서만 확인 기록을 저장할 수 있습니다."})
                 return
         payload = self.read_json()
+        if parsed.path.startswith("/api/tradingview/") or parsed.path == "/api/toss/prepare":
+            if parsed.query or not isinstance(payload, dict):
+                self.send_json({"ok": False, "reason": "현재 화면에서 정확한 요청으로 다시 확인하세요."})
+                return
+            try:
+                if parsed.path == "/api/toss/prepare":
+                    from .toss_adapter import prepare_read_only
+                    result = prepare_read_only(symbol=str(payload.get("symbol") or "").strip().upper(),
+                        market_country=str(payload.get("marketCountry") or "").strip().upper())
+                elif parsed.path == "/api/tradingview/connect":
+                    result = tradingview_research().begin_connect()
+                elif parsed.path == "/api/tradingview/disconnect":
+                    result = tradingview_research().disconnect()
+                elif parsed.path == "/api/tradingview/analyze":
+                    result = tradingview_research().analyze(symbol=str(payload.get("symbol") or ""), interval=str(payload.get("interval") or "1h"))
+                elif parsed.path == "/api/tradingview/chart":
+                    from trading_runtime.chart_links import tradingview_chart_url
+                    url = tradingview_chart_url(str(payload.get("symbol") or ""), provider=str(payload.get("provider") or ""),
+                        exchange=str(payload.get("exchange") or ""), timeframe=str(payload.get("interval") or "1h"))
+                    result = {"chartUrl": url, "researchOnly": True, "automaticExecution": False}
+                else:
+                    self.send_json({"ok": False, "reason": "지원하지 않는 분석 요청입니다."})
+                    return
+                self.send_json({"ok": True, **(result if isinstance(result, dict) else {})})
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_json({"ok": False, "reason": str(getattr(exc, "code", type(exc).__name__)), "ordersSubmitted": 0})
+            return
         if parsed.path == "/api/reconciliation/review":
             if parsed.query or not self.path.startswith("/") or parsed.scheme or parsed.netloc or not isinstance(payload, dict):
                 self.send_json({"ok": False, "reason": "정확한 현재 항목으로 다시 확인하세요."})

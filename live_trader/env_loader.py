@@ -9,6 +9,9 @@ from trading_runtime.secret_store import SecretStore, default_secret_store_path
 
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_TRADER_SECRET_KEYS = {
+    "TOSS_CLIENT_ID",
+    "TOSS_CLIENT_SECRET",
+    "TOSS_ACCOUNT_SEQ",
     "KIS_APP_KEY",
     "KIS_APP_SECRET",
     "KIS_ACCOUNT_NO",

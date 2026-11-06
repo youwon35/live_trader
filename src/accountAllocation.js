@@ -1,6 +1,6 @@
 // Adapter for read-only reconciliation snapshots. Never parses display strings as money.
 import { allocationNumber } from "../../../packages/design/allocation-model.js";
-const labels = { kis: "KIS 국내", binance: "Binance 현물", "binance-futures": "Binance 선물", upbit: "Upbit 현물" };
+const labels = { kis: "KIS 국내", toss: "토스증권 국내", binance: "Binance 현물", "binance-futures": "Binance 선물", upbit: "Upbit 현물" };
 const providerOf = row => String(row.broker_id || "unmatched").trim().toLowerCase();
 const currencyOf = value => String(value || "UNKNOWN").trim().toUpperCase();
 const accountScope = row => String(row.account_id ?? row.accountId ?? row.account ?? "").trim();
@@ -42,7 +42,7 @@ export function liveAllocationAccounts(accounts = [], positions = [], { nowMs = 
   for (const position of held) {
     const provider = providerOf(position), scope = accountScope(position);
     let candidates = normalized.filter(account => account.provider === provider)
-      .filter(account => provider !== "kis" || account.currency === currencyOf(position.currency));
+      .filter(account => !["kis", "toss"].includes(provider) || account.currency === currencyOf(position.currency));
     if (scope) candidates = candidates.filter(account => account.scope === scope);
     if (candidates.length === 1) candidates[0].positions.push(positionRow(position, candidates[0].currency, provider === "binance-futures", nowMs, preserveObserved));
     else {
@@ -52,7 +52,7 @@ export function liveAllocationAccounts(accounts = [], positions = [], { nowMs = 
   }
   const result = normalized.map(({ source: account, provider, scope, currency, id, positions: items, ambiguous }) => {
     const repeated = normalized.filter(other => other.provider === provider && other.currency === currency).length > 1;
-    const label = provider === "kis" && currency === "USD" ? "KIS 미국" : labels[provider] || account.broker_name || provider;
+    const label = provider === "toss" && currency === "USD" ? "토스증권 미국" : provider === "kis" && currency === "USD" ? "KIS 미국" : labels[provider] || account.broker_name || provider;
     const failed = account.ready === false || ["FAILED", "ERROR", "UNAVAILABLE"].includes(String(account.lookup_status || account.query_status || account.read_status || "").toUpperCase());
     return { id, label: repeated ? `${label} · ${scope || "계좌 미확인"}` : label, currency: /^[A-Z]{3,5}$/.test(currency) ? currency : "UNKNOWN",
       cash: allocationNumber(account.broker_cash_value), equity: allocationNumber(account.broker_equity_value),

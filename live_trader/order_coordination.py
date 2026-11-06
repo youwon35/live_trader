@@ -34,6 +34,7 @@ ROUTES = {
     "UPBIT_KRW_SPOT": ("upbit", "SPOT"), "upbit": ("upbit", "SPOT"),
     "KIS_KRX_CASH": ("kis", "CASH"), "KIS_KRX": ("kis", "CASH"), "KIS_KR_CASH": ("kis", "CASH"),
     "kis": ("kis", "CASH"),
+    "toss": ("toss", "CASH"), "TOSS_KR_CASH": ("toss", "CASH"), "TOSS_US_CASH": ("toss", "CASH"),
 }
 
 
@@ -85,6 +86,10 @@ class LiveOrderCoordination:
             raise CoordinationError("COORDINATION_ROUTE_UNSUPPORTED")
         broker, market = ROUTES[route]
         settings = os.environ if settings is None else settings
+        if broker == "toss":
+            identity = credential_account_identity(broker="toss", api_key=settings.get("TOSS_CLIENT_ID", ""),
+                account_number=settings.get("TOSS_ACCOUNT_SEQ", ""))
+            return broker, market, identity
         identity = credential_account_identity(broker=broker,
             api_key=settings.get("BINANCE_API_KEY" if broker == "binance" else "UPBIT_ACCESS_KEY", ""),
             account_number=settings.get("KIS_ACCOUNT_NO", ""),
@@ -224,6 +229,7 @@ class LiveOrderCoordination:
         order_id = str(response.get("orderId") or response.get("uuid") or response.get("algoId") or output.get("ODNO") or "")
         state = str(response.get("status") or response.get("state") or "").upper()
         mapped = {"NEW": "ACKNOWLEDGED", "WAIT": "ACKNOWLEDGED", "WATCH": "ACKNOWLEDGED",
+                  "PENDING": "ACKNOWLEDGED", "PARTIAL_FILLED": "PARTIALLY_FILLED",
                   "PARTIALLY_FILLED": "PARTIALLY_FILLED", "FILLED": "FILLED", "DONE": "FILLED",
                   "CANCELED": "CANCELED", "CANCEL": "CANCELED", "REJECTED": "REJECTED", "EXPIRED": "EXPIRED"}
         if order_id:
@@ -265,6 +271,9 @@ def read_dispatch_funds(intent):
     """Explicit per-order balance read; never used by page rendering or startup."""
     from . import brokers as b
     broker = str(intent.get("broker_id") or intent.get("broker") or "")
+    if broker == "toss":
+        from .toss_adapter import dispatch_funds
+        return dispatch_funds(intent)
     symbol, side = str(intent.get("symbol") or "").upper(), str(intent.get("side") or "").upper()
     quantity = _positive(intent.get("quantity") or intent.get("qty"))
     notional = _positive(intent.get("notional") or quantity * _positive(intent.get("price")))

@@ -3948,12 +3948,39 @@ def _kis_scoped_start_material(profile_id: str, mode: str, portfolio_id: str = "
     return context, preflight
 
 
+def _selected_continuous_start_broker(portfolio_id="", deployment_id="", strategy_id=""):
+    """Resolve the server's exact saved route; UI broker labels grant nothing."""
+    if not any((portfolio_id, deployment_id, strategy_id)):
+        return ""
+    selected = {"portfolioId": str(portfolio_id or ""), "deployment_id": str(deployment_id or ""),
+                "strategy_id": str(strategy_id or "")}
+    matches = []
+    for row in strategy_rows(portfolio_rows()):
+        gate = row.get("portfolio_gate") if isinstance(row.get("portfolio_gate"), dict) else {}
+        if all(not value or str(gate.get(key) if key == "portfolioId" else row.get(key)) == value
+               for key, value in selected.items()):
+            matches.append(row)
+    if len(matches) != 1:
+        raise ValueError("runtime-start-current-deployment-missing")
+    return strategy_broker_id(matches[0])
+
+
+def _continuous_start_requires_kis_route(profile_id, mode, portfolio_id="", deployment_id="", strategy_id="", *args, **kwargs):
+    if profile_id != "stock":
+        return False
+    return _selected_continuous_start_broker(portfolio_id, deployment_id, strategy_id) != "toss"
+
+
 def _native_prepared_kis_start(function):
     """Ordinary KIS LIVE alone uses the outside-lock preparation protocol."""
     @wraps(function)
     def wrapped(profile_id, mode, portfolio_id="", deployment_id="", strategy_id="",
                 execution_purpose="", functional_test_context=None, **kwargs):
-        if (profile_id == "stock" and normalize_runtime_mode(mode) in {"SMALL_LIVE", "FULL_LIVE"}
+        try:
+            selected_broker = _selected_continuous_start_broker(portfolio_id, deployment_id, strategy_id) if profile_id == "stock" else ""
+        except (ValueError, OSError, RuntimeError) as exc:
+            return {"ok": False, "reason": str(exc), "runtimeStarted": False, "brokerSubmissionPerformed": False}
+        if (profile_id == "stock" and selected_broker != "toss" and normalize_runtime_mode(mode) in {"SMALL_LIVE", "FULL_LIVE"}
                 and not str(execution_purpose or "").strip()):
             return _start_kis_prepared_native_runtime(profile_id, normalize_runtime_mode(mode),
                 portfolio_id, deployment_id, strategy_id, safety_confirmation=kwargs.get("safety_confirmation"))
@@ -7473,7 +7500,7 @@ def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers:
     strategies = strategies if strategies is not None else strategy_rows()
     brokers = brokers if brokers is not None else [broker.to_dict() for broker in broker_readiness()]
     broker_map = {str(broker["broker_id"]): broker for broker in brokers}
-    stock_strategies = [strategy for strategy in strategies if strategy_broker_id(strategy) == "kis"]
+    stock_strategies = [strategy for strategy in strategies if strategy_broker_id(strategy) in {"kis", "toss"}]
     crypto_strategies = [
         strategy
         for strategy in strategies
@@ -7487,18 +7514,18 @@ def automation_profiles(strategies: list[dict[str, Any]] | None = None, brokers:
             "id": "stock",
             "title": "주식/ETF 자동화",
             "provider": stock_provider,
-            "provider_label": "한국투자증권 Open API",
-            "broker_ids": ["kis"],
+            "provider_label": "토스증권 Open API" if stock_provider == "toss" else "한국투자증권 Open API",
+            "broker_ids": ["toss", "kis"],
             "asset_scope": ["한국주식", "미국주식", "금 ETF", "오일 ETF"],
             "mode": str(STATE["automation"]["stock"].get("mode") or "MONITOR"),
             "enabled": bool(STATE["automation"]["stock"]["enabled"]),
             "last_action": STATE["automation"]["stock"]["last_action"],
-            "ready": bool(broker_map.get("kis", {}).get("order_ready")),
+            "ready": bool(broker_map.get(stock_provider, {}).get("order_ready")),
             "strategy_count": len(stock_strategies),
             "live_strategy_count": sum(1 for strategy in stock_strategies if strategy.get("live_allowed")),
             "full_live_strategy_count": sum(1 for strategy in stock_strategies if strategy.get("live_eligible")),
-            "detail": "KIS 실계좌 API로 주식/ETF 주문을 라우팅합니다.",
-            "sample_request": redact_sensitive_payload(build_adapter_preview("kis", stock_strategies)),
+            "detail": "각 전략에 연결한 증권사로 주식/ETF 주문을 라우팅합니다. 저장된 연결은 자동 변경하지 않습니다.",
+            "sample_request": redact_sensitive_payload(build_adapter_preview(stock_provider, stock_strategies)),
         },
         {
             "id": "crypto",
@@ -7536,6 +7563,8 @@ def broker_id_from_hint(value: object) -> str:
         return ""
     if "upbit" in text:
         return "upbit"
+    if text == "toss" or "토스증권" in text:
+        return "toss"
     if "binance" in text and (
         "future" in text
         or "perpetual" in text
@@ -7663,6 +7692,10 @@ def build_adapter_preview(provider: str, strategies: list[dict[str, Any]]) -> di
     }
     if provider == "kis":
         return build_kis_live_order_request(intent).preview()
+    if provider == "toss":
+        return {"provider": "toss", "method": "POST", "endpoint": "/api/v1/orders",
+                "previewOnly": True, "orderSubmitted": False,
+                "detail": "선택한 시장·계좌·정수 수량 지정가를 실행 시작 시 다시 확인합니다."}
     if provider == "upbit":
         return build_upbit_order_request(intent).preview()
     if provider == "binance-futures":
@@ -9949,7 +9982,7 @@ def final_preflight_checks(
         {
             "label": "브로커 주문 어댑터",
             "status": "fail" if adapter_blocked else "pass",
-            "detail": "KIS/Binance signed order adapter가 구현·테스트·감사되어야 합니다.",
+            "detail": "선택한 거래소의 주문 어댑터와 계좌 연결 상태를 확인합니다. API 연결만으로 실거래가 승인되지는 않습니다.",
         },
         {
             "label": "포지션·계좌 대조",
@@ -14496,8 +14529,8 @@ def set_automation_profile(profile_id: str, enabled: bool, provider: str | None 
         return {"ok": False, "reason": "unknown automation profile", "snapshot": snapshot()}
     if provider:
         normalized_provider = provider.lower().strip()
-        if profile_id == "stock" and normalized_provider != "kis":
-            return {"ok": False, "reason": "주식/ETF 자동화 provider는 kis만 허용합니다.", "snapshot": snapshot()}
+        if profile_id == "stock" and normalized_provider not in {"kis", "toss"}:
+            return {"ok": False, "reason": "주식/ETF 증권사는 토스증권 또는 한국투자증권을 선택하세요.", "snapshot": snapshot()}
         if profile_id == "crypto" and normalized_provider not in {
             "binance",
             "binance-futures",
@@ -14748,7 +14781,7 @@ def refresh_broker_reconciliation() -> dict[str, Any]:
     from .reconciliation_review import configured_review_scopes
     review_scopes = configured_review_scopes(os.environ)
     router = LiveBrokerRouter()
-    broker_ids = ("kis", "binance", "binance-futures", "upbit")
+    broker_ids = ("kis", "binance", "binance-futures", "upbit") + (("toss",) if all(os.getenv(key, "").strip() for key in ("TOSS_CLIENT_ID", "TOSS_CLIENT_SECRET", "TOSS_ACCOUNT_SEQ")) else ())
     data: dict[str, Any] = {
         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "accounts": [],
@@ -16331,7 +16364,7 @@ def _poll_execution_events_unlocked(
         "binance",
         "binance-futures",
         "upbit",
-    ) if broker_id.strip().lower() in {"", "all"} else (
+    ) + (("toss",) if all(os.getenv(key, "").strip() for key in ("TOSS_CLIENT_ID", "TOSS_CLIENT_SECRET", "TOSS_ACCOUNT_SEQ")) else ()) if broker_id.strip().lower() in {"", "all"} else (
         broker_id.strip().lower(),
     )
     force = len(broker_ids) == 1 if force_snapshot is None else bool(force_snapshot)
@@ -27178,7 +27211,7 @@ def _active_session_for_intent(intent: OrderIntent):
         OPERATIONAL_GOVERNANCE.get_runtime_session,
         runtime_id=str(metadata.get("runtime_scope_id") or metadata.get("runtimeScopeId") or ""),
         deployment_id=str(metadata.get("deployment_id") or metadata.get("deploymentId") or ""),
-        broker_id=broker, profile_id="stock" if broker == "kis" else "crypto",
+        broker_id=broker, profile_id="stock" if broker in {"kis", "toss"} else "crypto",
     )
 
 
@@ -27234,7 +27267,7 @@ def resolve_continuous_runtime_scope(
         sizing = sizing_from_artifact(strategy)
         if sizing is not None:
             capital_currency = str(sizing["quantityContract"].get("quoteCurrency") or "")
-        if broker == "kis" and normalized_mode != "MONITOR" and capital_currency not in {"KRW", "USD"}:
+        if broker in {"kis", "toss"} and normalized_mode != "MONITOR" and capital_currency not in {"KRW", "USD"}:
             raise ValueError("runtime-scope-sealed-equity-currency-required")
     if normalized_mode != "MONITOR" and not execution_purpose:
         source = Path(str(strategy.get("artifact_source_path") or ""))
@@ -27317,7 +27350,7 @@ def _prepare_operational_runtime_session(
             "요청한 Live 실행 컨텍스트가 Artifact와 일치하지 않습니다: "
             + ", ".join(context_mismatches)
         )
-    expected_profile = "stock" if strategy_broker_id(strategy) == "kis" else "crypto"
+    expected_profile = "stock" if strategy_broker_id(strategy) in {"kis", "toss"} else "crypto"
     if profile_id != expected_profile:
         raise ValueError(
             f"요청 profile {profile_id}이 Deployment broker profile {expected_profile}과 일치하지 않습니다."
@@ -27710,7 +27743,7 @@ def start_functional_test_runtime(
 @_native_prepared_kis_start
 @_serialized_safety_mutation
 @_serialized_upbit_order_authority
-@_two_phase_kis_route_control("START")
+@_two_phase_kis_route_control("START", when=_continuous_start_requires_kis_route)
 def start_continuous_runtime(
     profile_id: str,
     mode: str,
@@ -27728,7 +27761,8 @@ def start_continuous_runtime(
     normalized_profile = profile_id
     normalized_mode = normalize_runtime_mode(mode)
     normalized_purpose = str(execution_purpose or "").strip().upper()
-    if normalized_profile == "stock" and normalized_mode == "MONITOR":
+    selected_broker = _selected_continuous_start_broker(portfolio_id, deployment_id, strategy_id) if normalized_profile == "stock" else ""
+    if normalized_profile == "stock" and selected_broker != "toss" and normalized_mode == "MONITOR":
         _revoke_kis_scoped_operational_authority("stock-monitor-start")
     if _upbit_functional_durable_authority_open():
         return {
@@ -27771,7 +27805,7 @@ def start_continuous_runtime(
         }
     kis_manual_context = None
     kis_manual_preflight = None
-    if normalized_profile == "stock" and normalized_mode != "MONITOR" and not normalized_purpose:
+    if normalized_profile == "stock" and selected_broker != "toss" and normalized_mode != "MONITOR" and not normalized_purpose:
         from .kis_operational_native_confirmation import KIS_NATIVE_OPERATIONAL_START_CONFIRMATIONS
         try:
             kis_manual_context, kis_manual_preflight = _kis_scoped_start_material(
@@ -27786,7 +27820,7 @@ def start_continuous_runtime(
             _revoke_kis_scoped_operational_authority("exact-native-start-replacement")
         except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
             return {"ok": False, "reason": str(exc), "runtimeStarted": False, "brokerSubmissionPerformed": False}
-    if normalized_profile == "crypto" and normalized_mode in {"SMALL_LIVE", "FULL_LIVE"} and not normalized_purpose:
+    if (normalized_profile == "crypto" or selected_broker == "toss") and normalized_mode in {"SMALL_LIVE", "FULL_LIVE"} and not normalized_purpose:
         start_confirmation = consume_safety_confirmation("RUNTIME_START", safety_confirmation, {
             "profile_id": normalized_profile, "mode": normalized_mode, "portfolio_id": portfolio_id,
             "deployment_id": deployment_id, "strategy_id": strategy_id})

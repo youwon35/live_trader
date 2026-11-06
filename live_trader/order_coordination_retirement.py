@@ -17,7 +17,7 @@ from trading_runtime.order_coordination import CoordinationError, canonical_requ
 
 _ROUTES = {("binance", "SPOT"): "BINANCE_SPOT",
            ("binance", "USDM_FUTURES"): "BINANCE_USDM_FUTURES",
-           ("upbit", "SPOT"): "UPBIT_KRW_SPOT", ("kis", "CASH"): "KIS_KR_CASH"}
+           ("upbit", "SPOT"): "UPBIT_KRW_SPOT", ("kis", "CASH"): "KIS_KR_CASH", ("toss", "CASH"): "toss"}
 _TERMINAL = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
 
 
@@ -75,6 +75,7 @@ class LiveRetirementJournal:
                "side": str(intent.get("side") or "").upper(),
                "positionSide": str(intent.get("position_side") or intent.get("positionSide") or "BOTH").upper(),
                "quantity": str(intent.get("quantity") or intent.get("qty") or ""),
+               "currency": str(intent.get("currency") or intent.get("quote_currency") or ""),
                "protection": bool(intent.get("client_algo_id")),
                "queryDate": datetime.fromtimestamp(now, ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")}
         request_hash = canonical_request_hash(dict(intent))
@@ -156,6 +157,9 @@ class OrdinaryRetirementReader:
         self.readers = readers
 
     def snapshot(self, route, symbols):
+        if route in {"toss", "TOSS_KR_CASH", "TOSS_US_CASH"}:
+            from .toss_adapter import retirement_snapshot
+            return retirement_snapshot(symbols)
         return self.readers.snapshot(route, tuple(symbols))
 
     def order(self, route, proof, core_intent):
@@ -181,6 +185,16 @@ class OrdinaryRetirementReader:
                     "filledQuantity": execution.get("filledQuantity") if isinstance(execution, dict) else "0",
                     "baseCommissionQuantity": "0", "baseCommissionKnown": True}
         broker_id = str(response.get("brokerOrderId") or "")
+        if route in {"toss", "TOSS_KR_CASH", "TOSS_US_CASH"}:
+            from .toss_adapter import client, exact_owned_order
+            if not broker_id:
+                raise CoordinationError("COORDINATION_TOSS_DURABLE_ORDER_ACK_REQUIRED")
+            observed_at = time.time()
+            row = exact_owned_order(client().get_order(broker_id), proof)
+            return {"known": True, "symbol": row["symbol"], "clientOrderId": proof.get("clientOrderId") or "",
+                    "brokerOrderId": broker_id, "status": str(row["status"]), "side": row["side"],
+                    "filledQuantity": row["filled_quantity"], "baseCommissionQuantity": "0",
+                    "baseCommissionKnown": True, "observedAt": observed_at}
         if route == "KIS_KR_CASH":
             return self._kis(proof)
         # Query by the original client ID even when a broker ID was received.

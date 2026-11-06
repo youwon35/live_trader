@@ -52,6 +52,7 @@ export function prepareMarketGapsForStart(selection, { accountKey, label, contin
 let functionalHttpSessionFlight = null;
 let functionalHttpSessionGeneration = 0;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
+  "/api/tradingview/connect", "/api/tradingview/disconnect", "/api/tradingview/analyze", "/api/tradingview/chart", "/api/toss/prepare",
   "/api/reconciliation/review",
   "/api/short-live-tests/prepare", "/api/short-live-tests/start", "/api/short-live-tests/stop",
   "/api/preparation/market-gaps/begin", "/api/preparation/market-gaps/cancel",
@@ -73,6 +74,7 @@ const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/crypto-first-live/reprepare",
 ]);
 const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
+  "/api/tradingview/status",
   "/api/short-live-tests/snapshot",
   "/api/short-live-tests/catalog",
   "/api/preparation/market-gaps/status",
@@ -870,9 +872,9 @@ export async function startContinuousRuntime(
   portfolioId = "",
   deploymentId = "",
   strategyId = "",
-  { accountKey = profileId, label = "한국투자증권", marketGapPreparationId = "", initializationOptions = null, batchContext = null } = {},
+  { accountKey = profileId, label = "한국투자증권", brokerId = "", marketGapPreparationId = "", initializationOptions = null, batchContext = null } = {},
 ) {
-  const nativeKisStart = profileId === "stock" && ["SMALL_LIVE", "FULL_LIVE"].includes(mode);
+  const nativeKisStart = profileId === "stock" && brokerId !== "toss" && ["SMALL_LIVE", "FULL_LIVE"].includes(mode);
   const body = {
     profile_id: profileId, mode, portfolio_id: portfolioId,
     deployment_id: deploymentId, strategy_id: strategyId,
@@ -938,10 +940,10 @@ export function getRuntimeBatchStatus(batchId) {
   return request(`/api/runtime/batches/status?batchId=${encodeURIComponent(batchId)}`, {timeoutMs: 10000});
 }
 
-export async function stopContinuousRuntime(profileId = "", { runtimeId = "", deploymentId = "" } = {}) {
+export async function stopContinuousRuntime(profileId = "", { runtimeId = "", deploymentId = "", brokerId = "" } = {}) {
   void cancelAllMarketGapPreparations();
   if (!profileId || profileId === "stock") void cancelAllKisStartPreparations("실행 중지가 요청되어 준비를 취소했습니다.");
-  const exactStockScope = profileId === "stock" && runtimeId !== "" && deploymentId !== "";
+  const exactStockScope = profileId === "stock" && brokerId !== "toss" && runtimeId !== "" && deploymentId !== "";
   const path = exactStockScope ? "/api/runtime/kis-stop-and-reconcile" : "/api/runtime/stop";
   return request(path, {
     method: "POST",

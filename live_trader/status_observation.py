@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Mapping
 
 DEFAULT_OBSERVATION_MAX_AGE_SECONDS = 60
-BROKER_IDS = ("kis", "binance", "binance-futures", "upbit")
+BROKER_IDS = ("kis", "toss", "binance", "binance-futures", "upbit")
 
 
 class DeploymentContextError(ValueError):

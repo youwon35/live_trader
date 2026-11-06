@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 
 _SHA = re.compile(r"[a-f0-9]{64}\Z")
-_BROKERS = {"kis": "stock", "binance": "crypto", "binance-futures": "crypto", "upbit": "crypto"}
+_BROKERS = {"kis": "stock", "toss": "stock", "binance": "crypto", "binance-futures": "crypto", "upbit": "crypto"}
 
 
 def runtime_scope_id(broker_id: str, account_fingerprint: str, deployment_id: str, capital_currency: str = "") -> str:
@@ -43,7 +43,7 @@ class RuntimeScope:
         if self.credential_configuration_hash and not _SHA.fullmatch(self.credential_configuration_hash):
             raise ValueError("runtime-scope-credential-hash-invalid")
 
-        if self.capital_currency and (not re.fullmatch(r"[A-Z]{2,10}", self.capital_currency) or (self.broker_id == "kis" and self.capital_currency not in {"KRW", "USD"})):
+        if self.capital_currency and (not re.fullmatch(r"[A-Z]{2,10}", self.capital_currency) or (self.broker_id in {"kis", "toss"} and self.capital_currency not in {"KRW", "USD"})):
             raise ValueError("runtime-scope-capital-currency-invalid")
 
     @property

@@ -36,6 +36,10 @@ class EnvSettingField:
 
 
 ENV_SETTING_FIELDS = (
+    EnvSettingField("TOSS_CLIENT_ID", "토스증권 Client ID", "토스증권 Open API에서 발급한 Client ID입니다.", "toss", "secret", required=True),
+    EnvSettingField("TOSS_CLIENT_SECRET", "토스증권 Client Secret", "Windows 보안 저장소에 보관합니다. 화면에 다시 표시하지 않습니다.", "toss", "secret", required=True),
+    EnvSettingField("TOSS_ACCOUNT_SEQ", "토스증권 계좌 순번", "토스증권 API의 accountSeq입니다. 계좌번호와 다르며 조회 시 실제 계좌와 대조합니다.", "toss", "secret", required=True),
+    EnvSettingField("DEFAULT_STOCK_BROKER", "새 주식 연결의 기본 증권사", "새 연결을 만들 때만 제안합니다. 저장된 KIS 전략이나 실행 중인 계좌는 바뀌지 않습니다.", "toss", "select", "toss", True, (("toss", "토스증권"), ("kis", "한국투자증권"))),
     EnvSettingField("SHORT_LIVE_KIS_COST_CONFIRMED", "짧은 시험: 본인 KIS 비용 확인", "본인 계좌의 실제 적용 수수료와 매도세율을 확인한 경우에만 켜세요. 공개 임시 요율을 실제 요율로 취급하지 않습니다.", "kis", "bool", "false"),
     EnvSettingField("SHORT_LIVE_KIS_COST_SOURCE", "짧은 시험: KIS 비용 확인 근거", "본인 계좌 요율을 확인한 문서·상담·조회 근거를 적습니다. 계좌번호나 인증정보는 넣지 마세요.", "kis", "text"),
     EnvSettingField("SHORT_LIVE_KIS_COST_SYMBOLS", "짧은 시험: 확인 요율 적용 종목", "확인한 동일 수수료·세율이 적용되는 6자리 종목코드를 쉼표로 구분합니다. 다른 세율의 주식과 ETF를 섞지 마세요.", "kis", "text"),
@@ -120,6 +124,7 @@ def env_settings_snapshot() -> dict[str, Any]:
         "envPath": str(ENV_PATH),
         "fields": fields,
         "groups": [
+            {"id": "toss", "label": "토스증권", "detail": "국내·미국 현금 주식 · 기본 계좌 후보"},
             {"id": "kis", "label": "주식/ETF", "detail": "한국투자증권 Open API"},
             {"id": "binance", "label": "Binance", "detail": "코인 현물 · USD-M 선물"},
             {"id": "upbit", "label": "Upbit", "detail": "KRW 코인"},
@@ -134,6 +139,8 @@ def save_env_settings(raw_values: dict[str, Any]) -> dict[str, Any]:
     # Reject an invalid funding choice before any credential migration or write.
     if MODE_KEY in raw_values:
         resolve_funding_mode({MODE_KEY: raw_values[MODE_KEY]})
+    if "DEFAULT_STOCK_BROKER" in raw_values and raw_values["DEFAULT_STOCK_BROKER"] not in {"kis", "toss"}:
+        raise ValueError("지원하는 기본 증권사를 선택해 주세요.")
     existing = read_env_file()
     # Validate all values which this save would persist before accessing or
     # migrating secrets. A single bad fee cannot cause a partial credential save.
@@ -223,7 +230,12 @@ def normalize_value(value: Any, field: EnvSettingField) -> str:
     if field.key in FEE_SETTING_DEFAULTS:
         return validate_fee_setting_value(field.key, value)
     if field.kind == "select":
-        return resolve_funding_mode({field.key: value})
+        if field.key == MODE_KEY:
+            return resolve_funding_mode({field.key: value})
+        text = str(value or "").strip() or field.default
+        if text not in {option[0] for option in field.options}:
+            raise ValueError("지원하지 않는 선택값입니다: " + field.key)
+        return text
     if field.kind == "bool":
         if isinstance(value, bool):
             return "true" if value else "false"

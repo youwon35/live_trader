@@ -72,7 +72,7 @@ KIS_TR_IDS = {
  "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl": "TTTC0084R",
  "/uapi/overseas-stock/v1/trading/inquire-nccs": "TTTS3018R",
 }
-SETTING_KEYS = ("BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_BASE_URL", "BINANCE_FUTURES_BASE_URL",
+SETTING_KEYS = ("TOSS_CLIENT_ID", "TOSS_CLIENT_SECRET", "TOSS_ACCOUNT_SEQ", "DEFAULT_STOCK_BROKER", "BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_BASE_URL", "BINANCE_FUTURES_BASE_URL",
  "UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY", "UPBIT_BASE_URL", "KIS_APP_KEY", "KIS_APP_SECRET",
  "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE", "KIS_BASE_URL", "KIS_ENV", MODE_KEY,
  *PROVISIONAL_FEE_DEFAULTS)
@@ -215,9 +215,38 @@ def _complete_number(value):
 
 
 class ReadOnlyBrokerReader:
-    def __init__(self, settings, *, transport=None):
+    def __init__(self, settings, *, transport=None, toss_client=None):
         self.settings = dict(settings)
         self.transport = transport or ReadOnlyTransport()
+        self._toss_client = toss_client
+
+    def _observe_toss(self, lane, symbol):
+        """Connection facts only; buying power cannot stand in for cash or NAV."""
+        result = {"status": "UNKNOWN", "account": "UNKNOWN", "openOrders": "UNKNOWN",
+                  "orderability": "UNKNOWN", "fundsCheck": "UNKNOWN", "accountBinding": "NOT_VERIFIED",
+                  "availableCash": None, "availableAssetQuantity": None, "feeRate": None,
+                  "constraints": {}, "capitalBasis": "UNKNOWN", "capitalPercent": 100,
+                  "currency": "", "privateValuesLocalOnly": True}
+        try:
+            if lane not in {"toss-kr", "toss-us"}:
+                raise ReadFailure("TOSS_EXPLICIT_MARKET_REQUIRED")
+            from trading_runtime.toss_securities import TossClient
+            from .toss_adapter import prepare_read_only
+            api = self._toss_client or TossClient.from_settings(self.settings, read_only=True)
+            # Account verification takes the snapshot configuration, not mutable
+            # process-global settings. No order method is reachable here.
+            report = prepare_read_only(symbol=symbol, market_country="KR" if lane == "toss-kr" else "US",
+                                       api=api, settings=self.settings)
+            account = report["accounts"][0]
+            result.update({"status": "PARTIAL", "account": "AVAILABLE", "currency": report["currency"],
+                "accountBinding": "BROKER_ACCOUNT_OBSERVED", "maskedAccount": account["maskedAccount"],
+                "buyingPower": account["buying_power"], "capitalBasis": "BUYING_POWER_NOT_ACCOUNT_EQUITY",
+                "openOrders": "PRESENT" if report["openOrderCount"] else "REGULAR_SYMBOL_NONE_ALGO_UNKNOWN",
+                "detail": "토스 계좌·일반 미체결 조회입니다. 주문 가능 금액은 예수금·총자산이 아니며 실행 승인이 아닙니다."})
+        except (ValueError, RuntimeError, OSError, TypeError, KeyError, ArithmeticError):
+            result["status"] = "TOSS_ACCOUNT_PREPARATION_UNAVAILABLE"
+        result["asOf"] = datetime.now(timezone.utc).isoformat()
+        return result
 
     def _get(self, provider, path, **kwargs):
         value, headers = self.transport.request(provider, "GET", path, **kwargs)
@@ -238,6 +267,9 @@ class ReadOnlyBrokerReader:
             raise ReadFailure("CONFIGURED_ORIGIN_BLOCKED")
 
     def read(self, lane, symbol, *, side="", quantity=None, limit_price=None):
+        if str(lane).startswith("toss"):
+            result = self._observe_toss(lane, symbol)
+            return {k: v for k, v in result.items() if k not in {"buyingPower", "maskedAccount", "availableCash", "availableAssetQuantity"}}
         provider = "kis" if lane in {"kis-kr", "kis-us"} else lane
         if provider not in ORIGINS:
             return {"status": "UNSUPPORTED", "account": "UNKNOWN", "openOrders": "UNKNOWN",
@@ -274,6 +306,8 @@ class ReadOnlyBrokerReader:
 
     def observe_preparation(self, lane, symbol, *, side="", quantity=None, limit_price=None):
         """Local explicit preview only. Private balances are never persisted by this reader."""
+        if str(lane).startswith("toss"):
+            return self._observe_toss(lane, symbol)
         from .account_profiles import saved_account_profiles
         provider = "kis" if lane in {"kis-kr", "kis-us"} else lane
         result = {"status": "UNKNOWN", "account": "UNKNOWN", "openOrders": "UNKNOWN",

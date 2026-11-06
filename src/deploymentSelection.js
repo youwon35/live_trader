@@ -36,7 +36,7 @@ export function deploymentRuntimeProfile(context = {}) {
       || "",
   ).trim().toLowerCase();
   if (!broker) return "";
-  if (broker === "kis" || broker.includes("stock") || broker.includes("주식")) {
+  if (["kis", "toss"].includes(broker) || broker.includes("stock") || broker.includes("주식")) {
     return "stock";
   }
   if (

@@ -7,8 +7,8 @@ from trading_runtime import infer_market_route
 
 
 _CRYPTO_BROKERS = frozenset({"binance", "binance-futures", "upbit"})
-_BROKERS = _CRYPTO_BROKERS | {"kis"}
-_PROVIDERS = {"yahoo": "kis", "kis": "kis", **{key: key for key in _CRYPTO_BROKERS}}
+_BROKERS = _CRYPTO_BROKERS | {"kis", "toss"}
+_PROVIDERS = {"yahoo": "kis", "kis": "kis", "toss": "toss", **{key: key for key in _CRYPTO_BROKERS}}
 _STOCK_ASSETS = frozenset({"한국주식", "미국주식", "주식", "ETF", "STOCK", "STOCKS", "KR_STOCK", "US_STOCK"})
 _CRYPTO_ASSETS = frozenset({"코인", "CRYPTO", "CRYPTOCURRENCY"})
 _PAIR = re.compile(r"(?:KRW-[A-Z0-9]+|[A-Z0-9]+-?(?:USDT|BUSD)(?:\.PERP)?)\Z")
@@ -41,7 +41,7 @@ def market_broker_id(symbol: str, *, broker_id: str = "", provider: str = "",
 
 def market_profile(symbol: str, **route: str) -> str:
     broker = market_broker_id(symbol, **route)
-    return "crypto" if broker in _CRYPTO_BROKERS else "stock" if broker == "kis" else ""
+    return "crypto" if broker in _CRYPTO_BROKERS else "stock" if broker in {"kis", "toss"} else ""
 
 
 def market_asset(symbol: str, **route: str) -> str:

@@ -212,6 +212,19 @@ class BrokerReadiness:
 
 BROKER_SPECS = (
     {
+        "broker_id": "toss", "name": "토스증권 Open API", "role": "국내·미국 현금 주식",
+        "required_env": ("TOSS_CLIENT_ID", "TOSS_CLIENT_SECRET", "TOSS_ACCOUNT_SEQ"),
+        "base_urls": ("https://openapi.tossinvest.com",), "docs": "토스증권 공식 Open API",
+        "capabilities": (
+            ("account_balance", "주문 가능 금액", True, "KRW·USD 주문 가능 금액과 보유 주식을 구분합니다. 총 예수금은 제공되지 않습니다."),
+            ("positions", "보유 주식", True, "국내·미국 보유 주식을 원래 통화로 표시합니다."),
+            ("place_order", "현금 지정가 주문", True, "정수 수량·명시한 시장·실행 동의·주문 소유권 조건에서 전송합니다."),
+            ("cancel_order", "소유 주문 취소", True, "같은 실행이 소유한 원주문만 조회 후 취소합니다."),
+            ("user_stream", "실시간 체결 스트림", False, "현재 주문 상태는 공식 REST 조회로 확인합니다."),
+        ),
+        "automation_group": "stock", "asset_scope": ("한국주식", "미국주식", "ETF"),
+    },
+    {
         "broker_id": "kis",
         "name": "한국투자증권 Open API",
         "role": "국내/미국 주식, ETF, 장내채권 실거래 후보",
@@ -387,7 +400,7 @@ def broker_diagnostics(broker_id: str | None = None) -> list[dict[str, Any]]:
                 "name": name,
                 "present": bool(os.getenv(name, "").strip()),
                 "masked": mask_env_value(name),
-                "secret": "SECRET" in name or "KEY" in name or name in {"KIS_ACCOUNT_NO", "KIS_HTS_ID"},
+                "secret": "SECRET" in name or "KEY" in name or name in {"KIS_ACCOUNT_NO", "KIS_HTS_ID", "TOSS_CLIENT_ID", "TOSS_ACCOUNT_SEQ"},
             }
             for name in required
         ]
@@ -3035,6 +3048,9 @@ class LiveBrokerRouter:
 
     def get_account_snapshot(self, broker_id: str) -> dict[str, object]:
         broker_id = broker_id.lower().strip()
+        if broker_id == "toss":
+            from .toss_adapter import account_snapshot
+            return account_snapshot()
         if broker_id == "kis":
             with kis_read_diagnostic_boundary():
                 token = issue_kis_access_token()
@@ -3062,6 +3078,9 @@ class LiveBrokerRouter:
 
     def list_positions(self, broker_id: str) -> list[dict[str, object]]:
         broker_id = broker_id.lower().strip()
+        if broker_id == "toss":
+            from .toss_adapter import client, positions
+            return positions(client().holdings())
         if broker_id == "kis":
             with kis_read_diagnostic_boundary():
                 token = issue_kis_access_token()
@@ -3097,6 +3116,31 @@ class LiveBrokerRouter:
                 str(intent.get("broker_id") or intent.get("broker") or ""), "PLACE_ORDER"):
             raise BrokerNotReadyError("실행 시작 확인 또는 정확한 주문 예약 권한이 필요합니다.")
         broker_id = str(intent.get("broker_id") or intent.get("broker") or "").lower()
+        if broker_id == "toss":
+            from .toss_adapter import client, normalized_order, dispatch_funds, number, owned_sell_quantity
+            from .order_coordination import current_coordination_context
+            normalized, body = normalized_order(intent)
+            if normalized["side"] == "SELL":
+                owner = self.coordination_owner_id or current_coordination_context().get("ownerId")
+                if not owner or not str(owner).startswith("live-runtime:"):
+                    raise BrokerNotReadyError("TOSS_SELL_EXACT_RUNTIME_OWNER_REQUIRED")
+                reader = client()
+                available_owned = owned_sell_quantity(self._order_coordination, owner, normalized["symbol"], reader)
+                if number(normalized["quantity"]) > available_owned:
+                    raise BrokerNotReadyError("TOSS_SELL_EXCEEDS_OWNED_QUANTITY")
+                funds = dispatch_funds(normalized, reader)
+                if number(funds["required"]) > number(funds["available"]):
+                    raise BrokerNotReadyError("TOSS_SELLABLE_QUANTITY_INSUFFICIENT")
+            def submit_toss():
+                result = client(read_only=False).place_order(body)
+                if not isinstance(result, dict) or not result.get("orderId") or result.get("clientOrderId") != body["clientOrderId"]:
+                    # The server may have accepted this POST. The coordinator
+                    # persists UNKNOWN; neither a fallback nor another ID is safe.
+                    raise BrokerNotReadyError("TOSS_ORDER_ACK_IDENTITY_UNKNOWN")
+                return {"ok": True, "json": result}
+            # The normal start consent gate above and durable shared ownership
+            # reservation below both precede the only writable client call.
+            return self._coordinated_send(normalized, submit_toss)
         if broker_id == "kis":
             try:
                 scoped = has_scoped_kis_dispatch_context()
@@ -3301,6 +3345,13 @@ class LiveBrokerRouter:
         symbol: str = "",
     ) -> list[dict[str, object]]:
         broker_id = broker_id.lower().strip()
+        if broker_id == "toss":
+            from .toss_adapter import client, order_status
+            payload = client().orders(status="OPEN", symbol=symbol or None)
+            rows = payload.get("orders") if isinstance(payload, dict) else None
+            if not isinstance(rows, list) or payload.get("hasNext") is not False:
+                raise BrokerNotReadyError("TOSS_OPEN_ORDERS_RESPONSE_INVALID")
+            return [order_status(row) for row in rows]
         if broker_id != "binance-futures":
             raise BrokerNotReadyError(
                 f"미체결 주문 조회를 지원하지 않는 broker_id입니다: {broker_id}"
@@ -3331,6 +3382,14 @@ class LiveBrokerRouter:
         client_order_id: bool = False,
     ) -> dict[str, object]:
         broker_id = broker_id.lower().strip()
+        if broker_id == "toss":
+            from .toss_adapter import client, order_status
+            if client_order_id:
+                raise BrokerNotReadyError("TOSS_EXACT_BROKER_ORDER_ID_REQUIRED")
+            result = order_status(client().get_order(broker_order_id))
+            if result.get("symbol") != symbol:
+                raise BrokerNotReadyError("TOSS_ORDER_SYMBOL_MISMATCH")
+            return result
         if broker_id != "binance-futures":
             raise BrokerNotReadyError(
                 f"주문 상태 조회를 지원하지 않는 broker_id입니다: {broker_id}"
@@ -3886,6 +3945,30 @@ class LiveBrokerRouter:
             raise BrokerNotReadyError("실행 시작 확인 또는 정확한 주문 취소 예약 권한이 필요합니다.")
         broker_id = broker_id.lower().strip()
         from .order_coordination import current_coordination_context
+        if broker_id == "toss":
+            from .toss_adapter import client, exact_owned_order
+            owner = self.coordination_owner_id or current_coordination_context().get("ownerId")
+            symbol = str(context.get("symbol") or "").upper()
+            if not owner or not symbol:
+                raise BrokerNotReadyError("TOSS_CANCEL_EXACT_OWNER_REQUIRED")
+            self._assert_coordination_owner("toss", symbol)
+            owned = self._order_coordination.coordinator.list_owned(owner_id=owner)
+            matches = []
+            for row in owned.get("intents", []):
+                proof = self._order_coordination.retirement_journal.proof(owner, row["intentId"])
+                if str((proof.get("response") or {}).get("brokerOrderId") or "") == broker_order_id:
+                    if proof.get("clientOrderId") != row["clientOrderId"]:
+                        raise BrokerNotReadyError("TOSS_CANCEL_ORDER_IDENTITY_MISMATCH")
+                    matches.append(proof)
+            if len(matches) != 1:
+                raise BrokerNotReadyError("TOSS_CANCEL_ORDER_NOT_OWNED")
+            observed = exact_owned_order(client().get_order(broker_order_id), matches[0])
+            if observed.get("symbol") != symbol or observed.get("state") not in {"new", "partially_filled"}:
+                raise BrokerNotReadyError("TOSS_CANCEL_ORDER_STATE_UNCONFIRMED")
+            result = client(read_only=False).cancel_order(broker_order_id)
+            if not isinstance(result, dict) or str(result.get("orderId") or "") != broker_order_id:
+                raise BrokerNotReadyError("TOSS_CANCEL_ACK_IDENTITY_UNKNOWN")
+            return {"ok": True, "json": result}
         if self.coordination_owner_id or current_coordination_context().get("ownerId"):
             self._assert_coordination_owner(broker_id, str(context.get("symbol") or ""))
         if broker_id == "kis":
@@ -4047,6 +4130,13 @@ class LiveBrokerRouter:
 
     def poll_execution_events(self, broker_id: str) -> dict[str, object]:
         broker_id = broker_id.lower().strip()
+        if broker_id == "toss":
+            from .toss_adapter import account_snapshot
+            result = account_snapshot()
+            # Buying power is not cash; do not synthesize ledger cash or fills
+            # from account observations. Exact order reads are a separate path.
+            return {**result, "events": [], "execution_truth": None,
+                    "source": "toss_account_observation_only"}
         if broker_id == "kis":
             with kis_read_diagnostic_boundary():
                 token = issue_kis_access_token()

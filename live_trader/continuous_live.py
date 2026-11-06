@@ -1626,6 +1626,15 @@ class LiveContinuousController:
         )
         provider = str(strategy.get("provider") or provider).strip().lower()
         broker_id = str(strategy.get("broker_id") or broker_id).strip().lower()
+        declared_instrument = str(strategy.get("instrument_id") or strategy.get("instrumentId") or "").strip()
+        if provider == "toss" or broker_id == "toss":
+            if provider != broker_id:
+                raise ValueError("TOSS_EXACT_SOURCE_ROUTE_REQUIRED")
+            # Preserve the reviewed source identity; do not inherit the legacy
+            # Yahoo/KIS .KS inference when Toss was explicitly selected.
+            if not declared_instrument:
+                raise ValueError("TOSS_EXPLICIT_INSTRUMENT_ID_REQUIRED")
+        instrument_id = declared_instrument or instrument_id
         strategy_id = str(strategy.get("strategy_id") or strategy.get("id") or "").strip()
         instance_id = str(
             strategy.get("strategy_instance_id")
@@ -2189,6 +2198,7 @@ class LiveContinuousController:
                         functional_test=functional_test,
                     ),
                     **({"exchange": native_quantity["modelResult"]["exchange"], "quote_currency": native_quantity["modelResult"]["currency"]} if native_quantity is not None and self._native_equity_specs((spec,)) else {}),
+                    **(self._toss_market_metadata(spec) if spec.broker_id == "toss" else {}),
                     "execution_timing": "next-open-boundary",
                     "decision_price_role": "PROTECTIVE_LIMIT_AT_EXACT_OPEN" if self._native_equity_specs((spec,)) else "SOURCE_SLIPPAGE_ADJUSTED_EXACT_OPEN" if self._native_boundary_receipt is not None else "reference-and-sizing-only",
                     **({"native_open_boundary": self._native_boundary_receipt, "source_artifact_hash": spec.artifact_hash} if self._native_boundary_receipt is not None else {}),
@@ -3116,10 +3126,17 @@ class LiveContinuousController:
             return {"status": "BLOCKED", "quantityForSubmission": None, "reasons": [str(error)]}
 
     @staticmethod
+    def _toss_market_metadata(spec):
+        from .toss_adapter import strategy_market_metadata
+        return strategy_market_metadata(spec)
+
+    @staticmethod
     def _order_quantity(spec: Any, price: float) -> float:
         from .native_spot_quantity import sizing_from_artifact
         if LiveContinuousController._native_specs((spec,)):
             raise ValueError("native quantity requires exact owned deployment equity, current cash/rules and canonical allocation")
+        if spec.broker_id == "toss":
+            raise ValueError("TOSS_REVIEWED_EQUITY_QUANTITY_CONTRACT_REQUIRED")
         override = spec.parameters.get("liveOrderQuantity")
         if override not in (None, ""):
             try:

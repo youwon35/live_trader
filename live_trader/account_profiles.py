@@ -7,6 +7,7 @@ from trading_runtime.artifact_governance import stable_sha256
 from .kis_overseas_funding import funding_policy
 
 _SPECS = {
+    "toss": ("토스증권 실계좌", ("TOSS_CLIENT_ID", "TOSS_CLIENT_SECRET", "TOSS_ACCOUNT_SEQ"), "TOSS_BASE_URL", "https://openapi.tossinvest.com", "KRW"),
     "kis": ("KIS 실계좌", ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE"), "KIS_BASE_URL", "https://openapi.koreainvestment.com:9443", "KRW"),
     "binance": ("Binance Spot", ("BINANCE_API_KEY", "BINANCE_API_SECRET"), "BINANCE_BASE_URL", "https://api.binance.com", "USDT"),
     "upbit": ("Upbit 현물", ("UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY"), "UPBIT_BASE_URL", "https://api.upbit.com", "KRW"),
@@ -29,6 +30,11 @@ def saved_account_profiles(settings: Mapping[str, Any] | None = None) -> list[di
                 continue
             identity = {"cano": cano, "product": product}
             suffix = cano[-4:]
+        elif broker == "toss":
+            if not values["TOSS_ACCOUNT_SEQ"].isdigit():
+                continue
+            identity = {"clientId": values["TOSS_CLIENT_ID"], "accountSeq": values["TOSS_ACCOUNT_SEQ"]}
+            suffix = ""
         else:
             identity = {"apiKey": values[keys[0]]}
             suffix = ""
@@ -48,6 +54,7 @@ def saved_account_profiles(settings: Mapping[str, Any] | None = None) -> list[di
             "accountFingerprint": fingerprint, "credentialConfigurationHash": configuration_hash,
             "accountBindingId": "live-account:" + broker + ":" + fingerprint,
             "currency": currency, "balanceQueried": False,
+            **({"supportedCurrencies": ["KRW", "USD"], "accountVerified": False} if broker == "toss" else {}),
             **({"overseasFunding": funding} if funding else {}),
         })
     return profiles

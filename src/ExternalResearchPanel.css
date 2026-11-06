@@ -1,0 +1,16 @@
+.external-research-panel { padding: 18px; }
+.external-research-panel > summary { cursor: pointer; }
+.external-research-panel .research-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+.external-research-panel .research-fields label { display: grid; gap: 6px; min-width: 0; }
+.external-research-panel .research-fields input,
+.external-research-panel .research-fields select { width: 100%; min-width: 0; }
+.external-research-panel .button-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.external-research-panel button { min-height: 40px; }
+.external-research-panel .research-error { color: var(--danger-text); }
+.external-research-panel .research-success { color: var(--success-text); }
+.external-research-panel a { color: var(--accent); text-decoration: underline; }

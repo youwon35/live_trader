@@ -1,5 +1,6 @@
 import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel, diagnosticSafetyContext, preflightCheckPresentation, ordinarySafetyPresentation } from "./diagnosticPresentation.js";
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
+import ExternalResearchPanel, { TossConnectionCheck } from "./ExternalResearchPanel.jsx";
 import ReconciliationChanges from "./ReconciliationChanges.jsx";
 import { submitReconciliationReview } from "./reconciliationReviewApi.js";
 import CoordinationRetirementNote from "./CoordinationRetirementNote.jsx";
@@ -2204,6 +2205,7 @@ function App() {
 
   async function runRuntimeStart(profileId, mode, selectionContext = deploymentContext, batchContext = null) {
     const args = [profileId, mode, selectionContext.portfolioId, selectionContext.id, selectionContext.strategyId];
+    const brokerId = String(selectionContext.brokerId || "").toLowerCase();
     if (profileId === "crypto") {
       try {
         return await prepareMarketGapsForStart({ profile_id: profileId, mode,
@@ -2217,7 +2219,7 @@ function App() {
         return { ok: false };
       }
     }
-    if (profileId !== "stock" || !["SMALL_LIVE", "FULL_LIVE"].includes(mode)) return runAction(() => startContinuousRuntime(...args, { batchContext }), { preserveSnapshotWithoutPayload: Boolean(batchContext) });
+    if (profileId !== "stock" || brokerId === "toss" || !["SMALL_LIVE", "FULL_LIVE"].includes(mode)) return runAction(() => startContinuousRuntime(...args, { batchContext, brokerId }), { preserveSnapshotWithoutPayload: Boolean(batchContext) });
     if (emergencyActionInFlightRef.current) return { ok: false, reason: "emergency-action-in-progress" };
     const safetyEpoch = snapshotSafetyEpochRef.current;
     const responseToken = snapshotResponseGateRef.current.begin();
@@ -2688,7 +2690,7 @@ function App() {
           onChecklistChange={(key, value) => runAction(() => setChecklistItem(key, value))}
           onValidationEvaluate={(candidateId) => runAction(() => evaluateValidationSmallLive(candidateId))}
           onRuntimeStart={runRuntimeStart}
-          onRuntimeStop={(profileId, runtimeId = "", deploymentId = "") => runAction(() => stopContinuousRuntime(profileId, { runtimeId, deploymentId }))}
+          onRuntimeStop={(profileId, runtimeId = "", deploymentId = "", brokerId = "") => runAction(() => stopContinuousRuntime(profileId, { runtimeId, deploymentId, brokerId }))}
           onPromoteLive={(strategyId) => runAction(() => promoteStrategyToLive(strategyId))}
           onStrategyLifecycle={(strategyId, action) => runAction(() => setStrategyLifecycle(strategyId, action))}
           onWatchdog={() => runAction(runWatchdog)}
@@ -3070,6 +3072,8 @@ function WorkspaceContent({
     return renderPage(
       <section className="settings-page-layout ts-layout-stack">
         <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} runtimeSnapshot={snapshot} onSave={onEnvSettings} />
+        <TossConnectionCheck />
+        <ExternalResearchPanel />
         <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
         <CompactDisclosure
           title="화면·레이아웃·Telegram"
@@ -5581,9 +5585,9 @@ function AutomationLauncherPanel({
     ? executionAvailability?.monitorSupported !== true
     : executionAvailability?.liveDispatchAvailable !== true && !kisManualStartPath;
   const cleanupView = kisStopCleanupView(reviewSnapshot);
-  const cleanupStartBlocked = kisCleanupBlocksStart(cleanupView, activeProfile.id, requestedMode);
+  const cleanupStartBlocked = deploymentContext?.brokerId !== "toss" && kisCleanupBlocksStart(cleanupView, activeProfile.id, requestedMode);
   const preparation = kisPreparationViews[deploymentContext?.accountId || "stock"];
-  const preparingKis = activeProfile.id === "stock" && preparation
+  const preparingKis = activeProfile.id === "stock" && deploymentContext?.brokerId !== "toss" && preparation
     && !["COMPLETE", "CANCELLED", "FAILED", "EXPIRED"].includes(preparation.status);
   const runtimeBindingDetail = !deploymentContext?.id
     ? "상단에서 실행할 Deployment를 먼저 선택하세요."
@@ -5603,7 +5607,7 @@ function AutomationLauncherPanel({
               <strong>{row.brokerId || row.profileId} · {row.portfolioId || row.requestedStrategyId || "관찰"}</strong>
               <StatusPill tone={row.phase === "DEGRADED" ? "warning" : "success"}>{liveRuntimeModeLabel(row.mode)} · {row.phase}</StatusPill>
               <button className="ts-action-button" type="button"
-                onClick={() => onRuntimeStop(row.profileId, row.runtimeId || "", row.deploymentId || "")}>
+                onClick={() => onRuntimeStop(row.profileId, row.runtimeId || "", row.deploymentId || "", row.brokerId || "")}>
                 <CircleStop size={16} /><span>이 실행 중지</span>
               </button>
             </div>
@@ -5669,6 +5673,16 @@ function AutomationLauncherPanel({
             <span key={item}>{item}</span>
           ))}
         </div>
+        {activeProfile.id === "stock" && (
+          <div className="provider-toggle" aria-label="주식 증권사 선택">
+            {[["toss", "토스증권"], ["kis", "한국투자증권"]].map(([provider, label]) => (
+              <button key={provider} type="button" className={activeProfile.provider === provider ? "active" : ""}
+                aria-pressed={activeProfile.provider === provider}
+                onClick={() => onAutomation(activeProfile.id, activeProfile.enabled, provider, activeProfile.mode)}>{label}</button>
+            ))}
+            <small>저장 전략의 계좌 연결은 자동 변경하지 않습니다.</small>
+          </div>
+        )}
         {activeProfile.id === "crypto" && (
           <div className="provider-toggle" aria-label="코인 거래소 선택">
             {["binance", "upbit"].map((provider) => (
@@ -5752,7 +5766,7 @@ function AutomationLauncherPanel({
             className="ts-action-button"
             type="button"
             disabled={!profileRuntime?.running}
-            onClick={() => onRuntimeStop(activeProfile.id, profileRuntime.runtimeId || "", profileRuntime.deploymentId || "")}
+            onClick={() => onRuntimeStop(activeProfile.id, profileRuntime.runtimeId || "", profileRuntime.deploymentId || "", profileRuntime.brokerId || deploymentContext?.brokerId || "")}
           >
             <CircleStop size={16} />
             <span>실행 중지</span>
