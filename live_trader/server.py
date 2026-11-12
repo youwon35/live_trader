@@ -72,6 +72,7 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
         "/api/short-live-tests/snapshot",
         "/api/runtime/batches/status",
         "/api/short-live-tests/catalog",
+        "/api/direct-strategies",
         "/api/paper-candidates",
         "/api/paper-candidates/accounts",
         "/api/preparation/sources",
@@ -97,6 +98,7 @@ _FUNCTIONAL_MUTATION_PATHS = frozenset(
         "/api/preparation/market-gaps/begin",
         "/api/preparation/market-gaps/cancel",
         "/api/runtime/kis-stop-and-reconcile",
+        "/api/direct-strategies/register",
         "/api/paper-candidates/import",
         "/api/paper-candidates/review",
         "/api/monitor-trial/run",
@@ -536,6 +538,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/preparation/sources":
             self.send_json(state.read_only_preparation_sources())
             return
+        if parsed.path == "/api/direct-strategies":
+            self.send_json(state.direct_strategy_catalog())
+            return
         if parsed.path == "/api/paper-candidates/accounts":
             self.send_json(state.saved_paper_candidate_accounts())
             return
@@ -747,6 +752,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "reasonCode": "EXACT_SHORT_LIVE_REQUEST_REQUIRED"})
                 return
             self.send_json(state.short_live_test_request(parsed.path.rsplit("/", 1)[1], payload))
+            return
+        if parsed.path == "/api/direct-strategies/register":
+            self.send_json(state.register_direct_strategy(payload))
             return
         if parsed.path == "/api/paper-candidates/review":
             self.send_json(state.review_paper_candidate_metadata(payload))

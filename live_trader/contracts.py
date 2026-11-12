@@ -944,14 +944,13 @@ def enrich_strategy_artifact_runtime(
     if deployment:
         payload["_deployment"] = deployment
     portfolio_ref = _dict_value(deployment.get("portfolioArtifact"))
-    qualification = load_pinned_paper_live_qualification(
-        folder,
-        payload,
-        deployment,
-        strategy_reference=reference,
-        portfolio_reference=portfolio_ref,
-    )
-    payload["_paper_live_qualification_required"] = True
+    from .direct_strategy import assess
+    direct = assess(folder, {key: value for key, value in payload.items() if key not in {"_artifact_integrity", "_artifact_reference", "_deployment"}}, deployment)
+    payload["_direct_execution"] = direct
+    qualification = ({"required": False, "ready": False, "issues": [], "detail": "Paper simulation is optional"}
+        if direct.get("required") else load_pinned_paper_live_qualification(
+            folder, payload, deployment, strategy_reference=reference, portfolio_reference=portfolio_ref))
+    payload["_paper_live_qualification_required"] = not direct.get("required", False)
     payload["_paper_live_qualification"] = qualification
     evidence_payload = qualification.get("evidencePayload")
     if isinstance(evidence_payload, dict):
@@ -1192,9 +1191,17 @@ def load_strategy_artifacts(limit: int | None = None) -> list[dict[str, Any]]:
             seen_payloads.add(fingerprint)
             if deployment_rows is None:
                 deployment_rows = DeploymentStore(folder).list()
-            artifacts.append(normalize_strategy_artifact(enrich_strategy_artifact_runtime(
-                folder, path, payload, deployment_rows=deployment_rows,
-            )))
+            try:
+                ref = artifact_reference(payload)
+            except ValueError:
+                ref = {}
+            matching = [item for item in deployment_rows if item.get("strategyArtifact") == ref
+                and item.get("environment") in {"LIVE", "SMALL_LIVE", "FULL_LIVE"}
+                and not (item.get("lifecycle") == "retired" and (item.get("permissions") or {}).get("supersededByDeploymentId"))]
+            for selected_deployment in matching or [None]:
+                artifacts.append(normalize_strategy_artifact(enrich_strategy_artifact_runtime(
+                    folder, path, dict(payload), deployment_rows=[selected_deployment] if selected_deployment else [],
+                )))
             if effective_limit is not None and len(artifacts) >= effective_limit:
                 return artifacts
     return artifacts
@@ -1262,7 +1269,13 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         or "draft"
     )
     final_test_status = str(artifact.get("finalTestStatus") or final_test.get("status") or artifact.get("test_status") or "")
+    direct_execution = _dict_value(artifact.get("_direct_execution"))
+    if direct_execution.get("required"):
+        # Backtester strategyId can name the plugin; the sealed id names this artifact.
+        strategy_id = str(_dict_value(artifact.get("_artifact_reference")).get("artifactId") or strategy_id)
     revalidation = strategy_revalidation_status(artifact, lifecycle_status=lifecycle_status)
+    if direct_execution.get("required"):
+        revalidation = {**revalidation, "expired": False, "purpose": "independent-runtime-source-binding"}
     normalized_permissions = {
         "trader_export_allowed": permissions.get("trader_export_allowed") is True,
         "live_small_eligible": permissions.get("live_small_eligible") is True,
@@ -1377,7 +1390,7 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         )
     if not backtest_lineage_assessment.valid and not backtest_lineage_assessment.legacy:
         lineage_issues.extend(f"backtest:{issue}" for issue in backtest_lineage_assessment.issues)
-    if not paper_lineage_assessment.valid and not paper_lineage_assessment.legacy:
+    if not direct_execution.get("required") and not paper_lineage_assessment.valid and not paper_lineage_assessment.legacy:
         lineage_issues.extend(f"paper:{issue}" for issue in paper_lineage_assessment.issues)
     if lineage_issues:
         lineage_reasons = [f"lineage-invalid:{issue}" for issue in lineage_issues]
@@ -1394,6 +1407,16 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     paper_portfolio_evidence = normalize_paper_portfolio_evidence(artifact)
     execution_policy = _dict_value(artifact.get("executionPolicy") or artifact.get("execution_policy"))
     market_type = str(artifact.get("marketType") or artifact.get("market_type") or data_artifact.get("marketType") or dataset.get("marketType") or "spot").lower()
+    direct_route = {}
+    if direct_execution.get("required"):
+        from trading_runtime.strategy_source_binding import resolve_strategy_source_route, canonical_source_parameters
+        try:
+            parameters = canonical_source_parameters(artifact)
+            direct_route = resolve_strategy_source_route(artifact)
+            market_type = direct_route["marketType"]
+        except (ValueError, TypeError, KeyError) as error:
+            direct_execution = {**direct_execution, "ready": False,
+                                "issues": [*direct_execution.get("issues", []), str(error)]}
     futures_execution_policy = futures_execution_policy_from_artifact(artifact)
     if (
         market_type in {"future", "futures", "perpetual"}
@@ -1519,6 +1542,21 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
                 ]
             )
         )
+    if direct_execution.get("required"):
+        # Runtime technical contracts still apply; performance/Paper outcomes do not grant execution authority.
+        technical_ok = (artifact_integrity.get("valid") is True
+            and not lineage_issues and not exposure_blockers
+            and provider_reconciliation_live_ready(provider_reconciliation)
+            and (market_type not in {"future", "futures", "perpetual"} or futures_execution_policy.get("valid") is True))
+        direct_allowed = direct_execution.get("ready") is True and technical_ok
+        capabilities.update(liveSmallEligible=direct_allowed, liveEligible=direct_allowed, canSubmitOrder=False)
+        normalized_permissions.update(live_small_eligible=direct_allowed, live_eligible=direct_allowed, live_allowed=direct_allowed)
+        if direct_allowed:
+            normalized_permissions["fail_reasons"] = []
+            capabilities["blockingFailReasons"] = []
+        else:
+            normalized_permissions["fail_reasons"] = list(dict.fromkeys([
+                *normalized_permissions["fail_reasons"], *direct_execution.get("issues", [])]))
     verification = {
         "backtester": _backtester_verification_badge(normalized_permissions, final_test_status),
         "paper_trader": _paper_verification_badge(artifact, normalized_permissions, lifecycle_status),
@@ -1575,8 +1613,10 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
             if isinstance(deployment.get("portfolioArtifact"), dict)
             else {}
         ),
+        "direct_execution": direct_execution,
         "strategy_instance_id": str(
-            paper_live_qualification.get("strategyInstanceId")
+            next(iter((direct_execution.get("binding") or {}).get("members", [])), {}).get("strategyInstanceId")
+            or paper_live_qualification.get("strategyInstanceId")
             or permissions.get("paperStrategyInstanceId")
             or artifact.get("strategyInstanceId")
             or artifact.get("instanceId")
@@ -1587,15 +1627,19 @@ def normalize_strategy_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
         "asset": str(artifact.get("asset") or dataset.get("assetClass") or data_artifact.get("assetClass") or artifact.get("assetClass") or "unknown"),
         "dataset_provider": str(dataset.get("provider") or artifact.get("datasetProvider") or ""),
         "market_data_provider": str(
-            artifact.get("marketDataProvider")
+            direct_route.get("provider")
+            or artifact.get("marketDataProvider")
             or artifact.get("market_data_provider")
             or data_artifact.get("marketDataProvider")
             or data_artifact.get("provider")
             or ""
         ),
-        "broker_id": str(artifact.get("brokerId") or artifact.get("broker_id") or trader_scope.get("brokerId") or ""),
+        "provider": str(direct_route.get("provider") or artifact.get("provider") or ""),
+        "broker_id": str(direct_route.get("brokerId") or artifact.get("brokerId") or artifact.get("broker_id") or trader_scope.get("brokerId") or ""),
         "allowed_brokers": allowed_brokers,
-        "instrument_id": str(data_artifact.get("instrumentId") or artifact.get("instrumentId") or artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN"),
+        "instrument_id": str(data_artifact.get("instrumentId") or artifact.get("instrumentId")
+            or (direct_route.get("instrumentId") if direct_route.get("brokerId") != "toss" else "")
+            or ("" if direct_route.get("brokerId") == "toss" else artifact.get("symbol") or artifact.get("ticker") or "UNKNOWN")),
         "market_type": market_type,
         "position_direction": position_direction,
         "exposure_contract": exposure_contract,

@@ -10,7 +10,7 @@ import { startupAccountObservation } from "./startupProgressModel.js";
 import { createSnapshotResponseGate, createSnapshotReadCoordinator, initialAccountRefreshState, accountRefreshResultState, accountObservationView } from "./snapshotRefreshState.js";
 import { environmentStatus, ordinaryEntryStatus, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation } from "./statusTruth.js";
 import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, ReconciliationEvidence, CapitalAllowance, DeploymentChanges, OrderInvestigation, OperatorNoteEditor } from "./OperatorInsights.jsx";
-import PaperCandidateEvidencePanel from "./PaperCandidateEvidencePanel";
+import DirectStrategyPanel from "./DirectStrategyPanel";
 import { runtimeRows, runtimeForDeployment, runtimeModeForDeployment, runningDeploymentIds, artifactIsRunning } from "./runtimeSelection.js";
 import { kisStopCleanupView, kisCleanupBlocksStart, kisManualStartPathSupported } from "./kisStopCleanup.js";
 import { KIS_PREPARATION_LABELS } from "./kisNativePreparation.js";
@@ -2953,16 +2953,18 @@ function WorkspaceContent({
     return renderPage(
       <section className="deployment-promotion-layout ts-layout-stack">
         <section className="panel">
-          <PanelHeader title="모의거래에서 받은 검증 근거" />
-          <PaperCandidateEvidencePanel onRegistered={onPaperCandidateRegistered} />
+          <PanelHeader title="Backtester 전략 연결" />
+          <DirectStrategyPanel onRegistered={onPaperCandidateRegistered} />
         </section>
         <DeploymentChanges snapshot={snapshot} scope={deploymentContext.id} />
         <LivePreparationPanel
           snapshot={snapshot}
           deploymentOnly
           selectedStrategyId={selectedStrategy?.strategy_id}
-          onSelectedStrategyIdChange={(strategyId) => {
-            const strategy = (snapshot.strategies ?? []).find((item) => item.strategy_id === strategyId);
+          selectedDeploymentId={deploymentContext.id}
+          onSelectedStrategyIdChange={(strategyId, deploymentId) => {
+            const strategy = (snapshot.strategies ?? []).find((item) => item.strategy_id === strategyId
+              && (!deploymentId || strategyDeploymentIdentity(item) === deploymentId));
             if (strategy) onDeploymentSelect(strategyDeploymentIdentity(strategy));
           }}
           onConfirm={onConfirm}
@@ -3658,6 +3660,7 @@ function LivePreparationPanel({
   snapshot,
   deploymentOnly = false,
   selectedStrategyId: controlledSelectedStrategyId,
+  selectedDeploymentId: controlledSelectedDeploymentId,
   onSelectedStrategyIdChange,
   onConfirm,
   onDryRun,
@@ -3714,7 +3717,8 @@ function LivePreparationPanel({
     [artifactMetadata, assetStrategies, discoveryFilters, snapshot.continuous_runtime],
   );
   const controlledSelectedStrategy = controlledSelectedStrategyId
-    ? (snapshot.strategies ?? []).find((strategy) => strategy.strategy_id === controlledSelectedStrategyId) ?? null
+    ? (snapshot.strategies ?? []).find((strategy) => strategy.strategy_id === controlledSelectedStrategyId
+      && (!controlledSelectedDeploymentId || strategyDeploymentIdentity(strategy) === controlledSelectedDeploymentId)) ?? null
     : null;
   const controlledAssetTab = controlledSelectedStrategy
     ? (isCryptoStrategy(controlledSelectedStrategy) ? "crypto" : "stock")
@@ -3729,9 +3733,9 @@ function LivePreparationPanel({
   ];
   const strategySearchPresets = savedSearches.filter((item) => item.entity === "strategy");
 
-  function selectStrategyId(strategyId) {
+  function selectStrategyId(strategyId, deploymentId) {
     setInternalSelectedStrategyId(strategyId);
-    onSelectedStrategyIdChange?.(strategyId);
+    onSelectedStrategyIdChange?.(strategyId, deploymentId);
   }
 
   useEffect(() => {
@@ -3870,8 +3874,8 @@ function LivePreparationPanel({
             automaticPromotion={snapshot.automatic_promotion}
             strategies={filteredStrategies}
             selectedStrategy={selectedStrategy}
-            onSelect={(strategyId) => {
-              selectStrategyId(strategyId);
+            onSelect={(strategyId, deploymentId) => {
+              selectStrategyId(strategyId, deploymentId);
               saveArtifactMetadata(strategyId, "strategy", { markUsed: true }).catch(() => undefined);
             }}
             metadata={selectedStrategy ? artifactMetadata[artifactMetadataKey(selectedStrategy.strategy_id, "strategy")] : null}
@@ -4674,7 +4678,7 @@ function buildDoctorItems(snapshot = {}, selectedDeploymentId = "", now = Date.n
       ["API / 브로커 연결", "Python API 연결이 필요합니다.", "settings"],
       ["운영 체크리스트", "API 연결 후 현재 체크 상태를 확인합니다.", "risk"],
       ["리스크 한도", "API 연결 후 현재 리스크 한도를 확인합니다.", "risk"],
-      ["전략 lifecycle eligibility", "API 연결 후 전략 승인 상태를 확인합니다.", "gate"],
+      ["전략 실행 계약", "API 연결 후 원본·플러그인·계좌 연결을 확인합니다.", "gate"],
       ["포지션·계좌 대조", "API 연결 후 브로커 대조 상태를 확인합니다.", "accounts"],
       ["Live Watchdog", "API 연결 후 Watchdog 상태를 확인합니다.", "automation"],
       ["최종 Preflight", "API 연결 후 최종 점검을 실행합니다.", "overview"],
@@ -4811,7 +4815,7 @@ function buildDoctorItems(snapshot = {}, selectedDeploymentId = "", now = Date.n
     {
       id: "doctor-strategy",
       index: 4,
-      title: "전략 lifecycle eligibility",
+      title: "전략 실행 계약",
       detail: !strategiesKnown ? "검증할 전략과 실행 권한을 확인하지 못했습니다." : strategyBlocked.length ? "선택한 배포의 실거래 자격을 확인해야 합니다. 다른 저장 전략은 이 점검에 포함하지 않습니다." : "선택한 배포의 실거래 자격을 확인했습니다.",
       tone: !strategiesKnown || strategyBlocked.length ? "warning" : "success",
       status: !strategiesKnown ? "미확인" : strategyBlocked.length ? "검토" : "통과",
@@ -6236,11 +6240,14 @@ function LiveStrategySelectorPanel({
       <div className="live-strategy-selector-grid">
         <label>
           <span>전략 저장본</span>
-          <select value={selectedStrategy?.strategy_id || ""} onChange={(event) => onSelect(event.target.value)} disabled={!strategies.length}>
+          <select value={selectedStrategy ? strategyDeploymentIdentity(selectedStrategy) : ""} onChange={(event) => {
+            const strategy = strategies.find((item) => strategyDeploymentIdentity(item) === event.target.value);
+            if (strategy) onSelect(strategy.strategy_id, strategyDeploymentIdentity(strategy));
+          }} disabled={!strategies.length}>
             {!strategies.length && <option value="">전략 없음</option>}
             {strategies.map((strategy) => (
-              <option key={strategy.strategy_id} value={strategy.strategy_id}>
-                {strategy.name} / {strategy.symbol} / {strategy.timeframe}
+              <option key={strategyDeploymentIdentity(strategy)} value={strategyDeploymentIdentity(strategy)}>
+                {strategy.name} / {strategy.symbol} / {strategy.timeframe} / {strategy.account_id || strategyDeploymentIdentity(strategy)}
               </option>
             ))}
           </select>
@@ -6254,7 +6261,7 @@ function LiveStrategySelectorPanel({
             <MetricCard className="metric-card" label="저장본 검증 단계" value={liveStrategyProgressLabel(selectedStrategy)} detail="원본 메타데이터에 기록된 검증 단계" />
             <MetricCard className="metric-card" label="배포 운용 상태" value={liveDeploymentLifecycleLabel(selectedStrategy)} detail={`실행 허용 범위: ${executionApprovalLabel(promotionStage)} · ${execution.verified ? `현재 배포 체결 ${execution.successful}건 · 차단 ${execution.blocked}건` : "현재 배포의 체결·차단 집계 미확인"}`} />
           </div>
-          <div className="live-strategy-promotion-line">
+          {!selectedStrategy.direct_execution?.required && <div className="live-strategy-promotion-line">
             {automaticResult && (
               <StatusPill tone={automaticResult.action === "PROMOTE" ? "success" : automaticResult.action === "PAUSE" ? "danger" : "warning"}>
                 AUTO {automaticResult.action}
@@ -6268,8 +6275,8 @@ function LiveStrategySelectorPanel({
               onClick={() => onPromoteLive?.(selectedStrategy.strategy_id)}
               status={canPromoteLive ? "success" : undefined}
             />
-          </div>
-          <CompactDisclosure title="전체 검증 단계" description="같은 원본 저장본의 메타데이터를 Backtester → 모의거래 Trader → Live Trader에서 표시합니다. 배포 운용 상태와 현재 주문 권한은 별도입니다.">
+          </div>}
+          <CompactDisclosure title="과거 검증 기록" description="원본에 남은 과거 연구·시험 기록입니다. Paper 기록은 Live 실행의 선행 조건이 아닙니다.">
 
             <div className="strategy-lifecycle-timeline live-lifecycle-timeline" aria-label="저장본 검증 단계">
               {lifecycleTimeline.map((item) => (
@@ -6309,7 +6316,9 @@ function LiveStrategySelectorPanel({
               onClick={() => onStrategyLifecycle?.(selectedStrategy.strategy_id, "retire")}
             />
             <span>
-              {isRetired
+              {selectedStrategy.direct_execution?.required
+                ? (isRetired ? "보관된 연결입니다. 실행할 수 없습니다." : isPaused ? "재개할 때 원본·계좌 연결을 다시 확인합니다. 실거래 시작은 별도입니다." : "Backtester 직접 연결 · Paper 결과 없이 독립적으로 준비합니다.")
+                : isRetired
                 ? "retired 상태라 신규 주문과 승급이 차단됩니다."
                 : isPaused && pausedFromLiveStage
                   ? "Live 단계 재개는 current-hash Paper live-forward 증거와 현재 Portfolio gate를 다시 통과해야 합니다."

@@ -120,6 +120,7 @@ from .contracts import (
     strategy_plugin_status,
     strategy_revalidation_status,
 )
+from .direct_strategy import normalized_ready as direct_execution_ready, manifest_members as direct_manifest_members, validate_manifest as validate_direct_manifest
 from .audit_store import SQLiteAuditEventStore
 from .operational_governance import OperationalGovernanceStore, stable_sha256 as governance_sha256
 from .account_risk import (
@@ -3898,9 +3899,13 @@ def _kis_scoped_start_material(profile_id: str, mode: str, portfolio_id: str = "
     inputs = _operational_manifest_inputs(strategy)
     if not _live_deployment_binding_is_executable(inputs["metadata"]["deploymentBinding"], mode=mode):
         raise ValueError("kis-manual-start-deployment-not-executable")
-    papers = inputs["metadata"]["paperFinalBindings"]
-    if not papers or any(row.get("ready") is not True for row in papers):
-        raise ValueError("kis-manual-start-exact-paper-required")
+    if inputs["metadata"].get("directBindings"):
+        if not validate_direct_manifest(inputs["metadata"]):
+            raise ValueError("kis-manual-start-direct-source-account-binding-invalid")
+    else:
+        papers = inputs["metadata"]["paperFinalBindings"]
+        if not papers or any(row.get("ready") is not True for row in papers):
+            raise ValueError("kis-manual-start-exact-paper-required")
     manifest = OPERATIONAL_GOVERNANCE.get_deployment_manifest(deployment_id)
     if manifest is None or not _operational_manifest_matches_inputs(manifest, inputs):
         raise ValueError("kis-manual-start-current-preflight-manifest-required")
@@ -3917,9 +3922,17 @@ def _kis_scoped_start_material(profile_id: str, mode: str, portfolio_id: str = "
     artifacts = load_strategy_artifacts()
     venues = []
     for member in inputs["metadata"]["strategyMembers"]:
-        candidates = [artifact for artifact in artifacts
-            if _operational_artifact_hash(artifact) == member["artifactHash"]
-            and str(artifact.get("symbol") or "").upper() == member["symbol"].upper()]
+        if direct_execution_ready(strategy):
+            # Resolve canonical members directly: a source may belong to several deployments.
+            from . import paper_candidate_inbox as source_files
+            source_root = Path(str(strategy.get("artifact_source_path") or "")).parent
+            reference = member["strategyArtifactReference"]
+            candidates = [source_files._exact_artifact(source_files._catalog(source_root, "strategy"),
+                reference["artifactId"], reference["artifactHash"])]
+        else:
+            candidates = [artifact for artifact in artifacts
+                if _operational_artifact_hash(artifact) == member["artifactHash"]
+                and str(artifact.get("symbol") or "").upper() == member["symbol"].upper()]
         if len(candidates) != 1:
             raise ValueError("kis-manual-start-exact-source-route-ambiguous")
         sizing = sizing_from_artifact(candidates[0])
@@ -4029,6 +4042,15 @@ def _capture_kis_native_start_plan(profile_id, mode, portfolio_id, deployment_id
             or loaded.portfolio_hash != manifest.portfolio_artifact_hash
             or scope.get("runtimeScopeId") != context["runtimeScopeId"]):
         raise ValueError("kis-native-start-exact-loaded-portfolio-or-manifest-changed")
+    selected = _operational_strategy(strategy_rows(portfolio_rows()), deployment_id=deployment_id,
+        strategy_id=strategy_id, portfolio_id=portfolio_id)
+    if direct_execution_ready(selected):
+        from trading_runtime.native_execution_policy import direct_policy, validate_initialization_policy
+        from trading_runtime.native_tick_initialization import canonical_graph
+        policy = direct_policy(selected["direct_execution"]["binding"])
+        validate_initialization_policy(policy, graph=canonical_graph(loaded, policy))
+        return {"context": context, "runtimeScope": scope, "deploymentManifestHash": manifest.manifest_hash,
+                "loaded": loaded, "portfolioPath": path, "artifactRoot": root, "promotionPolicy": policy, "preflight": preflight}
     artifacts, policies = load_strategy_artifacts(), []
     for spec in loaded.specs:
         matches = [row for row in artifacts if verified_strategy_artifact_reference(row).get("artifactHash") == spec.artifact_hash
@@ -6248,6 +6270,9 @@ def strategy_rows(portfolios: list[dict[str, Any]] | None = None) -> list[dict[s
 def paper_live_qualification_gate_for_strategy(
     strategy: dict[str, Any],
 ) -> dict[str, Any]:
+    if direct_execution_ready(strategy):
+        return {"required": False, "ready": False,
+                "detail": "Backtester 직접 연결: Paper 결과는 선택 참고 자료입니다."}
     qualification = (
         strategy.get("paper_live_qualification")
         if isinstance(strategy.get("paper_live_qualification"), dict)
@@ -6276,6 +6301,8 @@ def paper_live_qualification_gate_for_strategy(
 
 
 def paper_portfolio_evidence_gate_for_strategy(strategy: dict[str, Any], portfolio_gate: dict[str, Any]) -> dict[str, Any]:
+    if direct_execution_ready(strategy):
+        return {"required": False, "ready": False, "detail": "Paper simulation is optional"}
     if not portfolio_gate.get("active"):
         return {"required": False, "ready": True, "detail": "Portfolio artifact gate 비활성"}
     if portfolio_gate.get("allowed") is not True:
@@ -6556,7 +6583,7 @@ def portfolio_gate_for_strategy(
     strategy_id = str(strategy.get("strategy_id") or "")
     symbol = str(strategy.get("symbol") or "")
     for portfolio in portfolio_artifacts:
-        match = portfolio_match_for_strategy(portfolio, strategy_id, symbol, mode=mode or current_mode())
+        match = portfolio_match_for_strategy(portfolio, strategy_id, symbol, mode=mode or current_mode(), direct_strategy=strategy)
         if match is not None:
             return match
     if expected_portfolio_id or expected_portfolio_hash:
@@ -6578,7 +6605,7 @@ def portfolio_gate_for_strategy(
     }
 
 
-def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, symbol: str, *, mode: Mode) -> dict[str, Any] | None:
+def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, symbol: str, *, mode: Mode, direct_strategy=None) -> dict[str, Any] | None:
     instances = portfolio.get("strategy_instances") if isinstance(portfolio.get("strategy_instances"), list) else []
     targets = portfolio.get("target_portfolio") if isinstance(portfolio.get("target_portfolio"), list) else []
     matching_instance = next(
@@ -6642,6 +6669,7 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
     effective_symbol_limit = min(max_symbol_weight, target_weight * 100 if target_weight > 0 else max_symbol_weight)
     permissions = portfolio.get("permissions") if isinstance(portfolio.get("permissions"), dict) else {}
     lifecycle_status = normalize_lifecycle_status(portfolio.get("lifecycle_status"))
+    direct = direct_execution_ready(direct_strategy or {})
     required_status = "live" if mode == "FULL_LIVE" else "before-live-small"
     permission_ok = (
         permissions.get("live_allowed") is True
@@ -6652,9 +6680,9 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
     fx_freshness = portfolio_fx_freshness(portfolio, symbol)
     if lifecycle_status in {"paused", "retired"}:
         blockers.append(f"lifecycle={lifecycle_status}")
-    if lifecycle_rank(lifecycle_status) < lifecycle_rank(required_status):
+    if not direct and lifecycle_rank(lifecycle_status) < lifecycle_rank(required_status):
         blockers.append(f"lifecycle={lifecycle_status}, required={required_status}")
-    if not permission_ok:
+    if not direct and not permission_ok:
         blockers.append("live_export_allowed=false")
     failed_checks = [
         str(check.get("label") or check.get("id") or "risk")
@@ -6773,6 +6801,7 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
             intent.strategy_id,
             intent.symbol,
             mode=intent.mode,
+            direct_strategy=strategy_for_order_intent(checks, intent),
         )
         if selected_match is None:
             return {
@@ -7761,9 +7790,9 @@ def readiness_checks(
             "KIS/Binance 실주문 서명/전송 어댑터 구현 및 감사가 필요합니다." if adapter_blocked else "주문 어댑터가 준비되었습니다.",
         ),
         Check(
-            "전략 lifecycle eligibility",
+            "전략 실행 계약",
             "pass" if live_ready_count else "fail",
-            f"Live-Small 이상 전략 {live_ready_count}개 · Full Live {full_live_ready_count}개" if live_ready_count else "before-live-small 이상 lifecycle과 검증 evidence가 필요합니다.",
+            f"소액 운용 계약 {live_ready_count}개 · 일반 운용 계약 {full_live_ready_count}개" if live_ready_count else "선택한 전략의 원본·플러그인·거래 경로·계좌 연결을 확인하세요.",
         ),
         Check(
             "운용자 확인",
@@ -10698,6 +10727,8 @@ def _current_live_deployment_binding(
         "lifecycle": lifecycle,
         "environment": environment,
         "mode": mode,
+        "accountId": str(persisted.get("accountId") or ""),
+        "directExecutionBindingHash": str((permissions.get("directExecutionBinding") or {}).get("bindingHash") or ""),
         "executionPermissionDigest": _normalized_execution_permission_digest(
             dict(permissions)
         ),
@@ -10737,11 +10768,10 @@ def _live_deployment_binding_is_executable(
         and int(safe_float(binding.get("revision"), 0.0)) > 0
         and str(binding.get("environment") or "").upper()
         in {"LIVE", "SMALL_LIVE", "FULL_LIVE"}
-        and lifecycle in {"before-live-small", "live"}
-        and (
-            normalized_mode != "FULL_LIVE"
-            or lifecycle == "live"
-        )
+        and (lifecycle in {"before-live-small", "live"}
+            or (lifecycle == "backtested" and len(str(binding.get("directExecutionBindingHash") or "")) == 64))
+        and (normalized_mode != "FULL_LIVE" or lifecycle == "live"
+            or (lifecycle == "backtested" and len(str(binding.get("directExecutionBindingHash") or "")) == 64))
         and len(str(binding.get("executionPermissionDigest") or "")) == 64
         and len(str(binding.get("bindingHash") or "")) == 64
     )
@@ -10772,6 +10802,9 @@ def _operational_portfolio_members(
     strategy: dict[str, Any],
 ) -> tuple[str, dict[str, str], list[dict[str, Any]]]:
     """Resolve the immutable strategy/symbol routes owned by a deployment."""
+
+    if direct_execution_ready(strategy):
+        return direct_manifest_members(strategy)
 
     gate = (
         strategy.get("portfolio_gate")
@@ -11235,6 +11268,7 @@ def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
     strategy_ids = sorted({item["strategyId"] for item in strategy_members})
     allowed_symbols = sorted({item["symbol"] for item in strategy_members})
     broker_routes = sorted({item["brokerId"] for item in strategy_members})
+    direct_bindings = [strategy["direct_execution"]["binding"]] if direct_execution_ready(strategy) else []
     paper_final_bindings = [
         {
             "strategyId": str(item.get("strategyId") or ""),
@@ -11262,7 +11296,7 @@ def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
             "ready": item.get("paperQualificationReady") is True,
         }
         for item in strategy_members
-    ]
+    ] if not direct_bindings else []
     if len(broker_routes) != 1 or broker_routes[0] != route:
         raise ValueError(
             "현재 Deployment Preflight는 단일 Broker 계좌만 봉인합니다. "
@@ -11282,6 +11316,8 @@ def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
             "symbol": str(strategy.get("symbol") or ""),
             "timeframe": str(strategy.get("timeframe") or ""),
             "strategyMembers": strategy_members,
+            "directBindings": direct_bindings,
+            "directBindingsHash": governance_sha256(direct_bindings),
             "paperFinalBindings": paper_final_bindings,
             "deploymentBinding": deployment_binding,
             "portfolioArtifact": portfolio_reference,
@@ -11327,6 +11363,8 @@ def _operational_manifest_inputs(strategy: dict[str, Any]) -> dict[str, Any]:
             "allowedSymbols": allowed_symbols,
             "brokerRoutes": broker_routes,
             "strategyMembers": strategy_members,
+            "directBindings": direct_bindings,
+            "directBindingsHash": governance_sha256(direct_bindings),
             "paperFinalBindings": paper_final_bindings,
             "paperFinalBindingsHash": governance_sha256(paper_final_bindings),
             "deploymentBinding": deployment_binding,
@@ -14341,7 +14379,16 @@ def set_strategy_lifecycle_status(strategy_id: str, action: str) -> dict[str, An
             and str(reason) != "resume-live-canary-repromotion-required"
         ]
         live_capable_resume = lifecycle_rank(target_status) >= lifecycle_rank("before-live-small")
-        if live_capable_resume:
+        if permissions.get("directExecutionBinding", {}).get("schemaVersion") == "DIRECT_BACKTESTER_V1":
+            from .direct_strategy import assess
+            probe = {**deployment, "lifecycle": "backtested", "permissions": permissions}
+            current = assess(strategy_dir, payload, probe, settings=runtime_settings())
+            if current.get("ready") is not True:
+                return {"ok": False, "reason": ", ".join(current.get("issues") or []), "snapshot": snapshot()}
+            target_status = "backtested"
+            permissions.update(live_small_eligible=True, live_eligible=True, live_allowed=True)
+            audit_level, audit_reason = "info", "전략 연결을 재개했습니다. 실거래는 시작 점검과 사용자 시작이 필요합니다."
+        elif live_capable_resume:
             resume_evidence = paper_live_forward_resume_assessment(
                 strategy_dir,
                 payload,
@@ -19748,7 +19795,16 @@ def evaluate_order_gate(checks: dict[str, Any], side: str, dry_run: bool) -> tup
 
 def strategy_for_order_intent(checks: dict[str, Any], intent: OrderIntent) -> dict[str, Any]:
     strategies = checks.get("strategies") if isinstance(checks.get("strategies"), list) else []
-    return next((strategy for strategy in strategies if str(strategy.get("strategy_id")) == intent.strategy_id), {})
+    metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    deployment_id = str(metadata.get("deployment_id") or metadata.get("deploymentId") or "")
+    direct = [row for row in strategies if direct_execution_ready(row)
+        and deployment_id and row.get("deployment_id") == deployment_id
+        and any(member.get("strategyId") == intent.strategy_id and member.get("symbol") == intent.symbol
+            for member in row["direct_execution"]["binding"]["members"])]
+    if len(direct) == 1:
+        return direct[0]
+    return next((strategy for strategy in strategies if str(strategy.get("strategy_id")) == intent.strategy_id
+        and (not deployment_id or str(strategy.get("deployment_id") or "") == deployment_id)), {})
 
 
 def futures_risk_reducing_verified(
@@ -20263,6 +20319,7 @@ def evaluate_order_gate_with_report(
     revalidation = strategy_revalidation_status(strategy, lifecycle_status=strategy.get("lifecycle_status")) if strategy else {}
     if (
         not functional_execution
+        and not direct_execution_ready(strategy)
         and intent.side == "BUY"
         and revalidation.get("expired") is True
     ):
@@ -23572,93 +23629,97 @@ def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str
             != str(manifest_deployment_binding.get("bindingHash") or "")
         ):
             return False, "operational-session-deployment-binding-mismatch", authorization
-        manifest_paper_bindings = [
-            dict(item)
-            for item in manifest_metadata.get("paperFinalBindings", [])
-            if isinstance(item, dict)
-        ]
-        if (
-            not manifest_paper_bindings
-            or any(item.get("ready") is not True for item in manifest_paper_bindings)
-        ):
-            return False, "operational-paper-final-binding-missing", authorization
-        required_binding_keys = (
-            "strategyId",
-            "strategyInstanceId",
-            "paperEvidenceId",
-            "paperEvidenceHash",
-            "paperEvidenceBundleHash",
-            "paperFinalBindingHash",
-            "paperGovernanceDeploymentId",
-        )
-        if any(
-            any(not str(item.get(key) or "").strip() for key in required_binding_keys)
-            for item in manifest_paper_bindings
-        ):
-            return False, "operational-paper-final-binding-incomplete", authorization
-        if any(
-            str(item.get("paperGovernanceDeploymentId") or "").strip()
-            == str(manifest.deployment_id or "").strip()
-            for item in manifest_paper_bindings
-        ):
-            return False, "operational-paper-live-deployment-not-distinct", authorization
-        hash_keys = (
-            "paperEvidenceHash",
-            "paperEvidenceBundleHash",
-            "paperFinalBindingHash",
-        )
-        if any(
-            any(
-                len(str(item.get(key) or "").strip()) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in str(item.get(key) or "").strip().lower()
-                )
-                for key in hash_keys
+        if manifest_metadata.get("directBindings"):
+            if not validate_direct_manifest(manifest_metadata):
+                return False, "operational-direct-binding-invalid", authorization
+        else:
+            manifest_paper_bindings = [
+                dict(item)
+                for item in manifest_metadata.get("paperFinalBindings", [])
+                if isinstance(item, dict)
+            ]
+            if (
+                not manifest_paper_bindings
+                or any(item.get("ready") is not True for item in manifest_paper_bindings)
+            ):
+                return False, "operational-paper-final-binding-missing", authorization
+            required_binding_keys = (
+                "strategyId",
+                "strategyInstanceId",
+                "paperEvidenceId",
+                "paperEvidenceHash",
+                "paperEvidenceBundleHash",
+                "paperFinalBindingHash",
+                "paperGovernanceDeploymentId",
             )
-            for item in manifest_paper_bindings
-        ):
-            return False, "operational-paper-final-binding-hash-invalid", authorization
-        portfolio_binding_required = bool(manifest.portfolio_artifact_hash)
-        if any(
-            (
-                not str(item.get("paperPortfolioArtifactId") or "").strip()
-                or not str(item.get("paperPortfolioArtifactHash") or "").strip()
-                or not str(item.get("paperPortfolioInstanceId") or "").strip()
-            )
-            if portfolio_binding_required
-            else any(
-                str(item.get(key) or "").strip()
-                for key in (
-                    "paperPortfolioArtifactId",
-                    "paperPortfolioArtifactHash",
-                    "paperPortfolioInstanceId",
-                )
-            )
-            for item in manifest_paper_bindings
-        ):
-            return False, "operational-paper-portfolio-binding-invalid", authorization
-        manifest_portfolio_reference = (
-            manifest_metadata.get("portfolioArtifact")
-            if isinstance(manifest_metadata.get("portfolioArtifact"), dict)
-            else {}
-        )
-        if portfolio_binding_required and (
-            str(manifest_portfolio_reference.get("artifactHash") or "").lower()
-            != str(manifest.portfolio_artifact_hash or "").lower()
-            or any(
-                str(item.get("paperPortfolioArtifactId") or "")
-                != str(manifest_portfolio_reference.get("artifactId") or "")
-                or str(item.get("paperPortfolioArtifactHash") or "").lower()
-                != str(manifest.portfolio_artifact_hash or "").lower()
+            if any(
+                any(not str(item.get(key) or "").strip() for key in required_binding_keys)
                 for item in manifest_paper_bindings
+            ):
+                return False, "operational-paper-final-binding-incomplete", authorization
+            if any(
+                str(item.get("paperGovernanceDeploymentId") or "").strip()
+                == str(manifest.deployment_id or "").strip()
+                for item in manifest_paper_bindings
+            ):
+                return False, "operational-paper-live-deployment-not-distinct", authorization
+            hash_keys = (
+                "paperEvidenceHash",
+                "paperEvidenceBundleHash",
+                "paperFinalBindingHash",
             )
-        ):
-            return False, "operational-paper-portfolio-hash-mismatch", authorization
-        if str(manifest_metadata.get("paperFinalBindingsHash") or "") != governance_sha256(
-            manifest_paper_bindings
-        ):
-            return False, "operational-paper-final-binding-hash-invalid", authorization
+            if any(
+                any(
+                    len(str(item.get(key) or "").strip()) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in str(item.get(key) or "").strip().lower()
+                    )
+                    for key in hash_keys
+                )
+                for item in manifest_paper_bindings
+            ):
+                return False, "operational-paper-final-binding-hash-invalid", authorization
+            portfolio_binding_required = bool(manifest.portfolio_artifact_hash)
+            if any(
+                (
+                    not str(item.get("paperPortfolioArtifactId") or "").strip()
+                    or not str(item.get("paperPortfolioArtifactHash") or "").strip()
+                    or not str(item.get("paperPortfolioInstanceId") or "").strip()
+                )
+                if portfolio_binding_required
+                else any(
+                    str(item.get(key) or "").strip()
+                    for key in (
+                        "paperPortfolioArtifactId",
+                        "paperPortfolioArtifactHash",
+                        "paperPortfolioInstanceId",
+                    )
+                )
+                for item in manifest_paper_bindings
+            ):
+                return False, "operational-paper-portfolio-binding-invalid", authorization
+            manifest_portfolio_reference = (
+                manifest_metadata.get("portfolioArtifact")
+                if isinstance(manifest_metadata.get("portfolioArtifact"), dict)
+                else {}
+            )
+            if portfolio_binding_required and (
+                str(manifest_portfolio_reference.get("artifactHash") or "").lower()
+                != str(manifest.portfolio_artifact_hash or "").lower()
+                or any(
+                    str(item.get("paperPortfolioArtifactId") or "")
+                    != str(manifest_portfolio_reference.get("artifactId") or "")
+                    or str(item.get("paperPortfolioArtifactHash") or "").lower()
+                    != str(manifest.portfolio_artifact_hash or "").lower()
+                    for item in manifest_paper_bindings
+                )
+            ):
+                return False, "operational-paper-portfolio-hash-mismatch", authorization
+            if str(manifest_metadata.get("paperFinalBindingsHash") or "") != governance_sha256(
+                manifest_paper_bindings
+            ):
+                return False, "operational-paper-final-binding-hash-invalid", authorization
         manifest_broker_routes = sorted(
             {
                 str(item).strip().lower()
@@ -23825,7 +23886,9 @@ def operational_runtime_dispatch_allowed(intent: OrderIntent) -> tuple[bool, str
             else {}
         )
         if (
-            current_metadata.get("paperFinalBindings")
+            current_metadata.get("directBindings") != manifest_metadata.get("directBindings")
+            or current_metadata.get("directBindingsHash") != manifest_metadata.get("directBindingsHash")
+            or current_metadata.get("paperFinalBindings")
             != manifest_metadata.get("paperFinalBindings")
             or current_metadata.get("paperFinalBindingsHash")
             != manifest_metadata.get("paperFinalBindingsHash")
@@ -27355,7 +27418,7 @@ def _prepare_operational_runtime_session(
         raise ValueError(
             f"요청 profile {profile_id}이 Deployment broker profile {expected_profile}과 일치하지 않습니다."
         )
-    if mode in {"SMALL_LIVE", "FULL_LIVE"}:
+    if mode in {"SMALL_LIVE", "FULL_LIVE"} and not direct_execution_ready(strategy):
         qualification_gate = paper_live_qualification_gate_for_strategy(strategy)
         if (
             qualification_gate.get("required") is not True
@@ -27385,7 +27448,7 @@ def _prepare_operational_runtime_session(
         for item in manifest.metadata.get("paperFinalBindings", [])
         if isinstance(item, dict)
     ]
-    if mode in {"SMALL_LIVE", "FULL_LIVE"} and (
+    if mode in {"SMALL_LIVE", "FULL_LIVE"} and not direct_execution_ready(strategy) and (
         not paper_bindings
         or any(item.get("ready") is not True for item in paper_bindings)
     ):
@@ -27393,7 +27456,7 @@ def _prepare_operational_runtime_session(
             "Portfolio의 모든 Strategy Instance에 exact Paper Final binding이 "
             "고정되지 않아 Live runtime을 차단했습니다."
         )
-    if mode in {"SMALL_LIVE", "FULL_LIVE"} and manifest.portfolio_artifact_hash:
+    if mode in {"SMALL_LIVE", "FULL_LIVE"} and manifest.portfolio_artifact_hash and not direct_execution_ready(strategy):
         manifest_portfolio = (
             manifest.metadata.get("portfolioArtifact")
             if isinstance(manifest.metadata.get("portfolioArtifact"), dict)
@@ -29636,6 +29699,25 @@ def cancel_order(
                 _kill_cleanup=_kill_cleanup,
             )
         )
+
+
+def direct_strategy_catalog():
+    from .direct_strategy import list_candidates
+    try:
+        return list_candidates(settings=runtime_settings())
+    except (ValueError, OSError, TypeError):
+        return {"ok": False, "candidates": [], "reason": "전략 저장소를 읽지 못했습니다."}
+
+
+@_serialized_safety_mutation
+def register_direct_strategy(payload):
+    from .direct_strategy import register
+    try:
+        result = register(payload, settings=runtime_settings(), controls=paper_candidate_review_controls())
+    except (ValueError, OSError, TypeError) as exc:
+        return {"ok": False, "reason": str(exc), "ordersSubmitted": 0}
+    STATE["latest_preflight_snapshot_id"] = ""
+    return result
 
 
 def paper_candidate_evidence_inbox() -> dict[str, Any]:

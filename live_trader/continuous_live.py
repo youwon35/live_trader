@@ -271,7 +271,7 @@ class LiveContinuousController:
                     and normalized_purpose
                     != state.FUNCTIONAL_TEST_EXECUTION_PURPOSE
                     and not all(
-                        self._spec_mode_allowed(spec, normalized_mode)
+                        self._spec_mode_allowed(spec, normalized_mode, requested_deployment)
                         for spec in specs
                     )
                 ):
@@ -286,7 +286,7 @@ class LiveContinuousController:
                     and normalized_purpose
                     != state.FUNCTIONAL_TEST_EXECUTION_PURPOSE
                 ):
-                    binding_blocker = self._paper_final_binding_blocker(specs)
+                    binding_blocker = self._paper_final_binding_blocker(specs, requested_deployment)
                     if binding_blocker:
                         return {
                             "ok": False,
@@ -479,8 +479,10 @@ class LiveContinuousController:
                 if normalized_mode == "SMALL_LIVE":
                     allowed = allowed or runtime_permissions.get("live_small_eligible") is True or runtime_permissions.get("live_small_allowed") is True
                 if not allowed:
+                    allowed = all(self._direct_binding_for_spec(spec, requested_deployment) for spec in specs)
+                if not allowed:
                     return {"ok": False, "reason": f"{runtime_id}는 {normalized_mode} 권한을 통과하지 못했습니다. MONITOR만 가능합니다.", "snapshot": state.snapshot()}
-                binding_blocker = self._paper_final_binding_blocker(specs)
+                binding_blocker = self._paper_final_binding_blocker(specs, requested_deployment)
                 if binding_blocker:
                     return {
                         "ok": False,
@@ -1538,6 +1540,12 @@ class LiveContinuousController:
         portfolio_lifecycle = state.normalize_lifecycle_status(portfolio.get("lifecycle_status"))
         if portfolio_lifecycle in {"paused", "retired"}:
             return False
+        from .direct_strategy import normalized_ready
+        reference = state.verified_portfolio_artifact_reference(portfolio)
+        direct_rows = [row for rows in strategies_by_id.values() for row in rows if normalized_ready(row)
+            and row["direct_execution"]["binding"].get("portfolioArtifact") == reference]
+        if len(direct_rows) == 1:
+            return direct_rows[0].get("live_eligible" if mode == "FULL_LIVE" else "live_small_eligible") is True
         instances = portfolio.get("strategy_instances") if isinstance(portfolio.get("strategy_instances"), list) else []
         if not instances:
             return False
@@ -1559,7 +1567,7 @@ class LiveContinuousController:
             lifecycle = state.normalize_lifecycle_status(strategy.get("lifecycle_status"))
             if lifecycle in {"paused", "retired"} or state.lifecycle_rank(lifecycle) < state.lifecycle_rank("backtested"):
                 return False
-            if strategy.get("backtester_verified") is not True:
+            if strategy.get("backtester_verified") is not True and not (strategy.get("direct_execution") or {}).get("ready"):
                 return False
             if mode == "SMALL_LIVE" and strategy.get("live_small_eligible") is not True:
                 return False
@@ -1591,7 +1599,7 @@ class LiveContinuousController:
                     lifecycle in {"paused", "retired"}
                     or state.lifecycle_rank(lifecycle)
                     < state.lifecycle_rank("backtested")
-                    or strategy.get("backtester_verified") is not True
+                    or (strategy.get("backtester_verified") is not True and not (strategy.get("direct_execution") or {}).get("ready"))
                 ):
                     continue
             else:
@@ -1642,7 +1650,8 @@ class LiveContinuousController:
             or f"standalone:{strategy_id}"
         )
         artifact_hash = str(
-            strategy.get("artifact_hash")
+            ((strategy.get("artifact_reference") or {}).get("artifactHash") if (strategy.get("direct_execution") or {}).get("ready") else "")
+            or strategy.get("artifact_hash")
             or ((strategy.get("artifactLock") or {}).get("artifactHash") if isinstance(strategy.get("artifactLock"), dict) else "")
             or artifact_content_hash(strategy)
         )
@@ -1677,7 +1686,14 @@ class LiveContinuousController:
         )
 
     @staticmethod
-    def _spec_mode_allowed(spec: Any, mode: str) -> bool:
+    def _direct_binding_for_spec(spec: Any, deployment_id: str = "") -> dict:
+        from . import state
+        from .direct_strategy import binding_covers_spec
+        rows = [row for row in state.strategy_rows(state.portfolio_rows()) if binding_covers_spec(row, spec) and (not deployment_id or row.get("deployment_id") == deployment_id)]
+        return rows[0] if len(rows) == 1 else {}
+
+    @staticmethod
+    def _spec_mode_allowed(spec: Any, mode: str, deployment_id: str = "") -> bool:
         if mode == "MONITOR":
             return True
         artifact = spec.artifact if isinstance(spec.artifact, dict) else {}
@@ -1690,6 +1706,9 @@ class LiveContinuousController:
             policy = futures_execution_policy_from_artifact(artifact)
             if policy.get("valid") is not True:
                 return False
+        direct = LiveContinuousController._direct_binding_for_spec(spec, deployment_id)
+        if direct:
+            return direct.get("live_eligible" if mode == "FULL_LIVE" else "live_small_eligible") is True
         permissions = artifact.get("portfolioPermissions") if isinstance(artifact.get("portfolioPermissions"), dict) else {}
         if not permissions:
             permissions = artifact.get("permissions") if isinstance(artifact.get("permissions"), dict) else {}
@@ -1703,13 +1722,19 @@ class LiveContinuousController:
         )
 
     @staticmethod
-    def _paper_final_binding_blocker(specs: tuple[Any, ...]) -> str:
+    def _paper_final_binding_blocker(specs: tuple[Any, ...], deployment_id: str = "") -> str:
         """Re-read the pinned qualification before start or hot transition."""
 
         from . import state
 
         rows = state.strategy_rows(state.portfolio_rows())
+        from .direct_strategy import binding_covers_spec
         for spec in specs:
+            direct = [row for row in rows if binding_covers_spec(row, spec) and (not deployment_id or row.get("deployment_id") == deployment_id)]
+            if len(direct) == 1:
+                continue
+            if len(direct) > 1:
+                return "direct-binding-ambiguous:" + str(spec.strategy_id)
             strategy_id = str(spec.strategy_id or "").strip()
             instance_id = str(spec.strategy_instance_id or "").strip()
             portfolio_id = str(spec.portfolio_id or "").strip()

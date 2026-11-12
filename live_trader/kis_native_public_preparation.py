@@ -12,7 +12,7 @@ from uuid import uuid4
 from trading_runtime.artifact_governance import stable_sha256
 from trading_runtime.native_rest_initialization import NativeRestInitializationInputs,build_native_rest_initialization,_time,KST
 from trading_runtime.portfolio_runtime import required_warmup_bars
-from trading_runtime.promotion_policy import validate_paper_promotion_policy
+from trading_runtime.native_execution_policy import validate_initialization_policy
 from trading_runtime.provider_backfill_kis_kr import ENDPOINT,TR_ID,PARAMS,validate_params,capture,parse,seal,minute_timestamp,calendar_objects
 from trading_runtime.realtime_feeds import feeds_for_specs
 from .account_profiles import saved_account_profiles
@@ -141,7 +141,7 @@ def prepare_live_kis_native(root,*,plan,binding_reader,preparation_guard,setting
                 public_progress=public_progress)
     loaded=plan['loaded'];specs=tuple(loaded.specs)
     scope=plan['runtimeScope'];context=plan['context']
-    policy=validate_paper_promotion_policy(plan['promotionPolicy'],require_promotion=True)
+    policy=validate_initialization_policy(plan['promotionPolicy'])
     # The full policy must come from existing exact validated qualification.
     # No global/default policy is created or substituted for a missing pin.
     labels=plan.get('labelAcceptances')
@@ -212,7 +212,7 @@ def prepare_live_kis_native_ticks(root,*,plan,binding_reader,preparation_guard,s
     from .kis_prepared_native_feed import LivePreparedKisFeed
     utc_clock=utc_clock or (lambda:datetime.now(timezone.utc))
     loaded=plan['loaded'];specs=tuple(loaded.specs);scope=plan['runtimeScope'];context=plan['context']
-    policy=validate_paper_promotion_policy(plan['promotionPolicy'],require_promotion=True)
+    policy=validate_initialization_policy(plan['promotionPolicy'])
     profiles=[row for row in saved_account_profiles(settings) if row.get('brokerId')=='kis']
     if len(profiles)!=1 or any(profiles[0].get(k)!=scope.get(k) for k in ('accountFingerprint','credentialConfigurationHash','accountBindingId')):
         raise ValueError('LIVE_NATIVE_CURRENT_SAVED_ACCOUNT_CHANGED')

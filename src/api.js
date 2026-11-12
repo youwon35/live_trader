@@ -61,6 +61,7 @@ const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
   "/api/runtime/kis-manual-start-challenge",
   "/api/runtime/kis-native-prepare-cancel",
   "/api/runtime/kis-stop-and-reconcile",
+  "/api/direct-strategies/register",
   "/api/paper-candidates/import",
   "/api/paper-candidates/review",
   "/api/monitor-trial/run",
@@ -80,6 +81,7 @@ const FUNCTIONAL_HTTP_SESSION_PATHS = new Set([
   "/api/short-live-tests/snapshot",
   "/api/short-live-tests/catalog",
   "/api/preparation/market-gaps/status",
+  "/api/direct-strategies",
   "/api/paper-candidates",
   "/api/paper-candidates/accounts",
   "/api/preparation/sources",
@@ -1065,3 +1067,6 @@ export async function reviewPaperCandidate(reviewRequest) {
       method: "POST", body: { ...reviewRequest, ...safetyConfirmationPayload(confirmation) },
     }));
 }
+
+export const getDirectStrategies = () => request("/api/direct-strategies");
+export const registerDirectStrategy = (body) => request("/api/direct-strategies/register", { method: "POST", body });
