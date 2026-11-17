@@ -1,6 +1,7 @@
 import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel, diagnosticSafetyContext, preflightCheckPresentation, ordinarySafetyPresentation } from "./diagnosticPresentation.js";
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
 import ExternalResearchPanel, { TossConnectionCheck } from "./ExternalResearchPanel.jsx";
+import { StockSessionGuide } from "./components/StockSessionGuide.jsx";
 import TossCashOperationPanel from "./TossCashOperationPanel.jsx";
 import ReconciliationChanges from "./ReconciliationChanges.jsx";
 import { submitReconciliationReview } from "./reconciliationReviewApi.js";
@@ -3078,6 +3079,7 @@ function WorkspaceContent({
       <section className="settings-page-layout ts-layout-stack">
         <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} runtimeSnapshot={snapshot} onSave={onEnvSettings} />
         <TossConnectionCheck onSave={onEnvSettings} />
+        <StockSessionGuide />
         <ExternalResearchPanel />
         <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
         <CompactDisclosure

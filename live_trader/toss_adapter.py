@@ -314,6 +314,8 @@ def prepare_read_only(*, symbol, market_country, api=None, settings=None):
     orders = api.orders(status="OPEN", symbol=symbol)
     if not isinstance(orders, dict) or not isinstance(orders.get("orders"), list) or orders.get("hasNext") is not False:
         raise TossAdapterError("TOSS_OPEN_ORDER_COVERAGE_INCOMPLETE")
+    from trading_runtime.stock_session_plan import observe_toss_session_plan
+    session_plan = observe_toss_session_plan(api, market)
     details = [order_status(row) for row in orders["orders"]]
     if any(row.get("symbol") != symbol or row.get("currency") != currency for row in details):
         raise TossAdapterError("TOSS_ORDER_SYMBOL_MISMATCH")
@@ -324,4 +326,5 @@ def prepare_read_only(*, symbol, market_country, api=None, settings=None):
             "positions": [row for row in snapshot["positions"] if row["symbol"] == symbol],
             "openOrderCount": len(details), "commissions": api.commissions(),
             "observedAt": snapshot["observed_at"], "executionAuthorized": False,
-            "detail": "계좌·종목·미체결 조회를 확인했습니다. 실거래 시작 시 전략·한도·계좌 소유권을 별도로 확인합니다."}
+            "sessionSupport": session_plan,
+            "detail": "계좌·종목·미체결 조회를 확인했습니다. 실거래 시작 시 전략·한도·계좌 소유권을 별도로 확인합니다. " + session_plan["summaryKo"]}

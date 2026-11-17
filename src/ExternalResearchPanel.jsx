@@ -18,6 +18,7 @@ export default function ExternalResearchPanel() {
   async function run(action) {
     if (busy) return;
     setBusy(true); setError(""); setUrl("");
+    if (action === "analyze" || action === "disconnect") setResult(null);
     try {
       const payload = await request(`/api/tradingview/${action}`, action === "status" ? {} : {
         method: "POST", body: { symbol: symbol.trim(), interval }, timeoutMs: 45000,
@@ -25,6 +26,7 @@ export default function ExternalResearchPanel() {
       if (!payload.ok) throw new Error(payload.reason || "분석 요청을 확인하지 못했습니다.");
       if (action === "analyze") setResult(payload);
       else if (action === "chart" || action === "connect") {
+        if (action === "connect") setStatus(payload);
         const link = officialLink(payload.chartUrl || payload.authorizationUrl);
         if (!link) throw new Error("TradingView 공식 링크를 확인하지 못했습니다.");
         setUrl(link);
@@ -47,9 +49,9 @@ export default function ExternalResearchPanel() {
       <button disabled={busy} onClick={() => run("disconnect")}>연결 해제</button>
     </div>
     {url && <p><a href={url} target="_blank" rel="noopener noreferrer">TradingView에서 열기 ↗</a></p>}
-    {status && <p className="muted">{status.connected ? "TradingView 연결됨" : "TradingView 연결 전"}</p>}
+    {status && <p className="muted">{status.connecting ? "로그인 후 연결 확인을 눌러 주세요." : status.detail || (status.connected ? "TradingView 연결됨" : "TradingView 연결 전")}</p>}
     {error && <p role="alert" className="research-error">{error}</p>}
-    {result && <div aria-live="polite"><strong>추가 분석 · 주문과 분리</strong><ul>{(result.summary || []).map((line, i) => <li key={i}>{line}</li>)}</ul><p className="muted">관측 시각 {result.observedAt || "미확인"}</p></div>}
+    {result && <div aria-live="polite"><strong>추가 분석 · 주문과 분리</strong><ul>{(result.summary || []).map((line, i) => <li key={i}>{line}</li>)}</ul><p className="muted">분석 봉 시각 {result.lastBarAt || "미확인"} · 조회 시각 {result.observedAt || "미확인"}</p></div>}
   </details>;
 }
 
