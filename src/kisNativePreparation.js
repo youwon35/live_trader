@@ -15,8 +15,20 @@ export const KIS_PREPARATION_LABELS = Object.freeze({
   COMPLETE: "시작 요청 완료",
 });
 
+export function kisSessionStatusMessage(value = "") {
+  const code = String(value);
+  if (code.includes("INDICATOR_PRICE_BASIS_REVALIDATION_REQUIRED")) return "연구 자료와 실시간 시세의 가격 기준을 대조하지 못했습니다. 수정주가·원가격 근거를 확인한 뒤 다시 준비해 주세요.";
+  if (code.includes("LIVE_NATIVE_SESSION_WINDOW_CLOSED_REQUIRE_DRAINING")) return "선택 거래시간 종료 · 다음 구간은 새 준비가 필요합니다.";
+  if (code.includes("LIVE_NATIVE_SESSION_DIFFERENT_PROFILES_REQUIRE_SEPARATE_DEPLOYMENTS")) return "정규장과 시간외 전략은 각각 별도 배포로 준비해 주세요.";
+  if (code.includes("KIS_US_DAY_REALTIME_WEBSOCKET_NOT_OFFICIALLY_VERIFIED")) return "미국 주간거래의 공식 실시간 체결 구독을 확인하지 못해 연속 봉 운용을 보류했습니다.";
+  if (code.includes("KIS_PUBLIC_STREAM_ALREADY_OWNED")) return "다른 프로그램이 같은 KIS API 키로 실시간 시세를 받고 있습니다. 기존 연결을 확인해 주세요.";
+  return "";
+}
+
 export function kisPreparationFailureMessage(result = {}) {
   const code = [result.reasonCode, result.code, result.errorCode, result.reason].filter((v) => typeof v === "string").join(" ");
+  const session = kisSessionStatusMessage(code);
+  if (session) return session;
   if (/KIS_NATIVE_TICK_WINDOW_UNAVAILABLE/.test(code)) return "오늘 장중에 필요한 길이의 체결 자료를 모을 시간이 부족해 시작을 보류했습니다. 다음 정규장에 다시 준비해 주세요.";
   if (/KIS_LABEL_SCOPE_UNPROVEN|LIVE_NATIVE_REVIEWED_LABEL_/.test(code)) {
     return "국내 시세의 분봉 시각 검증이 완료되지 않아 시작을 보류했습니다.";

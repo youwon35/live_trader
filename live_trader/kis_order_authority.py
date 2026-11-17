@@ -70,6 +70,7 @@ _OPERATION_ENDPOINTS = {
         {
             "/uapi/domestic-stock/v1/trading/order-cash",
             "/uapi/overseas-stock/v1/trading/order",
+            "/uapi/overseas-stock/v1/trading/daytime-order",
         }
     ),
     "NATURAL_BUY": frozenset(
@@ -88,10 +89,10 @@ _OPERATION_ENDPOINTS = {
         {"/uapi/domestic-stock/v1/trading/order-rvsecncl"}
     ),
     "OVERSEAS_CANCEL_ORDER": frozenset(
-        {"/uapi/overseas-stock/v1/trading/order-rvsecncl"}
+        {"/uapi/overseas-stock/v1/trading/order-rvsecncl", "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"}
     ),
     "SCOPED_CANCEL_KR": frozenset({"/uapi/domestic-stock/v1/trading/order-rvsecncl"}),
-    "SCOPED_CANCEL_US": frozenset({"/uapi/overseas-stock/v1/trading/order-rvsecncl"}),
+    "SCOPED_CANCEL_US": frozenset({"/uapi/overseas-stock/v1/trading/order-rvsecncl", "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"}),
 }
 
 

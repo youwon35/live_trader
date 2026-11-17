@@ -128,6 +128,14 @@ def prepare_live_kis_native(root,*,plan,binding_reader,preparation_guard,setting
         utc_clock=None,monotonic_clock=None,maximum_seconds=660,feed_factory=None,transport=None,
         initialization_options=None,public_progress=None):
     """State-owned plan only; serialized request data is never accepted as it."""
+    from .kis_native_session_preparation import needs_session_initialization,prepare_live_kis_session
+    if needs_session_initialization(tuple(plan['loaded'].specs)):
+        if initialization_options is not None and initialization_options.method=='PUBLIC_H0STCNT0':
+            raise ValueError('LIVE_NATIVE_SESSION_REGULAR_SCIENTIFIC_OPTIONS_NOT_APPLICABLE')
+        if transport is not None:raise ValueError('LIVE_NATIVE_SESSION_DISTINCT_PUBLIC_CHART_TRANSPORT_REQUIRED')
+        return prepare_live_kis_session(root,plan=plan,binding_reader=binding_reader,preparation_guard=preparation_guard,
+            settings=settings,utc_clock=utc_clock,monotonic_clock=monotonic_clock,maximum_seconds=maximum_seconds,
+            feed_factory=feed_factory,public_progress=public_progress)
     utc_clock=utc_clock or (lambda:datetime.now(timezone.utc))
     from .kis_native_preparation_options import NativePreparationOptions,parse_native_preparation_options
     if initialization_options is not None:

@@ -121,10 +121,10 @@ def limit_price(raw_open, side, tick, protective_bps):
         return text(value)
 
 
-def validate_observation(value, *, account, contract, side, limit, now=None):
+def validate_observation(value, *, account, contract, side, limit, now=None, order_class="00"):
     value=checked(value,OBSERVATION); current=now or datetime.now(timezone.utc)
     expected={'brokerId':'kis','exchange':contract['exchange'],'currency':contract['quoteCurrency'],
-              'symbol':contract['symbol'],'side':side,'orderClass':'00','queryPrice':text(decimal_value(limit,'limit',positive=True)),
+              'symbol':contract['symbol'],'side':side,'orderClass':order_class,'queryPrice':text(decimal_value(limit,'limit',positive=True)),
               'profileId':account['profileId'],'accountFingerprint':account['accountFingerprint'],
               'credentialConfigurationHash':account['credentialConfigurationHash']}
     if any(value.get(k)!=v for k,v in expected.items()): raise ValueError('KIS_V2_OBSERVATION_EXACT_SCOPE_CHANGED')
@@ -142,6 +142,24 @@ def validate_observation(value, *, account, contract, side, limit, now=None):
         number=decimal_value(value.get(key),key)
         if 'Quantity' in key and number!=number.to_integral_value(): raise ValueError('KIS_V2_WHOLE_SHARES_REQUIRED')
     return value
+
+
+def _profile_ticket_fields(spec, boundary, observation, current):
+    if (spec.parameters or {}).get('stockSessionProfile') is None:
+        return {}, '00'
+    from trading_runtime.stock_session_profile import profile_for_spec, profile_hash, session_phase
+    from trading_runtime.kis_session_routes import kis_order_route, validate_kis_session_evidence
+    selected=profile_for_spec(spec);phase=session_phase(boundary.get('session'))
+    route=kis_order_route(selected, exchange=observation['exchange'], session_phase=phase)
+    if (observation.get('stockSessionProfile')!=selected or observation.get('sessionPhase')!=phase
+            or observation.get('sessionProfileHash')!=profile_hash(selected)
+            or boundary.get('sessionProfileHash')!=profile_hash(selected) or boundary.get('sourceVenue')!=selected['venue']
+            or observation.get('executionVenue')!=route['exchangeId'] or observation.get('orderClass')!=route['orderClass']):
+        raise ValueError('KIS_PROFILE_TICKET_NATIVE_OBSERVATION_CHANGED')
+    if selected['mode']=='EXTENDED':
+        validate_kis_session_evidence(selected,phase,observation.get('sessionEvidence'),now=current,symbol=spec.symbol,exchange=observation['exchange'])
+    return {'stockSessionProfile':selected,'stockSessionProfileHash':profile_hash(selected),'sessionPhase':phase,
+            'sessionEvidence':observation.get('sessionEvidence'),'executionVenue':route['exchangeId']}, route['orderClass']
 
 
 def live_equity_quantity(spec, *, side, price, allocation_weight, identity, context=None, position_quantity=0, now=None):
@@ -171,8 +189,9 @@ def live_equity_quantity(spec, *, side, price, allocation_weight, identity, cont
         for key in ('rawHash','closedBarHash'):
             if not re.fullmatch('[a-f0-9]{64}',str(boundary.get(key) or '')): raise ValueError('KIS_V2_BOUNDARY_PROOFS_REQUIRED')
         observation=context['nativeMarketObservation']
+        session_fields, order_class=_profile_ticket_fields(spec,boundary,observation,current)
         limit=limit_price(price,side,observation.get('priceTick'),execution['protectiveLimitBps'])
-        observation=validate_observation(observation,account=account,contract=contract,side=side,limit=limit,now=current)
+        observation=validate_observation(observation,account=account,contract=contract,side=side,limit=limit,now=current,order_class=order_class)
         rate=decimal_value(fee['reserveRates'][side],'reserve rate',positive=True)
         minimum=decimal_value(fee['minimumCostReserves'][side],'minimum reserve',positive=True)
         source_fee,source_slip=source_cost_rates(spec.artifact,spec.parameters)
@@ -203,7 +222,7 @@ def live_equity_quantity(spec, *, side, price, allocation_weight, identity, cont
                 'capitalScopeHash':context['capitalScopeHash'],'profileId':account['profileId'],
                 'accountFingerprint':account['accountFingerprint'],'credentialConfigurationHash':account['credentialConfigurationHash'],
                 'asOf':observation['asOf'],'deploymentId':identity['deploymentId'],'evaluationKey':boundary['evaluationKey'],
-                'boundaryHash':stable_sha256(boundary),'orderClass':'00','quantityUnit':'SHARE'})
+                'boundaryHash':stable_sha256(boundary),'orderClass':order_class,'quantityUnit':'SHARE',**session_fields})
         transported=float(qty)
         if Decimal(str(transported))!=qty or Decimal(str(float(wire)))!=wire: raise ValueError('KIS_V2_FLOAT_WIRE_TRANSPORT_LOSS')
         return {**blocked,'status':'READY','quantityForSubmission':transported,'nativeEligibility':'VERIFIED','modelResult':result,'preflightBinding':{'version':RESULT,'asOf':observation['asOf'],'deploymentId':identity['deploymentId'],'accountFingerprint':account['accountFingerprint'],'capitalScopeHash':context['capitalScopeHash'],'sourceContractHash':contract['contractHash'],'marketObservationHash':observation['contentHash'],'kisEquityTicket':result}}
@@ -238,6 +257,21 @@ def validate_ticket(intent, *, now=None, settings=None):
         or model.get('actualFeeObserved') is not False or model.get('feeAccounting')!='EXPLICIT_COST_RESERVE_NOT_ACTUAL_FEE'):
         raise ValueError('KIS_V2_TICKET_EXACT_SCOPE_CHANGED')
     current=now or datetime.now(timezone.utc)
+    session_fields={}
+    order_class='00'
+    if model.get('stockSessionProfile') is not None:
+        from trading_runtime.stock_session_profile import profile_hash, session_phase
+        from trading_runtime.kis_session_routes import kis_order_route, validate_kis_session_evidence
+        selected=model['stockSessionProfile'];phase=session_phase(boundary.get('session'))
+        route=kis_order_route(selected,exchange=model['exchange'],session_phase=phase,side=intent.side)
+        if (model.get('stockSessionProfileHash')!=profile_hash(selected) or model.get('sessionPhase')!=phase
+                or boundary.get('sessionProfileHash')!=profile_hash(selected) or boundary.get('sourceVenue')!=selected['venue']
+                or model.get('executionVenue')!=route['exchangeId']):
+            raise ValueError('KIS_PROFILE_TICKET_EXACT_SESSION_CHANGED')
+        if selected['mode']=='EXTENDED':
+            validate_kis_session_evidence(selected,phase,model.get('sessionEvidence'),now=current,symbol=intent.symbol,exchange=model['exchange'])
+        order_class=route['orderClass']
+        session_fields={key:model[key] for key in ('stockSessionProfile','stockSessionProfileHash','sessionPhase','sessionEvidence','executionVenue')}
     if (not 0<=(current-timestamp(model['asOf'])).total_seconds()<=15 or not 0<=(current-timestamp(boundary['startTime'])).total_seconds()<=30
         or current>=timestamp(model['executionPolicyValidUntil']) or current>=timestamp(model['feePolicyValidUntil'])):
         raise ValueError('KIS_V2_TICKET_EXPIRED')
@@ -250,7 +284,7 @@ def validate_ticket(intent, *, now=None, settings=None):
             or decimal_value(model['costReserve'],'reserve')!=max(decimal_value(model['minimumCostReserve'],'minimum reserve',positive=True),qty*price*decimal_value(model['costReserveRate'],'reserve rate',positive=True))):
             raise ValueError('KIS_V2_TICKET_DECIMAL_ACCOUNTING_CHANGED')
     if (boundary.get('provider')!='kis' or boundary.get('symbol')!=intent.symbol or boundary.get('promotionEligible') is not True
-        or model.get('orderClass')!='00' or model.get('exchange') not in VENUES or model.get('currency')!=VENUES[model['exchange']][0]):
+        or model.get('orderClass')!=order_class or model.get('exchange') not in VENUES or model.get('currency')!=VENUES[model['exchange']][0]):
         raise ValueError('KIS_V2_TICKET_BOUNDARY_OR_VENUE_CHANGED')
     for key in ('executionPolicyHash','feeReservePolicyHash','observationHash','capitalScopeHash','accountFingerprint','credentialConfigurationHash','sourceArtifactHash'):
         if not re.fullmatch('[a-f0-9]{64}',str(model.get(key) or '')):raise ValueError('KIS_V2_TICKET_PROOF_HASH_REQUIRED')
@@ -259,6 +293,6 @@ def validate_ticket(intent, *, now=None, settings=None):
         profiles=[p for p in saved_account_profiles(settings) if p['brokerId']=='kis']
         if len(profiles)!=1 or any(model.get(k)!=profiles[0][k] for k in ('profileId','accountFingerprint','credentialConfigurationHash')):
             raise ValueError('KIS_V2_TICKET_CURRENT_CREDENTIALS_CHANGED')
-    return {'orderClass':'00','exchange':model['exchange'],'currency':model['currency'],'quantity':text(qty),
+    return {**session_fields,'orderClass':order_class,'exchange':model['exchange'],'currency':model['currency'],'quantity':text(qty),
             'limitPrice':text(price),'costReserve':model['costReserve'],'actualPersonalFeeObserved':False,
             'orderAuthorityGranted':False}

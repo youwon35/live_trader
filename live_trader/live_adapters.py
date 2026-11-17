@@ -49,6 +49,8 @@ KIS_LIVE_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_TOKEN_ENDPOINT = "/oauth2/tokenP"
 KIS_DOMESTIC_ORDER_ENDPOINT = "/uapi/domestic-stock/v1/trading/order-cash"
 KIS_OVERSEAS_ORDER_ENDPOINT = "/uapi/overseas-stock/v1/trading/order"
+KIS_OVERSEAS_DAY_ORDER_ENDPOINT = "/uapi/overseas-stock/v1/trading/daytime-order"
+KIS_OVERSEAS_DAY_CANCEL_ENDPOINT = "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"
 KIS_DOMESTIC_CANCEL_ENDPOINT = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 KIS_OVERSEAS_CANCEL_ENDPOINT = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 KIS_DOMESTIC_BALANCE_ENDPOINT = "/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -77,6 +79,8 @@ _KIS_TRADING_ENDPOINTS = frozenset(
         KIS_DOMESTIC_CANCEL_ENDPOINT,
         KIS_OVERSEAS_ORDER_ENDPOINT,
         KIS_OVERSEAS_CANCEL_ENDPOINT,
+        KIS_OVERSEAS_DAY_ORDER_ENDPOINT,
+        KIS_OVERSEAS_DAY_CANCEL_ENDPOINT,
     }
 )
 _KIS_OWNED_ENDPOINTS = frozenset(
@@ -99,6 +103,8 @@ _KIS_OWNED_ENDPOINTS = frozenset(
 _KIS_TRADING_TR_IDS = {
     KIS_DOMESTIC_ORDER_ENDPOINT: frozenset(KIS_DOMESTIC_TR_IDS.values()),
     KIS_OVERSEAS_ORDER_ENDPOINT: frozenset(KIS_OVERSEAS_TR_IDS.values()),
+    KIS_OVERSEAS_DAY_ORDER_ENDPOINT: frozenset({"TTTS6036U", "TTTS6037U"}),
+    KIS_OVERSEAS_DAY_CANCEL_ENDPOINT: frozenset({"TTTS6038U"}),
     KIS_DOMESTIC_CANCEL_ENDPOINT: frozenset({"TTTC0013U"}),
     KIS_OVERSEAS_CANCEL_ENDPOINT: frozenset({"TTTT1004U"}),
 }
@@ -544,6 +550,28 @@ def normalize_kis_market(symbol: str, asset_class: str = "") -> str:
     return "US"
 
 
+def _kis_stock_session_route(payload, market, *, cancel=False):
+    value = payload.get("stockSessionProfile", payload.get("stock_session_profile"))
+    if value is None:
+        return None  # Legacy regular-only request retains its exact old wire.
+    from datetime import datetime, timezone
+    from trading_runtime.stock_session_profile import profile_hash
+    from trading_runtime.kis_session_routes import kis_order_route, validate_kis_session_evidence
+    route = kis_order_route(value, market=market, exchange=str(payload.get("exchange") or ""),
+        session_phase=str(payload.get("sessionPhase") or payload.get("session_phase") or ""),
+        side=normalize_side(payload.get("side") or "BUY"))
+    if payload.get("stockSessionProfileHash") not in {None, profile_hash(route["stockSessionProfile"])}:
+        raise ValueError("KIS_SESSION_PROFILE_HASH_CHANGED")
+    if route["stockSessionProfile"]["mode"] == "EXTENDED" and not cancel:
+        if str(payload.get("environment") or env_value("KIS_ENV") or "real").lower() not in {"real", "live"}:
+            raise ValueError("KIS_EXTENDED_REQUIRES_REAL_MARKET_ENVIRONMENT")
+        validate_kis_session_evidence(route["stockSessionProfile"], route["sessionPhase"],
+            payload.get("sessionEvidence"), now=datetime.now(timezone.utc),
+            symbol=str(payload.get("symbol") or "").removesuffix(".KS").removesuffix(".KQ"),
+            exchange=str(payload.get("exchange") or ""))
+    return route
+
+
 def build_kis_live_order_request(intent: dict[str, object], *, access_token: str = "") -> PreparedRequest:
     required = ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE")
     blocked = missing_env(*required)
@@ -558,6 +586,11 @@ def build_kis_live_order_request(intent: dict[str, object], *, access_token: str
     price = normalize_price(intent.get("price") or 0)
     market = normalize_kis_market(symbol, str(intent.get("asset") or intent.get("asset_class") or ""))
     cano, acnt_prdt_cd = split_kis_account(account_no, product_code)
+    session_route = None
+    try:
+        session_route = _kis_stock_session_route(intent, market)
+    except (ValueError, TypeError, KeyError) as error:
+        blocked.append(str(error))
 
     if not symbol:
         blocked.append("symbol")
@@ -590,6 +623,18 @@ def build_kis_live_order_request(intent: dict[str, object], *, access_token: str
             "ORD_SVR_DVSN_CD": "0",
             "ORD_DVSN": str(intent.get("order_type") or "00"),
         }
+
+    if session_route is not None:
+        endpoint, tr_id = session_route["endpoint"], session_route["trId"]
+        requested_class = str(intent.get("order_type") or "00")
+        if requested_class not in {"00", session_route["orderClass"]}:
+            blocked.append("KIS_SESSION_LIMIT_ORDER_CLASS_MISMATCH")
+        body["ORD_DVSN"] = session_route["orderClass"]
+        if market == "KR":
+            body["EXCG_ID_DVSN_CD"] = session_route["exchangeId"]
+        elif endpoint == KIS_OVERSEAS_DAY_ORDER_ENDPOINT:
+            body["CTAC_TLNO"] = ""
+            body["MGCO_APTM_ODNO"] = ""
 
     headers = {
         "content-type": "application/json; charset=utf-8",
@@ -1064,6 +1109,12 @@ def build_kis_cancel_order_request(order: dict[str, object], *, access_token: st
     market = normalize_kis_market(symbol, str(order.get("asset") or order.get("asset_class") or ""))
     env_dv = str(order.get("environment") or env_value("KIS_ENV") or "real").strip().lower()
 
+    session_route = None
+    try:
+        session_route = _kis_stock_session_route(order, market, cancel=True)
+    except (ValueError, TypeError, KeyError) as error:
+        blocked.append(str(error))
+
     if not access_token:
         blocked.append("access_token")
     if not symbol:
@@ -1108,6 +1159,14 @@ def build_kis_cancel_order_request(order: dict[str, object], *, access_token: st
             "MGCO_APTM_ODNO": str(order.get("manager_order_id") or ""),
             "ORD_SVR_DVSN_CD": "0",
         }
+
+    if session_route is not None:
+        endpoint, tr_id = session_route["cancelEndpoint"], session_route["cancelTrId"]
+        if market == "KR":
+            body["ORD_DVSN"] = session_route["orderClass"]
+            body["EXCG_ID_DVSN_CD"] = session_route["exchangeId"]
+        elif endpoint == KIS_OVERSEAS_DAY_CANCEL_ENDPOINT:
+            body["CTAC_TLNO"] = ""
 
     headers = {
         "content-type": "application/json; charset=utf-8",
@@ -2231,6 +2290,7 @@ def _validate_kis_operation_wire(
             (
                 frozenset({"TTTC0012U", "TTTC0011U"})
                 if endpoint == KIS_DOMESTIC_ORDER_ENDPOINT
+                else frozenset({"TTTS6036U", "TTTS6037U"}) if endpoint == KIS_OVERSEAS_DAY_ORDER_ENDPOINT
                 else frozenset({"TTTT1002U", "TTTT1006U"})
             ),
         ),
@@ -2255,11 +2315,11 @@ def _validate_kis_operation_wire(
             frozenset({"TTTC0013U"}),
         ),
         "OVERSEAS_CANCEL_ORDER": (
-            KIS_OVERSEAS_CANCEL_ENDPOINT,
-            frozenset({"TTTT1004U"}),
+            endpoint,
+            frozenset({"TTTS6038U"}) if endpoint == KIS_OVERSEAS_DAY_CANCEL_ENDPOINT else frozenset({"TTTT1004U"}),
         ),
         "SCOPED_CANCEL_KR": (KIS_DOMESTIC_CANCEL_ENDPOINT, frozenset({"TTTC0013U"})),
-        "SCOPED_CANCEL_US": (KIS_OVERSEAS_CANCEL_ENDPOINT, frozenset({"TTTT1004U"})),
+        "SCOPED_CANCEL_US": (endpoint, frozenset({"TTTS6038U"}) if endpoint == KIS_OVERSEAS_DAY_CANCEL_ENDPOINT else frozenset({"TTTT1004U"})),
     }
     contract = allowed.get(operation)
     if (
@@ -2296,7 +2356,7 @@ def _validate_kis_operation_wire(
             or str(exact_body.get("ORGN_ODNO") or "") != str(owned_order_key.get("orderNo") or "")
             or str(exact_body.get("RVSE_CNCL_DVSN_CD") or "") != "02"
             or (domestic and (str(exact_body.get("KRX_FWDG_ORD_ORGNO") or "") != str(owned_order_key.get("organizationNo") or "")
-                or exact_body.get("QTY_ALL_ORD_YN") != "N" or exact_body.get("ORD_UNPR") != "0" or exact_body.get("EXCG_ID_DVSN_CD") != "KRX"))
+                or exact_body.get("QTY_ALL_ORD_YN") != "N" or exact_body.get("ORD_UNPR") != "0" or exact_body.get("EXCG_ID_DVSN_CD") not in {"KRX", "NXT"}))
             or (not domestic and (exact_body.get("OVRS_EXCG_CD") not in {"NASD", "NYSE", "AMEX"}
                 or exact_body.get("OVRS_ORD_UNPR") != "0" or exact_body.get("ORD_SVR_DVSN_CD") != "0"))):
             raise KisOrderAuthorityError("KIS scoped cleanup wire differs from exact whole-share owned remainder")

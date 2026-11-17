@@ -21,6 +21,8 @@ from .kis_scoped_operational_authority import exact_context
 from .runtime_scope import scope_from_mapping
 
 SCHEMA = 'live-kis-native-initialization-data-v1'
+SESSION_SCHEMA='live-kis-native-session-initialization-data-v1'
+PUBLIC_SESSION_SCHEMA='source-bound-native-session-initialization-v1'
 _SHA = re.compile(r'^[a-f0-9]{64}$')
 _FIELDS = {'schemaVersion','context','contextHash','runtimeScope','deploymentManifestHash',
     'publicInitializationData','publicInitializationHash','cutoff','portfolioId','portfolioHash',
@@ -30,23 +32,38 @@ _FIELDS = {'schemaVersion','context','contextHash','runtimeScope','deploymentMan
 def build_live_initialization(public_data, *, context, runtime_scope, deployment_manifest_hash, specs):
     context = exact_context(context)
     scope = scope_from_mapping(runtime_scope)
-    public_data = validate_bound_native_initialization(public_data, portfolio_hash=specs[0].portfolio_hash,
-        promotion_policy_hash=public_data['promotionPolicyHash'])
-    assert_initialization_matches_runtime(public_data, specs)
+    session_data=isinstance(public_data,Mapping) and public_data.get('schemaVersion')==PUBLIC_SESSION_SCHEMA
+    if session_data:
+        from trading_runtime.native_session_initialization import validate_session_initialization
+        from trading_runtime.stock_session_profile import profile_for_spec
+        validate_session_initialization(public_data,specs=specs)
+        public_data=deepcopy(public_data)
+        capture=public_data['captureScope']
+        if any(capture[key]!=expected for key,expected in (
+                ('accountFingerprint',scope.account_fingerprint),('credentialConfigurationHash',scope.credential_configuration_hash),
+                ('runtimeScopeId',scope.runtime_id),('profileId',scope.profile_id),('deploymentId',scope.deployment_id))):
+            raise ValueError('LIVE_NATIVE_SESSION_PAPER_OR_FOREIGN_OWNER_SCOPE_REJECTED')
+        currencies={'KRW' if profile_for_spec(spec)['market']=='KR' else 'USD' for spec in specs}
+        if len(currencies)!=1 or scope.capital_currency not in currencies or context['capitalCurrency']!=scope.capital_currency:
+            raise ValueError('LIVE_NATIVE_SESSION_SINGLE_EXACT_CURRENCY_REQUIRED_NO_IMPLICIT_FX')
+    else:
+        public_data = validate_bound_native_initialization(public_data, portfolio_hash=specs[0].portfolio_hash,
+            promotion_policy_hash=public_data['promotionPolicyHash'])
+        assert_initialization_matches_runtime(public_data, specs)
     if public_data.get('schemaVersion') == 'source-bound-native-tick-initialization-v1':
         capture = public_data['captureManifest']['scope']
         if capture['mode'] != 'LIVE' or (capture['accountFingerprint'], capture['credentialConfigurationHash'], capture['runtimeScopeId']) != (
                 scope.account_fingerprint, scope.credential_configuration_hash, scope.runtime_id):
             raise ValueError('LIVE_NATIVE_TICK_PAPER_OR_FOREIGN_ACCOUNT_CAPTURE_REJECTED')
-    if (scope.broker_id != 'kis' or scope.capital_currency != 'KRW' or not scope.account_binding_id
-            or context['capitalCurrency'] != 'KRW' or context['runtimeScopeId'] != scope.runtime_id
+    if (scope.broker_id != 'kis' or not session_data and scope.capital_currency != 'KRW' or not scope.account_binding_id
+            or not session_data and context['capitalCurrency'] != 'KRW' or context['runtimeScopeId'] != scope.runtime_id
             or context['deploymentId'] != scope.deployment_id or context['profileId'] != scope.profile_id
             or context['accountFingerprint'] != scope.account_fingerprint
             or context['credentialConfigurationHash'] != scope.credential_configuration_hash
             or not _SHA.fullmatch(deployment_manifest_hash)
             or public_data['portfolioId'] != context['portfolioId']):
         raise ValueError('LIVE_NATIVE_INITIALIZATION_ACCOUNT_RUNTIME_SOURCE_BINDING_INVALID')
-    body = {'schemaVersion':SCHEMA,'context':deepcopy(context),'contextHash':stable_sha256(context),
+    body = {'schemaVersion':SESSION_SCHEMA if session_data else SCHEMA,'context':deepcopy(context),'contextHash':stable_sha256(context),
         'runtimeScope':scope.to_dict(),'deploymentManifestHash':deployment_manifest_hash,
         'publicInitializationData':public_data,'publicInitializationHash':public_data['contentHash'],
         'cutoff':public_data['cutoff'],'portfolioId':public_data['portfolioId'],'portfolioHash':public_data['portfolioHash'],
@@ -56,7 +73,7 @@ def build_live_initialization(public_data, *, context, runtime_scope, deployment
 
 def validate_live_initialization(value, *, context, runtime_scope, deployment_manifest_hash, specs):
     if (not isinstance(value,Mapping) or set(value)!=_FIELDS
-            or value.get('schemaVersion') != SCHEMA or type(value.get('contentHash')) is not str
+            or value.get('schemaVersion') not in {SCHEMA,SESSION_SCHEMA} or type(value.get('contentHash')) is not str
             or stable_sha256({k:v for k,v in value.items() if k!='contentHash'}) != value['contentHash']):
         raise ValueError('LIVE_NATIVE_INITIALIZATION_SCHEMA_OR_HASH_INVALID')
     expected = build_live_initialization(value['publicInitializationData'],context=context,runtime_scope=runtime_scope,
@@ -96,15 +113,36 @@ class LiveKisNativeInitializedEngine(PortfolioRuntimeEngine):
         self.live_native_initialization = receipt
         self._live_initialization_content_hash = stable_sha256(receipt)
         data=receipt['publicInitializationData']
-        bars=initialization_bars(data,portfolio_hash=receipt['portfolioHash'],promotion_policy_hash=data['promotionPolicyHash'])
+        if data.get('schemaVersion')==PUBLIC_SESSION_SCHEMA:
+            from trading_runtime.native_session_initialization import initialization_bars as session_bars
+            bars=session_bars(data,specs=self.specs)
+            for spec in self.specs:self.set_session_windows(spec,data['streams'][spec.strategy_instance_id]['windows'])
+        else:
+            bars=initialization_bars(data,portfolio_hash=receipt['portfolioHash'],promotion_policy_hash=data['promotionPolicyHash'])
         return {spec.strategy_instance_id:super(LiveKisNativeInitializedEngine,self).seed_history(spec.strategy_instance_id,
             bars[spec.strategy_instance_id]) for spec in self.specs}
 
-    def _assert_native_phase(self,start,end=None):
+    def _assert_native_phase(self,start,end=None,event=None):
         if self.live_native_initialization is None:
             raise ValueError('LIVE_NATIVE_INITIALIZATION_REQUIRED')
         if stable_sha256(self.live_native_initialization)!=self._live_initialization_content_hash:
             raise ValueError('LIVE_NATIVE_INITIALIZATION_CHANGED_AFTER_SEED')
+        if self.live_native_initialization['schemaVersion']==SESSION_SCHEMA:
+            from trading_runtime.stock_session_profile import profile_hash,session_window_at,bar_matches_profile
+            from trading_runtime.market_data import timeframe_seconds
+            data=self.live_native_initialization['publicInitializationData'];point=_time(start)
+            matches=[(spec,data['streams'][spec.strategy_instance_id]) for spec in self.specs
+                if event is not None and spec.instrument_id==event.instrument_id and spec.timeframe==event.timeframe
+                and bar_matches_profile(spec,event)]
+            if not matches:raise ValueError('LIVE_NATIVE_SESSION_FORWARD_PROFILE_OR_STREAM_DIFFERS')
+            for spec,row in matches:
+                cutoff=_time(row['historyReceipt']['throughEnd']);profile=row['stockSessionProfile']
+                window=session_window_at(profile,point,windows=row['windows'])
+                if (point<cutoff or end is not None and _time(end)<=cutoff or not window
+                        or end is not None and _time(end)>_time(window['end'])
+                        or end is not None and (_time(end)-point).total_seconds()!=timeframe_seconds(spec.timeframe)):
+                    raise ValueError('LIVE_NATIVE_SESSION_CUTOFF_OR_FULL_WINDOW_UNSUPPORTED_REQUIRE_DRAINING')
+            return
         cutoff=_time(self.live_native_initialization['cutoff'])
         point=_time(start)
         local=point.astimezone(KST)
@@ -125,12 +163,18 @@ class LiveKisNativeInitializedEngine(PortfolioRuntimeEngine):
         return ''
 
     def ingest_closed_bar(self,bar):
-        self._assert_native_phase(bar.start_time,bar.end_time)
+        self._assert_native_phase(bar.start_time,bar.end_time,event=bar)
         return super().ingest_closed_bar(bar)
 
     def ingest_open_boundary(self,boundary):
-        self._assert_native_phase(boundary.start_time)
-        if _time(boundary.start_time)<=_time(self.live_native_initialization['cutoff']):
+        self._assert_native_phase(boundary.start_time,event=boundary)
+        data=self.live_native_initialization['publicInitializationData']
+        cutoff=self.live_native_initialization['cutoff']
+        if self.live_native_initialization['schemaVersion']==SESSION_SCHEMA:
+            from trading_runtime.stock_session_profile import bar_matches_profile
+            rows=[data['streams'][s.strategy_instance_id] for s in self.specs if s.instrument_id==boundary.instrument_id and s.timeframe==boundary.timeframe and bar_matches_profile(s,boundary)]
+            cutoff=max((row['historyReceipt']['throughEnd'] for row in rows),key=_time)
+        if _time(boundary.start_time)<=_time(cutoff):
             raise ValueError('LIVE_NATIVE_INITIALIZATION_PREACTIVATION_OPEN_FORBIDDEN')
         return super().ingest_open_boundary(boundary)
 

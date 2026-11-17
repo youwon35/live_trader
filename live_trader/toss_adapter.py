@@ -58,7 +58,10 @@ def strategy_market_metadata(spec):
     allowed = {"KRX", "KOSPI", "KOSDAQ", "KONEX"} if market == "KR" else {"NASDAQ", "NYSE", "AMEX", "NASD", "NYSE", "AMEX"}
     if exchange not in allowed:
         raise TossAdapterError("TOSS_REVIEWED_EXCHANGE_MISMATCH")
-    return {"quote_currency": currency, "marketCountry": market, "exchange": exchange, "order_type": "LIMIT"}
+    from trading_runtime.stock_session_profile import profile_for_spec, profile_hash
+    profile=profile_for_spec(spec)
+    return {"quote_currency": currency, "marketCountry": market, "exchange": exchange, "order_type": "LIMIT",
+            "stockSessionProfile":profile,"stockSessionProfileHash":profile_hash(profile)}
 
 
 def normalized_order(intent):
@@ -85,7 +88,12 @@ def normalized_order(intent):
         raise TossAdapterError("TOSS_SHORT_POSITION_UNSUPPORTED")
     body = {"clientOrderId": identifier, "symbol": symbol, "side": side,
             "orderType": "LIMIT", "quantity": str(int(quantity)), "price": format(price, "f")}
-    identity = dict(intent, broker_id="toss", symbol=symbol, side=side, identifier=identifier,
+    from trading_runtime.stock_session_profile import normalize_stock_session_profile, profile_hash
+    metadata=intent.get('metadata') or {}
+    profile=normalize_stock_session_profile(intent.get('stockSessionProfile') or metadata.get('stockSessionProfile'),market=market,provider='toss')
+    declared=intent.get('stockSessionProfileHash') or metadata.get('stockSessionProfileHash')
+    if declared and declared!=profile_hash(profile): raise TossAdapterError('TOSS_ORDER_PROFILE_HASH_MISMATCH')
+    identity = dict(intent, stockSessionProfile=profile, stockSessionProfileHash=profile_hash(profile), broker_id="toss", symbol=symbol, side=side, identifier=identifier,
                     quantity=str(quantity), qty=str(quantity), price=str(price),
                     notional=str(price * quantity), currency=currency, market_country=market)
     return identity, body
@@ -285,6 +293,9 @@ def dispatch_funds(intent, api=None):
     kr = stock.get("koreanMarketDetail") or {}
     if kr.get("liquidationTrading") or kr.get("krxTradingSuspended"):
         raise TossAdapterError("TOSS_STOCK_TRADING_RESTRICTED")
+    from trading_runtime.toss_session_scope import execution_scope
+    if normalized['stockSessionProfile']['mode']=='EXTENDED':
+        execution_scope(api,normalized['stockSessionProfile'],normalized['symbol'],stock,now=time.time())
     if normalized["side"] == "BUY":
         power = api.buying_power(currency=currency)
         if not isinstance(power, dict) or power.get("currency") != currency:

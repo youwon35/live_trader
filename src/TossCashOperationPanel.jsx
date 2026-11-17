@@ -5,6 +5,12 @@ import "./TossCashOperationPanel.css";
 const base = "/api/toss/operation/";
 const labels = { IDLE: "준비 전", PREPARING: "주문 없이 준비 중", PREPARED: "준비 완료", PREPARATION_FAILED: "준비 확인 필요", RUNNING: "토스 현금 운용 중", STOPPING: "소유 주문 정리 중", STOPPED: "종료·대조 완료", STOPPED_WITH_ERROR: "오류를 남기고 종료", RECOVERY_REQUIRED: "이전 운용 대조 필요", RECONCILIATION_REQUIRED: "소유 주문·보유분 확인 필요", CLOSING: "이번 운용 보유분 매도 중" };
 const reasons = {
+  TOSS_DAILY_CANDLE_SESSION_SCOPE_UNAVAILABLE: "토스 일봉은 정규·시간외 범위를 분리할 수 없습니다. 분봉 전략을 선택하세요.",
+  TOSS_EXTENDED_SOURCE_REEXPORT_REQUIRED: "시간외 전략은 토스 데이터로 다시 백테스트한 원본을 선택하세요.",
+  TOSS_EXTENDED_NXT_ELIGIBILITY_REQUIRED: "이 종목의 NXT 시간외 거래 가능 여부를 확인하지 못했습니다.",
+  TOSS_PROFILE_HISTORY_INSUFFICIENT: "선택한 거래시간 범위의 과거 봉이 부족합니다.",
+  STOCK_SESSION_OFFICIAL_WINDOWS_REQUIRED: "해당 날짜의 공식 거래시간 자료가 필요합니다.",
+  STOCK_SESSION_NEXT_BOUNDARY_UNOBSERVED: "선택한 거래시간의 다음 봉 경계를 아직 확인하지 못했습니다.",
   TOSS_CREDENTIALS_REQUIRED: "연결·설정에서 토스 Client ID와 Secret을 입력해 주세요.",
   TOSS_ACCOUNT_SEQ_REQUIRED: "연결·설정 → 토스증권 연결 확인에서 공식 계좌 목록을 조회하고 사용할 계좌를 선택해 주세요.",
   TOSS_ACCOUNT_SELECTION_REQUIRED: "Client ID와 Secret을 저장한 뒤 연결·설정 → 토스증권 연결 확인에서 계좌를 선택해 주세요. Account Seq는 일반 계좌번호와 다릅니다.",
@@ -14,7 +20,7 @@ const reasons = {
   TOSS_PREPARATION_EXPIRED: "준비 결과가 만료되었습니다. 주문 없는 준비 검사를 다시 진행해 주세요.",
   TOSS_EXISTING_ORDERS_CONFLICT: "선택한 종목에 기존 주문 또는 조건 주문이 있습니다. 기존 주문을 확인해 주세요.",
   TOSS_ORDER_ACK_UNKNOWN_NO_RETRY: "전송 결과를 확정할 수 없는 주문이 있습니다. 중복 주문을 막기 위해 재전송하지 않습니다. 토스 주문 내역을 확인해 주세요.",
-  TOSS_OWNED_CLOSE_REGULAR_SESSION_REQUIRED: "이번 운용 보유분 정리는 해당 시장의 정규장에서 가능합니다.",
+  TOSS_OWNED_CLOSE_REGULAR_SESSION_REQUIRED: "이번 운용 보유분 정리는 원래 선택한 거래시간 범위에서 가능합니다.",
 };
 function message(value) { return reasons[value] || value || ""; }
 function money(value, currency) { return `${Number(value).toLocaleString("ko-KR", { maximumFractionDigits: currency === "USD" ? 2 : 0 })} ${currency}`; }
@@ -140,7 +146,7 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
     <details className="ts-disclosure toss-cash-options"><summary>진행 상세</summary><p className="muted">기존 장기 검증의 통과 판정과 별개인 현금 운용입니다. 총자산이나 수익률 대신 이번 운용의 주문·체결·소유 수량을 표시합니다.</p>
       {!!snapshot?.ledger && <ul>{Object.entries(snapshot.ledger.positions || {}).map(([id, qty]) => <li key={id}>{snapshot.ledger.scope?.specs?.find(s => s.strategyInstanceId === id)?.symbol || id} · 이번 운용 보유 {qty}주</li>)}</ul>}
       <ol>{(snapshot?.activity || []).map((a, i) => <li key={`${a.at}-${i}`}>{new Date(a.at * 1000).toLocaleTimeString()} · {a.detail}</li>)}</ol>
-      {snapshot?.firstFailure && <p className="toss-cash-error">최초 오류 · {snapshot.firstFailure}</p>}
+      {snapshot?.firstFailure && <p className="toss-cash-error">최초 오류 · {message(snapshot.firstFailure)}</p>}
     </details>
   </section>;
 }

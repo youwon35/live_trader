@@ -219,7 +219,31 @@ def request_session_date_from_dispatch(spec,dispatch):
         or boundary.get('recoveryOnly') is not False or boundary.get('promotionEligible') is not True):
         raise ValueError('KIS_IDENTITY_SEALED_MARKET_SESSION_BOUNDARY_REQUIRED')
     event=timestamp(boundary.get('startTime'))
+    if ticket.get('stockSessionProfile') is not None:
+        from trading_runtime.stock_session_profile import profile_hash, session_phase, session_window_at
+        selected=ticket['stockSessionProfile'];window=session_window_at(selected,event)
+        if (window is None or ticket.get('stockSessionProfileHash')!=profile_hash(selected)
+                or boundary.get('sessionProfileHash')!=profile_hash(selected)
+                or boundary.get('sourceVenue')!=selected['venue']
+                or session_phase(boundary.get('session'))!=window['phase']):
+            raise ValueError('KIS_IDENTITY_EXACT_PROFILE_TRADING_LABEL_REQUIRED')
+        return window['marketDate'].replace('-','')
     return event.astimezone(ZoneInfo('Asia/Seoul' if ticket['exchange']=='KRX' else 'America/New_York')).strftime('%Y%m%d')
+
+
+def _check_original_profile_order(ticket, official):
+    if ticket.get('stockSessionProfile') is None:return
+    from trading_runtime.stock_session_profile import profile_hash
+    from trading_runtime.kis_session_routes import kis_order_route
+    selected=ticket['stockSessionProfile']
+    route=kis_order_route(selected,exchange=ticket['exchange'],session_phase=ticket['sessionPhase'],side=ticket['side'])
+    if (ticket.get('stockSessionProfileHash')!=profile_hash(selected)
+            or ticket.get('executionVenue')!=route['exchangeId'] or ticket.get('orderClass')!=route['orderClass']
+            or (selected['market']=='KR' and official.get('excg_id_dvsn_cd')!=route['exchangeId'])):
+        raise ValueError('KIS_OWNED_ORIGINAL_PROFILE_OFFICIAL_VENUE_CHANGED')
+    echoed_class=official.get('ord_dvsn_cd',official.get('ord_dvsn'))
+    if echoed_class is not None and echoed_class!=route['orderClass']:
+        raise ValueError('KIS_OWNED_ORIGINAL_PROFILE_OFFICIAL_ORDER_CLASS_CHANGED')
 
 
 def resolve_official_order_identity(spec,dispatch,official_rows,*,request_session_date):
@@ -260,6 +284,7 @@ def resolve_official_order_identity(spec,dispatch,official_rows,*,request_sessio
     matches=[row for row in official_rows if str(row.get('ord_gno_brno') or '')==branch and str(row.get('odno') or '')==number]
     if len(matches)!=1:raise ValueError('KIS_IDENTITY_EXACT_ACK_NOT_FOUND_OR_AMBIGUOUS')
     official=matches[0];domestic=ticket['exchange']=='KRX'
+    _check_original_profile_order(ticket,official)
     if (str(official.get('ord_dt') or '')!=day or official.get('pdno')!=spec.symbol
         or official.get('sll_buy_dvsn_cd')!=('02' if dispatch['side']=='BUY' else '01')
         or (not domestic and (official.get('ovrs_excg_cd')!=ticket['exchange'] or official.get('tr_crcy_cd')!='USD'))
@@ -289,6 +314,7 @@ def terminal_receipt(scope,spec,dispatch,official):
         or official.get('sll_buy_dvsn_cd')!=('02' if dispatch.get('side')=='BUY' else '01')):
         raise ValueError('KIS_OWNED_OFFICIAL_COMPOSITE_ORDER_KEY_MISMATCH')
     domestic=ticket['exchange']=='KRX'
+    _check_original_profile_order(ticket,official)
     if not domestic and (official.get('ovrs_excg_cd')!=ticket['exchange'] or official.get('tr_crcy_cd')!='USD'):
         raise ValueError('KIS_OWNED_OFFICIAL_VENUE_CURRENCY_CHANGED')
     quantity=decimal_value(official.get('tot_ccld_qty' if domestic else 'ft_ccld_qty'),'actual total fill quantity')

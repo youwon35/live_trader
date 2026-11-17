@@ -65,20 +65,24 @@ class KisEquityReader:
 
     @staticmethod
     def _identity(exchange,symbol):
-        if exchange not in VENUES or (exchange=='KRX' and not re.fullmatch('[0-9]{6}',symbol)) or (exchange!='KRX' and not re.fullmatch(r'[A-Z][A-Z.\-]{0,9}',symbol)):
+        if exchange not in VENUES or (exchange=='KRX' and not re.fullmatch('[0-9][A-Z0-9]{5}',symbol)) or (exchange!='KRX' and not re.fullmatch(r'[A-Z][A-Z.\-]{0,9}',symbol)):
             raise ReadFailure('KIS_V2_EXACT_INSTRUMENT_REQUIRED')
 
-    def quote(self,exchange,symbol):
+    def quote(self,exchange,symbol,*,stock_session_profile=None,session_phase=""):
         self._identity(exchange,symbol); self.account()
+        session_route = None
+        if stock_session_profile is not None:
+            from trading_runtime.kis_session_routes import kis_quote_route
+            session_route = kis_quote_route(stock_session_profile, exchange=exchange, symbol=symbol, session_phase=session_phase)
         if exchange=='KRX':
-            payload,headers=self._get('/uapi/domestic-stock/v1/quotations/inquire-price',{'FID_COND_MRKT_DIV_CODE':'J','FID_INPUT_ISCD':symbol})
+            payload,headers=self._get('/uapi/domestic-stock/v1/quotations/inquire-price',session_route['params'] if session_route is not None else {'FID_COND_MRKT_DIV_CODE':'J','FID_INPUT_ISCD':symbol})
             quote=self._output(payload,headers)
             if quote.get('stck_shrn_iscd')!=symbol or quote.get('temp_stop_yn')!='N':raise ReadFailure('KIS_V2_DOMESTIC_QUOTE_SCOPE_OR_HALT')
             price=decimal_value(quote.get('stck_prpr'),'current mark',positive=True)
             tick=decimal_value(quote.get('aspr_unit'),'current price tick',positive=True)
             lot=decimal_value(quote.get('hts_deal_qty_unit_val'),'current lot',positive=True)
         else:
-            code=VENUES[exchange][1]
+            code=session_route['params']['EXCD'] if session_route is not None else VENUES[exchange][1]
             payload,headers=self._get('/uapi/overseas-price/v1/quotations/price-detail',{'AUTH':'','EXCD':code,'SYMB':symbol})
             quote=self._output(payload,headers)
             # rsym is an official real-time instrument identifier, not an echo
@@ -96,6 +100,8 @@ class KisEquityReader:
         return {'exchange':exchange,'symbol':symbol,'currency':VENUES[exchange][0],
                 'price':text(price),'priceTick':text(tick),'lotSize':'1','orderable':True,
                 'quoteHash':stable_sha256(quote),'quotePriceRole':'CURRENT_MARK_NOT_NEXT_OPEN',
+                **({'stockSessionProfile':session_route['stockSessionProfile'],'sessionPhase':session_phase,
+                    'quoteSourceVenue':session_route['venue']} if session_route is not None else {}),
                 'marketEventFreshness':'NOT_PROVEN_BY_RESPONSE_RECEIPT_TIME'}
 
     def account_scope(self,exchange,symbol):
@@ -128,19 +134,23 @@ class KisEquityReader:
             'openOrders':'PRESENT' if pending else 'NONE_OBSERVED_COMPLETE_ACCOUNT_CURRENCY_SCOPE',
             'positionResponseHash':stable_sha256(positions),'workingOrdersResponseHash':stable_sha256(pending)}
 
-    def observe(self,contract,*,side,raw_open,protective_bps):
+    def observe(self,contract,*,side,raw_open,protective_bps,stock_session_profile=None,session_phase=""):
         if contract.get('exchange') != 'KRX' and resolve_funding_mode(self.reader.settings) == 'INTEGRATED_MARGIN':
             # Post-FX buying power is not an owned USD balance or a shared-cash lease.
             # Preserve the operational guard until the settlement producer exists.
             raise ReadFailure('KIS_INTEGRATED_MARGIN_EXECUTION_NOT_VERIFIED')
         started=self.clock(); account=self.account(); exchange=contract['exchange'];symbol=contract['symbol']
         if contract['quoteCurrency']!=VENUES[exchange][0] or side not in {'BUY','SELL'}:raise ReadFailure('KIS_V2_EXACT_SCOPE_REQUIRED')
-        quote=self.quote(exchange,symbol)
+        session_route = None
+        if stock_session_profile is not None:
+            from trading_runtime.kis_session_routes import kis_order_route
+            session_route = kis_order_route(stock_session_profile, exchange=exchange, session_phase=session_phase, side=side)
+        quote=self.quote(exchange,symbol,**({'stock_session_profile':stock_session_profile,'session_phase':session_phase} if session_route is not None else {}))
         limit=limit_price(raw_open,side,quote['priceTick'],protective_bps)
         positions=self.account_scope(exchange,symbol)
         cano,product=split_kis_account(self.reader.settings['KIS_ACCOUNT_NO'],self.reader.settings['KIS_ACCOUNT_PRODUCT_CODE'])
         if exchange=='KRX':
-            base={'CANO':cano,'ACNT_PRDT_CD':product,'PDNO':symbol,'ORD_UNPR':limit,'ORD_DVSN':'00','CMA_EVLU_AMT_ICLD_YN':'N','OVRS_ICLD_YN':'N'}
+            base={'CANO':cano,'ACNT_PRDT_CD':product,'PDNO':symbol,'ORD_UNPR':limit,'ORD_DVSN':session_route['orderClass'] if session_route is not None else '00','CMA_EVLU_AMT_ICLD_YN':'N','OVRS_ICLD_YN':'N'}
             payload,headers=self._get('/uapi/domestic-stock/v1/trading/inquire-psbl-order',base)
             caps=self._output(payload,headers)
             # Official API warns class00 quantity may omit the security's margin
@@ -164,7 +174,8 @@ class KisEquityReader:
         if not 0<=(finished-started).total_seconds()<=15 or self.account()!=account:raise ReadFailure('KIS_V2_MULTIPLE_READS_STALE_OR_ACCOUNT_CHANGED')
         return seal({'version':OBSERVATION,'brokerId':'kis','exchange':exchange,'symbol':symbol,'side':side,
             'currency':VENUES[exchange][0],'profileId':account['profileId'],'accountFingerprint':account['accountFingerprint'],
-            'credentialConfigurationHash':account['credentialConfigurationHash'],'orderClass':'00',
+            'credentialConfigurationHash':account['credentialConfigurationHash'],'orderClass':session_route['orderClass'] if session_route is not None else '00',
+            **({'stockSessionProfile':stock_session_profile,'sessionPhase':session_phase,'executionVenue':session_route['exchangeId']} if session_route is not None else {}),
             'queryPrice':limit,'queryPriceRole':'REQUEST_LIMIT_PRICE_NOT_BROKER_ECHO',
             'brokerCalculationPrice':str(calculation) if calculation is not None else None,
             'brokerCalculationPriceRole':'KR_MARKET_QUANTITY_CALCULATION_ONLY' if calculation is not None else 'NOT_PROVIDED',
@@ -180,7 +191,7 @@ class KisEquityReader:
         if exchange=='KRX':
             return self._pages('/uapi/domestic-stock/v1/trading/inquire-daily-ccld',
                 {'INQR_STRT_DT':day,'INQR_END_DT':day,'SLL_BUY_DVSN_CD':'00','INQR_DVSN':'00','PDNO':'',
-                 'CCLD_DVSN':'00','ORD_GNO_BRNO':'','ODNO':'','INQR_DVSN_3':'00','INQR_DVSN_1':'','INQR_DVSN_2':''},context='100',output='output1')
+                 'CCLD_DVSN':'00','ORD_GNO_BRNO':'','ODNO':'','INQR_DVSN_3':'00','INQR_DVSN_1':'','INQR_DVSN_2':'','EXCG_ID_DVSN_CD':'ALL'},context='100',output='output1')
         return self._pages('/uapi/overseas-stock/v1/trading/inquire-ccnl',
             {'PDNO':'%','ORD_STRT_DT':day,'ORD_END_DT':day,'SLL_BUY_DVSN':'00','CCLD_NCCS_DVSN':'00',
              'OVRS_EXCG_CD':exchange,'SORT_SQN':'DS','ORD_DT':'','ORD_GNO_BRNO':'','ODNO':''},context='200',output='output')

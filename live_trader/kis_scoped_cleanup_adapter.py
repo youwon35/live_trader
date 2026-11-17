@@ -31,11 +31,13 @@ def build_kis_scoped_cleanup_request(proof, *, access_token=""):
     if any(not re.fullmatch(r"[0-9]{1,16}", str(proof.get(key) or "")) for key in ("organizationNo", "orderNo")) or not re.fullmatch(r"[0-9]{8}", str(proof.get("orderDate") or "")):
         raise KisOrderAuthorityError("KIS cleanup exact official date/branch/order number is required")
     symbol = proof.get("symbol")
-    if type(symbol) is not str or not re.fullmatch(r"[0-9]{6}" if market == "KR" else r"[A-Z][A-Z.\-]{0,9}", symbol) or proof.get("side") not in {"BUY", "SELL"}:
+    if type(symbol) is not str or not re.fullmatch(r"[0-9][A-Z0-9]{5}" if market == "KR" else r"[A-Z][A-Z.\-]{0,9}", symbol) or proof.get("side") not in {"BUY", "SELL"}:
         raise KisOrderAuthorityError("KIS cleanup exact instrument/side is required")
     prepared = build_kis_cancel_order_request({"symbol": symbol, "asset": "KR" if market == "KR" else "US",
         "environment": "real", "broker_order_id": proof["orderNo"], "organization_no": proof["organizationNo"],
-        "quantity": str(remaining), "order_type": "00", "exchange": venue, "manager_order_id": ""}, access_token=access_token)
+        "quantity": str(remaining), "order_type": "00", "exchange": venue, "manager_order_id": "",
+        **({"stockSessionProfile": proof["stockSessionProfile"], "sessionPhase": proof["sessionPhase"]}
+           if proof.get("stockSessionProfile") is not None else {})}, access_token=access_token)
     if prepared.blocked_reasons:
         raise KisOrderAuthorityError("KIS cleanup authenticated cancel wire is incomplete")
     body = dict(prepared.body)

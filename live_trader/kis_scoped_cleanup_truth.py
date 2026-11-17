@@ -168,6 +168,8 @@ def _owned(owned_orders, scope):
             "sourceArtifactHash":metadata.get("source_artifact_hash"),
             "portfolioHash":metadata.get("portfolio_hash"), "symbol":row["symbol"],
             "quoteCurrency":row["currency"]}
+        if ticket.get("stockSessionProfile") is not None:
+            member["stockSessionProfile"] = ticket["stockSessionProfile"]
         if any(not member[key] for key in member) or sum(item == member for item in members) != 1:
             _fail("DISPATCH_CANONICAL_MEMBER_CHANGED")
     # Different local dispatches must never claim the same broker order.
@@ -177,6 +179,28 @@ def _owned(owned_orders, scope):
     if len({(r["runtimeScopeId"],r["sessionId"],r["deploymentId"]) for r in result}) != 1:
         _fail("MIXED_RUNTIME_SESSION")
     return result
+
+
+def _original_session_fields(owned):
+    ticket = (owned.get("dispatch",{}).get("metadata",{}).get("native_quantity_model") or {})
+    if ticket.get("stockSessionProfile") is None:return {}
+    from trading_runtime.stock_session_profile import normalize_stock_session_profile, profile_hash
+    from trading_runtime.kis_session_routes import kis_order_route
+    selected=normalize_stock_session_profile(ticket["stockSessionProfile"],provider="kis")
+    route=kis_order_route(selected,exchange=ticket["exchange"],session_phase=ticket["sessionPhase"],side=owned["side"])
+    if ticket.get("stockSessionProfileHash")!=profile_hash(selected) or ticket.get("executionVenue")!=route["exchangeId"] or ticket.get("orderClass")!=route["orderClass"]:
+        _fail("ORIGINAL_SESSION_WIRE_SCOPE_CHANGED")
+    return {"stockSessionProfile":selected,"stockSessionProfileHash":profile_hash(selected),
+        "sessionPhase":ticket["sessionPhase"],"executionVenue":route["exchangeId"],"originalOrderClass":route["orderClass"]}
+
+
+def _owned_market_date(current, owned):
+    fields=_original_session_fields(owned)
+    if fields and fields["stockSessionProfile"]["market"]=="US" and fields["stockSessionProfile"]["segments"]==["DAY"]:
+        from trading_runtime.stock_session_profile import session_window_at
+        window=session_window_at(fields["stockSessionProfile"],current)
+        if window is not None:return window["marketDate"].replace("-","")
+    return _market_date(current,owned["venue"])
 
 
 def _official_identity(raw, owned, *, history):
@@ -193,9 +217,13 @@ def _official_identity(raw, owned, *, history):
         if raw.get("ovrs_excg_cd") != owned["venue"] or raw.get("tr_crcy_cd") != "USD":
             _fail("OFFICIAL_VENUE_CURRENCY_MISMATCH")
     else:
-        # New KRX-only cleanup never accepts NXT/SOR rows or guesses exchange.
-        if raw.get("excg_id_dvsn_cd") != "KRX":
-            _fail("OFFICIAL_KRX_EXCHANGE_REQUIRED")
+        fields=_original_session_fields(owned)
+        expected_venue=fields.get("executionVenue","KRX")
+        if raw.get("excg_id_dvsn_cd") != expected_venue:
+            _fail("OFFICIAL_ORIGINAL_EXCHANGE_REQUIRED" if fields else "OFFICIAL_KRX_EXCHANGE_REQUIRED")
+        actual_class=raw.get("ord_dvsn_cd",raw.get("ord_dvsn"))
+        if fields and actual_class is not None and actual_class!=fields["originalOrderClass"]:
+            _fail("OFFICIAL_ORIGINAL_ORDER_CLASS_CHANGED")
         if str(raw.get("loan_dt") or "") not in {"", "00000000"}:
             _fail("CASH_EQUITY_ONLY")
 
@@ -242,7 +270,7 @@ def _project(owned, scope, working_rows, history_rows, *, observed_at):
     _official_identity(history, owned, history=True)
     ordered, filled, remaining = _quantities(history, owned, history=True)
     history_notional=_gross_notional(history,owned,filled)
-    historical = owned["orderDate"] < _market_date(observed_at,owned["venue"])
+    historical = owned["orderDate"] < _owned_market_date(observed_at,owned)
     # KR PSBL has no ord_dt. An identical branch/ODNO in today's list may be a
     # newly reused identifier and must not be attached to an old terminal row.
     # Original-day official CCNL alone proves this old order's terminal state.
@@ -293,7 +321,7 @@ def _project(owned, scope, working_rows, history_rows, *, observed_at):
         receipt = terminal_receipt(scope, _spec(owned), owned["dispatch"], history)
         state = "TERMINAL"
     evidence = {"officialWorkingRow":working, "officialHistoryRow":history}
-    return {**result, "verifiedDispatchHash":_hash(owned["dispatch"]), "historicalTerminalOnly":historical and state == "TERMINAL",
+    return {**result, **_original_session_fields(owned), "verifiedDispatchHash":_hash(owned["dispatch"]), "historicalTerminalOnly":historical and state == "TERMINAL",
         "state":state, "filledQuantity":filled,
         "remainingQuantity":remaining, **evidence, "responseHash":_hash(evidence),
         "terminalVerified":state == "TERMINAL", "terminalReceipt":receipt}
@@ -330,9 +358,9 @@ def _check_order_days(orders, owned, queries, *, started, current):
     by_dispatch = {r["dispatchKey"]:r for r in owned}
     for row in orders:
         original = by_dispatch[row["dispatchKey"]]; day = original["orderDate"];venue=original["venue"]
-        if day > _market_date(started,venue) or day > _market_date(current,venue):
+        if day > _owned_market_date(started,original) or day > _owned_market_date(current,original):
             _fail("FUTURE_OFFICIAL_ORDER_DATE")
-        if row["state"] == "WORKING" and (day != _market_date(started,venue) or day != _market_date(current,venue)):
+        if row["state"] == "WORKING" and (day != _owned_market_date(started,original) or day != _owned_market_date(current,original)):
             _fail("CURRENT_MARKET_DAY_REQUIRED")
         selected = [q for q in queries if q["market"] == original["market"]
             and (q["kind"] == "WORKING" or (q["venue"] == venue and q["orderDate"] == day))]
@@ -340,7 +368,7 @@ def _check_order_days(orders, owned, queries, *, started, current):
             for evidence in query["httpDateEvidence"]:
                 if evidence["status"] == "VALID":
                     lower=_timestamp(evidence["minimumServerUtc"]);upper=_timestamp(evidence["maximumServerUtc"])
-                    if day > _market_date(lower,venue):
+                    if day > _owned_market_date(lower,original):
                         _fail("FUTURE_OFFICIAL_ORDER_DATE_VS_HTTP_SERVER")
                 if row["state"] != "WORKING":
                     continue
@@ -354,7 +382,7 @@ def _check_order_days(orders, owned, queries, *, started, current):
                 if ((date-local_response).total_seconds() < -MAX_SECONDS
                     or (date+timedelta(seconds=1)-local_request).total_seconds() > MAX_SECONDS):
                     _fail("HTTP_SERVER_LOCAL_CLOCK_SKEW_UNVERIFIED")
-                if day != _market_date(lower,venue) or day != _market_date(upper,venue):
+                if day != _owned_market_date(lower,original) or day != _owned_market_date(upper,original):
                     _fail("CURRENT_MARKET_DAY_REQUIRED")
 
 
@@ -417,7 +445,7 @@ def collect_cleanup_truth(native_runtime, owned_orders, *, now=None, monotonic_c
     if any(account.get(k) != scope.get(k) for k in ("accountFingerprint", "credentialConfigurationHash")):
         _fail("CURRENT_ACCOUNT_SCOPE_CHANGED")
     for row in owned:
-        if row["orderDate"] > _market_date(started,row["venue"]):
+        if row["orderDate"] > _owned_market_date(started,row):
             _fail("FUTURE_OFFICIAL_ORDER_DATE")
     queries = []
     for market in sorted({r["market"] for r in owned}):
@@ -431,7 +459,7 @@ def collect_cleanup_truth(native_runtime, owned_orders, *, now=None, monotonic_c
         domestic = venue == "KRX"
         path = "/uapi/" + ("domestic" if domestic else "overseas") + "-stock/v1/trading/" + ("inquire-daily-ccld" if domestic else "inquire-ccnl")
         params = ({"INQR_STRT_DT":day,"INQR_END_DT":day,"SLL_BUY_DVSN_CD":"00","INQR_DVSN":"00","PDNO":"",
-            "CCLD_DVSN":"00","ORD_GNO_BRNO":"","ODNO":"","INQR_DVSN_3":"00","INQR_DVSN_1":"","INQR_DVSN_2":"","EXCG_ID_DVSN_CD":"KRX"} if domestic else
+            "CCLD_DVSN":"00","ORD_GNO_BRNO":"","ODNO":"","INQR_DVSN_3":"00","INQR_DVSN_1":"","INQR_DVSN_2":"","EXCG_ID_DVSN_CD":"ALL"} if domestic else
             {"PDNO":"%","ORD_STRT_DT":day,"ORD_END_DT":day,"SLL_BUY_DVSN":"00","CCLD_NCCS_DVSN":"00",
              "OVRS_EXCG_CD":venue,"SORT_SQN":"DS","ORD_DT":"","ORD_GNO_BRNO":"","ODNO":""})
         query = _pages(observer,path,params,context="100" if domestic else "200",output="output1" if domestic else "output",budget=budget)

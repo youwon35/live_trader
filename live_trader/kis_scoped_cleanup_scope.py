@@ -34,7 +34,8 @@ def original_owned_cleanup_scope(native_runtime, context):
             ("credentialConfigurationHash","credentialConfigurationHash"),("quoteCurrency","capitalCurrency")))):
         raise ValueError("KIS_CLEANUP_ORIGINAL_PRINCIPAL_SCOPE_SEAL_CHANGED")
     members = sorted([{"strategyInstanceId":spec.strategy_instance_id,"sourceArtifactHash":spec.artifact_hash,
-        "portfolioHash":spec.portfolio_hash,"symbol":spec.symbol,"quoteCurrency":scope["quoteCurrency"]}
+        "portfolioHash":spec.portfolio_hash,"symbol":spec.symbol,"quoteCurrency":scope["quoteCurrency"],
+        **({"stockSessionProfile":__import__('trading_runtime.stock_session_profile',fromlist=['profile_for_spec']).profile_for_spec(spec)} if (getattr(spec,'parameters',{}) or {}).get('stockSessionProfile') is not None else {})}
         for spec in native_runtime.specs], key=lambda item:item["strategyInstanceId"])
     if not members or len(members) > 32 or scope.get("members") != members:
         raise ValueError("KIS_CLEANUP_ORIGINAL_CANONICAL_MEMBERS_CHANGED")

@@ -20,6 +20,38 @@ from .kis_shared_krw_bridge import shared_plan_from_reviewed_input
 from .kis_shared_krw_paths import selected_capital_path
 
 
+def _stock_session_args(spec, boundary=None):
+    if (spec.parameters or {}).get('stockSessionProfile') is None:
+        return {}
+    from trading_runtime.stock_session_profile import profile_for_spec, profile_hash, session_window_at, session_phase
+    selected=profile_for_spec(spec)
+    current=datetime.now(timezone.utc)
+    window=session_window_at(selected,current)
+    if window is None:raise ValueError('KIS_PROFILE_OUTSIDE_CURRENT_SESSION')
+    phase=window['phase']
+    if boundary is not None:
+        if (boundary.get('sessionProfileHash')!=profile_hash(selected)
+                or boundary.get('sourceVenue')!=selected['venue'] or session_phase(boundary.get('session'))!=phase):
+            raise ValueError('KIS_PROFILE_NATIVE_BOUNDARY_CHANGED')
+    return {'stock_session_profile':selected,'session_phase':phase}
+
+
+def _stock_session_evidence(spec, boundary, observation):
+    args=_stock_session_args(spec,boundary)
+    if not args:return observation
+    from trading_runtime.stock_session_profile import profile_hash, session_window_at
+    from .kis_equity_execution import seal
+    selected=args['stock_session_profile'];phase=args['session_phase']
+    evidence={'profileHash':profile_hash(selected),'symbol':spec.symbol,'phase':phase,
+        'observedAt':boundary.get('observedTime'),'sourceHash':boundary.get('rawHash'),
+        'continuous':boundary.get('promotionEligible') is True and boundary.get('recoveryOnly') is False,
+        'orderable':observation.get('orderable') is True,'symbolEligible':observation.get('orderable') is True,
+        'venue':observation['exchange'] if selected['market']=='US' else selected['venue'],
+        'instrumentType':observation.get('instrumentType'),
+        'window':session_window_at(selected,datetime.now(timezone.utc))}
+    return seal({**observation,'sessionProfileHash':profile_hash(selected),'sessionEvidence':evidence})
+
+
 class NativeEquityRuntime:
     def __init__(self,root,deployment_id,specs,*,reader=None,roots=None,deployment_reader=None,dispatch_reader=None,dispatch_identity_writer=None,dispatch_lookup=None,policy_reader=None,mark_provider=None,owned_store=None):
         self.root=Path(root);self.deployment_id=deployment_id;self.specs=tuple(specs)
@@ -56,7 +88,8 @@ class NativeEquityRuntime:
                 raise ValueError('KIS_V2_SEALED_EQUITY_MEMBER_REQUIRED')
             validate_policies(policies['executionPolicies'].get(spec.artifact_hash),policies.get('feeReservePolicy'),account=account,contract=contract,artifact_hash=spec.artifact_hash,saved_slippage_bps=policies.get('savedSlippageBps',50))
             currencies.add(contract['quoteCurrency']);exchanges.add(contract['exchange'])
-            bindings.append({'strategyInstanceId':spec.strategy_instance_id,'sourceArtifactHash':spec.artifact_hash,'portfolioHash':spec.portfolio_hash,'symbol':spec.symbol,'quoteCurrency':contract['quoteCurrency']})
+            bindings.append({'strategyInstanceId':spec.strategy_instance_id,'sourceArtifactHash':spec.artifact_hash,'portfolioHash':spec.portfolio_hash,'symbol':spec.symbol,'quoteCurrency':contract['quoteCurrency'],
+                **({'stockSessionProfile':__import__('trading_runtime.stock_session_profile',fromlist=['profile_for_spec']).profile_for_spec(spec)} if (spec.parameters or {}).get('stockSessionProfile') is not None else {})})
         if len(currencies)!=1 or len({m['strategyInstanceId'] for m in bindings})!=len(bindings):
             raise ValueError('KIS_V2_ONE_CURRENCY_BOOK_AND_UNIQUE_MEMBERS_REQUIRED')
         policy=permissions.get('liveCapitalPolicy') or {};percent=decimal_value(policy.get('percent'),'reviewed capital percent',positive=True)
@@ -102,8 +135,9 @@ class NativeEquityRuntime:
         started=datetime.now(timezone.utc);begin=time.monotonic()
         scope,account,policies=self._details();spec=self.specs[0];contract=sizing_from_artifact(spec.artifact)['quantityContract']
         funding_mode=resolve_funding_mode(self.reader.settings);shared_plan=self._shared_plan(scope,policies)
-        quote=self.observer.quote(contract['exchange'],spec.symbol)
-        observation=self.observer.observe(contract,side='BUY',raw_open=quote['price'],protective_bps=policies['executionPolicies'][spec.artifact_hash]['protectiveLimitBps'])
+        session_args=_stock_session_args(spec)
+        quote=self.observer.quote(contract['exchange'],spec.symbol,**session_args)
+        observation=self.observer.observe(contract,side='BUY',raw_open=quote['price'],protective_bps=policies['executionPolicies'][spec.artifact_hash]['protectiveLimitBps'],**session_args)
         elapsed=time.monotonic()-begin
         current_scope,_,current_policies=self._details()
         if (current_scope!=scope or not 0<=elapsed<=15
@@ -208,7 +242,8 @@ class NativeEquityRuntime:
                 return projection
             started=datetime.now(timezone.utc);contract=sizing_from_artifact(spec.artifact)['quantityContract']
             execution=policies['executionPolicies'][spec.artifact_hash]
-            observation=self.observer.observe(contract,side=side,raw_open=price,protective_bps=execution['protectiveLimitBps'])
+            observation=self.observer.observe(contract,side=side,raw_open=price,protective_bps=execution['protectiveLimitBps'],**_stock_session_args(spec,boundary))
+            observation=_stock_session_evidence(spec,boundary,observation)
             marks={}
             for member in self.specs:
                 if decimal_value(projection['ownedPositions'][member.strategy_instance_id],'owned shares'):

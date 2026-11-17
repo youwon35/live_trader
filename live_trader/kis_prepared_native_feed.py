@@ -10,7 +10,7 @@ from trading_runtime.continuous_runtime import ClosedBar
 from trading_runtime.market_clock_integrity import market_clock_integrity_failure_codes
 from trading_runtime.market_source_integrity import source_integrity_failure_codes
 from trading_runtime.native_rest_initialization import _time,KST
-from .kis_native_initialization import build_live_initialization,validate_live_initialization,LiveKisNativeInitializedEngine
+from .kis_native_initialization import build_live_initialization,validate_live_initialization,LiveKisNativeInitializedEngine,SESSION_SCHEMA
 
 
 class LivePreparedKisFeed:
@@ -55,9 +55,25 @@ class LivePreparedKisFeed:
         for feed in self.feeds:
             feed.disconnect()
 
+    def _session_cutoff_current(self,instant):
+        if self.receipt['schemaVersion']!=SESSION_SCHEMA:
+            return instant.replace(minute=instant.minute-instant.minute%5,second=0,microsecond=0)==_time(self.receipt['cutoff'])
+        from trading_runtime.provider_backfill_kis_sessions import _latest_end
+        from trading_runtime.market_data import timeframe_seconds
+        from trading_runtime.stock_session_profile import session_window_at
+        for row in self.receipt['publicInitializationData']['streams'].values():
+            if not session_window_at(row['stockSessionProfile'],instant,windows=row['windows']):return False
+            if _latest_end(row['stockSessionProfile'],instant,timeframe_seconds(row['timeframe']))!=_time(row['historyReceipt']['throughEnd']):return False
+        return True
+
     def _assert_public(self):
         if self._revoked.is_set() or stable_sha256(self.receipt)!=self._receipt_hash:
             raise RuntimeError('LIVE_NATIVE_PREPARED_REVOKED_OR_RECEIPT_CHANGED')
+        if self.receipt['schemaVersion']==SESSION_SCHEMA:
+            from .kis_native_session_preparation import capture_scope
+            if len(self.feeds)!=1:raise RuntimeError('LIVE_NATIVE_SESSION_ONE_PUBLIC_SOCKET_REQUIRED')
+            current=capture_scope(self.feeds[0],self.receipt['context'],self.receipt['runtimeScope'])
+            if current!=self.receipt['publicInitializationData']['captureScope']:raise RuntimeError('LIVE_NATIVE_SESSION_CURRENT_CAPTURE_OWNER_DIFFERS')
         for feed,socket,generation in self._snapshots:
             if feed.socket is not socket or socket is None or feed._clock_generation!=generation:
                 raise RuntimeError('LIVE_NATIVE_PREPARED_SOCKET_OR_GENERATION_CHANGED')
@@ -97,7 +113,7 @@ class LivePreparedKisFeed:
             current=self._monotonic_clock()
             now=self._utc_clock().astimezone(timezone.utc)
             if (not 0<=current-self._prepared_monotonic<=15
-                    or now.replace(minute=now.minute-now.minute%5,second=0,microsecond=0)!=_time(self.receipt['cutoff'])):
+                    or not self._session_cutoff_current(now)):
                 raise RuntimeError('LIVE_NATIVE_PREPARED_START_PREFLIGHT_EXPIRED')
             self._native_confirmation_monotonic=current
 
@@ -114,8 +130,8 @@ class LivePreparedKisFeed:
                     or session.get('deploymentId')!=scope['deploymentId']
                     or any(metadata.get(k)!=scope[k] for k in ('runtimeScopeId','brokerId','accountFingerprint',
                         'credentialConfigurationHash','accountBindingId','capitalCurrency','profileId','deploymentId'))
-                    or latest!=_time(self.receipt['cutoff'])
-                    or created<_time(self.receipt['publicInitializationData']['admissionRequestedAt'])
+                    or not self._session_cutoff_current(created)
+                    or created<_time(self.receipt['publicInitializationData'].get('admissionRequestedAt') or self.receipt['publicInitializationData']['observedAt'])
                     or activation_reader()!=session):
                 raise RuntimeError('LIVE_NATIVE_PREPARED_EXACT_ACTUAL_MANUAL_SESSION_REQUIRED')
             self._session=deepcopy(session)
@@ -144,7 +160,7 @@ class LivePreparedKisFeed:
             raise RuntimeError('LIVE_NATIVE_PREPARED_ACTIVATED_CLAIM_EXPIRED')
         now=self._utc_clock().astimezone(timezone.utc)
         latest=now.replace(minute=now.minute-now.minute%5,second=0,microsecond=0)
-        if latest!=_time(self.receipt['cutoff']):
+        if not self._session_cutoff_current(now):
             raise RuntimeError('LIVE_NATIVE_PREPARED_ACTIVATION_PREDECESSOR_EXPIRED')
 
     def assert_activation_claimable(self):
@@ -161,6 +177,14 @@ class LivePreparedKisFeed:
             self._assert_public()
             if self._activation_reader()!=self._session or self._binding_reader()!=self._binding:
                 raise RuntimeError('LIVE_NATIVE_PREPARED_SESSION_ACCOUNT_OR_CONFIG_CHANGED')
+            if self.receipt['schemaVersion']==SESSION_SCHEMA:
+                from trading_runtime.stock_session_profile import session_window_at
+                now=self._utc_clock().astimezone(timezone.utc)
+                for row in self.receipt['publicInitializationData']['streams'].values():
+                    captured=session_window_at(row['stockSessionProfile'],row['probeClosedBar']['startTime'],windows=row['windows'])
+                    current=session_window_at(row['stockSessionProfile'],now,windows=row['windows'])
+                    if not captured or current!=captured:raise RuntimeError('LIVE_NATIVE_SESSION_WINDOW_CLOSED_REQUIRE_DRAINING')
+                return
             now=self._utc_clock().astimezone(KST)
             cutoff=_time(self.receipt['cutoff']).astimezone(KST)
             if now.date()!=cutoff.date() or (now.hour,now.minute)>=(15,20):

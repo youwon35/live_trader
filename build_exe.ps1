@@ -119,6 +119,7 @@ if (-not (Test-Path -LiteralPath $sharedRuntime)) {
   --hidden-import Crypto.Cipher.AES `
   --hidden-import Crypto.Util.Padding `
   --collect-submodules webview `
+  --collect-data tzdata `
   live_trader\__main__.py
 Assert-NativeCommandSucceeded "PyInstaller package"
 

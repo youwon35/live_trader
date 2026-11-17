@@ -24,7 +24,18 @@ def decision_payload(decision,spec,deployment_id):
     if not declared or any(value not in {"next-open", "NEXT_BAR_OPEN"} for value in declared):
         raise ValueError("NATIVE_SOURCE_NEXT_OPEN_CONTRACT_NOT_DECLARED")
     bar=decision.bar.to_dict() if hasattr(decision.bar,"to_dict") else {key:getattr(decision.bar,key) for key in ("end_time","close")}
-    return {"deploymentId":deployment_id,"sourceArtifactHash":spec.artifact_hash,"portfolioHash":spec.portfolio_hash,"strategyInstanceId":spec.strategy_instance_id,"strategyId":spec.strategy_id,"evaluationKey":decision.evaluation_key,"signal":decision.signal,"reason":decision.reason,"provider":spec.provider,"instrumentId":spec.instrument_id,"symbol":spec.symbol,"timeframe":spec.timeframe,"closedBar":bar,"closedBarEnd":decision.bar.end_time,"closedSignalPrice":str(decision.bar.close),"expectedStart":next_tradable_boundary_start(provider=spec.provider,instrument_id=spec.instrument_id,symbol=spec.symbol,closed_bar_end=decision.bar.end_time).isoformat()}
+    session_fields = {}
+    expected_start = None
+    if (spec.parameters or {}).get("stockSessionProfile") is not None:
+        from trading_runtime.stock_session_profile import profile_for_spec, profile_hash, bar_matches_profile, next_profile_boundary_start
+        from trading_runtime.continuous_runtime import timeframe_seconds
+        selected = profile_for_spec(spec)
+        if not bar_matches_profile(spec, decision.bar):raise ValueError("NATIVE_SIGNAL_PROFILE_DATA_CHANGED")
+        expected_start = next_profile_boundary_start(selected, decision.bar.end_time, timeframe_seconds(spec.timeframe))
+        session_fields = {"stockSessionProfile":selected,"stockSessionProfileHash":profile_hash(selected)}
+    if expected_start is None:
+        expected_start = next_tradable_boundary_start(provider=spec.provider,instrument_id=spec.instrument_id,symbol=spec.symbol,closed_bar_end=decision.bar.end_time)
+    return {**session_fields,"deploymentId":deployment_id,"sourceArtifactHash":spec.artifact_hash,"portfolioHash":spec.portfolio_hash,"strategyInstanceId":spec.strategy_instance_id,"strategyId":spec.strategy_id,"evaluationKey":decision.evaluation_key,"signal":decision.signal,"reason":decision.reason,"provider":spec.provider,"instrumentId":spec.instrument_id,"symbol":spec.symbol,"timeframe":spec.timeframe,"closedBar":bar,"closedBarEnd":decision.bar.end_time,"closedSignalPrice":str(decision.bar.close),"expectedStart":expected_start.isoformat()}
 
 class NativeBoundaryQueue:
     def __init__(self,path):
@@ -64,6 +75,13 @@ class NativeBoundaryQueue:
         for key,owner,raw,digest in rows:
             p=json.loads(raw)
             if (p["provider"],p["instrumentId"],p["symbol"],p["timeframe"])!=stream:continue
+            # Another session's opening print must not consume this pending signal.
+            if p.get("stockSessionProfile") is not None:
+                from trading_runtime.stock_session_profile import bar_matches_profile
+                expected_spec = specs.get(p["strategyInstanceId"])
+                if expected_spec is not None and not bar_matches_profile(expected_spec,boundary):continue
+            if p.get("stockSessionProfileHash") != getattr(boundary,"session_profile_hash",None):
+                if p.get("stockSessionProfileHash") or getattr(boundary,"session_profile_hash",None):continue
             if owner!=self.owner:raise ValueError("BOUNDARY_PREVIOUS_OWNER_RECONCILIATION_REQUIRED")
             if stable_sha256(p)!=digest:raise ValueError("BOUNDARY_SIGNAL_SEAL_INVALID")
             if _time(p["expectedStart"])>_time(boundary.start_time):continue

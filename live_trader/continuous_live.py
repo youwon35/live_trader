@@ -695,14 +695,17 @@ class LiveContinuousController:
             from trading_runtime.market_data_hub import set_history_consumer
             for feed in (() if native_prepared_required else feeds):
                 set_history_consumer(feed, "live_trader")
-                feed.connect()
+                from .live_stock_profile_history import has_explicit_stock_profiles
+                if not has_explicit_stock_profiles(feed):feed.connect()
             warmup: dict[str, int] = prepared_warmup or {}
             for spec in (() if native_prepared_required else specs):
-                feed = next(item for item in feeds if item.provider_id == spec.provider)
-                bars = feed.warmup(FeedSubscription(spec.instrument_id, spec.symbol, spec.timeframe), required_warmup_bars(spec))
-                warmup[spec.strategy_instance_id] = engine.seed_history(spec.strategy_instance_id, bars)
+                from .live_stock_profile_history import seed_profile_history
+                warmup[spec.strategy_instance_id] = seed_profile_history(feeds,spec,engine,required_warmup_bars(spec))
             for feed in (() if native_prepared_required else feeds):
                 feed.disconnect()
+            if not native_prepared_required:
+                from .live_stock_profile_history import configure_profile_bridges
+                configure_profile_bridges(feeds,specs,engine)
             self.supervisor = ContinuousRuntimeSupervisor(
                 engine=engine,
                 feeds=feeds,
@@ -2154,6 +2157,13 @@ class LiveContinuousController:
                     "use_as_promotion_evidence": False,
                     "full_live_requested": False,
                 }
+            if spec.broker_id=='kis' and (spec.parameters or {}).get('stockSessionProfile') is not None:
+                from trading_runtime.stock_session_profile import profile_for_spec,profile_hash,session_phase
+                from trading_runtime.realtime_feeds import _runtime_spec_kis_exchange
+                selected_profile=profile_for_spec(spec)
+                functional_metadata.update({'stockSessionProfile':selected_profile,
+                    'stockSessionProfileHash':profile_hash(selected_profile),'sessionPhase':session_phase(decision.bar.session),
+                    'exchange':'KRX' if selected_profile['market']=='KR' else _runtime_spec_kis_exchange(spec)})
             intent = OrderIntent(
                 strategy_id=decision.strategy_id,
                 asset=state.asset_from_symbol(spec.symbol, broker_id=spec.broker_id, provider=spec.provider),
@@ -3048,7 +3058,9 @@ class LiveContinuousController:
 
         current = datetime.now(timezone.utc)
         candidates = []
-        cached = self._native_kis_marks.get((spec.instrument_id, spec.symbol))
+        from trading_runtime.stock_session_profile import profile_for_spec, profile_hash, bar_matches_profile
+        selected_hash = profile_hash(profile_for_spec(spec)) if (spec.parameters or {}).get("stockSessionProfile") is not None else None
+        cached = self._native_kis_marks.get((spec.instrument_id, spec.symbol, selected_hash))
         if cached is not None:
             observed = datetime.fromisoformat(cached["observedAt"].replace("Z", "+00:00"))
             started = datetime.fromisoformat(cached["providerWindowStart"].replace("Z", "+00:00"))
@@ -3067,6 +3079,7 @@ class LiveContinuousController:
                     or bar.instrument_id != spec.instrument_id or bar.timeframe != spec.timeframe
                     or bar.evidence_class or bar.event_count <= 0 or not bar.source_sequence.startswith("kis:")):
                     continue
+                if not bar_matches_profile(spec,bar):continue
                 observed = datetime.fromisoformat(bar.received_time.replace("Z", "+00:00"))
                 started = datetime.fromisoformat(bar.start_time.replace("Z", "+00:00"))
                 # A recent receipt of an old provider bucket is not a fresh print.
@@ -3087,8 +3100,10 @@ class LiveContinuousController:
             and boundary.attestation == "KIS_WEBSOCKET" and boundary.promotion_eligible and not boundary.recovery_only
             and any(s.instrument_id == boundary.instrument_id and s.symbol == boundary.symbol for s in self.supervisor.engine.specs)):
             mark = {"provider": "kis", "symbol": boundary.symbol, "attestation": "KIS_WEBSOCKET",
-                    "observedAt": boundary.observed_time, "providerWindowStart": boundary.start_time, "price": str(boundary.open)}
-            key = (boundary.instrument_id, boundary.symbol)
+                    "observedAt": boundary.observed_time, "providerWindowStart": boundary.start_time, "price": str(boundary.open),
+                    "sessionProfileHash": getattr(boundary,"session_profile_hash",None), "session":getattr(boundary,"session",None),
+                    "sourceVenue":getattr(boundary,"source_venue",None)}
+            key = (boundary.instrument_id, boundary.symbol, getattr(boundary,"session_profile_hash",None))
             previous = self._native_kis_marks.get(key)
             if previous is None or datetime.fromisoformat(mark["observedAt"].replace("Z", "+00:00")) >= datetime.fromisoformat(previous["observedAt"].replace("Z", "+00:00")):
                 self._native_kis_marks[key] = mark

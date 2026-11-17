@@ -29,11 +29,21 @@ from trading_runtime.provider_backfill_toss import _session
 from .toss_cash_ledger import TossCashLedger
 from .toss_cash_sources import resolve_sources, source_catalog, source_sizing
 from .toss_adapter import exact_owned_order
+from trading_runtime.stock_session_profile import profile_for_spec, profile_hash, bar_matches_profile, next_profile_boundary_start, normalize_stock_session_profile, session_window_at
+from trading_runtime.toss_session_scope import session_source, execution_scope, stock_session_eligible, assert_quote_session
 
 PURPOSE='TOSS_CASH_OPERATION'
 
 
-def consecutive(previous,current):
+def consecutive(previous,current,*,profile=None,windows=None):
+    if profile is not None and profile['mode']=='EXTENDED':
+        if any(getattr(b,'session_profile_hash','')!=profile_hash(profile) or getattr(b,'source_venue','')!=profile['venue'] for b in (previous,current)):
+            return False
+        try:
+            expected=next_profile_boundary_start(profile,parse_timestamp(previous.end_time),timeframe_seconds(previous.timeframe),windows=windows)
+            return parse_timestamp(current.start_time)==expected and current.timeframe==previous.timeframe
+        except ValueError:
+            return False
     market=toss_market(current.symbol)[1]
     pend=parse_timestamp(previous.end_time); cstart=parse_timestamp(current.start_time)
     if cstart==pend: return True
@@ -56,6 +66,17 @@ def regular_open(symbol,now):
     return result['orderable'] is True
 
 
+def profile_open(spec,api,now):
+    profile=profile_for_spec(spec)
+    if profile['mode']=='REGULAR': return regular_open(spec.symbol,now)
+    return session_source(api).current(profile,now=now) is not None
+
+
+def profile_windows_for(spec,api):
+    profile=profile_for_spec(spec)
+    return session_source(api).windows(profile['market']) if profile['mode']=='EXTENDED' else None
+
+
 def next_session_window(symbol,prior,current):
     """Only the next verified regular opening, never an arbitrary future day."""
     from zoneinfo import ZoneInfo
@@ -67,7 +88,13 @@ def next_session_window(symbol,prior,current):
     return len(days)==2 and 0<=current-opened.timestamp()<=300 and 0<=current-prior<=7*86400
 
 
-def signal_current(symbol,observed,current):
+def signal_current(symbol,observed,current,*,spec=None,api=None):
+    if spec is not None and profile_for_spec(spec)['mode']=='EXTENDED':
+        profile=profile_for_spec(spec)
+        source=session_source(api)
+        right=source.current(profile,now=current)
+        left=session_window_at(profile,observed,windows=source.windows(profile['market']))
+        return bool(left and right and (left['start'],left['end'],left['phase'])==(right['start'],right['end'],right['phase']) and 0<=current-observed<=30)
     if not regular_open(symbol,observed): return next_session_window(symbol,observed,current)
     return 0<=current-observed<=30
 
@@ -269,7 +296,12 @@ class TossCashOperation:
             settings=self.settings(); api=self.factory(settings,True)
             identity=exact_account(api,settings)
             symbols=[s.symbol for s in specs]; markets=sorted({toss_market(s.symbol)[1] for s in specs})
-            stock_metadata(api,symbols)
+            metadata=stock_metadata(api,symbols)
+            by_symbol={row['symbol']:row for row in metadata}
+            for spec in specs:
+                profile=profile_for_spec(spec)
+                stock_session_eligible(by_symbol[spec.symbol],profile,spec.symbol)
+                if profile['mode']=='EXTENDED': session_source(api).observe(profile['market'],now=self.clock())
             if open_orders(api,symbols): raise ValueError('TOSS_EXISTING_ORDERS_CONFLICT')
             baseline=holdings(api,symbols); rates=commission_rates(api,markets)
             fx=fx_observation(api,self.clock) if 'US' in markets else None
@@ -281,13 +313,20 @@ class TossCashOperation:
             try:
                 for subscription in feed.subscriptions:
                     self.view.update(reason=subscription.symbol+' '+subscription.timeframe+' 과거 봉을 확인합니다.')
-                    matches=[s for s in specs if s.instrument_id==subscription.instrument_id and s.timeframe==subscription.timeframe]
+                    selected_profile=normalize_stock_session_profile(getattr(subscription,'stock_session_profile',None),market=toss_market(subscription.symbol)[1],provider='toss')
+                    matches=[s for s in specs if s.instrument_id==subscription.instrument_id and s.timeframe==subscription.timeframe and profile_for_spec(s)==selected_profile]
                     need=max(required_warmup_bars(s) for s in matches)
                     if need>2000: raise ValueError('TOSS_LOOKBACK_TOO_LARGE')
-                    bars=feed.warmup(subscription,limit=need)
+                    from trading_runtime.stock_indicator_basis import adjusted_profile_requires_proof, fetch_toss_indicator_warmup
+                    if any(adjusted_profile_requires_proof(bound_spec) for bound_spec in matches):
+                        bars,basis_receipt=fetch_toss_indicator_warmup(api,subscription,matches,limit=need,
+                            now=self.clock(),cache=getattr(feed,'cache',None),max_pages=getattr(feed,'max_pagination_pages',128))
+                        feed.mark_emitted(bars)
+                    else:
+                        bars=feed.warmup(subscription,limit=need)
                     if len(bars)<need: raise ValueError('TOSS_HISTORY_INCOMPLETE')
-                    if any(not consecutive(a,b) for a,b in zip(bars,bars[1:])): raise ValueError('TOSS_HISTORY_GAP')
-                    if any(b.provider!='toss' or b.symbol!=subscription.symbol or b.instrument_id!=subscription.instrument_id or b.timeframe!=subscription.timeframe or epoch(b.end_time)>self.clock() for b in bars):
+                    if any(not consecutive(a,b,profile=profile_for_spec(matches[0]),windows=profile_windows_for(matches[0],api)) for a,b in zip(bars,bars[1:])): raise ValueError('TOSS_HISTORY_GAP')
+                    if any(not bar_matches_profile(matches[0],b) or b.provider!='toss' or b.symbol!=subscription.symbol or b.instrument_id!=subscription.instrument_id or b.timeframe!=subscription.timeframe or epoch(b.end_time)>self.clock() for b in bars):
                         raise ValueError('TOSS_HISTORY_SCOPE_INVALID')
                     history[matches[0].stream_key]=bars
             finally: feed.disconnect()
@@ -364,6 +403,7 @@ class TossCashOperation:
 
     def dispatch_signal(self,spec,decision,observed_at):
         if decision.signal not in {'BUY','SELL'} or self.stop_event.is_set(): return
+        if not bar_matches_profile(spec,decision.bar): raise ValueError('TOSS_SIGNAL_PROFILE_MISMATCH')
         self._guard(); p=self.prepared; projection=self.ledger.project(self.owner)
         if projection['unresolvedOrders']: return False
         if self.resolve(p['config'])[3]!=p['sourceHash']: raise ValueError('TOSS_SOURCE_CHANGED')
@@ -374,11 +414,14 @@ class TossCashOperation:
         actual=holdings(self.api,symbols)
         if set(actual)!=set(expected) or any(amount(actual[k])!=amount(expected[k]) for k in expected):
             raise ValueError('TOSS_EXTERNAL_POSITION_CHANGE_RECONCILE')
-        if not regular_open(spec.symbol,self.clock()):
+        if not profile_open(spec,self.api,self.clock()):
             return False
-        if not signal_current(spec.symbol,observed_at,self.clock()): return True
+        if not signal_current(spec.symbol,observed_at,self.clock(),spec=spec,api=self.api): return True
         if open_orders(self.api,symbols): raise ValueError('TOSS_EXTERNAL_PENDING_ORDER')
-        stock_metadata(self.api,[spec.symbol])
+        stock=stock_metadata(self.api,[spec.symbol])[0]
+        profile=profile_for_spec(spec)
+        stock_session_eligible(stock,profile,spec.symbol)
+        session_context=execution_scope(self.api,profile,spec.symbol,stock,now=self.clock()) if profile['mode']=='EXTENDED' else None
         market=toss_market(spec.symbol)[1]; currency='KRW' if market=='KR' else 'USD'
         rate=commission_rates(self.api,[market])[market]
         power=buying_power(self.api,currency) if decision.signal=='BUY' else None
@@ -390,6 +433,7 @@ class TossCashOperation:
             if str(exc)=='TOSS_QUOTE_PREDATES_SIGNAL_OBSERVATION':
                 return False  # Shared pre-signal quote is not an order failure; wait for the next actual receipt.
             raise
+        assert_quote_session(quote,session_context)
         quantity,percent=source_sizing(spec)
         sleeve=self._sleeve_cash(spec)
         capital=sleeve*percent/100 if percent is not None and decision.signal=='BUY' else sleeve
@@ -405,17 +449,24 @@ class TossCashOperation:
             if emergency.get('active') is not False or self.stop_event.is_set(): raise ValueError('TOSS_STOPPED_BEFORE_DISPATCH')
             self._guard()
             mutation_settings=self._mutation_settings()
-            if not regular_open(spec.symbol,self.clock()): return False
-            if not signal_current(spec.symbol,observed_at,self.clock()): return True
+            if not profile_open(spec,self.api,self.clock()): return False
+            if not signal_current(spec.symbol,observed_at,self.clock(),spec=spec,api=self.api): return True
             normalize_orderbook(raw,symbol=spec.symbol,currency=currency,received_at=received,now=self.clock(),after=observed_at,bar_end=decision.bar.end_time)
-            self.ledger.register(self.owner,cid,{**request,'currency':currency},spec.strategy_instance_id)
+            self.ledger.register(self.owner,cid,{**request,'currency':currency,'stockSessionProfile':profile_for_spec(spec),'stockSessionProfileHash':profile_hash(profile_for_spec(spec))},spec.strategy_instance_id)
             for claim in self.claims: self.pool.mark_started(claim_id=claim['claimId'],owner_id=self.owner)
+            if profile['mode']=='EXTENDED':
+                execution_scope(self.api,profile,spec.symbol,stock,now=self.clock())
             response=self.factory(mutation_settings,False).place_order(request)
             self.ledger.acknowledge(self.owner,cid,response)
         self.view['ordersSubmitted']+=1; self._note('ORDER',spec.symbol+' '+decision.signal+' '+ticket['quantity'])
         return True
 
-    def reconcile(self,*,cancel=False):
+    def _entry_scope_closed(self,entry):
+        key=(entry.get('request') or {}).get('strategyInstanceId') or entry.get('strategyInstanceId')
+        spec=next((s for s in self.prepared['specs'] if s.strategy_instance_id==key),None)
+        return spec is not None and not profile_open(spec,self.api,self.clock())
+
+    def reconcile(self,*,cancel=False,closed_scope_only=False):
         """Read exact original IDs; cancel at most once, never infer a lost ACK."""
         for entry in self.ledger.orders(self.owner):
             if entry['terminal']: continue
@@ -425,12 +476,12 @@ class TossCashOperation:
             row=exact_owned_order(raw,proof)
             if row['state'] in {'filled','canceled','rejected'}:
                 self.ledger.reconcile_order(self.owner,entry,raw); continue
-            if cancel and row['state'] in {'new','partially_filled'}:
+            if cancel and row['state'] in {'new','partially_filled'} and (not closed_scope_only or self._entry_scope_closed(entry)):
                 exists=any(f['kind']=='CANCEL_INTENT' and f['payload']['orderId']==order_id for f in self.ledger.facts(self.owner))
                 if not exists:
                     for scope in self.scopes: self.coordinator.assert_scope_owner(scope_key=scope['scopeKey'],owner_id=self.owner)
                     mutation_settings=self._mutation_settings()
-                    claimed=self.ledger.append(self.owner,'CANCEL_INTENT',self.owner+':cancel:'+order_id,{'orderId':order_id})
+                    claimed=self.ledger.append(self.owner,'CANCEL_INTENT',self.owner+':cancel:'+order_id,{'orderId':order_id,'stockSessionProfileHash':entry['request'].get('stockSessionProfileHash')})
                     if claimed:
                         self.factory(mutation_settings,False).cancel_order(order_id)
         return self.ledger.project(self.owner)
@@ -478,7 +529,7 @@ class TossCashOperation:
             if exact_account(api,settings)!=scope['identity']: raise ValueError('TOSS_RECOVERY_ACCOUNT_CHANGED')
             from types import SimpleNamespace
             self.owner=owner; self.api=api; self.claims=scope['claims']; self.scopes=scope['scopes']
-            specs=[SimpleNamespace(symbol=s['symbol'],strategy_instance_id=s['strategyInstanceId']) for s in scope['specs']]
+            specs=[SimpleNamespace(symbol=s['symbol'],strategy_instance_id=s['strategyInstanceId'],parameters=s.get('parameters') or {},provider=s.get('provider','toss'),broker_id=s.get('brokerId','toss')) for s in scope['specs']]
             self.prepared={**scope,'specs':specs}; self.stop_event.clear()
             self.started_wall=self.clock(); self.started_mono=self.monotonic()
             self.view.update(state='CLOSING',ownerId=owner,reason='이번 운용의 확인된 보유분만 현재 매수 호가의 지정가로 매도합니다.')
@@ -499,14 +550,17 @@ class TossCashOperation:
                 if self.stop_event.is_set(): break
                 projection=self.ledger.project(self.owner); qty=amount(projection['positions'].get(spec.strategy_instance_id,0))
                 if not qty: continue
-                if not regular_open(spec.symbol,self.clock()): raise ValueError('TOSS_OWNED_CLOSE_REGULAR_SESSION_REQUIRED')
+                if not profile_open(spec,self.api,self.clock()): raise ValueError('TOSS_OWNED_CLOSE_PROFILE_SESSION_REQUIRED')
                 expected={k:amount(v) for k,v in self.prepared['baseline'].items()}
                 for s in self.prepared['specs']: expected[s.symbol]+=amount(projection['positions'].get(s.strategy_instance_id,0))
                 actual=holdings(self.api,expected)
                 if any(amount(actual[k])!=v for k,v in expected.items()): raise ValueError('TOSS_EXTERNAL_POSITION_CHANGE_RECONCILE')
                 if exact_account(self.api,self.settings())!=self.prepared['identity']: raise ValueError('TOSS_ACCOUNT_CHANGED')
                 if open_orders(self.api,expected): raise ValueError('TOSS_EXTERNAL_PENDING_ORDER')
-                stock_metadata(self.api,[spec.symbol])
+                stock=stock_metadata(self.api,[spec.symbol])[0]
+                profile=profile_for_spec(spec)
+                stock_session_eligible(stock,profile,spec.symbol)
+                if profile['mode']=='EXTENDED': execution_scope(self.api,profile,spec.symbol,stock,now=self.clock())
                 currency='KRW' if toss_market(spec.symbol)[1]=='KR' else 'USD'
                 sellable=amount(self.api.sellable_quantity(spec.symbol).get('sellableQuantity'))
                 observed=self.clock()
@@ -520,6 +574,7 @@ class TossCashOperation:
                 # This short wait only obtains a later public quote. No order has
                 # been written or sent, and the subsequent POST is never retried.
                 ticket=budget_ticket(quote=quote,side='SELL',budget_available=0,owned_quantity=qty,sellable_quantity=sellable)
+                if profile['mode']=='EXTENDED': assert_quote_session(quote,execution_scope(self.api,profile,spec.symbol,stock,now=self.clock()))
                 if not amount(ticket['quantity']): raise ValueError('TOSS_OWNED_CLOSE_NO_SELLABLE_WHOLE_SHARES')
                 cid='lt'+uuid.uuid4().hex
                 request={'clientOrderId':cid,'symbol':spec.symbol,'side':'SELL','quantity':ticket['quantity'],'price':ticket['limitPrice'],'orderType':'LIMIT','timeInForce':'DAY'}
@@ -527,10 +582,11 @@ class TossCashOperation:
                     if emergency.get('active') is not False: raise ValueError('TOSS_EMERGENCY_STOP_ACTIVE')
                     self._guard()
                     mutation_settings=self._mutation_settings()
-                    if not regular_open(spec.symbol,self.clock()) or self.stop_event.is_set(): raise ValueError('TOSS_STOPPED_BEFORE_DISPATCH')
+                    if not profile_open(spec,self.api,self.clock()) or self.stop_event.is_set(): raise ValueError('TOSS_STOPPED_BEFORE_DISPATCH')
                     normalize_orderbook(raw,symbol=spec.symbol,currency=currency,received_at=received,now=self.clock(),after=observed)
-                    self.ledger.register(self.owner,cid,{**request,'currency':currency},spec.strategy_instance_id)
+                    self.ledger.register(self.owner,cid,{**request,'currency':currency,'stockSessionProfile':profile_for_spec(spec),'stockSessionProfileHash':profile_hash(profile_for_spec(spec))},spec.strategy_instance_id)
                     for claim in self.claims: self.pool.mark_started(claim_id=claim['claimId'],owner_id=self.owner)
+                    if profile['mode']=='EXTENDED': execution_scope(self.api,profile,spec.symbol,stock,now=self.clock())
                     self.ledger.acknowledge(self.owner,cid,self.factory(mutation_settings,False).place_order(request))
                 self.view['ordersSubmitted']=self.view.get('ordersSubmitted',0)+1
                 for _ in range(30):
@@ -580,7 +636,7 @@ class TossCashOperation:
                 self._guard()
                 with self.boundary() as emergency:
                     if emergency.get('active') is not False: raise ValueError('TOSS_EMERGENCY_STOP_ACTIVE')
-                projection=self.reconcile(); self.view['ledger']=projection
+                projection=self.reconcile(cancel=True,closed_scope_only=True); self.view['ledger']=projection
                 for bar in feed.poll(1): self.ingest_bar(bar)
                 self.dispatch_pending()
                 self.stop_event.wait(1)
@@ -598,13 +654,13 @@ class TossCashOperation:
             if self.view.get('firstFailure') and self.view.get('state')=='STOPPED': self.view['state']='STOPPED_WITH_ERROR'
 
     def ingest_bar(self,bar):
-        matches=[s for s in self.prepared['specs'] if (bar.instrument_id,bar.timeframe)==(s.instrument_id,s.timeframe)]
+        matches=[s for s in self.prepared['specs'] if (bar.instrument_id,bar.timeframe)==(s.instrument_id,s.timeframe) and bar_matches_profile(s,bar)]
         if not matches: raise ValueError('TOSS_UNREQUESTED_BAR')
         history=self.histories[matches[0].stream_key]
         if epoch(bar.end_time)<=epoch(history[-1].end_time): return
         if bar.provider!='toss' or bar.symbol!=matches[0].symbol or bar.price_basis!='unadjusted' or epoch(bar.end_time)>self.clock():
             raise ValueError('TOSS_BAR_SCOPE_OR_TIME_INVALID')
-        if not consecutive(history[-1],bar): raise ValueError('TOSS_LIVE_HISTORY_GAP')
+        if not consecutive(history[-1],bar,profile=profile_for_spec(matches[0]),windows=profile_windows_for(matches[0],self.api)): raise ValueError('TOSS_LIVE_HISTORY_GAP')
         history.append(bar); del history[:-max(256,*(required_warmup_bars(s) for s in matches))]
         for spec in matches:
             observed=self.clock()
@@ -625,11 +681,12 @@ class TossCashOperation:
             # Only signals observed in this genuine run survive a closed market.
             # No restart replay, old-history signal or quote from the past.
             now=self.clock()
-            deferred=not regular_open(spec.symbol,observed)
+            extended=profile_for_spec(spec)['mode']=='EXTENDED'
+            deferred=not profile_open(spec,self.api,observed) if not extended else False
             if (deferred and now-observed>7*86400) or (not deferred and now-observed>30):
                 self.pending_signals.pop(key,None); self._note('SIGNAL_EXPIRED',spec.symbol+' 장 대기 신호가 만료되었습니다.'); continue
             if self.ledger.project(self.owner)['unresolvedOrders']: break
-            if not regular_open(spec.symbol,self.clock()): continue
+            if not profile_open(spec,self.api,self.clock()): continue
             if deferred and not next_session_window(spec.symbol,observed,now):
                 self.pending_signals.pop(key,None); self._note('SIGNAL_EXPIRED',spec.symbol+' 다음 정규장 개장 대기 범위를 지났습니다.'); continue
             if self.dispatch_signal(spec,decision,observed): self.pending_signals.pop(key,None)

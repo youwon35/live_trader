@@ -4446,6 +4446,10 @@ def _kis_scoped_operational_dispatch_assessment(intent: object, *, broker_payloa
         raise ValueError("kis-operational-legacy-account-writer-lease-lost")
     if authority_intent is not None:
         expected_endpoint = "/uapi/domestic-stock/v1/trading/order-cash" if context["capitalCurrency"] == "KRW" else "/uapi/overseas-stock/v1/trading/order"
+        if expected_payload.get("stockSessionProfile") is not None:
+            from trading_runtime.kis_session_routes import kis_order_route
+            expected_endpoint = kis_order_route(expected_payload["stockSessionProfile"],
+                exchange=expected_payload["exchange"], session_phase=expected_payload["sessionPhase"], side=intent.side)["endpoint"]
         if authority_intent.get("endpoint") != expected_endpoint:
             raise ValueError("kis-operational-currency-wire-endpoint-mismatch")
         from .live_adapters import build_kis_live_order_request, kis_prepared_payload_hash
@@ -23259,6 +23263,8 @@ def live_broker_payload(
     ).lower()
     order_type = str(metadata.get("order_type") or "LIMIT")
     broker_price = intent.reference_price
+    session_fields = {}
+    broker_exchange = str(metadata.get("exchange") or "")
     if broker_id == "upbit":
         if order_type.lower() == "price":
             if "native_open_boundary" in metadata:
@@ -23269,7 +23275,25 @@ def live_broker_payload(
         elif order_type.lower() == "market":
             broker_price = 0.0
     elif broker_id == "kis":
-        if order_type == "01":
+        model = metadata.get("native_quantity_model") or {}
+        if isinstance(model, dict) and model.get("stockSessionProfile") is not None:
+            from .kis_equity_execution import validate_ticket
+            ticket = validate_ticket(intent, settings=runtime_settings())
+            session_fields = {key:ticket[key] for key in (
+                "stockSessionProfile", "stockSessionProfileHash", "sessionPhase", "sessionEvidence")}
+            order_type, broker_exchange = ticket["orderClass"], ticket["exchange"]
+            broker_price = safe_float(ticket["limitPrice"], intent.reference_price)
+        elif metadata.get("stockSessionProfile") is not None:
+            # Keep exact source identity even when no native ticket is present.
+            # Extended placement without its fresh original evidence fails in
+            # the broker route builder; it must never fall back to KRX/00.
+            session_fields={key:metadata.get(key) for key in (
+                "stockSessionProfile","stockSessionProfileHash","sessionPhase","sessionEvidence")}
+            from trading_runtime.kis_session_routes import kis_order_route
+            route=kis_order_route(session_fields['stockSessionProfile'],exchange=broker_exchange,
+                session_phase=session_fields['sessionPhase'],side=intent.side)
+            order_type=route['orderClass']
+        elif order_type == "01":
             broker_price = 0.0
         elif (
             order_type == "00"
@@ -23290,7 +23314,8 @@ def live_broker_payload(
         "notional": intent.notional,
         "order_type": order_type,
         "identifier": idempotency_key,
-        "exchange": str(metadata.get("exchange") or ""),
+        "exchange": broker_exchange,
+        **session_fields,
         "position_direction": str(
             metadata.get("position_direction") or "long"
         ),

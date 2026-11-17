@@ -14,7 +14,7 @@ import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, Re
 import DirectStrategyPanel from "./DirectStrategyPanel";
 import { runtimeRows, runtimeForDeployment, runtimeModeForDeployment, runningDeploymentIds, artifactIsRunning } from "./runtimeSelection.js";
 import { kisStopCleanupView, kisCleanupBlocksStart, kisManualStartPathSupported } from "./kisStopCleanup.js";
-import { KIS_PREPARATION_LABELS } from "./kisNativePreparation.js";
+import { KIS_PREPARATION_LABELS, kisSessionStatusMessage } from "./kisNativePreparation.js";
 import KisNativePreparationPanel from "./KisNativePreparationPanel.jsx";
 import MarketGapPreparationPanel from "./MarketGapPreparationPanel.jsx";
 import OperationalChecklistPanel from "./OperationalChecklistPanel";
@@ -5787,7 +5787,7 @@ function AutomationLauncherPanel({
             {runtimeRunning ? `${liveRuntimeModeLabel(profileRuntime.mode)} 실행 중` : profileRuntime?.phase || "STOPPED"}
           </StatusPill>
 
-          {profileRuntime?.lastError && <small data-ts-semantic-preserve="true">{profileRuntime.lastError}</small>}
+          {profileRuntime?.lastError && <small data-ts-semantic-preserve="true">{kisSessionStatusMessage(profileRuntime.lastError) || profileRuntime.lastError}</small>}
         </div>
       </div>
       <UnattendedSoakReportCard report={soakReport} />

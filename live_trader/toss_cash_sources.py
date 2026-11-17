@@ -5,6 +5,8 @@ import math
 
 from trading_runtime.artifact_governance import artifact_reference, stable_sha256
 from trading_runtime.continuous_runtime import RuntimeStrategySpec
+from trading_runtime.strategy_source_binding import canonical_instance_parameters, resolve_strategy_source_route
+from trading_runtime.stock_session_profile import profile_for_spec, profile_hash, normalize_stock_session_profile
 from trading_runtime.portfolio_runtime import load_portfolio_runtime, infer_market_route
 from trading_runtime.provider_backfill_toss import toss_market
 from trading_runtime.exposure_contract import exposure_contract_from_artifact
@@ -42,16 +44,37 @@ def standalone(root, target):
     plugin = str(instance.get('pluginId') or instance.get('plugin') or '')
     if (symbol != str(source.get('symbol') or '').upper() or timeframe != str(source.get('timeframe') or '').lower()
             or plugin != str(source.get('plugin') or source.get('pluginId') or '')
-            or instance.get('parameters') != source.get('parameters')):
+            or not isinstance(instance.get('parameters'), dict)):
         raise ValueError('TOSS_SOURCE_INSTANCE_EXECUTION_MISMATCH')
-    provider, broker, instrument = infer_market_route(symbol)
-    provider = str(instance.get('marketDataProvider') or (source.get('dataArtifact') or {}).get('provider') or provider).lower()
-    broker = str(instance.get('brokerId') or broker).lower()
+    parameters = canonical_instance_parameters(source, instance)
+    route = resolve_strategy_source_route(source, instance)
+    provider, broker, instrument = route['provider'], route['brokerId'], route['instrumentId']
     return RuntimeStrategySpec(portfolio_id='standalone:'+target['strategyId']+':'+target['strategyInstanceId'],
         portfolio_hash=_standalone_scope_hash(source, instance, digest), strategy_instance_id=target['strategyInstanceId'],
         strategy_id=target['strategyId'], artifact_hash=target['artifactHash'], plugin_id=plugin,
         instrument_id=instrument, symbol=symbol, timeframe=timeframe, provider=provider, broker_id=broker,
-        target_weight=1, parameters=dict(instance.get('parameters') or {}), artifact={**source, 'strategyInstance':instance})
+        target_weight=1, parameters=parameters, artifact={**source, 'strategyInstance':instance})
+
+
+def execution_session_profile(spec):
+    original = profile_for_spec(spec)
+    if original is None:
+        raise ValueError('TOSS_CASH_STOCK_SESSION_PROFILE_REQUIRED')
+    if original['mode'] == 'EXTENDED' and (spec.provider != 'toss' or spec.broker_id != 'toss'):
+        # Today's integrated Toss calendar is not evidence that a sealed KIS
+        # NXT/US history and session boundaries are equivalent. Re-export from
+        # Toss-scoped history rather than silently changing the source.
+        raise ValueError('TOSS_EXTENDED_SOURCE_REEXPORT_REQUIRED')
+    if spec.provider == 'toss' and spec.broker_id == 'toss':
+        actual = original
+    else:
+        actual = normalize_stock_session_profile({'market': original['market'], 'mode': original['mode'],
+            'segments': original['segments']}, provider='toss')
+    return original, actual
+
+
+def session_label(profile):
+    return '정규장' if profile['mode'] == 'REGULAR' else '시간외 · ' + '/'.join(profile['segments'])
 
 
 def validate_spec(spec):
@@ -81,6 +104,7 @@ def validate_spec(spec):
     source_sizing(spec)
     if float(params.get('leverage', 1)) != 1:
         raise ValueError('TOSS_CASH_LEVERAGE_UNSUPPORTED')
+    execution_session_profile(spec)
     return symbol, market, currency
 
 
@@ -122,8 +146,14 @@ def resolve_sources(config, roots=None):
                 continue
             targets_by_currency[currency].add(i)
             key = 'target-'+str(i+1)+':'+spec.strategy_instance_id
-            sources.append({'key':key,'currency':currency,'market':market,'targetIndex':i,'original':spec.to_dict(), 'sourceBodyHash':stable_sha256(spec.artifact)})
-            specs.append(replace(spec,strategy_instance_id=key,symbol=symbol,provider='toss',broker_id='toss',instrument_id='toss:'+market+':'+symbol))
+            original_profile, execution_profile = execution_session_profile(spec)
+            sources.append({'key':key,'currency':currency,'market':market,'targetIndex':i,'original':spec.to_dict(), 'sourceBodyHash':stable_sha256(spec.artifact),
+                'sourceSessionProfile':original_profile,'stockSessionProfile':execution_profile,
+                'stockSessionProfileHash':profile_hash(execution_profile),'stockSessionLabel':session_label(execution_profile)})
+            bound_parameters = ({**spec.parameters,'stockSessionProfile':execution_profile,'stockSessionProfileHash':profile_hash(execution_profile)}
+                if execution_profile['mode'] == 'EXTENDED' or 'stockSessionProfile' in spec.parameters else dict(spec.parameters))
+            specs.append(replace(spec,strategy_instance_id=key,symbol=symbol,provider='toss',broker_id='toss',instrument_id='toss:'+market+':'+symbol,
+                parameters=bound_parameters))
     if not 1 <= len(specs) <= 32:
         raise ValueError('TOSS_SPEC_COUNT_INVALID')
     factors = {row['key']:str(Decimal(str(row['original']['targetWeight']))/len(targets_by_currency[row['currency']])) for row in sources}
@@ -145,7 +175,7 @@ def source_catalog(roots=None):
                 _, ih=_exact_instance({identifier:rows},identifier,source)
                 target={'kind':'strategy','rootKey':root_key,'strategyId':sid,'artifactHash':sha,'strategyInstanceId':identifier,'instanceHash':ih}
                 spec=standalone(root,target); validate_spec(spec)
-                result.append({'key':stable_sha256(target),'label':str(source.get('name') or sid)+' · '+spec.symbol+' '+spec.timeframe,'target':target})
+                result.append({'key':stable_sha256(target),'label':str(source.get('name') or sid)+' · '+spec.symbol+' '+spec.timeframe+' · '+session_label(execution_session_profile(spec)[1]),'target':target})
             except (ValueError,KeyError,TypeError): continue
         for pid, rows in _catalog(root,'portfolio').items():
             try:
