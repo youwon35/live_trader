@@ -21,7 +21,7 @@ from trading_runtime.provider_backfill_toss import TossClosedBarFeed, toss_marke
 from trading_runtime.portfolio_runtime import BuiltinBarSignalEvaluator, required_warmup_bars
 from trading_runtime.toss_budget import TossBudgetPool
 from trading_runtime.toss_execution import (EXECUTION_MODEL, amount, epoch, normalize_orderbook,
-    budget_ticket, native_budget_from_krw, normalize_exchange_rate)
+    budget_ticket, native_budget_from_krw, normalize_exchange_rate, assert_toss_standard_exit_sizing)
 from trading_runtime.toss_securities import TossClient
 from trading_runtime.market_calendar import market_session_state, load_exchange_calendar
 from trading_runtime.market_data import parse_timestamp, timeframe_seconds
@@ -293,6 +293,7 @@ class TossCashOperation:
             if not isinstance(budgets_krw,dict) or set(budgets_krw)!={'KR','US'} or any(amount(v,positive=True)>1_000_000_000 for v in budgets_krw.values()):
                 raise ValueError('TOSS_MARKET_BUDGET_INVALID')
             specs,sources,factors,source_hash=self.resolve(config)
+            for spec in specs: assert_toss_standard_exit_sizing(spec.artifact,spec.parameters)
             settings=self.settings(); api=self.factory(settings,True)
             identity=exact_account(api,settings)
             symbols=[s.symbol for s in specs]; markets=sorted({toss_market(s.symbol)[1] for s in specs})
@@ -403,6 +404,7 @@ class TossCashOperation:
 
     def dispatch_signal(self,spec,decision,observed_at):
         if decision.signal not in {'BUY','SELL'} or self.stop_event.is_set(): return
+        assert_toss_standard_exit_sizing(spec.artifact,spec.parameters,decision_metadata=decision.metadata)
         if not bar_matches_profile(spec,decision.bar): raise ValueError('TOSS_SIGNAL_PROFILE_MISMATCH')
         self._guard(); p=self.prepared; projection=self.ledger.project(self.owner)
         if projection['unresolvedOrders']: return False
@@ -437,7 +439,9 @@ class TossCashOperation:
         quantity,percent=source_sizing(spec)
         sleeve=self._sleeve_cash(spec)
         capital=sleeve*percent/100 if percent is not None and decision.signal=='BUY' else sleeve
-        requested=None if percent is not None and decision.signal=='BUY' else quantity
+        # Entry size is not an exit cap. The shared ticket still limits a SELL
+        # to this operation's durable owned position and broker sellable shares.
+        requested=None if decision.signal=='SELL' or percent is not None and decision.signal=='BUY' else quantity
         ticket=budget_ticket(quote=quote,side=decision.signal,budget_available=min(capital,amount(projection['cash'][currency])),
             cash_buying_power=power,owned_quantity=projection['positions'].get(spec.strategy_instance_id,0),sellable_quantity=sellable,
             commission_rate=rate,requested_quantity=requested)
@@ -628,6 +632,34 @@ class TossCashOperation:
         self.ledger.append(self.owner,'RELEASED_FLAT',self.owner+':flat',{'evidenceHash':digest,'observedAt':seen})
         self.view.update(state='STOPPED',endedAt=seen,ledger=projection,reason='소유 주문의 종료와 보유분 0을 확인했습니다.')
 
+    def _market_data_poll(self,feed):
+        """Pause only chart reads outside the selected verified session.
+
+        The surrounding operation loop still reconciles owned orders and checks
+        protection/stop every iteration. Unknown or stale calendars retain their
+        existing exception; absence of proof is never treated as a closed market.
+        """
+        def running():
+            return not self.stop_event.is_set() and self.monotonic()-self.started_mono<self.prepared['durationHours']*3600
+        if not running(): return []
+        now=self.clock(); opened={}; selected=set()
+        for spec in self.prepared['specs']:
+            profile=profile_for_spec(spec); digest=profile_hash(profile)
+            if digest not in opened: opened[digest]=profile_open(spec,self.api,now)
+            if opened[digest]: selected.add((spec.instrument_id,spec.timeframe,digest))
+        original=feed.subscriptions
+        active=[]
+        for sub in original:
+            profile=normalize_stock_session_profile(getattr(sub,'stock_session_profile',None),market=toss_market(sub.symbol)[1],provider='toss')
+            if (sub.instrument_id,sub.timeframe,profile_hash(profile)) in selected: active.append(sub)
+        if not active or not running(): return []
+        try:
+            feed.subscriptions=tuple(active)
+            rows=list(feed.poll(1))
+        finally:
+            feed.subscriptions=original
+        return rows if running() else []
+
     def _run(self):
         feed=self.feed_factory(self.prepared['specs'],self.api)
         try:
@@ -637,7 +669,10 @@ class TossCashOperation:
                 with self.boundary() as emergency:
                     if emergency.get('active') is not False: raise ValueError('TOSS_EMERGENCY_STOP_ACTIVE')
                 projection=self.reconcile(cancel=True,closed_scope_only=True); self.view['ledger']=projection
-                for bar in feed.poll(1): self.ingest_bar(bar)
+                for bar in self._market_data_poll(feed):
+                    if self.stop_event.is_set() or self.monotonic()-self.started_mono>=self.prepared['durationHours']*3600: break
+                    self.ingest_bar(bar)
+                if self.stop_event.is_set() or self.monotonic()-self.started_mono>=self.prepared['durationHours']*3600: break
                 self.dispatch_pending()
                 self.stop_event.wait(1)
         except Exception as exc:
