@@ -26,7 +26,7 @@ try{
  const page=await context.newPage();page.on('pageerror',e=>report.errors.push(e.message));await page.goto(origin);await page.getByRole('heading',{name:'여러 거래소 함께 실행'}).waitFor();
  assert.equal(await page.evaluate(()=>window.fixture.calls.length),0,'mount has no preparation or start');
  for(const checkbox of await page.locator('.runtime-batch-option input').all())await checkbox.check();
- await page.getByRole('button',{name:'선택 3개 구성 확인 · 주문 없음',exact:true}).click();await page.getByText('구성 연결을 확인했습니다.',{exact:false}).waitFor();
+ await page.getByRole('button',{name:'선택 3개 구성 확인 · 주문 없음',exact:true}).click();await page.getByText('선택한 3개 구성의 연결 정보를 확인했습니다.',{exact:false}).waitFor();
  assert.equal(await page.evaluate(()=>window.fixture.calls.filter(c=>c.start).length),0);
  await page.getByRole('button',{name:'선택한 전략 함께 관찰',exact:true}).click();
  await page.getByText('검사용 시작 차단',{exact:true}).waitFor();

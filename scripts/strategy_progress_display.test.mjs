@@ -6,6 +6,7 @@ import { transformSync } from 'esbuild';
 import { executionApprovalLabel, strategyLifecycleRank } from '../../../packages/design/strategy-progress.js';
 import { readArtifactLifecycle } from '../../../packages/design/artifact-lifecycle.js';
 import { verifiedCanaryExecution } from '../src/executionAvailability.js';
+import { strategyDeploymentIdentity } from '../src/deploymentSelection.js';
 import {
   buildLiveStrategyProgress, liveDeploymentLifecycleLabel, liveStrategyLifecycleStage, liveStrategyValidationStage, liveStrategyPhaseFilter,
   liveStrategyPhaseId, liveStrategyPhaseLabel, liveStrategyPhaseOptions, liveStrategyProgressLabel, liveRuntimeModeLabel,
@@ -50,7 +51,7 @@ test('discovery groups the seven saved validation states into four shared phases
   const states = ['draft', 'backtested', 'before-shadow', 'shadowed', 'papered', 'before-live-small', 'live'];
   const phases = states.map((status) => liveStrategyPhaseId({ artifactLifecycle: projection(status), lifecycle_status: 'live' }));
   assert.deepEqual(phases, ['backtest', 'backtest', 'paper', 'paper', 'paper', 'live-check', 'live']);
-  assert.deepEqual([...new Set(phases)].map(liveStrategyPhaseLabel), ['백테스트', '모의 검증', '제한 실거래', '실전 운용']);
+  assert.deepEqual([...new Set(phases)].map(liveStrategyPhaseLabel), ['백테스트', '모의 운용', '실거래 준비', '실거래 운용']);
   assert.equal(liveStrategyPhaseFilter('shadowed'), 'paper');
   assert.equal(liveStrategyPhaseFilter('before-live-small'), 'live-check');
   assert.equal(liveStrategyPhaseFilter('all'), 'all');
@@ -86,7 +87,7 @@ const appSource = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8
 const selectorSource = appSource.slice(appSource.indexOf('function LiveStrategySelectorPanel('), appSource.indexOf('function StrategyDiscoveryToolbar('));
 const compiledSelector = transformSync(selectorSource, { loader: 'jsx', jsx: 'transform', jsxFactory: 'React.createElement', jsxFragment: 'React.Fragment' }).code;
 const selectorDependencies = {
-  React, executionApprovalLabel, strategyLifecycleRank, verifiedCanaryExecution, readArtifactLifecycle,
+  React, executionApprovalLabel, strategyLifecycleRank, verifiedCanaryExecution, readArtifactLifecycle, strategyDeploymentIdentity,
   liveStrategyLifecycleStage, buildLiveStrategyProgress, liveStrategyProgressLabel, liveDeploymentLifecycleLabel,
   MIN_LIVE_CANARY_FILLS: 3, formatKeyValueMap: () => '', liveArtifactFailureReasons: () => [],
   PanelHeader: 'header', MetricCard: 'metric', StatusPill: 'status', ActionButton: 'action',

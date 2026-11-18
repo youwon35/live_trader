@@ -44,8 +44,8 @@ test("merged sections preserve old routes and keep broker testing separate from 
   assert.match(appSource, /const route = liveNavigationRoute\(navId\)/);
   assert.match(appSource, /liveSectionTabs\(selectedNav\)/);
   assert.match(appSource, /<NestedTabs ariaLabel=.*? options=\{sectionTabs\} value=\{selectedNav\} onChange=\{onNavigate\}/);
-  assert.match(appSource, /최초 연결 또는 주문 경로 변경 때 점검하며, 실제 자금과 별도 승인이 필요합니다/);
-  assert.match(appSource, /통과해도 전략은 승급하지 않습니다/);
+  assert.match(appSource, /최초 연결이나 주문 경로 변경 때 사용하며, 실제 자금과 별도 시작 승인이 필요합니다/);
+  assert.match(appSource, /증권사·거래소의 실제 주문 연결을 별도로 시험합니다/);
   assert.match(appSource, /aria-label="저장본 검증 단계"/);
   assert.match(appSource, /lifecycleTimeline\.map/);
 });

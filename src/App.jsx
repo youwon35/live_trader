@@ -218,28 +218,28 @@ const pageProfiles = {
   gate: {
     title: "운용 전략",
     eyebrow: "DEPLOYMENT VALIDATION",
-    summary: "모의 검증을 마친 전략의 제한 실거래 근거를 확인하고 실전 운용 전환을 심사합니다. 단계 통과와 현재 주문 승인은 별개입니다.",
+    summary: "Backtester에서 저장한 전략과 운용 근거를 확인합니다. 실거래는 선택한 계좌의 준비 검사와 시작 승인을 거쳐 실행합니다.",
   },
   monitor: { title: "실시간 감시", eyebrow: "LIVE MONITOR", summary: "거래소별 수신 상태, 전략 평가, 실제 주문과 체결을 한 화면에서 확인합니다." },
   "functional-test": {
     title: "주문 연결 시험",
     eyebrow: "CONTROLLED LIVE TEST",
-    summary: "전략 단계와 별개인 증권사·거래소 주문 연결 시험입니다. 최초 연결 또는 주문 경로 변경 때 점검하며, 실제 자금과 별도 승인이 필요합니다. 통과해도 전략은 승급하지 않습니다.",
+    summary: "증권사·거래소의 실제 주문 연결을 별도로 시험합니다. 최초 연결이나 주문 경로 변경 때 사용하며, 실제 자금과 별도 시작 승인이 필요합니다.",
   },
   accounts: {
     title: "계좌·잔고",
     eyebrow: "BROKER TRUTH",
-    summary: "Broker Snapshot, 실시간 체결 상태, 프로그램 원장을 구분해 계좌와 포지션을 대조합니다.",
+    summary: "거래소에서 읽은 잔고·체결 내역과 프로그램 기록을 비교하고 차이가 난 이유를 확인합니다.",
   },
   orders: {
     title: "주문·체결",
     eyebrow: "ORDER & FILL LEDGER",
-    summary: "주문 의도부터 ACK·부분체결·완전체결·원장 대조까지 전체 상태와 실행 품질을 추적합니다.",
+    summary: "주문 요청, 거래소 접수, 부분·전체 체결과 기록 대조 결과를 확인합니다.",
   },
   risk: {
     title: "한도·안전장치",
     eyebrow: "RISK GATEWAY",
-    summary: "현재 사용량, Soft Warning·Hard Block, Reduce-only, 재시도·Kill 정책을 관리합니다.",
+    summary: "운용 한도와 차단 사유, 보유분 축소만 허용하는 조건, 재시도·긴급 정지 설정을 확인합니다.",
   },
   automation: {
     title: "실거래 운용",
@@ -249,17 +249,17 @@ const pageProfiles = {
   incidents: {
     title: "실행 기록",
     eyebrow: "AUDIT RECORDS",
-    summary: "잠금·배포·Preflight·모드·Risk·주문·Kill·Secret 변경을 append-only 감사 이벤트로 추적합니다.",
+    summary: "준비 검사, 실행·정지, 주문, 안전장치와 연결 설정의 변경 기록을 시간순으로 확인합니다.",
   },
   audit: {
     title: "상세 로그",
     eyebrow: "ENGINEERING LOG",
-    summary: "Scope·Level·Source·Correlation ID로 개발 및 운영 로그를 검색하고 분석합니다.",
+    summary: "대상·중요도·발생 위치·요청 식별값으로 상세 기록을 검색합니다.",
   },
   settings: {
     title: "연결·설정",
     eyebrow: "BROKER & RUNTIME",
-    summary: "화면·레이아웃, 브로커 연결, Telegram 알림과 Runtime 자체 검사를 관리합니다.",
+    summary: "화면 설정, 증권사·거래소 연결, Telegram 알림과 프로그램 자체 검사를 관리합니다.",
   },
 };
 

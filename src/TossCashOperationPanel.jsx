@@ -5,6 +5,8 @@ import "./TossCashOperationPanel.css";
 const base = "/api/toss/operation/";
 const labels = { IDLE: "준비 전", PREPARING: "주문 없이 준비 중", PREPARED: "준비 완료", PREPARATION_FAILED: "준비 확인 필요", RUNNING: "토스 현금 운용 중", STOPPING: "소유 주문 정리 중", STOPPED: "종료·대조 완료", STOPPED_WITH_ERROR: "오류를 남기고 종료", RECOVERY_REQUIRED: "이전 운용 대조 필요", RECONCILIATION_REQUIRED: "소유 주문·보유분 확인 필요", CLOSING: "이번 운용 보유분 매도 중" };
 const reasons = {
+  INDICATOR_PRICE_BASIS_REVALIDATION_REQUIRED: "백테스트의 수정주가와 현재 시세의 가격 기준을 맞췄는지 확인하지 못했습니다. 근거가 준비될 때까지 운용을 시작하지 않습니다.",
+  TOSS_EXIT_QUANTITY_CONTRACT_UNSUPPORTED: "이 전략의 수량·청산 설정을 현재 토스 운용에서 해석할 수 없습니다. 현재 토스 운용은 이번 전략이 보유한 수량 전체를 매도하는 방식만 지원합니다. 지원되는 전략을 선택하세요.",
   TOSS_DAILY_CANDLE_SESSION_SCOPE_UNAVAILABLE: "토스 일봉은 정규·시간외 범위를 분리할 수 없습니다. 분봉 전략을 선택하세요.",
   TOSS_EXTENDED_SOURCE_REEXPORT_REQUIRED: "시간외 전략은 토스 데이터로 다시 백테스트한 원본을 선택하세요.",
   TOSS_EXTENDED_NXT_ELIGIBILITY_REQUIRED: "이 종목의 NXT 시간외 거래 가능 여부를 확인하지 못했습니다.",
@@ -22,7 +24,11 @@ const reasons = {
   TOSS_ORDER_ACK_UNKNOWN_NO_RETRY: "전송 결과를 확정할 수 없는 주문이 있습니다. 중복 주문을 막기 위해 재전송하지 않습니다. 토스 주문 내역을 확인해 주세요.",
   TOSS_OWNED_CLOSE_REGULAR_SESSION_REQUIRED: "이번 운용 보유분 정리는 원래 선택한 거래시간 범위에서 가능합니다.",
 };
-function message(value) { return reasons[value] || value || ""; }
+function message(value) {
+  if (!value) return "";
+  const code = Object.keys(reasons).find(code => value === code || value.startsWith(`${code}:`));
+  return code ? reasons[code] : value;
+}
 function money(value, currency) { return `${Number(value).toLocaleString("ko-KR", { maximumFractionDigits: currency === "USD" ? 2 : 0 })} ${currency}`; }
 
 export default function TossCashOperationPanel({ monitorOnly = false }) {
