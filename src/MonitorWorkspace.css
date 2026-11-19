@@ -1,4 +1,4 @@
-.monitor-workspace-header,.monitor-chart-header,.monitor-runtime-title,.monitor-runtime-summary{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.monitor-workspace-header,.monitor-chart-header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
 .monitor-workspace-header h2,.monitor-chart-header h3{display:flex;gap:9px;align-items:center;margin:7px 0;color:var(--text)}
 .monitor-workspace-actions{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
 .monitor-workspace-actions button,.monitor-workspace-header button{display:inline-flex;align-items:center;gap:8px}
@@ -12,11 +12,6 @@
 .monitor-equity-chart>svg{display:block;width:100%;height:auto;max-height:330px;overflow:visible}.monitor-equity-chart>svg line{stroke:var(--border);stroke-dasharray:4 6}.monitor-equity-chart>svg text{fill:var(--muted);font-size:11px}.monitor-equity-chart>svg polyline{fill:none;stroke:currentColor;stroke-width:2.6;stroke-linejoin:round;stroke-linecap:round}.monitor-equity-chart>svg circle{fill:var(--moa-status-success,var(--moa-accent))}
 .monitor-chart-empty{display:grid;place-items:center;align-content:center;min-height:200px;gap:10px;color:var(--muted)}.monitor-chart-empty p{margin:0;text-align:center}
 .monitor-chart-note{font-size:12px!important;line-height:1.7!important;color:var(--muted)!important;margin:6px 0 0}
-.monitor-runtime-summary{padding:18px;background:var(--moa-accent-soft);border-radius:12px;margin:14px 0 20px}.monitor-runtime-summary span{color:var(--muted);font-size:12px}
-.monitor-runtime-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,310px),1fr));gap:14px}.monitor-runtime-grid article{padding:18px;border:1px solid var(--border);border-radius:12px;min-width:0;background:var(--panel)}
-.monitor-runtime-title>span{display:flex;align-items:center;gap:5px;font-size:12px}.monitor-runtime-grid article p{overflow-wrap:anywhere;font-size:13px}.monitor-runtime-grid article small{color:var(--muted)}
-.monitor-runtime-grid dl{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:16px 0;border-block:1px solid var(--border)}.monitor-runtime-grid dt{font-size:12px;color:var(--muted)}.monitor-runtime-grid dd{font-size:25px;margin:7px 0 0;color:var(--text);font-weight:650}
-.monitor-runtime-times{display:grid;gap:6px;font-size:12px;color:var(--muted)}
 .monitor-tone-success{color:var(--moa-status-success,#287f73)}.monitor-tone-warning{color:var(--moa-status-warning,#b18a49)}.monitor-tone-danger{color:var(--moa-status-danger,#c45760)}.monitor-tone-neutral{color:var(--muted)}
 .live-monitor .live-monitor-hero{border-left:4px solid var(--moa-accent);min-height:112px}.live-monitor .live-monitor-hero h3{font-size:25px}.live-monitor .live-monitor-metrics article{min-height:124px}.live-monitor .live-monitor-metrics article>strong{font-size:30px}
 .live-monitor .live-monitor-strategies article{border-left:3px solid var(--border-strong)}
@@ -29,7 +24,65 @@
 .monitor-chart-header h3 svg{width:18px;height:18px;flex:none}.monitor-chart-header h3{white-space:nowrap}.monitor-main-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(320px,1fr);gap:22px;margin-top:20px}.monitor-main-grid .monitor-equity-chart{margin-top:0;height:100%;box-sizing:border-box}.monitor-strategy-column{min-width:0}.monitor-strategy-column .live-monitor-strategies{max-height:480px;overflow:auto;margin:0}.monitor-table-scroll{overflow-x:auto}.monitor-account-details{margin-top:22px}.monitor-account-details summary{cursor:pointer;padding:14px 0;color:var(--text);font-weight:600}.monitor-chart-total .is-positive,.monitor-equity-chart .is-positive{color:var(--moa-status-success)}.monitor-chart-total .is-negative,.monitor-equity-chart .is-negative{color:var(--moa-status-danger)}.live-monitor .live-monitor-hero{min-height:88px;padding:18px}.live-monitor .live-monitor-metrics article{min-height:100px}.live-monitor .live-monitor-feed-strip>div{min-height:64px;padding:12px}.live-monitor .live-monitor-connection,.live-monitor .live-monitor-signal{background:transparent!important;border:0;padding:0;border-radius:0;color:var(--moa-status-muted)}.live-monitor .live-monitor-connection.is-current,.live-monitor .live-monitor-signal.signal-BUY{color:var(--moa-status-success)}.live-monitor .live-monitor-connection.is-stale,.live-monitor .live-monitor-signal.signal-SELL{color:var(--moa-status-danger)}.live-monitor .live-monitor-strategies article{border-left-color:var(--border)}
 @media(max-width:1000px){.monitor-main-grid{grid-template-columns:1fr}.monitor-strategy-column .live-monitor-strategies{max-height:none}.monitor-chart-header h3{white-space:normal}}
 
-.continuous-strategy-observations{display:grid;gap:12px;margin:16px 0}.continuous-strategy-observations section{padding-top:12px;border-top:1px solid var(--border)}.continuous-strategy-observations p{margin:8px 0}
+.control-tower {
+  display: grid;
+  gap: 14px;
+  min-inline-size: 0;
+}
+.tower-state, .tower-metric, .tower-panel, .tower-diagnostics {
+  min-inline-size: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.tower-state {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 14px 16px;
+  border-inline-start: 4px solid currentColor;
+  background: var(--moa-accent-soft);
+}
+.tower-state strong { color: inherit; font-size: 17px; }
+.tower-state > span { color: var(--muted); font-size: 13px; }
+.tower-metrics, .tower-grid { display: grid; gap: 12px; }
+.tower-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.tower-grid { grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); align-items: start; }
+.tower-metric, .tower-panel { padding: 13px 15px; background: var(--panel); }
+.tower-metric { display: grid; gap: 5px; align-content: start; }
+.tower-metric > span { display: flex; gap: 7px; align-items: center; color: var(--muted); font-size: 13px; }
+.tower-metric > span svg { flex: none; }
+.tower-metric > strong { color: var(--text); font-size: clamp(18px, 2.3vw, 27px); font-variant-numeric: tabular-nums; }
+.tower-metric > small, .tower-heading > span { color: var(--muted); font-size: 12px; }
+.tower-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 7px; }
+.tower-heading h3 { color: var(--text); font-size: 16px; margin: 0; }
+.tower-watch { margin-top: 8px; }
+.tower-chip { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; white-space: nowrap; }
+.tower-account-list, .tower-event-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.tower-account-list > li, .tower-event-list > li { border-bottom: 1px solid var(--border); padding: 9px 0; }
+.tower-account-list > li:last-child, .tower-event-list > li:last-child { border-bottom: 0; }
+.tower-account-list > li { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 5px 16px; }
+.tower-account-list > li > div { min-width: 0; overflow-wrap: anywhere; }
+.tower-account-list strong, .tower-event-list strong { display: block; font-size: 13px; }
+.tower-account-list small, .tower-event-list small { display: block; color: var(--muted); font-size: 12px; margin-top: 4px; }
+.tower-trend { flex: 1 0 100%; width: 100%; height: 37px; color: var(--moa-status-success); }
+.tower-trend polyline { fill: none; stroke: currentColor; stroke-width: 2; stroke-linejoin: round; }
+.tower-trend circle { fill: currentColor; }
+.tower-event-list > li { display: grid; grid-template-columns: 8ch minmax(0, 1fr); gap: 10px; overflow-wrap: anywhere; }
+.tower-event-list time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+.tower-event-list p { margin: 5px 0; font-size: 13px; }
+.tower-empty { margin: 11px 0 2px; color: var(--muted); font-size: 13px; }
+.tower-diagnostics { padding: 0 15px; }
+.tower-diagnostics summary { cursor: pointer; padding: 11px 0; color: var(--text); font-weight: 650; }
+.tower-diagnostics summary span { margin-inline-start: 8px; font-size: 12px; font-weight: 400; color: var(--muted); }
+.tower-diagnostics .tower-event-list { padding-bottom: 10px; }
+.tower-issues { color: var(--moa-status-danger); overflow-wrap: anywhere; }
+@media (max-width: 1050px) {
+  .tower-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 720px) {
+  .tower-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 
 .monitor-view-tabs{margin-bottom:18px;max-width:100%;flex-wrap:wrap}.monitor-view-tabs .ts-nested-tabs__tab{min-width:0;white-space:normal}.monitor-view-tabs .ts-nested-tabs__label{overflow-wrap:anywhere}.short-live-workspace>[role="tabpanel"][hidden]{display:none!important}.short-live-workspace>[role="tabpanel"]{min-width:0}.account-observation-disclosure .panel{border:0;box-shadow:none;margin:0}.account-observation-disclosure .live-compact-disclosure__content{padding-top:0}
 

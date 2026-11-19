@@ -11,14 +11,13 @@
 .live-monitor-hero span { font-size:12px; font-weight:650; }
 .live-monitor-hero h3 { margin:4px 0 7px; font-size:22px; line-height:1.45; }
 .live-monitor-hero p { margin:0; font-size:13px; }
-.live-monitor-hero.tone-danger { background:var(--bg-raised); border-color:var(--bg-raised); color:var(--bg-raised); }
-.live-monitor-hero.tone-warning { background:var(--bg-raised); border-color:var(--bg-raised); color:var(--bg-raised); }
-.live-monitor-hero.tone-neutral { background:var(--bg-raised); color:var(--bg-raised); }
+.live-monitor-hero.tone-danger > svg { color: var(--moa-status-danger); }
+.live-monitor-hero.tone-warning > svg { color: var(--moa-status-warning); }
 .live-monitor-freshness { display:flex; flex-wrap:wrap; gap:8px 22px; margin:10px 0 18px; color:var(--monitor-muted); font-size:11px; }
 .live-monitor-freshness strong { font-weight:600; }
 .live-monitor-metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
 .live-monitor-metrics article { padding:16px; border:1px solid var(--border); border-radius:14px; background:var(--panel); min-width:0; }
-.live-monitor-metrics article>span { display:block; color:var(--bg-raised); font-size:12px; font-weight:600; }
+.live-monitor-metrics article>span { display:block; color:var(--monitor-muted); font-size:12px; font-weight:600; }
 .live-monitor-metrics article>strong { display:block; margin-top:9px; font-size:27px; letter-spacing:-.04em; font-variant-numeric:tabular-nums; color:var(--monitor-ink); overflow-wrap:anywhere; }
 .live-monitor-metrics article strong small { margin-left:5px; font-size:13px; color:var(--monitor-muted); font-weight:500; }
 .live-monitor-metrics article p { color:var(--monitor-muted); font-size:11px; line-height:1.5; margin:7px 0 0; }
@@ -52,3 +51,18 @@
 .live-monitor-quote-observation dd { margin: 0; overflow-wrap: anywhere; }
 .live-monitor-failure-timing p { margin: 7px 0; }
 @media (max-width: 800px) { .live-monitor-quote-observation > div { grid-template-columns: 1fr; gap: 3px; } }
+
+.live-monitor .live-monitor-stop-reason { margin-top: 7px; color: var(--moa-status-warning); }
+.live-monitor-metrics { margin-top: 18px; }
+.live-monitor-diagnostics {
+  margin-top: 14px;
+  padding: 10px 13px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--monitor-muted);
+}
+.live-monitor-diagnostics > summary { cursor: pointer; color: var(--monitor-ink); font-size: 12px; font-weight: 650; }
+.live-monitor-diagnostics > summary:focus-visible { outline: 2px solid var(--monitor-accent); outline-offset: 4px; }
+.live-monitor-diagnostics[open] > summary { margin-bottom: 10px; }
+.live-monitor-activity-log > ol { list-style: none; margin: 0; padding: 0; max-height: 500px; overflow: auto; }
+.live-monitor .monitor-market-table .live-monitor-signal { display: inline-block; white-space: nowrap; }

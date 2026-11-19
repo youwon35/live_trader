@@ -31,6 +31,102 @@ function message(value) {
 }
 function money(value, currency) { return `${Number(value).toLocaleString("ko-KR", { maximumFractionDigits: currency === "USD" ? 2 : 0 })} ${currency}`; }
 
+const wholeCount = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+const displayQuantity = value => typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value) && Number.isFinite(Number(value))
+  ? Number(value).toLocaleString("ko-KR", { maximumFractionDigits: 8 }) : null;
+const tossTime = at => typeof at === "number" && Number.isFinite(new Date(at * 1000).getTime())
+  ? new Date(at * 1000).toLocaleString("ko-KR", { timeZone: "Asia/Seoul", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+  : "";
+const decisionLabels = { BUY: "매수 신호", SELL: "매도 신호", HOLD: "유지" };
+
+export function projectTossCashMonitor(snapshot, observedAt = Date.now() / 1000) {
+  const { ledger, ownerId, startedAt, state } = snapshot || {};
+  const scopes = ledger?.scope?.scopes;
+  // The status DTO can still contain the preceding ledger immediately after
+  // a new run starts. Its exact coordination owner is the scope authority.
+  const ownsLedger = typeof ownerId === "string" && ownerId.length > 0 && Array.isArray(scopes) && scopes.length > 0
+    && scopes.every(row => row?.ownerId === ownerId && row.broker === "toss" && row.market === "CASH"
+      && typeof row.symbol === "string" && row.symbol.length > 0);
+  const symbols = new Set(ownsLedger ? scopes.map(row => row.symbol) : []);
+  const unresolved = ownsLedger ? wholeCount(ledger.unresolvedOrders) : null;
+  const specs = ownsLedger && Array.isArray(ledger.scope.specs) ? ledger.scope.specs : [];
+  const positions = ledger?.positions;
+  const instruments = specs.filter(row => row?.strategyInstanceId && symbols.has(row.symbol)).map(row => {
+    let position = null;
+    if (positions && typeof positions === "object" && !Array.isArray(positions)) {
+      position = Object.hasOwn(positions, row.strategyInstanceId)
+        ? displayQuantity(positions[row.strategyInstanceId])
+        : unresolved === 0 ? "0" : null;
+    }
+    const profile = row.parameters?.stockSessionProfile;
+    const session = profile?.mode === "REGULAR" ? "정규장" : profile?.mode === "EXTENDED" ? "시간외" : "";
+    return { id: row.strategyInstanceId, symbol: row.symbol, timeframe: row.timeframe, session, position, plugin: row.pluginId };
+  });
+  const notes = Array.isArray(snapshot?.activity) ? snapshot.activity : [];
+  const current = ownsLedger && state === "RUNNING" && typeof startedAt === "number" && Number.isFinite(startedAt);
+  const activities = current ? notes.filter(row => typeof row?.at === "number" && row.at >= startedAt && row.at <= observedAt + 5)
+    .slice().sort((left, right) => right.at - left.at) : [];
+  const newest = (kind, pattern) => {
+    for (const row of activities) {
+      if (row.kind !== kind || typeof row.detail !== "string") continue;
+      const found = pattern.exec(row.detail);
+      if (found && symbols.has(found[1])) return { symbol: found[1], side: found[2], at: row.at };
+    }
+    return null;
+  };
+  return {
+    instruments,
+    evaluations: current ? wholeCount(snapshot.evaluations) : null,
+    acknowledged: current ? wholeCount(snapshot.ordersSubmitted) : null,
+    filled: ownsLedger ? wholeCount(ledger.fillCount) : null,
+    unresolved,
+    latestDecision: newest("EVALUATION", /^([A-Z0-9_.:/-]+) (BUY|SELL|HOLD)$/),
+    latestOrder: newest("ORDER", /^([A-Z0-9_.:/-]+) (BUY|SELL) [1-9]\d*(?:\.\d+)?$/),
+  };
+}
+
+function TossCashMonitor({ snapshot, state, active, error, now }) {
+  const view = projectTossCashMonitor(snapshot, now / 1000);
+  const showScope = view.instruments.length > 0;
+  const showStats = [view.evaluations, view.acknowledged, view.filled, view.unresolved].some(value => value !== null);
+  const activity = Array.isArray(snapshot?.activity) ? snapshot.activity : [];
+  const stateLabel = error ? "상태 갱신 미확인" : !snapshot ? "상태 확인 중"
+    : state === "RUNNING" && snapshot.running !== true ? "실행 여부 미확인"
+    : state === "FAILED" ? "운용 오류" : labels[state] || state;
+  return <section className="panel toss-cash-panel live-grid-full" aria-label="토스 현금 운용 감시">
+    <div className="toss-cash-heading"><h2>토스 현금 운용 감시</h2>
+      <strong className={active && !error && snapshot?.running === true ? "toss-cash-good" : "muted"}>{stateLabel}</strong></div>
+    {snapshot?.reason && <p role="status">{message(snapshot.reason)}</p>}
+    {error && <p className="toss-cash-error" role="alert">{message(error)}{snapshot && " · 아래는 마지막 수신 기록입니다."}</p>}
+    {showStats && <div className="toss-cash-stats" aria-label="운용 관측 횟수">
+      <span>봉 평가 <b>{view.evaluations ?? "—"}</b></span>
+      <span>주문 접수 <b>{view.acknowledged ?? "—"}</b></span>
+      <span>체결 확인 주문 <b>{view.filled ?? "—"}</b></span>
+      <span>종료 미확인 주문 <b>{view.unresolved ?? "—"}</b></span>
+    </div>}
+    {showScope ? <div className="toss-cash-watch">
+      <table aria-label="토스 운용 감시 종목">
+        <thead><tr><th scope="col">감시 종목</th><th scope="col">시간봉 · 거래 시간</th><th scope="col">이번 운용 보유 수량</th></tr></thead>
+        <tbody>{view.instruments.map((item, index) => <tr key={`${item.id}:${index}`}>
+          <th scope="row">{item.symbol}{item.plugin && <small>{item.plugin}</small>}</th>
+          <td>{[item.timeframe, item.session].filter(Boolean).join(" · ") || "미확인"}</td>
+          <td>{item.position === null ? "미확인" : `${item.position}주`}</td>
+        </tr>)}</tbody>
+      </table>
+      <p className="muted">보유 수량은 종료 주문 대조 기준입니다. 이번 운용의 수익률은 미기록입니다.</p>
+    </div> : <p className="muted">확인된 토스 운용 범위가 없습니다.</p>}
+    {view.latestDecision && <p className="toss-cash-latest"><b>최근 전략 판단</b> {view.latestDecision.symbol} · {decisionLabels[view.latestDecision.side]} <small>{tossTime(view.latestDecision.at)}</small></p>}
+    {showScope && state === "RUNNING" && !view.latestDecision && <p className="muted">최근 전략 판단 미관측</p>}
+    {view.latestOrder && <p className="toss-cash-latest"><b>최근 주문 접수 기록</b> {view.latestOrder.symbol} · {view.latestOrder.side === "BUY" ? "매수" : "매도"} <small>{tossTime(view.latestOrder.at)}</small></p>}
+    <details className="ts-disclosure toss-cash-options"><summary>진행 상세</summary>
+      <p className="muted">최근 활동 기록입니다. 주문 접수 후 체결 수량은 대조 결과에 반영됩니다.</p>
+      <ol>{activity.filter(row => typeof row?.detail === "string" && tossTime(row.at)).map((row, index) =>
+        <li key={`${row.at}:${index}`}>{tossTime(row.at)} · {row.detail}</li>)}</ol>
+      {snapshot?.firstFailure && <p className="toss-cash-error">최초 오류 · {message(snapshot.firstFailure)}</p>}
+    </details>
+  </section>;
+}
+
 export default function TossCashOperationPanel({ monitorOnly = false }) {
   const [items, setItems] = useState([]);
   const [selected, setSelected] = useState([]);
@@ -68,6 +164,7 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
         if (!stopped && mutation === latestMutation.current) {
           if (!value.ok) throw new Error(value.reason);
           setSnapshot(value); setNow(Date.now());
+          if (monitorOnly) setError("");
         }
       } catch (err) { if (!stopped && mutation === latestMutation.current) setError(err.message); }
       if (!stopped) timer = window.setTimeout(poll, 5000);
@@ -105,6 +202,7 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
     finally { submitted.current = false; if (mounted.current) setBusy(false); }
   }
 
+  if (monitorOnly) return <TossCashMonitor snapshot={snapshot} state={state} active={active} error={error} now={now} />;
   const accountCurrencyCash = snapshot?.ledger?.cash || {};
   return <section className="panel toss-cash-panel live-grid-full" aria-label="토스 현금 운용">
     <div className="toss-cash-heading"><div><span className="eyebrow">TOSS · 한국주식 / 미국주식</span><h2>토스 현금 운용</h2></div><strong className={active ? "toss-cash-good" : "muted"}>{labels[state] || state}</strong></div>

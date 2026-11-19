@@ -2671,7 +2671,6 @@ function App() {
         </section>}
         <KisNativePreparationPanel views={kisPreparationViews} onCancel={(key) => { void cancelKisStartPreparation(key); }} />
         {selectedNav === "automation" && <TossCashOperationPanel />}
-        {selectedNav === "monitor" && <TossCashOperationPanel monitorOnly />}
         <WorkspaceContent
           selectedNav={selectedNav}
           onNavigate={navigateWorkspace}

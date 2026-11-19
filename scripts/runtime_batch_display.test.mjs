@@ -83,15 +83,66 @@ test('a missing start outcome keeps the original once-only lock through a later 
   assert.equal(h.button(h.render(),'구성 확인').props.disabled,true);
   await h.button(h.render(),'실행 결과 조회').props.onClick();assert.equal(h.button(h.render(),'함께 관찰').props.disabled,true);assert.equal(h.starts(),1);
 });
-test('Toss diagnostics translate the actual prefixed basis error without changing unknown reasons',()=>{
+function loadTossPanel() {
   const code=transformSync(fs.readFileSync(path.join(root,'src/TossCashOperationPanel.jsx'),'utf8')+'\nexport {message};',{loader:'jsx',format:'cjs',jsx:'transform'}).code;
   const loaded={exports:{}};
   Function('require','module','exports',code)(id=>{
     if(id==='react')return {};if(id==='./api.js')return {request:()=>{throw Error('No real API');}};
     if(id.endsWith('.css'))return {};throw Error('Unexpected import '+id);
   },loaded,loaded.exports);
-  assert.match(loaded.exports.message('INDICATOR_PRICE_BASIS_REVALIDATION_REQUIRED: WARMUP_NOT_EXACT_NEUTRAL_PAIR'),/근거가 준비될 때까지 운용을 시작하지 않습니다/);
-  assert.match(loaded.exports.message('TOSS_EXIT_QUANTITY_CONTRACT_UNSUPPORTED'),/전체를 매도하는 방식만 지원/);
-  assert.equal(loaded.exports.message('UNKNOWN_ORIGINAL_ERROR'),'UNKNOWN_ORIGINAL_ERROR');
+  return loaded.exports;
+}
+test('Toss diagnostics translate the actual prefixed basis error without changing unknown reasons',()=>{
+  const loaded = loadTossPanel();
+  assert.match(loaded.message('INDICATOR_PRICE_BASIS_REVALIDATION_REQUIRED: WARMUP_NOT_EXACT_NEUTRAL_PAIR'),/근거가 준비될 때까지 운용을 시작하지 않습니다/);
+  assert.match(loaded.message('TOSS_EXIT_QUANTITY_CONTRACT_UNSUPPORTED'),/전체를 매도하는 방식만 지원/);
+  assert.equal(loaded.message('UNKNOWN_ORIGINAL_ERROR'),'UNKNOWN_ORIGINAL_ERROR');
   assert.match(runtimeBatchReason('BATCH_MEMBER_SELECTION_BLOCKED'),/운용 설정을 확인/);
+});
+
+const tossMonitorFixture = () => ({
+  ownerId: "owner-new", state: "RUNNING", running: true, startedAt: 1000, evaluations: 2, ordersSubmitted: 1,
+  ledger: {
+    fillCount: 0, unresolvedOrders: 1, positions: { a: "2" },
+    scope: {
+      scopes: [{ ownerId: "owner-new", broker: "toss", market: "CASH", symbol: "005930" }],
+      specs: [
+        { strategyInstanceId: "a", symbol: "005930", timeframe: "5m", parameters: { stockSessionProfile: { mode: "REGULAR" } } },
+        { strategyInstanceId: "b", symbol: "005930", timeframe: "1h" },
+        { strategyInstanceId: "foreign", symbol: "AAPL", timeframe: "5m" },
+      ],
+    },
+  },
+  activity: [
+    { kind: "ORDER", at: 1079, detail: "005930 BUY 2" },
+    { kind: "EVALUATION", at: 1080, detail: "005930 HOLD" },
+    { kind: "EVALUATION", at: 1100, detail: "005930 SELL" },
+    { kind: "EVALUATION", at: 1084, detail: "AAPL BUY" },
+    { kind: "EVALUATION", at: 999, detail: "005930 BUY" },
+  ],
+});
+
+test('Toss monitor binds positions to this owner and keeps same-symbol strategies distinct',()=>{
+  const {projectTossCashMonitor} = loadTossPanel();
+  const snapshot = tossMonitorFixture();
+  const view = projectTossCashMonitor(snapshot, 1090);
+  assert.deepEqual(view.instruments.map(row=>[row.symbol,row.timeframe,row.position]),[
+    ["005930","5m","2"],["005930","1h",null],
+  ]);
+  assert.equal(view.instruments[0].session, "정규장");
+  assert.equal(view.unresolved, 1); assert.equal(view.filled, 0);
+  assert.deepEqual(view.latestDecision, {symbol:"005930",side:"HOLD",at:1080});
+  assert.deepEqual(view.latestOrder, {symbol:"005930",side:"BUY",at:1079});
+  assert.equal(projectTossCashMonitor({...snapshot,state:"CLOSING"},1090).latestDecision,null);
+  assert.equal(projectTossCashMonitor(snapshot,1090).returnPercent,undefined);
+});
+
+test('Toss monitor rejects a carried prior ledger and does not invent missing counts',()=>{
+  const {projectTossCashMonitor} = loadTossPanel();
+  const snapshot = tossMonitorFixture();
+  const view = projectTossCashMonitor({...snapshot,ownerId:"another"},1090);
+  assert.deepEqual(view.instruments,[]); assert.equal(view.evaluations,null);
+  assert.equal(view.filled,null); assert.equal(view.latestDecision,null); assert.equal(view.latestOrder,null);
+  assert.equal(projectTossCashMonitor({...snapshot,ordersSubmitted:"0"},1090).acknowledged,null);
+  assert.equal(projectTossCashMonitor({...snapshot,ledger:{...snapshot.ledger,unresolvedOrders:0}},1090).instruments[1].position,"0");
 });

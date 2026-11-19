@@ -7,12 +7,19 @@ const sumKnown = values => values.length > 0 && values.every(known) ? values.red
 export const monitorRoute = route => SHORT_LIVE_ROUTES.find(row => row.id === route)?.label || route || '경로 미확인';
 export const monitorEventLabels = {
   FIRST_FAILURE: '최초 중단 원인 기록', STARTED: '시험 시작 기록', BAR_EVALUATED: '완성봉 평가', NEXT_OPEN_OBSERVED: '다음 봉 시작 관측',
-  ORDER_DEFERRED_PENDING_FILL: '앞선 주문 체결 대기', ORDER_INTENT_BEFORE_SUBMIT: '주문 제출 시도',
+  ORDER_DEFERRED_PENDING_FILL: '앞선 주문 체결 대기', ORDER_INTENT_BEFORE_SUBMIT: '주문 제출 의도 기록',
   ORDER_REPLY: '거래소 주문 응답', ACTUAL_FILL_INCREMENT: '추가 체결 관측',
   INTERNAL_ALLOCATION_TRANSFER: '전략 간 내부 배분', CLEANUP_INTENT_ONCE: '종료 대조 시작',
   CLEANUP_ORDER_OBSERVED: '종료 주문 관측', WORKER_EXIT_INTENT: '작업자 종료 의사 기록',
   WORKER_DEATH_OBSERVED: '작업자 종료 관측', STARTUP_RETIRED_BEFORE_WORKER: '작업자 시작 전 종료',
 };
+
+const orderReplyLabels = {
+  REJECTED: '거래소 주문 거절', UNKNOWN: '주문 결과 미확정', ACCEPTED: '거래소 주문 접수',
+  PARTIAL: '거래소 부분 체결 응답', FILLED: '거래소 체결 응답', CANCELED: '거래소 취소 응답',
+};
+export const monitorEventLabel = event => event.kind === 'ORDER_REPLY' && Object.hasOwn(orderReplyLabels, event.status)
+  ? orderReplyLabels[event.status] : monitorEventLabels[event.kind];
 
 export function monitorFailureDiagnostic(row) {
   const providerLabel = ({ binance: 'Binance 현물', 'binance-futures': 'Binance USDT 선물', upbit: 'Upbit', kis: '한국투자증권' })[row.provider] || '거래소 미확인';
@@ -86,6 +93,15 @@ export function projectRealtimeMonitor(snapshot, { fresh = false, pollError = ''
       if (observed.length) ended = Math.min(...observed);
     }
   }
+  // Each strategy row carries its own latest actual evaluation. The retained
+  // event journal does not carry a signal for every BAR_EVALUATED record.
+  const latestDecisions = strategies.flatMap(row => {
+    const at = stamp(row.lastDecisionAt);
+    if (!known(row.decisionCount) || row.decisionCount < 1 || !validEndpoint(at)
+        || (ended !== null && at > ended) || !['BUY', 'SELL', 'HOLD'].includes(row.signal)) return [];
+    return [{ at, observedAt: row.lastDecisionAt, selectionKey: row.selectionKey,
+      symbol: row.symbol, route: row.route, pluginId: row.pluginId, timeframe: row.timeframe, signal: row.signal }];
+  }).sort((a, b) => b.at - a.at).slice(0, 12);
   const progressAt = terminalReported ? ended : now;
   const elapsedSeconds = validEndpoint(progressAt) ? Math.floor((progressAt - started) / 1000) : null;
   const progress = elapsedSeconds !== null && ends !== null && ends > started
@@ -102,12 +118,12 @@ export function projectRealtimeMonitor(snapshot, { fresh = false, pollError = ''
       basisLabel: equity?.preservedSpotExcluded ? '기존 보호 현물 제외 · 기준 계좌 평가 대비' : '기준 계좌 평가 대비 · 계좌 범위',
       observedAt: row.accountObservedAt, routeLabel: monitorRoute(row.broker) };
   });
-  const activity = [...(run?.recentActivity || [])].filter(event => monitorEventLabels[event.kind] && stamp(event.observedAt) !== null && stamp(event.observedAt) - now <= 5000)
+  const activity = [...(run?.recentActivity || [])].filter(event => Object.hasOwn(monitorEventLabels, event.kind) && stamp(event.observedAt) !== null && stamp(event.observedAt) - now <= 5000)
     .sort((a,b) => stamp(b.observedAt)-stamp(a.observedAt) || (b.sequence || 0)-(a.sequence || 0)).slice(0, 30);
   const timing = failureTiming(run || {}, ended === null ? null : new Date(ended).toISOString(), now);
   return { timing, state, resultHasIssue, responseCurrent, receivedAt, ageMs, terminal, blockers, counts, progress, elapsedSeconds, terminalReported, terminatedAt: ended === null ? null : new Date(ended).toISOString(), feeds, feedsRecent,
     allAccountsCurrent: coversExpectedRoutes(routes.map(row => row.broker)) && routes.every(row => row.accountCurrent),
-    routes, strategies, activity, startedAt: run?.startedAt, endsAt: run?.endsAt,
+    routes, strategies, latestDecisions, activity, startedAt: run?.startedAt, endsAt: run?.endsAt,
     runStatus: run?.status, sessionId: run?.sessionId,
     totalChangeKrw: coversExpectedRoutes(routes.map(row => row.broker)) ? sumKnown(routes.map(row => row.changeKrw)) : null,
     failureDiagnostics: run?.firstFailure ? normalizeShortLiveFailureDiagnostics(run.firstFailureDiagnostics).map(monitorFailureDiagnostic) : [],

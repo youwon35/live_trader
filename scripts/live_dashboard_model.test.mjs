@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {equitySeries,projectContinuousDashboard} from '../src/liveDashboardModel.js';
+import {appendAccountObservations,equitySeries,projectContinuousDashboard} from '../src/liveDashboardModel.js';
 const now=Date.parse('2026-10-27T03:00:00Z'),at=ms=>new Date(now+ms).toISOString();
 const sample=(change={})=>({route:'BINANCE_SPOT',observedAt:at(-1000),baselineNative:20,currentNative:21,quoteCurrency:'USDT',basis:'OBSERVED_NATIVE_EQUITY_CHANGE',...change});
 test('curves use real same-route samples, preserving negative and zero without fake gaps',()=>{
@@ -50,4 +50,49 @@ test('guard failures and incomplete feed readiness cannot look healthy',()=>{
 test('a returning baseline cannot stitch across an intervening different account series',()=>{
  const points=equitySeries([sample({observedAt:at(-5000)}),sample({observedAt:at(-3000),baselineNative:25}),sample()],'BINANCE_SPOT',now);
  assert.equal(points.length,1);assert.equal(points[0].at,now-1000);
+});
+
+test('control tower separates watch scope, account equity and exact decision outcome',()=>{
+ const spec={strategyInstanceId:'toss-one',symbol:'005930',provider:'toss',timeframe:'5m'};
+ const runtime={running:true,brokerId:'toss',deploymentId:'owned',startedAt:at(-20000),lastHeartbeat:at(-300),allFeedsReady:true,
+  engine:{strategies:[spec],decisionCount:4,recentCycles:[
+   {occurredAt:at(-4000),decisions:[{strategyInstanceId:'toss-one',strategyId:'same',signal:'BUY',reason:'이동평균 교차',
+    bar:{close:141500,endTime:at(-5000)}}],handlerResult:{results:[{strategyInstanceId:'toss-one',action:'BLOCKED',ok:false,reason:'주문 한도 확인'}]}},
+   {occurredAt:at(-30000),decisions:[{strategyInstanceId:'toss-one',strategyId:'same',signal:'SELL'}]},
+  ]}};
+ const view=projectContinuousDashboard({api_connected:true,continuous_runtime:{runtimes:{a:runtime,other:{brokerId:'kis',running:false,engine:runtime.engine}}},
+  order_queue:{active:2},account_risk:{budgets:{
+   readable:{broker_id:'toss',currency:'KRW',day:'2026-10-27',observed_at:at(-500),starting_equity:200000,current_equity:210000},
+   unrelated:{broker_id:'kis',currency:'KRW',day:'2026-10-27',observed_at:at(-500),starting_equity:1,current_equity:10},
+   stale:{broker_id:'toss',currency:'USD',day:'2026-10-26',observed_at:at(-200000),starting_equity:0,current_equity:1},
+  }},orders:[
+   {order_id:'owned-order',broker_id:'toss',deployment_id:'owned',symbol:'005930',state:'rejected',reason:'승인 거절',updated_at:at(-3000)},
+   {order_id:'other-order',broker_id:'toss',deployment_id:'other',symbol:'005930',state:'filled',updated_at:at(-1000)},
+  ]},now);
+ assert.equal(view.active,1);assert.equal(view.symbols,1);
+ assert.equal(view.watch[0].brokerLabel,'토스증권');assert.equal(view.pending,2);
+ assert.deepEqual(view.accounts.map(row=>[row.currency,row.percent,row.current]),[['KRW',5,true],['USD',null,false]]);
+ assert.deepEqual(view.recent.map(row=>row.label),['주문 거절','매수 신호']);
+ assert.equal(view.details[1].price,141500);assert.equal(view.details[1].outcome,'주문 한도 확인');
+ assert.equal(view.details[1].issue,true);
+});
+
+test('a shared artifact cannot cross-assign a legacy decision outcome',()=>{
+ const engine={strategies:[{strategyInstanceId:'a',symbol:'A'},{strategyInstanceId:'b',symbol:'B'}],
+  recentCycles:[{occurredAt:at(-100),decisions:[{strategyInstanceId:'a',strategyId:'shared',signal:'HOLD'},{strategyInstanceId:'b',strategyId:'shared',signal:'SELL'}],
+   handlerResult:{results:[{strategyId:'shared',ok:false,reason:'다른 인스턴스에 속할 수 있음'}]}}]};
+ const view=projectContinuousDashboard({api_connected:false,order_queue:{active:3},continuous_runtime:{runtimes:{s:{running:true,engine}}}},now);
+ assert.equal(view.pending,null);assert.equal(view.details.length,2);
+ assert.equal(view.details.every(row=>!row.outcome && !row.issue),true);
+});
+
+test('account display history deduplicates observations and resets when baseline changes',()=>{
+ const first={broker:'kis',currency:'KRW',start:100,day:'2026-10-27',at:at(-900),percent:1,current:true};
+ const history=appendAccountObservations({},[first]);
+ assert.equal(appendAccountObservations(history,[first,{...first,at:at(-50),current:false}]),history);
+ const second={...first,at:at(-500),percent:-1};
+ const two=appendAccountObservations(history,[second]);
+ assert.deepEqual(two['kis:KRW'].map(point=>point.percent),[1,-1]);
+ const revised=appendAccountObservations(two,[{...first,start:200,at:at(0),percent:2}]);
+ assert.deepEqual(revised['kis:KRW'].map(point=>point.percent),[2]);
 });

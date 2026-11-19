@@ -16,3 +16,11 @@
 .toss-cash-good { color: var(--success-text,#218376); }
 .toss-cash-error { color: var(--danger-text,#dc3545); overflow-wrap: anywhere; }
 .toss-cash-panel button { min-height: 40px; }
+.toss-cash-watch { overflow-x: auto; }
+.toss-cash-watch table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.toss-cash-watch th, .toss-cash-watch td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+.toss-cash-watch thead th { color: var(--muted); font-weight: 600; }
+.toss-cash-watch th small, .toss-cash-latest small { color: var(--muted); }
+.toss-cash-watch th small { display: block; font-weight: 500; overflow-wrap: anywhere; }
+.toss-cash-latest { margin: 8px 0; }
+.toss-cash-latest b { margin-right: 5px; }

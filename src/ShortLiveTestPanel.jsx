@@ -12,17 +12,20 @@ import {
 import "./ShortLiveTestPanel.css";
 import RealtimeMonitor from "./RealtimeMonitor.jsx";
 import ContinuousMonitor from "./ContinuousMonitor.jsx";
+import TossCashOperationPanel from "./TossCashOperationPanel.jsx";
 import OperatingSummary from "./OperatingSummary.jsx";
 import {restoreOperatingProfile} from "./operatingProfile.js";
 import {projectRealtimeMonitor} from "./realtimeMonitorModel.js";
 import "./MonitorWorkspace.css";
 import { createNestedTabs } from "../../../packages/design/nested-tabs.js";
 import { createVisibleStatusPoll } from "./visibleStatusPoll.js";
+import { ordinaryRuntimeActive } from "./statusTruth.js";
 
 const MonitorTabs = createNestedTabs(React);
 const MONITOR_TABS = Object.freeze([
   { id: "ordinary", label: "실행 중인 전략과 거래소" },
   { id: "trial", label: "주문 연결 시험" },
+  { id: "toss", label: "토스 현금 운용" },
 ]);
 
 const defaultApi = { snapshot: getShortLiveTestSnapshot, catalog: getShortLiveTestCatalog, prepare: prepareShortLiveTest, start: startShortLiveTest, stop: stopShortLiveTest };
@@ -91,7 +94,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const [preparedAuthority, setPreparedAuthority] = useState("");
   const [unknownMutation, setUnknownMutation] = useState("");
   const [showLegacy, setShowLegacy] = useState(false);
-  const [monitorTab, setMonitorTab] = useState("trial");
+  const [selectedMonitorTab, setMonitorTab] = useState(null);
   const monitorPanelId = React.useId();
   const mounted = useRef(false);
   const pollFlight = useRef(null);
@@ -311,18 +314,23 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   }
 
   const monitorView = projectRealtimeMonitor(snapshot, {fresh, pollError, receivedAt, now:Date.now(), staleMs:Math.max(20000,pollMs*3)});
+  const monitorTab = selectedMonitorTab || (shortLiveRunning(snapshot) && !ordinaryRuntimeActive(operationalSnapshot) ? "trial" : "ordinary");
   if (viewMode === "monitor") return <div className="short-live-workspace" aria-label="실시간 감시 작업공간">
     <MonitorTabs ariaLabel="실시간 감시 종류" className="monitor-view-tabs" value={monitorTab} options={MONITOR_TABS} onChange={setMonitorTab} panelIdPrefix={monitorPanelId} variant="compact" />
     <section role="tabpanel" id={monitorPanelId + "-ordinary"} aria-labelledby={monitorPanelId + "-tab-ordinary"} hidden={monitorTab !== "ordinary"} tabIndex={0}>
-      <ContinuousMonitor snapshot={operationalSnapshot} onOpenExecution={onOpenExecution}/>
+      <ContinuousMonitor snapshot={operationalSnapshot} onOpenExecution={onOpenExecution} visible={activeView && monitorTab === "ordinary"}/>
     </section>
     <section role="tabpanel" id={monitorPanelId + "-trial"} aria-labelledby={monitorPanelId + "-tab-trial"} hidden={monitorTab !== "trial"} tabIndex={0}>
       <div className="monitor-workspace-actions"><button className="secondary-button" type="button" onClick={onOpenSetup}>시험 설정·시작·중지</button><button className="secondary-button" type="button" onClick={refresh} disabled={Boolean(busy)}><RefreshCw size={15}/> 상태 새로 확인</button></div>
       {unknownMutation && <p role="alert" className="short-live-error">요청 결과 미확정 · 자동 재시도하지 않습니다. 시험 설정에서 동일 실행의 상태를 확인하세요.</p>}
       {error && <p role="alert" className="short-live-error">{error}</p>}
-      <RealtimeMonitor snapshot={snapshot} fresh={fresh} pollError={pollError} receivedAt={receivedAt} staleMs={Math.max(20000,pollMs*3)}/>
+      <RealtimeMonitor snapshot={snapshot} fresh={fresh} pollError={pollError} receivedAt={receivedAt} staleMs={Math.max(20000,pollMs*3)}
+        visible={activeView && monitorTab === "trial"}/>
       <MarketDataArchiveStatus value={snapshot.runtime?.marketDataArchive}/>
       <OperatingSummary report={snapshot.runtime?.completionReport}/>
+    </section>
+    <section role="tabpanel" id={monitorPanelId + "-toss"} aria-labelledby={monitorPanelId + "-tab-toss"} hidden={monitorTab !== "toss"} tabIndex={0}>
+      {activeView && monitorTab === "toss" && <TossCashOperationPanel monitorOnly />}
     </section>
   </div>;
   return <div className="short-live-workspace" aria-label="짧은 실거래 기능시험">

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { projectRealtimeMonitor } from '../src/realtimeMonitorModel.js';
+import { monitorEventLabel, projectRealtimeMonitor } from '../src/realtimeMonitorModel.js';
 import { normalizeShortLiveSnapshot } from '../src/shortLiveTestModel.js';
 const now = Date.parse('2026-10-27T03:00:00Z');
 const iso = delta => new Date(now + delta).toISOString();
@@ -64,8 +64,41 @@ test('account freshness is separate from latest UI poll; absent counts remain un
 test('only allowed real events with valid time reach the public timeline in stable order',()=>{
   const result=project({recentActivity:[{sequence:2,kind:'ORDER_REPLY',observedAt:iso(0),status:'PARTIAL'},
     {sequence:1,kind:'ORDER_INTENT_BEFORE_SUBMIT',observedAt:iso(0)},
-    {sequence:3,kind:'ACCOUNT_SECRET',observedAt:iso(0)},{kind:'ACTUAL_FILL_INCREMENT'}]});
+    {sequence:3,kind:'ACCOUNT_SECRET',observedAt:iso(0)},
+    {sequence:4,kind:'constructor',observedAt:iso(0)},{kind:'ACTUAL_FILL_INCREMENT'}]});
   assert.deepEqual(result.activity.map(row=>row.sequence),[2,1]);
+});
+
+test('recent judgments come from scoped strategy observations and retain a separate order timeline',()=>{
+  const item = {route:'BINANCE_SPOT',symbol:'BTCUSDT',timeframe:'1m',pluginId:'moving_average_cross',decisionCount:1};
+  const value=project({strategyRows:[
+    {...item,instanceId:'first',lastSignal:'HOLD',lastDecisionAt:iso(-800)},
+    {...item,instanceId:'second',route:'BINANCE_USDM_FUTURES',lastSignal:'BUY',lastDecisionAt:iso(-100)},
+    {...item,instanceId:'never',decisionCount:0,lastSignal:'SELL',lastDecisionAt:iso(0)},
+    {...item,instanceId:'future',lastSignal:'SELL',lastDecisionAt:iso(6000)},
+    {...item,instanceId:'previous',lastSignal:'BUY',lastDecisionAt:iso(-3600001)},
+  ],recentActivity:[{sequence:1,kind:'BAR_EVALUATED',observedAt:iso(-300)}]});
+  assert.deepEqual(value.latestDecisions.map(row=>[row.selectionKey,row.route,row.signal]),[
+    ['second','BINANCE_USDM_FUTURES','BUY'],['first','BINANCE_SPOT','HOLD'],
+  ]);
+  assert.equal(value.activity.length,1);
+  assert.equal(value.activity[0].kind,'BAR_EVALUATED');
+});
+
+test('historical recent judgment cannot occur after the verified termination',()=>{
+  const value=project({
+    status:'TERMINATED',terminalVerified:true,naturalExitObserved:true,terminatedAt:iso(-1000),
+    strategyRows:[{instanceId:'late',decisionCount:1,lastSignal:'BUY',lastDecisionAt:iso(-500)}],
+  });
+  assert.deepEqual(value.latestDecisions,[]);
+});
+
+test('an intent, broker rejection, unconfirmed reply, and fill use distinct labels',()=>{
+  assert.match(monitorEventLabel({kind:'ORDER_INTENT_BEFORE_SUBMIT'}),/의도/);
+  assert.match(monitorEventLabel({kind:'ORDER_REPLY',status:'REJECTED'}),/거절/);
+  assert.match(monitorEventLabel({kind:'ORDER_REPLY',status:'UNKNOWN'}),/미확정/);
+  assert.match(monitorEventLabel({kind:'ACTUAL_FILL_INCREMENT'}),/체결 관측/);
+  assert.equal(monitorEventLabel({kind:'ORDER_REPLY',status:'constructor'}),'거래소 주문 응답');
 });
 
 test('future local receipt and future activity are unverified, not current',()=>{
