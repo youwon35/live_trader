@@ -21,7 +21,7 @@ from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from trading_runtime.continuous_runtime import (
-    ClosedBar, OpenBoundary, PortfolioRuntimeEngine, RuntimeStrategySpec,
+    ClosedBar, OpenBoundary, PortfolioRuntimeEngine, RuntimeStrategySpec, StrategyBarDecision,
     REALTIME_OPEN_BOUNDARY_ATTESTATIONS,
 )
 from trading_runtime.portfolio_runtime import BuiltinBarSignalEvaluator, required_warmup_bars
@@ -35,6 +35,16 @@ from .portfolio_execution import SleeveDelta, _split_internal_and_external_alloc
 from .short_live_read_diagnostics import sanitize_read_diagnostics
 from .operating_profile import load_profile, save_profile
 from .session_report import terminal_report
+from .signal_diagnostics import public_calculation_note
+
+
+def _monitor_calculations(decisions: tuple[StrategyBarDecision, ...]) -> list[dict[str, Any]]:
+    rows = []
+    for decision in decisions[:8]:
+        note = public_calculation_note(decision)
+        if note is not None:
+            rows.append(note)
+    return rows
 
 
 def _spec(value: Mapping[str, Any]) -> RuntimeStrategySpec:
@@ -130,7 +140,7 @@ class ShortLiveTestService:
             import os
             os.fsync(stream.fileno())
 
-    def _event(self, kind: str, **values: Any) -> None:
+    def _event(self, kind: str, *, monitor_decisions: tuple[StrategyBarDecision, ...] = (), **values: Any) -> None:
         self._journal_sequence += 1
         session_id = (self._session or {}).get("sessionId", "preparation")
         observed_at = utc_text(self._now())
@@ -158,6 +168,8 @@ class ShortLiveTestService:
                 item = values.get(key)
                 if isinstance(item, (float, int)) and not isinstance(item, bool):
                     event[key] = item
+            if kind == "BAR_EVALUATED" and monitor_decisions:
+                event["calculations"] = _monitor_calculations(monitor_decisions)
             self._monitor_events.append(event)
             self._monitor_events = self._monitor_events[-60:]
 
@@ -772,7 +784,7 @@ class ShortLiveTestService:
             changed.append(decision.strategy_instance_id)
         self._event("BAR_EVALUATED", route=route, barDtoHash=canonical_hash(bar.to_dict()),
                     decisionKeys=[d.evaluation_key for d in decisions],
-                    changedInstances=changed)
+                    changedInstances=changed, monitor_decisions=tuple(decisions))
         if changed:
             timing = self._specs[changed[0]]["executionTiming"]
             if timing == "signal-close":

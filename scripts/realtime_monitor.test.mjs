@@ -101,6 +101,26 @@ test('an intent, broker rejection, unconfirmed reply, and fill use distinct labe
   assert.equal(monitorEventLabel({kind:'ORDER_REPLY',status:'constructor'}),'거래소 주문 응답');
 });
 
+test('closed-bar evidence is bounded, formatted from known typed metrics and never attached to order replies',()=>{
+  const note={symbol:'BTCUSDT',timeframe:'1h',barEnd:iso(-1000),signal:'HOLD',close:100,
+    reason:'MA(5/20) 교차 없음. 다음 확정 봉에서 다시 평가합니다.',
+    metadata:{historyCount:22,currentShort:101,rsi:'30',privateKey:'PRIVATE'},accountId:'PRIVATE'};
+  const result=project({recentActivity:[
+    {sequence:3,kind:'ORDER_REPLY',observedAt:iso(0),status:'ACCEPTED',calculations:[note]},
+    {sequence:2,kind:'BAR_EVALUATED',observedAt:iso(-300),calculations:[
+      note,{...note,barEnd:iso(1)},{...note,barEnd:iso(-3600001)},{...note,symbol:'not-a-symbol'},
+    ]},
+  ]});
+  assert.equal(result.activity[0].calculations,undefined);
+  assert.equal(result.activity[1].calculations.length,1);
+  assert.deepEqual(result.activity[1].calculations[0].metrics.map(entry=>entry.value),[22,101]);
+  assert.equal(result.activity[1].calculations[0].close,100);
+  assert.equal(result.activity[1].calculations[0].reason,note.reason);
+  assert.doesNotMatch(JSON.stringify(result.activity),/PRIVATE|accountId/);
+  const many=project({recentActivity:[{kind:'BAR_EVALUATED',observedAt:iso(0),calculations:Array(15).fill(note)}]});
+  assert.equal(many.activity[0].calculations.length,8);
+});
+
 test('future local receipt and future activity are unverified, not current',()=>{
   const value=normalizeShortLiveSnapshot(raw({recentActivity:[{kind:'ACTUAL_FILL_INCREMENT',observedAt:iso(6000)}]}));
   assert.equal(projectRealtimeMonitor(value,{...opts,receivedAt:now+6000}).responseCurrent,false);

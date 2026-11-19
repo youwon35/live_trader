@@ -1,5 +1,6 @@
 import { normalizeFxObservation } from "./fxObservation.js";
 import { normalizeUpbitQuoteObservation } from './quoteObservation.js';
+import { signalDiagnostics } from './signalDiagnostics.js';
 export const SHORT_LIVE_ROUTES = Object.freeze([
   { id: "KIS_KR_CASH", label: "한국투자증권 국내 현금" },
   { id: "BINANCE_SPOT", label: "Binance 현물" },
@@ -25,6 +26,20 @@ export function sanitizeShortLiveText(value) {
     .replace(/\bBearer\s+\S+/gi, "[인증정보 숨김]")
     .replace(/\b\d{8,14}(?:-\d{2,4})?\b/g, "[번호 숨김]")
     .slice(0, 260);
+}
+
+function normalizeCalculationNotes(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 8).flatMap(row => {
+    const symbol = text(row?.symbol);
+    const timeframe = text(row?.timeframe);
+    const barEnd = text(row?.barEnd);
+    if (!/^[A-Z0-9][A-Z0-9_.:/-]{0,31}$/.test(symbol) || !/^[1-9]\d{0,3}[mhd]$/.test(timeframe)
+      || barEnd.length > 35 || !/T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(barEnd) || !Number.isFinite(Date.parse(barEnd))
+      || !["BUY", "SELL", "HOLD"].includes(row.signal)) return [];
+    return [{ symbol, timeframe, barEnd, signal: row.signal, close: numeric(row.close),
+      reason: sanitizeShortLiveText(row.reason).slice(0, 160), metrics: signalDiagnostics(row.metadata) }];
+  });
 }
 
 export function shortLiveBlockerLabel(value) {
@@ -471,12 +486,13 @@ export function normalizeShortLiveSnapshot(value = {}) {
       })),
       firstFailure: sanitizeShortLiveText(run.firstFailure), firstFailureAt: text(run.firstFailureAt), stopReason: sanitizeShortLiveText(run.stopReason),
       firstFailureDiagnostics: normalizeShortLiveFailureDiagnostics(run.firstFailureDiagnostics),
-      recentActivity: (Array.isArray(run.recentActivity) ? run.recentActivity : []).slice(-60).map((event) => ({
+      recentActivity: (Array.isArray(run.recentActivity) ? run.recentActivity : []).slice(-60).filter(Boolean).map((event) => ({
         sequence: numeric(event.sequence), kind: sanitizeShortLiveText(event.kind), observedAt: text(event.observedAt),
         route: sanitizeShortLiveText(event.route), symbol: sanitizeShortLiveText(event.symbol), side: sanitizeShortLiveText(event.side),
         status: sanitizeShortLiveText(event.status), quantity: amount(event.quantity),
         incrementalQuantity: amount(event.incrementalQuantity), cumulativeQuantity: amount(event.cumulativeQuantity),
         cumulativeAveragePrice: amount(event.cumulativeAveragePrice),
+        ...(event.kind === "BAR_EVALUATED" ? { calculations: normalizeCalculationNotes(event.calculations) } : {}),
       })),
       blockers: Array.isArray(run.blockers) ? run.blockers : [],
       brokers: (Array.isArray(run.brokers) ? run.brokers : Array.isArray(run.brokerRows) ? run.brokerRows : []).map((row) => ({

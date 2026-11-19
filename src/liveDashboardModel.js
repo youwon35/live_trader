@@ -1,4 +1,5 @@
 import { runtimeRows } from './runtimeSelection.js';
+import { signalDiagnostics } from './signalDiagnostics.js';
 
 const number = value => typeof value === 'number' && Number.isFinite(value) ? value : null;
 const stamp = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
@@ -130,7 +131,7 @@ export function projectContinuousDashboard(snapshot = {}, now = Date.now()) {
           label:blocked && decision.signal==='HOLD' ? '판단 보류' : watchSignal(decision.signal),
           price:number(decision.bar?.close),barAt:decision.bar?.endTime,
           reason:note(decision.reason),action:note(result?.action),
-          outcome:note(result?.reason),issue:blocked}];
+          outcome:note(result?.reason),issue:blocked,diagnostics:signalDiagnostics(decision.metadata)}];
       });
     }).sort(latestFirst);
     const latestByInstance = new Map();

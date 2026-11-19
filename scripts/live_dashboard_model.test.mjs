@@ -57,7 +57,7 @@ test('control tower separates watch scope, account equity and exact decision out
  const runtime={running:true,brokerId:'toss',deploymentId:'owned',startedAt:at(-20000),lastHeartbeat:at(-300),allFeedsReady:true,
   engine:{strategies:[spec],decisionCount:4,recentCycles:[
    {occurredAt:at(-4000),decisions:[{strategyInstanceId:'toss-one',strategyId:'same',signal:'BUY',reason:'이동평균 교차',
-    bar:{close:141500,endTime:at(-5000)}}],handlerResult:{results:[{strategyInstanceId:'toss-one',action:'BLOCKED',ok:false,reason:'주문 한도 확인'}]}},
+    bar:{close:141500,endTime:at(-5000)},metadata:{previousShort:0,currentShort:141500,rsi:'not numeric',regimePass:false,raw:'private'}}],handlerResult:{results:[{strategyInstanceId:'toss-one',action:'BLOCKED',ok:false,reason:'주문 한도 확인'}]}},
    {occurredAt:at(-30000),decisions:[{strategyInstanceId:'toss-one',strategyId:'same',signal:'SELL'}]},
   ]}};
  const view=projectContinuousDashboard({api_connected:true,continuous_runtime:{runtimes:{a:runtime,other:{brokerId:'kis',running:false,engine:runtime.engine}}},
@@ -75,6 +75,9 @@ test('control tower separates watch scope, account equity and exact decision out
  assert.deepEqual(view.recent.map(row=>row.label),['주문 거절','매수 신호']);
  assert.equal(view.details[1].price,141500);assert.equal(view.details[1].outcome,'주문 한도 확인');
  assert.equal(view.details[1].issue,true);
+ assert.deepEqual(view.details[1].diagnostics,[{label:'직전 단기 이동평균',value:0},
+  {label:'이번 단기 이동평균',value:141500},{label:'추세 필터',value:'미충족'}]);
+ assert.equal(Object.hasOwn(view.watch[0],'diagnostics'),false);
 });
 
 test('a shared artifact cannot cross-assign a legacy decision outcome',()=>{

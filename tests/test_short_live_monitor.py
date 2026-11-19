@@ -39,6 +39,51 @@ class ShortLiveMonitorTests(unittest.TestCase):
         finally:
             h.tearDown()
 
+    def test_actual_engine_calculation_publishes_only_chart_evidence_without_order(self):
+        import json
+        from datetime import timedelta
+        h = session_fixture.ShortLiveSessionTests(); h.setUp()
+        try:
+            spec = session_fixture.runtime_spec()
+            service, brokers, _ = h.service([spec])
+            h.start(service)
+            h.now = session_fixture.NOW + timedelta(milliseconds=200)
+            bar = session_fixture.candle(spec, session_fixture.NOW, 6)
+            service.step(spec["route"], bar)
+            activity = service.snapshot(include_catalog=False)["runtime"]["recentActivity"]
+            observed = next(event for event in activity if event["kind"] == "BAR_EVALUATED")
+            self.assertEqual(len(observed["calculations"]), 1)
+            row = observed["calculations"][0]
+            self.assertEqual((row["symbol"], row["timeframe"], row["barEnd"], row["close"], row["signal"]),
+                             (bar.symbol, bar.timeframe, bar.end_time, 6, "BUY"))
+            self.assertEqual(row["reason"], "MA(1/3) 상향 교차가 확정됐습니다.")
+            self.assertEqual(row["metadata"]["currentShort"], 6)
+            self.assertEqual(row["metadata"]["currentLong"], 3)
+            self.assertNotIn("positionQuantity", row["metadata"])
+            self.assertNotIn("brokerId", row["metadata"])
+            journal = [json.loads(path.read_bytes()) for path in service.store_root.glob("event-*.json")]
+            durable = next(event for event in journal if event["kind"] == "BAR_EVALUATED")
+            self.assertNotIn("calculations", durable)
+            self.assertNotIn("monitor_decisions", durable)
+            self.assertEqual(brokers[spec["route"]].submits, [])
+        finally:
+            h.tearDown()
+
+    def test_calculation_projection_caps_rows_and_omits_nonfinite_and_foreign_fields(self):
+        from trading_runtime.continuous_runtime import StrategyBarDecision
+        from live_trader.short_live_session import _monitor_calculations
+        bar = session_fixture.candle(session_fixture.runtime_spec(), session_fixture.NOW, 6)
+        decision = StrategyBarDecision(
+            "PRIVATE_INSTANCE", "PRIVATE_STRATEGY", "HOLD", "MA api_key: PRIVATE", bar,
+            "PRIVATE_EVAL", {"currentShort": 1.0, "rsi": float("nan"), "exit": True,
+                             "positionQuantity": 9, "private": "PRIVATE", "historyCount": 10**30},
+        )
+        notes = _monitor_calculations((decision,) * 12)
+        self.assertEqual(len(notes), 8)
+        self.assertEqual(notes[0]["metadata"], {"currentShort": 1.0})
+        self.assertNotIn("reason", notes[0])
+        self.assertNotIn("PRIVATE", str(notes))
+
 
 
 class PassiveFeedProjectionTests(unittest.TestCase):

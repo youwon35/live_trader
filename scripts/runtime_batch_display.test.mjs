@@ -6,6 +6,7 @@ import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {spawnSync} from 'node:child_process';
 import {runtimeBatchFromResponse,runtimeBatchReview,runtimeBatchReason} from '../src/runtimeBatchModel.js';
+import {signalDiagnostics} from '../src/signalDiagnostics.js';
 const require=createRequire(import.meta.url),{transformSync}=require('esbuild');
 const root=fileURLToPath(new URL('../',import.meta.url));
 
@@ -88,6 +89,7 @@ function loadTossPanel() {
   const loaded={exports:{}};
   Function('require','module','exports',code)(id=>{
     if(id==='react')return {};if(id==='./api.js')return {request:()=>{throw Error('No real API');}};
+    if(id==='./signalDiagnostics.js')return {signalDiagnostics};
     if(id.endsWith('.css'))return {};throw Error('Unexpected import '+id);
   },loaded,loaded.exports);
   return loaded.exports;
@@ -115,7 +117,10 @@ const tossMonitorFixture = () => ({
   },
   activity: [
     { kind: "ORDER", at: 1079, detail: "005930 BUY 2" },
-    { kind: "EVALUATION", at: 1080, detail: "005930 HOLD" },
+    { kind: "EVALUATION", at: 1080, detail: "005930 HOLD", calculation: {
+      symbol: "005930", timeframe: "5m", signal: "HOLD", reason: "이동평균 교차 없음",
+      metadata: {currentShort: 128400, currentLong: 129500, secret: "fixture"},
+    } },
     { kind: "EVALUATION", at: 1100, detail: "005930 SELL" },
     { kind: "EVALUATION", at: 1084, detail: "AAPL BUY" },
     { kind: "EVALUATION", at: 999, detail: "005930 BUY" },
@@ -133,6 +138,9 @@ test('Toss monitor binds positions to this owner and keeps same-symbol strategie
   assert.equal(view.unresolved, 1); assert.equal(view.filled, 0);
   assert.deepEqual(view.latestDecision, {symbol:"005930",side:"HOLD",at:1080});
   assert.deepEqual(view.latestOrder, {symbol:"005930",side:"BUY",at:1079});
+  assert.deepEqual(view.calculations.map(row=>[row.symbol,row.timeframe,row.values.map(field=>field.value)]),[
+    ["005930","5m",[128400,129500]],
+  ]);
   assert.equal(projectTossCashMonitor({...snapshot,state:"CLOSING"},1090).latestDecision,null);
   assert.equal(projectTossCashMonitor(snapshot,1090).returnPercent,undefined);
 });
@@ -143,6 +151,7 @@ test('Toss monitor rejects a carried prior ledger and does not invent missing co
   const view = projectTossCashMonitor({...snapshot,ownerId:"another"},1090);
   assert.deepEqual(view.instruments,[]); assert.equal(view.evaluations,null);
   assert.equal(view.filled,null); assert.equal(view.latestDecision,null); assert.equal(view.latestOrder,null);
+  assert.deepEqual(view.calculations,[]);
   assert.equal(projectTossCashMonitor({...snapshot,ordersSubmitted:"0"},1090).acknowledged,null);
   assert.equal(projectTossCashMonitor({...snapshot,ledger:{...snapshot.ledger,unresolvedOrders:0}},1090).instruments[1].position,"0");
 });

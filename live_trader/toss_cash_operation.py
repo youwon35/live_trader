@@ -26,6 +26,7 @@ from trading_runtime.toss_securities import TossClient
 from trading_runtime.market_calendar import market_session_state, load_exchange_calendar
 from trading_runtime.market_data import parse_timestamp, timeframe_seconds
 from trading_runtime.provider_backfill_toss import _session
+from .signal_diagnostics import public_calculation_note
 from .toss_cash_ledger import TossCashLedger
 from .toss_cash_sources import resolve_sources, source_catalog, source_sizing
 from .toss_adapter import exact_owned_order
@@ -243,9 +244,12 @@ class TossCashOperation:
                 self.view.update(state='IDLE',reason='연결 정보를 변경하여 주문 없는 준비 검사가 필요합니다.')
             return writer()
 
-    def _note(self,kind,detail):
+    def _note(self,kind,detail,*,calculation=None):
         with self.lock:
-            self.view['activity']=([{'at':self.clock(),'kind':kind,'detail':detail}]+self.view.get('activity',[]))[:30]
+            event = {'at': self.clock(), 'kind': kind, 'detail': detail}
+            if calculation is not None:
+                event['calculation'] = calculation
+            self.view['activity']=([event]+self.view.get('activity',[]))[:30]
 
     def begin_prepare(self,config):
         with self.lock:
@@ -703,7 +707,7 @@ class TossCashOperation:
             if observed-epoch(bar.end_time)>90 and not (bar.timeframe=='1d' and next_session_window(spec.symbol,epoch(bar.start_time),observed)): continue
             decision=self.evaluator(spec,bar,tuple(history)); self.view['evaluations']+=1
             if decision.metadata.get('unsupported'): raise ValueError('TOSS_PLUGIN_UNSUPPORTED')
-            self._note('EVALUATION',spec.symbol+' '+decision.signal)
+            self._note('EVALUATION',spec.symbol+' '+decision.signal,calculation=public_calculation_note(decision))
             # A new HOLD/SELL/BUY supersedes the previous unsubmitted signal.
             self.pending_signals.pop(spec.strategy_instance_id,None)
             if decision.signal in {'BUY','SELL'}:

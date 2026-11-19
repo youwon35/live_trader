@@ -118,11 +118,19 @@ export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt
           <p>{[monitorRoute(decision.route), decision.timeframe, decision.pluginId].filter(Boolean).join(' · ')}</p></div>
       </li>)}</ol>}
       <details className="live-monitor-diagnostics live-monitor-activity-log">
-        <summary>시험 활동 로그 · 평가·주문·거절·체결</summary>
+        <summary>시험 활동 로그 · 계산·판단·주문·거절·체결</summary>
         {view.activity.length === 0 ? <p className="live-monitor-empty">아직 공개 활동 기록이 없습니다.</p> : <ol>{view.activity.map((event,index)=><li key={`${event.sequence}:${index}`}>
           <span className={`live-monitor-event-icon ${event.kind === 'ACTUAL_FILL_INCREMENT' ? 'is-fill' : ''}`}>{event.side === 'BUY' ? <ArrowDownLeft size={15}/> : event.side === 'SELL' ? <ArrowUpRight size={15}/> : <Activity size={14}/>}</span>
           <div><strong>{monitorEventLabel(event)}</strong><time dateTime={event.observedAt}>{date(event.observedAt)}</time>
             <p>{[event.symbol, event.route && monitorRoute(event.route), event.side === 'BUY' ? '매수' : event.side === 'SELL' ? '매도' : ''].filter(Boolean).join(' · ')}</p>
+            {event.calculations?.map((note, noteIndex) => <section className="live-monitor-calculation" key={noteIndex}>
+              <strong>{note.symbol} · {note.timeframe} · {signalLabel(note.signal)}</strong>
+              <small>완성봉 {date(note.barEnd)}{note.close !== null && " · 종가 " + quantity(note.close)}</small>
+              {note.reason && <p>{note.reason}</p>}
+              {note.metrics.length > 0 && <dl className="live-monitor-quote-observation">
+                {note.metrics.map(({label, value}) => <div key={label}><dt>{label}</dt><dd>{typeof value === 'number' ? quantity(value) : value}</dd></div>)}
+              </dl>}
+            </section>)}
             {event.incrementalQuantity !== null && event.incrementalQuantity !== undefined && <small>추가 체결 수량 {quantity(event.incrementalQuantity)}</small>}
             {event.kind === 'INTERNAL_ALLOCATION_TRANSFER' && <small>전략 간 배분 기록</small>}
           </div></li>)}</ol>}

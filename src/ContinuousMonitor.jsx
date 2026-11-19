@@ -23,6 +23,9 @@ function EventList({events, details=false}) {
         {details && <>
           {event.barAt && <small>평가에 쓴 봉 {at(event.barAt)} · 종가 {fmt(event.price)}</small>}
           {event.reason && <p>{event.reason}</p>}
+          {event.diagnostics?.length>0 && <dl className="tower-signal-values">
+            {event.diagnostics.map(({label,value})=><div key={label}><dt>{label}</dt><dd>{typeof value==='number'?fmt(value):value}</dd></div>)}
+          </dl>}
           {event.action && <small>처리 결과 {event.action}</small>}
           {event.outcome && event.outcome!==event.reason && <p>{event.outcome}</p>}
           {!event.reason && !event.action && !event.outcome && <small>별도 사유 기록 없음</small>}

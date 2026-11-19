@@ -119,7 +119,17 @@ export function projectRealtimeMonitor(snapshot, { fresh = false, pollError = ''
       observedAt: row.accountObservedAt, routeLabel: monitorRoute(row.broker) };
   });
   const activity = [...(run?.recentActivity || [])].filter(event => Object.hasOwn(monitorEventLabels, event.kind) && stamp(event.observedAt) !== null && stamp(event.observedAt) - now <= 5000)
-    .sort((a,b) => stamp(b.observedAt)-stamp(a.observedAt) || (b.sequence || 0)-(a.sequence || 0)).slice(0, 30);
+    .sort((a,b) => stamp(b.observedAt)-stamp(a.observedAt) || (b.sequence || 0)-(a.sequence || 0)).slice(0, 30)
+    .map(event => {
+      if (event.kind !== 'BAR_EVALUATED' || !Array.isArray(event.calculations) || !event.calculations.length) return event;
+      const observedAt = stamp(event.observedAt);
+      const calculations = validEndpoint(observedAt) && (ended === null || observedAt <= ended)
+        ? event.calculations.filter(note => {
+          const barEnd = stamp(note.barEnd);
+          return validEndpoint(barEnd) && barEnd <= observedAt;
+        }) : [];
+      return { ...event, calculations };
+    });
   const timing = failureTiming(run || {}, ended === null ? null : new Date(ended).toISOString(), now);
   return { timing, state, resultHasIssue, responseCurrent, receivedAt, ageMs, terminal, blockers, counts, progress, elapsedSeconds, terminalReported, terminatedAt: ended === null ? null : new Date(ended).toISOString(), feeds, feedsRecent,
     allAccountsCurrent: coversExpectedRoutes(routes.map(row => row.broker)) && routes.every(row => row.accountCurrent),

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { request } from "./api.js";
+import { signalDiagnostics } from "./signalDiagnostics.js";
 import "./TossCashOperationPanel.css";
 
 const base = "/api/toss/operation/";
@@ -63,8 +64,9 @@ export function projectTossCashMonitor(snapshot, observedAt = Date.now() / 1000)
     return { id: row.strategyInstanceId, symbol: row.symbol, timeframe: row.timeframe, session, position, plugin: row.pluginId };
   });
   const notes = Array.isArray(snapshot?.activity) ? snapshot.activity : [];
-  const current = ownsLedger && state === "RUNNING" && typeof startedAt === "number" && Number.isFinite(startedAt);
-  const activities = current ? notes.filter(row => typeof row?.at === "number" && row.at >= startedAt && row.at <= observedAt + 5)
+  const hasRunScope = ownsLedger && typeof startedAt === "number" && Number.isFinite(startedAt);
+  const current = hasRunScope && state === "RUNNING";
+  const activities = hasRunScope ? notes.filter(row => typeof row?.at === "number" && row.at >= startedAt && row.at <= observedAt + 5)
     .slice().sort((left, right) => right.at - left.at) : [];
   const newest = (kind, pattern) => {
     for (const row of activities) {
@@ -80,8 +82,17 @@ export function projectTossCashMonitor(snapshot, observedAt = Date.now() / 1000)
     acknowledged: current ? wholeCount(snapshot.ordersSubmitted) : null,
     filled: ownsLedger ? wholeCount(ledger.fillCount) : null,
     unresolved,
-    latestDecision: newest("EVALUATION", /^([A-Z0-9_.:/-]+) (BUY|SELL|HOLD)$/),
-    latestOrder: newest("ORDER", /^([A-Z0-9_.:/-]+) (BUY|SELL) [1-9]\d*(?:\.\d+)?$/),
+    latestDecision: current ? newest("EVALUATION", /^([A-Z0-9_.:/-]+) (BUY|SELL|HOLD)$/) : null,
+    latestOrder: current ? newest("ORDER", /^([A-Z0-9_.:/-]+) (BUY|SELL) [1-9]\d*(?:\.\d+)?$/) : null,
+    calculations: activities.flatMap(row => {
+      const entry = row.calculation;
+      if (row.kind !== "EVALUATION" || !entry || !Object.hasOwn(decisionLabels, entry.signal)
+          || row.detail !== `${entry.symbol} ${entry.signal}`
+          || !instruments.some(item => item.symbol === entry.symbol && item.timeframe === entry.timeframe)) return [];
+      return [{ at: row.at, symbol: entry.symbol, timeframe: entry.timeframe,
+        reason: typeof entry.reason === "string" ? entry.reason : "",
+        values: signalDiagnostics(entry.metadata) }];
+    }),
   };
 }
 
@@ -122,6 +133,19 @@ function TossCashMonitor({ snapshot, state, active, error, now }) {
       <p className="muted">최근 활동 기록입니다. 주문 접수 후 체결 수량은 대조 결과에 반영됩니다.</p>
       <ol>{activity.filter(row => typeof row?.detail === "string" && tossTime(row.at)).map((row, index) =>
         <li key={`${row.at}:${index}`}>{tossTime(row.at)} · {row.detail}</li>)}</ol>
+      {view.calculations.length > 0 && <ol className="tower-event-list tower-event-details" aria-label="전략 계산 기록">
+        {view.calculations.map((entry, index) => <li key={`${entry.at}:${index}`}>
+          <time>{tossTime(entry.at)}</time>
+          <div><strong>{entry.symbol} · {entry.timeframe}</strong>
+            {entry.reason && <p>{entry.reason}</p>}
+            {entry.values.length > 0 && <dl className="tower-signal-values">
+              {entry.values.map(({label,value}) => <div key={label}><dt>{label}</dt><dd>
+                {typeof value === "number" ? value.toLocaleString("ko-KR", { maximumFractionDigits: 8 }) : value}
+              </dd></div>)}
+            </dl>}
+          </div>
+        </li>)}
+      </ol>}
       {snapshot?.firstFailure && <p className="toss-cash-error">최초 오류 · {message(snapshot.firstFailure)}</p>}
     </details>
   </section>;

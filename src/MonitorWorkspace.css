@@ -77,6 +77,10 @@
 .tower-diagnostics summary span { margin-inline-start: 8px; font-size: 12px; font-weight: 400; color: var(--muted); }
 .tower-diagnostics .tower-event-list { padding-bottom: 10px; }
 .tower-issues { color: var(--moa-status-danger); overflow-wrap: anywhere; }
+.tower-signal-values { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,140px),1fr)); gap: 6px 13px; margin: 7px 0; }
+.tower-signal-values > div { min-width: 0; }
+.tower-signal-values dt { color: var(--muted); font-size: 12px; }
+.tower-signal-values dd { color: var(--text); margin: 2px 0 0; font-size: 13px; font-variant-numeric: tabular-nums; }
 @media (max-width: 1050px) {
   .tower-grid { grid-template-columns: minmax(0, 1fr); }
 }
