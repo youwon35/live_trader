@@ -436,7 +436,10 @@ class LiveContinuousController:
                 if standalone is None:
                     return {"ok": False, "reason": f"{normalized_profile}용 Portfolio/Strategy Artifact를 찾을 수 없습니다.", "snapshot": state.snapshot()}
                 source_path = str(standalone.get("source_path") or "")
-                specs = (self._standalone_spec(standalone),)
+                try:
+                    specs = (self._standalone_spec(standalone),)
+                except ValueError as exc:
+                    return {"ok": False, "reason": str(exc), "snapshot": state.snapshot()}
                 runtime_id = specs[0].portfolio_id
                 runtime_hash = specs[0].portfolio_hash
                 runtime_permissions = dict(standalone.get("permissions") or {})
@@ -1625,6 +1628,13 @@ class LiveContinuousController:
 
     @staticmethod
     def _standalone_spec(strategy: dict[str, Any]) -> RuntimeStrategySpec:
+        from trading_runtime.strategy_source_binding import closed_bar_strategy_blocker
+
+        plugin = str(strategy.get("plugin") or strategy.get("pluginId") or "").strip()
+        parameters = dict(strategy.get("parameters") or {})
+        blocker = closed_bar_strategy_blocker(plugin, parameters)
+        if blocker:
+            raise ValueError(blocker)
         symbol = str(strategy.get("symbol") or "").strip().upper()
         market_type = str(
             strategy.get("market_type")
@@ -1664,14 +1674,14 @@ class LiveContinuousController:
             strategy_instance_id=instance_id,
             strategy_id=strategy_id,
             artifact_hash=artifact_hash,
-            plugin_id=str(strategy.get("plugin") or strategy.get("pluginId") or "").strip(),
+            plugin_id=plugin,
             instrument_id=instrument_id,
             symbol=symbol,
             timeframe=str(strategy.get("timeframe") or "1d").strip().lower(),
             provider=provider,
             broker_id=broker_id,
             target_weight=max(0.0, float(strategy.get("parameters", {}).get("positionSize", 100.0))) / 100.0,
-            parameters=dict(strategy.get("parameters") or {}),
+            parameters=parameters,
             artifact={**strategy, "standalone": True},
         )
 

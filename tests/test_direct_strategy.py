@@ -91,6 +91,21 @@ class DirectStrategyTests(unittest.TestCase):
         self.assertEqual((self.root/'source.json').read_bytes(),original)
         self.assertTrue(service.assess(self.root,self.source,deployment,settings=SETTINGS)['ready'])
 
+    def test_same_bar_breakout_is_absent_from_live_catalog_and_rejects_old_standalone(self):
+        source, _ = fixture(self.root, plugin="breakout")
+        with self.assertRaisesRegex(ValueError, "같은 봉 진입·청산"):
+            service.source_eligibility(source)
+        self.assertEqual(self.catalog()["candidates"], [])
+
+        tree = ast.parse((STAGE / "live_trader/continuous_live.py").read_text(encoding="utf-8-sig"))
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LiveContinuousController")
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_standalone_spec")
+        method.decorator_list = []
+        namespace = {"Any": object, "RuntimeStrategySpec": object}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), "<actual standalone spec>", "exec"), namespace)
+        with self.assertRaisesRegex(ValueError, "같은 봉 진입·청산"):
+            namespace["_standalone_spec"](source)
+
     def test_source_mode_lifecycle_tamper_and_unimplemented_plugin_rejected(self):
         for options in ({'mode':'sample'},{'mode':'unknown'},{'stage':'retired'},{'plugin':'missing_plugin'}):
             with self.subTest(options=options):
