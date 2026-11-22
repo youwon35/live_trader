@@ -7,7 +7,7 @@ import ReconciliationChanges from "./ReconciliationChanges.jsx";
 import { submitReconciliationReview } from "./reconciliationReviewApi.js";
 import CoordinationRetirementNote from "./CoordinationRetirementNote.jsx";
 import StartupProgress, { useStartupProgress } from "./StartupProgress.jsx";
-import { startupAccountObservation } from "./startupProgressModel.js";
+import { startupAccountObservation, startupStrategyObservation } from "./startupProgressModel.js";
 import { createSnapshotResponseGate, createSnapshotReadCoordinator, initialAccountRefreshState, accountRefreshResultState, accountObservationView } from "./snapshotRefreshState.js";
 import { environmentStatus, ordinaryEntryStatus, ordinaryRuntimeActive, ordinaryRuntimeKnown, activeOrderCountLabel, brokerAccountObservation } from "./statusTruth.js";
 import { RunningSelection, PreflightChanges, NoOrderExplanation, StopEffects, ReconciliationEvidence, CapitalAllowance, DeploymentChanges, OrderInvestigation, OperatorNoteEditor } from "./OperatorInsights.jsx";
@@ -1991,7 +1991,9 @@ function App() {
         if (safetyEpoch !== snapshotSafetyEpochRef.current || !snapshotResponseGateRef.current.accept(responseToken, next)) return;
         setSnapshot({ ...next, api_connected: true });
         setConnectionError("");
-        startup.finish("connection", true, "프로그램 서버 응답을 받았습니다. 실제 주문을 시작하지 않습니다.");
+        startup.finish("connection", true, "프로그램 서버 응답을 확인했습니다.");
+        const strategyRead = startupStrategyObservation(next);
+        startup.finish("strategies", strategyRead.ok, strategyRead.detail, strategyRead);
         return next;
       } catch (err) {
         if (safetyEpoch !== snapshotSafetyEpochRef.current) return;
@@ -2022,7 +2024,7 @@ function App() {
         if (safetyEpoch !== snapshotSafetyEpochRef.current) return result;
         setAccountRefreshState((current) => accountRefreshResultState(current, result));
         const startupRead = startupAccountObservation(result);
-        startup.finish("accounts", startupRead.ok, startupRead.detail);
+        startup.finish("accounts", startupRead.ok, startupRead.detail, startupRead);
         if (result?.snapshot && snapshotResponseGateRef.current.accept(responseToken, result.snapshot)) {
           setSnapshot({ ...result.snapshot, api_connected: true });
           setConnectionError("");
@@ -2625,7 +2627,7 @@ function App() {
           </div>
         </header>
 
-        {selectedNav === "overview" && <StartupProgress view={startup} onRetryConnection={refresh} onRetryPreferences={() => setPreferencesAttempt(value => value + 1)} onRetryAccounts={refreshBrokerAccounts} />}
+        {selectedNav === "overview" && <StartupProgress view={startup} onRetryConnection={refresh} onRetryPreferences={() => setPreferencesAttempt(value => value + 1)} onRetryAccounts={refreshBrokerAccounts} onNavigate={navigateWorkspace} />}
         {["functional-test", "monitor"].includes(selectedNav) ? null : (
           <LiveEnvironmentBar
             context={deploymentContext}
