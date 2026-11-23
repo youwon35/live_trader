@@ -6782,30 +6782,35 @@ def portfolio_match_for_strategy(portfolio: dict[str, Any], strategy_id: str, sy
 def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> dict[str, Any]:
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
     selected_portfolio_id = str(metadata.get("portfolio_id") or metadata.get("portfolioId") or "").strip()
+    strategy = strategy_for_order_intent(checks, intent)
+    portfolios = checks.get("portfolios") if isinstance(checks.get("portfolios"), list) else []
     if selected_portfolio_id:
-        portfolios = checks.get("portfolios") if isinstance(checks.get("portfolios"), list) else []
-        selected_portfolio = next(
-            (
-                item
-                for item in portfolios
-                if isinstance(item, dict)
-                and str(item.get("id") or item.get("portfolio_id") or item.get("portfolioId") or "") == selected_portfolio_id
-            ),
-            None,
-        )
+        expected_hash = metadata.get("portfolio_artifact_hash") or metadata.get("portfolioArtifactHash") or metadata.get("portfolio_hash")
+        strategy_gate = strategy.get("portfolio_gate")
+        if not expected_hash and isinstance(strategy_gate, dict) and strategy_gate.get("portfolioId") == selected_portfolio_id:
+            expected_hash = strategy_gate.get("portfolioArtifactHash")
+        expected_hash = str(expected_hash or "").strip().lower()
+        candidates = [
+            item for item in portfolios
+            if isinstance(item, dict)
+            and str(item.get("id") or item.get("portfolio_id") or item.get("portfolioId") or "") == selected_portfolio_id
+            and (not expected_hash or verified_portfolio_artifact_reference(item).get("artifactHash") == expected_hash)
+        ]
+        ambiguous_readiness = len(candidates) > 1 and any(item.get("operational_readiness_bundle") for item in candidates)
+        selected_portfolio = candidates[0] if candidates and not ambiguous_readiness else None
         if selected_portfolio is None:
             return {
                 "active": True,
                 "allowed": False,
                 "portfolioId": selected_portfolio_id,
-                "detail": f"명시적으로 선택한 Portfolio artifact {selected_portfolio_id}를 찾을 수 없습니다.",
+                "detail": f"선택한 Portfolio artifact {selected_portfolio_id}의 정확한 버전을 확인할 수 없습니다.",
             }
         selected_match = portfolio_match_for_strategy(
             selected_portfolio,
             intent.strategy_id,
             intent.symbol,
             mode=intent.mode,
-            direct_strategy=strategy_for_order_intent(checks, intent),
+            direct_strategy=strategy,
         )
         if selected_match is None:
             return {
@@ -6817,7 +6822,6 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
         selected_gate = selected_match
     else:
         selected_gate = None
-    strategy = strategy_for_order_intent(checks, intent)
     if selected_gate is None and strategy:
         gate = strategy.get("portfolio_gate") if isinstance(strategy.get("portfolio_gate"), dict) else None
         if gate is not None:
@@ -6825,7 +6829,7 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
     if selected_gate is None:
         selected_gate = portfolio_gate_for_strategy(
             {"strategy_id": intent.strategy_id, "symbol": intent.symbol},
-            checks.get("portfolios") if isinstance(checks.get("portfolios"), list) else [],
+            portfolios,
             mode=intent.mode,
         )
     policy = selected_gate.get("rebalancePolicy") if isinstance(selected_gate.get("rebalancePolicy"), dict) else {}
@@ -6854,19 +6858,57 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
         selected_gate["rebalanceDecision"] = {"action": "HOLD", "reason": "rebalance-inputs-missing", "missing": missing}
         selected_gate["detail"] = "Portfolio policy 차단: 리밸런싱 경제성 입력 누락(" + ", ".join(missing) + ")"
         return selected_gate
+    current_weight = safe_float(metadata.get("current_weight"), float("nan"))
+    portfolio_equity = safe_float(metadata.get("portfolio_equity"), float("nan"))
+    expected_alpha_bps = safe_float(metadata.get("expected_alpha_bps"), float("nan"))
+    expected_cost_bps = safe_float(metadata.get("expected_cost_bps"), float("nan"))
+    target_weight = safe_float(selected_gate.get("targetWeight"), 0.0)
+    priority_reduction = metadata.get("risk_limit_breached") is True
+    if (
+        not math.isfinite(current_weight) or not math.isfinite(portfolio_equity)
+        or portfolio_equity <= 0 or not math.isfinite(expected_alpha_bps)
+        or not math.isfinite(expected_cost_bps) or expected_cost_bps < 0
+    ):
+        selected_gate["allowed"] = False
+        selected_gate["rebalanceDecision"] = {"action": "HOLD", "reason": "rebalance-exposure-invalid"}
+        selected_gate["detail"] = "Portfolio policy 차단: 보유 비중, 평가액 또는 비용 입력이 유효하지 않습니다."
+        return selected_gate
+    if metadata.get("order_purpose") in {"SIGNAL", "PORTFOLIO_NET"}:
+        # This is a concrete signal or netted order. The configured allocation
+        # is still the capital cap, but it is not the order's post-trade weight.
+        held = safe_float(metadata.get("observed_position_quantity"), float("nan"))
+        signed_quantity = intent.quantity if intent.side == "BUY" else -intent.quantity
+        remaining = held + signed_quantity
+        if (
+            not math.isfinite(remaining) or intent.quantity <= 0
+            or not math.isfinite(intent.reference_price) or intent.reference_price <= 0
+            or not math.isclose(current_weight, held * intent.reference_price / portfolio_equity, abs_tol=1e-12)
+            or (abs(held) > 1e-12 and held * remaining < 0 and abs(remaining) > 1e-12)
+        ):
+            selected_gate["allowed"] = False
+            selected_gate["rebalanceDecision"] = {"action": "HOLD", "reason": "observed-order-exposure-invalid"}
+            selected_gate["detail"] = "Portfolio policy 차단: 관측 보유량을 확인할 수 없거나 주문량이 보유 방향을 뒤집습니다."
+            return selected_gate
+        target_weight = 0.0 if abs(remaining) <= 1e-12 else remaining * intent.reference_price / portfolio_equity
+        limit_pct = safe_float(selected_gate.get("maxSymbolWeightPct"), 0.0)
+        priority_reduction = priority_reduction or target_weight == 0.0 or (
+            limit_pct > 0 and abs(current_weight) * 100 > limit_pct
+        )
     decision = rebalance_decision(
-        current_weight=safe_float(metadata.get("current_weight"), 0.0),
-        target_weight=safe_float(selected_gate.get("targetWeight"), 0.0),
-        portfolio_equity=safe_float(metadata.get("portfolio_equity"), 0.0),
-        expected_alpha_bps=safe_float(metadata.get("expected_alpha_bps"), 0.0),
-        expected_cost_bps=safe_float(metadata.get("expected_cost_bps"), 0.0),
+        current_weight=current_weight,
+        target_weight=target_weight,
+        portfolio_equity=portfolio_equity,
+        expected_alpha_bps=expected_alpha_bps,
+        expected_cost_bps=expected_cost_bps,
         deadband_weight=safe_float(policy.get("deadbandWeight"), 0.0025),
         minimum_notional=safe_float(policy.get("minimumNotional"), 0.0),
-        risk_limit_breached=metadata.get("risk_limit_breached") is True,
+        risk_limit_breached=priority_reduction,
     )
     selected_gate["rebalanceDecision"] = {
         "action": decision.action,
         "reason": decision.reason,
+        "currentWeight": decision.current_weight,
+        "targetWeight": decision.target_weight,
         "tradeWeight": decision.trade_weight,
         "expectedNotional": decision.expected_notional,
         "priority": decision.priority,
@@ -6875,7 +6917,7 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
         selected_gate["allowed"] = False
         selected_gate["detail"] = f"Portfolio policy 차단: {decision.reason}"
         return selected_gate
-    risk_reducing = abs(safe_float(selected_gate.get("targetWeight"), 0.0)) < abs(safe_float(metadata.get("current_weight"), 0.0))
+    risk_reducing = abs(decision.target_weight) < abs(decision.current_weight)
     advanced_blockers: list[str] = []
     capacity = selected_gate.get("capacity") if isinstance(selected_gate.get("capacity"), dict) else {}
     maximum_order_notional = safe_float(capacity.get("maximumOrderNotional"), 0.0)
@@ -6888,9 +6930,17 @@ def portfolio_gate_for_intent(checks: dict[str, Any], intent: OrderIntent) -> di
     if safe_float(selected_gate.get("capitalMultiplier"), 1.0) <= 0 and not risk_reducing:
         advanced_blockers.append("automatic-de-risk-freeze")
     operational_bundle = selected_gate.get("operationalReadinessBundle") if isinstance(selected_gate.get("operationalReadinessBundle"), dict) else {}
-    runtime_readiness = checks.get("operational_readiness") if isinstance(checks.get("operational_readiness"), dict) else {}
-    if operational_bundle and runtime_readiness.get("liveEligible") is not True and not risk_reducing:
-        advanced_blockers.append(f"operational-readiness={runtime_readiness.get('score', 0)}/{runtime_readiness.get('threshold', 85)}")
+    if operational_bundle and not risk_reducing:
+        reference = selected_gate.get("portfolioArtifactReference")
+        matching_portfolios = [
+            item for item in portfolios
+            if reference and isinstance(item, dict)
+            and verified_portfolio_artifact_reference(item) == reference
+            and item.get("operational_readiness_bundle") == operational_bundle
+        ]
+        runtime_readiness = runtime_operational_readiness([strategy], matching_portfolios)
+        if runtime_readiness.get("liveEligible") is not True:
+            advanced_blockers.append(f"operational-readiness={runtime_readiness.get('score', 0)}/{runtime_readiness.get('threshold', 85)}")
     if advanced_blockers:
         selected_gate["allowed"] = False
         selected_gate["advancedOperationBlockers"] = list(dict.fromkeys(advanced_blockers))
@@ -6902,14 +6952,16 @@ def policy_replay_for_intent(checks: dict[str, Any], intent: OrderIntent, altern
     alternative = alternative or {}
     original_gate = portfolio_gate_for_intent(checks, intent)
     metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+    exposure = original_gate.get("rebalanceDecision") or {}
     event = ReplayEvent(
         event_id=str(metadata.get("event_id") or f"{intent.strategy_id}:{intent.symbol}:{intent.side}"),
         occurred_at=str(metadata.get("occurred_at") or datetime.now(timezone.utc).isoformat()),
         original_policy_version=str(original_gate.get("portfolioPolicyHash") or "legacy"),
         original_decision="TRADE" if original_gate.get("allowed") is True else "HOLD",
         inputs={
-            "currentWeight": metadata.get("current_weight"),
-            "targetWeight": original_gate.get("targetWeight"),
+            "currentWeight": exposure.get("currentWeight", metadata.get("current_weight")),
+            "targetWeight": exposure.get("targetWeight", original_gate.get("targetWeight")),
+            "riskReductionPriority": exposure.get("reason") == "risk-reducing-order-priority",
             "portfolioEquity": metadata.get("portfolio_equity"),
             "expectedAlphaBps": metadata.get("expected_alpha_bps"),
             "expectedCostBps": metadata.get("expected_cost_bps"),
@@ -6927,6 +6979,7 @@ def policy_replay_for_intent(checks: dict[str, Any], intent: OrderIntent, altern
             expected_cost_bps=safe_float(inputs.get("expectedCostBps"), 0.0) + safe_float(alternative.get("costBufferBps"), 0.0),
             deadband_weight=safe_float(alternative.get("deadbandWeight"), 0.0025),
             minimum_notional=safe_float(alternative.get("minimumNotional"), 0.0),
+            risk_limit_breached=inputs.get("riskReductionPriority") is True,
         )
         return {"decision": "TRADE" if decision.action == "TRADE" else "HOLD", "reasons": [decision.reason]}
 
@@ -6936,7 +6989,13 @@ def policy_replay_for_intent(checks: dict[str, Any], intent: OrderIntent, altern
 def apply_portfolio_gate_to_context(context: PreTradeContext, gate: dict[str, Any], intent: OrderIntent) -> PreTradeContext:
     if not gate.get("active") or gate.get("allowed") is not True:
         return context
-    base_equity = max(float(context.portfolio_equity or 0.0), context.strategy_capital_limit, intent.notional, 1.0)
+    base_equity = safe_float(context.portfolio_equity, 0.0)
+    if context.dry_run:
+        # Keep the synthetic capital estimate for dry-run evaluation.
+        base_equity = max(base_equity if math.isfinite(base_equity) else 0.0, context.strategy_capital_limit, intent.notional, 1.0)
+    elif not math.isfinite(base_equity) or base_equity <= 0:
+        # Without observed equity, the shared gate must reject increased exposure.
+        return replace(context, portfolio_equity=None, strategy_capital_limit=0.0)
     target_weight = safe_float(gate.get("targetWeight"), 0.0)
     strategy_ratio = safe_float(gate.get("strategyCapitalRatio"), target_weight)
     max_symbol_weight_pct = safe_float(gate.get("maxSymbolWeightPct"), context.max_symbol_weight_pct)
@@ -16030,8 +16089,15 @@ def merge_broker_reconciliation_cache(
     cache["position_observations"] = positions_observed
     cache["account_observations"] = account_observed
     cache["fetched_at"] = observed_at  # Aggregate refresh time is never an account-specific success.
-    if accounts:
-        refresh_account_risk_budget([row for row in cache["accounts"] if isinstance(row, dict)])
+    # Risk persistence stamps the rows it receives. Cached accounts from other
+    # brokers must keep their previous timestamp and daily equity baseline.
+    freshly_read_brokers = account_success - failed
+    fresh_accounts = [
+        row for row in accounts
+        if isinstance(row, dict) and str(row.get("broker_id") or "") in freshly_read_brokers
+    ]
+    if fresh_accounts:
+        refresh_account_risk_budget(fresh_accounts)
 
 
 def should_append_execution_sync_audit(
@@ -28922,23 +28988,38 @@ def run_shadow_live(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def runtime_operational_readiness(strategies: list[dict[str, Any]], portfolios: list[dict[str, Any]]) -> dict[str, Any]:
-    bundles = [item.get("operational_readiness_bundle") for item in portfolios if isinstance(item.get("operational_readiness_bundle"), dict) and item.get("operational_readiness_bundle")]
-    if not bundles:
+    scoped = [
+        item for item in portfolios
+        if isinstance(item, dict) and isinstance(item.get("operational_readiness_bundle"), dict)
+        and item["operational_readiness_bundle"]
+    ]
+    if not scoped:
         return {"schemaVersion": "operational-readiness-v1", "score": 0, "status": "NOT_REQUIRED", "liveEligible": False, "components": []}
-    base = bundles[0]
+    if len(scoped) != 1:
+        return {"schemaVersion": "operational-readiness-v1", "score": 0, "status": "SELECTION_REQUIRED", "liveEligible": False, "components": []}
+    portfolio = scoped[0]
+    base = portfolio["operational_readiness_bundle"]
+    reference = verified_portfolio_artifact_reference(portfolio)
     source = base.get("operationalReadiness") if isinstance(base.get("operationalReadiness"), dict) else {}
     components = source.get("components") if isinstance(source.get("components"), list) else []
-    paper_ready = any((item.get("paper_portfolio_evidence_gate") or {}).get("ready") is True for item in strategies)
-    execution_component = next((item for item in components if isinstance(item, dict) and item.get("id") == "executionQuality"), {})
-    execution_ok = bool(execution_component.get("passed") or safe_float(execution_component.get("awarded"), 0) > 0 or STATE.get("shadow_evidence"))
-    capacity_ok = all(
-        not (item.get("advanced_operations") or {}).get("capacity")
-        or all(entry.get("allowed") is True for entry in (item.get("advanced_operations") or {}).get("capacity", []) if isinstance(entry, dict))
-        for item in portfolios
+    qualifications = [item.get("paper_live_qualification") for item in strategies]
+    paper_ready = bool(reference) and any(
+        isinstance(qualification, dict) and qualification.get("ready") is True
+        and qualification.get("portfolioArtifactId") == reference["artifactId"]
+        and qualification.get("portfolioArtifactHash") == reference["artifactHash"]
+        for qualification in qualifications
     )
+    execution_component = next((item for item in components if isinstance(item, dict) and item.get("id") == "executionQuality"), {})
+    execution_ok = (
+        execution_component.get("passed") is True
+        and execution_component.get("awarded", 15) == 15
+        and execution_component.get("ratio", 1) == 1
+    )
+    capacity = (portfolio.get("advanced_operations") or {}).get("capacity") or []
+    capacity_ok = all(entry.get("allowed") is True for entry in capacity if isinstance(entry, dict))
     return operational_readiness({
         "dataIntegrity": next((component.get("passed") for component in components if isinstance(component, dict) and component.get("id") == "dataIntegrity"), False),
-        "artifactReproducibility": bool(base.get("contentHash")), "paperObservation": paper_ready,
+        "artifactReproducibility": bool(reference and base.get("contentHash")), "paperObservation": paper_ready,
         "executionQuality": execution_ok, "capacityHeadroom": capacity_ok,
         "recoveryVerified": STATE.get("recovery_status", {}).get("verified") is True and STATE.get("recovery_status", {}).get("safeMode") is False,
         "policyReplayPassed": bool(STATE.get("policy_replays")),

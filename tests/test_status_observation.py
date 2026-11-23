@@ -178,11 +178,13 @@ class StatusObservationTests(unittest.TestCase):
                 successful_account_brokers={"binance"}, successful_position_brokers=set())
         self.assertEqual(self.old, state.STATE["broker_reconciliation"]["position_observations"]["binance"]["observedAt"])
 
-    def test_other_broker_merge_never_advances_selected_account_observation(self):
+    def test_other_broker_merge_never_advances_selected_account_observation_or_risk(self):
         original = deepcopy(state.STATE["broker_reconciliation"]["account_observations"]["binance"])
-        with patch.object(state, "refresh_account_risk_budget"):
-            state.merge_broker_reconciliation_cache([{"broker_id": "upbit"}], [], {"upbit"}, [])
+        upbit_account = {"broker_id": "upbit", "currency": "KRW", "broker_cash": 50000}
+        with patch.object(state, "refresh_account_risk_budget") as risk_update:
+            state.merge_broker_reconciliation_cache([upbit_account], [], {"upbit"}, [])
         self.assertEqual(original, state.STATE["broker_reconciliation"]["account_observations"]["binance"])
+        risk_update.assert_called_once_with([upbit_account])
 
     def test_observation_route_never_guesses_from_symbol_asset_or_market_type(self):
         for row in ({"asset": "CRYPTO", "symbol": "BTCUSDT"}, {"symbol": "KRW-BTC"},

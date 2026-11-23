@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, localcontext, ROUND_DOWN
 from pathlib import Path
 from contextlib import contextmanager
+from dataclasses import replace
+import math
 import os
 import sqlite3
 import threading
@@ -2198,12 +2200,6 @@ class LiveContinuousController:
                     "instrument_id": spec.instrument_id,
                     "target_revision": max(1, int(datetime.fromisoformat(decision.bar.end_time.replace("Z", "+00:00")).timestamp())),
                     "order_purpose": "SIGNAL",
-                    "current_weight": (
-                        (-spec.target_weight if current_position_quantity < 0 else spec.target_weight)
-                        if abs(current_position_quantity) > 1e-12
-                        else 0.0
-                    ),
-                    "portfolio_equity": float(native_quantity["modelResult"]["deploymentEquity"]) if native_quantity is not None else max(1.0, float(state.STATE["risk_settings"]["strategy_capital_limit_krw"])),
                     "expected_alpha_bps": self._numeric_parameter(spec, "expectedAlphaBps", 0.0),
                     "expected_cost_bps": self._numeric_parameter(spec, "expectedCostBps", 5.0),
                     "position_direction": position_direction,
@@ -2249,11 +2245,45 @@ class LiveContinuousController:
                     **({"native_open_boundary": self._native_boundary_receipt, "source_artifact_hash": spec.artifact_hash} if self._native_boundary_receipt is not None else {}),
                 },
             )
+            intent = self._with_observed_position(
+                intent,
+                current_position_quantity,
+                native_equity=(
+                    native_quantity["modelResult"]["deploymentEquity"]
+                    if native_quantity is not None else None
+                ),
+            )
             result = self._submit_cycle_intent(
                 intent, audit_event="Continuous Runtime",
             )
             results.append({"strategyId": decision.strategy_id, "signal": decision.signal, "action": result.get("reason"), "ok": result.get("ok"), "commandId": result.get("commandId")})
         return {"mode": self.mode, "profileId": self.profile_id, "results": results}
+
+    @staticmethod
+    def _with_observed_position(
+        intent: OrderIntent, held_quantity: float | Decimal, *, native_equity: Any = None,
+    ) -> OrderIntent:
+        from . import state
+
+        metadata = dict(intent.metadata)
+        if native_equity is None:
+            if intent.asset == "us-stock" and metadata.get("broker_id") == "kis" and not metadata.get("quote_currency"):
+                metadata["quote_currency"] = "USD"
+            account = state.account_risk_for_intent(replace(intent, metadata=metadata))
+            if account.get("known") is True and account.get("fresh") is True:
+                native_equity = account.get("current_equity")
+            elif state.STATE["dry_run"]:
+                # A dry run can model unobserved equity; the live gate never does.
+                native_equity = state.STATE["risk_settings"]["strategy_capital_limit_krw"]
+        equity = state.safe_float(native_equity, float("nan"))
+        held = float(held_quantity)
+        weight = held * intent.reference_price / equity if math.isfinite(equity) and equity > 0 else float("nan")
+        metadata.update(
+            current_weight=weight if math.isfinite(weight) else None,
+            portfolio_equity=equity if math.isfinite(equity) and equity > 0 else None,
+            observed_position_quantity=held if math.isfinite(held) else None,
+        )
+        return replace(intent, metadata=metadata)
 
     def _portfolio_functional_metadata(self, spec: Any) -> dict[str, Any]:
         from . import state
@@ -2355,7 +2385,7 @@ class LiveContinuousController:
         sleeve_targets = {
             item.sleeve_id: float(item.target_quantity) for item in plan.deltas
         }
-        return OrderIntent(
+        intent = OrderIntent(
             strategy_id=str(decision.strategy_id),
             asset=state.asset_from_symbol(spec.symbol, broker_id=spec.broker_id, provider=spec.provider),
             symbol=spec.symbol,
@@ -2384,17 +2414,6 @@ class LiveContinuousController:
                 "instrument_id": spec.instrument_id,
                 "target_revision": target_revision,
                 "order_purpose": "PORTFOLIO_NET",
-                "current_weight": (
-                    spec.target_weight if current_quantity > 0 else 0.0
-                ),
-                "portfolio_equity": max(
-                    1.0,
-                    float(
-                        state.STATE["risk_settings"][
-                            "strategy_capital_limit_krw"
-                        ]
-                    ),
-                ),
                 "expected_alpha_bps": self._numeric_parameter(
                     spec, "expectedAlphaBps", 0.0
                 ),
@@ -2428,6 +2447,7 @@ class LiveContinuousController:
                 "portfolio_execution": plan.metadata(),
             },
         )
+        return self._with_observed_position(intent, current_quantity)
 
     @staticmethod
     def _portfolio_result(

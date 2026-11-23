@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 import copy
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -136,6 +137,51 @@ class LiveRiskStateIntegrationTest(unittest.TestCase):
     def tearDown(self) -> None:
         state.STATE.clear()
         state.STATE.update(self.original_state)
+
+    def test_live_portfolio_weight_uses_observed_equity(self) -> None:
+        intent = OrderIntent("sleeve", "kr-stock", "005930", "BUY", 1, 100, "SMALL_LIVE", "test")
+        gate = {
+            "active": True,
+            "allowed": True,
+            "targetWeight": 0.1,
+            "maxSymbolWeightPct": 10,
+        }
+        context = state.PreTradeContext(
+            mode="SMALL_LIVE",
+            dry_run=False,
+            portfolio_equity=1000,
+            symbol_exposure=50,
+            strategy_exposure=50,
+            strategy_capital_limit=5000,
+            available_cash=800,
+            real_orders_enabled=True,
+            live_order_adapter_verified=True,
+        )
+
+        selected = state.apply_portfolio_gate_to_context(context, gate, intent)
+        self.assertEqual(1000, selected.portfolio_equity)
+        self.assertEqual(100, selected.strategy_capital_limit)
+        checks = {check.label: check.status for check in state.PreTradeRiskGate().evaluate(intent, selected).checks}
+        self.assertEqual("fail", checks["종목별 최대 비중"])
+        self.assertEqual("fail", checks["전략별 자본 한도"])
+
+        for equity in (None, 0, float("nan"), float("inf")):
+            with self.subTest(equity=equity):
+                unknown = state.apply_portfolio_gate_to_context(replace(context, portfolio_equity=equity), gate, intent)
+                checks = {check.label: check.status for check in state.PreTradeRiskGate().evaluate(intent, unknown).checks}
+                self.assertIsNone(unknown.portfolio_equity)
+                self.assertEqual(0, unknown.strategy_capital_limit)
+                self.assertEqual("fail", checks["전략별 자본 한도"])
+
+        sell = replace(intent, side="SELL")
+        held = replace(context, portfolio_equity=None, position_quantity=1)
+        exit_context = state.apply_portfolio_gate_to_context(held, gate, sell)
+        checks = {check.label: check.status for check in state.PreTradeRiskGate().evaluate(sell, exit_context).checks}
+        self.assertEqual("pass", checks["전략별 자본 한도"])
+
+        draft = state.apply_portfolio_gate_to_context(replace(context, dry_run=True, portfolio_equity=None), gate, intent)
+        self.assertEqual(5000, draft.portfolio_equity)
+        self.assertEqual(500, draft.strategy_capital_limit)
 
     def test_risk_settings_are_persisted_and_reloaded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
