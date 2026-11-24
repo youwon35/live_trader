@@ -9,6 +9,7 @@ import {
   shortLiveFilterCandidates, shortLiveIsBoundedCandidate, shortLivePreparationWindow, shortLivePreviousSelection,
   normalizeShortLiveFuturesPolicy, shortLiveProtectionLabel, shortLiveFuturesIncidentLabel,
 } from "./shortLiveTestModel.js";
+import { FeatureHelp } from "./FeatureHelp.jsx";
 import "./ShortLiveTestPanel.css";
 import RealtimeMonitor from "./RealtimeMonitor.jsx";
 import ContinuousMonitor from "./ContinuousMonitor.jsx";
@@ -27,6 +28,12 @@ const MONITOR_TABS = Object.freeze([
   { id: "trial", label: "주문 연결 시험" },
   { id: "toss", label: "토스 현금 운용" },
 ]);
+
+const MONITOR_HELP = {
+  ordinary: { title: "실행 중인 전략과 거래소", description: "실거래 운용의 시세 수신, 전략 평가, 실제 주문과 체결을 거래소별로 확인합니다. 신호의 계산과 차단 이유는 상세 판단 로그에서 찾을 수 있습니다." },
+  trial: { title: "주문 연결 시험", description: "별도로 시작한 주문 연결 시험의 수신 상태, 전략 평가와 주문 기록을 확인합니다. 설정, 시작과 중지는 시험 설정 화면에서 합니다." },
+  toss: { title: "토스 현금 운용", description: "토스증권 현금 운용 경로의 연결 상태, 종목별 진행과 실제 주문·대조 기록을 확인합니다." },
+};
 
 const defaultApi = { snapshot: getShortLiveTestSnapshot, catalog: getShortLiveTestCatalog, prepare: prepareShortLiveTest, start: startShortLiveTest, stop: stopShortLiveTest };
 const money = (value) => value === null || value === undefined ? "미확인" : `${new Intl.NumberFormat("ko-KR").format(value)}원`;
@@ -316,7 +323,10 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const monitorView = projectRealtimeMonitor(snapshot, {fresh, pollError, receivedAt, now:Date.now(), staleMs:Math.max(20000,pollMs*3)});
   const monitorTab = selectedMonitorTab || (shortLiveRunning(snapshot) && !ordinaryRuntimeActive(operationalSnapshot) ? "trial" : "ordinary");
   if (viewMode === "monitor") return <div className="short-live-workspace" aria-label="실시간 감시 작업공간">
-    <MonitorTabs ariaLabel="실시간 감시 종류" className="monitor-view-tabs" value={monitorTab} options={MONITOR_TABS} onChange={setMonitorTab} panelIdPrefix={monitorPanelId} variant="compact" />
+    <div className="monitor-help-tabs">
+      <MonitorTabs ariaLabel="실시간 감시 종류" className="monitor-view-tabs" value={monitorTab} options={MONITOR_TABS} onChange={setMonitorTab} panelIdPrefix={monitorPanelId} variant="compact" />
+      <FeatureHelp key={monitorTab} {...MONITOR_HELP[monitorTab]} />
+    </div>
     <section role="tabpanel" id={monitorPanelId + "-ordinary"} aria-labelledby={monitorPanelId + "-tab-ordinary"} hidden={monitorTab !== "ordinary"} tabIndex={0}>
       <ContinuousMonitor snapshot={operationalSnapshot} onOpenExecution={onOpenExecution} visible={activeView && monitorTab === "ordinary"}/>
     </section>
@@ -338,8 +348,6 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     <section className="panel short-live-intro">
       <div className="short-live-heading"><div><p className="short-live-eyebrow">5~7시간 · 실제 주문 경로 확인</p><h2>짧은 실거래 기능시험</h2></div>
         <button type="button" className="secondary-button" onClick={refresh} disabled={Boolean(busy)}><RefreshCw size={16} /> 실행 상태 새로 확인</button></div>
-      <p>Live Trader와 GPT Trader가 같은 거래소·시장·종목의 주문 권한과 사용 예정 자금을 함께 확인합니다.</p>
-      <p>단일·복수 전략을 인스턴스와 포트폴리오로 연결하고 실제 신호 → 주문 → 체결 → 정상 종료를 확인합니다. 수익성이나 30일 검증을 통과했다는 의미는 아닙니다.</p>
       <div className="short-live-notice"><ShieldAlert size={19} /><span>준비 버튼은 주문을 보내지 않습니다. 실제 API 주문은 준비 결과를 확인하고 아래 시작 버튼을 직접 누른 뒤에만 요청합니다.</span></div>
       {snapshot.fixture && <p className="short-live-fixture" role="note">오프라인 화면 검사 · 표시 자료는 fixture이며 실계좌 조회·실주문 결과가 아닙니다.</p>}
       <p className="short-live-meta">상태 {snapshot.status} · 관측 {date(snapshot.observedAt)} · {fresh ? "최근 조회 성공" : "현재 상태 미확인 · 시작 차단"}</p>
@@ -369,8 +377,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
         <label>유형<select aria-label="짧은 시험 전략 유형" value={kindFilter} onChange={(event) => setKindFilter(event.target.value)}><option value="ALL">모든 유형</option><option value="instance">인스턴스</option><option value="portfolio">포트폴리오</option></select></label>
         <label>후보 구분<select aria-label="짧은 시험 후보 구분" value={profileFilter} onChange={(event) => setProfileFilter(event.target.value)}><option value="ALL">모든 후보</option><option value="BOUNDED">소액 배정금 100% 기능시험</option><option value="ORIGINAL">기존 원본·그 외 비중</option></select></label>
       </div>
-      {(timeframeFilter === "1h" || selectedCandidates.some((row) => row.timeframes.includes("1h"))) && <div className="short-live-hourly-guide"><strong>1시간봉은 완성된 봉으로 평가합니다</strong><p>시작 직후 주문이 나오지 않아도 정상일 수 있습니다. 공급자·시작 시점에 따라 과거 봉 연결과 첫 완성봉 수신을 기다린 뒤, 원래 전략 조건이 충족될 때 주문합니다.</p><p>Upbit은 시작 시 이미 진행 중인 일부 봉을 이력 보강에 사용합니다. 연결 뒤 온전히 관측한 봉부터 평가하므로, 첫 평가까지 시작 시점에 따라 약 1~2시간 걸릴 수 있습니다.</p><p className="short-live-meta">5~7시간 시험은 여러 번의 봉 평가를 관찰하기 위한 시간입니다. 주문·체결 횟수를 보장하거나, 신호가 없다는 이유로 통과 처리하지 않습니다.</p></div>}
-      <p>여러 대상을 선택하면 복수 전략 시험입니다. 포트폴리오의 종목 수와 서로 다른 전략 플러그인 수는 구분합니다.</p>
+      {(timeframeFilter === "1h" || selectedCandidates.some((row) => row.timeframes.includes("1h"))) && <div className="short-live-hourly-guide"><strong>1시간봉은 첫 완성봉을 받은 뒤 평가합니다</strong></div>}
       <p>신규 기능시험 후보는 배정된 소액 시험 자금의 100%를 사용합니다. 원래 5% 후보는 5% 그대로 적용합니다. 복수 전략은 배정 자금을 나누며 거래소별 총 10만원 한도는 유지합니다.</p>
       <p className="short-live-catalog-count">{catalogReady ? `현재 목록 ${visibleCandidates.length}개 / 전체 ${snapshot.catalog.length}개` : "전략 목록 미확인"} · 선택 {selection.length}개{hiddenSelectionCount > 0 ? ` · 필터 밖 선택 ${hiddenSelectionCount}개` : ""}</p>
       <div className="short-live-catalog" aria-label="짧은 시험 후보 목록">

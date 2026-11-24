@@ -1,5 +1,6 @@
 import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel, diagnosticSafetyContext, preflightCheckPresentation, ordinarySafetyPresentation } from "./diagnosticPresentation.js";
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
+import { FeatureHelp } from "./FeatureHelp.jsx";
 import ExternalResearchPanel, { TossConnectionCheck } from "./ExternalResearchPanel.jsx";
 import { StockSessionGuide } from "./components/StockSessionGuide.jsx";
 import TossCashOperationPanel from "./TossCashOperationPanel.jsx";
@@ -219,12 +220,19 @@ const pageProfiles = {
     title: "운용 전략",
     eyebrow: "DEPLOYMENT VALIDATION",
     summary: "Backtester에서 저장한 전략과 운용 근거를 확인합니다. 실거래는 선택한 계좌의 준비 검사와 시작 승인을 거쳐 실행합니다.",
+    details: ["주식/ETF 탭에서 국내·해외 주식 전략을, 코인 탭에서 거래소별 코인 전략을 찾을 수 있습니다. 전략을 선택하면 거래 경로와 준비 근거를 확인할 수 있습니다."],
   },
   monitor: { title: "실시간 감시", eyebrow: "LIVE MONITOR", summary: "거래소별 수신 상태, 전략 평가, 실제 주문과 체결을 한 화면에서 확인합니다." },
   "functional-test": {
     title: "주문 연결 시험",
     eyebrow: "CONTROLLED LIVE TEST",
     summary: "증권사·거래소의 실제 주문 연결을 별도로 시험합니다. 최초 연결이나 주문 경로 변경 때 사용하며, 실제 자금과 별도 시작 승인이 필요합니다.",
+    details: [
+      "Live Trader와 GPT Trader는 같은 거래소·시장·종목의 주문 권한과 사용 예정 자금을 함께 확인합니다.",
+      "선택한 인스턴스와 포트폴리오의 실제 신호, 주문, 체결과 종료를 관찰합니다. 여러 대상을 선택하면 복수 전략 시험이며 포트폴리오의 종목 수와 서로 다른 전략 수는 별개입니다.",
+      "1시간봉은 완성된 봉만 평가합니다. Upbit에서는 시작 시 이미 진행 중인 일부 봉을 이력 보강에 사용하므로, 온전히 관측한 첫 봉의 평가까지 시작 시점에 따라 약 1~2시간 걸릴 수 있습니다.",
+      "5~7시간 시험에서는 여러 번의 봉 평가를 관찰합니다. 전략 조건이 충족되어야 주문이 나오며, 수익성이나 장기 운용 검증은 별도로 확인합니다.",
+    ],
   },
   accounts: {
     title: "계좌·잔고",
@@ -245,6 +253,7 @@ const pageProfiles = {
     title: "실거래 운용",
     eyebrow: "RUNTIME SESSION",
     summary: "승인된 범위에서 제한 실거래 또는 실전 운용을 실행·중지합니다. 한도·안전장치에서 주문 차단과 위험 한도를 확인하세요.",
+    details: ["주식/ETF 또는 코인 탭에서 연결할 계좌와 운용 방식을 확인합니다. 선택한 전략과 계좌의 자산군이 맞아야 실행할 수 있습니다."],
   },
   incidents: {
     title: "실행 기록",
@@ -260,6 +269,11 @@ const pageProfiles = {
     title: "연결·설정",
     eyebrow: "BROKER & RUNTIME",
     summary: "화면 설정, 증권사·거래소 연결, Telegram 알림과 프로그램 자체 검사를 관리합니다.",
+    details: [
+      "브로커 실계좌 연결에서 주식/ETF 또는 거래소 탭을 열어 항목을 확인합니다. 토스증권 연결 검사는 별도 카드에서 할 수 있습니다.",
+      "KIS 국내 주문 연결 시험에 쓰는 수수료와 세율은 계좌 요율 안내·상담·조회 등에서 확인한 근거가 필요합니다. 같은 요율이 적용되는 종목만 지정합니다. 비율 0.00015는 0.015%입니다.",
+      "TradingView는 보조 분석과 차트 확인에 사용합니다.",
+    ],
   },
 };
 
@@ -2493,6 +2507,7 @@ function App() {
 
   const selectedNavRoot = liveNavigationRoot(selectedNav);
   const title = navItems.find((item) => item.id === selectedNavRoot)?.label ?? "시작 점검";
+  const pageHelp = pageProfiles[selectedNav] ?? pageProfiles.overview;
   const selectedStrategy = deploymentOptions.find((option) => option.id === selectedDeploymentId)?.strategy
     || deploymentOptions[0]?.strategy
     || null;
@@ -2563,6 +2578,7 @@ function App() {
             <div className="topbar-title-block">
               <h1 id="live-page-title">{title}</h1>
             </div>
+            {selectedNav !== "monitor" && <FeatureHelp key={selectedNav} title={pageHelp.title} description={pageHelp.summary} details={pageHelp.details} />}
           </div>
           <div className="topbar-actions">
             {(selectedNav !== "functional-test" || shortLiveHeader) && <>
@@ -5124,7 +5140,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
   const visibleFields = fields.filter((field) => field.group === activeGroup && field.key !== "TOSS_ACCOUNT_SEQ");
   const fieldSections = [
     { id: "basic", title: "API 연결에 필요한 정보", fields: visibleFields.filter(field => field.kind === "secret" || field.key === "KIS_ACCOUNT_PRODUCT_CODE") },
-    { id: "fees", title: "KIS 시험 비용 상세", detail: "KIS 국내 주문 연결 시험의 필수 확인 정보입니다. 본인 계좌의 수수료·세율을 어디서 확인했는지 근거(요율 안내·상담·조회 등)를 적으세요. 적용 종목에는 확인한 동일 요율이 적용되는 6자리 코드를 입력하며, 세율이 다른 주식·ETF는 섞지 않습니다. 프로그램은 확인 시각부터 24시간 이내 정보만 사용합니다. Binance·Upbit 시험이나 계좌 잔고 조회에는 필요하지 않습니다. 비율 0.00015는 0.015%입니다.", fields: visibleFields.filter(field => field.key.startsWith("SHORT_LIVE_KIS_")) },
+    { id: "fees", title: "KIS 시험 비용 상세", detail: "본인 계좌 요율의 근거와 같은 요율이 적용되는 6자리 종목 코드를 입력하세요. 확인 시각은 24시간 이내여야 합니다.", fields: visibleFields.filter(field => field.key.startsWith("SHORT_LIVE_KIS_")) },
     { id: "advanced", title: "수수료 추정·해외 결제·서버 주소", detail: "임시 수수료는 화면 계산용 참고값이며 계좌별 실제 수수료 확인을 대신하지 않습니다. 서버 주소는 연결 대상을 바꾸는 경우에만 수정하세요.", fields: visibleFields.filter(field => field.kind !== "secret" && field.key !== "KIS_ACCOUNT_PRODUCT_CODE" && !field.key.startsWith("SHORT_LIVE_KIS_")) },
   ].filter(section => section.fields.length > 0);
   const provisionalFields = visibleFields.filter(isProvisionalKisFeeField);

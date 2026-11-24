@@ -1,0 +1,60 @@
+.feature-help-trigger {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.feature-help-dialog {
+  box-sizing: border-box;
+  width: min(540px, calc(100% - 32px));
+  max-height: calc(100% - 32px);
+  margin: auto;
+  padding: 22px;
+  overflow-y: auto;
+  border: 1px solid var(--border, #b5c3c7);
+  border-radius: 14px;
+  background: var(--panel, #fff);
+  color: var(--text, #17262e);
+  box-shadow: 0 16px 42px rgb(0 0 0 / 24%);
+}
+
+.feature-help-dialog::backdrop {
+  background: rgb(13 23 31 / 50%);
+}
+
+.feature-help-dialog h2 {
+  margin: 0 0 12px;
+  font-size: 1.15rem;
+}
+
+.feature-help-dialog p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.feature-help-dialog p + p {
+  margin-top: 10px;
+}
+
+.feature-help-dialog form {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+
+.monitor-help-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.monitor-help-tabs .monitor-view-tabs {
+  flex: 1 1 480px;
+  margin-bottom: 0;
+}
