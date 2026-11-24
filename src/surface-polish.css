@@ -11,3 +11,28 @@ button.doctor-card[data-ts-selected="true"] :is(.ts-status-card__title, .ts-stat
   color: var(--ts-selection-contrast, #ffffff) !important;
 }
 }
+
+/* Separate the broker field sections, saving row, and in-field helper control. */
+.live-connection-fields-disclosure > .ts-disclosure-body {
+  display: grid;
+  gap: var(--ts-console-content-gap, 8px);
+}
+
+.live-connection-fields-disclosure .live-assistant-field-grid {
+  padding: 0 12px 12px;
+}
+
+.live-connection-fields-disclosure .live-assistant-field > div:has(> input + button) {
+  row-gap: var(--ts-console-action-gap, 8px);
+}
+
+.live-connection-fields-disclosure .live-assistant-save-row {
+  margin-top: 0;
+}
+
+/* Leave air below the actions when the next section opens or returns a result. */
+.short-live-workspace .panel > .primary-button + .ts-disclosure,
+.short-live-workspace .panel > .secondary-button + .functional-test-workspace,
+.external-research-panel > .button-row + :is(p, [aria-live]) {
+  margin-block-start: var(--ts-console-content-gap, 8px);
+}
