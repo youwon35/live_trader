@@ -11,11 +11,12 @@ test('every old stored or diagnostic route remains addressable', () => {
   assert.equal(liveNavigationRoute('unknown'), 'overview');
 });
 
-test('risk and logs keep their route and highlight the correct merged section', () => {
+test('risk keeps its action tabs and both record routes share a single workspace', () => {
   assert.equal(liveNavigationRoot('risk'), 'automation');
   assert.equal(liveNavigationRoot('audit'), 'incidents');
   assert.deepEqual(liveSectionTabs('risk').map(({ id, label }) => [id, label]), [['automation', '실행·중지'], ['risk', '한도·안전장치']]);
-  assert.deepEqual(liveSectionTabs('audit').map(({ id, label }) => [id, label]), [['incidents', '운영 이력'], ['audit', '상세 로그']]);
+  assert.deepEqual(liveSectionTabs('audit'), []);
+  assert.deepEqual(liveSectionTabs('incidents'), []);
 });
 
 test('broker testing is neither a strategy phase nor an automatic runtime subtab', () => {

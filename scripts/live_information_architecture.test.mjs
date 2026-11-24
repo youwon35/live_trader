@@ -50,6 +50,17 @@ test("merged sections preserve old routes and keep broker testing separate from 
   assert.match(appSource, /lifecycleTimeline\.map/);
 });
 
+test("operating events and technical records use one list, detail and filter workspace", () => {
+  const records = between(appSource, "function IncidentAuditWorkspace", "function DoctorHistoryPanel");
+  assert.match(records, /snapshot\.technical_logs \?\? snapshot\.audit/);
+  assert.match(records, /snapshot\.durable_audit \?\? snapshot\.audit_events/);
+  assert.equal((records.match(/<AuditPanel/g) || []).length, 1);
+  const audit = between(appSource, "function AuditPanel", "const AUDIT_PAYLOAD_SECRET_KEY");
+  assert.match(audit, /aria-label="기록 종류"/);
+  assert.match(audit, /onRecordTypeChange\(event\.currentTarget\.value\)/);
+  assert.match(audit, /handleExportLogs/);
+});
+
 test("advanced one-shot diagnostics load only on explicit opening", () => {
   const automation = between(appSource, "function AutomationLauncherPanel", "function isCryptoStrategy");
   assert.match(automation, /title="전략 연결 진단 \(주문 없음\)"/);
@@ -69,7 +80,7 @@ test("default pages prioritize decisions and move technical evidence into disclo
   const workspace = between(appSource, "function WorkspaceContent", "function compactHash");
   const automation = between(workspace, 'if (selectedNav === "automation")', 'if (monitoringPage)');
   const gate = between(workspace, 'if (selectedNav === "gate")', 'if (selectedNav === "accounts")');
-  const risk = between(workspace, 'if (selectedNav === "risk")', 'if (selectedNav === "incidents")');
+  const risk = between(workspace, 'if (selectedNav === "risk")', 'if (selectedNav === "incidents" || selectedNav === "audit")');
   const settings = between(workspace, 'if (selectedNav === "settings")', "<OperationsOverviewPage");
 
   assert.doesNotMatch(automation, /DeploymentContextPanel/);

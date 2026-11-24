@@ -4760,7 +4760,23 @@ body {
   padding: 10px;
 }
 
-.audit-panel .logs-toolbar,
+.audit-panel .logs-toolbar {
+  grid-template-columns: minmax(96px, 120px) minmax(130px, 1fr) repeat(3, minmax(70px, 112px)) auto auto;
+  width: 100%;
+}
+
+@media (max-width: 1050px) {
+  .audit-panel .logs-toolbar {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .audit-panel .logs-toolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .logs-panel.logs-page-panel .logs-toolbar {
   display: grid;
   grid-template-columns: minmax(260px, 1fr) minmax(120px, 150px) minmax(110px, 140px) minmax(120px, 150px) auto auto;

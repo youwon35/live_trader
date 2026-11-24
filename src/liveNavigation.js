@@ -19,12 +19,7 @@ const EXECUTION_TABS = Object.freeze([
   Object.freeze({ id: "automation", label: "실행·중지" }),
   Object.freeze({ id: "risk", label: "한도·안전장치" }),
 ]);
-const RECORD_TABS = Object.freeze([
-  Object.freeze({ id: "incidents", label: "운영 이력" }),
-  Object.freeze({ id: "audit", label: "상세 로그" }),
-]);
-
 export function liveSectionTabs(route) {
   const root = liveNavigationRoot(route);
-  return root === "automation" ? EXECUTION_TABS : root === "incidents" ? RECORD_TABS : [];
+  return root === "automation" ? EXECUTION_TABS : [];
 }

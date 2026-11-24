@@ -16,7 +16,7 @@ const tabs = [
   { label: "계좌·잔고", requiredHeadings: ["계좌·포지션 3자 대조", "내 계좌·보유 포지션"] },
   { label: "주문·체결", requiredHeadings: ["주문 상태 원장", "실행 품질"] },
   { label: "실행 기록", requiredHeadings: ["감사 이벤트"], forbiddenHeadings: ["운영 사고"] },
-  { label: "상세 로그", parent: "실행 기록", requiredHeadings: ["기술 로그"] },
+  { label: "상세 로그", parent: "실행 기록", recordType: "audit", requiredHeadings: ["기술 로그"] },
   {
     label: "연결·설정",
     requiredHeadings: ["브로커 실계좌 연결", "설정·Runtime 자체 검사"],
@@ -97,7 +97,11 @@ try {
 
     for (const tab of tabs) {
       await page.locator(".nav-list").getByRole("button", { name: tab.parent || tab.label, exact: true }).click();
-      if (tab.parent) await page.getByRole("tab", { name: tab.label, exact: true }).click();
+      if (tab.recordType) {
+        await page.getByRole("combobox", { name: "기록 종류" }).selectOption(tab.recordType);
+      } else if (tab.parent) {
+        await page.getByRole("tab", { name: tab.label, exact: true }).click();
+      }
       await page.waitForTimeout(150);
       const layout = await page.evaluate(() => {
         const root = document.documentElement;

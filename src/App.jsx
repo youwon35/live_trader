@@ -258,7 +258,7 @@ const pageProfiles = {
   incidents: {
     title: "실행 기록",
     eyebrow: "AUDIT RECORDS",
-    summary: "준비 검사, 실행·정지, 주문, 안전장치와 연결 설정의 변경 기록을 시간순으로 확인합니다.",
+    summary: "운영 이력과 상세 로그를 같은 목록과 검색 도구에서 조회합니다. 기록 종류를 바꿔 준비 검사, 실행·정지, 주문, 설정 변경 또는 기술 메시지를 확인하세요.",
   },
   audit: {
     title: "상세 로그",
@@ -2506,7 +2506,7 @@ function App() {
 
   const selectedNavRoot = liveNavigationRoot(selectedNav);
   const title = navItems.find((item) => item.id === selectedNavRoot)?.label ?? "시작 점검";
-  const pageHelp = pageProfiles[selectedNav] ?? pageProfiles.overview;
+  const pageHelp = pageProfiles[selectedNav === "audit" ? "incidents" : selectedNav] ?? pageProfiles.overview;
   const selectedStrategy = deploymentOptions.find((option) => option.id === selectedDeploymentId)?.strategy
     || deploymentOptions[0]?.strategy
     || null;
@@ -3076,17 +3076,9 @@ function WorkspaceContent({
     );
   }
 
-  if (selectedNav === "incidents") {
+  if (selectedNav === "incidents" || selectedNav === "audit") {
     return renderPage(
-      <IncidentAuditWorkspace snapshot={snapshot} />,
-    );
-  }
-
-  if (selectedNav === "audit") {
-    return renderPage(
-      <section className="audit-page-layout ts-layout-stack">
-        <AuditPanel audit={snapshot.technical_logs || snapshot.audit} title="기술 로그" />
-      </section>,
+      <IncidentAuditWorkspace snapshot={snapshot} recordType={selectedNav} onRecordTypeChange={onNavigate} />,
     );
   }
 
@@ -3635,15 +3627,20 @@ function RetryDecisionMatrixPanel({ matrix }) {
   );
 }
 
-function IncidentAuditWorkspace({ snapshot = {} }) {
-  const audit = snapshot.durable_audit ?? snapshot.audit_events ?? snapshot.audit ?? [];
+function IncidentAuditWorkspace({ snapshot, recordType, onRecordTypeChange }) {
+  const technical = recordType === "audit";
+  const records = technical
+    ? snapshot.technical_logs ?? snapshot.audit ?? []
+    : snapshot.durable_audit ?? snapshot.audit_events ?? snapshot.audit ?? [];
   return (
     <section className="incident-audit-layout ts-layout-stack">
       <AuditPanel
-        audit={audit}
-        detailLabel="감사 기록 상세"
-        emptyText="표시할 감사 이벤트가 없습니다."
-        title="감사 이벤트"
+        audit={records}
+        detailLabel={technical ? "기술 로그 상세" : "감사 기록 상세"}
+        emptyText={technical ? "검색 조건에 맞는 로그가 없습니다." : "표시할 감사 이벤트가 없습니다."}
+        onRecordTypeChange={onRecordTypeChange}
+        recordType={recordType}
+        title={technical ? "기술 로그" : "감사 이벤트"}
       />
     </section>
   );
@@ -6587,11 +6584,12 @@ function sortLiveStrategies(strategies, sort) {
 }
 
 function AuditPanel({
-  audit = [],
-  detailLabel = "기술 로그 상세",
-  emptyText = "검색 조건에 맞는 로그가 없습니다.",
-  subtitle,
-  title = "기술 로그",
+  audit,
+  detailLabel,
+  emptyText,
+  onRecordTypeChange,
+  recordType,
+  title,
 }) {
   const [query, setQuery] = useState("");
   const [channel, setChannel] = useState("all");
@@ -6618,12 +6616,15 @@ function AuditPanel({
       raw: `${displayTime} ${normalizedLevel} ${logChannel} ${source} ${message} ${item.trace_id || ""}`.toLowerCase(),
     };
   });
-  const visibleRows = rows
-    .filter((row) => channel === "all" || row.channel === channel)
-    .filter((row) => level === "all" || row.level === level)
-    .filter((row) => !query.trim() || row.raw.includes(query.trim().toLowerCase()))
-    .sort((a, b) => (sort === "latest" ? rows.indexOf(a) - rows.indexOf(b) : rows.indexOf(b) - rows.indexOf(a)));
-  const channels = ["all", ...Array.from(new Set(rows.map((row) => row.channel)))];
+  const channels = ["all", ...new Set(rows.map((row) => row.channel))];
+  const visibleChannel = channels.includes(channel) ? channel : "all";
+  const needle = query.trim().toLowerCase();
+  const visibleRows = rows.filter((row) => (
+    (visibleChannel === "all" || row.channel === visibleChannel)
+    && (level === "all" || row.level === level)
+    && (!needle || row.raw.includes(needle))
+  ));
+  if (sort === "oldest") visibleRows.reverse();
   const selectedLog = visibleRows.find((row) => row.id === selectedLogId) || visibleRows[0] || null;
   const handleExportLogs = () => {
     const exportRows = visibleRows.map((row) => ({
@@ -6638,7 +6639,7 @@ function AuditPanel({
 
   return (
     <section className="panel audit-panel">
-      <PanelHeader title={title} subtitle={subtitle} />
+      <PanelHeader title={title} />
       <MasterDetailLog
         className="logs-workbench audit-log-workspace"
         classes={{
@@ -6726,11 +6727,23 @@ function AuditPanel({
         selectedKey={selectedLog?.id || ""}
         toolbar={(
           <div className="logs-toolbar">
+            <select
+              aria-label="기록 종류"
+              value={recordType}
+              onChange={(event) => {
+                setChannel("all");
+                setSelectedLogId("");
+                onRecordTypeChange(event.currentTarget.value);
+              }}
+            >
+              <option value="incidents">운영 이력</option>
+              <option value="audit">상세 로그</option>
+            </select>
             <label className="search-box logs-search">
               <input aria-label={`${title} 검색`} value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="메시지, scope, 작업명 검색" />
               <Search size={18} />
             </label>
-            <select aria-label={`${title} 채널 필터`} value={channel} onChange={(event) => setChannel(event.currentTarget.value)}>
+            <select aria-label={`${title} 채널 필터`} value={visibleChannel} onChange={(event) => setChannel(event.currentTarget.value)}>
               {channels.map((item) => (
                 <option value={item} key={item}>
                   {item === "all" ? "전체" : item}

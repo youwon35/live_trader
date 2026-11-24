@@ -250,7 +250,7 @@ try {
         await page.locator('.three-way-reconciliation-panel').getByText('대조 미확인', { exact: true }).waitFor();
       }
       if (label === '실행 기록') {
-        await page.getByRole('tab', { name: '상세 로그', exact: true }).click();
+        await page.getByRole('combobox', { name: '기록 종류', exact: true }).selectOption('audit');
         await page.getByRole('heading', { name: '기술 로그', exact: true }).waitFor();
         assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), '실행 기록');
       }
