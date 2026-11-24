@@ -271,7 +271,6 @@ const pageProfiles = {
     summary: "화면 설정, 증권사·거래소 연결, Telegram 알림과 프로그램 자체 검사를 관리합니다.",
     details: [
       "브로커 실계좌 연결에서 주식/ETF 또는 거래소 탭을 열어 항목을 확인합니다. 토스증권 연결 검사는 별도 카드에서 할 수 있습니다.",
-      "KIS 국내 주문 연결 시험에 쓰는 수수료와 세율은 계좌 요율 안내·상담·조회 등에서 확인한 근거가 필요합니다. 같은 요율이 적용되는 종목만 지정합니다. 비율 0.00015는 0.015%입니다.",
       "TradingView는 보조 분석과 차트 확인에 사용합니다.",
     ],
   },
@@ -5140,7 +5139,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
   const visibleFields = fields.filter((field) => field.group === activeGroup && field.key !== "TOSS_ACCOUNT_SEQ");
   const fieldSections = [
     { id: "basic", title: "API 연결에 필요한 정보", fields: visibleFields.filter(field => field.kind === "secret" || field.key === "KIS_ACCOUNT_PRODUCT_CODE") },
-    { id: "fees", title: "KIS 시험 비용 상세", detail: "본인 계좌 요율의 근거와 같은 요율이 적용되는 6자리 종목 코드를 입력하세요. 확인 시각은 24시간 이내여야 합니다.", fields: visibleFields.filter(field => field.key.startsWith("SHORT_LIVE_KIS_")) },
+    { id: "fees", title: "KIS 시험 비용 상세", detail: "KIS 국내 주문 연결 시험의 필수 확인 정보입니다. 본인 계좌의 수수료·세율을 어디서 확인했는지 근거(요율 안내·상담·조회 등)를 적으세요. 적용 종목에는 확인한 동일 요율이 적용되는 6자리 코드를 입력하며, 세율이 다른 주식·ETF는 섞지 않습니다. 프로그램은 확인 시각부터 24시간 이내 정보만 사용합니다. Binance·Upbit 시험이나 계좌 잔고 조회에는 필요하지 않습니다. 비율 0.00015는 0.015%입니다.", fields: visibleFields.filter(field => field.key.startsWith("SHORT_LIVE_KIS_")) },
     { id: "advanced", title: "수수료 추정·해외 결제·서버 주소", detail: "임시 수수료는 화면 계산용 참고값이며 계좌별 실제 수수료 확인을 대신하지 않습니다. 서버 주소는 연결 대상을 바꾸는 경우에만 수정하세요.", fields: visibleFields.filter(field => field.kind !== "secret" && field.key !== "KIS_ACCOUNT_PRODUCT_CODE" && !field.key.startsWith("SHORT_LIVE_KIS_")) },
   ].filter(section => section.fields.length > 0);
   const provisionalFields = visibleFields.filter(isProvisionalKisFeeField);
