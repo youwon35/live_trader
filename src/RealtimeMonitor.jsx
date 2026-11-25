@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {historyReadinessLabel} from './historyReadiness.js';
 import { Activity, AlertTriangle, ArrowDownLeft, ArrowUpRight, CheckCircle2, Clock3, Radio, TrendingUp, WifiOff } from 'lucide-react';
 import { projectRealtimeMonitor, monitorEventLabel, monitorRoute } from './realtimeMonitorModel.js';
@@ -12,11 +12,13 @@ const amount = value => value === null || value === undefined ? '—' : `${value
 const date = value => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('ko-KR', {timeZone:'Asia/Seoul', month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '미기록';
 const percent = value => value === null ? '변화율 미확인' : `${value > 0 ? '+' : ''}${number(value)}%`;
 const duration = seconds => seconds === null ? '미확인' : `${seconds >= 3600 ? `${Math.floor(seconds / 3600)}시간 ` : ''}${Math.floor(seconds % 3600 / 60)}분 ${seconds % 60}초`;
+const activityClock = new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
 const signalLabels = { BUY:'매수 신호', SELL:'매도 신호', HOLD:'유지 · 신호 대기', NOT_OBSERVED:'아직 신호 미관측' };
 const signalLabel = value => Object.hasOwn(signalLabels, value) ? signalLabels[value] : '신호 미확인';
 
 export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt, staleMs = 20000, visible = true }) {
   const [now, setNow] = useState(Date.now);
+  const activityList = useRef(null);
   useEffect(() => {
     if (!visible) return undefined;
     const tick = () => setNow(Date.now());
@@ -26,6 +28,11 @@ export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt
   }, [visible]);
   const view = useMemo(() => visible ? projectRealtimeMonitor(snapshot, {fresh, pollError, receivedAt, now, staleMs}) : null,
     [snapshot, fresh, pollError, receivedAt, now, staleMs, visible]);
+  const newestActivity = view?.activity[0];
+  useEffect(() => {
+    const list = activityList.current;
+    if (list) list.scrollTop = list.scrollHeight;
+  }, [newestActivity?.sequence, newestActivity?.observedAt]);
   if (!view) return null;
   const StateIcon = view.resultHasIssue || ['warning', 'danger'].includes(view.state.tone) ? AlertTriangle
     : view.terminal ? CheckCircle2 : view.responseCurrent ? Activity : WifiOff;
@@ -117,11 +124,14 @@ export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt
           <time dateTime={decision.observedAt}>{date(decision.observedAt)}</time>
           <p>{[monitorRoute(decision.route), decision.timeframe, decision.pluginId].filter(Boolean).join(' · ')}</p></div>
       </li>)}</ol>}
-      <details className="live-monitor-diagnostics live-monitor-activity-log">
+      <details className="live-monitor-diagnostics live-monitor-activity-log" onToggle={event => {
+        const list = activityList.current;
+        if (event.currentTarget.open && list) list.scrollTop = list.scrollHeight;
+      }}>
         <summary>시험 활동 로그 · 계산·판단·주문·거절·체결</summary>
-        {view.activity.length === 0 ? <p className="live-monitor-empty">아직 공개 활동 기록이 없습니다.</p> : <ol>{view.activity.map((event,index)=><li key={`${event.sequence}:${index}`}>
+        {view.activity.length === 0 ? <p className="live-monitor-empty">아직 공개 활동 기록이 없습니다.</p> : <ol ref={activityList} role="log" aria-label="시험 활동 로그">{view.activity.slice().reverse().map((event, index) => <li key={event.sequence ?? `${event.observedAt}:${index}`}>
           <span className={`live-monitor-event-icon ${event.kind === 'ACTUAL_FILL_INCREMENT' ? 'is-fill' : ''}`}>{event.side === 'BUY' ? <ArrowDownLeft size={15}/> : event.side === 'SELL' ? <ArrowUpRight size={15}/> : <Activity size={14}/>}</span>
-          <div><strong>{monitorEventLabel(event)}</strong><time dateTime={event.observedAt}>{date(event.observedAt)}</time>
+          <div><strong>{monitorEventLabel(event)}</strong>
             <p>{[event.symbol, event.route && monitorRoute(event.route), event.side === 'BUY' ? '매수' : event.side === 'SELL' ? '매도' : ''].filter(Boolean).join(' · ')}</p>
             {event.calculations?.map((note, noteIndex) => <section className="live-monitor-calculation" key={noteIndex}>
               <strong>{note.symbol} · {note.timeframe} · {signalLabel(note.signal)}</strong>
@@ -133,7 +143,7 @@ export default function RealtimeMonitor({ snapshot, fresh, pollError, receivedAt
             </section>)}
             {event.incrementalQuantity !== null && event.incrementalQuantity !== undefined && <small>추가 체결 수량 {quantity(event.incrementalQuantity)}</small>}
             {event.kind === 'INTERNAL_ALLOCATION_TRANSFER' && <small>전략 간 배분 기록</small>}
-          </div></li>)}</ol>}
+          </div><time dateTime={event.observedAt} title={date(event.observedAt)}>{activityClock.format(new Date(event.observedAt))}</time></li>)}</ol>}
       </details>
     </aside></div>
   </section>;

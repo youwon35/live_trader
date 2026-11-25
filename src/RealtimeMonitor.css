@@ -67,3 +67,12 @@
 .live-monitor-activity-log > ol { list-style: none; margin: 0; padding: 0; max-height: 500px; overflow: auto; }
 .live-monitor .monitor-market-table .live-monitor-signal { display: inline-block; white-space: nowrap; }
 .live-monitor-calculation { margin-top: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; }
+
+
+.live-monitor-activity-log > ol > li > time {
+  flex: 0 0 auto;
+  margin-inline-start: auto;
+  white-space: nowrap;
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}

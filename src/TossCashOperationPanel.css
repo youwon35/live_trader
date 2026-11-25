@@ -24,3 +24,27 @@
 .toss-cash-watch th small { display: block; font-weight: 500; overflow-wrap: anywhere; }
 .toss-cash-latest { margin: 8px 0; }
 .toss-cash-latest b { margin-right: 5px; }
+
+
+.toss-cash-activity-log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-block-size: 280px;
+  overflow: auto;
+}
+
+.toss-cash-activity-log > li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  gap: 8px;
+  padding-block: 6px;
+  overflow-wrap: anywhere;
+}
+
+.toss-cash-activity-log time {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}

@@ -1,6 +1,9 @@
 .feature-help-trigger {
   display: inline-flex;
   flex: 0 0 auto;
+  inline-size: max-content;
+  min-inline-size: max-content;
+  padding-inline: 10px;
   align-items: center;
   justify-content: center;
   gap: 6px;

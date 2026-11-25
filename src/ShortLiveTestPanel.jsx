@@ -126,6 +126,7 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
   const hasFutures = selectedCandidates.some((row) => row.routes.includes("BINANCE_USDM_FUTURES"));
   const futuresPolicyValid = !hasFutures || normalizeShortLiveFuturesPolicy(futuresPolicy) !== null;
   const hiddenSelectionCount = selection.filter((key) => !visibleCandidates.some((row) => row.selectionKey === key)).length;
+  const visiblePreparation = busy === "prepare" ? null : snapshot.prepared;
   const preparationWindow = shortLivePreparationWindow(snapshot.prepared, now);
   const preparationValid = preparationWindow.status === "VALID";
   const preparedScopeMatches = shortLivePreparationMatches(snapshot.prepared, snapshot.catalog, selection, durationHours, futuresPolicy);
@@ -423,13 +424,13 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
       </fieldset>}
       <p>선택 {selection.length}개 · {durationHours}시간 · 자동 재시도 없음</p>
       <button type="button" className="primary-button" onClick={prepare} disabled={locked || !fresh || !catalogReady || selection.length === 0 || !futuresPolicyValid}>{busy === "prepare" ? "과거 자료·계좌·시세 준비 중…" : "자료·계좌 준비 검사 (주문 없음)"}</button>
-      {snapshot.prepared?.historyPreparation && <details className="ts-disclosure"><summary className="ts-disclosure-summary">과거 자료 준비 · {snapshot.prepared.historyPreparation.ready ? '완료' : '확인 필요'}</summary><div className="ts-disclosure-body"><ul>{snapshot.prepared.historyPreparation.streams?.map(row => <li key={`${row.provider}:${row.symbol}:${row.timeframe}`}>{row.symbol} · {row.timeframe} · {row.observedBars}/{row.requiredBars}봉 · {row.status === 'COMPLETE' ? '준비됨' : '자료 부족'}</li>)}</ul><p className="short-live-meta">공유 자료를 먼저 사용하고 부족한 구간만 수집합니다. 과거 자료를 실시간 평가 횟수로 계산하지 않습니다.</p></div></details>}
+      {visiblePreparation?.historyPreparation && <details className="ts-disclosure"><summary className="ts-disclosure-summary">과거 자료 준비 · {visiblePreparation.historyPreparation.ready ? '완료' : '확인 필요'}</summary><div className="ts-disclosure-body"><ul>{visiblePreparation.historyPreparation.streams?.map(row => <li key={`${row.provider}:${row.symbol}:${row.timeframe}`}>{row.symbol} · {row.timeframe} · {row.observedBars}/{row.requiredBars}봉 · {row.status === 'COMPLETE' ? '준비됨' : '자료 부족'}</li>)}</ul><p className="short-live-meta">공유 자료를 먼저 사용하고 부족한 구간만 수집합니다. 과거 자료를 실시간 평가 횟수로 계산하지 않습니다.</p></div></details>}
       <p className="short-live-meta">선택한 거래소 API에서 현재 잔고·보유 자산·미체결·시세를 다시 읽습니다. 주문이나 자금 이동은 하지 않습니다.</p>
-      {snapshot.prepared && !preparedScopeMatches && <p className="short-live-meta" role="status">아래는 마지막 준비 범위의 결과입니다. 현재 선택과 다르므로, 이전 설정을 다시 선택하거나 현재 범위로 새로 검사해 주세요.</p>}
-      <Blockers values={snapshot.prepared?.blockers} label={preparedScopeMatches ? "선택한 시험의 준비 차단 사유" : "마지막 준비 범위의 차단 사유"} />
-      {snapshot.prepared?.brokerReadiness?.length > 0 && <div className="short-live-readiness"><h4>거래소별 무주문 계좌 검사</h4>
+      {visiblePreparation && !preparedScopeMatches && <p className="short-live-meta" role="status">아래는 마지막 준비 범위의 결과입니다. 현재 선택과 다르므로, 이전 설정을 다시 선택하거나 현재 범위로 새로 검사해 주세요.</p>}
+      <Blockers values={visiblePreparation?.blockers} label={preparedScopeMatches ? "선택한 시험의 준비 차단 사유" : "마지막 준비 범위의 차단 사유"} />
+      {visiblePreparation?.brokerReadiness?.length > 0 && <div className="short-live-readiness"><h4>거래소별 무주문 계좌 검사</h4>
         <p className="short-live-meta">마지막 계좌 검사 결과입니다. 시작 직전 재검사에서 실패하면 해당 결과와 확인 시각으로 갱신됩니다.</p>
-        {snapshot.prepared.brokerReadiness.map((row) => <div key={row.route} className="short-live-notice"><div>
+        {visiblePreparation.brokerReadiness.map((row) => <div key={row.route} className="short-live-notice"><div>
           <strong>{SHORT_LIVE_ROUTES.find((route) => route.id === row.route)?.label || row.route} · {row.ready ? "계좌 검사 통과" : "계좌 검사 확인 필요"}</strong>
           {row.checkedAt && <p className="short-live-meta">마지막 계좌 확인 {date(row.checkedAt)}</p>}
           {row.fundingBasis === "AVAILABLE_QUOTE_ONLY" && <p>주문 가능 잔고 {row.availableQuoteNative === null ? "미확인" : new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 8 }).format(row.availableQuoteNative)} {row.quoteCurrency} · 이번 경로 배정 가능 {money(row.effectiveRouteBudgetKrw)}</p>}
@@ -442,22 +443,22 @@ export default function ShortLiveTestPanel({ api = defaultApi, initialSnapshot, 
     </section>
 
     <section className="panel short-live-start"><h3>3. 준비된 범위로 실제 시험 시작</h3>
-      {snapshot.prepared ? <><p className="short-live-meta">준비 ID {snapshot.prepared.preparationId} · 범위 해시 {compactHash(snapshot.prepared.scopeHash)}</p><p>{snapshot.prepared.readyToStart && preparationValid ? "서버의 현재 준비 조건 충족" : "준비 조건 미충족"} · 확인한 범위가 바뀌면 다시 준비해야 합니다.</p>
-        {snapshot.prepared.futuresPolicy && <p>확정 선물 범위: {snapshot.prepared.futuresPolicy.leverage}배 · 격리 · 보호 손절 가격 거리 {snapshot.prepared.futuresPolicy.stopLossPercent}%</p>}
-        {snapshot.prepared.executionModelBinding && <div className="short-live-meta"><strong>증거금 예산 기준 · 적용 {snapshot.prepared.executionModelBinding.executionLeverage}배 · 원본 허용 상한 {snapshot.prepared.executionModelBinding.maxLeverageMultiplier == null ? "미지정 (거래소 한도 별도 확인)" : `${snapshot.prepared.executionModelBinding.maxLeverageMultiplier}배`}</strong>
-          {snapshot.prepared.brokerReadiness.flatMap(row => row.executionAccounting?.previews || []).map(row => <p key={row.symbol}>{row.symbol} · 거래소 적용 {row.exchangeLeverage}배 / 종목 최대 {row.exchangeSymbolMaximumLeverage}배 · 배정 자금 (증거금＋비용) {money(row.capitalBudgetKrw)} · 예상 초기증거금 {money(row.initialMarginKrw)} · 명목 {money(row.positionNotionalKrw)} · 진입 수수료 {money(row.entryFeeEstimateKrw)} · 청산·펀딩 예비금 {money(row.costReserveKrw)}<small>현재 가격의 수량 반올림 전 추정치입니다.</small></p>)}
+      {busy === "prepare" ? <p role="status">현재 선택한 범위의 검사 결과를 기다리고 있습니다.</p> : visiblePreparation ? <><p className="short-live-meta">준비 ID {visiblePreparation.preparationId} · 범위 해시 {compactHash(visiblePreparation.scopeHash)}</p><p>{visiblePreparation.readyToStart && preparationValid ? "서버의 현재 준비 조건 충족" : "준비 조건 미충족"} · 확인한 범위가 바뀌면 다시 준비해야 합니다.</p>
+        {visiblePreparation.futuresPolicy && <p>확정 선물 범위: {visiblePreparation.futuresPolicy.leverage}배 · 격리 · 보호 손절 가격 거리 {visiblePreparation.futuresPolicy.stopLossPercent}%</p>}
+        {visiblePreparation.executionModelBinding && <div className="short-live-meta"><strong>증거금 예산 기준 · 적용 {visiblePreparation.executionModelBinding.executionLeverage}배 · 원본 허용 상한 {visiblePreparation.executionModelBinding.maxLeverageMultiplier == null ? "미지정 (거래소 한도 별도 확인)" : `${visiblePreparation.executionModelBinding.maxLeverageMultiplier}배`}</strong>
+          {visiblePreparation.brokerReadiness.flatMap(row => row.executionAccounting?.previews || []).map(row => <p key={row.symbol}>{row.symbol} · 거래소 적용 {row.exchangeLeverage}배 / 종목 최대 {row.exchangeSymbolMaximumLeverage}배 · 배정 자금 (증거금＋비용) {money(row.capitalBudgetKrw)} · 예상 초기증거금 {money(row.initialMarginKrw)} · 명목 {money(row.positionNotionalKrw)} · 진입 수수료 {money(row.entryFeeEstimateKrw)} · 청산·펀딩 예비금 {money(row.costReserveKrw)}<small>현재 가격의 수량 반올림 전 추정치입니다.</small></p>)}
         </div>}
-        {snapshot.prepared.executionModelBinding?.overrideRequired && <p className="short-live-error" role="status">선택 원본은 이 실제 거래 모형·배수로 검증된 증거가 없습니다. 아래 한 번의 시작 동의는 원본·적용 배수를 묶은 별도 기능시험에만 적용되며, 이전 Backtest/Paper 통과 결과를 재승인하지 않습니다.</p>}
-        {!active && <div className={`short-live-expiry ${preparationValid ? "" : "is-expired"}`}><Clock3 size={17} /><span>{preparationValid ? `준비 유효시간 ${remainingTime(preparationWindow.remainingSeconds)} 남음` : preparationWindow.status === "EXPIRED" ? "준비 유효시간 만료 · 무주문 준비 검사를 다시 실행해 주세요." : "준비 유효시간 미확인 · 무주문 준비 검사가 필요합니다."}<small>유효 기한 {date(snapshot.prepared.expiresAt)} · 시작 시 서버에서 다시 확인합니다.</small></span></div>}
+        {visiblePreparation.executionModelBinding?.overrideRequired && <p className="short-live-error" role="status">선택 원본은 이 실제 거래 모형·배수로 검증된 증거가 없습니다. 아래 한 번의 시작 동의는 원본·적용 배수를 묶은 별도 기능시험에만 적용되며, 이전 Backtest/Paper 통과 결과를 재승인하지 않습니다.</p>}
+        {!active && <div className={`short-live-expiry ${preparationValid ? "" : "is-expired"}`}><Clock3 size={17} /><span>{preparationValid ? `준비 유효시간 ${remainingTime(preparationWindow.remainingSeconds)} 남음` : preparationWindow.status === "EXPIRED" ? "준비 유효시간 만료 · 무주문 준비 검사를 다시 실행해 주세요." : "준비 유효시간 미확인 · 무주문 준비 검사가 필요합니다."}<small>유효 기한 {date(visiblePreparation.expiresAt)} · 시작 시 서버에서 다시 확인합니다.</small></span></div>}
         {preparedSelection !== selectionSignature && <p className="short-live-meta">현재 선택·시간·선물 보호 정책으로 무주문 준비 검사를 다시 실행해야 시작할 수 있습니다.</p>}
       </> : <p>아직 준비 결과가 없습니다. 먼저 시험 대상과 시간·금액을 확인해 주세요.</p>}
       <div className="short-live-consent" id="short-live-consent-summary">
         <strong>실제 자금으로 주문하며 손실이 발생할 수 있습니다.</strong>
         <p>아래 버튼을 누르면 지금 확인한 거래소·전략·시간·한도로 실거래 시작에 동의합니다. 주문은 전략 신호와 거래소 조건이 충족될 때 전송됩니다.</p>
-        {snapshot.prepared && <>
-          <p>준비된 시험: {snapshot.prepared.durationHours}시간 · 거래소별 자본 상한 {money(snapshot.prepared.budgetKrwPerBroker)} · 손실 중단 기준 {money(snapshot.prepared.lossKrwPerBroker)}</p>
-          <ul>{snapshot.prepared.targets.map((target, index) => <li key={`${target.selectionKey || target.id}:${index}`}>{preparedTargetText(target)}</li>)}</ul>
-          {snapshot.prepared.executionModelBinding?.overrideRequired && <p>동의 범위에 원본 검증 모형과 다른 기능시험 조건 적용이 포함됩니다. 결합 해시 {compactHash(snapshot.prepared.executionModelBinding.bindingHash)}</p>}
+        {visiblePreparation && <>
+          <p>준비된 시험: {visiblePreparation.durationHours}시간 · 거래소별 자본 상한 {money(visiblePreparation.budgetKrwPerBroker)} · 손실 중단 기준 {money(visiblePreparation.lossKrwPerBroker)}</p>
+          <ul>{visiblePreparation.targets.map((target, index) => <li key={`${target.selectionKey || target.id}:${index}`}>{preparedTargetText(target)}</li>)}</ul>
+          {visiblePreparation.executionModelBinding?.overrideRequired && <p>동의 범위에 원본 검증 모형과 다른 기능시험 조건 적용이 포함됩니다. 결합 해시 {compactHash(visiblePreparation.executionModelBinding.bindingHash)}</p>}
           <small>Binance 현물·선물은 같은 한도를 공유합니다. 급변·체결 지연으로 손실 중단 기준을 넘을 수 있습니다.</small>
         </>}
       </div>

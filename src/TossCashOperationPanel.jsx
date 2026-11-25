@@ -96,11 +96,36 @@ export function projectTossCashMonitor(snapshot, observedAt = Date.now() / 1000)
   };
 }
 
+
+const progressClock = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+
+function scrollOpenedActivity(event) {
+  const list = event.currentTarget.querySelector('.toss-cash-activity-log');
+  if (event.currentTarget.open && list) list.scrollTop = list.scrollHeight;
+}
+
+function TossActivityLog({ activity }) {
+  const listRef = useRef(null);
+  const recent = (Array.isArray(activity) ? activity : [])
+    .filter(row => typeof row?.detail === "string" && Number.isFinite(new Date(row.at * 1000).getTime()))
+    .sort((left, right) => left.at - right.at);
+  const newest = recent.at(-1);
+  useEffect(() => {
+    const list = listRef.current;
+    if (list) list.scrollTop = list.scrollHeight;
+  }, [newest?.at, newest?.detail]);
+  return <ol className="toss-cash-activity-log" ref={listRef} role="log" aria-label="토스 운용 활동">
+    {recent.map((entry, index) => {
+      const when = new Date(entry.at * 1000);
+      return <li key={`${entry.at}:${index}`}><span>{entry.detail}</span><time dateTime={when.toISOString()} title={tossTime(entry.at)}>{progressClock.format(when)}</time></li>;
+    })}
+  </ol>;
+}
+
 function TossCashMonitor({ snapshot, state, active, error, now }) {
   const view = projectTossCashMonitor(snapshot, now / 1000);
   const showScope = view.instruments.length > 0;
   const showStats = [view.evaluations, view.acknowledged, view.filled, view.unresolved].some(value => value !== null);
-  const activity = Array.isArray(snapshot?.activity) ? snapshot.activity : [];
   const stateLabel = error ? "상태 갱신 미확인" : !snapshot ? "상태 확인 중"
     : state === "RUNNING" && snapshot.running !== true ? "실행 여부 미확인"
     : state === "FAILED" ? "운용 오류" : labels[state] || state;
@@ -129,10 +154,9 @@ function TossCashMonitor({ snapshot, state, active, error, now }) {
     {view.latestDecision && <p className="toss-cash-latest"><b>최근 전략 판단</b> {view.latestDecision.symbol} · {decisionLabels[view.latestDecision.side]} <small>{tossTime(view.latestDecision.at)}</small></p>}
     {showScope && state === "RUNNING" && !view.latestDecision && <p className="muted">최근 전략 판단 미관측</p>}
     {view.latestOrder && <p className="toss-cash-latest"><b>최근 주문 접수 기록</b> {view.latestOrder.symbol} · {view.latestOrder.side === "BUY" ? "매수" : "매도"} <small>{tossTime(view.latestOrder.at)}</small></p>}
-    <details className="ts-disclosure toss-cash-options"><summary>진행 상세</summary>
+    <details className="ts-disclosure toss-cash-options" onToggle={scrollOpenedActivity}><summary>진행 상세</summary>
       <p className="muted">최근 활동 기록입니다. 주문 접수 후 체결 수량은 대조 결과에 반영됩니다.</p>
-      <ol>{activity.filter(row => typeof row?.detail === "string" && tossTime(row.at)).map((row, index) =>
-        <li key={`${row.at}:${index}`}>{tossTime(row.at)} · {row.detail}</li>)}</ol>
+      <TossActivityLog activity={snapshot?.activity} />
       {view.calculations.length > 0 && <ol className="tower-event-list tower-event-details" aria-label="전략 계산 기록">
         {view.calculations.map((entry, index) => <li key={`${entry.at}:${index}`}>
           <time>{tossTime(entry.at)}</time>
@@ -162,7 +186,8 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
   const [snapshot, setSnapshot] = useState(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState("");
+  const busy = Boolean(busyAction);
   const submitted = useRef(false);
   const scopeRevision = useRef(0);
   const preparedRevision = useRef(-1);
@@ -171,7 +196,7 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
   const [now, setNow] = useState(Date.now());
   const state = snapshot?.state || "IDLE";
   const active = snapshot?.running || ["RUNNING", "STOPPING", "CLOSING"].includes(state);
-  const preparing = snapshot?.preparing || state === "PREPARING";
+  const preparing = busyAction === "prepare" || snapshot?.preparing || state === "PREPARING";
   const unresolved = snapshot?.unfinishedOwners || [];
   const locked = busy || active || preparing || unresolved.length > 0;
   const preparation = snapshot?.preparation;
@@ -212,7 +237,7 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
 
   async function act(action, body) {
     if (submitted.current) return;
-    submitted.current = true; setBusy(true); setError(""); setNotice("");
+    submitted.current = true; setBusyAction(action); setError(""); setNotice("");
     latestMutation.current += 1;
     try {
       const result = await request(base + action, { method: "POST", body, timeoutMs: action === "start" || action === "recover" ? 180000 : 15000 });
@@ -223,16 +248,17 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
       if (action === "prepare") preparedRevision.current = scopeRevision.current;
       if (["start", "close_owned"].includes(action)) { setConsent(false); setCloseConsent(false); }
     } catch (err) { if (mounted.current) setError(err.message); }
-    finally { submitted.current = false; if (mounted.current) setBusy(false); }
+    finally { submitted.current = false; if (mounted.current) setBusyAction(""); }
   }
 
-  if (monitorOnly) return <TossCashMonitor snapshot={snapshot} state={state} active={active} error={error} now={now} />;
+  if (monitorOnly) return preparing ? <section className="panel toss-cash-panel live-grid-full" aria-label="토스 현금 운용 감시"><p role="status">선택한 범위의 자료와 계좌를 확인하고 있습니다.</p></section>
+    : <TossCashMonitor snapshot={snapshot} state={state} active={active} error={error} now={now} />;
   const accountCurrencyCash = snapshot?.ledger?.cash || {};
   return <section className="panel toss-cash-panel live-grid-full" aria-label="토스 현금 운용">
-    <div className="toss-cash-heading"><div><span className="eyebrow">TOSS · 한국주식 / 미국주식</span><h2>토스 현금 운용</h2></div><strong className={active ? "toss-cash-good" : "muted"}>{labels[state] || state}</strong></div>
+    <div className="toss-cash-heading"><div><span className="eyebrow">TOSS · 한국주식 / 미국주식</span><h2>토스 현금 운용</h2></div><strong className={active ? "toss-cash-good" : "muted"}>{preparing ? labels.PREPARING : labels[state] || state}</strong></div>
     <p className="muted">선택한 주식 전략을 토스 계좌에서 실행합니다. 완성봉 판단 후 새 호가의 지정가로 주문하며, 기존 보유 주식은 매도하지 않습니다.</p>
-    {snapshot?.reason && <p role="status">{message(snapshot.reason)}</p>}
-    {(active || unresolved.length > 0 || snapshot?.ledger) && <div className="toss-cash-stats">
+    {preparing ? <p role="status">선택한 범위의 자료와 계좌를 확인하고 있습니다.</p> : snapshot?.reason && <p role="status">{message(snapshot.reason)}</p>}
+    {!preparing && (active || unresolved.length > 0 || snapshot?.ledger) && <div className="toss-cash-stats">
       <span>봉 평가 <b>{snapshot?.evaluations || 0}</b></span><span>주문 접수 <b>{snapshot?.ordersSubmitted || 0}</b></span>
       <span>체결 주문 <b>{snapshot?.ledger?.fillCount ?? "—"}</b></span><span>장·주문 대기 신호 <b>{snapshot?.waitingSignals || 0}</b></span>
       {Object.entries(accountCurrencyCash).map(([c, v]) => <span key={c}>운용 잔여 예산 <b>{money(v, c)}</b></span>)}
@@ -257,7 +283,7 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
         <button disabled={locked || !selected.length || !binding} onClick={() => act("prepare", { targets: items.filter(i => selected.includes(i.key)).map(i => i.target), tossBindingConfirmed: binding, budgetKrwByMarket: budgets, durationHours: hours })}>{preparing ? "자료·계좌 준비 중…" : "자료·계좌 준비 검사 (주문 없음)"}</button>
         {active && <button disabled={busy} onClick={() => act("stop", { ownerId: snapshot.ownerId })}>운용 중단·소유 미체결 정리</button>}
       </div>
-      {preparation && !active && !unresolved.length && <div className="toss-cash-start">
+      {!preparing && preparation && !active && !unresolved.length && <div className="toss-cash-start">
         <p>{Object.entries(preparation.budgets).map(([c, v]) => money(v, c)).join(" · ")} · {preparation.durationHours}시간 · {ready ? `준비 유효 시간 약 ${Math.max(0, Math.ceil((preparation.expiresAt * 1000 - now) / 1000))}초` : "범위 변경 또는 만료 · 다시 준비하세요"}</p>
         <label className="toss-cash-check"><input type="checkbox" checked={consent} disabled={!ready || busy} onChange={e => setConsent(e.target.checked)} /><span>실제 자금으로 주문하며 손실이 발생할 수 있음을 확인했습니다.</span></label>
         <button className="primary" disabled={!ready || !consent || busy} onClick={() => act("start", { preparationId: preparation.preparationId, sourceHash: preparation.sourceHash, liveConsent: true })}>토스 실거래 시작</button>
@@ -271,10 +297,10 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
     </>}
     {notice && <p className="toss-cash-good" role="status">{notice}</p>}
     {error && <p className="toss-cash-error" role="alert">{message(error)}</p>}
-    <details className="ts-disclosure toss-cash-options"><summary>진행 상세</summary><p className="muted">기존 장기 검증의 통과 판정과 별개인 현금 운용입니다. 총자산이나 수익률 대신 이번 운용의 주문·체결·소유 수량을 표시합니다.</p>
+    {!preparing && <details className="ts-disclosure toss-cash-options" onToggle={scrollOpenedActivity}><summary>진행 상세</summary><p className="muted">기존 장기 검증의 통과 판정과 별개인 현금 운용입니다. 총자산이나 수익률 대신 이번 운용의 주문·체결·소유 수량을 표시합니다.</p>
       {!!snapshot?.ledger && <ul>{Object.entries(snapshot.ledger.positions || {}).map(([id, qty]) => <li key={id}>{snapshot.ledger.scope?.specs?.find(s => s.strategyInstanceId === id)?.symbol || id} · 이번 운용 보유 {qty}주</li>)}</ul>}
-      <ol>{(snapshot?.activity || []).map((a, i) => <li key={`${a.at}-${i}`}>{new Date(a.at * 1000).toLocaleTimeString()} · {a.detail}</li>)}</ol>
+      <TossActivityLog activity={snapshot?.activity} />
       {snapshot?.firstFailure && <p className="toss-cash-error">최초 오류 · {message(snapshot.firstFailure)}</p>}
-    </details>
+    </details>}
   </section>;
 }

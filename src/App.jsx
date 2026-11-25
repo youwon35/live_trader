@@ -4595,11 +4595,12 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
 
   async function runDoctor() {
     setRunning(true);
-    setHasRun(true);
+    setHasRun(false);
     try {
       await onReconcile();
       await onWatchdog();
       await onPreflight();
+      setHasRun(true);
     } finally {
       setRunning(false);
     }
@@ -4611,8 +4612,8 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
       <div className="doctor-hero">
         <div>
           <span>점검 결과</span>
-          <strong>{hasRun ? categorySummary.label : "일반 운용 점검 대기"}</strong>
-          <p>{hasRun ? categorySummary.detail : "계좌/API 연결과 일반 운용의 실행 조건을 분야별로 확인합니다. 주문 연결 시험은 해당 탭에서 별도로 준비하세요."}</p>
+          <strong role="status">{running ? "새 점검 진행 중" : hasRun ? categorySummary.label : "일반 운용 점검 대기"}</strong>
+          <p>{running ? "계좌 대조, Watchdog, 최종 사전 점검 결과를 읽고 있습니다." : hasRun ? categorySummary.detail : "계좌/API 연결과 일반 운용의 실행 조건을 분야별로 확인합니다. 주문 연결 시험은 해당 탭에서 별도로 준비하세요."}</p>
         </div>
         <ActionButton
           className="primary-button doctor-run-button"
@@ -4626,7 +4627,7 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
           variant="primary"
         />
       </div>
-      <div className="doctor-grid">
+      {!running && <div className="doctor-grid">
         {visibleItems.map((item) => (
           <StatusCard
             className={`doctor-card ${item.tone} ${selectedItem?.id === item.id ? "selected" : ""}`}
@@ -4643,8 +4644,8 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
           />
         ))}
         {!visibleItems.length && <EmptyRow text="현재 표시할 Hard Stop 또는 Warning이 없습니다." />}
-      </div>
-      {selectedItem && (
+      </div>}
+      {!running && selectedItem && (
         <div className="doctor-detail-panel">
           <div className="doctor-detail-head">
             <div>
