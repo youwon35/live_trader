@@ -4,6 +4,7 @@ import { verifyAppearancePolish, verifySelectedCards } from './surface_polish_pr
 import assert from 'node:assert/strict';
 import { probeRestoredUi, inspectRestoredTabs } from './font_restore_probe.mjs';
 const fontReview=process.env.FONT_RESTORE_REVIEW==='1';
+const settingsReview = process.env.LIVE_SETTINGS_REVIEW === '1';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { extname, resolve, sep } from 'node:path';
@@ -22,6 +23,11 @@ const fallbackLiteral = appSource.match(/const fallbackSnapshot = (\{[\s\S]*?\n\
 assert.ok(fallbackLiteral, 'the fail-closed fixture base must be an explicit static literal');
 const snapshot = JSON.parse(JSON.stringify(runInNewContext(`(${fallbackLiteral[1]})`, {}, { timeout: 500 })));
 snapshot.api_connected = true;
+snapshot.doctor_diagnostics = { latest: {
+  run_id: 'fixture-stored-doctor',
+  generated_at: '2026-09-05T00:00:00Z',
+  issues: [{ issue_code: 'fixture-cause', severity: 'hard_stop', problem: '이전 준비 검사에서 확인한 문제', remediation: '계좌 대조 기록을 확인하세요.', related_tab: 'accounts' }],
+} };
 if(fontReview) snapshot.technical_logs=['INFO','WARN','ERROR'].map((level,i)=>({level,event_id:`font-log-${i}`,timestamp:'2026-09-08T01:00:00Z',source:'오프라인 글꼴 검사',message:`${level} 의미색 검증` }));
 snapshot.execution_availability = {
   schemaVersion: 'live-execution-availability-v1', authorizationGranted: false,
@@ -85,7 +91,7 @@ try {
   const configurations=fontReview?[1024,1920].flatMap(width=>['light','dark'].map(theme=>({viewport:{width,height:1000},theme}))):[{viewport:{width:1280,height:800},theme:'light'},{viewport:{width:1920,height:1080},theme:'light'}];
   for (const {viewport,theme} of configurations) {
     const context = await browser.newContext({ viewport, serviceWorkers: 'block' });
-    if(candidateReview || sealedPreparation) await context.addInitScript(()=>{window.pywebview={api:{functional_http_session:async()=>({ok:true,available:true,csrfHeader:'X-LiveTrader-CSRF',csrfToken:'fixture-csrf-'.repeat(4)})}};});
+    await context.addInitScript(()=>{window.pywebview={api:{functional_http_session:async()=>({ok:true,available:true,csrfHeader:'X-LiveTrader-CSRF',csrfToken:'fixture-csrf-'.repeat(4)})}};});
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -112,6 +118,18 @@ try {
       else if (url.pathname === '/api/paper-candidates' && candidateReview) body = candidateReview.before;
       else if(url.pathname === '/api/monitor-trial/run' && candidateReview){assert.equal(request.method(),'POST');assert.deepEqual(request.postDataJSON(),candidateReview.trialRequest);body=candidateReview.trialResult;}
       else if (url.pathname === '/api/snapshot') body = snapshot;
+      else if (url.pathname === '/api/toss/operation/catalog') body = { ok: true, items: [] };
+      else if (url.pathname === '/api/toss/operation/preferences') body = { ok: true, budgetKrwByMarket: { KR: 5000, US: 5000 }, durationHours: 2 };
+      else if (url.pathname === '/api/toss/accounts') {
+        assert.equal(request.method(), 'POST');
+        assert.deepEqual(request.postDataJSON(), {});
+        body = { ok: true, accounts: [{ accountSeq: '1', label: '화면 검증용 토스 계좌', selected: true }] };
+      }
+      else if (url.pathname === '/api/toss/prepare') {
+        assert.equal(request.method(), 'POST');
+        assert.deepEqual(request.postDataJSON(), { symbol: '005930', marketCountry: 'KR' });
+        body = { ok: true, name: '화면 검증용 삼성전자', market: 'KRX', openOrderCount: 0, accounts: [] };
+      }
       else if (url.pathname === '/api/functional-test') body = EMPTY_FUNCTIONAL_TEST_WORKSPACE;
       else if (url.pathname === '/api/search-presets') body = { schemaVersion: 1, presets: [] };
       else if (url.pathname === '/api/artifact-metadata') body = { items: {} };
@@ -130,17 +148,47 @@ try {
     });
     await page.goto(origin);
     await page.getByRole('heading', { name: '시작 점검', exact: true }).waitFor();
-    const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '실시간 감시', '계좌·잔고', '주문·체결', '실행 기록', '연결·설정', '주문 연결 시험'];
+    const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '실시간 감시', '계좌·잔고', '주문·체결', '실행 기록', '연결·설정'];
     assert.deepEqual(await page.locator('.nav-list .nav-item').allTextContents().then((items) => items.map((text) => text.trim())), navLabels);
-    for (const label of (process.env.CARD_ACCENT_ONLY==='1'?['시작 점검']:navLabels)) {
-      await page.locator('.nav-list').getByRole('button', { name: label, exact: true }).click();
+    for (const label of (process.env.CARD_ACCENT_ONLY === '1' ? ['시작 점검'] : [...navLabels, '주문 연결 시험'])) {
+      const parent = label === '주문 연결 시험' ? '실거래 운용' : label;
+      await page.locator('.nav-list').getByRole('button', { name: parent, exact: true }).click();
+      if (parent !== label) await page.getByRole('tab', { name: label, exact: true }).click();
       await page.getByRole('heading', { name: label, exact: true }).waitFor();
       await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
-      assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), label);
+      assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), parent);
+      assert.equal(await page.getByText('TradingView 추가 분석·차트', { exact: true }).count(), 0);
+      assert.equal(await page.getByText('토스증권 연결 확인', { exact: true }).count(), Number(label === '계좌·잔고'));
+      assert.equal(await page.getByRole('heading', { name: '저장된 일반 운용 진단', exact: true }).count(), Number(label === '실행 기록'));
+      if (label === '운용 전략' || label === '실거래 운용') {
+        await page.getByRole('button', { name: '기능 설명', exact: true }).click();
+        const help = page.getByRole('dialog', { name: label + ' 기능 설명' });
+        await help.getByRole('heading', { name: '주식 정규장·시간외 지원 범위' }).waitFor();
+        await help.getByRole('button', { name: '닫기', exact: true }).click();
+      }
       assert.equal(await page.locator('.live-page-purpose').count(), 0);
       if (await page.locator('.live-environment-bar').count()) assert.equal(await page.locator('.live-environment-bar').evaluate(element => getComputedStyle(element).backgroundImage), 'none');
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1);
       assert.equal(overflow, false, `${label} horizontal viewport overflow at ${viewport.width}`);
+      if (label === '계좌·잔고') {
+        const toss = page.locator('.live-toss-connection-check');
+        await toss.getByText('토스증권 연결 확인', { exact: true }).click();
+        await toss.getByRole('button', { name: '계좌 목록 조회 (주문 없음)', exact: true }).click();
+        await toss.getByLabel('토스에서 사용할 계좌').locator('option[value="1"]').waitFor({ state: 'attached' });
+        await toss.getByRole('button', { name: '계좌·종목 확인 (주문 없음)', exact: true }).click();
+        await toss.getByText('화면 검증용 삼성전자 · KRX · 미체결 0건', { exact: true }).waitFor();
+      }
+      if (label === '실행 기록') {
+        await page.getByText('기록 당시 미충족 1건 · 주의 0건 · 세부 기록 보기', { exact: true }).click();
+        await page.getByText('이전 준비 검사에서 확인한 문제', { exact: true }).waitFor();
+        await page.getByRole('combobox', { name: '기록 종류', exact: true }).selectOption('audit');
+        await page.getByRole('heading', { name: '기술 로그', exact: true }).waitFor();
+        assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), '실행 기록');
+      }
+      if (settingsReview && label !== '주문 연결 시험') {
+        report.views.push({ viewport: viewport.width, label, overflow });
+        continue;
+      }
       if(process.env.CARD_ACCENT_REVIEW==='1' && label==='시작 점검') {
     await page.evaluate(theme=>{document.documentElement.dataset.uiTheme=theme;},theme);
         report.selectedCards??=[];report.selectedCards.push(...await verifySelectedCards(page,'button.doctor-card','Live 점검 선택 카드'));
@@ -249,11 +297,6 @@ try {
         assert.equal(await page.locator('.three-way-reconciliation-panel').getByText('조회됨', { exact: true }).count(), 0);
         await page.locator('.three-way-reconciliation-panel').getByText('대조 미확인', { exact: true }).waitFor();
       }
-      if (label === '실행 기록') {
-        await page.getByRole('combobox', { name: '기록 종류', exact: true }).selectOption('audit');
-        await page.getByRole('heading', { name: '기술 로그', exact: true }).waitFor();
-        assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), '실행 기록');
-      }
       if (label === '주문 연결 시험') {
         await page.getByRole('button', {name:'기존 개별 연결 시험 열기',exact:true}).click();
         await page.getByText('비승급 · promotionEligible=false', { exact: true }).waitFor();
@@ -283,6 +326,11 @@ try {
     }
     assert.deepEqual(errors, [], 'no runtime errors');
     await context.close();
+  }
+  const tossCalls = report.apiRequests.filter(({ path }) => path.startsWith('/api/toss/') && !path.startsWith('/api/toss/operation/') );
+  if (process.env.CARD_ACCENT_ONLY !== '1') {
+    assert.equal(tossCalls.length, configurations.length * 2);
+    assert.ok(tossCalls.every(({ method, path }) => method === 'POST' && ['/api/toss/accounts', '/api/toss/prepare'].includes(path)));
   }
   assert.deepEqual(report.externalRequests, [], 'all requests stay in the fixture origin');
   assert.deepEqual(report.styles.flatMap(s=>s.fontFailures),[]);

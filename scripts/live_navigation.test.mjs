@@ -14,13 +14,14 @@ test('every old stored or diagnostic route remains addressable', () => {
 test('risk keeps its action tabs and both record routes share a single workspace', () => {
   assert.equal(liveNavigationRoot('risk'), 'automation');
   assert.equal(liveNavigationRoot('audit'), 'incidents');
-  assert.deepEqual(liveSectionTabs('risk').map(({ id, label }) => [id, label]), [['automation', '실행·중지'], ['risk', '한도·안전장치']]);
+  assert.deepEqual(liveSectionTabs('risk').map(({ id, label }) => [id, label]), [['automation', '실행·중지'], ['risk', '한도·안전장치'], ['functional-test', '주문 연결 시험']]);
   assert.deepEqual(liveSectionTabs('audit'), []);
   assert.deepEqual(liveSectionTabs('incidents'), []);
 });
 
-test('broker testing is neither a strategy phase nor an automatic runtime subtab', () => {
-  assert.equal(liveNavigationRoot('functional-test'), 'functional-test');
-  assert.deepEqual(liveSectionTabs('functional-test'), []);
-  assert.ok(liveSectionTabs('automation').every(({ id }) => id !== 'functional-test'));
+test('broker testing is reachable inside execution without becoming a strategy phase', () => {
+  assert.equal(liveNavigationRoot('functional-test'), 'automation');
+  assert.equal(liveNavigationRoute('functional-test'), 'functional-test');
+  assert.ok(liveSectionTabs('automation').some(({ id }) => id === 'functional-test'));
+  assert.deepEqual(liveSectionTabs('gate'), []);
 });

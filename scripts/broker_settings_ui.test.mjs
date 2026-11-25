@@ -233,14 +233,14 @@ test("obsolete live-lock settings are absent and reading never enables trading",
   } finally {view.unmount();}
 });
 
-test("Toss read-only connection check lives only in the Toss account panel", async () => {
+test("broker settings does not duplicate the Toss account lookup", async () => {
   setup();
   const view = harness();
   try {
     await view.settle();
-    assert.match(view.render(), /<div hidden=""><div data-toss-query="true">/);
-    assert.match(view.group("toss"), /<div><div data-toss-query="true">/);
-    assert.match(view.group("kis"), /<div hidden=""><div data-toss-query="true">/);
+    assert.doesNotMatch(view.render(), /data-toss-query/);
+    assert.doesNotMatch(view.group("toss"), /data-toss-query/);
+    assert.doesNotMatch(view.group("kis"), /data-toss-query/);
     assert.equal(calls.filter(call => call.method === "POST").length, 0);
   } finally { view.unmount(); }
 });
@@ -360,7 +360,7 @@ test("filled official fee defaults stay amber and unconfirmed despite stale brok
   assert.match(html, /공식 기본표 참고 임시값 · 본인 적용 수수료 확인 필요/);
   assert.match(html, /수수료 확인 필요/);
   assert.match(html, /KIS 시험 비용 상세/);
-  assert.match(html, /다른 거래소의 연결 상태와 별개/);
+  assert.match(html, /임시값을 저장해도 요율 확인은 완료되지 않습니다/);
   assert.doesNotMatch(html, /READY|설정 확인<\/span>/);
   for (const field of feeSettings().fields.filter((item) => item.key.startsWith("KIS_ESTIMATED_"))) {
     assert.equal(view.input(field.key).props.value, field.default, "default must be a real editable value");
@@ -484,6 +484,60 @@ test("missing required values remain CHECK after a valid settings response", asy
   assert.match(view.render(), /BLOCK/);
   assert.doesNotMatch(view.render(), /설정 확인<\/span>|READY/);
   view.unmount();
+});
+
+test("Toss credentials distinguish an entered draft, pending save, and protected storage", async () => {
+  const initial = settings();
+  initial.groups.push({ id: "toss", label: "토스증권" });
+  const keys = ["TOSS_CLIENT_ID", "TOSS_CLIENT_SECRET"];
+  for (const key of keys) {
+    initial.fields.push({ key, kind: "secret", group: "toss", label: key, detail: "fixture",
+      configured: false, required: true, value: "", default: "" });
+  }
+  initial.fields.push({ key: "DEFAULT_STOCK_BROKER", kind: "select", group: "toss",
+    label: "기본 증권사", detail: "fixture", value: "toss", default: "toss",
+    options: [{ value: "toss", label: "토스증권" }] });
+  setup({ ok: true, settings: initial });
+  const view = harness();
+  try {
+    await view.settle();
+    view.group("toss");
+    assert.equal(view.saveButton().props.disabled, true);
+    assert.match(view.render(), /저장할 변경 사항이 없습니다/);
+    for (const key of keys) {
+      view.edit(key, "fixture-value");
+      assert.match(renderToStaticMarkup(view.field(key)), /입력됨 · 저장 전/);
+    }
+    assert.equal(view.saveButton().props.disabled, false);
+    let release;
+    let notifyStarted;
+    const started = new Promise((resolve) => { notifyStarted = resolve; });
+    respond = () => new Promise((resolve) => { release = resolve; notifyStarted(); });
+    const pending = view.save();
+    await started;
+    try {
+      assert.match(view.render(), /저장 중…/);
+      assert.equal(view.saveButton().props.disabled, true);
+      assert.deepEqual(calls.at(-1).body, {
+        values: Object.fromEntries(keys.map((key) => [key, "fixture-value"])),
+        confirmed: false,
+      });
+      const acknowledged = structuredClone(initial);
+      acknowledged.fields.filter((field) => keys.includes(field.key)).forEach((field) => { field.configured = true; });
+      release(response({ ok: true, settings: acknowledged }));
+      await pending;
+      assert.match(view.render(), /live-assistant-save-row[^>]*>.*2개 설정을 저장했습니다/);
+      assert.equal(view.saveButton().props.disabled, true);
+      for (const key of keys) {
+        const field = renderToStaticMarkup(view.field(key));
+        assert.match(field, />저장됨<\/span>/);
+        assert.doesNotMatch(field, /입력됨 · 저장 전|fixture-value/);
+      }
+    } finally {
+      release(response({ ok: true, settings: initial }));
+      await pending;
+    }
+  } finally { view.unmount(); }
 });
 
 test("successful save uses returned values, clears secrets and blocks simultaneous submissions", async () => {

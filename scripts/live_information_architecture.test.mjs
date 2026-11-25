@@ -27,13 +27,12 @@ test("operator navigation follows the live decision sequence", () => {
     "주문·체결",
     "실행 기록",
     "연결·설정",
-    "주문 연결 시험",
   ]);
 
   const groups = between(appSource, "const navGroups = [", "function formatKeyValueMap");
   assert.match(groups, /label: "실거래", itemIds: \["overview", "gate", "automation", "monitor"\]/);
   assert.match(groups, /label: "조회", itemIds: \["accounts", "orders", "incidents"\]/);
-  assert.match(groups, /label: "관리", itemIds: \["settings", "functional-test"\]/);
+  assert.match(groups, /label: "관리", itemIds: \["settings"\]/);
   assert.match(appSource, /aria-current=\{selectedNavRoot === item\.id \? "page" : undefined\}/);
   assert.match(appSource, /<h1 id="live-page-title">\{title\}<\/h1>/);
   assert.match(appSource, /aria-labelledby="live-page-title"/);
@@ -56,6 +55,8 @@ test("operating events and technical records use one list, detail and filter wor
   assert.match(records, /snapshot\.technical_logs \?\? snapshot\.audit/);
   assert.match(records, /snapshot\.durable_audit \?\? snapshot\.audit_events/);
   assert.equal((records.match(/<AuditPanel/g) || []).length, 1);
+  assert.match(records, /!technical && snapshot\.doctor_diagnostics\?\.latest/);
+  assert.match(records, /<DoctorHistoryPanel/);
   const audit = between(appSource, "function AuditPanel", "const AUDIT_PAYLOAD_SECRET_KEY");
   assert.match(audit, /aria-label="기록 종류"/);
   assert.match(audit, /onRecordTypeChange\(event\.currentTarget\.value\)/);
@@ -99,7 +100,11 @@ test("default pages prioritize decisions and move technical evidence into disclo
   assert.match(risk, /title="리스크 정책·재시도·선물 계산"/);
 
   assert.ok(settings.indexOf("BrokerConnectionAssistant") < settings.indexOf("CompactDisclosure"));
-  assert.ok(settings.indexOf("DoctorHistoryPanel") < settings.indexOf("CompactDisclosure"));
+  assert.doesNotMatch(settings, /DoctorHistoryPanel|TossConnectionCheck|StockSessionGuide|ExternalResearchPanel/);
+  assert.doesNotMatch(appSource, /TradingView|ExternalResearchPanel/);
+  const accountWorkspace = between(workspace, 'if (selectedNav === "accounts")', 'if (selectedNav === "orders")');
+  assert.match(accountWorkspace, /<TossConnectionCheck onSave=\{onEnvSettings\}/);
+  assert.match(appSource, /<FeatureHelp[^>]*>[\s\S]*?<StockSessionGuide \/>[\s\S]*?<\/FeatureHelp>/);
   assert.match(settings, /title="화면·레이아웃·Telegram"/);
 
   const overview = between(appSource, "function OperationsOverviewPage", "function RuntimeComponentStatusPanel");

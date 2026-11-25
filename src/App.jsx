@@ -1,7 +1,7 @@
 import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel, diagnosticSafetyContext, preflightCheckPresentation, ordinarySafetyPresentation } from "./diagnosticPresentation.js";
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
 import { FeatureHelp } from "./FeatureHelp.jsx";
-import ExternalResearchPanel, { TossConnectionCheck } from "./ExternalResearchPanel.jsx";
+import TossConnectionCheck from "./TossConnectionCheck.jsx";
 import { StockSessionGuide } from "./components/StockSessionGuide.jsx";
 import TossCashOperationPanel from "./TossCashOperationPanel.jsx";
 import ReconciliationChanges from "./ReconciliationChanges.jsx";
@@ -29,7 +29,6 @@ import {
   Clock3,
   Download,
   FileClock,
-  FlaskConical,
   LayoutDashboard,
   ListChecks,
   Lock,
@@ -207,7 +206,6 @@ const navItems = [
   { id: "orders", label: "주문·체결", icon: FileClock },
   { id: "incidents", label: "실행 기록", icon: FileClock },
   { id: "settings", label: "연결·설정", icon: Settings },
-  { id: "functional-test", label: "주문 연결 시험", icon: FlaskConical },
 ];
 
 const pageProfiles = {
@@ -237,7 +235,8 @@ const pageProfiles = {
   accounts: {
     title: "계좌·잔고",
     eyebrow: "BROKER TRUTH",
-    summary: "거래소에서 읽은 잔고·체결 내역과 프로그램 기록을 비교하고 차이가 난 이유를 확인합니다.",
+    summary: "거래소에서 읽은 잔고·체결과 프로그램 기록을 비교합니다.",
+    details: ["토스증권 연결 확인에서 계좌 목록과 종목을 조회할 수 있습니다. Client ID와 Secret은 연결·설정에서 저장합니다."],
   },
   orders: {
     title: "주문·체결",
@@ -268,11 +267,7 @@ const pageProfiles = {
   settings: {
     title: "연결·설정",
     eyebrow: "BROKER & RUNTIME",
-    summary: "화면 설정, 증권사·거래소 연결, Telegram 알림과 프로그램 자체 검사를 관리합니다.",
-    details: [
-      "브로커 실계좌 연결에서 주식/ETF 또는 거래소 탭을 열어 항목을 확인합니다. 토스증권 연결 검사는 별도 카드에서 할 수 있습니다.",
-      "TradingView는 보조 분석과 차트 확인에 사용합니다.",
-    ],
+    summary: "증권사·거래소의 API 설정과 화면·알림을 관리합니다.",
   },
 };
 
@@ -2499,8 +2494,8 @@ function App() {
   }
 
   const selectedNavRoot = liveNavigationRoot(selectedNav);
-  const title = navItems.find((item) => item.id === selectedNavRoot)?.label ?? "시작 점검";
   const pageHelp = pageProfiles[selectedNav === "audit" ? "incidents" : selectedNav] ?? pageProfiles.overview;
+  const title = selectedNav === "functional-test" ? pageHelp.title : navItems.find((item) => item.id === selectedNavRoot)?.label ?? "시작 점검";
   const selectedStrategy = deploymentOptions.find((option) => option.id === selectedDeploymentId)?.strategy
     || deploymentOptions[0]?.strategy
     || null;
@@ -2574,7 +2569,9 @@ function App() {
             <div className="topbar-title-block">
               <h1 id="live-page-title">{title}</h1>
             </div>
-            {selectedNav !== "monitor" && <FeatureHelp key={selectedNav} title={pageHelp.title} description={pageHelp.summary} details={pageHelp.details} />}
+            {selectedNav !== "monitor" && <FeatureHelp key={selectedNav} title={pageHelp.title} description={pageHelp.summary} details={pageHelp.details}>
+              {["gate", "automation"].includes(selectedNav) && <StockSessionGuide />}
+            </FeatureHelp>}
           </div>
           <div className="topbar-actions">
             {(selectedNav !== "functional-test" || shortLiveHeader) && <>
@@ -2721,7 +2718,7 @@ function App() {
           onAccountRefresh={refreshBrokerAccounts}
           accountRefreshState={accountRefreshState}
           onReconciliationReview={(payload) => runAction(() => submitReconciliationReview(payload), { preserveSnapshotWithoutPayload: true })}
-          onEnvSettings={(values, confirmed) => runAction(() => saveEnvSettings(values, confirmed))}
+          onEnvSettings={(values, confirmed) => runAction(() => saveEnvSettings(values, confirmed), { preserveSnapshotWithoutPayload: true })}
           appearance={appearance}
           updateAppearance={updateAppearance}
           layoutMode={layoutMode}
@@ -3020,6 +3017,7 @@ function WorkspaceContent({
           observation={accountObservationView(snapshot, accountRefreshState, accountNowMs)}
           nowMs={accountNowMs}
         />
+        <TossConnectionCheck onSave={onEnvSettings} />
       </section>,
     );
   }
@@ -3082,9 +3080,6 @@ function WorkspaceContent({
     return renderPage(
       <section className="settings-page-layout ts-layout-stack">
         <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} runtimeSnapshot={snapshot} onSave={onEnvSettings} />
-        <StockSessionGuide />
-        <ExternalResearchPanel />
-        <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
         <CompactDisclosure
           title="화면·레이아웃·Telegram"
           description="거래 연결과 직접 관계없는 개인화·알림 설정은 필요할 때만 엽니다."
@@ -3637,11 +3632,14 @@ function IncidentAuditWorkspace({ snapshot, recordType, onRecordTypeChange }) {
         recordType={recordType}
         title={technical ? "기술 로그" : "감사 이벤트"}
       />
+      {!technical && snapshot.doctor_diagnostics?.latest && (
+        <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} />
+      )}
     </section>
   );
 }
 
-function DoctorHistoryPanel({ diagnostics = {}, onNavigate }) {
+function DoctorHistoryPanel({ diagnostics = {} }) {
   const record = doctorHistoryPresentation(diagnostics);
   const date = Date.parse(record.timestamp);
   const recordedAt = Number.isFinite(date) ? new Date(date).toLocaleString("ko-KR") : "미실행";
@@ -3661,7 +3659,6 @@ function DoctorHistoryPanel({ diagnostics = {}, onNavigate }) {
           {!record.issues.length && <EmptyRow text="기록 당시 미충족 항목이 없었습니다. 현재 실행 준비는 별도 점검합니다." />}
         </div>
       </details> : <EmptyRow text="저장된 일반 운용 진단이 없습니다." />}
-      <div className="panel-action-line"><button className="secondary-button" type="button" onClick={() => onNavigate("overview")}>현재 일반 운용 조건 보기</button><button className="secondary-button" type="button" onClick={() => onNavigate("functional-test")}>주문 연결 시험 준비로 이동</button></div>
     </section>
   );
 }
@@ -4948,7 +4945,7 @@ function NotificationPanel({ items, onNavigate }) {
 const navGroups = [
   { id: "prepare", label: "실거래", itemIds: ["overview", "gate", "automation", "monitor"] },
   { id: "operate", label: "조회", itemIds: ["accounts", "orders", "incidents"] },
-  { id: "manage", label: "관리", itemIds: ["settings", "functional-test"] },
+  { id: "manage", label: "관리", itemIds: ["settings"] },
 ];
 
 function formatKeyValueMap(values = {}) {
@@ -5172,12 +5169,16 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
     updateDraft("SHORT_LIVE_KIS_COST_OBSERVED_AT", `${localTime}${offsetMinutes >= 0 ? "+" : "-"}${offsetHours}:${offsetRemainder}`);
   }
 
+  const canSaveConnection = settingsReady && (activeGroup !== "toss" || dirtyCount > 0) && typeof onSave === "function";
+
   async function handleSave() {
-    if (!settingsReady || saveInFlight.current || typeof onSave !== "function") return;
+    if (!canSaveConnection || saveInFlight.current) return;
     const values = {};
     visibleFields.forEach((field) => {
       const value = draft[field.key];
       if (field.kind === "secret" && !String(value || "").trim()) return;
+      if (activeGroup === "toss" && field.kind !== "secret"
+        && String(value ?? "") === String(field.value ?? field.default ?? "")) return;
       values[field.key] = value ?? "";
     });
     if (!Object.keys(values).length) return;
@@ -5187,8 +5188,10 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
     try {
       const result = await onSave(values, false);
       const saved = responseSettings(result);
-      if (!saved || visibleFields.some((field) => !saved.fields.some((next) =>
-        next.key === field.key && next.group === field.group && next.kind === field.kind))) {
+      if (!saved || visibleFields.some((field) => !saved.fields.some((next) => {
+        if (next.key !== field.key || next.group !== field.group || next.kind !== field.kind) return false;
+        return activeGroup !== "toss" || field.kind !== "secret" || !Object.hasOwn(values, field.key) || next.configured === true;
+      }))) {
         setSettingsStatus("error");
         setMessage(typeof result?.reason === "string" && result.reason
           ? result.reason : "저장 결과를 확인하지 못했습니다. 설정을 다시 확인하세요.");
@@ -5202,7 +5205,9 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
         });
         return next;
       });
-      setMessage(`${Object.keys(values).length}개 설정을 저장했습니다.${confirmationRequired ? " 임시 수수료는 계속 확인이 필요합니다." : ""}`);
+      const nextStep = activeGroup === "toss" ? " 계좌·잔고에서 토스증권 연결을 확인하세요."
+        : confirmationRequired ? " 임시 수수료는 계속 확인이 필요합니다." : "";
+      setMessage(`${Object.keys(values).length}개 설정을 저장했습니다.${nextStep}`);
     } catch (error) {
       setSettingsStatus("error");
       setMessage(error instanceof Error ? error.message : "설정 저장에 실패했습니다. 설정을 다시 확인하세요.");
@@ -5222,7 +5227,11 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
       <NestedTabs
         ariaLabel="실거래 연결 설정"
         className="internal-tabs live-assistant-tabs"
-        onChange={setActiveGroup}
+        onChange={(group) => {
+          if (saveInFlight.current) return;
+          setActiveGroup(group);
+          if (settingsStatus === "ready") setMessage("");
+        }}
         options={groups.map((group) => ({ id: group.id, label: group.label, title: group.detail }))}
         variant="cards"
         value={activeGroup}
@@ -5242,8 +5251,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
       {settingsReady && confirmationRequired && (
         <div {...semanticSurfaceProps("warning", "live-assistant-provisional-note")} role="note">
           <strong>공식 기본표 참고 임시값 · 본인 적용 수수료 확인 필요</strong>
-          <p>국내 주식·ETF와 미국 주식의 수수료 추정값입니다. 값을 저장하거나 수정해도 본인 계좌의 실제 요율 확인이 완료되지는 않습니다.</p>
-          <p>본인 계좌 요율은 ‘KIS 시험 비용 상세’에서 확인합니다. 다른 거래소의 연결 상태와 별개입니다.</p>
+          <p>본인 계좌의 요율을 확인한 뒤 ‘KIS 시험 비용 상세’에 입력하세요. 임시값을 저장해도 요율 확인은 완료되지 않습니다.</p>
         </div>
       )}
       {settingsReady && diagnostic && (
@@ -5253,7 +5261,7 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
           ))}
         </div>
       )}
-      {message && <p className="workflow-copy" role="status">{message}</p>}
+      {!settings && message && <p className="workflow-copy" role="status">{message}</p>}
       {settingsStatus === "error" && (
         <button className="secondary-button compact-button" disabled={saving} onClick={() => setLoadAttempt((attempt) => attempt + 1)} type="button">
           설정 다시 확인
@@ -5263,8 +5271,8 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
         <summary className="ts-disclosure-summary">
           <span className="ts-disclosure-copy">
             <strong className="ts-disclosure-title">API·계좌 설정 더보기</strong>
-            <span className="ts-disclosure-hint">{settingsStatus === "error" ? "설정을 읽지 못했습니다. 다시 확인한 뒤 연결 정보를 점검하세요."
-                : settingsReady ? `${visibleFields.length}개 설정 · ${checkCount ? `확인 필요 ${checkCount}개` : "저장 설정 확인됨"}${dirtyCount ? ` · 저장 전 변경 ${dirtyCount}개` : ""} · 연결 정보를 바꿀 때만 여세요.` : "설정 정보를 기다리는 중입니다."}</span>
+            <span className="ts-disclosure-hint">{settingsStatus === "error" ? (settings ? "저장 결과를 다시 확인하세요." : "설정을 읽지 못했습니다. 다시 확인하세요.")
+                : settingsReady ? `${visibleFields.length}개 설정 · ${checkCount ? `확인 필요 ${checkCount}개` : "저장됨"}${dirtyCount ? ` · 미저장 ${dirtyCount}개` : ""}` : "설정 정보를 기다리는 중입니다."}</span>
           </span>
         </summary>
         <div className="ts-disclosure-body">
@@ -5275,7 +5283,10 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
         {section.fields.map((field) => {
           const value = draft[field.key] ?? "";
           const status = assistantFieldStatus(field, value);
-          const fieldTone = status === "done" ? "success" : status === "block" ? "danger" : status === "confirm" ? "warning" : "neutral";
+          const unsavedSecret = field.kind === "secret" && Boolean(String(value).trim());
+          const fieldTone = unsavedSecret ? "warning" : status === "done" ? "success" : status === "block" ? "danger" : status === "confirm" ? "warning" : "neutral";
+          const fieldStatus = unsavedSecret ? "입력됨 · 저장 전" : field.kind === "secret" && field.configured ? "저장됨"
+            : status === "done" ? "DONE" : status === "block" ? "BLOCK" : status === "confirm" ? "확인 필요" : "WAIT";
           const boolChecked = field.kind === "bool" && settingsBooleanValue(value);
           return (
             <label
@@ -5324,23 +5335,24 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
                   value={String(value)}
                 />
               )}
-              <StatusPill tone={fieldTone}>{status === "done" ? "DONE" : status === "block" ? "BLOCK" : status === "confirm" ? "확인 필요" : "WAIT"}</StatusPill>
+              <StatusPill tone={fieldTone}>{fieldStatus}</StatusPill>
             </label>
           );
         })}
       </div>
       </details>)}
-      <div className="live-assistant-save-row">
-        <button className="primary-button compact-button" disabled={saving || !settingsReady || typeof onSave !== "function"} onClick={handleSave} type="button">
+      <div className="live-assistant-save-row" aria-busy={saving}>
+        <button className="primary-button compact-button" disabled={saving || !canSaveConnection} onClick={handleSave} type="button">
           <Save size={16} />
-          연결 설정 저장
+          {saving ? "저장 중…" : "연결 설정 저장"}
         </button>
+        <p className="workflow-copy" role="status">
+          {settings && message ? message : activeGroup === "toss" && settingsReady && !saving && !dirtyCount
+            ? "저장할 변경 사항이 없습니다." : null}
+        </p>
       </div>
         </div>
       </details>
-      <div hidden={activeGroup !== "toss"}>
-        <TossConnectionCheck onSave={onSave} />
-      </div>
     </section>
   );
 }

@@ -22,7 +22,7 @@ const tabs = [
     requiredHeadings: ["브로커 실계좌 연결", "설정·Runtime 자체 검사"],
     forbiddenHeadings: ["Secret 보호 상태", "브로커 Capability", "어댑터 인터페이스 계약", "브로커 준비 항목"],
   },
-  { label: "주문 연결 시험", requiredHeadings: ["KIS 기간형 기능시험", "시험 대상과 기간", "기간과 활성화 상태", "현재 실제 적용 한도", "현재 차단 항목"] },
+  { label: "주문 연결 시험", parent: "실거래 운용", requiredHeadings: ["KIS 기간형 기능시험", "시험 대상과 기간", "기간과 활성화 상태", "현재 실제 적용 한도", "현재 차단 항목"] },
 ];
 const expectedNavigationLabels = tabs.filter((tab) => !tab.parent).map((tab) => tab.label);
 const issues = [];

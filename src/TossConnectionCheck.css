@@ -1,0 +1,15 @@
+.live-toss-connection-check { padding: 18px; }
+.live-toss-connection-check > summary { cursor: pointer; }
+.live-toss-connection-check .toss-connection-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+.live-toss-connection-check .toss-connection-fields label { display: grid; gap: 6px; min-width: 0; }
+.live-toss-connection-check .toss-connection-fields input,
+.live-toss-connection-check .toss-connection-fields select { width: 100%; min-width: 0; }
+.live-toss-connection-check .button-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.live-toss-connection-check button { min-height: 40px; }
+.live-toss-connection-check .toss-connection-error { color: var(--danger-text); }
+.live-toss-connection-check .toss-connection-success { color: var(--success-text); }
