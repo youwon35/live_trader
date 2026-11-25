@@ -14,8 +14,15 @@
 .toss-cash-stats { display: flex; flex-wrap: wrap; gap: 16px; margin: 16px 0; }
 .toss-cash-stats b { margin-left: 6px; }
 .toss-cash-good { color: var(--success-text,#218376); }
-.toss-cash-panel .toss-cash-error { color: var(--moa-status-danger, var(--danger-text, #b42318)); overflow-wrap: anywhere; }
-.toss-cash-panel .toss-cash-warning { color: var(--moa-status-warning, var(--warning-text, #8a5a00)); }
+:root[data-ui-theme] #root .toss-cash-panel .toss-cash-error,
+:root[data-ui-theme] #root .toss-cash-panel .toss-cash-error > :is(strong, b) {
+  color: var(--moa-status-danger, var(--danger-text, #b42318)) !important;
+  overflow-wrap: anywhere;
+}
+:root[data-ui-theme] #root .toss-cash-panel .toss-cash-warning,
+:root[data-ui-theme] #root .toss-cash-panel .toss-cash-warning > strong {
+  color: var(--moa-status-warning, var(--warning-text, #8a5a00)) !important;
+}
 .toss-cash-panel .toss-cash-issue {
   margin-block: 10px;
   padding: 8px 10px;
