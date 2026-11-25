@@ -113,7 +113,7 @@ import { livePollingIntervals } from "./polling";
 import { executionApprovalLabel, strategyLifecycleRank } from "../../../packages/design/strategy-progress.js";
 import { readArtifactLifecycle } from "../../../packages/design/artifact-lifecycle.js";
 import { buildLiveStrategyProgress, liveDeploymentLifecycleLabel, liveStrategyLifecycleStage, liveStrategyValidationStage, liveStrategyPhaseFilter, liveStrategyPhaseId, liveStrategyPhaseLabel, liveStrategyPhaseOptions, liveStrategyProgressLabel, liveRuntimeModeLabel } from "./strategyProgressDisplay.js";
-import { LIVE_WORKSPACE_ROUTE_IDS, liveNavigationRoot, liveNavigationRoute, liveSectionTabs } from "./liveNavigation.js";
+import { liveNavigationRoot, liveNavigationRoute, liveSectionTabs } from "./liveNavigation.js";
 import { liveReconciliationDisplay, liveExecutionDisplay, liveLedgerDisplay, liveReconciliationIssues, liveBrokerBalanceDisplay } from "./liveReconciliationDisplay.js";
 import {
   buildRetryMatrix,
@@ -142,7 +142,6 @@ import {
   formatBarCountdown,
   nextClosedBarSummary,
 } from "../../../packages/design/bar-schedule.js";
-import { readGuidedFlowStep, writeGuidedFlowStep } from "../../../packages/design/guided-flow.js";
 import {
   LAYOUT_RESIZE_DIRECTIONS,
   applyLayoutTransformOffset,
@@ -1853,8 +1852,6 @@ function useEditablePanels(rootRef) {
 applyAppearance(readAppearance());
 applyLayoutMode(readLayoutMode());
 
-const LIVE_FLOW_STORAGE_KEY = "live_trader.guidedFlow.v1";
-const LIVE_FLOW_IDS = LIVE_WORKSPACE_ROUTE_IDS;
 const DEPLOYMENT_CONTEXT_STORAGE_KEY = "live_trader.deploymentContext.v1";
 function strategyDeploymentContext(strategy = null) {
   if (!strategy) {
@@ -1910,7 +1907,7 @@ function App() {
   const startup = useStartupProgress();
   const [preferencesAttempt, setPreferencesAttempt] = useState(0);
   const [snapshot, setSnapshot] = useState(fallbackSnapshot);
-  const [selectedNav, setSelectedNav] = useState(() => readGuidedFlowStep(LIVE_FLOW_STORAGE_KEY, LIVE_FLOW_IDS, "overview"));
+  const [selectedNav, setSelectedNav] = useState("overview");
   const [loading, setLoading] = useState(false);
   const [snapshotRefreshing, setSnapshotRefreshing] = useState(false);
   const [connectionError, setConnectionError] = useState("");
@@ -1937,6 +1934,7 @@ function App() {
   const snapshotResponseGateRef = useRef(null);
   if (!snapshotResponseGateRef.current) snapshotResponseGateRef.current = createSnapshotResponseGate();
   const accountRefreshRequestRef = useRef(null);
+  const startupSnapshotVerified = useRef(false);
   const startupAccountReadRef = useRef(null);
   if (!startupAccountReadRef.current) startupAccountReadRef.current = createStartupAccountRead();
   const snapshotSafetyEpochRef = useRef(0);
@@ -2004,6 +2002,7 @@ function App() {
         if (safetyEpoch !== snapshotSafetyEpochRef.current || !snapshotResponseGateRef.current.accept(responseToken, next)) return;
         setSnapshot({ ...next, api_connected: true });
         setConnectionError("");
+        startupSnapshotVerified.current = true;
         startup.finish("connection", true, "프로그램 서버 응답을 확인했습니다.");
         const strategyRead = startupStrategyObservation(next);
         startup.finish("strategies", strategyRead.ok, strategyRead.detail, strategyRead);
@@ -2015,6 +2014,10 @@ function App() {
         setSnapshot((current) => disconnectedSnapshot(nativeEmergency, current));
         setConnectionError(err instanceof Error ? err.message : "API 연결 실패");
         startup.finish("connection", false, "프로그램 서버 응답을 확인하지 못했습니다. 다시 읽거나 연결 상태를 확인하세요.");
+        if (!startupSnapshotVerified.current) {
+          startup.finish("strategies", false, "서버 연결 후 전략 목록을 확인할 수 있습니다.");
+          startup.finish("accounts", false, "서버 연결 후 계좌·잔고를 확인할 수 있습니다.", { route: "settings" });
+        }
       } finally {
         setSnapshotRefreshing(false);
       }
@@ -2304,7 +2307,6 @@ function App() {
 
   function navigateWorkspace(navId) {
     const route = liveNavigationRoute(navId);
-    writeGuidedFlowStep(LIVE_FLOW_STORAGE_KEY, route);
     setSelectedNav(route);
     setNotificationsOpen(false);
   }
@@ -2642,7 +2644,7 @@ function App() {
           </div>
         </header>
 
-        {selectedNav === "overview" && <StartupProgress view={startup} onRetryConnection={refresh} onRetryPreferences={() => setPreferencesAttempt(value => value + 1)} onRetryAccounts={refreshBrokerAccounts} onNavigate={navigateWorkspace} />}
+        {selectedNav === "overview" && <StartupProgress view={startup} onRetryConnection={refresh} onRetryPreferences={() => setPreferencesAttempt(value => value + 1)} onRetryAccounts={snapshot.api_connected ? refreshBrokerAccounts : undefined} onNavigate={navigateWorkspace} />}
         {["functional-test", "monitor"].includes(selectedNav) ? null : (
           <LiveEnvironmentBar
             context={deploymentContext}

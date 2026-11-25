@@ -4,11 +4,11 @@
 .startup-progress-actions b{font-size:22px;font-variant-numeric:tabular-nums;color:var(--moa-status-info,#3975dc)}
 .startup-progress progress{display:block;width:100%;height:7px;margin:12px 0;accent-color:var(--moa-status-success,#21a675)}
 .startup-progress ol{list-style:none;margin:0;padding:0;display:grid;gap:8px}
-.startup-progress li{padding:8px 0;border-bottom:1px solid var(--border,#dce5e7);font-size:14px}
+.startup-progress li{padding:10px 8px;border-bottom:1px solid var(--border,#dce5e7);font-size:14px}
 .startup-progress li>div>span{margin-right:auto}.startup-progress li strong{font-size:13px;color:var(--muted,#5b7181)}
 .startup-progress li[data-status=done] strong{color:var(--moa-status-success,#21a675)}
 .startup-progress li[data-status=failed] strong,.startup-progress.is-failed .startup-progress-actions b{color:var(--moa-status-danger,#ef4444)}
 .startup-progress li[data-status=review] strong,.startup-progress.is-review .startup-progress-actions b{color:var(--moa-status-warning,#a16207)}
 .startup-progress li[data-status=running] strong{color:var(--moa-status-info,#3975dc)}
-.startup-progress small{display:block;margin-top:10px;font-size:12px;line-height:1.6;color:var(--muted,#5b7181)}
+.startup-progress small{display:block;margin-top:10px;padding-inline:8px;font-size:12px;line-height:1.6;color:var(--muted,#5b7181)}
 @media(max-width:720px){.startup-progress{padding:12px}.startup-progress-heading{align-items:flex-start}.startup-progress-actions{gap:8px}}

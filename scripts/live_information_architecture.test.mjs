@@ -40,7 +40,8 @@ test("operator navigation follows the live decision sequence", () => {
 });
 
 test("merged sections preserve old routes and keep broker testing separate from promotion", () => {
-  assert.match(appSource, /const LIVE_FLOW_IDS = LIVE_WORKSPACE_ROUTE_IDS/);
+  assert.match(appSource, /const \[selectedNav, setSelectedNav\] = useState\("overview"\)/);
+  assert.doesNotMatch(appSource, /readGuidedFlowStep/);
   assert.match(appSource, /const route = liveNavigationRoute\(navId\)/);
   assert.match(appSource, /liveSectionTabs\(selectedNav\)/);
   assert.match(appSource, /<NestedTabs ariaLabel=.*? options=\{sectionTabs\} value=\{selectedNav\} onChange=\{onNavigate\}/);
