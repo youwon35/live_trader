@@ -52,7 +52,7 @@ test('actual App wiring observes existing reads without adding broker polling or
  assert.match(app,/startup\.finish\("preferences", true/);
  assert.match(app,/startupStrategyObservation\(next\)/);
  assert.match(app,/selectedNav === "overview" && <StartupProgress[^\n]+onNavigate=\{navigateWorkspace\}/);
- assert.match(app,/onRetryAccounts=\{refreshBrokerAccounts\}/);
+ assert.match(app,/onRetryAccounts=\{snapshot\.api_connected \? refreshBrokerAccounts : undefined\}/);
  assert.match(app,/startupAccountReadRef\.current\(snapshot\.api_connected === true, refreshBrokerAccounts\)/);
  assert.doesNotMatch(jsx,/\/api\/|fetch\(|startShortLive|onStart|onConfirm|killSwitch/);
 });
