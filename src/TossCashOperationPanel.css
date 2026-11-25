@@ -14,7 +14,15 @@
 .toss-cash-stats { display: flex; flex-wrap: wrap; gap: 16px; margin: 16px 0; }
 .toss-cash-stats b { margin-left: 6px; }
 .toss-cash-good { color: var(--success-text,#218376); }
-.toss-cash-error { color: var(--danger-text,#dc3545); overflow-wrap: anywhere; }
+.toss-cash-panel .toss-cash-error { color: var(--moa-status-danger, var(--danger-text, #b42318)); overflow-wrap: anywhere; }
+.toss-cash-panel .toss-cash-warning { color: var(--moa-status-warning, var(--warning-text, #8a5a00)); }
+.toss-cash-panel .toss-cash-issue {
+  margin-block: 10px;
+  padding: 8px 10px;
+  border-inline-start: 3px solid currentColor;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  overflow-wrap: anywhere;
+}
 .toss-cash-panel button { min-height: 40px; }
 .toss-cash-watch { overflow-x: auto; }
 .toss-cash-watch table { width: 100%; border-collapse: collapse; font-size: 13px; }
