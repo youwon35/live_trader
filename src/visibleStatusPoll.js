@@ -1,6 +1,6 @@
 // Controls display reads only. Runtime workers and terminal observers stay alive.
 export function createVisibleStatusPoll({ refresh, activeView = true, observationRequired = false,
-  intervalMs = 5000, visibility = document, timers = window, invalidate = () => {} }) {
+  intervalMs = 5000, readOnStart = true, visibility = document, timers = window, invalidate = () => {} }) {
   let timer = null;
   let flight = null;
   let disposed = false;
@@ -13,7 +13,7 @@ export function createVisibleStatusPoll({ refresh, activeView = true, observatio
     flight = Promise.resolve().then(refresh).catch(() => {}).finally(() => { flight = null; });
     return flight;
   }
-  function sync(catchUp = false) {
+  function sync(catchUp = false, readOnResume = true) {
     if (disposed) return;
     if (!wanted()) {
       if (timer !== null) timers.clearInterval(timer);
@@ -24,7 +24,7 @@ export function createVisibleStatusPoll({ refresh, activeView = true, observatio
     if (timer === null) {
       timer = timers.setInterval(read, Math.max(1000, intervalMs));
       invalidate();
-      void read();
+      if (readOnResume) void read();
     } else if (catchUp) {
       invalidate();
       void read();
@@ -32,7 +32,7 @@ export function createVisibleStatusPoll({ refresh, activeView = true, observatio
   }
   const visibilityChanged = () => sync(visible() && view);
   visibility.addEventListener("visibilitychange", visibilityChanged);
-  sync();
+  sync(false, readOnStart);
   return {
     update(next) {
       const returnedToView = !view && next.activeView;

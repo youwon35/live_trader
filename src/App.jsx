@@ -110,6 +110,7 @@ import {
   shouldHydrateRiskStrategy,
 } from "./futuresRiskSimulator";
 import { livePollingIntervals } from "./polling";
+import { createVisibleStatusPoll } from "./visibleStatusPoll.js";
 import { executionApprovalLabel, strategyLifecycleRank } from "../../../packages/design/strategy-progress.js";
 import { readArtifactLifecycle } from "../../../packages/design/artifact-lifecycle.js";
 import { buildLiveStrategyProgress, liveDeploymentLifecycleLabel, liveStrategyLifecycleStage, liveStrategyValidationStage, liveStrategyPhaseFilter, liveStrategyPhaseId, liveStrategyPhaseLabel, liveStrategyPhaseOptions, liveStrategyProgressLabel, liveRuntimeModeLabel } from "./strategyProgressDisplay.js";
@@ -2069,11 +2070,8 @@ function App() {
   useEffect(() => { void refresh(); }, []);
 
   useEffect(() => {
-    const refreshWhenVisible = () => {
-      if (document.visibilityState !== "hidden") refresh();
-    };
-    const timer = window.setInterval(refreshWhenVisible, pollingIntervals.snapshotMs);
-    return () => window.clearInterval(timer);
+    const poll = createVisibleStatusPoll({ refresh, intervalMs: pollingIntervals.snapshotMs, readOnStart: false });
+    return () => poll.dispose();
   }, [pollingIntervals.snapshotMs]);
 
   useEffect(() => {
@@ -2515,8 +2513,11 @@ function App() {
   const deploymentContext = strategyDeploymentContext(selectedStrategy);
   const selectedRuntimeMode = runtimeModeForDeployment(snapshot, deploymentContext);
   const shortLiveHeader = shortLiveHeaderState(snapshot);
-  const notifications = buildNotificationItems(snapshot, [connectionError, error, accountRefreshState.error && `계좌 갱신: ${accountRefreshState.error}`].filter(Boolean).join(" · "));
-  const notificationKey = notificationFingerprint(notifications);
+  const notifications = useMemo(
+    () => buildNotificationItems(snapshot, [connectionError, error, accountRefreshState.error && `계좌 갱신: ${accountRefreshState.error}`].filter(Boolean).join(" · ")),
+    [snapshot, connectionError, error, accountRefreshState.error],
+  );
+  const notificationKey = useMemo(() => notificationFingerprint(notifications), [notifications]);
   const unreadNotificationCount = notificationKey && notificationKey !== acknowledgedNotifications ? notifications.filter((item) => item.id !== "clear").length : 0;
 
   return (
@@ -4587,7 +4588,8 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
   const [running, setRunning] = useState(false);
   const [hasRun, setHasRun] = useState(false);
   const [selectedDoctorId, setSelectedDoctorId] = useState(null);
-  const items = buildDoctorItems(snapshot, selectedDeploymentId);
+  const doctorInFlight = useRef(false);
+  const items = running ? [] : buildDoctorItems(snapshot, selectedDeploymentId);
   const categorySummary = doctorCategorySummary(items);
   const problemCount = items.filter((item) => item.tone !== "success").length;
   const failCount = items.filter((item) => item.tone === "danger").length;
@@ -4596,6 +4598,8 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
   const selectedItem = visibleItems.find((item) => item.id === selectedDoctorId) ?? visibleItems[0] ?? null;
 
   async function runDoctor() {
+    if (doctorInFlight.current) return;
+    doctorInFlight.current = true;
     setRunning(true);
     setHasRun(false);
     try {
@@ -4604,6 +4608,7 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
       await onPreflight();
       setHasRun(true);
     } finally {
+      doctorInFlight.current = false;
       setRunning(false);
     }
   }
@@ -4872,7 +4877,7 @@ function buildDoctorItems(snapshot = {}, selectedDeploymentId = "", now = Date.n
 }
 
 function PageView({ selectedNav, onNavigate, snapshot, searchQuery, children }) {
-  const searchResults = buildSearchResults(snapshot, searchQuery);
+  const searchResults = useMemo(() => buildSearchResults(snapshot, searchQuery), [snapshot, searchQuery]);
   const sectionTabs = liveSectionTabs(selectedNav);
 
   return (

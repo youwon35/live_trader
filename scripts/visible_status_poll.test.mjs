@@ -26,6 +26,21 @@ test("idle tab navigation pauses reads and catches up once without unmounting", 
   assert.equal(f.reads,2); assert.equal(f.callbacks.size,1);
   f.poll.dispose(); assert.equal(f.callbacks.size,0); assert.equal(f.listeners.size,0);
 });
+test("initial full snapshot owns the first read; visibility return still catches up immediately", async () => {
+  const f = fixture({readOnStart:false});
+  await flush();
+  assert.equal(f.reads, 0);
+  assert.equal(f.callbacks.size, 1);
+  f.hide(true);
+  assert.equal(f.callbacks.size, 0);
+  for (let i = 0; i < 4; i++) f.tick();
+  await flush();
+  assert.equal(f.reads, 0);
+  f.hide(false);
+  await flush();
+  assert.equal(f.reads, 1);
+  f.poll.dispose();
+});
 test("background idle window pauses and foreground restores one current read", async () => {
   const f=fixture(); await flush(); f.hide(true); f.tick(); await flush();
   assert.equal(f.reads,1); f.hide(false); await flush(); assert.equal(f.reads,2);
