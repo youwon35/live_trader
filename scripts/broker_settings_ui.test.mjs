@@ -22,7 +22,7 @@ function functionSource(name) {
 const isolatedSource = `
 import React, { useEffect, useRef, useState } from "react";
 import { getEnvSettings } from "./api";
-import { PanelHeader, StatusPill, NestedTabs, ToggleSwitch, Save, semanticSurfaceProps } from "test-presentation";
+import { PanelHeader, StatusPill, NestedTabs, ToggleSwitch, Save, TossConnectionCheck, semanticSurfaceProps } from "test-presentation";
 ${["settingsBooleanValue", "isProvisionalKisFeeField", "assistantFieldStatus", "clearSecretDrafts", "BrokerConnectionAssistant"].map(functionSource).join("\n")}
 export default BrokerConnectionAssistant;
 `;
@@ -38,6 +38,7 @@ const presentation = {
     type: "checkbox", checked, "aria-label": label, onChange,
   }),
   Save: () => React.createElement("svg"),
+  TossConnectionCheck: () => React.createElement("div", { "data-toss-query": true }),
   semanticSurfaceProps: (tone, className) => ({ className, "data-tone": tone }),
 };
 const oldWindow = globalThis.window;
@@ -230,6 +231,18 @@ test("obsolete live-lock settings are absent and reading never enables trading",
     assert.doesNotMatch(view.render(), /실거래 잠금|실전 주문 라우트|앱을 다시 열면 실전 주문 허용이 해제/);
     assert.equal(calls.filter(call=>call.method==="POST").length,0);
   } finally {view.unmount();}
+});
+
+test("Toss read-only connection check lives only in the Toss account panel", async () => {
+  setup();
+  const view = harness();
+  try {
+    await view.settle();
+    assert.match(view.render(), /<div hidden=""><div data-toss-query="true">/);
+    assert.match(view.group("toss"), /<div><div data-toss-query="true">/);
+    assert.match(view.group("kis"), /<div hidden=""><div data-toss-query="true">/);
+    assert.equal(calls.filter(call => call.method === "POST").length, 0);
+  } finally { view.unmount(); }
 });
 
 test("API essentials are open while fee detail stays collapsed with no data loss", async () => {
