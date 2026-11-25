@@ -36,3 +36,13 @@ button.doctor-card[data-ts-selected="true"] :is(.ts-status-card__title, .ts-stat
 .external-research-panel > .button-row + :is(p, [aria-live]) {
   margin-block-start: var(--ts-console-content-gap, 8px);
 }
+
+.live-toss-connection-check {
+  margin-block-start: var(--ts-console-content-gap, 8px);
+}
+
+.retry-policy-panel > .retry-matrix-panel {
+  margin-block-start: var(--ts-console-content-gap, 8px);
+  padding-block-start: var(--ts-console-content-gap, 8px);
+  border-block-start: 1px solid var(--border);
+}

@@ -91,7 +91,7 @@ export function TossConnectionCheck({ onSave }) {
     catch (err) { setResult({ ok: false, reason: err.message }); }
     finally { setBusy(false); }
   }
-  return <details className="ts-disclosure panel external-research-panel">
+  return <details className="ts-disclosure external-research-panel live-toss-connection-check">
     <summary><strong>토스증권 연결 확인</strong><span className="muted"> · 주문 없이 계좌·종목 조회</span></summary>
     <p className="muted">위에서 Client ID와 Secret 두 항목을 먼저 저장한 뒤 계좌 목록을 조회하세요. Account Seq는 공식 API의 계좌 식별값으로 일반 계좌번호와 다릅니다. 아래 목록에서 선택하면 직접 입력할 필요가 없습니다.</p>
     <div className="button-row"><button disabled={busy} onClick={discoverAccounts}>계좌 목록 조회 (주문 없음)</button>

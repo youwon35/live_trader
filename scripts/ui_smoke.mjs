@@ -163,6 +163,9 @@ try {
       if (currentPageTitle !== tab.label) {
         issues.push(`${viewport.name}/${tab.label}: topbar title is '${currentPageTitle || "missing"}'`);
       }
+      if (tab.label === "계좌·잔고") {
+        await page.getByRole("button", { name: /^계좌 조회·대조 상세/ }).click();
+      }
       for (const heading of tab.requiredHeadings) {
         if (!await page.getByRole("heading", { name: heading, exact: true }).count()) {
           issues.push(`${viewport.name}/${tab.label}: required section '${heading}' is missing`);

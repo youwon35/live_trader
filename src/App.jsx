@@ -3008,11 +3008,9 @@ function WorkspaceContent({
   if (selectedNav === "accounts") {
     return renderPage(
       <section className="accounts-page-layout ts-layout-stack">
-        <CompactDisclosure title="계좌 갱신" description="마지막 계좌 조회 시각과 갱신 결과를 확인합니다." className="account-observation-disclosure">
+        <CompactDisclosure title="계좌 조회·대조 상세" description="마지막 조회와 거래소 잔고·주문·체결·원장의 대조 결과를 확인합니다." className="account-observation-disclosure">
           <AccountRefreshStatus snapshot={snapshot} state={accountRefreshState} nowMs={accountNowMs} />
           <CoordinationRetirementNote snapshot={snapshot} />
-        </CompactDisclosure>
-        <CompactDisclosure title="계좌·포지션 3자 대조" description="거래소 잔고, 주문·체결, 원장의 비교 근거를 확인합니다." className="account-observation-disclosure">
           <ThreeWayReconciliationPanel snapshot={snapshot} accountRefreshState={accountRefreshState} nowMs={accountNowMs} onReview={onReconciliationReview} />
         </CompactDisclosure>
         <UnifiedBrokerAccountPanel
@@ -3067,9 +3065,10 @@ function WorkspaceContent({
         >
           <section className="ts-panel-grid ts-panel-grid--two live-secondary-panel-grid">
             <RiskSettingsPanel settings={snapshot.risk_settings} snapshot={snapshot} context={deploymentContext} onRiskSetting={onRiskSetting} />
-            <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy} />
+            <RetryPolicyPanel policy={snapshot.retry_policy} onRetryPolicy={onRetryPolicy}>
+              <RetryDecisionMatrixPanel matrix={snapshot.retry_policy_matrix} />
+            </RetryPolicyPanel>
             <FuturesRiskSimulatorPanel strategies={selectedStrategy ? [selectedStrategy] : []} />
-            <RetryDecisionMatrixPanel matrix={snapshot.retry_policy_matrix} />
           </section>
         </CompactDisclosure>
       </section>,
@@ -3086,7 +3085,6 @@ function WorkspaceContent({
     return renderPage(
       <section className="settings-page-layout ts-layout-stack">
         <BrokerConnectionAssistant brokers={snapshot.brokers} diagnostics={snapshot.broker_diagnostics} runtimeSnapshot={snapshot} onSave={onEnvSettings} />
-        <TossConnectionCheck onSave={onEnvSettings} />
         <StockSessionGuide />
         <ExternalResearchPanel />
         <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} onNavigate={onNavigate} />
@@ -3620,7 +3618,7 @@ function RetryDecisionMatrixPanel({ matrix }) {
     { request: "Broker 주문", result: "명시적 거부", action: "원인 수정 전 재전송 금지", automatic: false },
   ];
   return (
-    <section className="panel retry-matrix-panel">
+    <section className="retry-matrix-panel">
       <PanelHeader title="요청별 재시도 원칙" />
       <div className="table-scroll ts-scroll-panel"><table className="data-table"><thead><tr><th>요청</th><th>결과</th><th>동작</th><th>자동</th></tr></thead><tbody>{displayRows.map((row, index) => <tr key={`${row.request || row.request_type}-${index}`}><td>{row.request || row.request_type}</td><td>{row.result || row.outcome}</td><td>{row.action || row.policy}</td><td><StatusPill tone={row.automatic ? "warning" : "neutral"}>{row.automatic ? "허용" : "금지"}</StatusPill></td></tr>)}</tbody></table></div>
     </section>
@@ -5127,11 +5125,14 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
     });
   }, [settings]);
 
-  const groups = (settings?.groups?.length ? settings.groups : [
+  const configuredGroups = (settings?.groups?.length ? settings.groups : [
     { id: "kis", label: "주식/ETF", detail: "한국투자증권 Open API" },
     { id: "binance", label: "Binance", detail: "코인 현물" },
     { id: "upbit", label: "Upbit", detail: "KRW 코인" },
   ]).filter(group => group.id !== "live-lock");
+  const groups = configuredGroups.some(group => group.id === "toss")
+    ? configuredGroups
+    : [...configuredGroups, { id: "toss", label: "토스증권", detail: "국내·미국 현금 주식" }];
   const fields = (settings?.fields ?? []).filter(field => field.group !== "live-lock");
   const visibleFields = fields.filter((field) => field.group === activeGroup && field.key !== "TOSS_ACCOUNT_SEQ");
   const fieldSections = [
@@ -5335,6 +5336,9 @@ function BrokerConnectionAssistant({ brokers = [], diagnostics = [], runtimeSnap
       </div>
         </div>
       </details>
+      <div hidden={activeGroup !== "toss"}>
+        <TossConnectionCheck onSave={onSave} />
+      </div>
     </section>
   );
 }
@@ -6060,7 +6064,7 @@ function OrderQueueSummaryPanel({ summary }) {
   );
 }
 
-function RetryPolicyPanel({ policy, onRetryPolicy }) {
+function RetryPolicyPanel({ policy, onRetryPolicy, children }) {
   function commitNumber(event, setting) {
     const nextValue = event.currentTarget.value;
     if (Number(nextValue) !== Number(setting.value)) {
@@ -6106,6 +6110,7 @@ function RetryPolicyPanel({ policy, onRetryPolicy }) {
           </div>
         ))}
       </div>
+      {children}
     </section>
   );
 }
