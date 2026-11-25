@@ -31,6 +31,7 @@ export function createSnapshotReadCoordinator() {
   let accountFlight = null;
   return {
     isSnapshotRunning() { return snapshotFlight !== null; },
+    waitForPendingReads() { return Promise.resolve(accountFlight ?? snapshotFlight).catch(() => {}); },
     runSnapshot(work) {
       if (accountFlight) return Promise.resolve(undefined);
       if (snapshotFlight) return snapshotFlight;

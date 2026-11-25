@@ -274,11 +274,7 @@ test("HTTP refresh failure makes one GET and preserves manual retry only", async
   assert.equal(nativeBridgeReads, 0);
 });
 
-test("App integration displays the complete inbox without an automatic strategy filter or execution callbacks", () => {
-  const appSource = readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
-  assert.equal((appSource.match(/<PaperCandidateEvidencePanel\b/g) || []).length, 1);
-  assert.match(appSource, /<PaperCandidateEvidencePanel onRegistered=\{onPaperCandidateRegistered\}\s*\/>/);
-  assert.match(appSource, /onPaperCandidateRegistered=\{selectImportedCandidate\}/);
+test("legacy Paper evidence stays user-requested and exposes no execution callback", () => {
   assert.doesNotMatch(source, /useEffect|setInterval|onImport|onApprove|onStart/);
 });
 

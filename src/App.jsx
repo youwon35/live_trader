@@ -219,8 +219,8 @@ const pageProfiles = {
   gate: {
     title: "운용 전략",
     eyebrow: "DEPLOYMENT VALIDATION",
-    summary: "Backtester에서 저장한 전략과 운용 근거를 확인합니다. 실거래는 선택한 계좌의 준비 검사와 시작 승인을 거쳐 실행합니다.",
-    details: ["주식/ETF 탭에서 국내·해외 주식 전략을, 코인 탭에서 거래소별 코인 전략을 찾을 수 있습니다. 전략을 선택하면 거래 경로와 준비 근거를 확인할 수 있습니다."],
+    summary: "Backtester 전략을 계좌에 연결하고, 연결한 전략의 운용 상태를 확인합니다.",
+    details: ["전략과 계좌를 연결한 뒤 시작 점검을 실행하세요. 주문은 별도의 실거래 시작 절차를 거칩니다.", "주식·ETF와 코인 전략은 연결한 거래소와 종목을 기준으로 찾아볼 수 있습니다."],
   },
   monitor: { title: "실시간 감시", eyebrow: "LIVE MONITOR", summary: "거래소별 수신 상태, 전략 평가, 실제 주문과 체결을 한 화면에서 확인합니다." },
   "functional-test": {
@@ -2480,19 +2480,13 @@ function App() {
     void engageGlobalKill();
   }
 
-  async function selectImportedCandidate(deploymentId) {
-    const deadline = Date.now() + 15_000;
-    while (snapshotRequestInFlightRef.current && Date.now() < deadline) {
-      await new Promise((resolve) => window.setTimeout(resolve, 50));
-    }
-    if (snapshotRequestInFlightRef.current || emergencyActionInFlightRef.current) {
-      throw new Error("등록은 완료됐습니다. 현재 작업이 끝난 뒤 등록한 배포 보기를 눌러주세요.");
-    }
+  async function selectConnectedStrategy(deploymentId) {
+    await snapshotReadCoordinatorRef.current.waitForPendingReads();
+    if (emergencyActionInFlightRef.current) return false;
     const updated = await refresh();
-    if (!updated || !buildCurrentDeploymentOptions(updated.strategies || []).some((item) => item.id === deploymentId)) {
-      throw new Error("등록은 완료됐지만 배포 목록을 확인하지 못했습니다. 새로고침 후 등록한 배포 보기를 눌러주세요.");
-    }
-    selectDeploymentContext(deploymentId);
+    const found = updated && buildCurrentDeploymentOptions(updated.strategies).some((item) => item.id === deploymentId);
+    if (found) selectDeploymentContext(deploymentId);
+    return Boolean(found);
   }
 
   function selectDeploymentContext(deploymentId) {
@@ -2699,7 +2693,7 @@ function App() {
           selectedStrategy={selectedStrategy}
           batchOptions={deploymentOptions.map(option => ({...option, context: strategyDeploymentContext(option.strategy), profileId: deploymentRuntimeProfile(strategyDeploymentContext(option.strategy)), running: runningDeploymentIds(snapshot.continuous_runtime).includes(option.id)}))}
           onDeploymentSelect={selectDeploymentContext}
-          onPaperCandidateRegistered={selectImportedCandidate}
+          onDirectStrategyConnected={selectConnectedStrategy}
           searchQuery={searchQuery}
           kisPreparationViews={kisPreparationViews}
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
@@ -2870,7 +2864,7 @@ function WorkspaceContent({
   selectedStrategy,
   batchOptions,
   onDeploymentSelect,
-  onPaperCandidateRegistered,
+  onDirectStrategyConnected,
   searchQuery,
   kisPreparationViews,
   onConfirm,
@@ -2974,7 +2968,7 @@ function WorkspaceContent({
       <section className="deployment-promotion-layout ts-layout-stack">
         <section className="panel">
           <PanelHeader title="Backtester 전략 연결" />
-          <DirectStrategyPanel onRegistered={onPaperCandidateRegistered} />
+          <DirectStrategyPanel onConnected={onDirectStrategyConnected} />
         </section>
         <DeploymentChanges snapshot={snapshot} scope={deploymentContext.id} />
         <LivePreparationPanel
@@ -3000,7 +2994,7 @@ function WorkspaceContent({
         />
         <CompactDisclosure
           title="운용 배포 상세 근거"
-          description="고정 구성 hash와 실행 엔진 고정값은 장애 분석이나 binding 검증이 필요할 때만 확인합니다."
+          description="저장된 구성과 실행 엔진 버전을 확인합니다."
         >
           <DeploymentManifestPanel governance={snapshot.live_governance} />
         </CompactDisclosure>
