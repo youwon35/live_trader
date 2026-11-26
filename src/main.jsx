@@ -19,7 +19,7 @@ import { installLayoutEditingSupport } from "../../../packages/design/layout-edi
 
 installLayoutEditingSupport({ program: "live-trader" });
 
-installTaskNotifications({ id: "live_trader", title: "Live Trader", location: "작업 상태·실행 기록에서 상세 결과를 확인하세요." });
+installTaskNotifications({ id: "live_trader", title: "Live Trader", location: "작업 상태나 작업 기록에서 상세 결과를 확인하세요." });
 
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>

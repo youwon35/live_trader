@@ -58,7 +58,7 @@ try{
  await fulfill(heldSync,{ok:true});
  await page.waitForFunction(()=>document.querySelector('.account-refresh-status')?.textContent.includes('갱신 실패'));
  await page.clock.runFor(15001);assert.equal(snapshotCount,2);
- await page.getByRole('button',{name:'계좌 다시 읽기',exact:true}).click();
+ await page.getByRole('button',{name:'계좌 새로고침',exact:true}).click();
  await page.waitForFunction(()=>document.querySelector('.account-refresh-status')?.textContent.includes('전체 상태 조회 완료 대기'));
  assert.equal(syncCount,1);
  await page.clock.runFor(15001);
@@ -78,7 +78,7 @@ try{
  assert.equal(syncCount,2,'reconnect must not refresh accounts');
  assert.match(await page.locator('.account-refresh-status').innerText(),/갱신 실패/);
  reconcileFails=false;
- await page.getByRole('button',{name:'계좌 다시 읽기',exact:true}).click();
+ await page.getByRole('button',{name:'계좌 새로고침',exact:true}).click();
  await page.waitForFunction(()=>document.querySelector('.account-refresh-status')?.textContent.includes('최근 전체 조회 성공 2026. 10. 28. 오후 1:00:30'));
  assert.equal(syncCount,3);assert.equal(reconcileCount,3);
  assert.doesNotMatch(await page.locator('.account-refresh-status').innerText(),/갱신 실패/);

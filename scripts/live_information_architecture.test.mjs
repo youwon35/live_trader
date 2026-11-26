@@ -25,9 +25,9 @@ test("operator navigation follows the live decision sequence", () => {
     "실시간 감시",
     "계좌·잔고",
     "주문·체결",
-    "작업 진행",
-    "실행 기록",
-    "연결·설정",
+    "작업 상태",
+    "작업 기록",
+    "설정",
   ]);
 
   const groups = between(appSource, "const navGroups = [", "function formatKeyValueMap");
@@ -116,7 +116,7 @@ test("default pages prioritize decisions and move technical evidence into disclo
 
   const accounts = between(appSource, "function UnifiedBrokerAccountPanel", "function OperationsReportPanel");
   assert.doesNotMatch(accounts, /onBaseline|현재 계좌를 기준 원장으로 승인/);
-  assert.match(accounts, /계좌 다시 읽기는 원장을 덮어쓰지 않습니다/);
+  assert.match(accounts, /계좌 새로고침은 원장을 덮어쓰지 않습니다/);
   assert.match(accounts, /title="내 실계좌 구성"/);
 });
 

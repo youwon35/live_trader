@@ -115,7 +115,7 @@ export function OperatorNoteEditor({ recordKey }) {
       <div className="operator-note-actions"><small>{text.length}/500 · 개인 메모, 원본 실행 증거와 별도</small><button className="primary-button" type="button" onClick={save} disabled={!note || busy || note.text===text}>{busy ? '저장 중' : '메모 저장'}</button></div>
       {note?.updated_at && <small>저장 {stamp(note.updated_at)}</small>}
       {message && <p role="status" className="ts-text-region">{message}</p>}
-      <button type="button" className="secondary-button" disabled={busy} onClick={reload}>저장 메모 다시 읽기</button>
+      <button type="button" className="secondary-button" disabled={busy} onClick={reload}>메모 새로고침</button>
       {note?.history?.length > 1 && <InlineDisclosure><summary>메모 수정 이력 {note.history.length}건</summary>{note.history.map(row=><p key={row.revision}>{stamp(row.updated_at)} · {row.text || '(내용 삭제)'}</p>)}</InlineDisclosure>}
     </>}
   </section>;

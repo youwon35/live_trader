@@ -11,7 +11,7 @@ const statusLabels = {
 };
 
 const actionLabels = {
-  settings: '연결·설정 열기',
+  settings: '설정 열기',
   gate: '운용 전략 열기',
   accounts: '계좌·잔고 열기',
 };

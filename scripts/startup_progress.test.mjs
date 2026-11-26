@@ -85,7 +85,7 @@ test('missing account credentials link to connection settings and incomplete res
  const html = renderToStaticMarkup(React.createElement(Component, {
   view: startupView(state), onNavigate() {}, onRetryAccounts() {},
  }));
- assert.match(html, /연결·설정 열기/);
+ assert.match(html, /설정 열기/);
  assert.match(html, /초기 계좌·잔고 조회 다시 조회/);
  const brokerError = startupAccountObservation({ ...result, snapshot: {
   reconciliation: { summary: { ...summary, api_required_count: 0 }, accounts: [{}] },

@@ -148,7 +148,7 @@ try {
     });
     await page.goto(origin);
     await page.getByRole('heading', { name: '시작 점검', exact: true }).waitFor();
-    const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '실시간 감시', '계좌·잔고', '주문·체결', '작업 진행', '실행 기록', '연결·설정'];
+    const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '실시간 감시', '계좌·잔고', '주문·체결', '작업 상태', '작업 기록', '설정'];
     assert.deepEqual(await page.locator('.nav-list .nav-item').allTextContents().then((items) => items.map((text) => text.trim())), navLabels);
     for (const label of (process.env.CARD_ACCENT_ONLY === '1' ? ['시작 점검'] : [...navLabels, '주문 연결 시험'])) {
       const parent = label === '주문 연결 시험' ? '실거래 운용' : label;
@@ -159,7 +159,7 @@ try {
       assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), parent);
       assert.equal(await page.getByText('TradingView 추가 분석·차트', { exact: true }).count(), 0);
       assert.equal(await page.getByText('토스증권 연결 확인', { exact: true }).count(), Number(label === '계좌·잔고'));
-      assert.equal(await page.getByRole('heading', { name: '저장된 일반 운용 진단', exact: true }).count(), Number(label === '실행 기록'));
+      assert.equal(await page.getByRole('heading', { name: '저장된 일반 운용 진단', exact: true }).count(), Number(label === '작업 기록'));
       if (label === '운용 전략' || label === '실거래 운용') {
         await page.getByRole('button', { name: '기능 설명', exact: true }).click();
         const help = page.getByRole('dialog', { name: label + ' 기능 설명' });
@@ -178,12 +178,12 @@ try {
         await toss.getByRole('button', { name: '계좌·종목 확인 (주문 없음)', exact: true }).click();
         await toss.getByText('화면 검증용 삼성전자 · KRX · 미체결 0건', { exact: true }).waitFor();
       }
-      if (label === '실행 기록') {
+      if (label === '작업 기록') {
         await page.getByText('기록 당시 미충족 1건 · 주의 0건 · 세부 기록 보기', { exact: true }).click();
         await page.getByText('이전 준비 검사에서 확인한 문제', { exact: true }).waitFor();
         await page.getByRole('combobox', { name: '기록 종류', exact: true }).selectOption('audit');
         await page.getByRole('heading', { name: '기술 로그', exact: true }).waitFor();
-        assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), '실행 기록');
+        assert.equal(await page.locator('.nav-list [aria-current="page"]').textContent().then((value) => value.trim()), '작업 기록');
       }
       if (settingsReview && label !== '주문 연결 시험') {
         report.views.push({ viewport: viewport.width, label, overflow });
@@ -283,7 +283,7 @@ try {
         const originalPositions = snapshot.positions;
         snapshot.accounts = snapshot.accounts.map(account => account.broker_id === 'kis' ? { ...account, broker_cash_value: 0, broker_equity_value: 0 } : account);
         snapshot.positions = snapshot.positions.map(position => position.broker_id === 'kis' ? { ...position, current_price: 0, broker_value: 0 } : position);
-        await allocation.getByRole('button', { name: '계좌 다시 읽기', exact: true }).click();
+        await allocation.getByRole('button', { name: '계좌 새로고침', exact: true }).click();
         await allocation.getByText(/평가 정보가 부족해|조회가 완전하지|부분 조회/).first().waitFor();
         assert.equal(await allocation.getByText('보유 자산이 없습니다.', { exact: true }).count(), 0);
         assert.equal(await allocation.locator('tbody tr').count(), 2);
@@ -291,7 +291,7 @@ try {
         await page.screenshot({ path: resolve(output, `allocation-missing-price-${viewport.width}.png`) });
         snapshot.accounts = originalAccounts;
         snapshot.positions = originalPositions;
-        await allocation.getByRole('button', { name: '계좌 다시 읽기', exact: true }).click();
+        await allocation.getByRole('button', { name: '계좌 새로고침', exact: true }).click();
         await allocation.locator('.ts-allocation-center-value').filter({ hasText: '400,000원' }).waitFor();
         report.views.push({ viewport: viewport.width, label: '시세·총액 누락 계좌', missingValueHidden: true });
         assert.equal(await page.locator('.three-way-reconciliation-panel').getByText('조회됨', { exact: true }).count(), 0);
@@ -306,16 +306,16 @@ try {
       if(fontReview){
         await page.evaluate(theme=>{document.documentElement.dataset.uiTheme=theme;},theme);
         report.styles.push(await probeRestoredUi(page,label));
-        if(label==='실행 기록') {
+        if(label==='작업 기록') {
           assert.ok(new Set(report.styles.at(-1).logs.map(log=>log.background)).size>=3,'info/warning/error retain distinct semantic colors');
           await page.screenshot({path:resolve(output,`restored-logs-${theme}-${viewport.width}.png`)});
         }
-        if(label==='연결·설정') {
+        if(label==='설정') {
           await page.getByRole('button',{name:/화면·레이아웃·Telegram/}).click();
           report.styles.push(await probeRestoredUi(page,`${label} / 화면 설정`));
           await page.screenshot({path:resolve(output,`restored-settings-${theme}-${viewport.width}.png`)});
           if(process.env.SURFACE_POLISH_REVIEW==='1'){
-            const openPanel=async()=>{await page.locator('.nav-list').getByRole('button',{name:'연결·설정',exact:true}).click();if(!await page.locator('.ts-appearance-settings').count())await page.getByRole('button',{name:/화면·레이아웃·Telegram/}).click();};
+            const openPanel=async()=>{await page.locator('.nav-list').getByRole('button',{name:'설정',exact:true}).click();if(!await page.locator('.ts-appearance-settings').count())await page.getByRole('button',{name:/화면·레이아웃·Telegram/}).click();};
             report.appearance??=[];report.appearance.push(...await verifyAppearancePolish(page,'Live 화면 테마',theme,openPanel));
             await page.screenshot({path:resolve(output,`polished-settings-${theme}-${viewport.width}.png`)});
           }

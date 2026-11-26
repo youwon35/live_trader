@@ -205,14 +205,14 @@ const navItems = [
   { id: "monitor", label: "실시간 감시", icon: Radio },
   { id: "accounts", label: "계좌·잔고", icon: WalletCards },
   { id: "orders", label: "주문·체결", icon: FileClock },
-  { id: "progress", label: "작업 진행", icon: Clock3 },
-  { id: "incidents", label: "실행 기록", icon: FileClock },
-  { id: "settings", label: "연결·설정", icon: Settings },
+  { id: "progress", label: "작업 상태", icon: Clock3 },
+  { id: "incidents", label: "작업 기록", icon: FileClock },
+  { id: "settings", label: "설정", icon: Settings },
 ];
 
 const pageProfiles = {
   progress: {
-    title: "작업 진행",
+    title: "작업 상태",
     summary: "시작 점검, 장시간 점검과 주문 연결 시험의 현재 단계를 확인합니다.",
     details: ["서버나 시작 준비가 제공하는 단계만 표시합니다. 일반 실거래 운용과 실시간 주문 상태는 각 화면에서 확인하세요."],
   },
@@ -243,7 +243,7 @@ const pageProfiles = {
     title: "계좌·잔고",
     eyebrow: "BROKER TRUTH",
     summary: "거래소에서 읽은 잔고·체결과 프로그램 기록을 비교합니다.",
-    details: ["토스증권 연결 확인에서 계좌 목록과 종목을 조회할 수 있습니다. Client ID와 Secret은 연결·설정에서 저장합니다."],
+    details: ["토스증권 연결 확인에서 계좌 목록과 종목을 조회할 수 있습니다. Client ID와 Secret은 ‘설정’에서 저장합니다."],
   },
   orders: {
     title: "주문·체결",
@@ -262,17 +262,17 @@ const pageProfiles = {
     details: ["주식/ETF 또는 코인 탭에서 연결할 계좌와 운용 방식을 확인합니다. 선택한 전략과 계좌의 자산군이 맞아야 실행할 수 있습니다."],
   },
   incidents: {
-    title: "실행 기록",
+    title: "작업 기록",
     eyebrow: "AUDIT RECORDS",
-    summary: "운영 이력과 상세 로그를 같은 목록과 검색 도구에서 조회합니다. 기록 종류를 바꿔 준비 검사, 실행·정지, 주문, 설정 변경 또는 기술 메시지를 확인하세요.",
+    summary: "‘감사 기록’에서 점검, 실행·중지, 주문, 설정 변경을 확인합니다. 프로그램 메시지와 오류는 ‘기술 로그’에 표시됩니다.",
   },
   audit: {
-    title: "상세 로그",
+    title: "기술 로그",
     eyebrow: "ENGINEERING LOG",
     summary: "대상·중요도·발생 위치·요청 식별값으로 상세 기록을 검색합니다.",
   },
   settings: {
-    title: "연결·설정",
+    title: "설정",
     eyebrow: "BROKER & RUNTIME",
     summary: "증권사·거래소의 API 설정과 화면·알림을 관리합니다.",
   },
@@ -3338,7 +3338,7 @@ function AccountRefreshStatus({ snapshot, state, nowMs }) {
     {state.error && <p role="alert">계좌 갱신 실패: {state.error}</p>}
     {state.warning && <p role="status">{state.warning}</p>}
     <p>{view.detail}</p>
-    <p>계좌는 앱 시작 시 한 번 읽습니다. 최신 잔고는 ‘계좌 다시 읽기’로 확인하세요. 실행 중 주문·체결 확인은 별도로 계속됩니다.</p>
+    <p>계좌는 앱 시작 시 한 번 읽습니다. 최신 잔고는 ‘계좌 새로고침’로 확인하세요. 실행 중 주문·체결 확인은 별도로 계속됩니다.</p>
   </section>;
 }
 
@@ -3687,10 +3687,10 @@ function IncidentAuditWorkspace({ snapshot, recordType, onRecordTypeChange }) {
       <AuditPanel
         audit={records}
         detailLabel={technical ? "기술 로그 상세" : "감사 기록 상세"}
-        emptyText={technical ? "검색 조건에 맞는 로그가 없습니다." : "표시할 감사 이벤트가 없습니다."}
+        emptyText={technical ? "검색 조건에 맞는 로그가 없습니다." : "표시할 감사 기록이 없습니다."}
         onRecordTypeChange={onRecordTypeChange}
         recordType={recordType}
-        title={technical ? "기술 로그" : "감사 이벤트"}
+        title={technical ? "기술 로그" : "감사 기록"}
       />
       {!technical && snapshot.doctor_diagnostics?.latest && (
         <DoctorHistoryPanel diagnostics={snapshot.doctor_diagnostics} />
@@ -6230,7 +6230,7 @@ function UnifiedBrokerAccountPanel({
       <div className="account-baseline-toolbar">
         <div>
           <strong>프로그램 기준 원장</strong>
-          <span>계좌 다시 읽기는 원장을 덮어쓰지 않습니다. 차이가 있으면 위의 ‘확인할 차이’에서 거래·입출금 기록과 대조하세요.</span>
+          <span>계좌 새로고침은 원장을 덮어쓰지 않습니다. 차이가 있으면 위의 ‘확인할 차이’에서 거래·입출금 기록과 대조하세요.</span>
         </div>
       </div>
 
@@ -6814,8 +6814,8 @@ function AuditPanel({
                 onRecordTypeChange(event.currentTarget.value);
               }}
             >
-              <option value="incidents">운영 이력</option>
-              <option value="audit">상세 로그</option>
+              <option value="incidents">감사 기록</option>
+              <option value="audit">기술 로그</option>
             </select>
             <label className="search-box logs-search">
               <input aria-label={`${title} 검색`} value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="메시지, scope, 작업명 검색" />

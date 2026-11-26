@@ -15,10 +15,10 @@ const tabs = [
   { label: "한도·안전장치", parent: "실거래 운용", requiredHeadings: ["현재 리스크 사용량", "운영 차단 설정"] },
   { label: "계좌·잔고", requiredHeadings: ["계좌·포지션 3자 대조", "내 계좌·보유 포지션"] },
   { label: "주문·체결", requiredHeadings: ["주문 상태 원장", "실행 품질"] },
-  { label: "실행 기록", requiredHeadings: ["감사 이벤트"], forbiddenHeadings: ["운영 사고"] },
-  { label: "상세 로그", parent: "실행 기록", recordType: "audit", requiredHeadings: ["기술 로그"] },
+  { label: "작업 기록", requiredHeadings: ["감사 기록"], forbiddenHeadings: ["운영 사고"] },
+  { label: "기술 로그", parent: "작업 기록", recordType: "audit", requiredHeadings: ["기술 로그"] },
   {
-    label: "연결·설정",
+    label: "설정",
     requiredHeadings: ["브로커 실계좌 연결", "설정·Runtime 자체 검사"],
     forbiddenHeadings: ["Secret 보호 상태", "브로커 Capability", "어댑터 인터페이스 계약", "브로커 준비 항목"],
   },
@@ -245,7 +245,7 @@ try {
           issues.push(`${viewport.name}/${tab.label}: daily activation action is missing`);
         }
       }
-      if (tab.label === "실행 기록" && !await page.getByText(/append-only 원장/).count()) {
+      if (tab.label === "작업 기록" && !await page.getByText(/append-only 원장/).count()) {
         issues.push(`${viewport.name}/${tab.label}: immutable audit guidance is missing`);
       }
       if (tab.label === "한도·안전장치") {

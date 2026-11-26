@@ -40,7 +40,7 @@ export function noOrderReasons(snapshot = {}, context = {}) {
     const signal = String(runner.last_signal || '').toUpperCase();
     if (['HOLD', 'NONE', 'NO_SIGNAL'].includes(signal)) result.push({ category: '신호 없음', detail: `${stamp(runner.last_run)} 평가에서 매매 신호가 없었습니다. ${runner.last_action || ''}` });
     else result.push({ category: '조건 대기', detail: `${stamp(runner.last_run)} 최근 평가: ${runner.last_action || '상세 사유 미기록'}. 현재 무주문의 단일 원인으로 확정하지 않습니다.` });
-  } else if (running) result.push({ category: '조건 대기', detail: '이 배포에 연결된 검증된 최근 평가가 없습니다. 다음 완료 봉 또는 시세·실행 기록을 확인하세요.' });
+  } else if (running) result.push({ category: '조건 대기', detail: '이 배포에 연결된 검증된 최근 평가가 없습니다. 다음 완료 봉이나 시세·작업 기록을 확인하세요.' });
   return result;
 }
 

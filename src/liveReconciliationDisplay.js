@@ -36,7 +36,7 @@ export function liveBrokerBalanceDisplay(snapshot = {}, {fresh = false} = {}) {
   const view = liveReconciliationDisplay(snapshot);
   const last = snapshot.reconciliation?.summary?.last_run;
   if (view.brokerKnown) return {status: fresh ? "pass" : "info", value: fresh ? "조회됨" : "마지막 조회값 보관",
-    detail: "마지막 계좌 조회 " + last + (fresh ? "" : " · 자동 반복 조회하지 않음 · 최신 값은 계좌 다시 읽기")};
+    detail: "마지막 계좌 조회 " + last + (fresh ? "" : " · 자동 반복 조회하지 않음 · 최신 값은 계좌 새로고침")};
   return {status:"warn",value:snapshot.api_connected === true ? "조회 결과 확인 필요" : "서버 연결 미확인",
     detail:"마지막 대조 " + (last || "미실행") + " · 조회 시각과 계좌별 오류를 확인하세요."};
 }
@@ -79,7 +79,7 @@ export function liveExecutionDisplay(snapshot = {}, { nowMs = Date.now(), maxAge
   };
   if (recordedSuccesses.length) return {
     status:"info",value:"마지막 REST 조회 보관",
-    detail:"마지막 조회 성공 " + lastSuccess + " · 현재 실시간 체결 감시 " + (running ? "연결 대기" : "미시작") + " · 새 조회는 계좌 다시 읽기",
+    detail:"마지막 조회 성공 " + lastSuccess + " · 현재 실시간 체결 감시 " + (running ? "연결 대기" : "미시작") + " · 새 조회는 계좌 새로고침",
   };
   return {
     status: "warn", value: attempt ? "최근 조회 미확인" : "체결 감시 미시작",

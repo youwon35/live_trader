@@ -77,13 +77,13 @@ export default function DirectStrategyPanel({ onConnected }) {
       <label><span>가용 현금 중 사용할 비율 (%)</span><input type="number" min="0.01" max="100" step="0.01" value={percent} disabled={Boolean(busy)} onChange={(event) => setPercent(event.target.value)} /></label>
     </div>
     <div className="live-strategy-control-line">
-      <button type="button" className="secondary-button" disabled={Boolean(busy)} onClick={refresh}>전략 목록 다시 읽기</button>
+      <button type="button" className="secondary-button" disabled={Boolean(busy)} onClick={refresh}>전략 목록 새로고침</button>
       <button type="button" className="primary-button" disabled={Boolean(busy) || !canConnect} onClick={connect}>{busy === "connect" ? "연결 중…" : "전략과 계좌 연결"}</button>
     </div>
     {busy === "read" && <p role="status">Backtester 전략 목록을 읽는 중입니다.</p>}
     {message && <p role="status">{message}</p>}{error && <p role="alert" style={{ color: "var(--danger)" }}>{error}</p>}
-    {data && !busy && !candidates.length && <p>연결할 전략이 없습니다. Backtester에서 실제 데이터 전략을 저장한 뒤 목록을 다시 읽으세요.</p>}
-    {selected && !accounts.length && <p>이 전략에 맞는 거래소 계좌를 연결·설정에서 먼저 저장하세요.</p>}
+    {data && !busy && !candidates.length && <p>연결할 전략이 없습니다. Backtester에서 실제 데이터로 검증한 전략을 저장한 뒤 ‘전략 목록 새로고침’을 누르세요.</p>}
+    {selected && !accounts.length && <p>이 전략에 맞는 거래소 계좌를 ‘설정’에서 먼저 저장하세요.</p>}
     <details><summary>계좌 연결 기준</summary><p>포트폴리오 하나에는 같은 거래소의 계좌 하나를 연결합니다. 거래소가 여러 곳이면 각각 연결하세요. 전략 원본이나 계좌 설정이 바뀌면 다시 연결해야 합니다.</p></details>
   </div>;
 }
