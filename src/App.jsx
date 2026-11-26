@@ -5407,6 +5407,9 @@ function TelegramConnectionPanel() {
           </StatusPill>
         )}
       />
+      <p className="diagnostic-explanation">
+        실주문 체결과 주문 대조가 필요한 문제, 긴급 정지를 알립니다.
+      </p>
       <TelegramConnectionStatus connection={connection} onRefresh={refreshConnection} />
     </section>
   );

@@ -147,7 +147,7 @@ class UpbitSmokeOrderTest(unittest.TestCase):
         )
         self.assertTrue(temporary_flight.is_file())
         self.assertEqual(2, len(temporary_flight.read_text(encoding="utf-8").splitlines()))
-        self.telegram_send.assert_called_once()
+        self.telegram_send.assert_not_called()
         self.assertEqual(
             original_audit,
             self._file_fingerprint(self.original_audit_path),

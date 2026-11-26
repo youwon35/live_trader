@@ -755,23 +755,6 @@ TELEGRAM_DISPATCHER = TelegramDispatcher(
     env_file=Path(__file__).resolve().parents[1] / ".env",
 )
 
-TELEGRAM_SAFETY_AUDIT_EVENTS = {
-    "Kill Switch",
-    "신규 진입 차단",
-    "Watchdog Fail Closed",
-    "Recovery Drill",
-    "Startup Recovery",
-}
-TELEGRAM_HEALTH_AUDIT_EVENTS = {
-    "Watchdog",
-    "포지션/계좌 대조",
-}
-TELEGRAM_CONNECTIVITY_AUDIT_EVENTS = {
-    "체결 스트림",
-    "체결 이벤트 동기화",
-}
-
-
 RISK_SETTING_META: dict[str, dict[str, object]] = {
     "daily_loss_limit_pct": {
         "label": "일일 손실 한도",
@@ -9932,6 +9915,7 @@ def apply_watchdog_fail_closed(report: dict[str, Any]) -> bool:
             "danger",
             "Watchdog Fail Closed",
             f"critical {report['critical_count']}개: {', '.join(report['next_actions'][:4])}. MONITOR와 신규 진입 차단을 적용했습니다.",
+            telegram_alert=report.get("active_live") is True or bool(runtime_transition.get("results")),
         )
     return changed
 
@@ -11981,7 +11965,14 @@ def persist_audit_event(record: AuditEvent) -> None:
             del errors[: len(errors) - 10]
 
 
-def append_audit(level: str, event: str, detail: str, *, audit_record: AuditEvent | None = None) -> None:
+def append_audit(
+    level: str,
+    event: str,
+    detail: str,
+    *,
+    audit_record: AuditEvent | None = None,
+    telegram_alert: bool = False,
+) -> None:
     now = datetime.now()
     safe_detail = mask_secrets(detail)
     STATE["audit"].append({
@@ -12012,68 +12003,38 @@ def append_audit(level: str, event: str, detail: str, *, audit_record: AuditEven
         )
     )
     persist_audit_event(safe_audit_record)
-    queue_live_audit_telegram(level, event, safe_detail)
+    if telegram_alert:
+        queue_live_audit_telegram(level, event, safe_detail)
 
 
 def queue_live_audit_telegram(level: str, event: str, detail: str) -> bool:
-    """Queue only actionable Live safety alerts; fills use notify_new_live_fills."""
+    """Send a safety incident explicitly identified at its source."""
     from trading_runtime.telegram_alert_policy import alert_broker_scope, stable_alert_reason
 
     normalized_level = str(level or "").strip().lower()
-    normalized_event = str(event or "").strip()
     is_critical = normalized_level in {"danger", "error", "critical"}
-    is_safety_event = (
-        normalized_event in TELEGRAM_SAFETY_AUDIT_EVENTS
-        or (
-            normalized_event in TELEGRAM_HEALTH_AUDIT_EVENTS
-            and normalized_level in {"warn", "warning", "danger", "error", "critical"}
-        )
-    )
-    is_connectivity_failure = (
-        normalized_event in TELEGRAM_CONNECTIVITY_AUDIT_EVENTS
-        and normalized_level in {"warn", "warning", "danger", "error", "critical"}
-    )
-    is_connectivity_recovery = (
-        normalized_event in TELEGRAM_CONNECTIVITY_AUDIT_EVENTS
-        and "연결 복구" in str(detail or "")
-    )
-    is_health_recovery = normalized_event in TELEGRAM_HEALTH_AUDIT_EVENTS and normalized_level in {"info", "success"}
-    if not (is_critical or is_safety_event or is_connectivity_failure or is_connectivity_recovery or is_health_recovery):
-        return False
-    recovered = is_connectivity_recovery or is_health_recovery
-    stable_state = "healthy" if recovered else (
-        f"{normalized_level}:{bool(STATE.get('kill_switch'))}:{bool(STATE.get('new_entries_blocked'))}:"
-        + stable_alert_reason(detail)
-    )
-
+    stable_state = f"{normalized_level}:{stable_alert_reason(detail)}"
     try:
         return TELEGRAM_DISPATCHER.send_async(
             "\n".join(
                 [
-                    "✅ <b>[실전 트레이더] 복구 확인</b>" if recovered else "⚠️ <b>[실전 트레이더] 확인 필요</b>",
-                    f"이벤트: {html.escape(normalized_event)}",
+                    "⚠️ <b>[실전 트레이더] 확인 필요</b>",
+                    f"이벤트: {html.escape(event)}",
                     f"운용 상태: {html.escape(str(STATE.get('mode') or 'MONITOR'))}",
                     f"거래 영향: Kill Switch {'ON' if STATE.get('kill_switch') else 'OFF'} · 신규 진입 {'차단' if STATE.get('new_entries_blocked') else '허용'}",
                     "",
-                    f"내용: {html.escape(str(detail or '')[:1200])}",
+                    f"내용: {html.escape(detail[:1200])}",
                 ]
             ),
-            dedupe_key=f"live-alert:{normalized_event}:{stable_state}",
+            dedupe_key=f"live-alert:{event}:{stable_state}",
             dedupe_seconds=3600 if is_critical else 21600,
-            state_key=f"live-health:{normalized_event}:{alert_broker_scope(detail)}",
+            state_key=f"live-health:{event}:{alert_broker_scope(detail)}",
             state_value=stable_state,
-            notify_initial=not recovered,
             severity="critical" if is_critical else "warning",
-            event_type=(
-                "recovery"
-                if recovered
-                else "failure"
-                if is_critical or is_connectivity_failure
-                else "safety"
-            ),
+            event_type="failure" if is_critical else "safety",
         )
     except Exception:
-        # Telegram 관제 실패는 감사 기록이나 주문/운용 경로를 중단시키지 않는다.
+        # Telegram delivery cannot interrupt order handling or local audit.
         return False
 
 
@@ -13463,6 +13424,7 @@ def _emit_durable_emergency_recovery_evidence(
             f"cleanup {'완료' if cancellation.get('cleanup_complete') is True else '미완료'} · "
             "포지션 자동 청산 없음"
         ),
+        telegram_alert=outcome.get("ok") is not True,
     )
     sync_operational_incident(
         code="DURABLE_EMERGENCY_STOP_ACTIVE",
@@ -13696,7 +13658,12 @@ def set_flag(
         "dry_run": "Dry Run 보호",
     }[name]
     level = "info" if name == "dry_run" and value else ("warn" if value else "info")
-    append_audit(level, label, f"{label} 값이 {value}(으)로 변경되었습니다.")
+    append_audit(
+        level,
+        label,
+        f"{label} 값이 {value}(으)로 변경되었습니다.",
+        telegram_alert=name == "kill_switch" and bool(value) and changed,
+    )
     return {
         "ok": (
             emergency_action is None
@@ -15674,45 +15641,54 @@ def live_order_message_key(
     return f"live-order:{broker_id}:{identifier}"
 
 
-def queue_live_order_lifecycle_notification(
-    order: dict[str, Any],
-    *,
-    status: str,
-    reason: str = "",
-    message_final: bool = False,
-) -> bool:
-    broker_id = str(
-        order.get("broker_id")
-        or broker_id_from_symbol(str(order.get("symbol") or ""), str(order.get("asset") or ""))
-        or "broker"
-    )
-    portfolio_gate = order.get("portfolio_gate") if isinstance(order.get("portfolio_gate"), dict) else {}
+def queue_live_order_failure_notification(order: dict[str, Any], *, reason: str) -> bool:
+    state = str(order.get("state") or "").lower()
+    if order.get("dry_run") is not False or state not in {"broker_rejected", "unknown"}:
+        return False
+    broker = str(order.get("broker_id") or "")
+    if not broker:
+        return False
+    pending_reconciliation = state == "unknown"
     return TELEGRAM_DISPATCHER.send_async(
         format_order_lifecycle_notification(
             app_name="Live Trader",
-            environment=str(STATE.get("mode") or "LIVE"),
-            broker=broker_id.upper(),
-            status=status,
+            environment=str(order.get("mode") or "LIVE"),
+            broker=broker.upper(),
+            status="error" if pending_reconciliation else "rejected",
             side=str(order.get("side") or ""),
             symbol=str(order.get("symbol") or ""),
             quantity=order.get("qty") or "-",
             price=order.get("reference_price"),
             strategy=str(order.get("strategy_id") or ""),
-            portfolio=str(portfolio_gate.get("portfolio_id") or ""),
             order_id=str(order.get("broker_order_id") or order.get("order_id") or ""),
             occurred_at=str(order.get("updated_at") or order.get("time") or ""),
-            reason=reason,
+            reason=mask_secrets(reason),
         ),
-        dedupe_key=f"live-order-state:{order.get('order_id')}:{status}",
+        dedupe_key=f"live-order-state:{order.get('order_id')}:{state}",
         dedupe_seconds=604800,
-        severity="warning",
-        event_type="failure" if status in {"failed", "error", "rejected"} else "trade",
+        severity="critical" if pending_reconciliation else "warning",
+        event_type="failure",
         message_key=live_order_message_key(order),
-        message_final=message_final,
+        message_final=not pending_reconciliation,
     )
 
 
 def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[str]) -> int:
+    verified_fills = []
+    for event in events:
+        event_id = str(event.get("event_id") or "")
+        state_name = str(event.get("state") or "").lower()
+        quantity = safe_float(event.get("quantity"), 0.0)
+        if (
+            event_id
+            and event_id not in existing_event_ids
+            and state_name in {"partial", "partially_filled", "filled", "done", "executed"}
+            and quantity > 0
+        ):
+            verified_fills.append((event, event_id, state_name, quantity))
+    if not verified_fills:
+        return 0
+
     positions_by_key = {
         (
             str(item.get("broker_id") or "").lower(),
@@ -15728,14 +15704,7 @@ def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[
     for item in PROGRAM_LEDGER.cash_rows():
         cash_by_broker.setdefault(str(item.get("broker_id") or "").lower(), []).append(item)
     sent = 0
-    for event in events:
-        event_id = str(event.get("event_id") or "")
-        state_name = str(event.get("state") or "").lower()
-        quantity = safe_float(event.get("quantity"), 0.0)
-        if not event_id or event_id in existing_event_ids:
-            continue
-        if state_name not in {"partial", "partially_filled", "filled", "done", "executed"} or quantity <= 0:
-            continue
+    for event, event_id, state_name, quantity in verified_fills:
         broker_id = str(event.get("broker_id") or "").lower()
         symbol = str(event.get("symbol") or "").upper()
         side = str(event.get("side") or (event.get("raw") or {}).get("side") or "").upper()
@@ -15795,7 +15764,7 @@ def notify_new_live_fills(events: list[dict[str, Any]], existing_event_ids: set[
             portfolio=str(portfolio_gate.get("portfolio_id") or ""),
             cash_after=cash_summary,
             equity_after=(
-                f"{sum(safe_float(item.get('cash'), 0.0) for item in cash_rows) + sum(safe_float(item.get('value'), 0.0) for item in PROGRAM_LEDGER.position_rows() if str(item.get('broker_id') or '').lower() == broker_id):,.4f}"
+                f"{sum(safe_float(item.get('cash'), 0.0) for item in cash_rows) + sum(safe_float(item.get('value'), 0.0) for item in positions_by_key.values() if str(item.get('broker_id') or '').lower() == broker_id):,.4f}"
                 if cash_rows
                 else None
             ),
@@ -19339,6 +19308,9 @@ def _run_reconciliation_without_public_fence(
             f"{summary['status_label']}: API/원장 필요 {summary['api_required_count']}개, "
             f"미지원 capability {summary.get('capability_gap_count', 0)}개, "
             f"불일치 {summary['mismatch_count']}개, 조회 오류 {len(broker_data['errors'])}개"
+        ),
+        telegram_alert=(
+            not display_only and int(summary["mismatch_count"]) > 0
         ),
     )
     reconciliation_blocked = bool(
@@ -25376,20 +25348,10 @@ def submit_order_intent(
             runner_report=runner_report,
         ),
     )
-    if not dry_run and order.get("broker_id"):
-        state_name = str(order.get("state") or "").lower()
-        if state_name == "acknowledged":
-            queue_live_order_lifecycle_notification(
-                order,
-                status="acknowledged",
-            )
-        elif state_name in {"broker_rejected", "adapter_blocked", "unknown"}:
-            queue_live_order_lifecycle_notification(
-                order,
-                status="rejected" if state_name == "broker_rejected" else "error",
-                reason=str(order.get("reason") or reason),
-                message_final=True,
-            )
+    try:
+        queue_live_order_failure_notification(order, reason=str(order.get("reason") or reason))
+    except Exception:
+        pass  # A notification failure cannot change the broker outcome.
     return {"ok": ok, "reason": reason, "order": order, "snapshot": snapshot()}
 
 
@@ -28929,7 +28891,14 @@ def restore_runtime_from_checkpoint() -> dict[str, Any]:
             "detail": "유효한 체크포인트 없음: MONITOR/신규 진입 차단 유지",
             "corruptCheckpoints": loaded.get("corruptCheckpoints", []),
         }
-        append_audit("warn", "Startup Recovery", STATE["recovery_status"]["detail"])
+        unresolved_orders = any(
+            item.get("dry_run") is not True and _restore_order_is_pending_or_unknown(item)
+            for item in durable_dispatch_orders
+        )
+        append_audit(
+            "warn", "Startup Recovery", STATE["recovery_status"]["detail"],
+            telegram_alert=unresolved_orders,
+        )
         return dict(STATE["recovery_status"])
     recovered = loaded.get("state") if isinstance(loaded.get("state"), dict) else {}
     STATE["orders"] = merge_recovered_orders(
@@ -29530,7 +29499,10 @@ def _cancel_order_after_kis_route_selection(
                     }
                 )
                 STATE["new_entries_blocked"] = True
-                append_audit("error", "주문 취소 실패", f"{order_id} · 취소 요청 checkpoint 저장 실패")
+                append_audit(
+                    "error", "주문 취소 실패", f"{order_id} · 취소 요청 checkpoint 저장 실패",
+                    telegram_alert=True,
+                )
                 return {"ok": False, "reason": "cancel-request-checkpoint-failed", "snapshot": snapshot()}
         kis_kill_intent: dict[str, Any] | None = None
         kis_kill_revision = 0
@@ -29684,7 +29656,7 @@ def _cancel_order_after_kis_route_selection(
                     PROGRAM_LEDGER.update_order_dispatch(order)
                 except (OSError, sqlite3.Error, ValueError):
                     pass
-            append_audit("error", "주문 취소 실패", f"{order_id} · {reason}")
+            append_audit("error", "주문 취소 실패", f"{order_id} · {reason}", telegram_alert=True)
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
         if cancel_response.get("ok") is not True:
             reason = str(cancel_response.get("text") or cancel_response.get("status") or "broker cancel rejected")
@@ -29708,7 +29680,7 @@ def _cancel_order_after_kis_route_selection(
                     PROGRAM_LEDGER.update_order_dispatch(order)
                 except (OSError, sqlite3.Error, ValueError):
                     pass
-            append_audit("error", "주문 취소 실패", f"{order_id} · {reason}")
+            append_audit("error", "주문 취소 실패", f"{order_id} · {reason}", telegram_alert=True)
             return {"ok": False, "reason": reason, "snapshot": snapshot()}
         order.update(
             {
@@ -29729,12 +29701,6 @@ def _cancel_order_after_kis_route_selection(
                 STATE["new_entries_blocked"] = True
                 return {"ok": False, "reason": "cancel-ack-checkpoint-failed", "snapshot": snapshot()}
         append_audit("warn", "주문 취소", f"{order_id} 브로커 취소 요청 접수 · 상태/체결 대조 대기")
-        queue_live_order_lifecycle_notification(
-            order,
-            status="cancel_pending",
-            reason=str(order["reason"]),
-            message_final=False,
-        )
         return {
             "ok": True,
             "reason": "cancel request acknowledged; reconciliation pending",
@@ -29748,13 +29714,6 @@ def _cancel_order_after_kis_route_selection(
     order["next_retry_at"] = "-"
     order["reason"] = "브로커 주문과 로컬 큐를 취소했습니다." if submitted_to_broker else "운용자 요청으로 주문 큐 항목을 취소했습니다."
     append_audit("warn", "주문 취소", f"{order_id} {'브로커 주문 및 ' if submitted_to_broker else ''}주문 큐 항목을 취소했습니다.")
-    if submitted_to_broker:
-        queue_live_order_lifecycle_notification(
-            order,
-            status="cancelled",
-            reason=str(order["reason"]),
-            message_final=True,
-        )
     return {"ok": True, "reason": "order canceled", "snapshot": snapshot()}
 
 

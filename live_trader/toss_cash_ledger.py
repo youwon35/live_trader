@@ -126,9 +126,9 @@ class TossCashLedger:
             raise ValueError("TOSS_ORDER_ACK_UNKNOWN_NO_RETRY")
         proof = {**request, "clientOrderId": entry["clientOrderId"],
                  "response": {"brokerOrderId": ack["orderId"], "responseHash": ack["rawHash"]}}
-        fill = terminal_fill(raw, proof)
-        return self.append(owner, "TERMINAL", owner + ":terminal:" + ack["orderId"],
-                           {**fill, "strategyInstanceId": entry["strategyInstanceId"]})
+        fill = {**terminal_fill(raw, proof), "strategyInstanceId": entry["strategyInstanceId"]}
+        stored = self.append(owner, "TERMINAL", owner + ":terminal:" + ack["orderId"], fill)
+        return fill if stored else None
 
     def project(self, owner):
         rows = self.facts(owner)

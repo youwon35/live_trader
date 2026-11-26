@@ -491,7 +491,10 @@ class TossCashOperation:
             proof={**entry['request'],'response':{'brokerOrderId':order_id,'responseHash':entry['ack']['rawHash']}}
             row=exact_owned_order(raw,proof)
             if row['state'] in {'filled','canceled','rejected'}:
-                self.ledger.reconcile_order(self.owner,entry,raw); continue
+                terminal = self.ledger.reconcile_order(self.owner, entry, raw)
+                if terminal and Decimal(terminal["quantity"]) > 0:
+                    self._notify_new_terminal_fill(terminal)
+                continue
             if cancel and row['state'] in {'new','partially_filled'} and (not closed_scope_only or self._entry_scope_closed(entry)):
                 exists=any(f['kind']=='CANCEL_INTENT' and f['payload']['orderId']==order_id for f in self.ledger.facts(self.owner))
                 if not exists:
@@ -501,6 +504,29 @@ class TossCashOperation:
                     if claimed:
                         self.factory(mutation_settings,False).cancel_order(order_id)
         return self.ledger.project(self.owner)
+
+    @staticmethod
+    def _notify_new_terminal_fill(fill):
+        from .state import TELEGRAM_DISPATCHER, format_order_lifecycle_notification
+
+        try:
+            quantity = Decimal(fill["quantity"])
+            partial = fill["state"] != "filled"
+            TELEGRAM_DISPATCHER.send_async(
+                format_order_lifecycle_notification(
+                    app_name="Live Trader", environment="LIVE", broker="토스증권",
+                    status="partial" if partial else "filled", side=fill["side"], symbol=fill["symbol"],
+                    quantity=str(quantity), filled_quantity=str(quantity),
+                    average_price=f"{Decimal(fill['amount']) / quantity:.8g} {fill['currency']}",
+                    strategy=fill["strategyInstanceId"], order_id=fill["orderId"],
+                    occurred_at=fill["filledAt"], reason="남은 수량의 종료 확인" if partial else "",
+                ),
+                dedupe_key=f"live-fill:toss:{fill['orderId']}",
+                dedupe_seconds=604800,
+                severity="warning", event_type="trade", message_final=True,
+            )
+        except Exception:
+            pass  # The broker evidence is already durably recorded.
 
     def stop(self,payload):
         with self.lock:

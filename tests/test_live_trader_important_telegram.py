@@ -21,19 +21,17 @@ class ImportantTelegramIntegrationTests(unittest.TestCase):
         patch = mock.patch.object(state, "TELEGRAM_DISPATCHER", self.dispatcher)
         patch.start(); self.addCleanup(patch.stop)
 
-    def event(self, level, detail):
-        state.queue_live_audit_telegram(level, "체결 스트림", detail)
+    def event(self, level, detail, *, incident=True):
+        with mock.patch.object(state, "persist_audit_event"), mock.patch.dict(state.STATE):
+            state.append_audit(level, "Watchdog Fail Closed", detail, telegram_alert=incident)
         self.dispatcher.queue.join()
 
-    def test_measurement_drift_recovery_and_recurrence(self):
-        self.event("info", "binance 연결 복구")
+    def test_measurement_drift_does_not_repeat_urgent_alert(self):
         self.event("warning", "binance timeout 3회 지연 50초")
         self.event("warning", "binance timeout 8회 지연 70초")
-        self.event("info", "binance 연결 복구")
-        self.event("info", "binance 연결 복구")
-        self.event("warning", "binance timeout 8회 지연 90초")
-        self.assertEqual(3, len(self.sent))
-        self.assertIn("복구 확인", self.sent[1])
+        self.event("info", "binance 연결 복구", incident=False)
+        self.assertEqual(1, len(self.sent))
+        self.assertIn("Watchdog Fail Closed", self.sent[0])
 
     def test_another_broker_and_critical_escalation_still_notify(self):
         self.event("warning", "binance timeout 1회")
