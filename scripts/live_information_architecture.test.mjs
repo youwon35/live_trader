@@ -25,13 +25,14 @@ test("operator navigation follows the live decision sequence", () => {
     "실시간 감시",
     "계좌·잔고",
     "주문·체결",
+    "작업 진행",
     "실행 기록",
     "연결·설정",
   ]);
 
   const groups = between(appSource, "const navGroups = [", "function formatKeyValueMap");
   assert.match(groups, /label: "실거래", itemIds: \["overview", "gate", "automation", "monitor"\]/);
-  assert.match(groups, /label: "조회", itemIds: \["accounts", "orders", "incidents"\]/);
+  assert.match(groups, /label: "조회", itemIds: \["accounts", "orders", "progress", "incidents"\]/);
   assert.match(groups, /label: "관리", itemIds: \["settings"\]/);
   assert.match(appSource, /aria-current=\{selectedNavRoot === item\.id \? "page" : undefined\}/);
   assert.match(appSource, /<h1 id="live-page-title">\{title\}<\/h1>/);

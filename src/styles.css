@@ -9209,3 +9209,25 @@ body {
 .launch-condition-list { margin-top: 12px; }
 
 .launch-report-panel .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+:root[data-program="live-trader"] .live-safety-hierarchy {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+:root[data-program="live-trader"] .live-safety-hierarchy > div {
+  display: inline-flex;
+  align-items: center;
+  min-height: 0;
+  gap: 4px;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+}
+:root[data-program="live-trader"] .live-safety-hierarchy > div > span:first-child { width: auto; white-space: normal; }
+.live-work-progress { min-width: 0; }
+.live-work-progress > p { margin: 10px 14px; }
+.live-work-progress article { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 10px 14px; border-top: 1px solid var(--border); }
+.live-work-progress article strong, .live-work-progress article span { overflow-wrap: anywhere; }
+.live-work-progress progress { flex: 0 1 min(100%, 30rem); height: 9px; accent-color: var(--moa-accent); }

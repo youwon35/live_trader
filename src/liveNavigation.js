@@ -2,7 +2,7 @@
 // Keep legacy routes addressable while presenting fewer top-level decisions.
 export const LIVE_WORKSPACE_ROUTE_IDS = Object.freeze([
   "overview", "gate", "functional-test", "monitor", "risk", "automation", "accounts",
-  "orders", "incidents", "audit", "settings",
+  "orders", "progress", "incidents", "audit", "settings",
 ]);
 
 export function liveNavigationRoot(route) {

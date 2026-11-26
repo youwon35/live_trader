@@ -148,7 +148,7 @@ try {
     });
     await page.goto(origin);
     await page.getByRole('heading', { name: '시작 점검', exact: true }).waitFor();
-    const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '실시간 감시', '계좌·잔고', '주문·체결', '실행 기록', '연결·설정'];
+    const navLabels = ['시작 점검', '운용 전략', '실거래 운용', '실시간 감시', '계좌·잔고', '주문·체결', '작업 진행', '실행 기록', '연결·설정'];
     assert.deepEqual(await page.locator('.nav-list .nav-item').allTextContents().then((items) => items.map((text) => text.trim())), navLabels);
     for (const label of (process.env.CARD_ACCENT_ONLY === '1' ? ['시작 점검'] : [...navLabels, '주문 연결 시험'])) {
       const parent = label === '주문 연결 시험' ? '실거래 운용' : label;

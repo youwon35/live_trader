@@ -205,11 +205,17 @@ const navItems = [
   { id: "monitor", label: "실시간 감시", icon: Radio },
   { id: "accounts", label: "계좌·잔고", icon: WalletCards },
   { id: "orders", label: "주문·체결", icon: FileClock },
+  { id: "progress", label: "작업 진행", icon: Clock3 },
   { id: "incidents", label: "실행 기록", icon: FileClock },
   { id: "settings", label: "연결·설정", icon: Settings },
 ];
 
 const pageProfiles = {
+  progress: {
+    title: "작업 진행",
+    summary: "시작 점검, 장시간 점검과 주문 연결 시험의 현재 단계를 확인합니다.",
+    details: ["서버나 시작 준비가 제공하는 단계만 표시합니다. 일반 실거래 운용과 실시간 주문 상태는 각 화면에서 확인하세요."],
+  },
   overview: {
     title: "시작 점검",
     eyebrow: "LIVE READINESS",
@@ -2638,7 +2644,7 @@ function App() {
         </header>
 
         {selectedNav === "overview" && <StartupProgress view={startup} onRetryConnection={refresh} onRetryPreferences={() => setPreferencesAttempt(value => value + 1)} onRetryAccounts={snapshot.api_connected ? refreshBrokerAccounts : undefined} onNavigate={navigateWorkspace} />}
-        {["functional-test", "monitor"].includes(selectedNav) ? null : (
+        {["functional-test", "monitor", "progress"].includes(selectedNav) ? null : (
           <LiveEnvironmentBar
             context={deploymentContext}
             deploymentOptions={deploymentOptions}
@@ -2672,7 +2678,7 @@ function App() {
         )}
 
         <MarketGapPreparationPanel views={marketGapViews} onCancel={(key) => { void cancelMarketGapPreparation(key); }} onContinue={continueMarketGapPreparation} />
-        {deploymentContext?.brokerId === "kis" && <section className="panel" aria-label="국내 시세 준비 방법">
+        {selectedNav !== "progress" && deploymentContext?.brokerId === "kis" && <section className="panel" aria-label="국내 시세 준비 방법">
           <label>시세 준비 방법 <select value={kisInitializationMethod} onChange={(event) => { void cancelAllKisStartPreparations(); setKisInitializationMethod(event.target.value); }}>
             <option value="REVIEWED_REST">기존 분봉 자료로 준비</option><option value="PUBLIC_H0STCNT0">장중 체결 자료를 직접 모으기</option>
           </select></label>
@@ -2681,7 +2687,7 @@ function App() {
             <p>같은 정규장에서 최소 250분을 모읍니다. 오후 3시 20분 이전의 미래 5분 경계를 선택해 주세요. 준비 중 취소할 수 있으며 완료 후 별도로 계좌와 시작 여부를 확인합니다.</p>
           </>}
         </section>}
-        <KisNativePreparationPanel views={kisPreparationViews} onCancel={(key) => { void cancelKisStartPreparation(key); }} />
+        {selectedNav !== "progress" && <KisNativePreparationPanel views={kisPreparationViews} onCancel={(key) => { void cancelKisStartPreparation(key); }} />}
         {selectedNav === "automation" && <TossCashOperationPanel />}
         <WorkspaceContent
           selectedNav={selectedNav}
@@ -2893,6 +2899,7 @@ function WorkspaceContent({
   changeLayoutMode,
   resetWorkspaceLayout,
 }) {
+  const [doctorStep, setDoctorStep] = useState(-1);
   const [accountNowMs, setAccountNowMs] = useState(() => Date.now());
   useEffect(() => {
     if (selectedNav !== "accounts") return undefined;
@@ -2918,6 +2925,10 @@ function WorkspaceContent({
       {!monitoringPage && content}
     </PageView>
   );
+
+  if (selectedNav === "progress") {
+    return renderPage(<LiveWorkProgress snapshot={snapshot} preparationViews={kisPreparationViews} doctorStep={doctorStep} />);
+  }
 
   if (selectedNav === "automation") {
     return renderPage(
@@ -3108,8 +3119,51 @@ function WorkspaceContent({
       onReconcile={onReconcile}
       onPreflight={onPreflight}
       onWatchdog={onWatchdog}
+      doctorStep={doctorStep}
+      onDoctorStep={setDoctorStep}
     />,
   );
+}
+
+const DOCTOR_STEPS = ["계좌·포지션 대조", "운용 감시 점검", "선택 배포의 최종 시작 점검"];
+
+function LiveWorkProgress({ snapshot, preparationViews, doctorStep }) {
+  const connected = snapshot.api_connected === true;
+  const test = shortLiveHeaderState(snapshot);
+  const soak = connected ? (snapshot.soakReport || snapshot.soak_report) : null;
+  const soakActive = ["STARTING", "RUNNING"].includes(String(soak?.status || "").toUpperCase());
+  const fillSoak = connected && snapshot.binance_futures_fill_soak?.active === true ? snapshot.binance_futures_fill_soak : null;
+  const preparations = Object.values(preparationViews).filter(view => view.status !== "COMPLETE" && view.status !== "CANCELLED");
+  const pct = Number.isFinite(soak?.progressPct) && soak.progressPct >= 0 && soak.progressPct <= 100
+    ? soak.progressPct : null;
+  const hasWork = doctorStep >= 0 || test || soakActive || fillSoak || preparations.length > 0;
+
+  return <section className="panel live-work-progress" aria-label="시간이 걸리는 작업">
+    <PanelHeader title="현재 작업" />
+    {!connected && <p role="status">서버 연결을 확인하지 못했습니다. 거래와 서버 작업의 현재 상태는 미확인입니다.</p>}
+    {connected && !hasWork && <p role="status">현재 확인된 장시간 작업이 없습니다.</p>}
+    {doctorStep >= 0 && <article>
+      <strong>실거래 시작 점검</strong><span role="status">{doctorStep + 1} / {DOCTOR_STEPS.length}단계 · {DOCTOR_STEPS[doctorStep]}</span>
+      <progress aria-label={`시작 점검 완료 단계 ${doctorStep} / ${DOCTOR_STEPS.length}`} value={doctorStep} max={DOCTOR_STEPS.length} />
+    </article>}
+    {test && <article>
+      <strong>짧은 실거래 기능시험</strong><span role="status">{test.label}</span>
+      {test.observedAt && <small>최근 상태 확인 {formatAuditTime({ timestamp: test.observedAt })}</small>}
+    </article>}
+    {soakActive && <article>
+      <strong>무인 모니터 장시간 점검</strong><span role="status">{pct == null ? "진행 중" : `${pct.toFixed(0)}% 진행`}</span>
+      {pct == null ? <progress aria-label="무인 모니터 점검 진행 중" /> : <progress aria-label="무인 모니터 점검 진행률" value={pct} max={100} />}
+    </article>}
+    {fillSoak && <article>
+      <strong>Binance 선물 실체결 장시간 점검</strong><span role="status">{fillSoak.symbol ? `${fillSoak.symbol} · ` : ""}실행 중</span>
+    </article>}
+    {preparations.map(view => <article key={view.scopeKey}>
+      <strong>{view.label || "한국투자증권 시작 준비"}</strong>
+      <span role="status">{KIS_PREPARATION_LABELS[view.status] || "준비 상태 확인 중"}
+        {view.publicProgress && ` · 수신 ${view.publicProgress.frameCount}건 · ${Math.floor(view.publicProgress.elapsedSeconds / 60)}분 경과`}
+      </span>
+    </article>)}
+  </section>;
 }
 
 function compactHash(value = "") {
@@ -3186,7 +3240,7 @@ function PreflightScopePanel({ snapshot = {}, selectedDeploymentId = "", onPrefl
   );
 }
 
-function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, onReconcile, onPreflight, onWatchdog }) {
+function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, onReconcile, onPreflight, onWatchdog, doctorStep, onDoctorStep }) {
   const execution = ordinaryExecutionView(snapshot);
   return (
     <section className="operations-overview-layout ts-layout-stack">
@@ -3205,6 +3259,8 @@ function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, on
           onReconcile={onReconcile}
           onPreflight={onPreflight}
           onWatchdog={onWatchdog}
+          activeStep={doctorStep}
+          onProgress={onDoctorStep}
         />
         <LaunchReportPanel snapshot={snapshot} report={snapshot.launch_report ?? {}} observed={snapshot.api_connected === true && snapshot.final_preflight?.length > 0} onNavigate={onNavigate} />
       </section>
@@ -4577,8 +4633,8 @@ function LegacyOperationalSafeguardsControls({ apiConnected, dryRun, newEntriesB
   );
 }
 
-function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onReconcile, onPreflight, onWatchdog }) {
-  const [running, setRunning] = useState(false);
+function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onReconcile, onPreflight, onWatchdog, activeStep, onProgress }) {
+  const running = activeStep >= 0;
   const [hasRun, setHasRun] = useState(false);
   const [selectedDoctorId, setSelectedDoctorId] = useState(null);
   const doctorInFlight = useRef(false);
@@ -4591,18 +4647,20 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
   const selectedItem = visibleItems.find((item) => item.id === selectedDoctorId) ?? visibleItems[0] ?? null;
 
   async function runDoctor() {
-    if (doctorInFlight.current) return;
+    if (running || doctorInFlight.current) return;
     doctorInFlight.current = true;
-    setRunning(true);
+    onProgress(0);
     setHasRun(false);
     try {
       await onReconcile();
+      onProgress(1);
       await onWatchdog();
+      onProgress(2);
       await onPreflight();
       setHasRun(true);
     } finally {
       doctorInFlight.current = false;
-      setRunning(false);
+      onProgress(-1);
     }
   }
 
@@ -4613,7 +4671,7 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
         <div>
           <span>점검 결과</span>
           <strong role="status">{running ? "새 점검 진행 중" : hasRun ? categorySummary.label : "일반 운용 점검 대기"}</strong>
-          <p>{running ? "계좌 대조, Watchdog, 최종 사전 점검 결과를 읽고 있습니다." : hasRun ? categorySummary.detail : "계좌/API 연결과 일반 운용의 실행 조건을 분야별로 확인합니다. 주문 연결 시험은 해당 탭에서 별도로 준비하세요."}</p>
+          <p>{running ? DOCTOR_STEPS[activeStep] : hasRun ? categorySummary.detail : "계좌/API 연결과 일반 운용의 실행 조건을 분야별로 확인합니다. 주문 연결 시험은 해당 탭에서 별도로 준비하세요."}</p>
         </div>
         <ActionButton
           className="primary-button doctor-run-button"
@@ -4946,7 +5004,7 @@ function NotificationPanel({ items, onNavigate }) {
 
 const navGroups = [
   { id: "prepare", label: "실거래", itemIds: ["overview", "gate", "automation", "monitor"] },
-  { id: "operate", label: "조회", itemIds: ["accounts", "orders", "incidents"] },
+  { id: "operate", label: "조회", itemIds: ["accounts", "orders", "progress", "incidents"] },
   { id: "manage", label: "관리", itemIds: ["settings"] },
 ];
 
