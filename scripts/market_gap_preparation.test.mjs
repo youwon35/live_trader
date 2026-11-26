@@ -73,17 +73,23 @@ test('actual Live API adds trusted CSRF and carries optional fresh note only int
   const paths = []; const saved = { window: globalThis.window, fetch: globalThis.fetch };
   globalThis.window = { setTimeout, clearTimeout, pywebview: { api: { functional_http_session: async () => ({ ok: true, available: true, csrfHeader: 'X-LiveTrader-CSRF', csrfToken: 'x'.repeat(64) }) } } };
   globalThis.fetch = async (path, options) => {
-    paths.push({ path, options }); const value = path.endsWith('/begin') ? reply('fresh') : { ok: true };
+    paths.push({ path, options });
+    const value = path === '/api/safety-confirmation/challenge'
+      ? { ok: true, challengeId: 'fixture-gap', token: 'fixture-gap-token', expectedPhrase: 'LIVE TEST', expiresAt: new Date(Date.now() + 60000).toISOString() }
+      : path.endsWith('/begin') ? reply('fresh') : { ok: true };
     return { ok: true, headers: { get: () => 'application/json' }, json: async () => value };
   };
   try {
     const api = await import(`../src/api.js?gap-${Date.now()}`);
     api.registerMarketGapPresenter((view) => { if (view.phase === 'REVIEW') api.continueMarketGapPreparation(view.scopeKey); });
+    api.registerSafetyConfirmationPresenter(async ({ expectedPhrase }) => ({ confirmed: true, typedPhrase: expectedPhrase }));
     await api.prepareMarketGapsForStart({ profile_id: 'crypto', mode: 'SMALL_LIVE', portfolio_id: 'p', deployment_id: 'd', strategy_id: 's' }, {
       accountKey: 'a', label: '코인', continueStart: (id) => api.startContinuousRuntime('crypto', 'SMALL_LIVE', 'p', 'd', 's', { marketGapPreparationId: id }),
     });
     for (const row of paths.filter((value) => /market-gaps\/(begin|cancel)$/.test(value.path))) assert.equal(row.options.headers['X-LiveTrader-CSRF'], 'x'.repeat(64));
-    assert.equal(JSON.parse(paths.find((row) => row.path === '/api/runtime/start').options.body).marketGapPreparationId, 'fresh');
+    const submission = JSON.parse(paths.find((row) => row.path === '/api/runtime/start').options.body);
+    assert.equal(submission.marketGapPreparationId, 'fresh');
+    assert.deepEqual(submission.safety_confirmation, { challengeId: 'fixture-gap', token: 'fixture-gap-token', typedPhrase: 'LIVE TEST' });
     assert.equal(paths.filter((row) => row.path === '/api/runtime/start').length, 1);
   } finally { globalThis.window = saved.window; globalThis.fetch = saved.fetch; }
 });

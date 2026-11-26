@@ -18,10 +18,15 @@ function setup() {
   globalThis.fetch = async (path, options) => {
     calls.push({ path, body: options.body ? JSON.parse(options.body) : undefined, headers: options.headers });
     return { ok: true, headers: { get: () => "application/json" },
-      json: async () => path.endsWith("kis-manual-start-challenge")
+      json: async () => {
+        if (path === "/api/safety-confirmation/challenge") {
+          return { ok: true, challengeId: "fixture-crypto", token: "fixture-token", expectedPhrase: "LIVE TEST", expiresAt: new Date(Date.now() + 60000).toISOString() };
+        }
+        return path.endsWith("kis-manual-start-challenge")
         ? { ok: true, preparationId: "fixture-preparation", status: "PREPARING_PUBLIC", maximumPreparationSeconds: 660, runtimeStarted: false }
         : path.includes("kis-native-prepare-status?") ? { ...challenge(), preparationId: "fixture-preparation", status: "READY" }
-          : { ok: true, runtime_session_id: "mock-session" } };
+          : { ok: true, runtime_session_id: "mock-session" };
+      } };
   };
 }
 try {
@@ -71,9 +76,15 @@ try {
   assert.equal(Object.hasOwn(calls[0].body,"safety_confirmation"),false);
 
   setup();globalThis.window = { setTimeout, clearTimeout };
-  await api.startContinuousRuntime("crypto","SMALL_LIVE","p1","d1","s1");
-  assert.deepEqual(calls.map(x=>x.path),["/api/runtime/start"]);
-  assert.equal(Object.hasOwn(calls[0].body,"safety_confirmation"),false);
+  await assert.rejects(api.startContinuousRuntime("crypto","SMALL_LIVE","p1","d1","s1"), { code: "SAFETY_CONFIRMATION_UI_UNAVAILABLE" });
+  assert.equal(calls.length, 0);
+  const unregister = api.registerSafetyConfirmationPresenter(async ({ expectedPhrase }) => ({ confirmed: true, typedPhrase: expectedPhrase }));
+  try {
+    await api.startContinuousRuntime("crypto","SMALL_LIVE","p1","d1","s1");
+    assert.deepEqual(calls.map(x=>x.path),["/api/safety-confirmation/challenge","/api/runtime/start"]);
+    assert.deepEqual(calls[1].body.safety_confirmation, { challengeId: "fixture-crypto", token: "fixture-token", typedPhrase: "LIVE TEST" });
+    assert.equal(nativeCalls.length, 0);
+  } finally { unregister(); }
 
   setup();
   await api.stopContinuousRuntime("stock",{runtimeId:"stock-scope",deploymentId:"stock-deployment"});
