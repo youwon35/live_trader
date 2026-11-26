@@ -1,4 +1,4 @@
-import { doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel, diagnosticSafetyContext, preflightCheckPresentation, ordinarySafetyPresentation } from "./diagnosticPresentation.js";
+import { runDoctorChecks, DOCTOR_CHECK_LABELS, doctorCategorySummary, doctorHistoryPresentation, launchConditionPresentation, deploymentMetadataLabel, diagnosticSafetyContext, preflightCheckPresentation, ordinarySafetyPresentation } from "./diagnosticPresentation.js";
 import RuntimeBatchLauncher from "./RuntimeBatchLauncher.jsx";
 import { FeatureHelp } from "./FeatureHelp.jsx";
 import TossConnectionCheck from "./TossConnectionCheck.jsx";
@@ -2677,7 +2677,7 @@ function App() {
           </section>
         )}
 
-        <MarketGapPreparationPanel views={marketGapViews} onCancel={(key) => { void cancelMarketGapPreparation(key); }} onContinue={continueMarketGapPreparation} />
+        {selectedNav !== "progress" && <MarketGapPreparationPanel views={marketGapViews} onCancel={(key) => { void cancelMarketGapPreparation(key); }} onContinue={continueMarketGapPreparation} />}
         {selectedNav !== "progress" && deploymentContext?.brokerId === "kis" && <section className="panel" aria-label="국내 시세 준비 방법">
           <label>시세 준비 방법 <select value={kisInitializationMethod} onChange={(event) => { void cancelAllKisStartPreparations(); setKisInitializationMethod(event.target.value); }}>
             <option value="REVIEWED_REST">기존 분봉 자료로 준비</option><option value="PUBLIC_H0STCNT0">장중 체결 자료를 직접 모으기</option>
@@ -2700,6 +2700,7 @@ function App() {
           onDirectStrategyConnected={selectConnectedStrategy}
           searchQuery={searchQuery}
           kisPreparationViews={kisPreparationViews}
+          marketGapContent={selectedNav === "progress" && <MarketGapPreparationPanel views={marketGapViews} onCancel={(key) => { void cancelMarketGapPreparation(key); }} onContinue={continueMarketGapPreparation} />}
           onConfirm={() => runAction(() => setFlag("operator_confirmed", !snapshot.operator_confirmed))}
           onDryRun={() => runAction(() => setFlag("dry_run", !snapshot.dry_run, snapshot.dry_run))}
           onEntryBlock={() =>
@@ -2871,6 +2872,7 @@ function WorkspaceContent({
   onDirectStrategyConnected,
   searchQuery,
   kisPreparationViews,
+  marketGapContent,
   onConfirm,
   onDryRun,
   onEntryBlock,
@@ -2899,7 +2901,7 @@ function WorkspaceContent({
   changeLayoutMode,
   resetWorkspaceLayout,
 }) {
-  const [doctorStep, setDoctorStep] = useState(-1);
+  const [doctorProgress, setDoctorProgress] = useState(null);
   const [accountNowMs, setAccountNowMs] = useState(() => Date.now());
   useEffect(() => {
     if (selectedNav !== "accounts") return undefined;
@@ -2927,7 +2929,7 @@ function WorkspaceContent({
   );
 
   if (selectedNav === "progress") {
-    return renderPage(<LiveWorkProgress snapshot={snapshot} preparationViews={kisPreparationViews} doctorStep={doctorStep} />);
+    return renderPage(<><LiveWorkProgress snapshot={snapshot} preparationViews={kisPreparationViews} doctorProgress={doctorProgress} />{marketGapContent}</>);
   }
 
   if (selectedNav === "automation") {
@@ -3119,15 +3121,13 @@ function WorkspaceContent({
       onReconcile={onReconcile}
       onPreflight={onPreflight}
       onWatchdog={onWatchdog}
-      doctorStep={doctorStep}
-      onDoctorStep={setDoctorStep}
+      doctorProgress={doctorProgress}
+      onDoctorProgress={setDoctorProgress}
     />,
   );
 }
 
-const DOCTOR_STEPS = ["계좌·포지션 대조", "운용 감시 점검", "선택 배포의 최종 시작 점검"];
-
-function LiveWorkProgress({ snapshot, preparationViews, doctorStep }) {
+function LiveWorkProgress({ snapshot, preparationViews, doctorProgress }) {
   const connected = snapshot.api_connected === true;
   const test = shortLiveHeaderState(snapshot);
   const soak = connected ? (snapshot.soakReport || snapshot.soak_report) : null;
@@ -3136,16 +3136,19 @@ function LiveWorkProgress({ snapshot, preparationViews, doctorStep }) {
   const preparations = Object.values(preparationViews).filter(view => view.status !== "COMPLETE" && view.status !== "CANCELLED");
   const pct = Number.isFinite(soak?.progressPct) && soak.progressPct >= 0 && soak.progressPct <= 100
     ? soak.progressPct : null;
-  const hasWork = doctorStep >= 0 || test || soakActive || fillSoak || preparations.length > 0;
+
 
   return <section className="panel live-work-progress" aria-label="시간이 걸리는 작업">
     <PanelHeader title="현재 작업" />
     {!connected && <p role="status">서버 연결을 확인하지 못했습니다. 거래와 서버 작업의 현재 상태는 미확인입니다.</p>}
-    {connected && !hasWork && <p role="status">현재 확인된 장시간 작업이 없습니다.</p>}
-    {doctorStep >= 0 && <article>
-      <strong>실거래 시작 점검</strong><span role="status">{doctorStep + 1} / {DOCTOR_STEPS.length}단계 · {DOCTOR_STEPS[doctorStep]}</span>
-      <progress aria-label={`시작 점검 완료 단계 ${doctorStep} / ${DOCTOR_STEPS.length}`} value={doctorStep} max={DOCTOR_STEPS.length} />
+    {doctorProgress && <article>
+      <strong>실거래 시작 점검</strong>
+      <span role="status">{doctorProgress.running ? `${doctorProgress.step + 1} / ${DOCTOR_CHECK_LABELS.length}단계 · ${DOCTOR_CHECK_LABELS[doctorProgress.step]}` : "점검 종료"} · 응답 확인 ${doctorProgress.confirmed}건 · 실패 ${doctorProgress.failed.length}건</span>
+      {doctorProgress.running && <progress aria-label="시작 점검에서 응답을 확인한 단계" value={doctorProgress.confirmed} max={DOCTOR_CHECK_LABELS.length} />}
+      {doctorProgress.failed.length > 0 && <span role="alert">확인하지 못한 단계 · {doctorProgress.failed.join(", ")}</span>}
     </article>}
+    {connected && <TossCashOperationPanel monitorOnly progressOnly />}
+
     {test && <article>
       <strong>짧은 실거래 기능시험</strong><span role="status">{test.label}</span>
       {test.observedAt && <small>최근 상태 확인 {formatAuditTime({ timestamp: test.observedAt })}</small>}
@@ -3240,7 +3243,7 @@ function PreflightScopePanel({ snapshot = {}, selectedDeploymentId = "", onPrefl
   );
 }
 
-function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, onReconcile, onPreflight, onWatchdog, doctorStep, onDoctorStep }) {
+function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, onReconcile, onPreflight, onWatchdog, doctorProgress, onDoctorProgress }) {
   const execution = ordinaryExecutionView(snapshot);
   return (
     <section className="operations-overview-layout ts-layout-stack">
@@ -3259,8 +3262,8 @@ function OperationsOverviewPage({ snapshot, selectedDeploymentId, onNavigate, on
           onReconcile={onReconcile}
           onPreflight={onPreflight}
           onWatchdog={onWatchdog}
-          activeStep={doctorStep}
-          onProgress={onDoctorStep}
+          progress={doctorProgress}
+          onProgress={onDoctorProgress}
         />
         <LaunchReportPanel snapshot={snapshot} report={snapshot.launch_report ?? {}} observed={snapshot.api_connected === true && snapshot.final_preflight?.length > 0} onNavigate={onNavigate} />
       </section>
@@ -4633,9 +4636,10 @@ function LegacyOperationalSafeguardsControls({ apiConnected, dryRun, newEntriesB
   );
 }
 
-function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onReconcile, onPreflight, onWatchdog, activeStep, onProgress }) {
-  const running = activeStep >= 0;
-  const [hasRun, setHasRun] = useState(false);
+function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onReconcile, onPreflight, onWatchdog, progress, onProgress }) {
+  const running = progress?.running === true;
+  const hasRun = progress?.running === false && progress.scopeId === selectedDeploymentId;
+  const failed = hasRun ? progress.failed : [];
   const [selectedDoctorId, setSelectedDoctorId] = useState(null);
   const doctorInFlight = useRef(false);
   const items = running ? [] : buildDoctorItems(snapshot, selectedDeploymentId);
@@ -4649,18 +4653,10 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
   async function runDoctor() {
     if (running || doctorInFlight.current) return;
     doctorInFlight.current = true;
-    onProgress(0);
-    setHasRun(false);
     try {
-      await onReconcile();
-      onProgress(1);
-      await onWatchdog();
-      onProgress(2);
-      await onPreflight();
-      setHasRun(true);
+      await runDoctorChecks([onReconcile, onWatchdog, onPreflight], state => onProgress({ ...state, scopeId: selectedDeploymentId }));
     } finally {
       doctorInFlight.current = false;
-      onProgress(-1);
     }
   }
 
@@ -4670,8 +4666,8 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
       <div className="doctor-hero">
         <div>
           <span>점검 결과</span>
-          <strong role="status">{running ? "새 점검 진행 중" : hasRun ? categorySummary.label : "일반 운용 점검 대기"}</strong>
-          <p>{running ? DOCTOR_STEPS[activeStep] : hasRun ? categorySummary.detail : "계좌/API 연결과 일반 운용의 실행 조건을 분야별로 확인합니다. 주문 연결 시험은 해당 탭에서 별도로 준비하세요."}</p>
+          <strong role="status">{running ? "새 점검 진행 중" : failed.length ? "일부 점검 응답 확인 필요" : hasRun ? categorySummary.label : "일반 운용 점검 대기"}</strong>
+          <p>{running ? DOCTOR_CHECK_LABELS[progress.step] : failed.length ? failed.join(", ") : hasRun ? categorySummary.detail : "계좌/API 연결과 일반 운용의 실행 조건을 분야별로 확인합니다. 주문 연결 시험은 해당 탭에서 별도로 준비하세요."}</p>
         </div>
         <ActionButton
           className="primary-button doctor-run-button"
@@ -4681,7 +4677,7 @@ function PreTradeDoctorPanel({ snapshot, selectedDeploymentId, onNavigate, onRec
           onClick={runDoctor}
           pending={running}
           pendingLabel="점검 중"
-          status={running ? "pending" : hasRun ? (failCount ? "error" : problemCount ? undefined : "success") : undefined}
+          status={running ? "pending" : hasRun ? (failed.length || failCount ? "error" : problemCount ? undefined : "success") : undefined}
           variant="primary"
         />
       </div>

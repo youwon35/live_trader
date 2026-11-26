@@ -191,7 +191,7 @@ function TossCashMonitor({ snapshot, state, error, now }) {
   </section>;
 }
 
-export default function TossCashOperationPanel({ monitorOnly = false }) {
+export default function TossCashOperationPanel({ monitorOnly = false, progressOnly = false }) {
   const [items, setItems] = useState([]);
   const [selected, setSelected] = useState([]);
   const [budgets, setBudgets] = useState({ KR: 300000, US: 300000 });
@@ -223,6 +223,10 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
     mounted.current = true;
     let stopped = false, timer;
     async function poll() {
+      if (progressOnly && document.hidden) {
+        timer = window.setTimeout(poll, 5000);
+        return;
+      }
       const mutation = latestMutation.current;
       try {
         const value = await request(base + "status", { timeoutMs: 10000 });
@@ -236,7 +240,7 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
     }
     poll();
     return () => { stopped = true; mounted.current = false; window.clearTimeout(timer); };
-  }, []);
+  }, [monitorOnly, progressOnly]);
 
   useEffect(() => {
     if (monitorOnly) return undefined;
@@ -267,6 +271,15 @@ export default function TossCashOperationPanel({ monitorOnly = false }) {
     finally { submitted.current = false; if (mounted.current) setBusyAction(""); }
   }
 
+  if (progressOnly) {
+    const stateLabel = error ? "상태 갱신 미확인" : !snapshot ? "상태 확인 중"
+      : state === "RUNNING" && snapshot.running !== true ? "실행 여부 미확인" : labels[state] || message(state);
+    return <article aria-label="토스증권 작업">
+      <strong>토스증권</strong><span role={error ? "alert" : "status"}>{stateLabel}</span>
+      {preparing && !error && <progress aria-label="토스증권 자료와 계좌 확인 중" />}
+      {!error && <TossOperationReason state={state} reason={snapshot?.reason} />}
+    </article>;
+  }
   if (monitorOnly) return preparing ? <section className="panel toss-cash-panel live-grid-full" aria-label="토스 현금 운용 감시"><p role="status">선택한 범위의 자료와 계좌를 확인하고 있습니다.</p></section>
     : <TossCashMonitor snapshot={snapshot} state={state} error={error} now={now} />;
   const accountCurrencyCash = snapshot?.ledger?.cash || {};

@@ -1,12 +1,21 @@
 import * as React from 'react';
 
+function MarketGapProgress({ completed, total }) {
+  const measured = Number.isSafeInteger(completed) && Number.isSafeInteger(total)
+    && total > 0 && completed >= 0 && completed <= total;
+  return <div className="market-gap-progress">
+    <p role="status">공개 체결 자료 확인 중{measured && ` · ${completed} / ${total}개 종목`}</p>
+    <progress aria-label="공개 체결 자료 확인 종목 수" value={measured ? completed : undefined} max={measured ? total : undefined} />
+  </div>;
+}
+
 const historicalLabel = (row) => row.status === 'WARNING' ? row.currentIdleWarning && !row.recentDeadlineMisses ? '최근 체결 공백이 시가 기한보다 김' : '기한 안 체결이 없는 구간 관측'
   : row.status === 'OBSERVED' ? '최근 관측 구간 내 체결 확인' : '관측 자료 부족';
 export default function MarketGapPreparationPanel({ views = {}, onCancel, onContinue }) {
   return Object.values(views).filter((view) => !['COMPLETE', 'CANCELLED'].includes(view.phase)).map((view) => (
     <section key={view.scopeKey} className="panel" aria-label="종목별 최근 체결 공백" data-testid="market-gap-preparation">
       <strong>{view.label || '선택한 구성'} · 최근 체결 공백</strong>
-      {view.phase === 'PREPARING' ? <p role="status" aria-live="polite">공개 체결 자료 확인 중… {view.completedMembers || 0}/{view.memberCount || '선택 종목'}</p>
+      {view.phase === 'PREPARING' ? <MarketGapProgress completed={view.completedMembers} total={view.memberCount} />
         : view.phase === 'REVIEW' ? <>
           <p>최근 네 번의 5분봉 시작 구간만 살펴본 경고입니다. 앞으로의 검증 통과를 보장하지 않습니다.</p>
           {view.result?.members?.length ? <ul>{view.result.members.map((row) => <li key={row.strategyInstanceId}>

@@ -5,6 +5,7 @@ import { parse } from "@babel/parser";
 import { brokerAccountObservation } from "../src/statusTruth.js";
 import { recordedReconciliation } from "../src/executionAvailability.js";
 import { deploymentContextMatchesPreflight } from "../src/deploymentSelection.js";
+import { DOCTOR_CHECK_LABELS, runDoctorChecks } from "../src/diagnosticPresentation.js";
 
 // Read actual App function bodies by AST boundaries. Do not import App,
 // initialize its settings, mount effects or contact a server.
@@ -211,4 +212,20 @@ test('one broker account success cannot make another broker API diagnosis pass',
   assert.equal(row.details[0].tone,'danger');
   assert.equal(row.details[1].tone,'success');
   assert.equal(row.tone,'danger');
+});
+
+test("Doctor tracks attempted checks separately from confirmed responses", async () => {
+  const calls = [];
+  const updates = [];
+  await runDoctorChecks([
+    async () => { calls.push(0); return { ok: false }; },
+    async () => { calls.push(1); throw new Error("fixture timeout"); },
+    async () => { calls.push(2); return { ok: true }; },
+  ], (progress) => updates.push(progress));
+  assert.deepEqual(calls, [0, 1, 2]);
+  assert.deepEqual(updates.slice(0, -1).map((item) => item.step), [0, 1, 2]);
+  assert.deepEqual(updates.slice(0, -1).map((item) => item.confirmed), [0, 0, 0]);
+  assert.equal(updates.at(-1).running, false);
+  assert.equal(updates.at(-1).confirmed, 1);
+  assert.deepEqual(updates.at(-1).failed, DOCTOR_CHECK_LABELS.slice(0, 2));
 });

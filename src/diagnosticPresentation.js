@@ -102,3 +102,21 @@ export function ordinarySafetyPresentation(snapshot = {}) {
     { label: '전체 긴급 정지', status: !known || typeof snapshot.kill_switch !== 'boolean' ? 'warn' : snapshot.kill_switch ? 'fail' : 'pass', detail: !known || typeof snapshot.kill_switch !== 'boolean' ? '긴급 정지 상태 미확인' : snapshot.kill_switch ? '작동 중입니다. 원인과 진행 중 주문을 확인해야 합니다.' : '긴급 정지 신호가 없습니다.' },
   ] };
 }
+
+export const DOCTOR_CHECK_LABELS = Object.freeze(["계좌·포지션 대조", "운용 감시 점검", "선택 배포의 최종 시작 점검"]);
+
+export async function runDoctorChecks(checks, onProgress) {
+  let confirmed = 0;
+  const failed = [];
+  for (let step = 0; step < DOCTOR_CHECK_LABELS.length; step += 1) {
+    onProgress({ running: true, step, confirmed, failed: [...failed] });
+    try {
+      const result = await checks[step]();
+      if (result?.ok === true) confirmed += 1;
+      else failed.push(DOCTOR_CHECK_LABELS[step]);
+    } catch {
+      failed.push(DOCTOR_CHECK_LABELS[step]);
+    }
+  }
+  onProgress({ running: false, step: null, confirmed, failed });
+}
