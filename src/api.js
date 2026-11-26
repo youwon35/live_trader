@@ -52,6 +52,7 @@ export function prepareMarketGapsForStart(selection, { accountKey, label, contin
 let functionalHttpSessionFlight = null;
 let functionalHttpSessionGeneration = 0;
 const FUNCTIONAL_HTTP_MUTATION_PATHS = new Set([
+  "/api/shared-order-halt", "/api/shared-order-reconciliation",
   "/api/toss/operation/prepare", "/api/toss/operation/start", "/api/toss/operation/stop", "/api/toss/operation/recover", "/api/toss/operation/close_owned", "/api/toss/operation/preferences",
   "/api/tradingview/connect", "/api/tradingview/disconnect", "/api/tradingview/analyze", "/api/tradingview/chart", "/api/toss/prepare", "/api/toss/accounts",
   "/api/reconciliation/review",
@@ -1067,6 +1068,12 @@ export async function reviewPaperCandidate(reviewRequest) {
       method: "POST", body: { ...reviewRequest, ...safetyConfirmationPayload(confirmation) },
     }));
 }
+
+export const getSharedOrderHalt = () => request("/api/shared-order-halt");
+export const setSharedOrderHalt = (body) => request("/api/shared-order-halt", { method: "POST", body });
+export const reconcileSharedLiveOrders = () => request("/api/shared-order-reconciliation", {
+  method: "POST", body: { confirm: "reconcile" }, timeoutMs: 90_000,
+});
 
 export const getDirectStrategies = () => request("/api/direct-strategies");
 export const registerDirectStrategy = (body) => request("/api/direct-strategies/register", { method: "POST", body });

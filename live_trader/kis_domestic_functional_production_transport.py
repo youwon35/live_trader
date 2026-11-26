@@ -872,6 +872,14 @@ class DisabledKisDomesticFunctionalProductionTransport:
             "credentialEnvironmentKeyIdHash": self._credential_environment_key_id_hash,
             "productionBindingHash": self.production_binding_status()["bindingHash"],
         }
+        if normalized["operation"] in {"NATURAL_BUY", "CLEANUP_SELL"}:
+            from trading_runtime.order_coordination import CoordinationError, OrderCoordinator
+            try:
+                OrderCoordinator().assert_new_orders_enabled()
+            except (CoordinationError, OSError) as exc:
+                raise KisDomesticFunctionalProductionTransportBlocked(
+                    getattr(exc, "code", "COORDINATION_ORDER_HALT_UNAVAILABLE")
+                ) from exc
         try:
             raw_response = self._executor(prepared)
         except KisDomesticFunctionalProductionTransportBlocked as exc:

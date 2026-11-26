@@ -8,10 +8,11 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from decimal import Decimal
 import os
+import sqlite3
 import time
 
 from trading_runtime.order_coordination import (
-    CoordinationError, OrderCoordinator, canonical_request_hash,
+    CoordinationError, OrderCoordinator, SubmissionBlocked, canonical_request_hash,
     credential_account_identity, currency_units,
 )
 
@@ -79,6 +80,10 @@ class LiveOrderCoordination:
         # Called only by an explicit account refresh. No timer or startup read.
         return {owner: self.reconcile_stopped(owner, reader=reader)
                 for owner in self.retirement_journal.stopped_owners()}
+
+    def observe_interrupted_orders(self, *, reader=None):
+        from .order_coordination_retirement import observe_interrupted_orders
+        return observe_interrupted_orders(self, reader)
 
     @staticmethod
     def _binding(route, settings=None):
@@ -162,6 +167,7 @@ class LiveOrderCoordination:
             raise CoordinationError("COORDINATION_RUNTIME_OWNER_REQUIRED")
         if owner_id.startswith("live-runtime:") and owner_id in self.retirement_journal.stopped_owners():
             raise CoordinationError("COORDINATION_STOPPED_OWNER_CANNOT_SUBMIT")
+        self.coordinator.assert_new_orders_enabled()
         symbol = str(intent.get("symbol") or "").upper()
         prior_scopes = {s["scope_key"] for s in self.coordinator.list_owned(owner_id=owner_id)["scopes"]
                         if s["status"] == "CLAIMED"}
@@ -193,19 +199,29 @@ class LiveOrderCoordination:
                 except CoordinationError:
                     pass  # A durable or ambiguous registration must survive.
             raise
-        self.retirement_journal.register(owner_id, receipt, intent, route, self.coordinator.clock())
-        if not self.coordinator.begin_submission(intent_id=receipt["intentId"], owner_id=owner_id):
-            raise CoordinationError("COORDINATION_ALREADY_SUBMITTED_RECONCILE_ONLY")
         try:
-            response = submit()
-        except BaseException:
-            self.coordinator.record_result(intent_id=receipt["intentId"], owner_id=owner_id, status="UNKNOWN")
+            self.retirement_journal.register(owner_id, receipt, intent, route, self.coordinator.clock())
+        except (CoordinationError, OSError, sqlite3.Error):
+            self._cancel_new_reservation(receipt, owner_id)
+            raise
+        try:
+            response = self.coordinator.dispatch_submission(
+                intent_id=receipt["intentId"], owner_id=owner_id, submit=submit,
+                classify_result=self._result,
+            )
+        except SubmissionBlocked:
+            self._cancel_new_reservation(receipt, owner_id)
             raise
         status, broker_order_id = self._result(response)
-        self.coordinator.record_result(intent_id=receipt["intentId"], owner_id=owner_id,
-                                       status=status, broker_order_id=broker_order_id)
         self.retirement_journal.response(owner_id, receipt, response, status, broker_order_id)
         return response
+
+    def _cancel_new_reservation(self, receipt, owner_id):
+        if receipt["created"]:
+            try:
+                self.coordinator.cancel_unsubmitted_intent(intent_id=receipt["intentId"], owner_id=owner_id)
+            except (CoordinationError, OSError, sqlite3.Error):
+                pass  # A concurrently submitted intent keeps its durable state.
 
     @staticmethod
     def _result(response):
@@ -220,13 +236,13 @@ class LiveOrderCoordination:
                 return "UNKNOWN", ""
             if code == 0 or code >= 500:
                 return "UNKNOWN", ""
-        if "ok" in response:
+        if "ok" in response or "json" in response:
             payload = response.get("json")
             if not isinstance(payload, dict):
                 return "UNKNOWN", ""
             response = payload
         output = response.get("output") if isinstance(response.get("output"), dict) else {}
-        order_id = str(response.get("orderId") or response.get("uuid") or response.get("algoId") or output.get("ODNO") or "")
+        order_id = str(response.get("orderId") or response.get("uuid") or response.get("algoId") or output.get("ODNO") or output.get("odno") or "")
         state = str(response.get("status") or response.get("state") or "").upper()
         mapped = {"NEW": "ACKNOWLEDGED", "WAIT": "ACKNOWLEDGED", "WATCH": "ACKNOWLEDGED",
                   "PENDING": "ACKNOWLEDGED", "PARTIAL_FILLED": "PARTIALLY_FILLED",

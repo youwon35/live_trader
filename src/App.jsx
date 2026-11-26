@@ -7,6 +7,7 @@ import TossCashOperationPanel from "./TossCashOperationPanel.jsx";
 import ReconciliationChanges from "./ReconciliationChanges.jsx";
 import { submitReconciliationReview } from "./reconciliationReviewApi.js";
 import CoordinationRetirementNote from "./CoordinationRetirementNote.jsx";
+import SharedOrderHaltControls from "./SharedOrderHaltControls.jsx";
 import StartupProgress, { useStartupProgress } from "./StartupProgress.jsx";
 import { startupAccountObservation, startupStrategyObservation } from "./startupProgressModel.js";
 import { createSnapshotResponseGate, createSnapshotReadCoordinator, initialAccountRefreshState, accountRefreshResultState, accountObservationView } from "./snapshotRefreshState.js";
@@ -3037,7 +3038,7 @@ function WorkspaceContent({
     return renderPage(
       <section className="ts-panel-grid ts-panel-grid--two risk-page-layout">
         <RiskUsagePanel snapshot={snapshot} context={deploymentContext} />
-        <OperationalSafeguardsPanel snapshot={snapshot}
+        <OperationalSafeguardsPanel snapshot={snapshot} showSharedOrderHalt
           apiConnected={snapshot.api_connected === true}
           dryRun={snapshot.dry_run}
           newEntriesBlocked={snapshot.new_entries_blocked}
@@ -4513,12 +4514,13 @@ function FuturesFillSoakPanel({ snapshot = EMPTY_FUTURES_PANEL_SNAPSHOT, selecte
   );
 }
 
-function OperationalSafeguardsPanel({ snapshot = {}, ...legacyControls }) {
+function OperationalSafeguardsPanel({ snapshot = {}, showSharedOrderHalt = false, ...legacyControls }) {
   const view = ordinarySafetyPresentation(snapshot);
   return <section className="panel operational-safeguards-panel">
     <PanelHeader title="실행 확인 · 일반 운용 안전 상태" />
     <p className="diagnostic-explanation">주문 연결 시험은 해당 시작 화면의 동의를 사용합니다. 아래는 일반 운용 엔진의 상태이며, 일반 운용의 단계 승인·호환 제어는 고급 영역에 별도로 있습니다.</p>
     <div className="status-list">{view.rows.map(row => <StatusRow key={row.label} label={row.label} status={row.status} detail={row.detail} />)}</div>
+    {showSharedOrderHalt && <SharedOrderHaltControls />}
     <CompactDisclosure title="일반 운용 호환 제어 · 고급" description="주문 연결 시험과 별개입니다. 일반 운용의 단계 승인·기존 운영 경로가 실제로 사용하는 제어를 보존합니다. 시세 오류를 이곳의 토글로 해결하지 마세요.">
       <LegacyOperationalSafeguardsControls {...legacyControls} apiConnected={snapshot.api_connected === true}
         dryRun={snapshot.dry_run} newEntriesBlocked={snapshot.new_entries_blocked} killSwitch={snapshot.kill_switch} operatorConfirmed={snapshot.operator_confirmed} />

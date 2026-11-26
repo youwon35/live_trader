@@ -22,6 +22,7 @@ from .functional_http_session import (
     normalize_loopback_bind_host,
 )
 from trading_runtime.artifact_metadata import ArtifactMetadataStore
+from trading_runtime.order_coordination import CoordinationError, OrderCoordinator
 from trading_runtime.telegram_notifications import save_shared_telegram_settings, verify_telegram_connection
 
 
@@ -68,6 +69,7 @@ def tradingview_research():
 _FUNCTIONAL_STATUS_PATHS = frozenset(
     {
         "/api/tradingview/status",
+        "/api/shared-order-halt",
         "/api/toss/operation/status", "/api/toss/operation/catalog", "/api/toss/operation/preferences",
         "/api/short-live-tests/snapshot",
         "/api/runtime/batches/status",
@@ -84,6 +86,7 @@ _FUNCTIONAL_STATUS_PATHS = frozenset(
 )
 _FUNCTIONAL_MUTATION_PATHS = frozenset(
     {
+        "/api/shared-order-halt", "/api/shared-order-reconciliation",
         "/api/tradingview/connect", "/api/tradingview/disconnect", "/api/tradingview/analyze", "/api/tradingview/chart",
         "/api/toss/prepare", "/api/toss/accounts",
         "/api/toss/operation/prepare", "/api/toss/operation/start", "/api/toss/operation/stop", "/api/toss/operation/recover", "/api/toss/operation/close_owned", "/api/toss/operation/preferences",
@@ -473,6 +476,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
             require_origin=False
         ):
             return
+        if parsed.path == "/api/shared-order-halt":
+            self._shared_order_control(parsed)
+            return
         if parsed.path == "/api/runtime/batches/status":
             query = parse_qs(parsed.query, keep_blank_values=True)
             if set(query) != {"batchId"} or len(query["batchId"]) != 1:
@@ -690,6 +696,9 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
         if parsed.path in _FUNCTIONAL_MUTATION_PATHS and not self._authorize_functional_http(
             require_origin=True
         ):
+            return
+        if parsed.path in {"/api/shared-order-halt", "/api/shared-order-reconciliation"}:
+            self._shared_order_control(parsed, mutation=True)
             return
         if parsed.path in {"/api/operator-note", "/api/reconciliation/review"}:
             origin = self.headers.get("Origin", "")
@@ -1306,6 +1315,44 @@ class LiveTraderHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+    def _shared_order_control(self, parsed, *, mutation=False) -> None:
+        try:
+            if parsed.query:
+                raise CoordinationError("COORDINATION_EXACT_CONTROL_REQUIRED")
+            coordinator = OrderCoordinator()
+            if not mutation:
+                result = {"status": coordinator.get_order_halt()}
+            else:
+                length = self.headers.get("Content-Length", "")
+                content_type = self.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                if len(length) > 3 or not length.isascii() or not length.isdigit() or not 0 < int(length) <= 512:
+                    raise CoordinationError("COORDINATION_EXACT_CONTROL_REQUIRED")
+                if content_type != "application/json":
+                    raise CoordinationError("COORDINATION_EXACT_CONTROL_REQUIRED")
+                body = self.read_json()
+                if parsed.path == "/api/shared-order-reconciliation" and body == {"confirm": "reconcile"}:
+                    from .order_coordination import LiveOrderCoordination
+                    result = LiveOrderCoordination(coordinator).observe_interrupted_orders()
+                elif parsed.path == "/api/shared-order-halt" and isinstance(body, dict):
+                    if set(body) == {"halted"} and body["halted"] is True:
+                        status = coordinator.set_order_halt(halted=True, actor="live_trader")
+                    elif (set(body) == {"halted", "expectedRevision", "bothEnginesPaused"}
+                            and body["halted"] is False and body["bothEnginesPaused"] is True
+                            and type(body["expectedRevision"]) is int):
+                        status = coordinator.set_order_halt(
+                            halted=False, actor="live_trader", expected_revision=body["expectedRevision"]
+                        )
+                    else:
+                        raise CoordinationError("COORDINATION_EXACT_CONTROL_REQUIRED")
+                    result = {"status": status}
+                else:
+                    raise CoordinationError("COORDINATION_EXACT_CONTROL_REQUIRED")
+            self.send_json({"ok": True, **result})
+        except CoordinationError as exc:
+            self.send_json({"ok": False, "reasonCode": exc.code})
+        except (OSError, UnicodeError, sqlite3.Error):
+            self.send_json({"ok": False, "reasonCode": "COORDINATION_ORDER_CONTROL_UNAVAILABLE"})
 
     def read_json(self) -> dict[str, object]:
         length = int(self.headers.get("Content-Length", "0") or 0)

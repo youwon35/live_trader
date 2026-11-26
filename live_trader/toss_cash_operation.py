@@ -16,7 +16,7 @@ import time
 import uuid
 
 from trading_runtime.artifact_governance import stable_sha256
-from trading_runtime.order_coordination import OrderCoordinator, credential_account_identity
+from trading_runtime.order_coordination import NATIVE_TOSS_OWNER_PREFIX, OrderCoordinator, credential_account_identity
 from trading_runtime.provider_backfill_toss import TossClosedBarFeed, toss_market
 from trading_runtime.portfolio_runtime import BuiltinBarSignalEvaluator, required_warmup_bars
 from trading_runtime.toss_budget import TossBudgetPool
@@ -274,6 +274,12 @@ class TossCashOperation:
         for claim in self.claims:
             self.pool.assert_claim(claim_id=claim['claimId'],owner_id=self.owner)
 
+    def _assert_account_dispatch(self, symbol):
+        scope = next((item for item in self.scopes if item["symbol"] == symbol), None)
+        if scope is None:
+            raise ValueError("TOSS_SCOPE_REQUIRED_BEFORE_DISPATCH")
+        self.coordinator.assert_native_toss_submission_allowed(scope_key=scope["scopeKey"], owner_id=self.owner)
+
     def _mutation_settings(self):
         """One immutable settings snapshot binds both account check and POST."""
         settings=dict(self.settings())
@@ -374,7 +380,8 @@ class TossCashOperation:
                 wall_elapsed=self.clock()-(p['expiresAt']-180); mono_elapsed=self.monotonic()-p['preparedMono']
                 if not 0<=wall_elapsed<=180 or not 0<=mono_elapsed<=180 or abs(wall_elapsed-mono_elapsed)>2:
                     raise ValueError('TOSS_PREPARATION_EXPIRED')
-                self.owner='live-runtime:toss-'+str(uuid.uuid4()); self.claims=[]; self.scopes=[]
+                self.coordinator.assert_new_orders_enabled()
+                self.owner=NATIVE_TOSS_OWNER_PREFIX+str(uuid.uuid4()); self.claims=[]; self.scopes=[]
                 try:
                     for c,v in p['budgets'].items():
                         self.claims.append(self.pool.claim(account_identity=p['identity'],owner_id=self.owner,currency=c,limit=v))
@@ -460,10 +467,11 @@ class TossCashOperation:
             if not profile_open(spec,self.api,self.clock()): return False
             if not signal_current(spec.symbol,observed_at,self.clock(),spec=spec,api=self.api): return True
             normalize_orderbook(raw,symbol=spec.symbol,currency=currency,received_at=received,now=self.clock(),after=observed_at,bar_end=decision.bar.end_time)
-            self.ledger.register(self.owner,cid,{**request,'currency':currency,'stockSessionProfile':profile_for_spec(spec),'stockSessionProfileHash':profile_hash(profile_for_spec(spec))},spec.strategy_instance_id)
-            for claim in self.claims: self.pool.mark_started(claim_id=claim['claimId'],owner_id=self.owner)
             if profile['mode']=='EXTENDED':
                 execution_scope(self.api,profile,spec.symbol,stock,now=self.clock())
+            self._assert_account_dispatch(spec.symbol)
+            self.ledger.register(self.owner,cid,{**request,'currency':currency,'stockSessionProfile':profile_for_spec(spec),'stockSessionProfileHash':profile_hash(profile_for_spec(spec))},spec.strategy_instance_id)
+            for claim in self.claims: self.pool.mark_started(claim_id=claim['claimId'],owner_id=self.owner)
             response=self.factory(mutation_settings,False).place_order(request)
             self.ledger.acknowledge(self.owner,cid,response)
         self.view['ordersSubmitted']+=1; self._note('ORDER',spec.symbol+' '+decision.signal+' '+ticket['quantity'])
@@ -592,9 +600,10 @@ class TossCashOperation:
                     mutation_settings=self._mutation_settings()
                     if not profile_open(spec,self.api,self.clock()) or self.stop_event.is_set(): raise ValueError('TOSS_STOPPED_BEFORE_DISPATCH')
                     normalize_orderbook(raw,symbol=spec.symbol,currency=currency,received_at=received,now=self.clock(),after=observed)
+                    if profile['mode']=='EXTENDED': execution_scope(self.api,profile,spec.symbol,stock,now=self.clock())
+                    self._assert_account_dispatch(spec.symbol)
                     self.ledger.register(self.owner,cid,{**request,'currency':currency,'stockSessionProfile':profile_for_spec(spec),'stockSessionProfileHash':profile_hash(profile_for_spec(spec))},spec.strategy_instance_id)
                     for claim in self.claims: self.pool.mark_started(claim_id=claim['claimId'],owner_id=self.owner)
-                    if profile['mode']=='EXTENDED': execution_scope(self.api,profile,spec.symbol,stock,now=self.clock())
                     self.ledger.acknowledge(self.owner,cid,self.factory(mutation_settings,False).place_order(request))
                 self.view['ordersSubmitted']=self.view.get('ordersSubmitted',0)+1
                 for _ in range(30):

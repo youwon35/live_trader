@@ -1,4 +1,4 @@
-"""Read-only broker reconciliation after an ordinary Live worker has stopped.
+"""Read-only broker reconciliation using the ordinary Live order journal.
 
 The local journal preserves exact client/order identity, not credentials or
 account balances. It never cancels or places orders and never treats a missing
@@ -13,7 +13,7 @@ import threading
 import time
 from zoneinfo import ZoneInfo
 
-from trading_runtime.order_coordination import CoordinationError, canonical_request_hash
+from trading_runtime.order_coordination import CoordinationError, account_identity_hash, canonical_request_hash
 
 _ROUTES = {("binance", "SPOT"): "BINANCE_SPOT",
            ("binance", "USDM_FUTURES"): "BINANCE_USDM_FUTURES",
@@ -93,7 +93,7 @@ class LiveRetirementJournal:
     def response(self, owner, receipt, raw, status, broker_id):
         if not owner.startswith("live-runtime:"):
             return
-        body = raw.get("json") if isinstance(raw, dict) and "ok" in raw else raw
+        body = raw.get("json") if isinstance(raw, dict) and "json" in raw else raw
         body = body if isinstance(body, dict) else {}
         output = body.get("output") if isinstance(body.get("output"), dict) else {}
         row = {"status": status, "brokerOrderId": broker_id,
@@ -115,6 +115,12 @@ class LiveRetirementJournal:
             return []
         with self._db() as db:
             return [r[0] for r in db.execute("SELECT owner FROM owners WHERE stopped=1")]
+
+    def ordinary_owners(self):
+        if not self.path.exists():
+            return []
+        with self._db() as db:
+            return [row[0] for row in db.execute("SELECT DISTINCT owner FROM proofs ORDER BY owner")]
 
     def proof(self, owner, intent_id):
         if not self.path.exists():
@@ -246,6 +252,53 @@ class OrdinaryRetirementReader:
                 "baseCommissionKnown": True, "observedAt": started, "orderDate": date, "organizationNo": org}
 
 
+def observe_interrupted_orders(helper, reader=None):
+    """Update exact broker outcomes without releasing scopes or inferring absence."""
+    result = {"checked": 0, "resolved": 0, "unresolved": 0, "blockers": []}
+    if not helper.coordinator.path.exists():
+        return result
+    for owner in helper.retirement_journal.ordinary_owners():
+        owned = helper.coordinator.list_owned(owner_id=owner)
+        scopes = {row["scope_key"]: row for row in owned["scopes"] if row["status"] == "CLAIMED"}
+        for item in owned["intents"]:
+            if item["state"] not in {"SUBMITTING", "UNKNOWN"} or item["reconciled"]:
+                continue
+            scope = scopes.get(item["scopeKey"])
+            if not scope:
+                continue
+            result["checked"] += 1
+            try:
+                route = _ROUTES[(scope["broker"], scope["market"])]
+                broker, market, account_identity = helper._binding(route)
+                if scope["market"] != market or scope["account_hash"] != account_identity_hash(broker, account_identity):
+                    raise CoordinationError("COORDINATION_ACCOUNT_CHANGED")
+                proof = helper.retirement_journal.proof(owner, item["intentId"])
+                if proof["symbol"] != scope["symbol"] or proof["clientOrderId"] != item["clientOrderId"]:
+                    raise CoordinationError("COORDINATION_ORDER_PROOF_IDENTITY_MISMATCH")
+                reader = reader or OrdinaryRetirementReader()
+                observed = reader.order(route, proof, item)
+                if (observed.get("known") is not True or observed.get("symbol") != scope["symbol"]
+                        or observed.get("clientOrderId") != item["clientOrderId"] or observed.get("side") != proof["side"]):
+                    raise CoordinationError("COORDINATION_OWNED_ORDER_UNKNOWN")
+                if scope["market"] == "USDM_FUTURES" and observed.get("positionSide") != proof["positionSide"]:
+                    raise CoordinationError("COORDINATION_OWNED_POSITION_SIDE_MISMATCH")
+                status = str(observed.get("status") or "").upper().replace("CANCELLED", "CANCELED")
+                status = {"NEW": "ACKNOWLEDGED", "PENDING": "ACKNOWLEDGED", "WAIT": "ACKNOWLEDGED",
+                          "WATCH": "ACKNOWLEDGED", "PARTIAL_FILLED": "PARTIALLY_FILLED",
+                          "DONE": "FILLED", "CANCEL": "CANCELED"}.get(status, status)
+                helper.coordinator.observe_existing_submission(
+                    intent_id=item["intentId"], owner_id=owner, status=status,
+                    broker_order_id=str(observed.get("algoId" if proof["protection"] else "brokerOrderId") or ""),
+                    observed_at=_timestamp(observed.get("observedAt")),
+                )
+                result["resolved"] += 1
+            except Exception as exc:
+                result["unresolved"] += 1
+                result["blockers"].append({"broker": scope["broker"], "symbol": scope["symbol"],
+                    "reason": exc.code if isinstance(exc, CoordinationError) else "COORDINATION_BROKER_RECONCILIATION_UNAVAILABLE"})
+    return result
+
+
 def reconcile_stopped_owner(helper, owner_id, reader=None):
     """Release only exact stopped owner scopes with current complete proof."""
     if owner_id not in helper.retirement_journal.stopped_owners():
@@ -266,6 +319,8 @@ def reconcile_stopped_owner(helper, owner_id, reader=None):
             times, terminal, observations, net = [], {}, [], Decimal(0)
             side_nets = {}
             for item in intents:
+                if item["state"] == "CANCELLED_BEFORE_SUBMIT" and item["reconciled"]:
+                    continue  # Durable cancellation proved the broker send never started.
                 proof = helper.retirement_journal.proof(owner_id, item["intentId"])
                 if proof["symbol"] != scope["symbol"] or proof["clientOrderId"] != item["clientOrderId"]:
                     raise CoordinationError("COORDINATION_ORDER_PROOF_IDENTITY_MISMATCH")

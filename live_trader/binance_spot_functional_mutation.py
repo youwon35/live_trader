@@ -717,6 +717,14 @@ class BinanceSpotFunctionalMutationEdge:
                 raise BinanceSpotFunctionalMutationNotSent(
                     "final independent exclusivity health changed"
                 )
+        if prepared.method == "POST":
+            from trading_runtime.order_coordination import CoordinationError, OrderCoordinator
+            try:
+                OrderCoordinator().assert_new_orders_enabled()
+            except (CoordinationError, OSError) as exc:
+                raise BinanceSpotFunctionalMutationNotSent(
+                    getattr(exc, "code", "COORDINATION_ORDER_HALT_UNAVAILABLE")
+                ) from exc
         # Contract: every local validation precedes this marker.  The sender
         # is invoked exactly once after it; no retry exists.
         self.claim_marker(_text(claim_id))

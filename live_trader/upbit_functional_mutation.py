@@ -630,6 +630,14 @@ class UpbitFunctionalMutationEdge:
         def mark_and_send() -> Mapping[str, Any]:
             from .short_live_order_authority import check_short_live_authority
             check_short_live_authority("UPBIT")
+            if prepared.method == "POST":
+                from trading_runtime.order_coordination import CoordinationError, OrderCoordinator
+                try:
+                    OrderCoordinator().assert_new_orders_enabled()
+                except (CoordinationError, OSError) as exc:
+                    raise UpbitFunctionalMutationNotSent(
+                        getattr(exc, "code", "COORDINATION_ORDER_HALT_UNAVAILABLE")
+                    ) from exc
             try:
                 marker = self.post_boundary_marker(claim_id, request_hash)
             except Exception as exc:
