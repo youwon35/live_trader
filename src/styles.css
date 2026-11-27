@@ -330,30 +330,21 @@ button {
   border-color: var(--primary-border);
 }
 
-.notification-badge {
-  position: absolute;
-  top: 2px;
-  right: 2px;
-  display: inline-grid;
-  place-items: center;
-  min-width: 14px;
-  height: 14px;
-  padding: 0 3px;
-  color: #991b1b;
-  background: #ffffff;
-  border: 1px solid #dc2626;
-  border-radius: var(--radius-pill);
-  font-size: 9px;
-  font-weight: 900;
-  line-height: 1;
-  pointer-events: none;
+.notification-button.icon-button:has(.notification-count) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: auto;
+  padding-inline: 8px;
 }
 
-:root[data-program] .notification-button > .notification-badge {
-  color: #991b1b !important;
-  background-color: #ffffff !important;
-  background-image: none !important;
-  border-color: #dc2626 !important;
+.notification-count {
+  color: var(--moa-status-warning, currentColor);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
 
 .notification-panel {
@@ -9228,8 +9219,14 @@ body {
 :root[data-program="live-trader"] .live-safety-hierarchy > div > span:first-child { width: auto; white-space: normal; }
 .live-work-progress { min-width: 0; }
 .live-work-progress > p { margin: 10px 14px; }
-.live-work-progress article { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 10px 14px; border-top: 1px solid var(--border); }
-.live-work-progress article strong, .live-work-progress article span { overflow-wrap: anywhere; }
-.live-work-progress article [role="alert"] { color: var(--moa-status-danger); }
+.live-progress-table-wrap { min-width: 0; overflow: auto; }
+.live-progress-table { width: 100%; min-width: 340px; border-collapse: collapse; font-size: 13px; }
+.live-progress-table :is(th, td) { padding: 7px 10px; text-align: start; vertical-align: middle; border-block-end: 1px solid var(--border); overflow-wrap: anywhere; }
+.live-progress-table thead th { color: var(--text-soft); background: var(--panel-muted, var(--panel)); white-space: nowrap; }
+.live-progress-table tbody th { width: 30%; }
+.live-progress-table td:last-child { width: 44%; font-variant-numeric: tabular-nums; }
+.live-progress-table td :is(progress, small) { display: block; }
+.live-progress-table td p { margin: 0; }
+.live-progress-table [role="alert"] { color: var(--moa-status-danger); }
 .market-gap-progress progress { width: min(100%, 30rem); height: 9px; accent-color: var(--moa-accent); }
-.live-work-progress progress { flex: 0 1 min(100%, 30rem); height: 9px; accent-color: var(--moa-accent); }
+.live-progress-table progress { width: 100%; max-width: 28rem; height: 9px; accent-color: var(--moa-accent); }

@@ -274,11 +274,15 @@ export default function TossCashOperationPanel({ monitorOnly = false, progressOn
   if (progressOnly) {
     const stateLabel = error ? "상태 갱신 미확인" : !snapshot ? "상태 확인 중"
       : state === "RUNNING" && snapshot.running !== true ? "실행 여부 미확인" : labels[state] || message(state);
-    return <article aria-label="토스증권 작업">
-      <strong>토스증권</strong><span role={error ? "alert" : "status"}>{stateLabel}</span>
-      {preparing && !error && <progress aria-label="토스증권 자료와 계좌 확인 중" />}
-      {!error && <TossOperationReason state={state} reason={snapshot?.reason} />}
-    </article>;
+    return <tr>
+      <th scope="row">토스증권</th>
+      <td><span role={error ? "alert" : "status"}>{stateLabel}</span></td>
+      <td>
+        {preparing && !error && <progress aria-label="토스증권 자료와 계좌 확인 중" />}
+        {!error && snapshot?.reason && <TossOperationReason state={state} reason={snapshot.reason} />}
+        {(error || (!preparing && !snapshot?.reason)) && "–"}
+      </td>
+    </tr>;
   }
   if (monitorOnly) return preparing ? <section className="panel toss-cash-panel live-grid-full" aria-label="토스 현금 운용 감시"><p role="status">선택한 범위의 자료와 계좌를 확인하고 있습니다.</p></section>
     : <TossCashMonitor snapshot={snapshot} state={state} error={error} now={now} />;

@@ -2597,7 +2597,7 @@ function App() {
               <IconButton
                 className="notification-button"
                 active={notificationsOpen}
-                aria-label="알림"
+                aria-label={unreadNotificationCount ? "읽지 않은 알림 " + unreadNotificationCount + "개" : "알림"}
                 aria-expanded={notificationsOpen}
                 onClick={() => {
                   if (!notificationsOpen && notificationKey) acknowledgeNotifications(notificationKey);
@@ -2605,7 +2605,7 @@ function App() {
                 }}
               >
                 <Bell size={17} />
-                {unreadNotificationCount > 0 && <span className="notification-badge">{Math.min(unreadNotificationCount, 9)}</span>}
+                {unreadNotificationCount > 0 && <span className="notification-count" aria-hidden="true">{unreadNotificationCount > 9 ? "9+" : unreadNotificationCount}</span>}
               </IconButton>
               {notificationsOpen && <NotificationPanel items={notifications} onNavigate={navigateWorkspace} />}
             </div>
@@ -3141,31 +3141,47 @@ function LiveWorkProgress({ snapshot, preparationViews, doctorProgress }) {
   return <section className="panel live-work-progress" aria-label="시간이 걸리는 작업">
     <PanelHeader title="현재 작업" />
     {!connected && <p role="status">서버 연결을 확인하지 못했습니다. 거래와 서버 작업의 현재 상태는 미확인입니다.</p>}
-    {doctorProgress && <article>
-      <strong>실거래 시작 점검</strong>
-      <span role="status">{doctorProgress.running ? `${doctorProgress.step + 1} / ${DOCTOR_CHECK_LABELS.length}단계 · ${DOCTOR_CHECK_LABELS[doctorProgress.step]}` : "점검 종료"} · 응답 확인 ${doctorProgress.confirmed}건 · 실패 ${doctorProgress.failed.length}건</span>
-      {doctorProgress.running && <progress aria-label="시작 점검에서 응답을 확인한 단계" value={doctorProgress.confirmed} max={DOCTOR_CHECK_LABELS.length} />}
-      {doctorProgress.failed.length > 0 && <span role="alert">확인하지 못한 단계 · {doctorProgress.failed.join(", ")}</span>}
-    </article>}
-    {connected && <TossCashOperationPanel monitorOnly progressOnly />}
-
-    {test && <article>
-      <strong>짧은 실거래 기능시험</strong><span role="status">{test.label}</span>
-      {test.observedAt && <small>최근 상태 확인 {formatAuditTime({ timestamp: test.observedAt })}</small>}
-    </article>}
-    {soakActive && <article>
-      <strong>무인 모니터 장시간 점검</strong><span role="status">{pct == null ? "진행 중" : `${pct.toFixed(0)}% 진행`}</span>
-      {pct == null ? <progress aria-label="무인 모니터 점검 진행 중" /> : <progress aria-label="무인 모니터 점검 진행률" value={pct} max={100} />}
-    </article>}
-    {fillSoak && <article>
-      <strong>Binance 선물 실체결 장시간 점검</strong><span role="status">{fillSoak.symbol ? `${fillSoak.symbol} · ` : ""}실행 중</span>
-    </article>}
-    {preparations.map(view => <article key={view.scopeKey}>
-      <strong>{view.label || "한국투자증권 시작 준비"}</strong>
-      <span role="status">{KIS_PREPARATION_LABELS[view.status] || "준비 상태 확인 중"}
-        {view.publicProgress && ` · 수신 ${view.publicProgress.frameCount}건 · ${Math.floor(view.publicProgress.elapsedSeconds / 60)}분 경과`}
-      </span>
-    </article>)}
+    {(connected || doctorProgress || preparations.length > 0) && <div className="live-progress-table-wrap">
+      <table className="live-progress-table" aria-label="시간이 걸리는 작업">
+        <thead><tr><th scope="col">작업</th><th scope="col">상태</th><th scope="col">진행 상황</th></tr></thead>
+        <tbody>
+          {doctorProgress && <tr>
+            <th scope="row">실거래 시작 점검</th>
+            <td><span role="status">{doctorProgress.running ? (doctorProgress.step + 1) + " / " + DOCTOR_CHECK_LABELS.length + "단계 · " + DOCTOR_CHECK_LABELS[doctorProgress.step] : "점검 종료"}</span></td>
+            <td>
+              <span>응답 확인 {doctorProgress.confirmed}건 · 실패 {doctorProgress.failed.length}건</span>
+              {doctorProgress.running && <progress aria-label="시작 점검에서 응답을 확인한 단계" value={doctorProgress.confirmed} max={DOCTOR_CHECK_LABELS.length} />}
+              {doctorProgress.failed.length > 0 && <small role="alert">확인하지 못한 단계 · {doctorProgress.failed.join(", ")}</small>}
+            </td>
+          </tr>}
+          {connected && <TossCashOperationPanel monitorOnly progressOnly />}
+          {test && <tr>
+            <th scope="row">짧은 실거래 기능시험</th>
+            <td><span role="status">{test.label}</span></td>
+            <td>{test.observedAt ? "최근 확인 " + formatAuditTime({ timestamp: test.observedAt }) : "–"}</td>
+          </tr>}
+          {soakActive && <tr>
+            <th scope="row">무인 모니터 장시간 점검</th>
+            <td><span role="status">진행 중</span></td>
+            <td>{pct == null ? <progress aria-label="무인 모니터 점검 진행 중" /> : <>
+              <span>{pct.toFixed(0)}%</span><progress aria-label="무인 모니터 점검 진행률" value={pct} max={100} />
+            </>}</td>
+          </tr>}
+          {fillSoak && <tr>
+            <th scope="row">Binance 선물 실체결 장시간 점검</th>
+            <td><span role="status">실행 중</span></td>
+            <td>{fillSoak.symbol || "–"}</td>
+          </tr>}
+          {preparations.map(view => <tr key={view.scopeKey}>
+            <th scope="row">{view.label || "한국투자증권 시작 준비"}</th>
+            <td><span role="status">{KIS_PREPARATION_LABELS[view.status] || "준비 상태 확인 중"}</span></td>
+            <td>{view.publicProgress
+              ? "수신 " + view.publicProgress.frameCount + "건 · " + Math.floor(view.publicProgress.elapsedSeconds / 60) + "분 경과"
+              : "–"}</td>
+          </tr>)}
+        </tbody>
+      </table>
+    </div>}
   </section>;
 }
 
