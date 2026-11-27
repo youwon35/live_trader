@@ -54,11 +54,8 @@ export default function StartupProgress({ view, onRetryConnection, onRetryPrefer
         <strong role="status">{title}</strong>
         <p>{view.completed}/{view.total}단계 완료 · {view.elapsedSeconds}초 경과</p>
       </div>
-      <div className="startup-progress-actions">
-        <b>{view.percent}%</b>
-        {view.ready && !hasIssues && <button type="button" className="secondary-button"
-          aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? '접기' : '점검 내역'}</button>}
-      </div>
+      {view.ready && !hasIssues && <button type="button" className="secondary-button"
+        aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? '접기' : '점검 내역'}</button>}
     </div>
     <progress max="100" value={view.percent} aria-label="초기 점검 단계 완료율" />
     {showRows && <ol>{view.rows.map(row => {

@@ -41,7 +41,7 @@ test('actual startup component exposes truthful progress and explicit execution 
  assert.match(html,/value="0"/);assert.match(html,/0\/4단계 완료/);assert.match(html,/12초 경과/);assert.match(html,/아래 실거래 시작 점검을 실행하세요/);
  let state=done(done(done(done(startupInitial(),'accounts'),'connection'),'preferences'),'strategies');
  const ready=renderToStaticMarkup(React.createElement(Component,{view:{...startupView(state),elapsedSeconds:15}}));
- assert.match(ready,/초기 점검 완료/);assert.match(ready,/aria-expanded="false"/);assert.doesNotMatch(ready,/<ol>/);
+ assert.match(ready,/초기 점검 완료/);assert.match(ready,/value="100"/);assert.match(ready,/4\/4단계 완료/);assert.doesNotMatch(ready,/100%/);assert.match(ready,/aria-expanded="false"/);assert.doesNotMatch(ready,/<ol>/);
 });
 test('actual App wiring observes existing reads without adding broker polling or mutating authority',()=>{
  const app=readFileSync(new URL('../src/App.jsx',import.meta.url),'utf8');
