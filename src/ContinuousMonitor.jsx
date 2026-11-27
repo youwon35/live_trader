@@ -14,11 +14,13 @@ function MonitorMetric({icon:Icon,label,value,note}) {
 }
 
 function EventList({events, details=false}) {
-  return <ol className={details?'tower-event-list tower-event-details':'tower-event-list'}>
-    {events.map((event,index)=><li key={[event.kind,event.id,event.instance,index].join(':')}>
-      <time dateTime={event.at}>{at(event.at)}</time>
-      <div>
-        <strong className={event.issue?'monitor-tone-danger':'monitor-tone-'+tone(event.signal)}>{event.label}</strong>
+  const label = details ? '상세 운용 기록' : '최근 운용 활동';
+  return <div className="live-activity-table tower-activity-table" aria-label={label + " 스크롤"} tabIndex={0}>
+    <table aria-label={label}><thead><tr><th scope="col">시각</th><th scope="col">활동</th><th scope="col">대상 · 상세</th></tr></thead><tbody>
+    {events.map((event,index)=><tr key={[event.kind,event.id,event.instance,index].join(':')}>
+      <td><time dateTime={event.at}>{at(event.at)}</time></td>
+      <td><strong className={event.issue?'monitor-tone-danger':'monitor-tone-'+tone(event.signal)}>{event.label}</strong></td>
+      <td>
         <small>{[event.symbol,routeName(event.broker),event.timeframe,event.kind==='order'&&({BUY:'매수',SELL:'매도'})[String(event.side||'').toUpperCase()]].filter(Boolean).join(' · ')}</small>
         {details && <>
           {event.barAt && <small>평가에 쓴 봉 {at(event.barAt)} · 종가 {fmt(event.price)}</small>}
@@ -30,9 +32,10 @@ function EventList({events, details=false}) {
           {event.outcome && event.outcome!==event.reason && <p>{event.outcome}</p>}
           {!event.reason && !event.action && !event.outcome && <small>별도 사유 기록 없음</small>}
         </>}
-      </div>
-    </li>)}
-  </ol>;
+      </td>
+    </tr>)}
+    </tbody></table>
+  </div>;
 }
 
 function AccountTrend({points, account}) {

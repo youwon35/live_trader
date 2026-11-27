@@ -41,25 +41,6 @@
 .toss-cash-latest b { margin-right: 5px; }
 
 
-.toss-cash-activity-log {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  max-block-size: 280px;
-  overflow: auto;
-}
 
-.toss-cash-activity-log > li {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) max-content;
-  gap: 8px;
-  padding-block: 6px;
-  overflow-wrap: anywhere;
-}
-
-.toss-cash-activity-log time {
-  color: var(--text-muted);
-  font-size: 0.75rem;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
+.toss-cash-activity-log { max-block-size: 280px; }
+.toss-cash-calculations { max-block-size: 26rem; margin-block-start: 10px; }

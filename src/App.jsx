@@ -3560,10 +3560,15 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
                 <OrderInvestigation key={`${order.broker_id}:${order.order_id}:${order.updated_at || ""}`} snapshot={snapshot} order={order} />
                 <section className="order-detail-section order-timeline-section">
                   <header><h4>주문 타임라인</h4><span>{timelineProjection.timeline.length}건</span></header>
-                  <div className="order-timeline">
-                    {timelineProjection.timeline.map((event) => <div key={event.id}><span>{formatAuditTime({ timestamp: event.time })}</span><strong>{event.label}</strong><small>{event.detail || event.source || "상태 기록"}</small></div>)}
-                    {!timelineProjection.timeline.length && <div><span>-</span><strong>거래소 Event 대기</strong><small>체결 스트림 또는 REST 대조 결과가 아직 없습니다.</small></div>}
-                  </div>
+                  {timelineProjection.timeline.length ? (
+                    <div className="live-activity-table order-timeline" tabIndex={0} aria-label="주문 타임라인 스크롤">
+                      <table aria-label="주문 타임라인"><thead><tr><th scope="col">시각</th><th scope="col">상태</th><th scope="col">내용</th></tr></thead>
+                        <tbody>{timelineProjection.timeline.map((event) => <tr key={event.id}>
+                          <td>{formatAuditTime({ timestamp: event.time })}</td><td><strong>{event.label}</strong></td><td>{event.detail || event.source || "상태 기록"}</td>
+                        </tr>)}</tbody>
+                      </table>
+                    </div>
+                  ) : <p className="muted">체결 스트림 또는 REST 대조 결과를 기다리는 중입니다.</p>}
                   <div className="operator-actions">
                     <button className="secondary-button" type="button" disabled={!order.order_id || !timelineProjection.directRetryAllowed} onClick={() => onRetryOrder(order.order_id)}>상태 대조 후 재시도</button>
                     <button className="secondary-button" type="button" disabled={!order.order_id || Boolean(order.cancel_request_id) || ["filled", "canceled"].includes(String(order.state || "").toLowerCase())} onClick={() => onCancelOrder(order.order_id)}>{order.cancel_request_id ? "취소 대조 중" : "취소 요청"}</button>

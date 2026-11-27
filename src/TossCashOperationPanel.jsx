@@ -129,12 +129,14 @@ function TossActivityLog({ activity }) {
     const list = listRef.current;
     if (list) list.scrollTop = list.scrollHeight;
   }, [newest?.at, newest?.detail]);
-  return <ol className="toss-cash-activity-log" ref={listRef} role="log" aria-label="토스 운용 활동">
+  return <div className="live-activity-table toss-cash-activity-log" ref={listRef} role="log" aria-label="토스 운용 활동" tabIndex={0}>
+    <table aria-label="토스 운용 활동 기록"><thead><tr><th scope="col">시각</th><th scope="col">내용</th></tr></thead><tbody>
     {recent.map((entry, index) => {
       const when = new Date(entry.at * 1000);
-      return <li key={`${entry.at}:${index}`}><span>{entry.detail}</span><time dateTime={when.toISOString()} title={tossTime(entry.at)}>{progressClock.format(when)}</time></li>;
+      return <tr key={entry.at + ":" + index}><td><time dateTime={when.toISOString()} title={tossTime(entry.at)}>{progressClock.format(when)}</time></td><td>{entry.detail}</td></tr>;
     })}
-  </ol>;
+    </tbody></table>
+  </div>;
 }
 
 function TossCashMonitor({ snapshot, state, error, now }) {
@@ -173,19 +175,20 @@ function TossCashMonitor({ snapshot, state, error, now }) {
     <details className="ts-disclosure toss-cash-options" onToggle={scrollOpenedActivity}><summary>진행 상세</summary>
       <p className="muted">최근 활동 기록입니다. 주문 접수 후 체결 수량은 대조 결과에 반영됩니다.</p>
       <TossActivityLog activity={snapshot?.activity} />
-      {view.calculations.length > 0 && <ol className="tower-event-list tower-event-details" aria-label="전략 계산 기록">
-        {view.calculations.map((entry, index) => <li key={`${entry.at}:${index}`}>
-          <time>{tossTime(entry.at)}</time>
-          <div><strong>{entry.symbol} · {entry.timeframe}</strong>
-            {entry.reason && <p>{entry.reason}</p>}
-            {entry.values.length > 0 && <dl className="tower-signal-values">
-              {entry.values.map(({label,value}) => <div key={label}><dt>{label}</dt><dd>
-                {typeof value === "number" ? value.toLocaleString("ko-KR", { maximumFractionDigits: 8 }) : value}
-              </dd></div>)}
-            </dl>}
-          </div>
-        </li>)}
-      </ol>}
+      {view.calculations.length > 0 && <div className="live-activity-table toss-cash-calculations" aria-label="전략 계산 기록 스크롤" tabIndex={0}>
+        <table aria-label="전략 계산 기록"><thead><tr><th scope="col">시각</th><th scope="col">전략 대상</th><th scope="col">계산 내용</th></tr></thead>
+          <tbody>{view.calculations.map((entry, index) => <tr key={entry.at + ":" + index}>
+            <td><time>{tossTime(entry.at)}</time></td><td><strong>{entry.symbol} · {entry.timeframe}</strong></td>
+            <td>{entry.reason && <p>{entry.reason}</p>}
+              {entry.values.length > 0 && <dl className="tower-signal-values">
+                {entry.values.map(({label,value}) => <div key={label}><dt>{label}</dt><dd>
+                  {typeof value === "number" ? value.toLocaleString("ko-KR", { maximumFractionDigits: 8 }) : value}
+                </dd></div>)}
+              </dl>}
+            </td>
+          </tr>)}</tbody>
+        </table>
+      </div>}
       {snapshot?.firstFailure && <p className="toss-cash-error">최초 오류 · {message(snapshot.firstFailure)}</p>}
     </details>
   </section>;

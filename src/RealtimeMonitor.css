@@ -36,7 +36,7 @@
 .live-monitor-equity { display:grid; gap:10px; }.live-monitor-equity article { border:1px solid var(--border); border-radius:13px; background:var(--bg-raised); padding:15px; min-width:0; }.live-monitor-equity-head strong { font-size:13px; }.live-monitor-equity-head span { font-size:10px; color:var(--monitor-muted); }.live-monitor-equity-value { display:flex; align-items:baseline; gap:10px; margin:10px 0; flex-wrap:wrap; }.live-monitor-equity-value strong { font-size:23px; font-variant-numeric:tabular-nums; }.live-monitor-equity-value span { font-size:12px; color:var(--muted); }.live-monitor-equity p { font-size:11px; margin:5px 0; }.live-monitor-equity small { display:block; font-size:10px; line-height:1.65; color:var(--monitor-muted); overflow-wrap:anywhere; }
 .live-monitor-activity { border-left:1px solid var(--border); padding-left:24px; min-width:0; }.live-monitor-activity>ol { list-style:none; margin:0; padding:0; max-height:650px; overflow:auto; }.live-monitor-activity li { display:flex; gap:11px; padding:12px 0; border-bottom:1px solid var(--border); }.live-monitor-event-icon { flex:none; display:flex; align-items:center; justify-content:center; background:var(--bg-raised); color:var(--muted); width:29px; height:29px; border-radius:10px; }.live-monitor-event-icon.is-fill { background:var(--bg-raised); color:var(--moa-status-success); }.live-monitor-activity li>div { min-width:0; }.live-monitor-activity li strong { display:block; font-size:12px; color:var(--monitor-ink); }.live-monitor-activity time { display:block; font-size:10px; color:var(--monitor-muted); margin-top:3px; }.live-monitor-activity li p { font-size:11px; margin:4px 0; overflow-wrap:anywhere; }.live-monitor-activity li small { font-size:10px; color:var(--monitor-muted); }
 .live-monitor .live-monitor-empty { background:var(--bg-raised); border-radius:12px; padding:18px; color:var(--monitor-muted); font-size:12px; line-height:1.7; }.live-monitor .live-monitor-footnote { font-size:10px; color:var(--monitor-muted); line-height:1.7; margin-top:14px; }.live-monitor-alert { margin-top:16px; border:1px solid var(--border); background:var(--bg-raised); border-radius:12px; padding:14px; color:var(--moa-status-warning); font-size:12px; }.live-monitor-alert ul { margin-bottom:0; padding-left:18px; }
-@media(max-width:1100px) { .live-monitor-columns { grid-template-columns:1fr; }.live-monitor-activity { border-left:0; padding:20px 0 0; border-top:1px solid var(--border); }.live-monitor-activity>ol { max-height:400px; } }
+@media(max-width:1100px) { .live-monitor-columns { grid-template-columns:1fr; }.live-monitor-activity { border-left:0; padding:20px 0 0; border-top:1px solid var(--border); }}
 @media(max-width:700px) { .live-monitor-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }.live-monitor-strategies article { grid-template-columns:1fr; }.live-monitor-hero h3 { font-size:19px; }.live-monitor-hero { padding:16px; }.live-monitor-metrics article>strong { font-size:22px; } }
 @media(prefers-reduced-motion:reduce) { .live-monitor * { transition:none!important; animation:none!important; } }
 
@@ -64,15 +64,10 @@
 .live-monitor-diagnostics > summary { cursor: pointer; color: var(--monitor-ink); font-size: 12px; font-weight: 650; }
 .live-monitor-diagnostics > summary:focus-visible { outline: 2px solid var(--monitor-accent); outline-offset: 4px; }
 .live-monitor-diagnostics[open] > summary { margin-bottom: 10px; }
-.live-monitor-activity-log > ol { list-style: none; margin: 0; padding: 0; max-height: 500px; overflow: auto; }
 .live-monitor .monitor-market-table .live-monitor-signal { display: inline-block; white-space: nowrap; }
 .live-monitor-calculation { margin-top: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; }
 
 
-.live-monitor-activity-log > ol > li > time {
-  flex: 0 0 auto;
-  margin-inline-start: auto;
-  white-space: nowrap;
-  text-align: end;
-  font-variant-numeric: tabular-nums;
-}
+
+.live-monitor-activity .live-activity-table { max-block-size: 25rem; }
+.live-monitor-activity-log .live-activity-follow { max-block-size: 500px; }
