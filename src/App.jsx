@@ -2821,6 +2821,20 @@ function dateStamp(date = new Date()) {
   return date.toISOString().replace(/[-:]/g, "").slice(0, 15);
 }
 
+function ExecutionEventTable({ events, label }) {
+  return <div className="live-activity-table tower-activity-table" role="region" aria-label={label + " 스크롤"} tabIndex={0}>
+    <table aria-label={label}>
+      <thead><tr><th scope="col">시각</th><th scope="col">종목 · 방향</th><th scope="col">수량 · 가격</th><th scope="col">상태</th></tr></thead>
+      <tbody>{events.slice(0, 30).map((event, index) => <tr key={event.event_id || index}>
+        <td>{formatAuditTime({ timestamp: event.occurred_at })}</td>
+        <td>{event.symbol || "—"} · {event.side || "—"}</td>
+        <td>{event.quantity ?? "—"} @ {event.price ?? "—"}</td>
+        <td><StatusPill tone={orderStateTone(event.state)}>{orderStateLabel(event.state)}</StatusPill></td>
+      </tr>)}</tbody>
+    </table>
+  </div>;
+}
+
 function formatAuditTime(item = {}) {
   const value = item.timestamp || item.datetime || item.occurred_at || item.occurredAt || item.created_at || item.createdAt || item.time || "";
   const text = String(value || "").trim();
@@ -3516,15 +3530,7 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
               </section>
               {events.length > 0 && (
                 <CompactDisclosure title="주문과 연결되지 않은 체결 Event" badge={`${events.length}건`}>
-                  <div className="compact-list">
-                    {events.slice(0, 30).map((event, index) => (
-                      <div className="compact-row" key={event.event_id || "unmatched-event-" + index}>
-                        <strong>{event.symbol || "-"} · {event.side || "-"}</strong>
-                        <span>{event.quantity ?? "-"} @ {event.price ?? "-"} · {formatAuditTime({ timestamp: event.occurred_at })}</span>
-                        <StatusPill tone={orderStateTone(event.state)}>{orderStateLabel(event.state)}</StatusPill>
-                      </div>
-                    ))}
-                  </div>
+                  <ExecutionEventTable events={events} label="주문과 연결되지 않은 체결" />
                 </CompactDisclosure>
               )}
             </div>
@@ -3576,15 +3582,9 @@ function OrderExecutionWorkspace({ context = {}, snapshot = {}, onRetryOrder, on
                 </section>
                 <section className="order-detail-section fill-ledger-panel">
                   <header><h4>체결 원장</h4><span>{orderEvents.length}건</span></header>
-                  <div className="compact-list">
-                    {orderEvents.length ? orderEvents.slice(0, 30).map((event, index) => (
-                      <div className="compact-row" key={event.event_id || "event-" + index}>
-                        <strong>{event.symbol || "-"} · {event.side || "-"}</strong>
-                        <span>{event.quantity ?? "-"} @ {event.price ?? "-"} · {formatAuditTime({ timestamp: event.occurred_at })}</span>
-                        <StatusPill tone={orderStateTone(event.state)}>{orderStateLabel(event.state)}</StatusPill>
-                      </div>
-                    )) : <EmptyRow text="선택 주문에 연결된 체결 Event가 없습니다." />}
-                  </div>
+                  {orderEvents.length
+                    ? <ExecutionEventTable events={orderEvents} label="선택한 주문의 체결 원장" />
+                    : <EmptyRow text="선택한 주문에 연결된 체결이 없습니다." />}
                 </section>
                 <section className="order-detail-section execution-quality-panel">
                   <header><h4>실행 품질</h4><span>전체 주문 기준</span></header>

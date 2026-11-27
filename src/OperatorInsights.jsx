@@ -101,7 +101,13 @@ export function OrderInvestigation({ snapshot, order }) {
     } catch(error) { setHistoryError(error.message); } finally { setHistoryBusy(false); }
   }
   const audit = history.total == null ? view.audit : history.events;
-  return <InlineDisclosure className="operator-insights" open><summary>주문 조사 내역 · 마지막 대조</summary><p>{view.reason}</p><dl><div><dt>주문 기록 갱신</dt><dd>{stamp(view.lastUpdated)}</dd></div><div><dt>이 주문의 마지막 체결 이벤트</dt><dd>{stamp(view.lastExecution)}</dd></div><div><dt>전체 계좌 마지막 대조</dt><dd>{stamp(view.lastAccountReconciliation)} · 이 주문의 접수·취소 확정과는 별개</dd></div><div><dt>다음 재시도 기록</dt><dd>{view.nextRetry && view.nextRetry !== '-' ? stamp(view.nextRetry) : '예약 근거 없음'}</dd></div></dl>{audit.map((row,index) => <p key={row.event_id || index}>{stamp(row.timestamp || row.occurred_at)} · {row.message || row.detail || row.reason}</p>)}{!audit.length && <p>이 주문 번호에 직접 연결된 저장 조사 기록이 없습니다.</p>}{history.total != null && <small>저장 조사 기록 {audit.length}/{history.total}건</small>}{history.nextOffset != null && <button type="button" className="secondary-button" disabled={historyBusy} onClick={loadOlder}>이전 조사 기록 더 보기</button>}{historyError && <p>{historyError}</p>}<small>미확정 결과는 새 주문으로 재전송하지 말고 기존 상태 대조 절차로 확인하세요.</small></InlineDisclosure>;
+  return <InlineDisclosure className="operator-insights" open><summary>주문 조사 내역 · 마지막 대조</summary><p>{view.reason}</p><dl><div><dt>주문 기록 갱신</dt><dd>{stamp(view.lastUpdated)}</dd></div><div><dt>이 주문의 마지막 체결 이벤트</dt><dd>{stamp(view.lastExecution)}</dd></div><div><dt>전체 계좌 마지막 대조</dt><dd>{stamp(view.lastAccountReconciliation)} · 이 주문의 접수·취소 확정과는 별개</dd></div><div><dt>다음 재시도 기록</dt><dd>{view.nextRetry && view.nextRetry !== '-' ? stamp(view.nextRetry) : '예약 근거 없음'}</dd></div></dl>{audit.length ? <div className="operator-table-scroll" role="region" aria-label="저장 조사 기록 스크롤" tabIndex={0}>
+    <table aria-label="저장 조사 기록"><thead><tr><th scope="col">시각</th><th scope="col">조사 내용</th></tr></thead>
+      <tbody>{audit.map((row, index) => <tr key={row.event_id || index}>
+        <td>{stamp(row.timestamp || row.occurred_at)}</td><td>{row.message || row.detail || row.reason}</td>
+      </tr>)}</tbody>
+    </table>
+  </div> : <p>이 주문 번호에 직접 연결된 저장 조사 기록이 없습니다.</p>}{history.total != null && <small>저장 조사 기록 {audit.length}/{history.total}건</small>}{history.nextOffset != null && <button type="button" className="secondary-button" disabled={historyBusy} onClick={loadOlder}>이전 조사 기록 더 보기</button>}{historyError && <p>{historyError}</p>}<small>미확정 결과는 새 주문으로 재전송하지 말고 기존 상태 대조 절차로 확인하세요.</small></InlineDisclosure>;
 }
 export function OperatorNoteEditor({ recordKey }) {
   const [note,setNote] = useState(null), [text,setText] = useState(''), [message,setMessage] = useState(''), [busy,setBusy] = useState(false);
